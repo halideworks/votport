@@ -31,6 +31,7 @@ RUN mkdir -p /app /data /received
 COPY --from=build /src/server/target/release/votport /app/votport
 COPY web /app/web
 COPY --from=build /wasm-vendor/ /app/web/assets/vendor/
+RUN chmod -R a+rX /app/web
 
 ENV VOTPORT_BIND=0.0.0.0:8080 \
     VOTPORT_DATA_DIR=/data \
