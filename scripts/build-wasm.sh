@@ -12,8 +12,8 @@ if [ ! -f "$vot/crates/vot-wasm/Cargo.toml" ]; then
     exit 2
 fi
 
-cargo build --manifest-path "$vot/Cargo.toml" --release \
-    -p vot-wasm --target wasm32-unknown-unknown --locked
+(cd "$vot" && cargo build --release \
+    -p vot-wasm --target wasm32-unknown-unknown --locked)
 
 mkdir -p "$here/web/assets/vendor"
 wasm-bindgen --target web --no-typescript \

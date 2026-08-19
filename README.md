@@ -16,7 +16,7 @@ you (admin)                    them (any modern browser)
     ├──────────── send link ───────────▶│
     │                                   │  vot-wasm hashes the files locally,
     │                                   │  builds a VOT package (manifest+seal),
-    │                                   │  streams proven 2 MiB ranges
+    │                                   │  streams up to four proven 8 MiB ranges
     │                                   ▼
     │                       votport server (this repo)
     │                       verifies every range against the announced
@@ -149,7 +149,7 @@ POST /api/r/{link}/session     announce package root (+ link password)
 POST /api/session/{s}/seal     manifest seal bytes
 POST /api/session/{s}/page     manifest pages, in order
 POST /api/session/{s}/begin    server verifies manifest, stages files
-POST /api/session/{s}/chunk    proof ‖ data for one 2 MiB range   (repeat)
+POST /api/session/{s}/chunk    proof ‖ data for one 8 MiB range   (repeat)
 POST /api/session/{s}/finish   all files verified → recorded
 ```
 
@@ -159,7 +159,6 @@ dies halfway still delivers the files that finished.
 ## Roadmap ideas
 
 * Signed VOT receipts (CBOR) stored next to upload records
-* Resumable uploads (VOT coverage makes this natural)
 * Content dedup when two entries share an object root
 * Outbound mode: serve files to a recipient with verified download
 

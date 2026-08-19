@@ -113,7 +113,34 @@ async fn upload_chunks(
     entry: u64,
     file: &ClientFile,
 ) {
-    upload_chunks_from(client, base, session, entry, file, 0, usize::MAX).await;
+    let mut requests = tokio::task::JoinSet::new();
+    let mut offset = 0;
+    while offset < file.bytes.len() as u64 {
+        let proof = file
+            .prepared
+            .prove(offset, CHUNK.min(file.bytes.len() as u64 - offset))
+            .expect("prove");
+        let start = proof.covered_offset() as usize;
+        let end = start + proof.covered_length() as usize;
+        let mut body = proof.proof().to_vec();
+        let proof_len = body.len();
+        body.extend_from_slice(&file.bytes[start..end]);
+        let client = client.clone();
+        let url = format!("{base}/api/session/{session}/chunk?entry={entry}&offset={start}");
+        requests.spawn(async move {
+            client
+                .post(url)
+                .header("X-Votport-Proof", proof_len.to_string())
+                .body(body)
+                .send()
+                .await
+        });
+        offset = proof.covered_offset() + proof.covered_length();
+    }
+    while let Some(response) = requests.join_next().await {
+        let response = response.expect("chunk task").expect("chunk request");
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    }
 }
 
 /// Sends at most `max_chunks` ranges starting at `from`, and returns the
