@@ -4,54 +4,86 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
-<title>Send files</title>
-<link rel="icon" href="data:,">
+<title>File Receipt Portal</title>
+<link rel="icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAxNiAxNic+PHJlY3Qgd2lkdGg9JzE2JyBoZWlnaHQ9JzE2JyBmaWxsPScjRjJDMjMwJy8+PC9zdmc+">
 <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
+<div class="appbar">
+  <span class="mark" aria-hidden="true"></span>
+  <span class="wordmark">File Receipt Portal</span>
+</div>
+
 <main class="wrap narrow">
   <header class="masthead">
-    <h1 id="title">Send files</h1>
-    <p class="sub" id="subtitle">Files are verified end to end before they are accepted.</p>
+    <p class="eyebrow">Transfer request</p>
+    <!-- #title is replaced with the request reference once the link loads. -->
+    <h1 id="title">&nbsp;</h1>
+    <p class="sub" id="subtitle">Files are verified on receipt.</p>
   </header>
 
   <section id="closed" class="card" hidden>
-    <h2>This link is closed</h2>
-    <p>Ask the person who sent it to you for a new one.</p>
+    <h2>Request closed</h2>
+    <p>This request is no longer accepting files.</p>
+  </section>
+
+  <section id="gate" hidden>
+    <form id="gate-form" class="card">
+      <h2>Access required</h2>
+      <label>Password
+        <input type="password" id="link-password" autocomplete="off" required>
+      </label>
+      <button type="submit" id="gate-continue">Continue</button>
+      <p class="error" id="gate-error" hidden></p>
+    </form>
   </section>
 
   <section id="uploader" hidden>
     <form id="upload-form" class="card">
-      <label id="password-row" hidden>Link password
-        <input type="password" id="link-password" autocomplete="off">
-      </label>
-
       <div id="drop" class="drop" tabindex="0">
-        <p><strong>Drop files here</strong> or</p>
-        <p><button type="button" id="pick">Choose files</button></p>
+        <p><strong>Drop files here</strong></p>
+        <p><button type="button" id="pick" class="ghost">Browse</button></p>
         <input type="file" id="file-input" multiple hidden>
       </div>
 
       <ul id="file-list" class="files"></ul>
       <p class="muted" id="totals" hidden></p>
+      <p class="muted" id="resume-note" hidden></p>
 
-      <button type="submit" id="send" disabled>Send files</button>
+      <button type="submit" id="send" disabled>Transmit</button>
       <p class="error" id="upload-error" hidden></p>
     </form>
 
     <div id="progress-card" class="card" hidden>
-      <h2 id="phase">Preparing&hellip;</h2>
+      <h2>Transfer in progress</h2>
+      <p id="phase">Preparing&hellip;</p>
       <div class="meter"><div id="meter-fill"></div></div>
       <p class="muted" id="progress-note"></p>
+      <div class="progress-actions">
+        <button type="button" id="cancel" class="ghost">Cancel transfer</button>
+      </div>
     </div>
 
     <div id="done-card" class="card ok" hidden>
-      <h2>Files delivered &#10003;</h2>
-      <p>Every byte was cryptographically verified on arrival.</p>
+      <h2>Transfer complete</h2>
       <ul id="done-list" class="files"></ul>
     </div>
   </section>
 </main>
+
+<!-- Native <dialog>: focus trap, Esc to dismiss and a backdrop come with it.
+     "Continue transfer" is first so Enter is the safe answer. -->
+<dialog id="confirm-cancel" class="modal">
+  <form method="dialog">
+    <h2>Cancel transfer</h2>
+    <p id="confirm-cancel-detail">The file in progress is discarded. Files already delivered are kept.</p>
+    <div class="modal-actions">
+      <button value="keep" class="ghost">Continue transfer</button>
+      <button value="cancel" class="danger">Cancel transfer</button>
+    </div>
+  </form>
+</dialog>
+
 <script type="module" src="/assets/upload.js"></script>
 </body>
 </html>

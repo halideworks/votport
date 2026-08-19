@@ -66,6 +66,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/admin/login", post(api::admin_login))
         .route("/api/admin/logout", post(api::admin_logout))
         .route("/api/admin/session", get(api::admin_session))
+        .route("/api/admin/password", post(api::admin_change_password))
         .route(
             "/api/admin/links",
             get(api::list_links).post(api::create_link),
@@ -76,6 +77,7 @@ pub fn router(app: Arc<App>) -> Router {
         )
         // Public upload API.
         .route("/api/r/{token}", get(api::link_info))
+        .route("/api/r/{token}/verify", post(api::verify_link_password))
         .route("/api/r/{token}/session", post(api::create_session))
         .route(
             "/api/session/{sid}/seal",

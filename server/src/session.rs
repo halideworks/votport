@@ -94,6 +94,9 @@ pub struct EntryInfo {
     pub stored_as: String,
     pub bytes: u64,
     pub complete: bool,
+    /// Bytes already verified and written for this entry. The uploader sends
+    /// ranges strictly in order, so this doubles as the offset to resume from.
+    pub covered_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -230,6 +233,12 @@ fn handle_page(phase: &mut Phase, bytes: &[u8]) -> Result<u64, SessionError> {
 }
 
 fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>, SessionError> {
+    // Begin is idempotent once receiving: a client that lost its connection
+    // (or its page) calls it again to learn how far each entry got, and picks
+    // up from there. Without this a reconnect could only start over.
+    if let Phase::Receiving { files } = phase {
+        return Ok(entry_infos(setup, files));
+    }
     let Phase::Pages {
         ingest: _,
         entries,
@@ -286,7 +295,13 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
         }
     }
 
-    let infos = files
+    let infos = entry_infos(setup, &files);
+    *phase = Phase::Receiving { files };
+    Ok(infos)
+}
+
+fn entry_infos(setup: &WorkerSetup, files: &[FileState]) -> Vec<EntryInfo> {
+    files
         .iter()
         .enumerate()
         .map(|(index, file)| EntryInfo {
@@ -295,10 +310,17 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
             stored_as: stored_rel(&setup.dest_rel, &file.stored_components),
             bytes: file.object.length,
             complete: file.published,
+            // A published file has no live handle left to ask, and its
+            // coverage is by definition the whole object.
+            covered_bytes: if file.published {
+                file.object.length
+            } else {
+                file.native
+                    .as_ref()
+                    .map_or(0, |native| native.progress().covered_bytes)
+            },
         })
-        .collect();
-    *phase = Phase::Receiving { files };
-    Ok(infos)
+        .collect()
 }
 
 fn open_destination(

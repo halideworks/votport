@@ -113,9 +113,26 @@ async fn upload_chunks(
     entry: u64,
     file: &ClientFile,
 ) {
+    upload_chunks_from(client, base, session, entry, file, 0, usize::MAX).await;
+}
+
+/// Sends at most `max_chunks` ranges starting at `from`, and returns the
+/// offset reached. Stopping short stands in for a client that lost its
+/// connection mid-file.
+async fn upload_chunks_from(
+    client: &reqwest::Client,
+    base: &str,
+    session: &str,
+    entry: u64,
+    file: &ClientFile,
+    from: u64,
+    max_chunks: usize,
+) -> u64 {
     let length = file.bytes.len() as u64;
-    let mut offset = 0u64;
-    while offset < length {
+    let mut offset = from;
+    let mut sent = 0usize;
+    while offset < length && sent < max_chunks {
+        sent += 1;
         let want = CHUNK.min(length - offset);
         let proof = file.prepared.prove(offset, want).expect("prove");
         let start = proof.covered_offset() as usize;
@@ -135,6 +152,7 @@ async fn upload_chunks(
         assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
         offset = proof.covered_offset() + proof.covered_length();
     }
+    offset
 }
 
 async fn run_upload(
@@ -495,4 +513,136 @@ async fn admin_api_requires_sign_in() {
         .await
         .unwrap();
     assert_eq!(response.status(), 401);
+}
+
+
+/// An interrupted transfer must not have to re-send bytes the server already
+/// verified: `begin` is idempotent and reports per-entry coverage, and the
+/// client picks up from exactly that offset.
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupted_transfer_resumes_from_reported_coverage() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+
+    let response = client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let response = client
+        .post(format!("{base}/api/admin/links"))
+        .header("X-Votport", "1")
+        .json(&json!({ "label": "resume", "dest": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let token = response.json::<Value>().await.unwrap()["link"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // 12 MiB is six 2 MiB chunks, so "half sent" is unambiguous.
+    let bytes: Vec<u8> = (0..12u32 * 1024 * 1024)
+        .map(|index| (index.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let length = bytes.len() as u64;
+    let files = [prepare(vec!["resume.bin"], bytes.clone())];
+    let (announcement, pages, seal) = build_package(&files);
+
+    let response = client
+        .post(format!("{base}/api/r/{token}/session"))
+        .json(&json!({ "password": null, "package": announcement }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let session = response.json::<Value>().await.unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let response = client
+        .post(format!("{base}/api/session/{session}/seal"))
+        .body(seal)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    for page in pages {
+        let response = client
+            .post(format!("{base}/api/session/{session}/page"))
+            .body(page)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    }
+
+    let begin = client
+        .post(format!("{base}/api/session/{session}/begin"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(begin["entries"][0]["covered_bytes"].as_u64().unwrap(), 0);
+    let index = begin["entries"][0]["index"].as_u64().unwrap();
+
+    // --- the client dies three chunks in ----------------------------------
+    let stopped =
+        upload_chunks_from(&client, &base, &session, index, &files[0], 0, 3).await;
+    assert!(stopped > 0 && stopped < length, "stopped at {stopped}");
+
+    // --- it comes back and asks how far it got ----------------------------
+    let response = client
+        .post(format!("{base}/api/session/{session}/begin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "begin must be idempotent for a reconnecting client"
+    );
+    let again = response.json::<Value>().await.unwrap();
+    assert_eq!(
+        again["entries"][0]["covered_bytes"].as_u64().unwrap(),
+        stopped,
+        "coverage must match what the client actually sent"
+    );
+    assert!(!again["entries"][0]["complete"].as_bool().unwrap());
+
+    // --- and resumes from exactly there, re-sending nothing ---------------
+    let finished = upload_chunks_from(
+        &client,
+        &base,
+        &session,
+        index,
+        &files[0],
+        stopped,
+        usize::MAX,
+    )
+    .await;
+    assert_eq!(finished, length);
+
+    let response = client
+        .post(format!("{base}/api/session/{session}/finish"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let report = response.json::<Value>().await.unwrap();
+    assert_eq!(report["files"][0]["bytes"].as_u64().unwrap(), length);
+
+    let landed = std::fs::read(server.receive_dir.join("resume.bin")).expect("published file");
+    assert_eq!(landed, bytes, "resumed file must be byte-identical");
 }

@@ -16,6 +16,46 @@ const HASH_READ_BYTES = 8 * 1024 * 1024;
 let chunkBytes = 2 * 1024 * 1024;
 let picked = new Map(); // relative path -> File
 let uploading = false;
+let cancelled = false;
+let controller = null; // aborts the request in flight when the sender cancels
+
+// Hash this many files ahead of the one being uploaded. Hashing stays strictly
+// sequential (one thread), so depth only buys anything when uploads outpace
+// hashing between files; it is cheap, so it is here.
+const LOOKAHEAD = 2;
+
+class Cancelled extends Error {
+  constructor() {
+    super('Transfer cancelled.');
+    this.cancelled = true;
+  }
+}
+
+function checkCancelled() {
+  if (cancelled) throw new Cancelled();
+}
+
+// A record of the session currently in flight, so an interrupted transfer can
+// re-attach to it instead of re-sending bytes the server already verified.
+// Cleared on success and on cancel, kept on failure — failure is the case it
+// exists for. The server sweeps the session itself once it goes idle.
+const RESUME_KEY = `votport-resume-${token}`;
+
+function saveResume(record) {
+  try { localStorage.setItem(RESUME_KEY, JSON.stringify(record)); } catch { /* private mode */ }
+}
+
+function loadResume() {
+  try { return JSON.parse(localStorage.getItem(RESUME_KEY) || 'null'); } catch { return null; }
+}
+
+function clearResume() {
+  try { localStorage.removeItem(RESUME_KEY); } catch { /* private mode */ }
+}
+
+function hex(bytes) {
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
 
 // ---------------------------------------------------------------- formatting
 
@@ -25,6 +65,40 @@ function formatBytes(bytes) {
   const exponent = Math.min(Math.floor(Math.log2(bytes) / 10), units.length - 1);
   const value = bytes / 2 ** (10 * exponent);
   return `${value >= 100 || exponent === 0 ? Math.round(value) : value.toFixed(1)} ${units[exponent]}`;
+}
+
+// Throughput over a trailing window. A cumulative average keeps reporting a
+// speed the transfer no longer has once it stalls, which is exactly when
+// someone is staring at the number.
+const RATE_WINDOW_MS = 4000;
+
+function makeRate() {
+  const samples = [[performance.now(), 0]];
+  let windowed = 0;
+  return (step) => {
+    const now = performance.now();
+    samples.push([now, step]);
+    windowed += step;
+    while (samples.length > 1 && now - samples[0][0] > RATE_WINDOW_MS) {
+      windowed -= samples.shift()[1];
+    }
+    const seconds = (now - samples[0][0]) / 1000;
+    return seconds >= 0.5 ? windowed / seconds : null;
+  };
+}
+
+// Decimal units here, unlike the binary units used for sizes: transfer rates
+// are quoted decimally everywhere else a sender will compare them.
+function formatRate(bytesPerSecond) {
+  if (bytesPerSecond === null) return '';
+  const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
+  let value = bytesPerSecond;
+  let unit = 0;
+  while (value >= 1000 && unit < units.length - 1) {
+    value /= 1000;
+    unit += 1;
+  }
+  return `${value >= 100 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
 }
 
 function fail(message) {
@@ -149,7 +223,7 @@ function setStatus(path, text, done = false) {
 // ------------------------------------------------------------------- network
 
 async function apiJson(path, options = {}) {
-  const response = await fetch(path, options);
+  const response = await fetch(path, { signal: controller?.signal, ...options });
   let body = null;
   try { body = await response.json(); } catch { /* not JSON */ }
   if (!response.ok) {
@@ -160,8 +234,13 @@ async function apiJson(path, options = {}) {
 
 async function postWithRetry(path, options, attempts = 3) {
   for (let attempt = 1; ; attempt += 1) {
+    checkCancelled();
     try {
-      const response = await fetch(path, { method: 'POST', ...options });
+      const response = await fetch(path, {
+        method: 'POST',
+        signal: controller?.signal,
+        ...options,
+      });
       if (response.status >= 500 || response.status === 429) {
         throw new Error(`server busy (${response.status})`);
       }
@@ -170,6 +249,7 @@ async function postWithRetry(path, options, attempts = 3) {
       if (!response.ok) throw Object.assign(new Error(body?.error || `failed (${response.status})`), { fatal: true });
       return body;
     } catch (error) {
+      if (cancelled) throw new Cancelled();
       if (error.fatal || attempt >= attempts) throw error;
       await new Promise((resolve) => { setTimeout(resolve, 1000 * attempt); });
     }
@@ -188,15 +268,43 @@ function setMeter(fraction) {
   $('meter-fill').style.width = `${Math.min(100, Math.round(fraction * 100))}%`;
 }
 
+function setNote(done, total, bytesPerSecond) {
+  const parts = [`${formatBytes(done)} of ${formatBytes(total)}`];
+  const rate = formatRate(bytesPerSecond);
+  if (rate) {
+    parts.push(rate);
+    const remaining = total - done;
+    if (remaining > 0 && bytesPerSecond > 0) {
+      parts.push(`${formatDuration(remaining / bytesPerSecond)} left`);
+    }
+  }
+  $('progress-note').textContent = parts.join(' · ');
+}
+
+function formatDuration(seconds) {
+  if (seconds < 60) return `${Math.ceil(seconds)}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  return `${Math.floor(seconds / 3600)}h ${Math.round((seconds % 3600) / 60)}m`;
+}
+
 async function hashFile(file, onProgress) {
   const size = BigInt(file.size);
   const builder = new ObjectBuilder(Suite.Blake3Bao64, size, size);
+  const readAt = (offset) =>
+    file.slice(offset, Math.min(offset + HASH_READ_BYTES, file.size)).arrayBuffer();
   let offset = 0;
-  while (offset < file.size) {
-    const slice = file.slice(offset, Math.min(offset + HASH_READ_BYTES, file.size));
-    const bytes = new Uint8Array(await slice.arrayBuffer());
-    builder.update(bytes);
+  // The next slice starts reading before the current one is hashed, so disk
+  // and CPU overlap instead of taking turns: the phase costs max(read, hash)
+  // rather than read + hash.
+  let pending = file.size > 0 ? readAt(0) : null;
+  while (pending) {
+    // Checked every slice: a 10 GiB hash has to be interruptible, or Cancel
+    // does nothing until it finishes.
+    checkCancelled();
+    const bytes = new Uint8Array(await pending);
     offset += bytes.length;
+    pending = offset < file.size ? readAt(offset) : null;
+    builder.update(bytes);
     onProgress(bytes.length);
   }
   return builder.finish();
@@ -230,37 +338,52 @@ function buildPackage(items) {
   return { summary, pages, seal };
 }
 
-async function uploadEntryChunks(sessionId, entryIndex, item, onProgress) {
+async function uploadEntryChunks(sessionId, entryIndex, item, from, onProgress) {
   const { file, prepared } = item;
-  let offset = 0n;
   const size = BigInt(file.size);
-  while (offset < size) {
+  // Proof and disk read for one chunk. Kicked off for the *next* chunk while
+  // the current one is still in flight, so the disk and the network overlap.
+  // The POSTs themselves stay strictly sequential.
+  const prepare = (offset) => {
+    if (offset >= size) return null;
     const want = size - offset < BigInt(chunkBytes) ? size - offset : BigInt(chunkBytes);
     const proof = prepared.prove(offset, want);
-    const coveredOffset = proof.coveredOffset;
-    const coveredLength = proof.coveredLength;
-    const start = Number(coveredOffset);
-    const length = Number(coveredLength);
-    const data = new Uint8Array(await file.slice(start, start + length).arrayBuffer());
-    if (data.length !== length) {
+    const start = Number(proof.coveredOffset);
+    const length = Number(proof.coveredLength);
+    return {
+      next: proof.coveredOffset + proof.coveredLength,
+      start,
+      length,
+      proofBytes: proof.bytes(),
+      data: file.slice(start, start + length).arrayBuffer(),
+    };
+  };
+  // `from` is the server's covered byte count. Ranges go out strictly in
+  // order, so coverage is always a prefix and prove() lands on the same
+  // boundaries it did the first time round.
+  let chunk = prepare(from);
+  while (chunk) {
+    checkCancelled();
+    const data = new Uint8Array(await chunk.data);
+    if (data.length !== chunk.length) {
       throw new Error(`"${item.path}" changed while uploading; pick it again`);
     }
-    const proofBytes = proof.bytes();
-    const body = new Uint8Array(proofBytes.length + data.length);
-    body.set(proofBytes, 0);
-    body.set(data, proofBytes.length);
+    const body = new Uint8Array(chunk.proofBytes.length + data.length);
+    body.set(chunk.proofBytes, 0);
+    body.set(data, chunk.proofBytes.length);
+    const upcoming = prepare(chunk.next);
     await postWithRetry(
-      `/api/session/${sessionId}/chunk?entry=${entryIndex}&offset=${start}`,
+      `/api/session/${sessionId}/chunk?entry=${entryIndex}&offset=${chunk.start}`,
       {
         headers: {
           'Content-Type': 'application/octet-stream',
-          'X-Votport-Proof': String(proofBytes.length),
+          'X-Votport-Proof': String(chunk.proofBytes.length),
         },
         body,
       },
     );
-    offset = coveredOffset + coveredLength;
-    onProgress(length);
+    onProgress(chunk.length);
+    chunk = upcoming;
   }
 }
 
@@ -268,87 +391,158 @@ async function runUpload() {
   const password = $('link-password').value;
   const files = [...picked.entries()];
   const totalBytes = files.reduce((sum, [, file]) => sum + file.size, 0);
-
-  // Phase 1: hash everything locally.
-  setPhase('Verifying files locally…', 'computing cryptographic identities');
+  const hashRate = makeRate();
+  const sendRate = makeRate();
   let hashed = 0;
-  const items = [];
-  for (const [path, file] of files) {
-    setStatus(path, 'hashing…');
+  let sent = 0;
+  const delivered = [];
+
+  async function hashOne([path, file]) {
+    checkCancelled();
+    const components = path.split('/');
+    let fileHashed = 0;
+    setStatus(path, 'hashing 0%');
     const prepared = await hashFile(file, (step) => {
       hashed += step;
-      setMeter(totalBytes ? hashed / totalBytes : 1);
-    });
-    const components = path.split('/');
-    items.push({ path, components, file, prepared, key: pathKeyBytes(components) });
-    setStatus(path, 'hashed');
-  }
-
-  // Phase 2: build the package manifest.
-  const { summary, pages, seal } = buildPackage(items);
-  const packageId = summary.objectId;
-  const suite = packageId.suite === Suite.Blake3Bao64 ? 'blake3' : 'sha256';
-
-  // Phase 3: announce, then stream the manifest.
-  setPhase('Starting transfer…');
-  setMeter(0);
-  const session = await apiJson(`/api/r/${token}/session`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      password: password || null,
-      package: {
-        suite,
-        root: [...packageId.root].map((byte) => byte.toString(16).padStart(2, '0')).join(''),
-        length: Number(packageId.length),
-      },
-    }),
-  });
-  const sessionId = session.session;
-  chunkBytes = session.chunk_bytes || chunkBytes;
-
-  try {
-    await postWithRetry(`/api/session/${sessionId}/seal`, {
-      headers: { 'Content-Type': 'application/octet-stream' },
-      body: seal,
-    });
-    for (const page of pages) {
-      await postWithRetry(`/api/session/${sessionId}/page`, {
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: page,
-      });
-    }
-    const { entries } = await postWithRetry(`/api/session/${sessionId}/begin`, {});
-
-    // Phase 4: stream proven ranges.
-    setPhase('Sending files…');
-    const byPath = new Map(items.map((item) => [item.path, item]));
-    let sent = 0;
-    for (const entry of entries) {
-      const item = byPath.get(entry.path);
-      if (!item) throw new Error(`server listed unknown entry "${entry.path}"`);
-      if (entry.complete) {
-        setStatus(item.path, 'delivered ✓', true);
-        continue;
+      fileHashed += step;
+      const rate = hashRate(step);
+      setStatus(path, `hashing ${Math.floor((fileHashed / (file.size || 1)) * 100)}%`);
+      // Before the first upload starts there is no send rate to show, so the
+      // note reports what is actually happening: local hashing throughput.
+      if (sent === 0) {
+        $('progress-note').textContent =
+          [`verifying ${formatBytes(hashed)} of ${formatBytes(totalBytes)}`, formatRate(rate)]
+            .filter(Boolean)
+            .join(' \u00b7 ');
       }
-      setStatus(item.path, 'sending…');
-      let fileSent = 0;
-      await uploadEntryChunks(sessionId, entry.index, item, (step) => {
-        sent += step;
-        fileSent += step;
-        setMeter(totalBytes ? sent / totalBytes : 1);
-        setStatus(item.path, `${formatBytes(fileSent)} / ${formatBytes(item.file.size)}`);
+    });
+    setStatus(path, 'ready');
+    return { path, components, file, prepared, key: pathKeyBytes(components) };
+  }
+
+  async function sendOne(item, position) {
+    // One VOT package per file. A package root is a hash over every entry it
+    // contains, so a batch package cannot be announced until the last file is
+    // hashed — which is precisely what would prevent overlapping hashing with
+    // uploading. Per file, each package is announced the moment its own file
+    // is ready, and anything already delivered stays delivered if a later
+    // file fails.
+    const { summary, pages, seal } = buildPackage([item]);
+    const packageId = summary.objectId;
+    const rootHex = hex(packageId.root);
+    const suite = packageId.suite === Suite.Blake3Bao64 ? 'blake3' : 'sha256';
+    setPhase(`Sending ${position} of ${files.length}`);
+
+    // Re-attach to an interrupted session for this exact file. The root is
+    // part of the match, so a file edited since the interruption starts over
+    // rather than failing deep inside range verification.
+    const saved = loadResume();
+    let sessionId = saved && saved.root === rootHex && saved.path === item.path
+      ? saved.session
+      : null;
+    let entries = null;
+    if (sessionId) {
+      try {
+        ({ entries } = await postWithRetry(`/api/session/${sessionId}/begin`, {}, 1));
+        setStatus(item.path, 'resuming…');
+      } catch (error) {
+        if (error.cancelled) throw error;
+        sessionId = null; // session swept or server restarted; start over
+      }
+    }
+    if (!sessionId) {
+      const session = await apiJson(`/api/r/${token}/session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          password: password || null,
+          package: { suite, root: rootHex, length: Number(packageId.length) },
+        }),
       });
-      setStatus(item.path, 'delivered ✓', true);
+      sessionId = session.session;
+      chunkBytes = session.chunk_bytes || chunkBytes;
+      saveResume({ session: sessionId, path: item.path, size: item.file.size, root: rootHex });
+      await postWithRetry(`/api/session/${sessionId}/seal`, {
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: seal,
+      });
+      for (const page of pages) {
+        await postWithRetry(`/api/session/${sessionId}/page`, {
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: page,
+        });
+      }
+      ({ entries } = await postWithRetry(`/api/session/${sessionId}/begin`, {}));
     }
 
-    // Phase 5: finish.
-    const report = await postWithRetry(`/api/session/${sessionId}/finish`, {});
-    showDone(report);
-  } catch (error) {
-    fetch(`/api/session/${sessionId}/abort`, { method: 'POST' }).catch(() => {});
-    throw error;
+    try {
+      for (const entry of entries) {
+        const already = entry.covered_bytes || 0;
+        sent += already;
+        if (entry.complete) {
+          setMeter(totalBytes ? sent / totalBytes : 1);
+          continue;
+        }
+        let fileSent = already;
+        await uploadEntryChunks(sessionId, entry.index, item, BigInt(already), (step) => {
+          sent += step;
+          fileSent += step;
+          setMeter(totalBytes ? sent / totalBytes : 1);
+          setNote(sent, totalBytes, sendRate(step));
+          setStatus(item.path, `${formatBytes(fileSent)} / ${formatBytes(item.file.size)}`);
+        });
+      }
+      const report = await postWithRetry(`/api/session/${sessionId}/finish`, {});
+      delivered.push(...report.files);
+      clearResume();
+      setStatus(item.path, 'delivered \u2713', true);
+    } catch (error) {
+      // Only a deliberate cancel throws the session away. A network failure is
+      // precisely what the resume record exists for, so it is left in place
+      // and the partially written bytes stay on the server until it goes idle.
+      if (error.cancelled) {
+        fetch(`/api/session/${sessionId}/abort`, { method: 'POST' }).catch(() => {});
+        clearResume();
+      }
+      throw error;
+    }
   }
+
+  setPhase('Preparing', 'verifying the first file locally');
+  setMeter(0);
+
+  // Hashing runs ahead of uploading by up to LOOKAHEAD files. The .then chain
+  // keeps hashing strictly sequential — one file at a time, in order — while
+  // the gate stops it from running further ahead than that and pinning several
+  // finished merkle trees in wasm memory at once.
+  const uploaded = files.map(() => {
+    let release;
+    return { promise: new Promise((resolve) => { release = resolve; }), release };
+  });
+  let chain = Promise.resolve();
+  const hashes = files.map((entry, index) => {
+    chain = chain
+      .then(() => (index >= LOOKAHEAD ? uploaded[index - LOOKAHEAD].promise : undefined))
+      .then(() => hashOne(entry));
+    return chain;
+  });
+  // Each is awaited in order below; this only stops the ones after a failure
+  // from being reported as unhandled rejections.
+  hashes.forEach((promise) => { promise.catch(() => {}); });
+
+  for (let index = 0; index < files.length; index += 1) {
+    const item = await hashes[index];
+    try {
+      await sendOne(item, index + 1);
+    } catch (error) {
+      if (delivered.length) {
+        error.message += ` — ${delivered.length} file(s) already delivered and kept`;
+      }
+      throw error;
+    }
+    uploaded[index].release();
+  }
+  showDone({ files: delivered });
 }
 
 function showDone(report) {
@@ -372,6 +566,23 @@ function showDone(report) {
 
 // -------------------------------------------------------------------- wiring
 
+$('cancel').addEventListener('click', () => {
+  const delivered = $('done-list').children.length;
+  const kept = delivered === 1
+    ? 'The one already delivered is kept.'
+    : `The ${delivered} already delivered are kept.`;
+  $('confirm-cancel-detail').textContent = delivered
+    ? `The file in progress is discarded. ${kept}`
+    : 'The file in progress is discarded. Nothing already delivered is affected.';
+  $('confirm-cancel').showModal();
+});
+
+$('confirm-cancel').addEventListener('close', () => {
+  if ($('confirm-cancel').returnValue !== 'cancel') return;
+  cancelled = true;
+  controller?.abort(); // kills the request in flight rather than waiting it out
+});
+
 $('pick').addEventListener('click', () => $('file-input').click());
 $('file-input').addEventListener('change', (event) => addFiles(event.target.files));
 
@@ -394,22 +605,63 @@ window.addEventListener('beforeunload', (event) => {
   if (uploading) event.preventDefault();
 });
 
+$('gate-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  $('gate-error').hidden = true;
+  const button = $('gate-continue');
+  button.disabled = true;
+  try {
+    await apiJson(`/api/r/${token}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: $('link-password').value }),
+    });
+    $('gate').hidden = true;
+    $('uploader').hidden = false;
+  } catch (error) {
+    $('gate-error').textContent = error.message;
+    $('gate-error').hidden = false;
+  } finally {
+    button.disabled = false;
+  }
+});
+
 $('upload-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   if (uploading || picked.size === 0) return;
   uploading = true;
+  cancelled = false;
+  controller = new AbortController();
   $('send').disabled = true;
   $('upload-error').hidden = true;
   try {
     await runUpload();
   } catch (error) {
-    fail(error.message);
+    fail(error.cancelled
+      ? error.message
+      : `${error.message} — reselect the same files to resume where this stopped.`);
     $('progress-card').hidden = true;
     $('send').disabled = false;
+    showResumeNote();
   } finally {
     uploading = false;
+    controller = null;
   }
 });
+
+function showResumeNote() {
+  const saved = loadResume();
+  const note = $('resume-note');
+  if (!saved) {
+    note.hidden = true;
+    return;
+  }
+  note.textContent =
+    `An interrupted transfer of "${saved.path}" is held on the server. `
+    + 'Select the same file again and it continues from where it stopped, '
+    + 'as long as it has not been left idle too long.';
+  note.hidden = false;
+}
 
 (async () => {
   let info;
@@ -425,12 +677,22 @@ $('upload-form').addEventListener('submit', async (event) => {
   }
   $('title').textContent = info.label;
   chunkBytes = info.chunk_bytes || chunkBytes;
-  $('password-row').hidden = !info.needs_password;
   try {
     await init();
   } catch {
-    $('subtitle').textContent = 'Could not load the verification engine (WebAssembly).';
+    $('subtitle').textContent =
+      'This browser could not load the verification engine. It requires WebAssembly '
+      + 'with SIMD: Safari 16.4, Chrome 91, Firefox 89 or newer.';
     return;
   }
-  $('uploader').hidden = false;
+  // Password first, always. Hashing is the expensive step and it happens
+  // entirely in the browser, so revealing the drop zone before the password is
+  // checked invites someone to spend an hour hashing and then get rejected.
+  if (info.needs_password) {
+    $('gate').hidden = false;
+    $('link-password').focus();
+  } else {
+    $('uploader').hidden = false;
+  }
+  showResumeNote();
 })();
