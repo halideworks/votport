@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Send files</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<main class="wrap narrow">
+  <header class="masthead">
+    <h1 id="title">Send files</h1>
+    <p class="sub" id="subtitle">Files are verified end to end before they are accepted.</p>
+  </header>
+
+  <section id="closed" class="card" hidden>
+    <h2>This link is closed</h2>
+    <p>Ask the person who sent it to you for a new one.</p>
+  </section>
+
+  <section id="uploader" hidden>
+    <form id="upload-form" class="card">
+      <label id="password-row" hidden>Link password
+        <input type="password" id="link-password" autocomplete="off">
+      </label>
+
+      <div id="drop" class="drop" tabindex="0">
+        <p><strong>Drop files here</strong> or</p>
+        <p><button type="button" id="pick">Choose files</button></p>
+        <input type="file" id="file-input" multiple hidden>
+      </div>
+
+      <ul id="file-list" class="files"></ul>
+      <p class="muted" id="totals" hidden></p>
+
+      <button type="submit" id="send" disabled>Send files</button>
+      <p class="error" id="upload-error" hidden></p>
+    </form>
+
+    <div id="progress-card" class="card" hidden>
+      <h2 id="phase">Preparing&hellip;</h2>
+      <div class="meter"><div id="meter-fill"></div></div>
+      <p class="muted" id="progress-note"></p>
+    </div>
+
+    <div id="done-card" class="card ok" hidden>
+      <h2>Files delivered &#10003;</h2>
+      <p>Every byte was cryptographically verified on arrival.</p>
+      <ul id="done-list" class="files"></ul>
+    </div>
+  </section>
+</main>
+<script type="module" src="/assets/upload.js"></script>
+</body>
+</html>

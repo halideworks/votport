@@ -1,0 +1,185 @@
+# votport
+
+A small, self-hosted **file receive portal** built on
+[VOT (Verified Object Transfer)](https://github.com/halideworks/VOT).
+
+You sign in to a one-page admin UI, create a unique request link (with an
+optional password), and send it to someone. They open it in a browser, drop
+files on the page, and the files land — cryptographically verified, atomically
+published, never overwriting anything — in a folder you chose on your server.
+
+```
+you (admin)                    them (any modern browser)
+    │                                   │
+    │  create request link              │
+    │  https://drop.example/r/9f2c…     │
+    ├──────────── send link ───────────▶│
+    │                                   │  vot-wasm hashes the files locally,
+    │                                   │  builds a VOT package (manifest+seal),
+    │                                   │  streams proven 2 MiB ranges
+    │                                   ▼
+    │                       votport server (this repo)
+    │                       verifies every range against the announced
+    │                       package root before a byte is accepted;
+    │                       publishes atomically via vot-sdk-file
+    ▼
+/your/folder/…      ← files appear here, listed in the admin UI
+```
+
+## Why VOT instead of a plain upload form?
+
+* **End-to-end integrity.** The browser computes each file's VOT object
+  identity (BLAKE3 merkle root) and a package manifest before anything is
+  sent. The server accepts a byte range only with a valid proof against the
+  announced root — a flipped bit in transit, a truncated body, or a buggy
+  proxy is refused, not stored.
+* **Authenticated names.** File names arrive inside the sealed manifest, so
+  the listing you see is the listing that was hashed.
+* **Atomic, no-overwrite publication.** Files are staged and published by
+  `vot-sdk-file`: a file either appears complete and verified, or not at
+  all. Existing files are never overwritten — repeats get `name-1.ext`.
+* **Interrupted uploads leave nothing behind.** Abandoned sessions are swept
+  and their staging files removed.
+
+## Quick start (Docker + Caddy)
+
+Requirements: Docker with the compose plugin, and Caddy on the host.
+
+```sh
+git clone https://github.com/halideworks/votport
+cd votport
+# edit docker-compose.yml:
+#   - set VOTPORT_ADMIN_PASSWORD
+#   - set VOTPORT_PUBLIC_URL to the https URL Caddy will serve
+#   - point the /received volume at the folder that should receive files
+docker compose up -d --build
+```
+
+The first build takes a while: it compiles the VOT SDK to WebAssembly for the
+browser and builds the server. Then add the site to your Caddyfile (see
+[`Caddyfile.example`](Caddyfile.example)):
+
+```caddy
+drop.example.com {
+	reverse_proxy 127.0.0.1:8321
+}
+```
+
+Reload Caddy, open `https://drop.example.com`, sign in with your admin
+password, create a link, and send it to someone.
+
+Received files appear under the host folder you mounted at `/received`
+(per-link subfolders are configurable when you create a link).
+
+## Configuration
+
+Everything is environment variables (see `docker-compose.yml`):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `VOTPORT_ADMIN_PASSWORD` | — | Admin password (hashed with argon2id at startup). Required unless the hash is set. |
+| `VOTPORT_ADMIN_PASSWORD_HASH` | — | Argon2 PHC string; takes precedence over the plain password. |
+| `VOTPORT_PUBLIC_URL` | — | Public https URL; used for generated links and to mark cookies `Secure`. |
+| `VOTPORT_BIND` | `0.0.0.0:8080` | Listen address inside the container. |
+| `VOTPORT_DATA_DIR` | `/data` | State: `state.json` (links, upload records) and the cookie secret. |
+| `VOTPORT_RECEIVE_DIR` | `/received` | Root folder received files are published into. |
+| `VOTPORT_MAX_UPLOAD_BYTES` | 50 GiB | Hard cap per upload session (per-link caps can be lower). |
+| `VOTPORT_ALLOW_HIDDEN` | off | Set `1` to accept dot-file names from uploaders. |
+| `VOTPORT_SESSION_IDLE_SECS` | `1800` | Idle time before an unfinished upload session is discarded. |
+| `VOTPORT_WEB_ROOT` | `./web` | Static assets directory (`/app/web` in Docker). |
+
+## Security model
+
+* Request links are unguessable 128-bit URLs; add a per-link password for a
+  second factor (argon2id-hashed, verified before any upload state exists).
+* The admin session is a signed, expiring cookie (`HttpOnly`, `SameSite=Lax`,
+  `Secure` behind https); mutating admin calls also require a custom header,
+  which closes cross-site request forgery.
+* Login attempts are throttled after repeated failures.
+* Uploaded names pass VOT's portable-path profile (no traversal, no control
+  characters, no Windows-reserved names) **and** a server-side re-check; files
+  cannot land outside the receive folder.
+* Per-link expiry, per-link size caps, a global session cap, and bounded
+  request bodies keep resource use predictable.
+* votport itself speaks plain HTTP and expects to sit behind Caddy (or any
+  TLS-terminating proxy) — don't expose the container port publicly.
+
+Threat-model honesty: TLS (Caddy) protects confidentiality in transit. VOT
+adds integrity — what lands on disk is exactly what the sender's browser
+hashed, verified range by range, independent of every proxy in between.
+
+## Admin flow
+
+1. Open the site, sign in.
+2. "New request link": label it, optionally pick a destination subfolder, a
+   password, an expiry, a size cap.
+3. Copy the link, send it (share any password separately).
+4. When files arrive, each link shows its uploads: stored paths, sizes, and
+   the verified package/object roots.
+5. Deactivate or delete links when done (files stay on disk).
+
+## Development
+
+```sh
+# server (needs Rust ≥ 1.97)
+cd server
+cargo test          # unit + full-protocol integration tests
+cargo run           # needs VOTPORT_ADMIN_PASSWORD, VOTPORT_DATA_DIR, etc.
+
+# browser wasm bundle (needs wasm32 target + wasm-bindgen-cli 0.2.126)
+scripts/build-wasm.sh /path/to/VOT-checkout
+```
+
+The server pins `vot-sdk` / `vot-sdk-file` to an exact VOT commit in
+`server/Cargo.toml`; the Dockerfile builds `vot-wasm` from the same commit so
+browser and server always agree on the wire artifacts.
+
+### Layout
+
+```
+server/   axum server: admin API, upload protocol, VOT verify + publish
+web/      static frontend: admin UI and the uploader (vot-wasm in browser)
+scripts/  wasm build helper
+```
+
+### Upload protocol (what the browser does)
+
+```
+POST /api/r/{link}/session     announce package root (+ link password)
+POST /api/session/{s}/seal     manifest seal bytes
+POST /api/session/{s}/page     manifest pages, in order
+POST /api/session/{s}/begin    server verifies manifest, stages files
+POST /api/session/{s}/chunk    proof ‖ data for one 2 MiB range   (repeat)
+POST /api/session/{s}/finish   all files verified → recorded
+```
+
+Each file is published the moment its coverage is complete, so a session that
+dies halfway still delivers the files that finished.
+
+## Roadmap ideas
+
+* Signed VOT receipts (CBOR) stored next to upload records
+* Resumable uploads (VOT coverage makes this natural)
+* Content dedup when two entries share an object root
+* Outbound mode: serve files to a recipient with verified download
+
+## Splitting this out into its own repository
+
+votport is self-contained (it consumes VOT only as pinned git dependencies),
+so if it currently lives as `votport/` inside the VOT repository you can
+extract it with full history:
+
+```sh
+cd VOT
+git subtree split --prefix=votport -b votport-standalone
+# create an empty repo (e.g. halideworks/votport) on GitHub, then:
+git push git@github.com:halideworks/votport.git votport-standalone:main
+```
+
+Nothing in the project references its location inside the VOT tree.
+
+## License
+
+votport is free software, licensed under the
+**GNU Affero General Public License, version 3 only** (same as VOT).
+See [LICENSE](LICENSE).
