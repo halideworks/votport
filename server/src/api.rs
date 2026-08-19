@@ -1,0 +1,565 @@
+//! HTTP API: admin management plus the public upload protocol.
+
+use std::sync::Arc;
+
+use axum::body::Bytes;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tokio::sync::oneshot;
+
+use vot_sdk::object::{ObjectId, Suite};
+
+use crate::app::App;
+use crate::auth;
+use crate::paths;
+use crate::session::{self, Cmd, SessionError};
+use crate::store::{Link, now_unix};
+
+const ADMIN_COOKIE: &str = "votport_admin";
+const MAX_SESSIONS: usize = 32;
+const MAX_SESSIONS_PER_LINK: usize = 8;
+
+pub struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    pub fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn unauthorized() -> Self {
+        Self::new(StatusCode::UNAUTHORIZED, "not signed in")
+    }
+
+    fn not_found() -> Self {
+        Self::new(StatusCode::NOT_FOUND, "not found")
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
+    }
+}
+
+impl From<SessionError> for ApiError {
+    fn from(error: SessionError) -> Self {
+        Self::new(
+            StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            error.message,
+        )
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.status, Json(json!({ "error": self.message }))).into_response()
+    }
+}
+
+type ApiResult<T> = Result<T, ApiError>;
+
+// ---------------------------------------------------------------- admin auth
+
+fn is_admin(app: &App, headers: &HeaderMap) -> bool {
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| auth::cookie_value(cookies, ADMIN_COOKIE))
+        .is_some_and(|token| auth::verify_admin_token(&app.secret, token))
+}
+
+fn require_admin(app: &App, headers: &HeaderMap) -> ApiResult<()> {
+    if is_admin(app, headers) {
+        Ok(())
+    } else {
+        Err(ApiError::unauthorized())
+    }
+}
+
+/// Mutating admin routes also require a custom header; cross-site forms
+/// cannot set one, which closes CSRF without token bookkeeping.
+fn require_admin_write(app: &App, headers: &HeaderMap) -> ApiResult<()> {
+    require_admin(app, headers)?;
+    if headers.contains_key("x-votport") {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "missing X-Votport header",
+        ))
+    }
+}
+
+fn cookie_attributes(app: &App) -> &'static str {
+    let secure = app
+        .config
+        .public_url
+        .as_deref()
+        .is_none_or(|url| url.starts_with("https://"));
+    if secure {
+        "; Secure"
+    } else {
+        ""
+    }
+}
+
+#[derive(Deserialize)]
+pub struct LoginRequest {
+    password: String,
+}
+
+pub async fn admin_login(
+    State(app): State<Arc<App>>,
+    Json(request): Json<LoginRequest>,
+) -> ApiResult<Response> {
+    if app.throttle.locked() {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed attempts; wait a minute",
+        ));
+    }
+    let ok = tokio::task::spawn_blocking({
+        let hash = app.config.admin_password_hash.clone();
+        move || auth::verify_password(&request.password, &hash)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?;
+    app.throttle.record(ok);
+    if !ok {
+        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "wrong password"));
+    }
+    let token = auth::issue_admin_token(&app.secret);
+    let cookie = format!(
+        "{ADMIN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{}",
+        cookie_attributes(&app)
+    );
+    Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
+}
+
+pub async fn admin_logout(State(app): State<Arc<App>>) -> Response {
+    let cookie = format!(
+        "{ADMIN_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}",
+        cookie_attributes(&app)
+    );
+    ([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response()
+}
+
+pub async fn admin_session(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(&app, &headers)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ------------------------------------------------------------ link management
+
+#[derive(Serialize)]
+struct LinkView {
+    id: String,
+    label: String,
+    dest: String,
+    url: String,
+    has_password: bool,
+    created_at: u64,
+    expires_at: Option<u64>,
+    max_bytes: Option<u64>,
+    active: bool,
+    usable: bool,
+    uploads: Vec<crate::store::UploadRecord>,
+}
+
+fn base_url(app: &App, headers: &HeaderMap) -> String {
+    if let Some(url) = &app.config.public_url {
+        return url.clone();
+    }
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("http");
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("localhost");
+    format!("{proto}://{host}")
+}
+
+fn link_view(link: Link, base: &str) -> LinkView {
+    LinkView {
+        url: format!("{base}/r/{}", link.id),
+        usable: link.usable_now(),
+        id: link.id,
+        label: link.label,
+        dest: link.dest,
+        has_password: link.password_hash.is_some(),
+        created_at: link.created_at,
+        expires_at: link.expires_at,
+        max_bytes: link.max_bytes,
+        active: link.active,
+        uploads: link.uploads,
+    }
+}
+
+pub async fn list_links(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(&app, &headers)?;
+    let base = base_url(&app, &headers);
+    let links: Vec<LinkView> = app
+        .store
+        .links()
+        .into_iter()
+        .map(|link| link_view(link, &base))
+        .collect();
+    Ok(Json(json!({ "links": links, "receive_dir": app.config.receive_dir })))
+}
+
+#[derive(Deserialize)]
+pub struct CreateLinkRequest {
+    label: String,
+    #[serde(default)]
+    dest: String,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    expires_days: Option<u32>,
+    #[serde(default)]
+    max_bytes: Option<u64>,
+}
+
+pub async fn create_link(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateLinkRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin_write(&app, &headers)?;
+    let label = request.label.trim().to_owned();
+    if label.is_empty() || label.len() > 200 {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "label must be 1..=200 characters",
+        ));
+    }
+    let dest = paths::admit_dest(&request.dest)
+        .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    let password_hash = match request.password.as_deref().filter(|p| !p.is_empty()) {
+        Some(password) => Some(
+            auth::hash_password(password).map_err(ApiError::internal)?,
+        ),
+        None => None,
+    };
+    let link = Link {
+        id: auth::random_token(),
+        label,
+        dest,
+        password_hash,
+        created_at: now_unix(),
+        expires_at: request
+            .expires_days
+            .map(|days| now_unix() + u64::from(days) * 86_400),
+        max_bytes: request.max_bytes.filter(|&bytes| bytes > 0),
+        active: true,
+        uploads: Vec::new(),
+    };
+    let base = base_url(&app, &headers);
+    let view = link_view(link.clone(), &base);
+    app.store.insert_link(link).map_err(ApiError::internal)?;
+    Ok(Json(json!({ "link": view })))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateLinkRequest {
+    active: bool,
+}
+
+pub async fn update_link(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateLinkRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin_write(&app, &headers)?;
+    let found = app
+        .store
+        .update_link(&id, |link| link.active = request.active)
+        .map_err(ApiError::internal)?;
+    if !found {
+        return Err(ApiError::not_found());
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn delete_link(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin_write(&app, &headers)?;
+    if !app.store.remove_link(&id).map_err(ApiError::internal)? {
+        return Err(ApiError::not_found());
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ------------------------------------------------------------- upload protocol
+
+pub async fn link_info(
+    State(app): State<Arc<App>>,
+    Path(token): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let link = app.store.link(&token).ok_or_else(ApiError::not_found)?;
+    Ok(Json(json!({
+        "label": link.label,
+        "needs_password": link.password_hash.is_some(),
+        "usable": link.usable_now(),
+        "max_bytes": effective_cap(&app, &link),
+        "chunk_bytes": session::CHUNK_BYTES,
+    })))
+}
+
+fn effective_cap(app: &App, link: &Link) -> u64 {
+    link.max_bytes
+        .map_or(app.config.max_upload_bytes, |cap| {
+            cap.min(app.config.max_upload_bytes)
+        })
+}
+
+#[derive(Deserialize)]
+pub struct PackageAnnouncement {
+    /// "blake3" or "sha256" — package roots are blake3 today, but the wire
+    /// format carries the suite so the client stays authoritative.
+    suite: String,
+    root: String,
+    length: u64,
+}
+
+#[derive(Deserialize)]
+pub struct CreateSessionRequest {
+    #[serde(default)]
+    password: Option<String>,
+    package: PackageAnnouncement,
+}
+
+fn parse_object(package: &PackageAnnouncement) -> ApiResult<ObjectId> {
+    let suite = match package.suite.as_str() {
+        "blake3" => Suite::Blake3Bao64,
+        "sha256" => Suite::Sha256Bep52,
+        other => {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("unknown suite {other:?}"),
+            ));
+        }
+    };
+    let bytes = hex::decode(&package.root).map_err(|_| {
+        ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "root must be hex")
+    })?;
+    let root: [u8; 32] = bytes.try_into().map_err(|_| {
+        ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "root must be 32 bytes")
+    })?;
+    Ok(ObjectId {
+        suite: suite.identifier(),
+        root,
+        length: package.length,
+    })
+}
+
+pub async fn create_session(
+    State(app): State<Arc<App>>,
+    Path(token): Path<String>,
+    Json(request): Json<CreateSessionRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let link = app.store.link(&token).ok_or_else(ApiError::not_found)?;
+    if !link.usable_now() {
+        return Err(ApiError::new(
+            StatusCode::GONE,
+            "this link is no longer accepting uploads",
+        ));
+    }
+    if let Some(hash) = &link.password_hash {
+        if app.throttle.locked() {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many failed attempts; wait a minute",
+            ));
+        }
+        let password = request.password.clone().unwrap_or_default();
+        let hash = hash.clone();
+        let ok = tokio::task::spawn_blocking(move || auth::verify_password(&password, &hash))
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        app.throttle.record(ok);
+        if !ok {
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "wrong link password",
+            ));
+        }
+    }
+    if app.sessions.active_for_link(&link.id) >= MAX_SESSIONS_PER_LINK
+        || app.sessions.total() >= MAX_SESSIONS
+    {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many uploads in progress; try again shortly",
+        ));
+    }
+    let expected = parse_object(&request.package)?;
+    let cap = effective_cap(&app, &link);
+    if expected.length > cap {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("upload exceeds the {cap} byte limit for this link"),
+        ));
+    }
+    let dest_components: Vec<String> = link
+        .dest
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let setup = session::WorkerSetup {
+        store: Arc::clone(&app.store),
+        link_id: link.id.clone(),
+        dest_dir: paths::join_under(&app.config.receive_dir, &dest_components),
+        dest_rel: link.dest.clone(),
+        expected_package: expected,
+        max_total_bytes: cap,
+        allow_hidden: app.config.allow_hidden,
+    };
+    let sender = session::spawn_worker(setup);
+    let session_id = auth::random_token();
+    app.sessions.insert(session_id.clone(), link.id, sender);
+    Ok(Json(json!({
+        "session": session_id,
+        "chunk_bytes": session::CHUNK_BYTES,
+    })))
+}
+
+async fn dispatch<T>(
+    app: &App,
+    session_id: &str,
+    build: impl FnOnce(oneshot::Sender<Result<T, SessionError>>) -> Cmd,
+) -> ApiResult<T> {
+    let sender = app
+        .sessions
+        .touch(session_id)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "unknown or expired session"))?;
+    let (reply, receive) = oneshot::channel();
+    sender
+        .send(build(reply))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::GONE, "upload session ended"))?;
+    receive
+        .await
+        .map_err(|_| ApiError::new(StatusCode::GONE, "upload session ended"))?
+        .map_err(ApiError::from)
+}
+
+pub async fn upload_seal(
+    State(app): State<Arc<App>>,
+    Path(sid): Path<String>,
+    body: Bytes,
+) -> ApiResult<Json<serde_json::Value>> {
+    if body.len() > session::MAX_SEAL_BYTES {
+        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "seal too large"));
+    }
+    let pages = dispatch(&app, &sid, |reply| Cmd::Seal {
+        bytes: body.to_vec(),
+        reply,
+    })
+    .await?;
+    Ok(Json(json!({ "pages": pages })))
+}
+
+pub async fn upload_page(
+    State(app): State<Arc<App>>,
+    Path(sid): Path<String>,
+    body: Bytes,
+) -> ApiResult<Json<serde_json::Value>> {
+    if body.len() > session::MAX_PAGE_BYTES {
+        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "page too large"));
+    }
+    let remaining = dispatch(&app, &sid, |reply| Cmd::Page {
+        bytes: body.to_vec(),
+        reply,
+    })
+    .await?;
+    Ok(Json(json!({ "remaining_pages": remaining })))
+}
+
+pub async fn upload_begin(
+    State(app): State<Arc<App>>,
+    Path(sid): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let entries = dispatch(&app, &sid, |reply| Cmd::Begin { reply }).await?;
+    Ok(Json(json!({ "entries": entries })))
+}
+
+#[derive(Deserialize)]
+pub struct ChunkQuery {
+    entry: usize,
+    offset: u64,
+}
+
+pub async fn upload_chunk(
+    State(app): State<Arc<App>>,
+    Path(sid): Path<String>,
+    Query(query): Query<ChunkQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<session::ChunkProgress>> {
+    let proof_len: usize = headers
+        .get("x-votport-proof")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "X-Votport-Proof header must carry the proof length",
+            )
+        })?;
+    if proof_len > body.len() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "proof length exceeds the body",
+        ));
+    }
+    let proof = body[..proof_len].to_vec();
+    let data = body[proof_len..].to_vec();
+    let progress = dispatch(&app, &sid, |reply| Cmd::Chunk {
+        entry: query.entry,
+        offset: query.offset,
+        proof,
+        data,
+        reply,
+    })
+    .await?;
+    Ok(Json(progress))
+}
+
+pub async fn upload_finish(
+    State(app): State<Arc<App>>,
+    Path(sid): Path<String>,
+) -> ApiResult<Json<session::FinishReport>> {
+    let report = dispatch(&app, &sid, |reply| Cmd::Finish { reply }).await?;
+    app.sessions.remove(&sid);
+    Ok(Json(report))
+}
+
+pub async fn upload_abort(
+    State(app): State<Arc<App>>,
+    Path(sid): Path<String>,
+) -> Json<serde_json::Value> {
+    app.sessions.remove(&sid);
+    Json(json!({ "ok": true }))
+}

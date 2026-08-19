@@ -1,0 +1,33 @@
+[package]
+name = "votport"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+rust-version = "1.97"
+description = "Password-protected file receive portal built on VOT (Verified Object Transfer)"
+publish = false
+
+# Standalone build: never join a surrounding cargo workspace.
+[workspace]
+
+[dependencies]
+vot-sdk = { git = "https://github.com/halideworks/VOT", rev = "976065296e2d2d2ec2a31c480dcaeddb93dc8aa3" }
+vot-sdk-file = { git = "https://github.com/halideworks/VOT", rev = "976065296e2d2d2ec2a31c480dcaeddb93dc8aa3" }
+
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
+tower-http = { version = "0.6", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+argon2 = "0.5"
+rand = "0.8"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies"] }
+tempfile = "3"
+
+[profile.release]
+lto = "thin"

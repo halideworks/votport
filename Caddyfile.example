@@ -1,0 +1,16 @@
+# Example Caddy site for votport.
+#
+# Add this to your existing Caddyfile (adjust the hostname and port to match
+# docker-compose.yml). Caddy terminates TLS; votport speaks plain HTTP on
+# localhost.
+
+drop.example.com {
+	reverse_proxy 127.0.0.1:8321
+
+	# votport uploads travel as chunks of at most ~9 MiB per request, so no
+	# special body-size configuration is needed. If you use a global
+	# `request_body max_size` smaller than 10MB, override it here:
+	# request_body {
+	# 	max_size 10MB
+	# }
+}

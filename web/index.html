@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>votport admin</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<main class="wrap">
+  <header class="masthead">
+    <h1>votport</h1>
+    <p class="sub">verified file receive &middot; <a href="https://github.com/halideworks/VOT">VOT</a></p>
+  </header>
+
+  <section id="login" hidden>
+    <form id="login-form" class="card">
+      <h2>Sign in</h2>
+      <label>Admin password
+        <input type="password" id="login-password" autocomplete="current-password" required>
+      </label>
+      <button type="submit">Sign in</button>
+      <p class="error" id="login-error" hidden></p>
+    </form>
+  </section>
+
+  <section id="dashboard" hidden>
+    <div class="bar">
+      <span id="receive-dir" class="mono muted"></span>
+      <button id="logout" class="ghost">Sign out</button>
+    </div>
+
+    <form id="create-form" class="card">
+      <h2>New request link</h2>
+      <div class="grid">
+        <label>Label
+          <input id="create-label" placeholder="Files from Alex" required maxlength="200">
+        </label>
+        <label>Destination subfolder <span class="muted">(optional)</span>
+          <input id="create-dest" placeholder="clients/alex">
+        </label>
+        <label>Password <span class="muted">(optional)</span>
+          <input id="create-password" type="text" autocomplete="off" placeholder="leave empty for none">
+        </label>
+        <label>Expires after <span class="muted">(days, optional)</span>
+          <input id="create-expires" type="number" min="1" max="3650" placeholder="never">
+        </label>
+        <label>Size limit <span class="muted">(GiB, optional)</span>
+          <input id="create-max" type="number" min="1" max="10000" placeholder="server default">
+        </label>
+      </div>
+      <button type="submit">Create link</button>
+      <p class="error" id="create-error" hidden></p>
+    </form>
+
+    <div id="new-link" class="card ok" hidden>
+      <h2>Link ready</h2>
+      <p>Send this to the person who has files for you:</p>
+      <p class="mono" id="new-link-url"></p>
+      <button id="new-link-copy">Copy link</button>
+      <span id="new-link-note" class="muted"></span>
+    </div>
+
+    <h2>Request links</h2>
+    <div id="links"></div>
+  </section>
+</main>
+<script type="module" src="/assets/admin.js"></script>
+</body>
+</html>
