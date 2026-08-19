@@ -12,11 +12,11 @@ use vot_sdk::object::{InMemoryObjectBuilder, InMemoryPreparedObject, Suite};
 use vot_sdk::package::{PackageBuilder, PackageEntry};
 
 use votport::config::Config;
-use votport::{app, auth};
+use votport::{app, auth, session};
 
 const ADMIN_PASSWORD: &str = "test-admin-password";
 const LINK_PASSWORD: &str = "hunter2";
-const CHUNK: u64 = 2 * 1024 * 1024;
+const CHUNK: u64 = session::CHUNK_BYTES;
 
 struct TestServer {
     base: String,
