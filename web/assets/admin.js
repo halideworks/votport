@@ -39,13 +39,13 @@ function show(section) {
 
 async function refreshLinks() {
   const { links, receive_dir } = await api('/api/admin/links');
-  $('receive-dir').textContent = `receiving into ${receive_dir}`;
+  $('receive-dir').textContent = `Receive root ${receive_dir}`;
   const container = $('links');
   container.replaceChildren();
   if (!links.length) {
     const empty = document.createElement('p');
     empty.className = 'muted';
-    empty.textContent = 'No request links yet. Create one above.';
+    empty.textContent = 'No requests issued.';
     container.append(empty);
     return;
   }
@@ -93,7 +93,7 @@ function renderLink(link) {
   const actions = document.createElement('div');
   actions.className = 'actions';
   actions.append(
-    button('Copy link', 'tiny', () => navigator.clipboard.writeText(link.url)),
+    button('Copy', 'tiny', () => navigator.clipboard.writeText(link.url)),
     button(link.active ? 'Deactivate' : 'Reactivate', 'tiny ghost', async () => {
       await api(`/api/admin/links/${link.id}`, {
         method: 'POST',
@@ -102,7 +102,7 @@ function renderLink(link) {
       await refreshLinks();
     }),
     button('Delete', 'tiny danger', async () => {
-      if (!confirm(`Delete link "${link.label}"? Received files stay on disk.`)) return;
+      if (!confirm(`Delete request "${link.label}"? Received files stay on disk.`)) return;
       await api(`/api/admin/links/${link.id}`, { method: 'DELETE' });
       await refreshLinks();
     }),
@@ -113,7 +113,7 @@ function renderLink(link) {
     const details = document.createElement('details');
     const summary = document.createElement('summary');
     const total = link.uploads.reduce((sum, upload) => sum + upload.total_bytes, 0);
-    summary.textContent = `${link.uploads.length} upload(s) · ${formatBytes(total)}`;
+    summary.textContent = `${link.uploads.length} transfer${link.uploads.length === 1 ? '' : 's'} · ${formatBytes(total)}`;
     details.append(summary);
     const list = document.createElement('ul');
     list.className = 'uploads';
@@ -188,13 +188,33 @@ $('create-form').addEventListener('submit', async (event) => {
     $('new-link').hidden = false;
     $('new-link-url').textContent = link.url;
     $('new-link-note').textContent = link.has_password
-      ? 'Share the password separately.'
+      ? 'Send the access password by a separate channel.'
       : '';
     $('new-link-copy').onclick = () => navigator.clipboard.writeText(link.url);
     await refreshLinks();
   } catch (error) {
     $('create-error').textContent = error.message;
     $('create-error').hidden = false;
+  }
+});
+
+$('password-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  $('password-error').hidden = true;
+  $('password-note').textContent = '';
+  try {
+    await api('/api/admin/password', {
+      method: 'POST',
+      body: JSON.stringify({
+        current: $('password-current').value,
+        new: $('password-new').value,
+      }),
+    });
+    $('password-form').reset();
+    $('password-note').textContent = 'Password updated.';
+  } catch (error) {
+    $('password-error').textContent = error.message;
+    $('password-error').hidden = false;
   }
 });
 

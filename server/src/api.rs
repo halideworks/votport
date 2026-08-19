@@ -98,6 +98,15 @@ fn require_admin_write(app: &App, headers: &HeaderMap) -> ApiResult<()> {
     }
 }
 
+/// The admin password in force: a hash stored by "change password" wins over
+/// the one derived from the environment at startup, so a restart does not roll
+/// the password back to VOTPORT_ADMIN_PASSWORD.
+fn admin_hash(app: &App) -> String {
+    app.store
+        .admin_password_hash()
+        .unwrap_or_else(|| app.config.admin_password_hash.clone())
+}
+
 fn cookie_attributes(app: &App) -> &'static str {
     let secure = app
         .config
@@ -127,7 +136,7 @@ pub async fn admin_login(
         ));
     }
     let ok = tokio::task::spawn_blocking({
-        let hash = app.config.admin_password_hash.clone();
+        let hash = admin_hash(&app);
         move || auth::verify_password(&request.password, &hash)
     })
     .await
@@ -157,6 +166,63 @@ pub async fn admin_session(
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_admin(&app, &headers)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct ChangePasswordRequest {
+    current: String,
+    new: String,
+}
+
+/// Replaces the admin password. The new hash is persisted in state.json, which
+/// from then on takes precedence over the environment.
+///
+/// ponytail: existing admin cookies stay valid across the change, because they
+/// are signed with the data-dir secret rather than derived from the password.
+/// Rotating that secret here would log every session out, which is the right
+/// behaviour for a multi-admin deployment; add it if votport ever grows one.
+pub async fn admin_change_password(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(request): Json<ChangePasswordRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin_write(&app, &headers)?;
+    if app.throttle.locked() {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed attempts; wait a minute",
+        ));
+    }
+    if request.new.chars().count() < 12 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "new password must be at least 12 characters",
+        ));
+    }
+    let current_ok = tokio::task::spawn_blocking({
+        let hash = admin_hash(&app);
+        let current = request.current.clone();
+        move || auth::verify_password(&current, &hash)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?;
+    // Throttled like login: this endpoint verifies a password too, so it would
+    // otherwise be an unthrottled oracle for an attacker holding a session.
+    app.throttle.record(current_ok);
+    if !current_ok {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "current password is wrong",
+        ));
+    }
+    let hash = tokio::task::spawn_blocking(move || auth::hash_password(&request.new))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .map_err(ApiError::internal)?;
+    app.store
+        .set_admin_password_hash(hash)
+        .map_err(ApiError::internal)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -373,6 +439,62 @@ fn parse_object(package: &PackageAnnouncement) -> ApiResult<ObjectId> {
     })
 }
 
+/// Verifies a link password. Throttled: this is the only unauthenticated
+/// password check in the service, so without the shared throttle it would be
+/// an oracle. A link with no password accepts anything, including nothing.
+async fn check_link_password(
+    app: &Arc<App>,
+    link: &crate::store::Link,
+    password: Option<&str>,
+) -> ApiResult<()> {
+    let Some(hash) = &link.password_hash else {
+        return Ok(());
+    };
+    if app.throttle.locked() {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed attempts; wait a minute",
+        ));
+    }
+    let password = password.unwrap_or_default().to_owned();
+    let hash = hash.clone();
+    let ok = tokio::task::spawn_blocking(move || auth::verify_password(&password, &hash))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    app.throttle.record(ok);
+    if !ok {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "wrong link password",
+        ));
+    }
+    Ok(())
+}
+
+/// Checks a link password without creating any upload state, so the uploader
+/// can gate its drop zone behind the password instead of letting someone hash
+/// a hundred gigabytes and only then discover they typed it wrong.
+pub async fn verify_link_password(
+    State(app): State<Arc<App>>,
+    Path(token): Path<String>,
+    Json(request): Json<VerifyRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let link = app.store.link(&token).ok_or_else(ApiError::not_found)?;
+    if !link.usable_now() {
+        return Err(ApiError::new(
+            StatusCode::GONE,
+            "this link is no longer accepting uploads",
+        ));
+    }
+    check_link_password(&app, &link, request.password.as_deref()).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct VerifyRequest {
+    password: Option<String>,
+}
+
 pub async fn create_session(
     State(app): State<Arc<App>>,
     Path(token): Path<String>,
@@ -385,26 +507,7 @@ pub async fn create_session(
             "this link is no longer accepting uploads",
         ));
     }
-    if let Some(hash) = &link.password_hash {
-        if app.throttle.locked() {
-            return Err(ApiError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "too many failed attempts; wait a minute",
-            ));
-        }
-        let password = request.password.clone().unwrap_or_default();
-        let hash = hash.clone();
-        let ok = tokio::task::spawn_blocking(move || auth::verify_password(&password, &hash))
-            .await
-            .map_err(|error| ApiError::internal(error.to_string()))?;
-        app.throttle.record(ok);
-        if !ok {
-            return Err(ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                "wrong link password",
-            ));
-        }
-    }
+    check_link_password(&app, &link, request.password.as_deref()).await?;
     if app.sessions.active_for_link(&link.id) >= MAX_SESSIONS_PER_LINK
         || app.sessions.total() >= MAX_SESSIONS
     {

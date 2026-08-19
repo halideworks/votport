@@ -63,6 +63,12 @@ impl Link {
 struct Document {
     #[serde(default)]
     links: Vec<Link>,
+    /// Argon2 PHC hash set by "change password" in the admin UI. Once present
+    /// it wins over VOTPORT_ADMIN_PASSWORD, so a restart cannot silently roll
+    /// the password back to whatever the environment still holds. To recover a
+    /// lost password, delete this field from state.json and restart.
+    #[serde(default)]
+    admin_password_hash: Option<String>,
 }
 
 pub struct Store {
@@ -85,6 +91,20 @@ impl Store {
             path,
             document: Mutex::new(document),
         })
+    }
+
+    pub fn admin_password_hash(&self) -> Option<String> {
+        self.document
+            .lock()
+            .expect("store poisoned")
+            .admin_password_hash
+            .clone()
+    }
+
+    pub fn set_admin_password_hash(&self, hash: String) -> Result<(), String> {
+        let mut document = self.document.lock().expect("store poisoned");
+        document.admin_password_hash = Some(hash);
+        persist(&self.path, &document)
     }
 
     pub fn links(&self) -> Vec<Link> {

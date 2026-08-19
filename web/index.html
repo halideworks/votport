@@ -4,21 +4,22 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
-<title>votport admin</title>
-<link rel="icon" href="data:,">
+<title>Administration &middot; File Receipt Portal</title>
+<link rel="icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAxNiAxNic+PHJlY3Qgd2lkdGg9JzE2JyBoZWlnaHQ9JzE2JyBmaWxsPScjRjJDMjMwJy8+PC9zdmc+">
 <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
-<main class="wrap">
-  <header class="masthead">
-    <h1>votport</h1>
-    <p class="sub">verified file receive &middot; <a href="https://github.com/halideworks/VOT">VOT</a></p>
-  </header>
+<div class="appbar">
+  <span class="mark" aria-hidden="true"></span>
+  <span class="wordmark">File Receipt Portal</span>
+  <span class="appbar-tag">Administration</span>
+</div>
 
+<main class="wrap">
   <section id="login" hidden>
     <form id="login-form" class="card">
       <h2>Sign in</h2>
-      <label>Admin password
+      <label>Administrator password
         <input type="password" id="login-password" autocomplete="current-password" required>
       </label>
       <button type="submit">Sign in</button>
@@ -33,38 +34,52 @@
     </div>
 
     <form id="create-form" class="card">
-      <h2>New request link</h2>
+      <h2>New transfer request</h2>
       <div class="grid">
-        <label>Label
+        <label>Reference
           <input id="create-label" placeholder="Files from Alex" required maxlength="200">
         </label>
-        <label>Destination subfolder <span class="muted">(optional)</span>
+        <label>Destination folder <span class="muted">optional</span>
           <input id="create-dest" placeholder="clients/alex">
         </label>
-        <label>Password <span class="muted">(optional)</span>
-          <input id="create-password" type="text" autocomplete="off" placeholder="leave empty for none">
+        <label>Access password <span class="muted">optional</span>
+          <input id="create-password" type="text" autocomplete="off" placeholder="none">
         </label>
-        <label>Expires after <span class="muted">(days, optional)</span>
+        <label>Expires after <span class="muted">days, optional</span>
           <input id="create-expires" type="number" min="1" max="3650" placeholder="never">
         </label>
-        <label>Size limit <span class="muted">(GiB, optional)</span>
+        <label>Transfer limit <span class="muted">GiB, optional</span>
           <input id="create-max" type="number" min="1" max="10000" placeholder="server default">
         </label>
       </div>
-      <button type="submit">Create link</button>
+      <button type="submit">Issue request</button>
       <p class="error" id="create-error" hidden></p>
     </form>
 
     <div id="new-link" class="card ok" hidden>
-      <h2>Link ready</h2>
-      <p>Send this to the person who has files for you:</p>
+      <h2>Request issued</h2>
       <p class="mono" id="new-link-url"></p>
-      <button id="new-link-copy">Copy link</button>
+      <button id="new-link-copy">Copy address</button>
       <span id="new-link-note" class="muted"></span>
     </div>
 
-    <h2>Request links</h2>
+    <h2>Issued requests</h2>
     <div id="links"></div>
+
+    <form id="password-form" class="card">
+      <h2>Change administrator password</h2>
+      <div class="grid">
+        <label>Current password
+          <input type="password" id="password-current" autocomplete="current-password" required>
+        </label>
+        <label>New password <span class="muted">12 characters minimum</span>
+          <input type="password" id="password-new" autocomplete="new-password" required minlength="12">
+        </label>
+      </div>
+      <button type="submit">Update password</button>
+      <span id="password-note" class="muted"></span>
+      <p class="error" id="password-error" hidden></p>
+    </form>
   </section>
 </main>
 <script type="module" src="/assets/admin.js"></script>
