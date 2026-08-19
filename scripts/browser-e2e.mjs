@@ -24,7 +24,8 @@ if (!adminPassword || !receiveDir) {
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'votport-e2e-'));
 fs.writeFileSync(path.join(dir, 'Résumé Draft.pdf'), 'unicode names travel\n');
-const big = Buffer.alloc(4 * 1024 * 1024 + 99);
+// Five server-sized ranges exercise the bounded parallel upload path.
+const big = Buffer.alloc(40 * 1024 * 1024 + 99);
 for (let i = 0; i < big.length; i += 1) big[i] = (i * 7) % 253;
 fs.writeFileSync(path.join(dir, 'archive.tar'), big);
 

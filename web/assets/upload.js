@@ -13,11 +13,12 @@ const $ = (id) => document.getElementById(id);
 const token = window.location.pathname.split('/').filter(Boolean).pop();
 
 const HASH_READ_BYTES = 8 * 1024 * 1024;
+const UPLOADS_IN_FLIGHT = 4;
 let chunkBytes = 2 * 1024 * 1024;
 let picked = new Map(); // relative path -> File
 let uploading = false;
 let cancelled = false;
-let controller = null; // aborts the request in flight when the sender cancels
+let controller = null; // aborts in-flight requests when the sender cancels
 
 // Hash this many files ahead of the one being uploaded. Hashing stays strictly
 // sequential (one thread), so depth only buys anything when uploads outpace
@@ -341,9 +342,7 @@ function buildPackage(items) {
 async function uploadEntryChunks(sessionId, entryIndex, item, from, onProgress) {
   const { file, prepared } = item;
   const size = BigInt(file.size);
-  // Proof and disk read for one chunk. Kicked off for the *next* chunk while
-  // the current one is still in flight, so the disk and the network overlap.
-  // The POSTs themselves stay strictly sequential.
+  // Each worker prepares one proven range and keeps at most one POST in flight.
   const prepare = (offset) => {
     if (offset >= size) return null;
     const want = size - offset < BigInt(chunkBytes) ? size - offset : BigInt(chunkBytes);
@@ -351,6 +350,7 @@ async function uploadEntryChunks(sessionId, entryIndex, item, from, onProgress) 
     const start = Number(proof.coveredOffset);
     const length = Number(proof.coveredLength);
     return {
+      offset,
       next: proof.coveredOffset + proof.coveredLength,
       start,
       length,
@@ -358,33 +358,52 @@ async function uploadEntryChunks(sessionId, entryIndex, item, from, onProgress) 
       data: file.slice(start, start + length).arrayBuffer(),
     };
   };
-  // `from` is the server's covered byte count. Ranges go out strictly in
-  // order, so coverage is always a prefix and prove() lands on the same
-  // boundaries it did the first time round.
-  let chunk = prepare(from);
-  while (chunk) {
-    checkCancelled();
-    const data = new Uint8Array(await chunk.data);
-    if (data.length !== chunk.length) {
-      throw new Error(`"${item.path}" changed while uploading; pick it again`);
+  let next = from;
+  let prefix = from;
+  let failure = null;
+  const completed = new Map();
+  const take = () => {
+    const chunk = prepare(next);
+    if (chunk) next = chunk.next;
+    return chunk;
+  };
+  const send = async () => {
+    while (!failure) {
+      const chunk = take();
+      if (!chunk) return;
+      try {
+        checkCancelled();
+        const data = new Uint8Array(await chunk.data);
+        if (data.length !== chunk.length) {
+          throw new Error(`"${item.path}" changed while uploading; pick it again`);
+        }
+        const body = new Uint8Array(chunk.proofBytes.length + data.length);
+        body.set(chunk.proofBytes, 0);
+        body.set(data, chunk.proofBytes.length);
+        await postWithRetry(
+          `/api/session/${sessionId}/chunk?entry=${entryIndex}&offset=${chunk.start}`,
+          {
+            headers: {
+              'Content-Type': 'application/octet-stream',
+              'X-Votport-Proof': String(chunk.proofBytes.length),
+            },
+            body,
+          },
+        );
+        completed.set(chunk.offset, chunk.next);
+        while (completed.has(prefix)) {
+          const covered = completed.get(prefix);
+          completed.delete(prefix);
+          prefix = covered;
+        }
+        onProgress(chunk.length, prefix);
+      } catch (error) {
+        failure ||= error;
+      }
     }
-    const body = new Uint8Array(chunk.proofBytes.length + data.length);
-    body.set(chunk.proofBytes, 0);
-    body.set(data, chunk.proofBytes.length);
-    const upcoming = prepare(chunk.next);
-    await postWithRetry(
-      `/api/session/${sessionId}/chunk?entry=${entryIndex}&offset=${chunk.start}`,
-      {
-        headers: {
-          'Content-Type': 'application/octet-stream',
-          'X-Votport-Proof': String(chunk.proofBytes.length),
-        },
-        body,
-      },
-    );
-    onProgress(chunk.length);
-    chunk = upcoming;
-  }
+  };
+  await Promise.all(Array.from({ length: UPLOADS_IN_FLIGHT }, send));
+  if (failure) throw failure;
 }
 
 async function runUpload() {
@@ -437,9 +456,10 @@ async function runUpload() {
     // part of the match, so a file edited since the interruption starts over
     // rather than failing deep inside range verification.
     const saved = loadResume();
-    let sessionId = saved && saved.root === rootHex && saved.path === item.path
-      ? saved.session
+    let resume = saved && saved.root === rootHex && saved.path === item.path
+      ? saved
       : null;
+    let sessionId = resume?.session || null;
     let entries = null;
     if (sessionId) {
       try {
@@ -461,7 +481,14 @@ async function runUpload() {
       });
       sessionId = session.session;
       chunkBytes = session.chunk_bytes || chunkBytes;
-      saveResume({ session: sessionId, path: item.path, size: item.file.size, root: rootHex });
+      resume = {
+        session: sessionId,
+        path: item.path,
+        size: item.file.size,
+        root: rootHex,
+        covered: 0,
+      };
+      saveResume(resume);
       await postWithRetry(`/api/session/${sessionId}/seal`, {
         headers: { 'Content-Type': 'application/octet-stream' },
         body: seal,
@@ -477,16 +504,21 @@ async function runUpload() {
 
     try {
       for (const entry of entries) {
-        const already = entry.covered_bytes || 0;
+        const savedPrefix = Number.isSafeInteger(resume?.covered) ? resume.covered : null;
+        const already = entry.complete
+          ? item.file.size
+          : Math.min(savedPrefix ?? entry.covered_bytes ?? 0, item.file.size);
         sent += already;
         if (entry.complete) {
           setMeter(totalBytes ? sent / totalBytes : 1);
           continue;
         }
         let fileSent = already;
-        await uploadEntryChunks(sessionId, entry.index, item, BigInt(already), (step) => {
+        await uploadEntryChunks(sessionId, entry.index, item, BigInt(already), (step, prefix) => {
           sent += step;
           fileSent += step;
+          resume.covered = Number(prefix);
+          saveResume(resume);
           setMeter(totalBytes ? sent / totalBytes : 1);
           setNote(sent, totalBytes, sendRate(step));
           setStatus(item.path, `${formatBytes(fileSent)} / ${formatBytes(item.file.size)}`);
