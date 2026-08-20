@@ -14,7 +14,7 @@ RUN cargo install wasm-bindgen-cli --version 0.2.126 --locked
 
 # Browser-side VOT: hashing, proofs, and package building in WebAssembly.
 ARG VOT_GIT=https://github.com/halideworks/VOT
-ARG VOT_REV=67cffa46c6c8049ced88c28eb2390d468f6385bd
+ARG VOT_REV=7e51df9bb5773612711c72fb3d5fe82c6ddcd468
 RUN git clone --filter=blob:none "$VOT_GIT" /vot \
     && git -C /vot checkout "$VOT_REV"
 RUN cd /vot \

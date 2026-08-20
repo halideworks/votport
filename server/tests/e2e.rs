@@ -576,8 +576,8 @@ async fn interrupted_transfer_resumes_from_reported_coverage() {
         .unwrap()
         .to_owned();
 
-    // 12 MiB is six 2 MiB chunks, so "half sent" is unambiguous.
-    let bytes: Vec<u8> = (0..12u32 * 1024 * 1024)
+    // Six advertised chunks make "half sent" unambiguous at any chunk size.
+    let bytes: Vec<u8> = (0..u32::try_from(6 * CHUNK).unwrap())
         .map(|index| (index.wrapping_mul(2_654_435_761) >> 13) as u8)
         .collect();
     let length = bytes.len() as u64;
