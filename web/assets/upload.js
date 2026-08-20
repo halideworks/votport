@@ -173,6 +173,27 @@ function formatRate(bytesPerSecond) {
   return `${value >= 100 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
 }
 
+// Screen wake lock while sending: an unattended laptop otherwise hits its
+// sleep timer mid-transfer and the upload dies. Best effort; browsers without
+// the API (or a denied request) just keep today's behavior. A closed lid
+// still sleeps the machine; no web API can prevent that.
+let wakeLock = null;
+
+async function keepAwake() {
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch { /* unsupported or denied */ }
+}
+
+async function releaseWakeLock() {
+  try { await wakeLock?.release(); } catch { /* already released */ }
+  wakeLock = null;
+}
+
+// The browser auto-releases the lock whenever the tab is hidden; take it back
+// as soon as the sender returns while an upload is still running.
+document.addEventListener('visibilitychange', () => {
+  if (uploading && document.visibilityState === 'visible') keepAwake();
+});
+
 function fail(message) {
   $('upload-error').textContent = message;
   $('upload-error').hidden = false;
@@ -336,7 +357,9 @@ async function apiJson(path, options = {}) {
   let body = null;
   try { body = await response.json(); } catch { /* not JSON */ }
   if (!response.ok) {
-    throw new Error(body?.error || `request failed (${response.status})`);
+    const error = new Error(body?.error || `request failed (${response.status})`);
+    error.status = response.status;
+    throw error;
   }
   return body;
 }
@@ -648,7 +671,7 @@ async function runUpload() {
       await sendOne(item, index + 1);
     } catch (error) {
       if (delivered.length) {
-        error.message += ` — ${delivered.length} file(s) already delivered and kept`;
+        error.message += ` (${delivered.length} file(s) already delivered and kept)`;
       }
       throw error;
     }
@@ -775,14 +798,22 @@ $('upload-form').addEventListener('submit', async (event) => {
   cancelled = false;
   controller = new AbortController();
   startWorkers();
+  keepAwake();
   $('send').disabled = true;
   $('upload-error').hidden = true;
   try {
     await runUpload();
   } catch (error) {
+    // The server no longer holds the session, so the saved resume record is
+    // useless; clearing it also hides the stale "held on the server" note and
+    // keeps the advice below honest.
+    const expired = /unknown or expired session/.test(error.message);
+    if (expired) clearResume();
     fail(error.cancelled
       ? error.message
-      : `${error.message} — reselect the same files to resume where this stopped.`);
+      : expired
+        ? `${error.message}. The partial transfer was discarded, reselect the same files to send them again from the start.`
+        : `${error.message}. Reselect the same files to resume where this stopped.`);
     $('progress-card').hidden = true;
     $('send').disabled = false;
     showResumeNote();
@@ -790,6 +821,7 @@ $('upload-form').addEventListener('submit', async (event) => {
     uploading = false;
     controller = null;
     stopWorkers();
+    releaseWakeLock();
   }
 });
 
@@ -808,18 +840,39 @@ function showResumeNote() {
 }
 
 (async () => {
+  // Only a definitive server answer (404/410, or usable:false below) means the
+  // link is closed. Anything else — Caddy 502 while the container restarts, a
+  // network blip — used to show the "Request closed" card and made senders
+  // think their link died; retry those instead.
   let info;
-  try {
-    info = await apiJson(`/api/r/${token}`);
-  } catch {
-    $('closed').hidden = false;
-    return;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      info = await apiJson(`/api/r/${token}`);
+      break;
+    } catch (error) {
+      if (error.status === 404 || error.status === 410) {
+        if (error.status === 404) {
+          $('closed').querySelector('p').textContent =
+            'This link was not found. Check that the full URL was copied.';
+        }
+        $('closed').hidden = false;
+        return;
+      }
+      if (attempt >= 4) {
+        $('subtitle').textContent =
+          'Could not reach the server. Reload the page to try again.';
+        return;
+      }
+      $('subtitle').textContent = 'Connecting…';
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
   }
   if (!info.usable) {
     $('closed').hidden = false;
     return;
   }
   $('title').textContent = info.label;
+  $('subtitle').textContent = 'Files are verified on receipt.';
   chunkBytes = info.chunk_bytes || chunkBytes;
   try {
     await init();

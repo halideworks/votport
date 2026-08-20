@@ -98,6 +98,20 @@
   <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
 </div>
 
+<!-- Shared confirm/alert dialog; admin.js fills the text and buttons.
+     Native <dialog>: focus trap, Esc to dismiss and a backdrop come with it.
+     Cancel is first so Enter is the safe answer. -->
+<dialog id="confirm" class="modal">
+  <form method="dialog">
+    <h2 id="confirm-title">Confirm</h2>
+    <p id="confirm-detail"></p>
+    <div class="modal-actions">
+      <button value="cancel" class="ghost" id="confirm-cancel">Cancel</button>
+      <button value="ok" class="danger" id="confirm-ok">Delete</button>
+    </div>
+  </form>
+</dialog>
+
 <script type="module" src="/assets/admin.js"></script>
 </body>
 </html>

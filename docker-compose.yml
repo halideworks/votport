@@ -3,23 +3,31 @@ services:
     build: .
     container_name: votport
     restart: unless-stopped
-    # Only Caddy talks to votport; keep it off the public interface.
+    # Received files land in /mediastorage-pool as davidtorcivia:davidtorcivia,
+    # matching the other *-in drop folders, instead of root.
+    user: "1000:1000"
+    # Caddy reaches votport over media-server_default by container name; this
+    # published port is host-local only, for debugging.
     ports:
-      - "127.0.0.1:8321:8080"
+      - "127.0.0.1:8103:8080"
+    networks:
+      - media-server_default
     environment:
-      # REQUIRED: the admin password (or set VOTPORT_ADMIN_PASSWORD_HASH
-      # to an argon2 PHC string instead and drop this line).
-      VOTPORT_ADMIN_PASSWORD: "change-me-before-first-start"
-      # The URL Caddy serves votport at; used for generated links and
-      # to mark cookies Secure.
-      VOTPORT_PUBLIC_URL: "https://drop.example.com"
-      # Optional hard cap per upload session (bytes). Default 50 GiB.
-      # VOTPORT_MAX_UPLOAD_BYTES: "53687091200"
-      # Optional: allow dot-files in received names (off by default).
-      # VOTPORT_ALLOW_HIDDEN: "1"
+      VOTPORT_ADMIN_PASSWORD: "${VOTPORT_ADMIN_PASSWORD:?set VOTPORT_ADMIN_PASSWORD in .env}"
+      VOTPORT_PUBLIC_URL: "https://receive.davidtorcivia.com"
+      # 500 GiB per upload session.
+      VOTPORT_MAX_UPLOAD_BYTES: "536870912000"
+      VOTPORT_ALLOW_HIDDEN: "1"
+      # 48 hours. This is the resume window: an interrupted transfer keeps its
+      # partially written staging file, and the sender can come back and pick
+      # up where they stopped, until the session has been idle this long.
+      # 4h proved too short: a sender who stalls overnight loses the partial.
+      VOTPORT_SESSION_IDLE_SECS: "172800"
     volumes:
       # votport state (links, secrets) — keep this private.
       - ./data:/data
-      # Where received files land on YOUR machine. Point this wherever
-      # you want the files to appear.
-      - /srv/votport/received:/received
+      - /mediastorage-pool/vot-in:/received
+
+networks:
+  media-server_default:
+    external: true
