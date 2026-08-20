@@ -2,23 +2,29 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex">
-<title>Administration &middot; File Receipt Portal</title>
-<link rel="icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAxNiAxNic+PHJlY3Qgd2lkdGg9JzE2JyBoZWlnaHQ9JzE2JyBmaWxsPScjRjJDMjMwJy8+PC9zdmc+">
+<title>VOTPort &middot; Administration</title>
+<link rel="icon" type="image/png" href="/assets/favicon.png">
 <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
-<div class="appbar">
-  <span class="mark" aria-hidden="true"></span>
-  <span class="wordmark">File Receipt Portal</span>
-  <span class="appbar-tag">Administration</span>
+
+<div class="hero">
+  <div class="hero-brand">
+    <div class="brand-square"><img src="/assets/pommern_ship_white.png" alt=""></div>
+    <span class="wordmark">VOTPort</span>
+  </div>
+  <p class="hero-tag">Administration</p>
 </div>
 
-<main class="wrap">
+<div class="sheet">
   <section id="login" hidden>
-    <form id="login-form" class="card">
-      <h2>Sign in</h2>
+    <header class="masthead">
+      <h1>Sign in</h1>
+      <p class="sub">Issue and manage transfer requests.</p>
+    </header>
+    <form id="login-form">
       <label>Administrator password
         <input type="password" id="login-password" autocomplete="current-password" required>
       </label>
@@ -28,6 +34,13 @@
   </section>
 
   <section id="dashboard" hidden>
+    <header class="masthead">
+      <div class="hero-brand">
+        <div class="brand-square"><img src="/assets/pommern_ship_white.png" alt=""></div>
+        <span class="wordmark">VOTPort</span>
+      </div>
+    </header>
+
     <div class="bar">
       <span id="receive-dir" class="mono muted"></span>
       <button id="logout" class="ghost">Sign out</button>
@@ -81,7 +94,10 @@
       <p class="error" id="password-error" hidden></p>
     </form>
   </section>
-</main>
+
+  <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
+</div>
+
 <script type="module" src="/assets/admin.js"></script>
 </body>
 </html>

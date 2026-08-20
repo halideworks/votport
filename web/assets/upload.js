@@ -54,6 +54,23 @@ function clearResume() {
   try { localStorage.removeItem(RESUME_KEY); } catch { /* private mode */ }
 }
 
+// A password that verified once is kept per link, so a reload (or coming back
+// tomorrow to resume) does not ask for it again. It is the link's shared
+// password, not a personal credential, and it is scoped to this token.
+const PASS_KEY = `votport-pass-${token}`;
+
+function savePassword(password) {
+  try { localStorage.setItem(PASS_KEY, password); } catch { /* private mode */ }
+}
+
+function loadPassword() {
+  try { return localStorage.getItem(PASS_KEY); } catch { return null; }
+}
+
+function clearPassword() {
+  try { localStorage.removeItem(PASS_KEY); } catch { /* private mode */ }
+}
+
 function hex(bytes) {
   return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
@@ -617,6 +634,10 @@ $('pick').addEventListener('click', () => $('file-input').click());
 $('file-input').addEventListener('change', (event) => addFiles(event.target.files));
 
 const drop = $('drop');
+// The whole zone is clickable; #pick has its own handler, so skip it here.
+drop.addEventListener('click', (event) => {
+  if (event.target !== $('pick')) $('file-input').click();
+});
 for (const eventName of ['dragenter', 'dragover']) {
   drop.addEventListener(eventName, (event) => {
     event.preventDefault();
@@ -646,6 +667,7 @@ $('gate-form').addEventListener('submit', async (event) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ password: $('link-password').value }),
     });
+    savePassword($('link-password').value);
     $('gate').hidden = true;
     $('uploader').hidden = false;
   } catch (error) {
@@ -719,8 +741,29 @@ function showResumeNote() {
   // entirely in the browser, so revealing the drop zone before the password is
   // checked invites someone to spend an hour hashing and then get rejected.
   if (info.needs_password) {
-    $('gate').hidden = false;
-    $('link-password').focus();
+    // A password that verified on an earlier visit skips the gate — re-checked
+    // with the server first, so a changed password falls back to asking.
+    const saved = loadPassword();
+    let verified = false;
+    if (saved !== null) {
+      try {
+        await apiJson(`/api/r/${token}/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: saved }),
+        });
+        verified = true;
+      } catch {
+        clearPassword();
+      }
+    }
+    if (verified) {
+      $('link-password').value = saved; // runUpload reads it from the field
+      $('uploader').hidden = false;
+    } else {
+      $('gate').hidden = false;
+      $('link-password').focus();
+    }
   } else {
     $('uploader').hidden = false;
   }
