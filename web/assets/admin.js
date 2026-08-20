@@ -20,6 +20,32 @@ async function api(path, options = {}) {
   return body;
 }
 
+// Styled replacements for the native confirm()/alert() dialogs, sharing the
+// one <dialog class="modal"> in index.html. Resolves true when the action
+// button is chosen; Esc and Cancel resolve false.
+function confirmModal(title, detail, action) {
+  const dialog = $('confirm');
+  $('confirm-title').textContent = title;
+  $('confirm-detail').textContent = detail;
+  $('confirm-ok').textContent = action;
+  $('confirm-ok').hidden = false;
+  $('confirm-cancel').textContent = 'Cancel';
+  dialog.returnValue = 'cancel';
+  dialog.showModal();
+  return new Promise((resolve) => {
+    dialog.addEventListener('close', () => resolve(dialog.returnValue === 'ok'), { once: true });
+  });
+}
+
+function alertModal(message) {
+  const dialog = $('confirm');
+  $('confirm-title').textContent = 'Something went wrong';
+  $('confirm-detail').textContent = message;
+  $('confirm-ok').hidden = true;
+  $('confirm-cancel').textContent = 'OK';
+  dialog.showModal();
+}
+
 function formatBytes(bytes) {
   if (bytes === 0) return '0 B';
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
@@ -117,7 +143,7 @@ function renderLink(link) {
       await refreshLinks();
     }),
     button('Delete', 'tiny danger', async () => {
-      if (!confirm(`Delete request "${link.label}"? Received files stay on disk.`)) return;
+      if (!(await confirmModal('Delete request', `Delete "${link.label}"? Received files stay on disk.`, 'Delete'))) return;
       await api(`/api/admin/links/${link.id}`, { method: 'DELETE' });
       await refreshLinks();
     }),
@@ -151,7 +177,7 @@ function renderUpload(link, upload) {
   head.append(
     when,
     button('Clear record', 'tiny ghost', async () => {
-      if (!confirm('Remove this transfer from the history? Files on disk stay.')) return;
+      if (!(await confirmModal('Clear record', 'Remove this transfer from the history? Files on disk stay.', 'Clear'))) return;
       await api(`/api/admin/links/${link.id}/uploads/${upload.id}`, { method: 'DELETE' });
       await refreshLinks();
     }),
@@ -181,7 +207,7 @@ function renderUpload(link, upload) {
     if (file.exists) {
       row.append(
         button('Delete file', 'tiny danger', async () => {
-          if (!confirm(`Delete "${file.stored_as}" from disk? This cannot be undone.`)) return;
+          if (!(await confirmModal('Delete file', `Delete "${file.stored_as}" from disk? This cannot be undone.`, 'Delete'))) return;
           await api(`/api/admin/links/${link.id}/uploads/${upload.id}/files/${index}`, {
             method: 'DELETE',
           });
@@ -210,7 +236,7 @@ function button(text, classes, onClick) {
   element.className = classes;
   element.textContent = text;
   element.addEventListener('click', () => {
-    onClick().catch?.((error) => alert(error.message));
+    onClick().catch?.((error) => alertModal(error.message));
   });
   return element;
 }

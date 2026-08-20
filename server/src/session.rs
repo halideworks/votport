@@ -433,7 +433,7 @@ fn publish_file(setup: &WorkerSetup, file: &mut FileState) -> Result<(), Session
         .ok_or_else(|| SessionError::internal("file state lost"))?;
     native.publish().map_err(|error| {
         SessionError::conflict(format!(
-            "publish {} failed: {error}; the name may have been taken mid-upload — retry the upload",
+            "publish {} failed: {error}; the name may have been taken mid-upload, retry the upload",
             file.display_path
         ))
     })?;
