@@ -44,9 +44,13 @@ async fn main() {
         "votport listening on {bind}; receiving into {}",
         application.config.receive_dir.display()
     );
-    if let Err(error) = axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
+    // ConnectInfo carries the peer address to the per-IP link throttle.
+    if let Err(error) = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
     {
         eprintln!("votport: server error: {error}");
         std::process::exit(1);

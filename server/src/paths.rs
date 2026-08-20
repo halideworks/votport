@@ -7,6 +7,25 @@
 
 use std::path::{Path, PathBuf};
 
+/// Drops group/other write bits on a directory files are received into. VOT
+/// stages next to the destination and refuses a group-writable parent, so a
+/// mount created 0775 (umask 002 hosts) would fail every upload into it.
+pub fn tighten_dir(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode() & 0o7777;
+            if mode & 0o022 != 0 {
+                let _ =
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & !0o022));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 /// Validates one package path component for on-disk placement.
 pub fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String> {
     if component.is_empty() || component.len() > 255 {
@@ -22,8 +41,9 @@ pub fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String
         return Err("path component contains a separator or control character".to_owned());
     }
     if !allow_hidden && component.starts_with('.') {
-        return Err("hidden file names are not accepted (VOTPORT_ALLOW_HIDDEN=1 to allow)"
-            .to_owned());
+        return Err(
+            "hidden file names are not accepted (VOTPORT_ALLOW_HIDDEN=1 to allow)".to_owned(),
+        );
     }
     Ok(())
 }
@@ -39,8 +59,9 @@ pub fn admit_dest(dest: &str) -> Result<String, String> {
     for component in trimmed.split('/') {
         let component = component.trim();
         if component.is_empty() || component == "." || component == ".." {
-            return Err("destination folder may not contain empty, '.' or '..' segments"
-                .to_owned());
+            return Err(
+                "destination folder may not contain empty, '.' or '..' segments".to_owned(),
+            );
         }
         if component.len() > 128
             || !component

@@ -63,26 +63,27 @@ pub fn load_secret(data_dir: &std::path::Path) -> Result<[u8; 32], String> {
     }
 }
 
-fn admin_mac(secret: &[u8; 32], expires: u64, nonce: &str) -> String {
+fn token_mac(secret: &[u8; 32], context: &[&[u8]], expires: u64, nonce: &str) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts 32-byte keys");
-    mac.update(b"votport-admin\0");
+    for part in context {
+        mac.update(part);
+        mac.update(b"\0");
+    }
     mac.update(expires.to_le_bytes().as_slice());
     mac.update(nonce.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }
 
-/// Issues an admin session token: `expires.nonce.mac`.
-pub fn issue_admin_token(secret: &[u8; 32]) -> String {
-    let expires = now_unix() + ADMIN_SESSION_SECS;
+fn issue_token(secret: &[u8; 32], context: &[&[u8]], lifetime_secs: u64) -> String {
+    let expires = now_unix() + lifetime_secs;
     let nonce = random_token();
-    let mac = admin_mac(secret, expires, &nonce);
+    let mac = token_mac(secret, context, expires, &nonce);
     format!("{expires}.{nonce}.{mac}")
 }
 
-pub fn verify_admin_token(secret: &[u8; 32], token: &str) -> bool {
+fn verify_token(secret: &[u8; 32], context: &[&[u8]], token: &str) -> bool {
     let mut parts = token.splitn(3, '.');
-    let (Some(expires), Some(nonce), Some(mac)) = (parts.next(), parts.next(), parts.next())
-    else {
+    let (Some(expires), Some(nonce), Some(mac)) = (parts.next(), parts.next(), parts.next()) else {
         return false;
     };
     let Ok(expires) = expires.parse::<u64>() else {
@@ -91,8 +92,46 @@ pub fn verify_admin_token(secret: &[u8; 32], token: &str) -> bool {
     if now_unix() >= expires {
         return false;
     }
-    let expected = admin_mac(secret, expires, nonce);
+    let expected = token_mac(secret, context, expires, nonce);
     constant_time_eq(expected.as_bytes(), mac.as_bytes())
+}
+
+/// Issues an admin session token: `expires.nonce.mac`. The MAC covers the
+/// stored password hash, so changing the password via the UI invalidates
+/// every outstanding session. `phc` is the state.json hash or empty when the
+/// password still comes from the environment; the env-derived hash is salted
+/// fresh each boot and would otherwise log the admin out on every restart.
+pub fn issue_admin_token(secret: &[u8; 32], phc: &str) -> String {
+    issue_token(
+        secret,
+        &[b"votport-admin", phc.as_bytes()],
+        ADMIN_SESSION_SECS,
+    )
+}
+
+pub fn verify_admin_token(secret: &[u8; 32], phc: &str, token: &str) -> bool {
+    verify_token(secret, &[b"votport-admin", phc.as_bytes()], token)
+}
+
+const LINK_SESSION_SECS: u64 = 30 * 24 * 3600;
+
+/// Issues a link access token proving the link password was verified once.
+/// The MAC covers the link's password hash, so replacing the link (or its
+/// password) invalidates outstanding cookies.
+pub fn issue_link_token(secret: &[u8; 32], link_id: &str, phc: &str) -> String {
+    issue_token(
+        secret,
+        &[b"votport-link", link_id.as_bytes(), phc.as_bytes()],
+        LINK_SESSION_SECS,
+    )
+}
+
+pub fn verify_link_token(secret: &[u8; 32], link_id: &str, phc: &str, token: &str) -> bool {
+    verify_token(
+        secret,
+        &[b"votport-link", link_id.as_bytes(), phc.as_bytes()],
+        token,
+    )
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -135,6 +174,53 @@ impl LoginThrottle {
                 state.1 = Some(Instant::now() + Duration::from_secs(LOCKOUT_SECS));
                 state.0 = 0;
             }
+        }
+    }
+}
+
+/// Per-IP throttle for link password checks. The global [`LoginThrottle`]
+/// stays admin-only: sharing it with public links let anyone holding a link
+/// URL lock the admin out with five bad guesses.
+pub struct IpThrottle {
+    state: Mutex<std::collections::HashMap<String, (u32, Option<Instant>)>>,
+}
+
+impl Default for IpThrottle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IpThrottle {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    pub fn locked(&self, ip: &str) -> bool {
+        let state = self.state.lock().expect("throttle poisoned");
+        state
+            .get(ip)
+            .is_some_and(|(_, until)| until.is_some_and(|until| Instant::now() < until))
+    }
+
+    pub fn record(&self, ip: &str, success: bool) {
+        let mut state = self.state.lock().expect("throttle poisoned");
+        // ponytail: wholesale clear past 4096 IPs instead of per-entry expiry;
+        // move to timed eviction if a botnet ever makes the reset exploitable.
+        if state.len() >= 4096 {
+            state.clear();
+        }
+        if success {
+            state.remove(ip);
+            return;
+        }
+        let entry = state.entry(ip.to_owned()).or_insert((0, None));
+        entry.0 += 1;
+        if entry.0 >= LOCKOUT_THRESHOLD {
+            entry.1 = Some(Instant::now() + Duration::from_secs(LOCKOUT_SECS));
+            entry.0 = 0;
         }
     }
 }

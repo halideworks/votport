@@ -19,12 +19,21 @@ pub struct App {
     pub store: Arc<Store>,
     pub sessions: Sessions,
     pub secret: [u8; 32],
+    /// Global throttle for the admin password endpoints.
     pub throttle: LoginThrottle,
+    /// Per-IP throttle for public link password checks.
+    pub link_throttle: crate::auth::IpThrottle,
 }
 
 pub fn build(config: Config) -> Result<Arc<App>, String> {
+    // VOT refuses to stage files under a group-writable directory. On hosts
+    // with umask 002 (Ubuntu user groups) every directory votport creates
+    // would be 0775 and every upload would fail, so pin the umask here.
+    #[cfg(unix)]
+    rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o022));
     std::fs::create_dir_all(&config.receive_dir)
         .map_err(|error| format!("create {}: {error}", config.receive_dir.display()))?;
+    crate::paths::tighten_dir(&config.receive_dir);
     let store = Arc::new(Store::open(&config.data_dir)?);
     let secret = crate::auth::load_secret(&config.data_dir)?;
     Ok(Arc::new(App {
@@ -32,6 +41,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         sessions: Sessions::new(),
         secret,
         throttle: LoginThrottle::new(),
+        link_throttle: crate::auth::IpThrottle::new(),
         config,
     }))
 }
@@ -61,7 +71,20 @@ pub fn router(app: Arc<App>) -> Router {
         // Pages.
         .route("/", serve_page(admin_page))
         .route("/r/{token}", serve_page(request_page))
-        .nest_service("/assets", ServeDir::new(web_root.join("assets")))
+        // no-cache means revalidate, not never-cache: repeat visits answer
+        // conditional GETs with 304s instead of re-downloading the wasm and
+        // the hero image, while a redeploy still takes effect immediately.
+        .nest_service(
+            "/assets",
+            tower::ServiceBuilder::new()
+                .layer(
+                    tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+                        axum::http::header::CACHE_CONTROL,
+                        axum::http::HeaderValue::from_static("no-cache"),
+                    ),
+                )
+                .service(ServeDir::new(web_root.join("assets"))),
+        )
         // Admin API.
         .route("/api/admin/login", post(api::admin_login))
         .route("/api/admin/logout", post(api::admin_logout))
@@ -81,19 +104,16 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/r/{token}/session", post(api::create_session))
         .route(
             "/api/session/{sid}/seal",
-            post(api::upload_seal)
-                .layer(DefaultBodyLimit::max(session::MAX_SEAL_BYTES + 1024)),
+            post(api::upload_seal).layer(DefaultBodyLimit::max(session::MAX_SEAL_BYTES + 1024)),
         )
         .route(
             "/api/session/{sid}/page",
-            post(api::upload_page)
-                .layer(DefaultBodyLimit::max(session::MAX_PAGE_BYTES + 1024)),
+            post(api::upload_page).layer(DefaultBodyLimit::max(session::MAX_PAGE_BYTES + 1024)),
         )
         .route("/api/session/{sid}/begin", post(api::upload_begin))
         .route(
             "/api/session/{sid}/chunk",
-            post(api::upload_chunk)
-                .layer(DefaultBodyLimit::max(session::MAX_CHUNK_BODY_BYTES)),
+            post(api::upload_chunk).layer(DefaultBodyLimit::max(session::MAX_CHUNK_BODY_BYTES)),
         )
         .route("/api/session/{sid}/finish", post(api::upload_finish))
         .route("/api/session/{sid}/abort", post(api::upload_abort))

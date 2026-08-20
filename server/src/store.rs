@@ -128,11 +128,7 @@ impl Store {
     }
 
     /// Applies `mutate` to the link and persists; Ok(false) when absent.
-    pub fn update_link(
-        &self,
-        id: &str,
-        mutate: impl FnOnce(&mut Link),
-    ) -> Result<bool, String> {
+    pub fn update_link(&self, id: &str, mutate: impl FnOnce(&mut Link)) -> Result<bool, String> {
         let mut document = self.document.lock().expect("store poisoned");
         let Some(link) = document.links.iter_mut().find(|link| link.id == id) else {
             return Ok(false);
