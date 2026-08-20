@@ -181,15 +181,16 @@ impl LoginThrottle {
 /// Per-IP throttle for link password checks. The global [`LoginThrottle`]
 /// stays admin-only: sharing it with public links let anyone holding a link
 /// URL lock the admin out with five bad guesses.
-pub struct IpThrottle {
-    state: Mutex<std::collections::HashMap<String, (u32, Option<Instant>)>>,
+struct IpState {
+    failures: u32,
+    locked_until: Option<Instant>,
+    last_seen: Instant,
 }
 
-impl Default for IpThrottle {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Entries idle this long carry no lockout and stale failure counts; they are
+/// evicted when the table needs room.
+const IP_ENTRY_TTL_SECS: u64 = 600;
+const IP_TABLE_CAP: usize = 4096;
 
 impl IpThrottle {
     pub fn new() -> Self {
@@ -200,28 +201,49 @@ impl IpThrottle {
 
     pub fn locked(&self, ip: &str) -> bool {
         let state = self.state.lock().expect("throttle poisoned");
-        state
-            .get(ip)
-            .is_some_and(|(_, until)| until.is_some_and(|until| Instant::now() < until))
+        state.get(ip).is_some_and(|entry| {
+            entry
+                .locked_until
+                .is_some_and(|until| Instant::now() < until)
+        })
     }
 
     pub fn record(&self, ip: &str, success: bool) {
         let mut state = self.state.lock().expect("throttle poisoned");
-        // ponytail: wholesale clear past 4096 IPs instead of per-entry expiry;
-        // move to timed eviction if a botnet ever makes the reset exploitable.
-        if state.len() >= 4096 {
-            state.clear();
+        if state.len() >= IP_TABLE_CAP {
+            // Evict only dead weight: expired, idle entries. Live lockouts
+            // survive, so filling the table cannot reset anyone's penalty.
+            let now = Instant::now();
+            state.retain(|_, entry| {
+                entry.locked_until.is_some_and(|until| now < until)
+                    || now.duration_since(entry.last_seen).as_secs() < IP_ENTRY_TTL_SECS
+            });
         }
         if success {
             state.remove(ip);
             return;
         }
-        let entry = state.entry(ip.to_owned()).or_insert((0, None));
-        entry.0 += 1;
-        if entry.0 >= LOCKOUT_THRESHOLD {
-            entry.1 = Some(Instant::now() + Duration::from_secs(LOCKOUT_SECS));
-            entry.0 = 0;
+        let entry = state.entry(ip.to_owned()).or_insert(IpState {
+            failures: 0,
+            locked_until: None,
+            last_seen: Instant::now(),
+        });
+        entry.last_seen = Instant::now();
+        entry.failures += 1;
+        if entry.failures >= LOCKOUT_THRESHOLD {
+            entry.locked_until = Some(Instant::now() + Duration::from_secs(LOCKOUT_SECS));
+            entry.failures = 0;
         }
+    }
+}
+
+pub struct IpThrottle {
+    state: Mutex<std::collections::HashMap<String, IpState>>,
+}
+
+impl Default for IpThrottle {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

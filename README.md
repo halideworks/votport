@@ -87,6 +87,27 @@ Everything is environment variables (see `docker-compose.yml`):
 | `VOTPORT_ALLOW_HIDDEN` | off | Set `1` to accept dot-file names from uploaders. |
 | `VOTPORT_SESSION_IDLE_SECS` | `1800` | Idle time before an unfinished upload session is discarded. |
 | `VOTPORT_WEB_ROOT` | `./web` | Static assets directory (`/app/web` in Docker). |
+| `VOTPORT_NOTIFY_WEBHOOK_URL` | — | POSTed a JSON summary (`event`, `label`, `upload_id`, `total_bytes`, `files`) when an upload completes. |
+| `VOTPORT_NOTIFY_NTFY_URL` | — | Full ntfy topic URL (e.g. `https://ntfy.sh/mytopic`) sent a message per completed upload. |
+| `VOTPORT_NOTIFY_NTFY_TOKEN` | — | Bearer token for the ntfy topic, if it needs one. |
+| `VOTPORT_NOTIFY_PUSHOVER_TOKEN` | — | Pushover application token (set together with the user key). |
+| `VOTPORT_NOTIFY_PUSHOVER_USER` | — | Pushover user key. |
+
+Notifications are best-effort: a delivery failure is logged and never affects
+the upload.
+
+## Receipts
+
+Every published file gets a sidecar, `<name>.vot-receipt`: a canonical
+[vot-receipt](https://github.com/halideworks/VOT) CBOR envelope, ed25519-signed
+with a key votport generates in the data directory (`receipt.key`), attesting
+that exactly that object (suite, BLAKE3 root, length) reached **Published**
+assurance under the Balanced commit profile, with the session, provider
+incarnation, sequence, and UTC timestamp of the observation. The verifying
+public key is shown at the top of the admin dashboard (and returned by
+`GET /api/admin/links` as `receipt_key`); the receipt's embedded key id is the
+same 32-byte public key. Verify one with the `vot-receipt` crate:
+`decode_authenticated(bytes)` then `verify_ed25519(&decoded, &key)`.
 
 ## Security model
 
@@ -114,9 +135,16 @@ hashed, verified range by range, independent of every proxy in between.
 2. "New request link": label it, optionally pick a destination subfolder, a
    password, an expiry, a size cap.
 3. Copy the link, send it (share any password separately).
-4. When files arrive, each link shows its uploads: stored paths, sizes, and
-   the verified package/object roots.
-5. Deactivate or delete links when done (files stay on disk).
+4. When files arrive, each link shows its uploads: stored paths, sizes, the
+   full verified package/object roots, whether each file is still on disk,
+   and whether its receipt sidecar was written.
+5. Show a QR code for any link for senders on phones; delete individual
+   received files (with their receipts) or clear a transfer from the history.
+6. Deactivate or delete links when done (files stay on disk).
+
+Senders can drop folders as well as files; browser support requires
+WebAssembly SIMD and module workers (Safari 16.4, Chrome 91, Firefox 114 or
+newer).
 
 ## Development
 
@@ -158,7 +186,6 @@ dies halfway still delivers the files that finished.
 
 ## Roadmap ideas
 
-* Signed VOT receipts (CBOR) stored next to upload records
 * Content dedup when two entries share an object root
 * Outbound mode: serve files to a recipient with verified download
 

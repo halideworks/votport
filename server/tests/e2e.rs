@@ -34,6 +34,11 @@ async fn start_server() -> TestServer {
         receive_dir: received.path().to_path_buf(),
         web_root: PathBuf::from("./web"),
         admin_password_hash: auth::hash_password(ADMIN_PASSWORD).unwrap(),
+        admin_token_tag: String::new(),
+        notify_webhook: None,
+        notify_ntfy: None,
+        notify_ntfy_token: None,
+        notify_pushover: None,
         public_url: None,
         max_upload_bytes: 64 * 1024 * 1024,
         allow_hidden: false,
@@ -1005,4 +1010,132 @@ async fn changing_the_admin_password_evicts_other_sessions_but_not_the_actor() {
         .await
         .unwrap();
     assert_eq!(response.status(), 401, "other sessions are evicted");
+}
+
+/// Every published file gets a signed receipt sidecar that verifies against
+/// the advertised key, and the admin can delete files and clear history.
+#[tokio::test(flavor = "multi_thread")]
+async fn receipts_are_written_and_files_are_manageable() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    let response = client
+        .post(format!("{base}/api/admin/links"))
+        .header("X-Votport", "1")
+        .json(&json!({ "label": "receipts" }))
+        .send()
+        .await
+        .unwrap();
+    let token = response.json::<Value>().await.unwrap()["link"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let files = [prepare(vec!["receipted.bin"], vec![5u8; 300_000])];
+    let report = run_upload(&client, &base, &token, "", &files).await;
+    assert!(
+        report["files"][0]["receipt"].as_bool().unwrap(),
+        "finish reports the sidecar"
+    );
+
+    let sidecar = server.receive_dir.join("receipted.bin.vot-receipt");
+    let listing = client
+        .get(format!("{base}/api/admin/links"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let key_hex = listing["receipt_key"].as_str().unwrap();
+    let bytes = std::fs::read(&sidecar).expect("sidecar exists");
+    let decoded = vot_receipt::decode_authenticated(&bytes).expect("sidecar decodes");
+    let key =
+        ed25519_dalek::VerifyingKey::from_bytes(&hex::decode(key_hex).unwrap().try_into().unwrap())
+            .unwrap();
+    let verified = vot_receipt::verify_ed25519(&decoded, &key).expect("receipt verifies");
+    assert_eq!(
+        hex::encode(verified.receipt().subject_digest),
+        report["files"][0]["root"].as_str().unwrap(),
+        "receipt attests the exact object"
+    );
+
+    let link = listing["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == json!(token))
+        .unwrap();
+    let upload = &link["uploads"][0];
+    assert!(upload["files"][0]["exists"].as_bool().unwrap());
+    assert!(upload["files"][0]["receipt"].as_bool().unwrap());
+    let upload_id = upload["id"].as_str().unwrap();
+
+    let response = client
+        .delete(format!(
+            "{base}/api/admin/links/{token}/uploads/{upload_id}/files/0"
+        ))
+        .header("X-Votport", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    assert!(!server.receive_dir.join("receipted.bin").exists());
+    assert!(!sidecar.exists(), "sidecar is deleted with the file");
+    // Deleting again is fine: the file is already gone.
+    let response = client
+        .delete(format!(
+            "{base}/api/admin/links/{token}/uploads/{upload_id}/files/0"
+        ))
+        .header("X-Votport", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let response = client
+        .delete(format!(
+            "{base}/api/admin/links/{token}/uploads/{upload_id}"
+        ))
+        .header("X-Votport", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let listing = client
+        .get(format!("{base}/api/admin/links"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let link = listing["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == json!(token))
+        .unwrap();
+    assert!(
+        link["uploads"].as_array().unwrap().is_empty(),
+        "history cleared"
+    );
+
+    // The QR endpoint answers with an SVG for the admin.
+    let response = client
+        .get(format!("{base}/api/admin/links/{token}/qr"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.text().await.unwrap().contains("<svg"));
 }

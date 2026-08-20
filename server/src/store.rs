@@ -23,6 +23,9 @@ pub struct FileRecord {
     pub suite: String,
     /// Hex object root the received bytes verified against.
     pub root: String,
+    /// Whether a signed `.vot-receipt` sidecar was written next to the file.
+    #[serde(default)]
+    pub receipt: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

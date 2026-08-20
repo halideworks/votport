@@ -38,8 +38,9 @@ function show(section) {
 }
 
 async function refreshLinks() {
-  const { links, receive_dir } = await api('/api/admin/links');
-  $('receive-dir').textContent = `Receive root ${receive_dir}`;
+  const { links, receive_dir, receipt_key } = await api('/api/admin/links');
+  $('receive-dir').textContent =
+    `Receive root ${receive_dir} · receipt key ${receipt_key || 'unavailable'}`;
   const container = $('links');
   container.replaceChildren();
   if (!links.length) {
@@ -90,10 +91,24 @@ function renderLink(link) {
   meta.textContent = parts.join(' · ');
   card.append(meta);
 
+  // Lazily-loaded QR of the request link, toggled from the actions row.
+  const qr = document.createElement('div');
+  qr.className = 'qr';
+  qr.hidden = true;
+
   const actions = document.createElement('div');
   actions.className = 'actions';
   actions.append(
     button('Copy', 'tiny', () => navigator.clipboard.writeText(link.url)),
+    button('QR', 'tiny ghost', async () => {
+      qr.hidden = !qr.hidden;
+      if (!qr.hidden && !qr.firstChild) {
+        const image = document.createElement('img');
+        image.alt = `QR code for ${link.url}`;
+        image.src = `/api/admin/links/${link.id}/qr`;
+        qr.append(image);
+      }
+    }),
     button(link.active ? 'Deactivate' : 'Reactivate', 'tiny ghost', async () => {
       await api(`/api/admin/links/${link.id}`, {
         method: 'POST',
@@ -107,7 +122,7 @@ function renderLink(link) {
       await refreshLinks();
     }),
   );
-  card.append(actions);
+  card.append(actions, qr);
 
   if (link.uploads.length) {
     const details = document.createElement('details');
@@ -118,21 +133,75 @@ function renderLink(link) {
     const list = document.createElement('ul');
     list.className = 'uploads';
     for (const upload of [...link.uploads].reverse()) {
-      const item = document.createElement('li');
-      const files = upload.files
-        .map((file) => `${file.stored_as} (${formatBytes(file.bytes)})`)
-        .join(', ');
-      item.textContent = `${formatWhen(upload.completed_at)} — ${files}`;
-      const root = document.createElement('div');
-      root.className = 'mono muted';
-      root.textContent = `package ${upload.package_root.slice(0, 16)}…`;
-      item.append(root);
-      list.append(item);
+      list.append(renderUpload(link, upload));
     }
     details.append(list);
     card.append(details);
   }
   return card;
+}
+
+function renderUpload(link, upload) {
+  const item = document.createElement('li');
+
+  const head = document.createElement('div');
+  head.className = 'upload-head';
+  const when = document.createElement('span');
+  when.textContent = `${formatWhen(upload.completed_at)} · ${formatBytes(upload.total_bytes)}`;
+  head.append(
+    when,
+    button('Clear record', 'tiny ghost', async () => {
+      if (!confirm('Remove this transfer from the history? Files on disk stay.')) return;
+      await api(`/api/admin/links/${link.id}/uploads/${upload.id}`, { method: 'DELETE' });
+      await refreshLinks();
+    }),
+  );
+  item.append(head);
+
+  upload.files.forEach((file, index) => {
+    const row = document.createElement('div');
+    row.className = 'upload-file';
+
+    const name = document.createElement('span');
+    name.textContent = `${file.stored_as} (${formatBytes(file.bytes)})`;
+    row.append(name);
+
+    if (!file.exists) {
+      const missing = document.createElement('span');
+      missing.className = 'badge off';
+      missing.textContent = 'missing';
+      row.append(missing);
+    }
+    if (file.receipt) {
+      const receipt = document.createElement('span');
+      receipt.className = 'badge on';
+      receipt.textContent = 'receipt';
+      row.append(receipt);
+    }
+    if (file.exists) {
+      row.append(
+        button('Delete file', 'tiny danger', async () => {
+          if (!confirm(`Delete "${file.stored_as}" from disk? This cannot be undone.`)) return;
+          await api(`/api/admin/links/${link.id}/uploads/${upload.id}/files/${index}`, {
+            method: 'DELETE',
+          });
+          await refreshLinks();
+        }),
+      );
+    }
+    item.append(row);
+
+    const id = document.createElement('div');
+    id.className = 'mono muted file-id';
+    id.textContent = `${file.suite}:${file.root}`;
+    item.append(id);
+  });
+
+  const root = document.createElement('div');
+  root.className = 'mono muted file-id';
+  root.textContent = `package ${upload.package_root}`;
+  item.append(root);
+  return item;
 }
 
 function button(text, classes, onClick) {

@@ -44,8 +44,9 @@
     <form id="upload-form">
       <div id="drop" class="drop" tabindex="0">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M12 12v9"/><path d="m16 16-4-4-4 4"/></svg>
-        <p><strong>Drop files here or</strong> <button type="button" id="pick" class="ghost">browse</button></p>
+        <p><strong>Drop files or folders here, or browse</strong> <button type="button" id="pick" class="ghost">files</button> <strong>/</strong> <button type="button" id="pick-folder" class="ghost">a folder</button></p>
         <input type="file" id="file-input" multiple hidden>
+        <input type="file" id="folder-input" webkitdirectory hidden>
       </div>
 
       <ul id="file-list" class="files"></ul>
