@@ -403,6 +403,19 @@ button.danger:hover:not(:disabled) { border-color: var(--danger); transform: non
 
 .uploads { margin: 0.6rem 0 0; padding: 0; list-style: none; }
 .uploads li { padding: 0.5rem 0; border-top: 1px solid var(--border-faint); font-size: 0.78rem; }
+.upload-head,
+.upload-file {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin: 0.25rem 0;
+}
+.upload-head { justify-content: space-between; }
+.upload-file > span:first-child { min-width: 0; overflow-wrap: anywhere; }
+
+.qr { margin-bottom: 1.1rem; }
+.qr img { width: 180px; height: 180px; border-radius: 0.6rem; }
 
 /* ---- uploader ------------------------------------------------------------ */
 
@@ -482,6 +495,9 @@ button.danger:hover:not(:disabled) { border-color: var(--danger); transform: non
   font-size: 0.72rem;
 }
 .files li.done .status { color: var(--ok); }
+/* Full object ids wrap onto their own line under the file row. */
+.files li { flex-wrap: wrap; }
+.file-id { flex-basis: 100%; font-size: 0.68rem; opacity: 0.8; }
 
 .meter {
   height: 4px;

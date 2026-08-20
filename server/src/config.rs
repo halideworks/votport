@@ -16,6 +16,19 @@ pub struct Config {
     pub web_root: PathBuf,
     /// Argon2 PHC hash of the admin password.
     pub admin_password_hash: String,
+    /// Stable tag for the environment-provided admin credential, bound into
+    /// session token MACs so rotating the env password (or env hash) evicts
+    /// sessions while a plain restart does not. The argon2 hash above cannot
+    /// serve: it is salted fresh each boot.
+    pub admin_token_tag: String,
+    /// Webhook URL POSTed a JSON summary when an upload completes.
+    pub notify_webhook: Option<String>,
+    /// ntfy topic URL (e.g. "https://ntfy.sh/mytopic") for upload notices.
+    pub notify_ntfy: Option<String>,
+    /// Bearer token for the ntfy topic, if it needs one.
+    pub notify_ntfy_token: Option<String>,
+    /// Pushover application token + user key for upload notices.
+    pub notify_pushover: Option<(String, String)>,
     /// Public base URL (e.g. "https://drop.example.com"); used to render
     /// links in the admin UI and to decide whether cookies are `Secure`.
     pub public_url: Option<String>,
@@ -37,11 +50,22 @@ pub fn from_env() -> Result<Config, String> {
     let receive_dir = PathBuf::from(env_or("VOTPORT_RECEIVE_DIR", "/received"));
     let web_root = PathBuf::from(env_or("VOTPORT_WEB_ROOT", "./web"));
 
-    let admin_password_hash = match env::var("VOTPORT_ADMIN_PASSWORD_HASH") {
-        Ok(hash) if !hash.trim().is_empty() => hash.trim().to_owned(),
+    let (admin_password_hash, admin_token_tag) = match env::var("VOTPORT_ADMIN_PASSWORD_HASH") {
+        // The env PHC string is stable across restarts and changes on
+        // rotation, so it is its own token tag.
+        Ok(hash) if !hash.trim().is_empty() => {
+            let hash = hash.trim().to_owned();
+            let tag = hash.clone();
+            (hash, tag)
+        }
         _ => match env::var("VOTPORT_ADMIN_PASSWORD") {
-            Ok(password) if !password.is_empty() => crate::auth::hash_password(&password)
-                .map_err(|error| format!("failed to hash admin password: {error}"))?,
+            Ok(password) if !password.is_empty() => {
+                use sha2::Digest as _;
+                let tag = hex::encode(sha2::Sha256::digest(password.as_bytes()));
+                let hash = crate::auth::hash_password(&password)
+                    .map_err(|error| format!("failed to hash admin password: {error}"))?;
+                (hash, tag)
+            }
             _ => {
                 return Err(
                     "set VOTPORT_ADMIN_PASSWORD (or VOTPORT_ADMIN_PASSWORD_HASH with an \
@@ -73,12 +97,33 @@ pub fn from_env() -> Result<Config, String> {
         Err(_) => 1800,
     };
 
+    let optional = |name: &str| env::var(name).ok().filter(|value| !value.trim().is_empty());
+    let notify_pushover = match (
+        optional("VOTPORT_NOTIFY_PUSHOVER_TOKEN"),
+        optional("VOTPORT_NOTIFY_PUSHOVER_USER"),
+    ) {
+        (Some(token), Some(user)) => Some((token, user)),
+        (None, None) => None,
+        _ => {
+            return Err(
+                "set both VOTPORT_NOTIFY_PUSHOVER_TOKEN and VOTPORT_NOTIFY_PUSHOVER_USER, \
+                 or neither"
+                    .to_owned(),
+            );
+        }
+    };
+
     Ok(Config {
         bind,
         data_dir,
         receive_dir,
         web_root,
         admin_password_hash,
+        admin_token_tag,
+        notify_webhook: optional("VOTPORT_NOTIFY_WEBHOOK_URL"),
+        notify_ntfy: optional("VOTPORT_NOTIFY_NTFY_URL"),
+        notify_ntfy_token: optional("VOTPORT_NOTIFY_NTFY_TOKEN"),
+        notify_pushover,
         public_url,
         max_upload_bytes,
         allow_hidden,

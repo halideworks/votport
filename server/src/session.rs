@@ -127,6 +127,9 @@ pub struct WorkerSetup {
     pub expected_package: ObjectId,
     pub max_total_bytes: u64,
     pub allow_hidden: bool,
+    pub signer: Arc<crate::receipt::ReceiptSigner>,
+    /// The session id bytes, carried into issued receipts.
+    pub session_id: [u8; 16],
 }
 
 struct FileState {
@@ -135,6 +138,7 @@ struct FileState {
     object: ObjectId,
     native: Option<NativeFile>,
     published: bool,
+    receipt: bool,
 }
 
 // One Phase exists per session; the variant size gap is irrelevant here.
@@ -177,7 +181,9 @@ pub fn spawn_worker(setup: WorkerSetup) -> mpsc::Sender<Cmd> {
                     data,
                     reply,
                 } => {
-                    let _ = reply.send(handle_chunk(&mut phase, entry, offset, &proof, &data));
+                    let _ = reply.send(handle_chunk(
+                        &setup, &mut phase, entry, offset, &proof, &data,
+                    ));
                 }
                 Cmd::Finish { reply } => {
                     let _ = reply.send(handle_finish(&setup, &mut phase));
@@ -296,7 +302,7 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
     // Zero-length objects have complete coverage already; publish now.
     for file in &mut files {
         if file.object.length == 0 {
-            publish_file(file)?;
+            publish_file(setup, file)?;
         }
     }
 
@@ -352,6 +358,7 @@ fn open_destination(setup: &WorkerSetup, entry: &PackageEntry) -> Result<FileSta
                     object,
                     native: Some(native),
                     published: false,
+                    receipt: false,
                 });
             }
             Err(error) if error.kind() == vot_sdk_file::ErrorKind::AlreadyExists => {}
@@ -368,6 +375,7 @@ fn open_destination(setup: &WorkerSetup, entry: &PackageEntry) -> Result<FileSta
 }
 
 fn handle_chunk(
+    setup: &WorkerSetup,
     phase: &mut Phase,
     entry: usize,
     offset: u64,
@@ -407,7 +415,7 @@ fn handle_chunk(
         .map_err(|error| SessionError::internal(format!("write failed: {error}")))?;
     let complete = acceptance.progress.covered_bytes == acceptance.progress.total_bytes;
     if complete {
-        publish_file(file)?;
+        publish_file(setup, file)?;
     }
     Ok(ChunkProgress {
         accepted: matches!(acceptance.status, RangeStatus::Accepted),
@@ -418,7 +426,7 @@ fn handle_chunk(
     })
 }
 
-fn publish_file(file: &mut FileState) -> Result<(), SessionError> {
+fn publish_file(setup: &WorkerSetup, file: &mut FileState) -> Result<(), SessionError> {
     let native = file
         .native
         .as_mut()
@@ -429,6 +437,18 @@ fn publish_file(file: &mut FileState) -> Result<(), SessionError> {
             file.display_path
         ))
     })?;
+    // Best effort: the file is delivered and verified either way, and the
+    // record notes whether its receipt exists.
+    if let Some(observation) = native.publish_observation() {
+        let destination = paths::join_under(&setup.dest_dir, &file.stored_components);
+        match setup
+            .signer
+            .write_sidecar(&destination, &file.object, setup.session_id, observation)
+        {
+            Ok(_) => file.receipt = true,
+            Err(error) => eprintln!("votport: receipt for {}: {error}", file.display_path),
+        }
+    }
     file.published = true;
     file.native = None;
     Ok(())
@@ -452,6 +472,7 @@ fn handle_finish(setup: &WorkerSetup, phase: &mut Phase) -> Result<FinishReport,
             bytes: file.object.length,
             suite: suite_name(file.object.suite),
             root: hex::encode(file.object.root),
+            receipt: file.receipt,
         })
         .collect();
     let upload = UploadRecord {
@@ -523,6 +544,15 @@ impl Sessions {
                 last_active: Instant::now(),
             },
         );
+    }
+
+    /// The link a session belongs to, for completion notifications.
+    pub fn link_id(&self, id: &str) -> Option<String> {
+        self.map
+            .lock()
+            .expect("sessions poisoned")
+            .get(id)
+            .map(|handle| handle.link_id.clone())
     }
 
     /// Returns the sender for a session and refreshes its idle clock.

@@ -68,11 +68,14 @@ type ApiResult<T> = Result<T, ApiError>;
 
 // ---------------------------------------------------------------- admin auth
 
-/// Hash bound into token MACs: the state.json hash, or empty while the
-/// password still comes from the environment (that hash is re-salted each
-/// boot and would invalidate every session on restart).
+/// Credential tag bound into admin token MACs: the state.json hash when the
+/// UI has set one, else the stable tag derived from the environment
+/// credential. Either way, rotating the credential evicts sessions and a
+/// plain restart does not.
 fn admin_token_phc(app: &App) -> String {
-    app.store.admin_password_hash().unwrap_or_default()
+    app.store
+        .admin_password_hash()
+        .unwrap_or_else(|| app.config.admin_token_tag.clone())
 }
 
 fn is_admin(app: &App, headers: &HeaderMap) -> bool {
@@ -278,7 +281,28 @@ struct LinkView {
     max_bytes: Option<u64>,
     active: bool,
     usable: bool,
-    uploads: Vec<crate::store::UploadRecord>,
+    uploads: Vec<UploadView>,
+}
+
+#[derive(Serialize)]
+struct UploadView {
+    id: String,
+    completed_at: u64,
+    package_root: String,
+    total_bytes: u64,
+    files: Vec<FileView>,
+}
+
+#[derive(Serialize)]
+struct FileView {
+    path: String,
+    stored_as: String,
+    bytes: u64,
+    suite: String,
+    root: String,
+    receipt: bool,
+    /// Whether the stored file is still on disk right now.
+    exists: bool,
 }
 
 fn base_url(app: &App, headers: &HeaderMap) -> String {
@@ -296,10 +320,45 @@ fn base_url(app: &App, headers: &HeaderMap) -> String {
     format!("{proto}://{host}")
 }
 
-fn link_view(link: Link, base: &str) -> LinkView {
+/// The on-disk path a file record points at, from server-recorded components
+/// only; client input never reaches this.
+fn stored_path(app: &App, stored_as: &str) -> std::path::PathBuf {
+    let components: Vec<String> = stored_as
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect();
+    paths::join_under(&app.config.receive_dir, &components)
+}
+
+fn link_view(app: &App, link: Link, base: &str) -> LinkView {
+    let usable = link.usable_now();
+    let uploads = link
+        .uploads
+        .into_iter()
+        .map(|upload| UploadView {
+            files: upload
+                .files
+                .into_iter()
+                .map(|file| FileView {
+                    exists: stored_path(app, &file.stored_as).is_file(),
+                    path: file.path,
+                    stored_as: file.stored_as,
+                    bytes: file.bytes,
+                    suite: file.suite,
+                    root: file.root,
+                    receipt: file.receipt,
+                })
+                .collect(),
+            id: upload.id,
+            completed_at: upload.completed_at,
+            package_root: upload.package_root,
+            total_bytes: upload.total_bytes,
+        })
+        .collect();
     LinkView {
         url: format!("{base}/r/{}", link.id),
-        usable: link.usable_now(),
+        usable,
         id: link.id,
         label: link.label,
         dest: link.dest,
@@ -308,7 +367,7 @@ fn link_view(link: Link, base: &str) -> LinkView {
         expires_at: link.expires_at,
         max_bytes: link.max_bytes,
         active: link.active,
-        uploads: link.uploads,
+        uploads,
     }
 }
 
@@ -322,11 +381,13 @@ pub async fn list_links(
         .store
         .links()
         .into_iter()
-        .map(|link| link_view(link, &base))
+        .map(|link| link_view(&app, link, &base))
         .collect();
-    Ok(Json(
-        json!({ "links": links, "receive_dir": app.config.receive_dir }),
-    ))
+    Ok(Json(json!({
+        "links": links,
+        "receive_dir": app.config.receive_dir,
+        "receipt_key": app.signer.public_hex,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -375,7 +436,7 @@ pub async fn create_link(
         uploads: Vec::new(),
     };
     let base = base_url(&app, &headers);
-    let view = link_view(link.clone(), &base);
+    let view = link_view(&app, link.clone(), &base);
     app.store.insert_link(link).map_err(ApiError::internal)?;
     Ok(Json(json!({ "link": view })))
 }
@@ -410,6 +471,79 @@ pub async fn delete_link(
     require_admin_write(&app, &headers)?;
     if !app.store.remove_link(&id).map_err(ApiError::internal)? {
         return Err(ApiError::not_found());
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// The request link as a scannable SVG, for senders on phones.
+pub async fn link_qr(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_admin(&app, &headers)?;
+    let link = app.store.link(&id).ok_or_else(ApiError::not_found)?;
+    let url = format!("{}/r/{}", base_url(&app, &headers), link.id);
+    let code = qrcode::QrCode::new(url.as_bytes())
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let svg = code
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(220, 220)
+        .dark_color(qrcode::render::svg::Color("#000000"))
+        .light_color(qrcode::render::svg::Color("#ffffff"))
+        .build();
+    Ok(([(header::CONTENT_TYPE, "image/svg+xml")], svg).into_response())
+}
+
+/// Removes one upload from a link's history. Files on disk are untouched.
+pub async fn delete_upload_record(
+    State(app): State<Arc<App>>,
+    Path((id, upload)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin_write(&app, &headers)?;
+    let found = app
+        .store
+        .update_link(&id, |link| link.uploads.retain(|entry| entry.id != upload))
+        .map_err(ApiError::internal)?;
+    if !found {
+        return Err(ApiError::not_found());
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Deletes one received file (and its receipt sidecar) from disk. The path
+/// comes from the stored record, never from the client. Already-gone files
+/// succeed: the record's existence flag is the display of truth.
+pub async fn delete_received_file(
+    State(app): State<Arc<App>>,
+    Path((id, upload, index)): Path<(String, String, usize)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin_write(&app, &headers)?;
+    let link = app.store.link(&id).ok_or_else(ApiError::not_found)?;
+    let record = link
+        .uploads
+        .iter()
+        .find(|entry| entry.id == upload)
+        .and_then(|entry| entry.files.get(index))
+        .ok_or_else(ApiError::not_found)?;
+    let path = stored_path(&app, &record.stored_as);
+    for target in [path.clone(), {
+        let mut sidecar = path.into_os_string();
+        sidecar.push(".vot-receipt");
+        sidecar.into()
+    }] {
+        match std::fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ApiError::internal(format!(
+                    "delete {}: {error}",
+                    target.display()
+                )));
+            }
+        }
     }
     Ok(Json(json!({ "ok": true })))
 }
@@ -603,6 +737,11 @@ pub async fn create_session(
         .filter(|part| !part.is_empty())
         .map(str::to_owned)
         .collect();
+    let session_id = auth::random_token();
+    let session_bytes: [u8; 16] = hex::decode(&session_id)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| ApiError::internal("session id shape"))?;
     let setup = session::WorkerSetup {
         store: Arc::clone(&app.store),
         link_id: link.id.clone(),
@@ -611,9 +750,10 @@ pub async fn create_session(
         expected_package: expected,
         max_total_bytes: cap,
         allow_hidden: app.config.allow_hidden,
+        signer: Arc::clone(&app.signer),
+        session_id: session_bytes,
     };
     let sender = session::spawn_worker(setup);
-    let session_id = auth::random_token();
     app.sessions.insert(session_id.clone(), link.id, sender);
     Ok(Json(json!({
         "session": session_id,
@@ -727,8 +867,16 @@ pub async fn upload_finish(
     State(app): State<Arc<App>>,
     Path(sid): Path<String>,
 ) -> ApiResult<Json<session::FinishReport>> {
+    let link_id = app.sessions.link_id(&sid);
     let report = dispatch(&app, &sid, |reply| Cmd::Finish { reply }).await?;
     app.sessions.remove(&sid);
+    if let Some(link) = link_id.and_then(|id| app.store.link(&id)) {
+        tokio::spawn(crate::notify::uploaded(
+            Arc::clone(&app),
+            link.label,
+            report.clone(),
+        ));
+    }
     Ok(Json(report))
 }
 

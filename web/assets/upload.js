@@ -19,56 +19,73 @@ let uploading = false;
 let cancelled = false;
 let controller = null; // aborts in-flight requests when the sender cancels
 
-// Hash this many files ahead of the one being uploaded. Hashing stays strictly
-// sequential (one worker), so depth only buys anything when uploads outpace
-// hashing between files; it is cheap, so it is here.
+// Hash this many files ahead of the one being uploaded; they hash in parallel
+// across the worker pool, and the gate keeps the finished merkle trees pinned
+// in worker memory bounded.
 const LOOKAHEAD = 2;
 
-// ------------------------------------------------------------- hash worker
-// Hashing and the merkle trees live in a worker so the page stays responsive
-// and hashing genuinely overlaps upload bookkeeping. The worker also serves
-// the per-chunk range proofs, since the trees live in its wasm memory.
-// ponytail: one worker, files hashed one at a time; a pool would parallelize
-// hashing across files if it ever measurably lags the uploads.
+// ------------------------------------------------------------- hash workers
+// Hashing and the merkle trees live in workers so the page stays responsive
+// and hashing genuinely overlaps upload bookkeeping. Each file's tree stays
+// in the worker that hashed it, which also serves its range proofs. The pool
+// hashes up to LOOKAHEAD+1 files in parallel — the lookahead gate already
+// caps how many files may be ahead of the upload cursor.
 
-let hashWorker = null;
+let hashWorkers = [];
+const workerByPath = new Map(); // path -> the worker holding its tree
 const workerRequests = new Map(); // req -> {resolve, reject, onStep}
 let nextRequest = 0;
 
-function startWorker() {
-  hashWorker = new Worker('/assets/hash-worker.js', { type: 'module' });
-  hashWorker.onmessage = ({ data }) => {
-    const pending = workerRequests.get(data.req);
-    if (!pending) return;
-    if (data.step !== undefined) {
-      pending.onStep?.(data.step);
-      return;
-    }
-    workerRequests.delete(data.req);
-    if (data.error !== undefined) pending.reject(new Error(data.error));
-    else pending.resolve(data.done);
-  };
-  hashWorker.onerror = () => stopWorker(new Error('the hash worker failed'));
+function startWorkers() {
+  const count = Math.min(LOOKAHEAD + 1, Math.max(1, (navigator.hardwareConcurrency || 2) - 1));
+  hashWorkers = Array.from({ length: count }, () => {
+    const worker = new Worker('/assets/hash-worker.js', { type: 'module' });
+    worker.onmessage = ({ data }) => {
+      const pending = workerRequests.get(data.req);
+      if (!pending) return;
+      if (data.step !== undefined) {
+        pending.onStep?.(data.step);
+        return;
+      }
+      workerRequests.delete(data.req);
+      if (data.error !== undefined) pending.reject(new Error(data.error));
+      else pending.resolve(data.done);
+    };
+    worker.onerror = () => stopWorkers(new Error('a hash worker failed'));
+    return worker;
+  });
 }
 
-function workerCall(message, onStep) {
+// 'hash' pins the file's tree to a worker; 'prove' and 'drop' follow it.
+function workerFor(message, index) {
+  if (message.op === 'hash') {
+    const worker = hashWorkers[index % hashWorkers.length];
+    workerByPath.set(message.key, worker);
+    return worker;
+  }
+  return workerByPath.get(message.key);
+}
+
+function workerCall(message, index = 0, onStep = null) {
   return new Promise((resolve, reject) => {
-    if (!hashWorker) {
+    const worker = hashWorkers.length ? workerFor(message, index) : null;
+    if (!worker) {
       reject(new Cancelled());
       return;
     }
     const req = nextRequest;
     nextRequest += 1;
     workerRequests.set(req, { resolve, reject, onStep });
-    hashWorker.postMessage({ ...message, req });
+    worker.postMessage({ ...message, req });
   });
 }
 
-// Terminating the worker is what makes Cancel instant mid-hash: there is no
-// cooperative flag to poll, the thread just stops.
-function stopWorker(error) {
-  hashWorker?.terminate();
-  hashWorker = null;
+// Terminating the workers is what makes Cancel instant mid-hash: there is no
+// cooperative flag to poll, the threads just stop.
+function stopWorkers(error) {
+  for (const worker of hashWorkers) worker.terminate();
+  hashWorkers = [];
+  workerByPath.clear();
   for (const pending of workerRequests.values()) {
     pending.reject(error || new Cancelled());
   }
@@ -228,9 +245,43 @@ function relativePath(file) {
 }
 
 function addFiles(files) {
+  addNamed([...files].map((file) => ({ path: relativePath(file), file })));
+}
+
+// Collects every file under a dropped directory entry, keeping its path.
+function entryFiles(entry) {
+  return new Promise((resolve, reject) => {
+    if (entry.isFile) {
+      entry.file(
+        (file) => resolve([{ path: entry.fullPath.replace(/^\//, ''), file }]),
+        reject,
+      );
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      const children = [];
+      // readEntries returns at most ~100 entries per call; drain it.
+      const drain = () => reader.readEntries(async (batch) => {
+        if (batch.length) {
+          children.push(...batch);
+          drain();
+          return;
+        }
+        try {
+          resolve((await Promise.all(children.map(entryFiles))).flat());
+        } catch (error) {
+          reject(error);
+        }
+      }, reject);
+      drain();
+    } else {
+      resolve([]);
+    }
+  });
+}
+
+function addNamed(pairs) {
   if (uploading) return;
-  for (const file of files) {
-    const path = relativePath(file);
+  for (const { path, file } of pairs) {
     const components = path.split('/').filter(Boolean);
     for (const component of components) {
       const problem = validateComponent(component);
@@ -442,12 +493,12 @@ async function runUpload() {
   let sent = 0;
   const delivered = [];
 
-  async function hashOne([path, file]) {
+  async function hashOne([path, file], index) {
     checkCancelled();
     const components = path.split('/');
     let fileHashed = 0;
     setStatus(path, 'hashing 0%');
-    const done = await workerCall({ op: 'hash', key: path, file }, (step) => {
+    const done = await workerCall({ op: 'hash', key: path, file }, index, (step) => {
       hashed += step;
       fileHashed += step;
       const rate = hashRate(step);
@@ -558,7 +609,7 @@ async function runUpload() {
       const report = await postWithRetry(`/api/session/${sessionId}/finish`, {});
       delivered.push(...report.files);
       clearResume();
-      hashWorker?.postMessage({ op: 'drop', key: item.path }); // frees the tree
+      workerByPath.get(item.path)?.postMessage({ op: 'drop', key: item.path }); // frees the tree
       setStatus(item.path, 'delivered \u2713', true);
     } catch (error) {
       // Only a deliberate cancel throws the session away. A network failure is
@@ -575,20 +626,17 @@ async function runUpload() {
   setPhase('Preparing', 'verifying the first file locally');
   setMeter(0);
 
-  // Hashing runs ahead of uploading by up to LOOKAHEAD files. The .then chain
-  // keeps hashing strictly sequential — one file at a time, in order — while
-  // the gate stops it from running further ahead than that and pinning several
-  // finished merkle trees in wasm memory at once.
+  // Hashing runs ahead of uploading by up to LOOKAHEAD files, and those files
+  // hash in parallel across the worker pool. The gate keeps hashing from
+  // running further ahead than that and pinning many finished merkle trees in
+  // worker memory at once.
   const uploaded = files.map(() => {
     let release;
     return { promise: new Promise((resolve) => { release = resolve; }), release };
   });
-  let chain = Promise.resolve();
   const hashes = files.map((entry, index) => {
-    chain = chain
-      .then(() => (index >= LOOKAHEAD ? uploaded[index - LOOKAHEAD].promise : undefined))
-      .then(() => hashOne(entry));
-    return chain;
+    const gate = index >= LOOKAHEAD ? uploaded[index - LOOKAHEAD].promise : Promise.resolve();
+    return gate.then(() => hashOne(entry, index));
   });
   // Each is awaited in order below; this only stops the ones after a failure
   // from being reported as unhandled rejections.
@@ -622,8 +670,11 @@ function showDone(report) {
     name.textContent = file.path;
     const status = document.createElement('span');
     status.className = 'status';
-    status.textContent = `${formatBytes(file.bytes)} · ${file.suite}:${file.root.slice(0, 12)}…`;
-    item.append(name, status);
+    status.textContent = formatBytes(file.bytes) + (file.receipt ? ' · receipt ✓' : '');
+    const id = document.createElement('div');
+    id.className = 'mono muted file-id';
+    id.textContent = `${file.suite}:${file.root}`;
+    item.append(name, status, id);
     list.append(item);
   }
 }
@@ -647,16 +698,18 @@ $('confirm-cancel').addEventListener('close', () => {
   if ($('confirm-cancel').returnValue !== 'cancel') return;
   cancelled = true;
   controller?.abort(); // kills the request in flight rather than waiting it out
-  stopWorker(); // stops a hash mid-file instead of waiting for it to finish
+  stopWorkers(); // stops a hash mid-file instead of waiting for it to finish
 });
 
 $('pick').addEventListener('click', () => $('file-input').click());
+$('pick-folder').addEventListener('click', () => $('folder-input').click());
+$('folder-input').addEventListener('change', (event) => addFiles(event.target.files));
 $('file-input').addEventListener('change', (event) => addFiles(event.target.files));
 
 const drop = $('drop');
 // The whole zone is clickable; #pick has its own handler, so skip it here.
 drop.addEventListener('click', (event) => {
-  if (event.target !== $('pick')) $('file-input').click();
+  if (!event.target.closest('button')) $('file-input').click();
 });
 for (const eventName of ['dragenter', 'dragover']) {
   drop.addEventListener(eventName, (event) => {
@@ -670,7 +723,23 @@ for (const eventName of ['dragleave', 'drop']) {
     drop.classList.remove('hover');
   });
 }
-drop.addEventListener('drop', (event) => addFiles(event.dataTransfer.files));
+drop.addEventListener('drop', async (event) => {
+  // Entries must be captured before the first await; the DataTransferItemList
+  // is neutered as soon as the handler yields.
+  const items = event.dataTransfer.items;
+  const entries = items
+    ? [...items].map((item) => item.webkitGetAsEntry?.()).filter(Boolean)
+    : [];
+  if (!entries.length) {
+    addFiles(event.dataTransfer.files);
+    return;
+  }
+  try {
+    addNamed((await Promise.all(entries.map(entryFiles))).flat());
+  } catch {
+    fail('Could not read a dropped folder; use the folder picker instead.');
+  }
+});
 
 window.addEventListener('beforeunload', (event) => {
   if (uploading) event.preventDefault();
@@ -705,7 +774,7 @@ $('upload-form').addEventListener('submit', async (event) => {
   uploading = true;
   cancelled = false;
   controller = new AbortController();
-  startWorker();
+  startWorkers();
   $('send').disabled = true;
   $('upload-error').hidden = true;
   try {
@@ -720,7 +789,7 @@ $('upload-form').addEventListener('submit', async (event) => {
   } finally {
     uploading = false;
     controller = null;
-    stopWorker();
+    stopWorkers();
   }
 });
 

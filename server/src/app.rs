@@ -23,6 +23,10 @@ pub struct App {
     pub throttle: LoginThrottle,
     /// Per-IP throttle for public link password checks.
     pub link_throttle: crate::auth::IpThrottle,
+    /// Signs the `.vot-receipt` sidecars written next to received files.
+    pub signer: Arc<crate::receipt::ReceiptSigner>,
+    /// Outbound client for upload notifications.
+    pub http: reqwest::Client,
 }
 
 pub fn build(config: Config) -> Result<Arc<App>, String> {
@@ -36,12 +40,21 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     crate::paths::tighten_dir(&config.receive_dir);
     let store = Arc::new(Store::open(&config.data_dir)?);
     let secret = crate::auth::load_secret(&config.data_dir)?;
+    let signer = Arc::new(crate::receipt::ReceiptSigner::load_or_create(
+        &config.data_dir,
+    )?);
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|error| format!("http client: {error}"))?;
     Ok(Arc::new(App {
         store,
         sessions: Sessions::new(),
         secret,
         throttle: LoginThrottle::new(),
         link_throttle: crate::auth::IpThrottle::new(),
+        signer,
+        http,
         config,
     }))
 }
@@ -51,12 +64,28 @@ pub fn router(app: Arc<App>) -> Router {
     let admin_page = web_root.join("index.html");
     let request_page = web_root.join("request.html");
 
+    // Everything the pages load is same-origin except the Google Fonts pair
+    // imported from style.css. wasm-unsafe-eval is what lets the browser
+    // compile the verification engine; there is no JS eval anywhere.
+    const CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; \
+        style-src 'self' https://fonts.googleapis.com; \
+        font-src https://fonts.gstatic.com; connect-src 'self'; \
+        img-src 'self' data:; worker-src 'self'; \
+        frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+
     let serve_page = |path: std::path::PathBuf| {
         get(move || {
             let path = path.clone();
             async move {
                 match tokio::fs::read_to_string(&path).await {
-                    Ok(contents) => Html(contents).into_response(),
+                    Ok(contents) => (
+                        [
+                            (axum::http::header::CONTENT_SECURITY_POLICY, CSP),
+                            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                        ],
+                        Html(contents),
+                    )
+                        .into_response(),
                     Err(_) => (
                         axum::http::StatusCode::NOT_FOUND,
                         "page not found; is VOTPORT_WEB_ROOT set correctly?",
@@ -97,6 +126,15 @@ pub fn router(app: Arc<App>) -> Router {
         .route(
             "/api/admin/links/{id}",
             post(api::update_link).delete(api::delete_link),
+        )
+        .route("/api/admin/links/{id}/qr", get(api::link_qr))
+        .route(
+            "/api/admin/links/{id}/uploads/{upload}",
+            axum::routing::delete(api::delete_upload_record),
+        )
+        .route(
+            "/api/admin/links/{id}/uploads/{upload}/files/{index}",
+            axum::routing::delete(api::delete_received_file),
         )
         // Public upload API.
         .route("/api/r/{token}", get(api::link_info))
