@@ -13,7 +13,6 @@ const $ = (id) => document.getElementById(id);
 const token = window.location.pathname.split('/').filter(Boolean).pop();
 
 const HASH_READ_BYTES = 8 * 1024 * 1024;
-const HASH_READS_IN_FLIGHT = 4;
 const UPLOADS_IN_FLIGHT = 4;
 let chunkBytes = 2 * 1024 * 1024;
 let picked = new Map(); // relative path -> File
@@ -293,25 +292,17 @@ async function hashFile(file, onProgress) {
   const size = BigInt(file.size);
   const builder = new ObjectBuilder(Suite.Blake3Bao64, size, size);
   const readAt = (offset) =>
-    file.slice(offset, Math.min(offset + HASH_READ_BYTES, file.size)).arrayBuffer()
-      .then((bytes) => ({ bytes }), (error) => ({ error }));
-  const reads = [];
-  let next = 0;
-  const fill = () => {
-    while (reads.length < HASH_READS_IN_FLIGHT && next < file.size) {
-      reads.push(readAt(next));
-      next = Math.min(next + HASH_READ_BYTES, file.size);
-    }
-  };
-  fill();
-  while (reads.length) {
+    file.slice(offset, Math.min(offset + HASH_READ_BYTES, file.size)).arrayBuffer();
+  let offset = 0;
+  // Overlap one read with hashing without making Firefox seek among slices.
+  let pending = file.size > 0 ? readAt(0) : null;
+  while (pending) {
     // Checked every slice: a 10 GiB hash has to be interruptible, or Cancel
     // does nothing until it finishes.
     checkCancelled();
-    const read = await reads.shift();
-    if (read.error) throw read.error;
-    fill();
-    const bytes = new Uint8Array(read.bytes);
+    const bytes = new Uint8Array(await pending);
+    offset += bytes.length;
+    pending = offset < file.size ? readAt(offset) : null;
     builder.update(bytes);
     onProgress(bytes.length);
   }
