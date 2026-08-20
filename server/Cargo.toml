@@ -11,12 +11,13 @@ publish = false
 [workspace]
 
 [dependencies]
-vot-sdk = { git = "https://github.com/halideworks/VOT", rev = "7e51df9bb5773612711c72fb3d5fe82c6ddcd468" }
-vot-sdk-file = { git = "https://github.com/halideworks/VOT", rev = "7e51df9bb5773612711c72fb3d5fe82c6ddcd468" }
+vot-sdk = { git = "https://github.com/halideworks/VOT", rev = "d64bd9d6c78a9e264049a2f46eec8b3c5ab6e3a0" }
+vot-sdk-file = { git = "https://github.com/halideworks/VOT", rev = "d64bd9d6c78a9e264049a2f46eec8b3c5ab6e3a0" }
 
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
-tower-http = { version = "0.6", features = ["fs"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "set-header"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 argon2 = "0.5"
@@ -24,6 +25,7 @@ rand = "0.8"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+rustix = { version = "1", features = ["process", "fs"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "cookies"] }

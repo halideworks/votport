@@ -2,7 +2,7 @@
 // streams proven ranges to the server. AGPL-3.0-only.
 
 import init, {
-  ObjectBuilder,
+  ObjectId,
   PackageBuilder,
   PackageEntry,
   PackagePath,
@@ -12,8 +12,7 @@ import init, {
 const $ = (id) => document.getElementById(id);
 const token = window.location.pathname.split('/').filter(Boolean).pop();
 
-const HASH_READ_BYTES = 8 * 1024 * 1024;
-const UPLOADS_IN_FLIGHT = 4;
+const UPLOADS_IN_FLIGHT = 8;
 let chunkBytes = 2 * 1024 * 1024;
 let picked = new Map(); // relative path -> File
 let uploading = false;
@@ -21,9 +20,60 @@ let cancelled = false;
 let controller = null; // aborts in-flight requests when the sender cancels
 
 // Hash this many files ahead of the one being uploaded. Hashing stays strictly
-// sequential (one thread), so depth only buys anything when uploads outpace
+// sequential (one worker), so depth only buys anything when uploads outpace
 // hashing between files; it is cheap, so it is here.
 const LOOKAHEAD = 2;
+
+// ------------------------------------------------------------- hash worker
+// Hashing and the merkle trees live in a worker so the page stays responsive
+// and hashing genuinely overlaps upload bookkeeping. The worker also serves
+// the per-chunk range proofs, since the trees live in its wasm memory.
+// ponytail: one worker, files hashed one at a time; a pool would parallelize
+// hashing across files if it ever measurably lags the uploads.
+
+let hashWorker = null;
+const workerRequests = new Map(); // req -> {resolve, reject, onStep}
+let nextRequest = 0;
+
+function startWorker() {
+  hashWorker = new Worker('/assets/hash-worker.js', { type: 'module' });
+  hashWorker.onmessage = ({ data }) => {
+    const pending = workerRequests.get(data.req);
+    if (!pending) return;
+    if (data.step !== undefined) {
+      pending.onStep?.(data.step);
+      return;
+    }
+    workerRequests.delete(data.req);
+    if (data.error !== undefined) pending.reject(new Error(data.error));
+    else pending.resolve(data.done);
+  };
+  hashWorker.onerror = () => stopWorker(new Error('the hash worker failed'));
+}
+
+function workerCall(message, onStep) {
+  return new Promise((resolve, reject) => {
+    if (!hashWorker) {
+      reject(new Cancelled());
+      return;
+    }
+    const req = nextRequest;
+    nextRequest += 1;
+    workerRequests.set(req, { resolve, reject, onStep });
+    hashWorker.postMessage({ ...message, req });
+  });
+}
+
+// Terminating the worker is what makes Cancel instant mid-hash: there is no
+// cooperative flag to poll, the thread just stops.
+function stopWorker(error) {
+  hashWorker?.terminate();
+  hashWorker = null;
+  for (const pending of workerRequests.values()) {
+    pending.reject(error || new Cancelled());
+  }
+  workerRequests.clear();
+}
 
 class Cancelled extends Error {
   constructor() {
@@ -54,22 +104,9 @@ function clearResume() {
   try { localStorage.removeItem(RESUME_KEY); } catch { /* private mode */ }
 }
 
-// A password that verified once is kept per link, so a reload (or coming back
-// tomorrow to resume) does not ask for it again. It is the link's shared
-// password, not a personal credential, and it is scoped to this token.
-const PASS_KEY = `votport-pass-${token}`;
-
-function savePassword(password) {
-  try { localStorage.setItem(PASS_KEY, password); } catch { /* private mode */ }
-}
-
-function loadPassword() {
-  try { return localStorage.getItem(PASS_KEY); } catch { return null; }
-}
-
-function clearPassword() {
-  try { localStorage.removeItem(PASS_KEY); } catch { /* private mode */ }
-}
+// The verified-password cookie replaced the plaintext copy an earlier build
+// kept in localStorage; scrub any leftover.
+try { localStorage.removeItem(`votport-pass-${token}`); } catch { /* private mode */ }
 
 function hex(bytes) {
   return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
@@ -208,9 +245,13 @@ function addFiles(files) {
   renderPicked();
 }
 
+// path -> its list row, so per-chunk status updates skip the O(files) scan.
+let rows = new Map();
+
 function renderPicked() {
   const list = $('file-list');
   list.replaceChildren();
+  rows = new Map();
   let total = 0;
   for (const [path, file] of picked) {
     total += file.size;
@@ -223,6 +264,7 @@ function renderPicked() {
     status.textContent = formatBytes(file.size);
     item.append(name, status);
     list.append(item);
+    rows.set(path, item);
   }
   $('totals').hidden = picked.size === 0;
   $('totals').textContent = `${picked.size} file(s), ${formatBytes(total)} total`;
@@ -230,12 +272,10 @@ function renderPicked() {
 }
 
 function setStatus(path, text, done = false) {
-  for (const item of $('file-list').children) {
-    if (item.dataset.path === path) {
-      item.querySelector('.status').textContent = text;
-      item.classList.toggle('done', done);
-    }
-  }
+  const item = rows.get(path);
+  if (!item) return;
+  item.querySelector('.status').textContent = text;
+  item.classList.toggle('done', done);
 }
 
 // ------------------------------------------------------------------- network
@@ -305,27 +345,6 @@ function formatDuration(seconds) {
   return `${Math.floor(seconds / 3600)}h ${Math.round((seconds % 3600) / 60)}m`;
 }
 
-async function hashFile(file, onProgress) {
-  const size = BigInt(file.size);
-  const builder = new ObjectBuilder(Suite.Blake3Bao64, size, size);
-  const readAt = (offset) =>
-    file.slice(offset, Math.min(offset + HASH_READ_BYTES, file.size)).arrayBuffer();
-  let offset = 0;
-  // Overlap one read with hashing without making Firefox seek among slices.
-  let pending = file.size > 0 ? readAt(0) : null;
-  while (pending) {
-    // Checked every slice: a 10 GiB hash has to be interruptible, or Cancel
-    // does nothing until it finishes.
-    checkCancelled();
-    const bytes = new Uint8Array(await pending);
-    offset += bytes.length;
-    pending = offset < file.size ? readAt(offset) : null;
-    builder.update(bytes);
-    onProgress(bytes.length);
-  }
-  return builder.finish();
-}
-
 function buildPackage(items) {
   // Canonical manifest order: case-folded path keys, byte-wise.
   items.sort((a, b) => compareBytes(a.key, b.key));
@@ -341,7 +360,7 @@ function buildPackage(items) {
   for (const item of items) {
     const packagePath = new PackagePath();
     for (const component of item.components) packagePath.push(component);
-    const entry = PackageEntry.direct(packagePath, item.prepared.objectId);
+    const entry = PackageEntry.direct(packagePath, item.objectId);
     const page = builder.push(entry);
     if (page) drafts.push(page);
   }
@@ -355,63 +374,55 @@ function buildPackage(items) {
 }
 
 async function uploadEntryChunks(sessionId, entryIndex, item, from, onProgress) {
-  const { file, prepared } = item;
+  const { file } = item;
   const size = BigInt(file.size);
-  // Each worker prepares one proven range and keeps at most one POST in flight.
-  const prepare = (offset) => {
-    if (offset >= size) return null;
-    const want = size - offset < BigInt(chunkBytes) ? size - offset : BigInt(chunkBytes);
-    const proof = prepared.prove(offset, want);
-    const start = Number(proof.coveredOffset);
-    const length = Number(proof.coveredLength);
-    return {
-      offset,
-      next: proof.coveredOffset + proof.coveredLength,
-      start,
-      length,
-      proofBytes: proof.bytes(),
-      data: file.slice(start, start + length).arrayBuffer(),
-    };
-  };
   let next = from;
-  let prefix = from;
   let failure = null;
-  const completed = new Map();
+  // Ranges start 64 KiB aligned and advance by whole chunks, so a proof
+  // always covers exactly what was asked; the check below guards the maths.
   const take = () => {
-    const chunk = prepare(next);
-    if (chunk) next = chunk.next;
-    return chunk;
+    if (next >= size) return null;
+    const offset = next;
+    const want = size - offset < BigInt(chunkBytes) ? size - offset : BigInt(chunkBytes);
+    next = offset + want;
+    return { offset, want };
   };
+  // Each sender prepares one proven range and keeps at most one POST in flight.
   const send = async () => {
     while (!failure) {
-      const chunk = take();
-      if (!chunk) return;
+      const range = take();
+      if (!range) return;
       try {
         checkCancelled();
-        const data = new Uint8Array(await chunk.data);
-        if (data.length !== chunk.length) {
+        const proof = await workerCall({
+          op: 'prove',
+          key: item.path,
+          offset: range.offset,
+          length: range.want,
+        });
+        const start = Number(proof.coveredOffset);
+        const length = Number(proof.coveredLength);
+        if (BigInt(start) !== range.offset || BigInt(length) !== range.want) {
+          throw new Error('a proof covered an unexpected range; retry the upload');
+        }
+        const data = new Uint8Array(await file.slice(start, start + length).arrayBuffer());
+        if (data.length !== length) {
           throw new Error(`"${item.path}" changed while uploading; pick it again`);
         }
-        const body = new Uint8Array(chunk.proofBytes.length + data.length);
-        body.set(chunk.proofBytes, 0);
-        body.set(data, chunk.proofBytes.length);
+        const body = new Uint8Array(proof.bytes.length + data.length);
+        body.set(proof.bytes, 0);
+        body.set(data, proof.bytes.length);
         await postWithRetry(
-          `/api/session/${sessionId}/chunk?entry=${entryIndex}&offset=${chunk.start}`,
+          `/api/session/${sessionId}/chunk?entry=${entryIndex}&offset=${start}`,
           {
             headers: {
               'Content-Type': 'application/octet-stream',
-              'X-Votport-Proof': String(chunk.proofBytes.length),
+              'X-Votport-Proof': String(proof.bytes.length),
             },
             body,
           },
         );
-        completed.set(chunk.offset, chunk.next);
-        while (completed.has(prefix)) {
-          const covered = completed.get(prefix);
-          completed.delete(prefix);
-          prefix = covered;
-        }
-        onProgress(chunk.length, prefix);
+        onProgress(length);
       } catch (error) {
         failure ||= error;
       }
@@ -436,7 +447,7 @@ async function runUpload() {
     const components = path.split('/');
     let fileHashed = 0;
     setStatus(path, 'hashing 0%');
-    const prepared = await hashFile(file, (step) => {
+    const done = await workerCall({ op: 'hash', key: path, file }, (step) => {
       hashed += step;
       fileHashed += step;
       const rate = hashRate(step);
@@ -451,7 +462,8 @@ async function runUpload() {
       }
     });
     setStatus(path, 'ready');
-    return { path, components, file, prepared, key: pathKeyBytes(components) };
+    const objectId = new ObjectId(done.suite, done.root, done.length);
+    return { path, components, file, objectId, key: pathKeyBytes(components) };
   }
 
   async function sendOne(item, position) {
@@ -471,7 +483,7 @@ async function runUpload() {
     // part of the match, so a file edited since the interruption starts over
     // rather than failing deep inside range verification.
     const saved = loadResume();
-    let resume = saved && saved.root === rootHex && saved.path === item.path
+    const resume = saved && saved.root === rootHex && saved.path === item.path
       ? saved
       : null;
     let sessionId = resume?.session || null;
@@ -480,6 +492,10 @@ async function runUpload() {
       try {
         ({ entries } = await postWithRetry(`/api/session/${sessionId}/begin`, {}, 1));
         setStatus(item.path, 'resuming…');
+        // Keep the interrupted run's chunk grid: a different chunk size would
+        // straddle extents the server already accepted and be rejected as
+        // partial overlaps.
+        chunkBytes = resume.chunk || chunkBytes;
       } catch (error) {
         if (error.cancelled) throw error;
         sessionId = null; // session swept or server restarted; start over
@@ -496,14 +512,15 @@ async function runUpload() {
       });
       sessionId = session.session;
       chunkBytes = session.chunk_bytes || chunkBytes;
-      resume = {
+      // Written once per session: the server's begin reply is the authority
+      // on how far the transfer got, so nothing needs saving per chunk.
+      saveResume({
         session: sessionId,
         path: item.path,
         size: item.file.size,
         root: rootHex,
-        covered: 0,
-      };
-      saveResume(resume);
+        chunk: chunkBytes,
+      });
       await postWithRetry(`/api/session/${sessionId}/seal`, {
         headers: { 'Content-Type': 'application/octet-stream' },
         body: seal,
@@ -519,21 +536,20 @@ async function runUpload() {
 
     try {
       for (const entry of entries) {
-        const savedPrefix = Number.isSafeInteger(resume?.covered) ? resume.covered : null;
+        // covered_bytes is the server's contiguous verified prefix, so it is
+        // safe to restart from even when chunks landed out of order.
         const already = entry.complete
           ? item.file.size
-          : Math.min(savedPrefix ?? entry.covered_bytes ?? 0, item.file.size);
+          : Math.min(entry.covered_bytes ?? 0, item.file.size);
         sent += already;
         if (entry.complete) {
           setMeter(totalBytes ? sent / totalBytes : 1);
           continue;
         }
         let fileSent = already;
-        await uploadEntryChunks(sessionId, entry.index, item, BigInt(already), (step, prefix) => {
+        await uploadEntryChunks(sessionId, entry.index, item, BigInt(already), (step) => {
           sent += step;
           fileSent += step;
-          resume.covered = Number(prefix);
-          saveResume(resume);
           setMeter(totalBytes ? sent / totalBytes : 1);
           setNote(sent, totalBytes, sendRate(step));
           setStatus(item.path, `${formatBytes(fileSent)} / ${formatBytes(item.file.size)}`);
@@ -542,6 +558,7 @@ async function runUpload() {
       const report = await postWithRetry(`/api/session/${sessionId}/finish`, {});
       delivered.push(...report.files);
       clearResume();
+      hashWorker?.postMessage({ op: 'drop', key: item.path }); // frees the tree
       setStatus(item.path, 'delivered \u2713', true);
     } catch (error) {
       // Only a deliberate cancel throws the session away. A network failure is
@@ -614,7 +631,9 @@ function showDone(report) {
 // -------------------------------------------------------------------- wiring
 
 $('cancel').addEventListener('click', () => {
-  const delivered = $('done-list').children.length;
+  // Delivered rows are marked .done in the staged list as each file lands;
+  // #done-list only exists after the whole transfer finishes.
+  const delivered = $('file-list').querySelectorAll('.done').length;
   const kept = delivered === 1
     ? 'The one already delivered is kept.'
     : `The ${delivered} already delivered are kept.`;
@@ -628,6 +647,7 @@ $('confirm-cancel').addEventListener('close', () => {
   if ($('confirm-cancel').returnValue !== 'cancel') return;
   cancelled = true;
   controller?.abort(); // kills the request in flight rather than waiting it out
+  stopWorker(); // stops a hash mid-file instead of waiting for it to finish
 });
 
 $('pick').addEventListener('click', () => $('file-input').click());
@@ -662,12 +682,13 @@ $('gate-form').addEventListener('submit', async (event) => {
   const button = $('gate-continue');
   button.disabled = true;
   try {
+    // Success sets an HttpOnly cookie server-side, so later visits (and the
+    // session creation below) are authorized without keeping the password.
     await apiJson(`/api/r/${token}/verify`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ password: $('link-password').value }),
     });
-    savePassword($('link-password').value);
     $('gate').hidden = true;
     $('uploader').hidden = false;
   } catch (error) {
@@ -684,6 +705,7 @@ $('upload-form').addEventListener('submit', async (event) => {
   uploading = true;
   cancelled = false;
   controller = new AbortController();
+  startWorker();
   $('send').disabled = true;
   $('upload-error').hidden = true;
   try {
@@ -698,6 +720,7 @@ $('upload-form').addEventListener('submit', async (event) => {
   } finally {
     uploading = false;
     controller = null;
+    stopWorker();
   }
 });
 
@@ -734,36 +757,15 @@ function showResumeNote() {
   } catch {
     $('subtitle').textContent =
       'This browser could not load the verification engine. It requires WebAssembly '
-      + 'with SIMD: Safari 16.4, Chrome 91, Firefox 89 or newer.';
+      + 'with SIMD and module workers: Safari 16.4, Chrome 91, Firefox 114 or newer.';
     return;
   }
   // Password first, always. Hashing is the expensive step and it happens
   // entirely in the browser, so revealing the drop zone before the password is
   // checked invites someone to spend an hour hashing and then get rejected.
-  if (info.needs_password) {
-    // A password that verified on an earlier visit skips the gate — re-checked
-    // with the server first, so a changed password falls back to asking.
-    const saved = loadPassword();
-    let verified = false;
-    if (saved !== null) {
-      try {
-        await apiJson(`/api/r/${token}/verify`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ password: saved }),
-        });
-        verified = true;
-      } catch {
-        clearPassword();
-      }
-    }
-    if (verified) {
-      $('link-password').value = saved; // runUpload reads it from the field
-      $('uploader').hidden = false;
-    } else {
-      $('gate').hidden = false;
-      $('link-password').focus();
-    }
+  if (info.needs_password && !info.authorized) {
+    $('gate').hidden = false;
+    $('link-password').focus();
   } else {
     $('uploader').hidden = false;
   }

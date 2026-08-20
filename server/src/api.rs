@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ use crate::app::App;
 use crate::auth;
 use crate::paths;
 use crate::session::{self, Cmd, SessionError};
-use crate::store::{Link, now_unix};
+use crate::store::{now_unix, Link};
 
 const ADMIN_COOKIE: &str = "votport_admin";
 const MAX_SESSIONS: usize = 32;
@@ -68,12 +68,32 @@ type ApiResult<T> = Result<T, ApiError>;
 
 // ---------------------------------------------------------------- admin auth
 
+/// Hash bound into token MACs: the state.json hash, or empty while the
+/// password still comes from the environment (that hash is re-salted each
+/// boot and would invalidate every session on restart).
+fn admin_token_phc(app: &App) -> String {
+    app.store.admin_password_hash().unwrap_or_default()
+}
+
 fn is_admin(app: &App, headers: &HeaderMap) -> bool {
     headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
         .and_then(|cookies| auth::cookie_value(cookies, ADMIN_COOKIE))
-        .is_some_and(|token| auth::verify_admin_token(&app.secret, token))
+        .is_some_and(|token| auth::verify_admin_token(&app.secret, &admin_token_phc(app), token))
+}
+
+/// Client address for per-IP throttling: the rightmost X-Forwarded-For entry
+/// (the one the reverse proxy appended; earlier entries are client-supplied),
+/// else the socket peer.
+fn client_ip(headers: &HeaderMap, peer: &std::net::SocketAddr) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|list| list.rsplit(',').next())
+        .map(|ip| ip.trim().to_owned())
+        .filter(|ip| !ip.is_empty())
+        .unwrap_or_else(|| peer.ip().to_string())
 }
 
 fn require_admin(app: &App, headers: &HeaderMap) -> ApiResult<()> {
@@ -145,7 +165,7 @@ pub async fn admin_login(
     if !ok {
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "wrong password"));
     }
-    let token = auth::issue_admin_token(&app.secret);
+    let token = auth::issue_admin_token(&app.secret, &admin_token_phc(&app));
     let cookie = format!(
         "{ADMIN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{}",
         cookie_attributes(&app)
@@ -176,17 +196,15 @@ pub struct ChangePasswordRequest {
 }
 
 /// Replaces the admin password. The new hash is persisted in state.json, which
-/// from then on takes precedence over the environment.
-///
-/// ponytail: existing admin cookies stay valid across the change, because they
-/// are signed with the data-dir secret rather than derived from the password.
-/// Rotating that secret here would log every session out, which is the right
-/// behaviour for a multi-admin deployment; add it if votport ever grows one.
+/// from then on takes precedence over the environment. Token MACs cover that
+/// hash, so every outstanding admin session is invalidated by the change; the
+/// response reissues a cookie under the new hash so the acting admin stays
+/// signed in.
 pub async fn admin_change_password(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     Json(request): Json<ChangePasswordRequest>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Response> {
     require_admin_write(&app, &headers)?;
     if app.throttle.locked() {
         return Err(ApiError::new(
@@ -223,7 +241,12 @@ pub async fn admin_change_password(
     app.store
         .set_admin_password_hash(hash)
         .map_err(ApiError::internal)?;
-    Ok(Json(json!({ "ok": true })))
+    let token = auth::issue_admin_token(&app.secret, &admin_token_phc(&app));
+    let cookie = format!(
+        "{ADMIN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{}",
+        cookie_attributes(&app)
+    );
+    Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
 
 // ------------------------------------------------------------ link management
@@ -286,7 +309,9 @@ pub async fn list_links(
         .into_iter()
         .map(|link| link_view(link, &base))
         .collect();
-    Ok(Json(json!({ "links": links, "receive_dir": app.config.receive_dir })))
+    Ok(Json(
+        json!({ "links": links, "receive_dir": app.config.receive_dir }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -318,9 +343,7 @@ pub async fn create_link(
     let dest = paths::admit_dest(&request.dest)
         .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     let password_hash = match request.password.as_deref().filter(|p| !p.is_empty()) {
-        Some(password) => Some(
-            auth::hash_password(password).map_err(ApiError::internal)?,
-        ),
+        Some(password) => Some(auth::hash_password(password).map_err(ApiError::internal)?),
         None => None,
     };
     let link = Link {
@@ -378,25 +401,43 @@ pub async fn delete_link(
 
 // ------------------------------------------------------------- upload protocol
 
+/// Cookie carrying proof that this link's password was verified once.
+fn link_cookie_name(link_id: &str) -> String {
+    format!("votport_r_{link_id}")
+}
+
+fn link_authorized(app: &App, link: &Link, headers: &HeaderMap) -> bool {
+    let phc = link.password_hash.as_deref().unwrap_or_default();
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| auth::cookie_value(cookies, &link_cookie_name(&link.id)))
+        .is_some_and(|token| auth::verify_link_token(&app.secret, &link.id, phc, token))
+}
+
 pub async fn link_info(
     State(app): State<Arc<App>>,
     Path(token): Path<String>,
+    headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     let link = app.store.link(&token).ok_or_else(ApiError::not_found)?;
+    let usable = link.usable_now();
     Ok(Json(json!({
-        "label": link.label,
+        // The label leaks nothing new to an authorized sender, but an old URL
+        // for a closed request should not keep revealing what it was for.
+        "label": if usable { Some(&link.label) } else { None },
         "needs_password": link.password_hash.is_some(),
-        "usable": link.usable_now(),
+        "authorized": link_authorized(&app, &link, &headers),
+        "usable": usable,
         "max_bytes": effective_cap(&app, &link),
         "chunk_bytes": session::CHUNK_BYTES,
     })))
 }
 
 fn effective_cap(app: &App, link: &Link) -> u64 {
-    link.max_bytes
-        .map_or(app.config.max_upload_bytes, |cap| {
-            cap.min(app.config.max_upload_bytes)
-        })
+    link.max_bytes.map_or(app.config.max_upload_bytes, |cap| {
+        cap.min(app.config.max_upload_bytes)
+    })
 }
 
 #[derive(Deserialize)]
@@ -426,12 +467,11 @@ fn parse_object(package: &PackageAnnouncement) -> ApiResult<ObjectId> {
             ));
         }
     };
-    let bytes = hex::decode(&package.root).map_err(|_| {
-        ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "root must be hex")
-    })?;
-    let root: [u8; 32] = bytes.try_into().map_err(|_| {
-        ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "root must be 32 bytes")
-    })?;
+    let bytes = hex::decode(&package.root)
+        .map_err(|_| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "root must be hex"))?;
+    let root: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "root must be 32 bytes"))?;
     Ok(ObjectId {
         suite: suite.identifier(),
         root,
@@ -439,18 +479,20 @@ fn parse_object(package: &PackageAnnouncement) -> ApiResult<ObjectId> {
     })
 }
 
-/// Verifies a link password. Throttled: this is the only unauthenticated
-/// password check in the service, so without the shared throttle it would be
-/// an oracle. A link with no password accepts anything, including nothing.
+/// Verifies a link password, throttled per client IP: this is the only
+/// unauthenticated password check in the service, so without a throttle it
+/// would be an oracle, and with a global one anyone holding a link URL could
+/// lock the admin out. A link with no password accepts anything.
 async fn check_link_password(
     app: &Arc<App>,
     link: &crate::store::Link,
     password: Option<&str>,
+    ip: &str,
 ) -> ApiResult<()> {
     let Some(hash) = &link.password_hash else {
         return Ok(());
     };
-    if app.throttle.locked() {
+    if app.link_throttle.locked(ip) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed attempts; wait a minute",
@@ -461,7 +503,7 @@ async fn check_link_password(
     let ok = tokio::task::spawn_blocking(move || auth::verify_password(&password, &hash))
         .await
         .map_err(|error| ApiError::internal(error.to_string()))?;
-    app.throttle.record(ok);
+    app.link_throttle.record(ip, ok);
     if !ok {
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -473,12 +515,15 @@ async fn check_link_password(
 
 /// Checks a link password without creating any upload state, so the uploader
 /// can gate its drop zone behind the password instead of letting someone hash
-/// a hundred gigabytes and only then discover they typed it wrong.
+/// a hundred gigabytes and only then discover they typed it wrong. Success
+/// sets a signed cookie so a return visit skips the gate.
 pub async fn verify_link_password(
     State(app): State<Arc<App>>,
     Path(token): Path<String>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<VerifyRequest>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Response> {
     let link = app.store.link(&token).ok_or_else(ApiError::not_found)?;
     if !link.usable_now() {
         return Err(ApiError::new(
@@ -486,8 +531,16 @@ pub async fn verify_link_password(
             "this link is no longer accepting uploads",
         ));
     }
-    check_link_password(&app, &link, request.password.as_deref()).await?;
-    Ok(Json(json!({ "ok": true })))
+    let ip = client_ip(&headers, &peer);
+    check_link_password(&app, &link, request.password.as_deref(), &ip).await?;
+    let phc = link.password_hash.as_deref().unwrap_or_default();
+    let value = auth::issue_link_token(&app.secret, &link.id, phc);
+    let cookie = format!(
+        "{}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000{}",
+        link_cookie_name(&link.id),
+        cookie_attributes(&app)
+    );
+    Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
 
 #[derive(Deserialize)]
@@ -498,6 +551,8 @@ pub struct VerifyRequest {
 pub async fn create_session(
     State(app): State<Arc<App>>,
     Path(token): Path<String>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<CreateSessionRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let link = app.store.link(&token).ok_or_else(ApiError::not_found)?;
@@ -507,7 +562,10 @@ pub async fn create_session(
             "this link is no longer accepting uploads",
         ));
     }
-    check_link_password(&app, &link, request.password.as_deref()).await?;
+    if !link_authorized(&app, &link, &headers) {
+        let ip = client_ip(&headers, &peer);
+        check_link_password(&app, &link, request.password.as_deref(), &ip).await?;
+    }
     if app.sessions.active_for_link(&link.id) >= MAX_SESSIONS_PER_LINK
         || app.sessions.total() >= MAX_SESSIONS
     {
@@ -574,13 +632,12 @@ pub async fn upload_seal(
     body: Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
     if body.len() > session::MAX_SEAL_BYTES {
-        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "seal too large"));
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "seal too large",
+        ));
     }
-    let pages = dispatch(&app, &sid, |reply| Cmd::Seal {
-        bytes: body.to_vec(),
-        reply,
-    })
-    .await?;
+    let pages = dispatch(&app, &sid, |reply| Cmd::Seal { bytes: body, reply }).await?;
     Ok(Json(json!({ "pages": pages })))
 }
 
@@ -590,13 +647,12 @@ pub async fn upload_page(
     body: Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
     if body.len() > session::MAX_PAGE_BYTES {
-        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "page too large"));
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "page too large",
+        ));
     }
-    let remaining = dispatch(&app, &sid, |reply| Cmd::Page {
-        bytes: body.to_vec(),
-        reply,
-    })
-    .await?;
+    let remaining = dispatch(&app, &sid, |reply| Cmd::Page { bytes: body, reply }).await?;
     Ok(Json(json!({ "remaining_pages": remaining })))
 }
 
@@ -637,8 +693,10 @@ pub async fn upload_chunk(
             "proof length exceeds the body",
         ));
     }
-    let proof = body[..proof_len].to_vec();
-    let data = body[proof_len..].to_vec();
+    // Bytes::slice is a refcount bump, not a copy; the session worker holds
+    // the same buffers the request body arrived in.
+    let proof = body.slice(..proof_len);
+    let data = body.slice(proof_len..);
     let progress = dispatch(&app, &sid, |reply| Cmd::Chunk {
         entry: query.entry,
         offset: query.offset,

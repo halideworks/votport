@@ -87,5 +87,8 @@ pub fn from_env() -> Result<Config, String> {
 }
 
 fn env_or(name: &str, default: &str) -> String {
-    env::var(name).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| default.to_owned())
+    env::var(name)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_owned())
 }

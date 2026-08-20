@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use axum::body::Bytes;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
@@ -20,7 +21,7 @@ use vot_sdk::verify::verify_range;
 use vot_sdk_file::{CommitProfile, NativeFile, RangeStatus};
 
 use crate::paths;
-use crate::store::{FileRecord, Store, UploadRecord, now_unix};
+use crate::store::{now_unix, FileRecord, Store, UploadRecord};
 
 pub const MAX_SEAL_BYTES: usize = 1024 * 1024;
 pub const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
@@ -65,11 +66,11 @@ type Reply<T> = oneshot::Sender<Result<T, SessionError>>;
 
 pub enum Cmd {
     Seal {
-        bytes: Vec<u8>,
+        bytes: Bytes,
         reply: Reply<u64>,
     },
     Page {
-        bytes: Vec<u8>,
+        bytes: Bytes,
         reply: Reply<u64>,
     },
     Begin {
@@ -78,8 +79,8 @@ pub enum Cmd {
     Chunk {
         entry: usize,
         offset: u64,
-        proof: Vec<u8>,
-        data: Vec<u8>,
+        proof: Bytes,
+        data: Bytes,
         reply: Reply<ChunkProgress>,
     },
     Finish {
@@ -94,7 +95,9 @@ pub struct EntryInfo {
     pub stored_as: String,
     pub bytes: u64,
     pub complete: bool,
-    /// Total bytes already verified and written for this entry.
+    /// Bytes verified and written contiguously from offset zero. Chunks land
+    /// out of order, so this is the offset a resuming sender restarts from;
+    /// the total accepted count would make it skip holes.
     pub covered_bytes: u64,
 }
 
@@ -150,7 +153,10 @@ enum Phase {
 }
 
 pub fn spawn_worker(setup: WorkerSetup) -> mpsc::Sender<Cmd> {
-    let (sender, mut receiver) = mpsc::channel::<Cmd>(2);
+    // Depth matches the client's chunk concurrency so handlers rarely block on
+    // send. Queued chunks are Bytes aliasing the request bodies, not copies,
+    // so the queue holds refcounts rather than duplicated buffers.
+    let (sender, mut receiver) = mpsc::channel::<Cmd>(8);
     std::thread::spawn(move || {
         let mut phase = Phase::AwaitSeal;
         while let Some(cmd) = receiver.blocking_recv() {
@@ -217,9 +223,9 @@ fn handle_page(phase: &mut Phase, bytes: &[u8]) -> Result<u64, SessionError> {
             "manifest pages are not expected in this state",
         ));
     };
-    let page = ingest
-        .push_page(bytes)
-        .map_err(|error| SessionError::bad(format!("manifest page rejected: {:?}", error.code())))?;
+    let page = ingest.push_page(bytes).map_err(|error| {
+        SessionError::bad(format!("manifest page rejected: {:?}", error.code()))
+    })?;
     let new_entries = page.into_entries();
     if entries.len() + new_entries.len() > MAX_ENTRIES {
         return Err(SessionError::bad(format!(
@@ -265,8 +271,7 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
             ));
         }
         for component in entry.path() {
-            paths::admit_component(component, setup.allow_hidden)
-                .map_err(SessionError::bad)?;
+            paths::admit_component(component, setup.allow_hidden).map_err(SessionError::bad)?;
         }
         total = total
             .checked_add(entry.object_id().length)
@@ -281,6 +286,7 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
 
     fs::create_dir_all(&setup.dest_dir)
         .map_err(|error| SessionError::internal(format!("create destination: {error}")))?;
+    paths::tighten_dir(&setup.dest_dir);
 
     let mut files = Vec::with_capacity(entries.len());
     for entry in &entries {
@@ -316,16 +322,13 @@ fn entry_infos(setup: &WorkerSetup, files: &[FileState]) -> Vec<EntryInfo> {
             } else {
                 file.native
                     .as_ref()
-                    .map_or(0, |native| native.progress().covered_bytes)
+                    .map_or(0, |native| native.progress().prefix_bytes)
             },
         })
         .collect()
 }
 
-fn open_destination(
-    setup: &WorkerSetup,
-    entry: &PackageEntry,
-) -> Result<FileState, SessionError> {
+fn open_destination(setup: &WorkerSetup, entry: &PackageEntry) -> Result<FileState, SessionError> {
     let components: Vec<String> = entry.path().map(str::to_owned).collect();
     let display_path = components.join("/");
     let object = entry.object_id();
@@ -333,6 +336,8 @@ fn open_destination(
         let parent = paths::join_under(&setup.dest_dir, &components[..components.len() - 1]);
         fs::create_dir_all(&parent)
             .map_err(|error| SessionError::internal(format!("create folders: {error}")))?;
+        // Staging lands in this parent; see paths::tighten_dir.
+        paths::tighten_dir(&parent);
     }
     let name = components.last().expect("manifest paths are never empty");
     for attempt in 0..MAX_NAME_ATTEMPTS {

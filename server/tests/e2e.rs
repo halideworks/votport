@@ -44,7 +44,12 @@ async fn start_server() -> TestServer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     TestServer {
         base: format!("http://{addr}"),
@@ -302,7 +307,10 @@ async fn full_protocol_end_to_end() {
     assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
     let link = response.json::<Value>().await.unwrap()["link"].clone();
     let token = link["id"].as_str().unwrap().to_owned();
-    assert!(link["url"].as_str().unwrap().ends_with(&format!("/r/{token}")));
+    assert!(link["url"]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!("/r/{token}")));
 
     // Destination traversal is rejected at creation time.
     let response = client
@@ -475,25 +483,28 @@ async fn corrupted_chunks_are_refused() {
         .as_str()
         .unwrap()
         .to_owned();
-    client
+    let response = client
         .post(format!("{base}/api/session/{session}/seal"))
         .body(seal)
         .send()
         .await
         .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
     for page in pages {
-        client
+        let response = client
             .post(format!("{base}/api/session/{session}/page"))
             .body(page)
             .send()
             .await
             .unwrap();
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
     }
-    client
+    let response = client
         .post(format!("{base}/api/session/{session}/begin"))
         .send()
         .await
         .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
 
     // Flip one byte: verification must refuse the range.
     let file = &files[0];
@@ -504,7 +515,9 @@ async fn corrupted_chunks_are_refused() {
     let proof_len = body.len();
     body.extend_from_slice(&tampered);
     let response = client
-        .post(format!("{base}/api/session/{session}/chunk?entry=0&offset=0"))
+        .post(format!(
+            "{base}/api/session/{session}/chunk?entry=0&offset=0"
+        ))
         .header("X-Votport-Proof", proof_len.to_string())
         .body(body)
         .send()
@@ -541,7 +554,6 @@ async fn admin_api_requires_sign_in() {
         .unwrap();
     assert_eq!(response.status(), 401);
 }
-
 
 /// An interrupted transfer must not have to re-send bytes the server already
 /// verified: `begin` is idempotent and reports per-entry coverage, and the
@@ -625,8 +637,7 @@ async fn interrupted_transfer_resumes_from_reported_coverage() {
     let index = begin["entries"][0]["index"].as_u64().unwrap();
 
     // --- the client dies three chunks in ----------------------------------
-    let stopped =
-        upload_chunks_from(&client, &base, &session, index, &files[0], 0, 3).await;
+    let stopped = upload_chunks_from(&client, &base, &session, index, &files[0], 0, 3).await;
     assert!(stopped > 0 && stopped < length, "stopped at {stopped}");
 
     // --- it comes back and asks how far it got ----------------------------
@@ -672,4 +683,326 @@ async fn interrupted_transfer_resumes_from_reported_coverage() {
 
     let landed = std::fs::read(server.receive_dir.join("resume.bin")).expect("published file");
     assert_eq!(landed, bytes, "resumed file must be byte-identical");
+}
+
+/// Chunks land out of order, so begin must report the contiguous prefix as
+/// the resume offset, not the total accepted bytes: a client restarting from
+/// the total would skip the hole and the file could never complete.
+#[tokio::test(flavor = "multi_thread")]
+async fn out_of_order_chunks_resume_from_the_contiguous_prefix() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+
+    client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    let response = client
+        .post(format!("{base}/api/admin/links"))
+        .header("X-Votport", "1")
+        .json(&json!({ "label": "holes" }))
+        .send()
+        .await
+        .unwrap();
+    let token = response.json::<Value>().await.unwrap()["link"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let bytes: Vec<u8> = (0..u32::try_from(6 * CHUNK).unwrap())
+        .map(|index| (index.wrapping_mul(2_246_822_519) >> 11) as u8)
+        .collect();
+    let length = bytes.len() as u64;
+    let files = [prepare(vec!["holes.bin"], bytes)];
+    let (announcement, pages, seal) = build_package(&files);
+
+    let session = client
+        .post(format!("{base}/api/r/{token}/session"))
+        .json(&json!({ "package": announcement }))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let response = client
+        .post(format!("{base}/api/session/{session}/seal"))
+        .body(seal)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    for page in pages {
+        let response = client
+            .post(format!("{base}/api/session/{session}/page"))
+            .body(page)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    }
+    let begin = client
+        .post(format!("{base}/api/session/{session}/begin"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let index = begin["entries"][0]["index"].as_u64().unwrap();
+
+    // Two chunks land beyond a hole at the front.
+    upload_chunks_from(&client, &base, &session, index, &files[0], 2 * CHUNK, 2).await;
+    let again = client
+        .post(format!("{base}/api/session/{session}/begin"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(
+        again["entries"][0]["covered_bytes"].as_u64().unwrap(),
+        0,
+        "resume offset must stop at the hole, not count the accepted extents"
+    );
+
+    // Filling the front merges through the accepted extents.
+    upload_chunks_from(&client, &base, &session, index, &files[0], 0, 2).await;
+    let again = client
+        .post(format!("{base}/api/session/{session}/begin"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(
+        again["entries"][0]["covered_bytes"].as_u64().unwrap(),
+        4 * CHUNK
+    );
+
+    upload_chunks_from(
+        &client,
+        &base,
+        &session,
+        index,
+        &files[0],
+        4 * CHUNK,
+        usize::MAX,
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/session/{session}/finish"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let report = response.json::<Value>().await.unwrap();
+    assert_eq!(report["files"][0]["bytes"].as_u64().unwrap(), length);
+}
+
+/// The link password throttle is per client IP and separate from the admin
+/// throttle, and a verified password sets a cookie that stands in for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn link_password_throttles_per_ip_without_locking_the_admin() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let admin = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    admin
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    let response = admin
+        .post(format!("{base}/api/admin/links"))
+        .header("X-Votport", "1")
+        .json(&json!({ "label": "guarded", "password": "sesame-pass-123" }))
+        .send()
+        .await
+        .unwrap();
+    let token = response.json::<Value>().await.unwrap()["link"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let stranger = reqwest::Client::new();
+    for _ in 0..5 {
+        let response = stranger
+            .post(format!("{base}/api/r/{token}/verify"))
+            .json(&json!({ "password": "wrong" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+    }
+    let response = stranger
+        .post(format!("{base}/api/r/{token}/verify"))
+        .json(&json!({ "password": "sesame-pass-123" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 429, "five failures lock the client IP");
+
+    // The lockout is the stranger's, not the admin's.
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "admin login is not affected");
+}
+
+/// A verified link password sets a cookie that authorizes later visits, and a
+/// closed link stops revealing its label.
+#[tokio::test(flavor = "multi_thread")]
+async fn verified_password_cookie_survives_and_closed_links_hide_the_label() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let admin = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    admin
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    let response = admin
+        .post(format!("{base}/api/admin/links"))
+        .header("X-Votport", "1")
+        .json(&json!({ "label": "guarded", "password": "sesame-pass-123" }))
+        .send()
+        .await
+        .unwrap();
+    let token = response.json::<Value>().await.unwrap()["link"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let sender = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let info = sender
+        .get(format!("{base}/api/r/{token}"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(info["label"].as_str().unwrap(), "guarded");
+    assert!(info["needs_password"].as_bool().unwrap());
+    assert!(!info["authorized"].as_bool().unwrap());
+
+    let response = sender
+        .post(format!("{base}/api/r/{token}/verify"))
+        .json(&json!({ "password": "sesame-pass-123" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let info = sender
+        .get(format!("{base}/api/r/{token}"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert!(info["authorized"].as_bool().unwrap(), "cookie authorizes");
+
+    // The cookie also stands in for the password when a session is created.
+    let files = [prepare(vec!["small.bin"], vec![9u8; 1000])];
+    let (announcement, _pages, _seal) = build_package(&files);
+    let response = sender
+        .post(format!("{base}/api/r/{token}/session"))
+        .json(&json!({ "password": null, "package": announcement }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+
+    let response = admin
+        .post(format!("{base}/api/admin/links/{token}"))
+        .header("X-Votport", "1")
+        .json(&json!({ "active": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let info = sender
+        .get(format!("{base}/api/r/{token}"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert!(info["label"].is_null(), "closed links hide the label");
+    assert!(!info["usable"].as_bool().unwrap());
+}
+
+/// Changing the admin password invalidates every other session's token but
+/// reissues a cookie to the session that made the change.
+#[tokio::test(flavor = "multi_thread")]
+async fn changing_the_admin_password_evicts_other_sessions_but_not_the_actor() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let actor = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let other = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    for client in [&actor, &other] {
+        let response = client
+            .post(format!("{base}/api/admin/login"))
+            .json(&json!({ "password": ADMIN_PASSWORD }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    let response = actor
+        .post(format!("{base}/api/admin/password"))
+        .header("X-Votport", "1")
+        .json(&json!({ "current": ADMIN_PASSWORD, "new": "a-new-password-123" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+
+    let response = actor
+        .get(format!("{base}/api/admin/session"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "the acting admin stays signed in");
+    let response = other
+        .get(format!("{base}/api/admin/session"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401, "other sessions are evicted");
 }
