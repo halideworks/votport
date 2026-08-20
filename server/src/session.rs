@@ -27,7 +27,7 @@ pub const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_PAGES: u64 = 4096;
 pub const MAX_ENTRIES: usize = 20_000;
 /// Covered bytes the client sends per chunk request.
-pub const CHUNK_BYTES: u64 = 2 * 1024 * 1024;
+pub const CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 /// Body cap for one chunk request (data + proof + slack).
 pub const MAX_CHUNK_BODY_BYTES: usize = 9 * 1024 * 1024;
 const MAX_NAME_ATTEMPTS: u32 = 100;
