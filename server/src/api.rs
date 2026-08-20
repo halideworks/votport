@@ -87,6 +87,13 @@ fn is_admin(app: &App, headers: &HeaderMap) -> bool {
 /// (the one the reverse proxy appended; earlier entries are client-supplied),
 /// else the socket peer.
 fn client_ip(headers: &HeaderMap, peer: &std::net::SocketAddr) -> String {
+    // X-Forwarded-For is honored only from a peer that can be the reverse
+    // proxy (loopback or a private/ULA address). A caller reaching the port
+    // directly from elsewhere would otherwise mint a fresh throttle bucket
+    // per request by spoofing the header.
+    if !proxy_peer(&peer.ip()) {
+        return peer.ip().to_string();
+    }
     headers
         .get("x-forwarded-for")
         .and_then(|value| value.to_str().ok())
@@ -94,6 +101,14 @@ fn client_ip(headers: &HeaderMap, peer: &std::net::SocketAddr) -> String {
         .map(|ip| ip.trim().to_owned())
         .filter(|ip| !ip.is_empty())
         .unwrap_or_else(|| peer.ip().to_string())
+}
+
+fn proxy_peer(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
+        // fc00::/7 unique-local, the v6 analogue of RFC 1918.
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
+    }
 }
 
 fn require_admin(app: &App, headers: &HeaderMap) -> ApiResult<()> {
@@ -723,4 +738,22 @@ pub async fn upload_abort(
 ) -> Json<serde_json::Value> {
     app.sessions.remove(&sid);
     Json(json!({ "ok": true }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forwarded_for_is_trusted_only_from_proxy_peers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.2.3.4, 5.6.7.8".parse().unwrap());
+        let proxy: std::net::SocketAddr = "127.0.0.1:80".parse().unwrap();
+        let private: std::net::SocketAddr = "172.18.0.2:80".parse().unwrap();
+        let public: std::net::SocketAddr = "203.0.113.9:80".parse().unwrap();
+        assert_eq!(client_ip(&headers, &proxy), "5.6.7.8");
+        assert_eq!(client_ip(&headers, &private), "5.6.7.8");
+        assert_eq!(client_ip(&headers, &public), "203.0.113.9");
+        assert_eq!(client_ip(&HeaderMap::new(), &proxy), "127.0.0.1");
+    }
 }
