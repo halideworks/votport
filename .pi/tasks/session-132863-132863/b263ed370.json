@@ -1,0 +1,19 @@
+{
+  "id": "b263ed370",
+  "name": "CI watch PR 12 final",
+  "command": "cd /nvme-mirror/apps/votport && for i in $(seq 1 20); do if gh pr checks 12 > /tmp/ci-watch3.log 2>&1; then break; fi; grep -q \"no checks\" /tmp/ci-watch3.log || break; sleep 15; done; gh pr checks 12 --watch --interval 60 >> /tmp/ci-watch3.log 2>&1; echo \"EXIT=$?\" >> /tmp/ci-watch3.log",
+  "status": "completed",
+  "outputPath": ".pi/tasks/session-132863-132863/b263ed370.output",
+  "cwd": "/nvme-mirror/apps/votport",
+  "startTime": 1787329815486,
+  "endTime": 1787330300369,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 313357,
+  "bytesWritten": 0,
+  "isAgent": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 3600
+}
