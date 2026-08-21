@@ -81,7 +81,7 @@ Everything is environment variables (see `docker-compose.yml`):
 | `VOTPORT_ADMIN_PASSWORD_HASH` | — | Argon2 PHC string; takes precedence over the plain password. |
 | `VOTPORT_PUBLIC_URL` | — | Public https URL; used for generated links and to mark cookies `Secure`. |
 | `VOTPORT_BIND` | `0.0.0.0:8080` | Listen address inside the container. |
-| `VOTPORT_DATA_DIR` | `/data` | State: `state.json` (links, upload records) and the cookie secret. |
+| `VOTPORT_DATA_DIR` | `/data` | State: `votport.db` (links, upload records; legacy `state.json` is imported once) and the cookie secret. |
 | `VOTPORT_RECEIVE_DIR` | `/received` | Root folder received files are published into. |
 | `VOTPORT_MAX_UPLOAD_BYTES` | 50 GiB | Hard cap per upload session (per-link caps can be lower). Accepts plain bytes or a `K/KiB/KB`, `M/MiB/MB`, `G/GiB/GB`, `T/TiB/TB` suffix, e.g. `500G`. |
 | `VOTPORT_ALLOW_HIDDEN` | off | Set `1` to accept dot-file names from uploaders. |

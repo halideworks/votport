@@ -1,14 +1,16 @@
 //! Persistent state: request links and their completed uploads.
 //!
-//! Everything lives in one JSON document written atomically (temp file +
-//! rename) under the data directory. Scale target is a personal server, so a
-//! mutex around one document is deliberate.
+//! SQLite (WAL, synchronous FULL) in the data directory. The public API is
+//! the one the JSON-document store had: every mutation commits durably before
+//! returning, and callers stay free of SQL. Uploads and session events remain
+//! embedded JSON on the link row; splitting them into tables is phase 2 work
+//! (see docs/multi-tenancy.md).
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rusqlite::{Connection, OptionalExtension as _};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -98,114 +100,289 @@ impl Link {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct Document {
+/// The pre-SQLite state document, kept only to import legacy state.json files.
+#[derive(Deserialize)]
+struct LegacyDocument {
     #[serde(default)]
     links: Vec<Link>,
-    /// Argon2 PHC hash set by "change password" in the admin UI. Once present
-    /// it wins over VOTPORT_ADMIN_PASSWORD, so a restart cannot silently roll
-    /// the password back to whatever the environment still holds. To recover a
-    /// lost password, delete this field from state.json and restart.
     #[serde(default)]
     admin_password_hash: Option<String>,
 }
 
+const SCHEMA_VERSION: &str = "1";
+
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS links (
+    id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    dest TEXT NOT NULL DEFAULT '',
+    password_hash TEXT,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER,
+    max_bytes INTEGER,
+    active INTEGER NOT NULL DEFAULT 1,
+    uploads_json TEXT NOT NULL DEFAULT '[]',
+    events_json TEXT NOT NULL DEFAULT '[]'
+);
+";
+
 pub struct Store {
-    path: PathBuf,
-    document: Mutex<Document>,
+    connection: Mutex<Connection>,
 }
 
 impl Store {
     pub fn open(data_dir: &Path) -> Result<Self, String> {
-        fs::create_dir_all(data_dir)
+        std::fs::create_dir_all(data_dir)
             .map_err(|error| format!("create {}: {error}", data_dir.display()))?;
-        let path = data_dir.join("state.json");
-        let document = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|error| format!("parse {}: {error}", path.display()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Document::default(),
-            Err(error) => return Err(format!("read {}: {error}", path.display())),
+        let path = data_dir.join("votport.db");
+        let connection =
+            Connection::open(&path).map_err(|error| format!("open {}: {error}", path.display()))?;
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .map_err(|error| error.to_string())?;
+        // Durability matches the old fsync-per-persist store: a completed
+        // mutation survives power loss.
+        connection
+            .pragma_update(None, "synchronous", "FULL")
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute_batch(SCHEMA)
+            .map_err(|error| format!("schema: {error}"))?;
+        // The db/-wal directory entries are new; sync them like the old JSON
+        // store synced its renames.
+        if let Ok(dir) = std::fs::File::open(data_dir) {
+            let _ = dir.sync_all();
+        }
+        let store = Self {
+            connection: Mutex::new(connection),
         };
-        Ok(Self {
-            path,
-            document: Mutex::new(document),
-        })
+        store.import_legacy(data_dir)?;
+        store.with(|connection| {
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?1)",
+                    [SCHEMA_VERSION],
+                )
+                .map(|_| ())
+        })?;
+        Ok(store)
+    }
+
+    /// Imports a legacy state.json once: links and the admin hash move into
+    /// the database, the file is renamed so a later crash cannot re-import
+    /// stale state over newer rows.
+    fn import_legacy(&self, data_dir: &Path) -> Result<(), String> {
+        let path = data_dir.join("state.json");
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Ok(());
+        };
+        let document: LegacyDocument = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("parse {}: {error}", path.display()))?;
+        {
+            let mut connection = self.connection.lock().expect("store poisoned");
+            let transaction = connection
+                .transaction()
+                .map_err(|error| error.to_string())?;
+            for link in &document.links {
+                // OR IGNORE keeps a retry idempotent: if a previous run
+                // committed the import but died before the rename, the rows
+                // are already there and identical.
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO links (id, label, dest, password_hash, created_at,
+                                                      expires_at, max_bytes, active,
+                                                      uploads_json, events_json)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        link_params(link),
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            if let Some(hash) = &document.admin_password_hash {
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO meta (key, value) VALUES ('admin_password_hash', ?1)",
+                        [hash],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            transaction.commit().map_err(|error| error.to_string())?;
+        }
+        let imported = data_dir.join("state.json.imported");
+        std::fs::rename(&path, imported).map_err(|error| error.to_string())?;
+        tracing::info!(
+            target: "audit",
+            links = document.links.len(),
+            "imported legacy state.json into sqlite"
+        );
+        Ok(())
+    }
+
+    /// Runs `f` with the connection, mapping SQL errors into strings.
+    fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T, String> {
+        let connection = self.connection.lock().expect("store poisoned");
+        f(&connection).map_err(|error| error.to_string())
     }
 
     pub fn admin_password_hash(&self) -> Option<String> {
-        self.document
-            .lock()
-            .expect("store poisoned")
-            .admin_password_hash
-            .clone()
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'admin_password_hash'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+        })
+        .expect("store read failed")
     }
 
     pub fn set_admin_password_hash(&self, hash: String) -> Result<(), String> {
-        let mut document = self.document.lock().expect("store poisoned");
-        document.admin_password_hash = Some(hash);
-        persist(&self.path, &document)
+        self.with(|connection| {
+            connection
+                .execute(
+                    "INSERT INTO meta (key, value) VALUES ('admin_password_hash', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [hash],
+                )
+                .map(|_| ())
+        })
     }
 
     pub fn links(&self) -> Vec<Link> {
-        self.document.lock().expect("store poisoned").links.clone()
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, label, dest, password_hash, created_at, expires_at, max_bytes,
+                        active, uploads_json, events_json
+                 FROM links ORDER BY rowid",
+            )?;
+            let rows = statement.query_map([], row_to_link)?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .expect("store read failed")
     }
 
     pub fn link(&self, id: &str) -> Option<Link> {
-        self.document
-            .lock()
-            .expect("store poisoned")
-            .links
-            .iter()
-            .find(|link| link.id == id)
-            .cloned()
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT id, label, dest, password_hash, created_at, expires_at, max_bytes,
+                            active, uploads_json, events_json
+                     FROM links WHERE id = ?1",
+                    [id],
+                    row_to_link,
+                )
+                .optional()
+        })
+        .expect("store read failed")
     }
 
     pub fn insert_link(&self, link: Link) -> Result<(), String> {
-        let mut document = self.document.lock().expect("store poisoned");
-        document.links.push(link);
-        persist(&self.path, &document)
+        self.with(|connection| insert_link_row(connection, &link))
     }
 
-    /// Applies `mutate` to the link and persists; Ok(false) when absent.
+    /// Applies `mutate` to the link and commits; Ok(false) when absent.
     pub fn update_link(&self, id: &str, mutate: impl FnOnce(&mut Link)) -> Result<bool, String> {
-        let mut document = self.document.lock().expect("store poisoned");
-        let Some(link) = document.links.iter_mut().find(|link| link.id == id) else {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let Some(mut link) = read_link(&transaction, id)? else {
             return Ok(false);
         };
-        mutate(link);
-        persist(&self.path, &document).map(|()| true)
+        mutate(&mut link);
+        write_link_row(&transaction, &link).map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(true)
     }
 
     pub fn remove_link(&self, id: &str) -> Result<bool, String> {
-        let mut document = self.document.lock().expect("store poisoned");
-        let before = document.links.len();
-        document.links.retain(|link| link.id != id);
-        if document.links.len() == before {
-            return Ok(false);
-        }
-        persist(&self.path, &document).map(|()| true)
+        self.with(|connection| {
+            let changed = connection.execute("DELETE FROM links WHERE id = ?1", [id])?;
+            Ok(changed > 0)
+        })
     }
 }
 
-fn persist(path: &Path, document: &Document) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(document).map_err(|error| error.to_string())?;
-    let temp = path.with_extension("json.tmp");
-    // A crash between write and rename leaves the temp behind; write_private
-    // uses create_new, so a stale temp would fail every persist forever.
-    match fs::remove_file(&temp) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("remove {}: {error}", temp.display())),
-    }
-    // 0600: the document holds the argon2 admin and link password hashes.
-    crate::auth::write_private(&temp, &bytes)
-        .map_err(|error| format!("write {}: {error}", temp.display()))?;
-    fs::rename(&temp, path).map_err(|error| error.to_string())?;
-    // The rename is only durable once its directory entry is.
-    if let Ok(dir) = fs::File::open(path.parent().unwrap_or(Path::new("."))) {
-        let _ = dir.sync_all();
-    }
+fn insert_link_row(connection: &Connection, link: &Link) -> rusqlite::Result<()> {
+    connection.execute(
+        "INSERT INTO links (id, label, dest, password_hash, created_at, expires_at, max_bytes,
+                            active, uploads_json, events_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        link_params(link),
+    )?;
     Ok(())
+}
+
+fn write_link_row(connection: &Connection, link: &Link) -> rusqlite::Result<()> {
+    connection.execute(
+        "UPDATE links SET label = ?2, dest = ?3, password_hash = ?4, created_at = ?5,
+                          expires_at = ?6, max_bytes = ?7, active = ?8,
+                          uploads_json = ?9, events_json = ?10
+         WHERE id = ?1",
+        link_params(link),
+    )?;
+    Ok(())
+}
+
+fn link_params(link: &Link) -> [rusqlite::types::Value; 10] {
+    use rusqlite::types::Value as V;
+    let uploads = serde_json::to_string(&link.uploads).unwrap_or_else(|_| "[]".to_owned());
+    let events = serde_json::to_string(&link.events).unwrap_or_else(|_| "[]".to_owned());
+    [
+        V::from(link.id.clone()),
+        V::from(link.label.clone()),
+        V::from(link.dest.clone()),
+        link.password_hash.clone().map(V::from).unwrap_or(V::Null),
+        V::from(i64::try_from(link.created_at).unwrap_or(i64::MAX)),
+        link.expires_at
+            .map(|at| V::from(i64::try_from(at).unwrap_or(i64::MAX)))
+            .unwrap_or(V::Null),
+        link.max_bytes
+            .map(|b| i64::try_from(b).unwrap_or(i64::MAX))
+            .map(V::from)
+            .unwrap_or(V::Null),
+        V::from(link.active),
+        V::from(uploads),
+        V::from(events),
+    ]
+}
+
+fn row_to_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<Link> {
+    let uploads_json: String = row.get("uploads_json")?;
+    let events_json: String = row.get("events_json")?;
+    Ok(Link {
+        id: row.get("id")?,
+        label: row.get("label")?,
+        dest: row.get("dest")?,
+        password_hash: row.get("password_hash")?,
+        created_at: row.get::<_, i64>("created_at")?.max(0) as u64,
+        expires_at: row
+            .get::<_, Option<i64>>("expires_at")?
+            .and_then(|value| u64::try_from(value).ok()),
+        max_bytes: row
+            .get::<_, Option<i64>>("max_bytes")?
+            .and_then(|value| u64::try_from(value).ok()),
+        active: row.get::<_, i64>("active")? != 0,
+        uploads: serde_json::from_str(&uploads_json).unwrap_or_default(),
+        events: serde_json::from_str(&events_json).unwrap_or_default(),
+    })
+}
+
+fn read_link(connection: &Connection, id: &str) -> Result<Option<Link>, String> {
+    connection
+        .query_row(
+            "SELECT id, label, dest, password_hash, created_at, expires_at, max_bytes,
+                    active, uploads_json, events_json
+             FROM links WHERE id = ?1",
+            [id],
+            row_to_link,
+        )
+        .optional()
+        .map_err(|error| error.to_string())
 }
 
 pub fn now_unix() -> u64 {
@@ -218,14 +395,9 @@ pub fn now_unix() -> u64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn persist_recovers_from_a_stale_temp_file() {
-        let directory = tempfile::tempdir().unwrap();
-        // Left behind by a crash between write and rename.
-        std::fs::write(directory.path().join("state.json.tmp"), b"garbage").unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        let link = Link {
-            id: "test-link".to_owned(),
+    fn test_link(id: &str) -> Link {
+        Link {
+            id: id.to_owned(),
             label: "test".to_owned(),
             dest: String::new(),
             password_hash: None,
@@ -235,10 +407,162 @@ mod tests {
             active: true,
             uploads: Vec::new(),
             events: Vec::new(),
-        };
-        store
-            .insert_link(link)
-            .expect("stale temp must not wedge the store");
+        }
+    }
+
+    #[test]
+    fn links_round_trip_with_uploads_and_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut link = test_link("link-1");
+        link.uploads.push(UploadRecord {
+            id: "up-1".to_owned(),
+            started_at: 1,
+            completed_at: 2,
+            replayed_chunks: 3,
+            rejected_chunks: 4,
+            package_root: "aa".to_owned(),
+            total_bytes: 5,
+            files: vec![FileRecord {
+                path: "a.txt".to_owned(),
+                stored_as: "a.txt".to_owned(),
+                bytes: 5,
+                suite: "blake3".to_owned(),
+                root: "bb".to_owned(),
+                receipt: true,
+                deleted: false,
+            }],
+        });
+        link.events.push(SessionEvent {
+            at: 3,
+            started_at: 1,
+            outcome: "cancelled".to_owned(),
+            detail: "by sender".to_owned(),
+            received_bytes: 6,
+            expected_bytes: 7,
+            replayed_chunks: 8,
+            rejected_chunks: 9,
+        });
+        store.insert_link(link).unwrap();
+
+        let loaded = store.link("link-1").unwrap();
+        assert_eq!(loaded.uploads.len(), 1);
+        assert!(loaded.uploads[0].files[0].receipt);
+        assert_eq!(loaded.events[0].outcome, "cancelled");
         assert_eq!(store.links().len(), 1);
+    }
+
+    #[test]
+    fn update_and_remove_report_presence() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.insert_link(test_link("link-1")).unwrap();
+        let found = store
+            .update_link("link-1", |link| link.active = false)
+            .unwrap();
+        assert!(found);
+        assert!(!store.link("link-1").unwrap().active);
+        assert!(!store.update_link("missing", |_| {}).unwrap());
+        assert!(store.remove_link("link-1").unwrap());
+        assert!(!store.remove_link("link-1").unwrap());
+        assert!(store.link("link-1").is_none());
+    }
+
+    #[test]
+    fn links_preserve_insertion_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.insert_link(test_link("b")).unwrap();
+        store.insert_link(test_link("a")).unwrap();
+        let ids: Vec<String> = store.links().into_iter().map(|link| link.id).collect();
+        assert_eq!(ids, ["b", "a"]);
+    }
+
+    #[test]
+    fn admin_hash_persists_across_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        assert!(store.admin_password_hash().is_none());
+        store
+            .set_admin_password_hash("argon2-hash".to_owned())
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(directory.path()).unwrap();
+        assert_eq!(
+            reopened.admin_password_hash().as_deref(),
+            Some("argon2-hash")
+        );
+    }
+
+    #[test]
+    fn optional_columns_round_trip() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut link = test_link("link-1");
+        link.password_hash = Some("argon2".to_owned());
+        link.expires_at = Some(12345);
+        link.max_bytes = Some(999);
+        store.insert_link(link).unwrap();
+        drop(store);
+        let reopened = Store::open(directory.path()).unwrap();
+        let loaded = reopened.link("link-1").unwrap();
+        assert_eq!(loaded.password_hash.as_deref(), Some("argon2"));
+        assert_eq!(loaded.expires_at, Some(12345));
+        assert_eq!(loaded.max_bytes, Some(999));
+        // And the None side survives too.
+        let mut bare = test_link("link-2");
+        bare.expires_at = None;
+        reopened.insert_link(bare).unwrap();
+        assert_eq!(reopened.link("link-2").unwrap().expires_at, None);
+    }
+
+    #[test]
+    fn interrupted_import_retries_cleanly() {
+        let directory = tempfile::tempdir().unwrap();
+        // Simulate a crash after the first link was committed but before the
+        // rename: the database already holds old-link-a while state.json
+        // still lists both.
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .insert_link(test_link_with_label("old-link-a", "old"))
+            .unwrap();
+        drop(store);
+        std::fs::write(
+            directory.path().join("state.json"),
+            r#"{"links":[
+                {"id":"old-link-a","label":"old","dest":"","created_at":0,"active":true},
+                {"id":"old-link-b","label":"old","dest":"","created_at":0,"active":true}]}"#,
+        )
+        .unwrap();
+        let reopened = Store::open(directory.path()).unwrap();
+        assert!(reopened.link("old-link-a").is_some());
+        assert!(reopened.link("old-link-b").is_some());
+        assert!(!directory.path().join("state.json").exists());
+    }
+
+    fn test_link_with_label(id: &str, label: &str) -> Link {
+        let mut link = test_link(id);
+        link.label = label.to_owned();
+        link
+    }
+
+    #[test]
+    fn legacy_state_json_is_imported_and_renamed() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("state.json"),
+            r#"{"links":[{"id":"old-link","label":"old","dest":"","created_at":0,"active":true}],
+                "admin_password_hash":"old-hash"}"#,
+        )
+        .unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        assert!(store.link("old-link").is_some());
+        assert_eq!(store.admin_password_hash().as_deref(), Some("old-hash"));
+        assert!(!directory.path().join("state.json").exists());
+        assert!(directory.path().join("state.json.imported").exists());
+        // Reopening must not re-import stale state over newer rows.
+        drop(store);
+        let reopened = Store::open(directory.path()).unwrap();
+        assert!(reopened.link("old-link").is_some());
     }
 }

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 pub struct Config {
     /// Address the HTTP server binds to.
     pub bind: SocketAddr,
-    /// Directory holding votport state (state.json, secret).
+    /// Directory holding votport state (votport.db, secret).
     pub data_dir: PathBuf,
     /// Root directory received files are published into.
     pub receive_dir: PathBuf,
