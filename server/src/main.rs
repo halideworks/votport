@@ -26,7 +26,7 @@ async fn main() {
     let config = match config::from_env() {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("votport: {error}");
+            tracing::error!("{error}");
             std::process::exit(2);
         }
     };

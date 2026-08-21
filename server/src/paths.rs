@@ -45,6 +45,13 @@ pub fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String
             "hidden file names are not accepted (VOTPORT_ALLOW_HIDDEN=1 to allow)".to_owned(),
         );
     }
+    // Reserved even with VOTPORT_ALLOW_HIDDEN: a sender file of this shape
+    // would publish fine and then be deleted by the next boot's staging sweep.
+    if component.starts_with(".vot-")
+        && (component.ends_with(".stage") || component.ends_with(".journal"))
+    {
+        return Err("name is reserved for votport staging files".to_owned());
+    }
     Ok(())
 }
 
@@ -163,6 +170,11 @@ mod tests {
         assert!(admit_component(".env", false).is_err());
         assert!(admit_component(".env", true).is_ok());
         assert!(admit_component("", true).is_err());
+        // The staging shape is reserved even when hidden names are allowed:
+        // the boot sweep deletes exactly these.
+        assert!(admit_component(".vot-1a2b-0-3c4d.stage", true).is_err());
+        assert!(admit_component(".vot-1a2b-0-3c4d.journal", true).is_err());
+        assert!(admit_component(".vot-notes.txt", true).is_ok());
     }
 
     #[test]

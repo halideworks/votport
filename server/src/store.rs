@@ -190,6 +190,13 @@ impl Store {
 fn persist(path: &Path, document: &Document) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(document).map_err(|error| error.to_string())?;
     let temp = path.with_extension("json.tmp");
+    // A crash between write and rename leaves the temp behind; write_private
+    // uses create_new, so a stale temp would fail every persist forever.
+    match fs::remove_file(&temp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("remove {}: {error}", temp.display())),
+    }
     // 0600: the document holds the argon2 admin and link password hashes.
     crate::auth::write_private(&temp, &bytes)
         .map_err(|error| format!("write {}: {error}", temp.display()))?;
@@ -205,4 +212,33 @@ pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persist_recovers_from_a_stale_temp_file() {
+        let directory = tempfile::tempdir().unwrap();
+        // Left behind by a crash between write and rename.
+        std::fs::write(directory.path().join("state.json.tmp"), b"garbage").unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let link = Link {
+            id: "test-link".to_owned(),
+            label: "test".to_owned(),
+            dest: String::new(),
+            password_hash: None,
+            created_at: 0,
+            expires_at: None,
+            max_bytes: None,
+            active: true,
+            uploads: Vec::new(),
+            events: Vec::new(),
+        };
+        store
+            .insert_link(link)
+            .expect("stale temp must not wedge the store");
+        assert_eq!(store.links().len(), 1);
+    }
 }

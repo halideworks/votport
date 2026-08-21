@@ -160,10 +160,15 @@ fn parse_bytes(value: &str) -> Result<u64, String> {
     if digits.is_empty() {
         return Err(format!("{value:?} is not a byte count"));
     }
-    digits
+    let bytes = digits
         .parse::<u64>()
-        .map(|bytes| bytes.saturating_mul(multiplier))
-        .map_err(|_| format!("{value:?} is out of range"))
+        .map_err(|_| format!("{value:?} is out of range"))?
+        .saturating_mul(multiplier);
+    // A zero cap would silently refuse every upload.
+    if bytes == 0 {
+        return Err(format!("{value:?} must be greater than zero"));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -182,7 +187,8 @@ mod tests {
             parse_bytes(" 50T ").unwrap(),
             50 * 1024u64 * 1024 * 1024 * 1024
         );
-        assert_eq!(parse_bytes("0").unwrap(), 0);
+        assert!(parse_bytes("0").is_err());
+        assert!(parse_bytes("0G").is_err());
         assert!(parse_bytes("").is_err());
         assert!(parse_bytes("500x").is_err());
         assert!(parse_bytes("-5").is_err());
