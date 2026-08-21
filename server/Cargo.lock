@@ -2120,6 +2120,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hmac 0.12.1",
+ "http-body-util",
  "qrcode",
  "rand 0.8.7",
  "reqwest",
