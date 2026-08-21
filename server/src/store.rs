@@ -26,6 +26,11 @@ pub struct FileRecord {
     /// Whether a signed `.vot-receipt` sidecar was written next to the file.
     #[serde(default)]
     pub receipt: bool,
+    /// Set when the admin deleted the stored file. The freed name can be
+    /// reused by later, different content, so a tombstoned record must never
+    /// satisfy dedupe even if a same-length file sits at its path again.
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 /// A session that ended without a completed upload: cancelled by the sender

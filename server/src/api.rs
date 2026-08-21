@@ -554,6 +554,21 @@ pub async fn delete_received_file(
             }
         }
     }
+    // Tombstone every record naming this path, not just the one deleted
+    // through: the freed name can be reused by different content, and any
+    // record still pointing there must never satisfy dedupe again.
+    let stored_as = record.stored_as.clone();
+    app.store
+        .update_link(&id, |link| {
+            for upload in &mut link.uploads {
+                for file in &mut upload.files {
+                    if file.stored_as == stored_as {
+                        file.deleted = true;
+                    }
+                }
+            }
+        })
+        .map_err(ApiError::internal)?;
     Ok(Json(json!({ "ok": true })))
 }
 
