@@ -378,7 +378,7 @@ pub async fn upload_finish(
     );
     app.store.audit(
         "upload_completed",
-        &sid,
+        &sid[..8.min(sid.len())],
         &serde_json::json!({
             "files": report.files.len(),
             "bytes": report.files.iter().map(|f| f.bytes).sum::<u64>()

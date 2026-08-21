@@ -190,7 +190,7 @@ pub async fn session_sweeper(app: Arc<App>) {
             _ = day.tick() => {
                 if app.config.audit_retention_days > 0 {
                     let cutoff =
-                        crate::store::now_unix().saturating_sub(app.config.audit_retention_days * 86_400);
+                        crate::store::now_unix().saturating_sub(app.config.audit_retention_days.saturating_mul(86_400));
                     match app.store.audit_prune(cutoff) {
                         Ok(count) if count > 0 => {
                             tracing::info!(count, "pruned expired audit rows");
