@@ -200,7 +200,24 @@ pub fn spawn_worker(setup: WorkerSetup) -> mpsc::Sender<Cmd> {
                     send_noted!(reply, handle_page(&mut phase, &bytes));
                 }
                 Cmd::Begin { reply } => {
-                    send_noted!(reply, handle_begin(&setup, &mut phase));
+                    let result = handle_begin(&setup, &mut phase);
+                    // A failed begin has consumed the pages: the phase is
+                    // already Done, the worker exits below, and the exit-time
+                    // "interrupted" fall-through is skipped. Record it here.
+                    if let Err(error) = &result {
+                        if matches!(phase, Phase::Done) {
+                            record_event(
+                                &setup,
+                                received,
+                                last_seen,
+                                "rejected",
+                                error.message.clone(),
+                                replays,
+                                rejected,
+                            );
+                        }
+                    }
+                    send_noted!(reply, result);
                 }
                 Cmd::Chunk {
                     entry,

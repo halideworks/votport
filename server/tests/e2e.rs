@@ -1263,3 +1263,98 @@ async fn aborted_sessions_record_a_cancelled_event() {
     assert_eq!(events[0]["rejected_chunks"].as_u64().unwrap(), 0);
     assert!(events[0]["expected_bytes"].as_u64().unwrap() > stopped);
 }
+
+/// A package refused at begin (hidden path here) consumes the session, so
+/// the worker must record a "rejected" event rather than exiting silently.
+#[tokio::test(flavor = "multi_thread")]
+async fn begin_rejection_records_an_event() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+
+    let response = client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let response = client
+        .post(format!("{base}/api/admin/links"))
+        .header("X-Votport", "1")
+        .json(&json!({ "label": "reject", "dest": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let token = response.json::<Value>().await.unwrap()["link"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let files = [prepare(vec![".hidden"], b"dotfile".to_vec())];
+    let (announcement, pages, seal) = build_package(&files);
+
+    let response = client
+        .post(format!("{base}/api/r/{token}/session"))
+        .json(&json!({ "password": null, "package": announcement }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let session = response.json::<Value>().await.unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let response = client
+        .post(format!("{base}/api/session/{session}/seal"))
+        .body(seal)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    for page in pages {
+        let response = client
+            .post(format!("{base}/api/session/{session}/page"))
+            .body(page)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    }
+    let response = client
+        .post(format!("{base}/api/session/{session}/begin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 422, "{}", response.text().await.unwrap());
+
+    let links = client
+        .get(format!("{base}/api/admin/links"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let events = links["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == json!(token))
+        .unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["outcome"], json!("rejected"));
+    assert!(
+        events[0]["detail"].as_str().unwrap().contains("hidden"),
+        "{events:?}"
+    );
+}

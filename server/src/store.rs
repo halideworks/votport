@@ -35,7 +35,7 @@ pub struct FileRecord {
 pub struct SessionEvent {
     pub at: u64,
     pub started_at: u64,
-    /// "cancelled" or "interrupted".
+    /// "cancelled", "interrupted", or "rejected" (begin refused the package).
     pub outcome: String,
     pub detail: String,
     pub received_bytes: u64,
