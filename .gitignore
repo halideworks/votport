@@ -3,3 +3,4 @@ web/assets/vendor/
 data/
 .env
 HANDOFF.md
+.pi/

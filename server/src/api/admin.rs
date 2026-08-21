@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -74,6 +74,8 @@ pub struct LoginRequest {
 
 pub async fn admin_login(
     State(app): State<Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> ApiResult<Response> {
     if app.throttle.locked() {
@@ -89,9 +91,12 @@ pub async fn admin_login(
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?;
     app.throttle.record(ok);
+    let ip = super::client_ip(&headers, &peer);
     if !ok {
+        tracing::warn!(target: "audit", event = "admin_login_failed", %ip, "admin login refused");
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "wrong password"));
     }
+    tracing::info!(target: "audit", event = "admin_login", %ip, "admin signed in");
     let token = auth::issue_admin_token(&app.secret, &admin_token_phc(&app));
     let cookie = format!(
         "{ADMIN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{}",
@@ -168,6 +173,7 @@ pub async fn admin_change_password(
     app.store
         .set_admin_password_hash(hash)
         .map_err(ApiError::internal)?;
+    tracing::info!(target: "audit", event = "admin_password_changed", "admin password changed; outstanding sessions invalidated");
     let token = auth::issue_admin_token(&app.secret, &admin_token_phc(&app));
     let cookie = format!(
         "{ADMIN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{}",
@@ -357,6 +363,7 @@ pub async fn create_link(
     let base = base_url(&app, &headers);
     let view = link_view(&app, link.clone(), &base);
     app.store.insert_link(link).map_err(ApiError::internal)?;
+    tracing::info!(target: "audit", event = "link_created", id = %view.id, label = %view.label, dest = %view.dest, "request link created");
     Ok(Json(json!({ "link": view })))
 }
 
@@ -379,6 +386,7 @@ pub async fn update_link(
     if !found {
         return Err(ApiError::not_found());
     }
+    tracing::info!(target: "audit", event = "link_active_changed", id = %id, active = request.active, "request link toggled");
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -391,6 +399,7 @@ pub async fn delete_link(
     if !app.store.remove_link(&id).map_err(ApiError::internal)? {
         return Err(ApiError::not_found());
     }
+    tracing::info!(target: "audit", event = "link_deleted", id = %id, "request link deleted");
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -428,6 +437,7 @@ pub async fn delete_upload_record(
     if !found {
         return Err(ApiError::not_found());
     }
+    tracing::info!(target: "audit", event = "upload_record_cleared", link = %id, upload = %upload, "upload record cleared from history");
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -480,6 +490,7 @@ pub async fn delete_received_file(
             }
         })
         .map_err(ApiError::internal)?;
+    tracing::info!(target: "audit", event = "received_file_deleted", link = %id, stored_as = %stored_as, "received file deleted from disk");
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -499,6 +510,10 @@ mod handler_tests {
             .method("POST")
             .uri("/api/admin/login")
             .header("content-type", "application/json")
+            .extension(ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                1234,
+            ))))
             .body(Body::from(format!(
                 "{{\"password\":\"{}\"}}",
                 testing::TEST_PASSWORD
@@ -574,6 +589,10 @@ mod handler_tests {
             .method("POST")
             .uri("/api/admin/login")
             .header("content-type", "application/json")
+            .extension(ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                1234,
+            ))))
             .body(Body::from(format!(
                 "{{\"password\":\"{}\"}}",
                 testing::TEST_PASSWORD

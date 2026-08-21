@@ -685,6 +685,12 @@ fn record_event(
         replayed_chunks: replays,
         rejected_chunks: rejected,
     };
+    tracing::warn!(
+        target: "audit", event = "upload_session_ended", link = %setup.link_id,
+        outcome = %event.outcome, detail = %event.detail,
+        received_bytes = event.received_bytes, expected_bytes = event.expected_bytes,
+        "upload session ended without completing"
+    );
     let _ = setup.store.update_link(&setup.link_id, |link| {
         link.events.push(event);
         if link.events.len() > EVENTS_KEPT {
