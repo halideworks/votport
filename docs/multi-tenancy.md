@@ -30,8 +30,11 @@ implementation, not the API.
 
 - rusqlite (bundled SQLite, WAL mode), one database file `data/votport.db`.
 - `Store` keeps its current method set; signatures gain no tenant concept yet.
-- Schema: `links`, `uploads`, `files`, `session_events`, `audit_log` (phase 2),
-  `meta` (schema version). Foreign keys on, `busy_timeout` set.
+- Schema: `links`, `uploads`, `files`, `meta` (schema version), plus an
+  `audit_log` table created now but written only from phase 2. Session events
+  stay embedded in the `links` row exactly as today (`Link.events`, capped) —
+  splitting them into a table changes the read API, so that moves to phase 2
+  with the audit work. Foreign keys on, `busy_timeout` set.
 - Migration: if `state.json` exists and the DB is absent, import and rename the
   JSON to `state.json.imported`. The importer runs before the listener binds; a
   failed import refuses startup rather than silently dropping links.
@@ -57,12 +60,16 @@ also inserted into `audit_log(at, tenant, actor, event, subject, detail_json)`.
 - Config: `VOTPORT_OIDC_ISSUER`, `VOTPORT_OIDC_CLIENT_ID`, secret file ref.
   Authorization-code flow with PKCE; discovery document fetched at boot.
 - The admin session cookie stays a stateless HMAC token, but its MAC now covers
-  `(subject, tenant, role)` instead of the password hash. Rotation of any of those
-  invalidates sessions, reusing the existing binding trick.
+  `(subject, tenant, role, credential_version)` instead of the password hash.
+  `credential_version` bumps on a local password change (preserving today's
+  guarantee that changing the break-glass password evicts every session) and on
+  role or tenant-mapping changes, reusing the existing binding trick.
 - Tenant mapping: the `tenant` claim if present, else group-to-tenant mapping in
   the DB, else the single default tenant. Role: `admin` or `viewer` from claims;
   `viewer` gets read-only admin routes (enforced where `require_admin_write`
-  sits today).
+  sits today); finer roles are deferred until someone asks with a use case.
+  SAML is out of scope: OIDC covers every provider named above, and SAML-in-front
+  of an OIDC bridge is the standard enterprise answer.
 - Local password auth remains the zero-config default and the break-glass path;
   it maps to the default tenant. When OIDC is configured, the login page offers
   SSO first.
@@ -92,6 +99,10 @@ also inserted into `audit_log(at, tenant, actor, event, subject, detail_json)`.
 - Per-tenant metrics lines on a plain-text `/metrics` (counts only, no new framework).
 - Deployment guide: single instance behind Caddy, volume layout, SSO setup with
   two worked examples (Authentik, Entra ID).
+- Upload-content lifecycle: `VOTPORT_UPLOAD_RETENTION_DAYS` (off by default) with
+  a daily sweep deleting expired received files and their records, emitting audit
+  events; audit retention alone does not answer "how long does received data
+  live", which every security review asks.
 
 ## Threat-model deltas
 
@@ -101,6 +112,8 @@ also inserted into `audit_log(at, tenant, actor, event, subject, detail_json)`.
 | Cross-tenant data read | Tenant is in every store query signature, not remembered by callers; token MAC binds tenant |
 | Tenant admin confusion | Cookie MAC covers `(subject, tenant, role)`; switching tenant re-issues the cookie |
 | Audit tampering | Audit rows are insert-only from the request path; no admin route deletes them; retention prune is the only writer |
+| Cross-tenant noisy-neighbor DoS | Today's `IpThrottle`, `SessionRate`, and session caps are shared buckets; phase 4 adds per-tenant throttle buckets and per-tenant session caps alongside them |
+| Tenant offboarding and erasure | Tenant deletion purges store rows and the receive subtree, emits an audit tombstone; backup docs cover per-tenant restore (GDPR-style erasure is a standard security-review ask) |
 | OIDC provider outage | Local break-glass account per tenant, created at first boot, password rotated on first login |
 
 ## Non-goals
@@ -109,7 +122,11 @@ also inserted into `audit_log(at, tenant, actor, event, subject, detail_json)`.
 - Tenant self-registration; tenants are provisioned by mapping, not signup.
 - Cross-tenant sharing, public API tokens, per-tenant custom domains.
 - Horizontal scaling: one writer (SQLite) is a feature at this scale; if a deploy
-  ever outgrows one node, the store trait is the seam, not a queue system.
+  ever outgrows one node, the `Store` struct is the seam (a trait gets introduced
+  only when a second backend actually exists).
+- Public API tokens: automation integration is a real enterprise ask, but tokens
+  that can create links bypass the human-rate assumptions of every throttle here;
+  they deserve their own design with scoped grants, not a phase-4 leftover.
 
 ## Deliberately unchanged
 
