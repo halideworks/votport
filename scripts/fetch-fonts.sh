@@ -8,7 +8,8 @@ cd "$(dirname "$0")/.."
 
 FAMILIES='family=Instrument+Serif:ital@0;1&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500'
 
-curl -s -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36" \
+# -f makes an HTTP error page fail the script instead of feeding the parser.
+curl -sf --fail -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36" \
     "https://fonts.googleapis.com/css2?${FAMILIES}&display=swap" -o /tmp/votport-gf.css
 
 python3 - <<'EOF'
@@ -27,6 +28,10 @@ for subset, block in blocks:
     fname = f"{family}-{weight}{'-italic' if style == 'italic' else ''}.woff2"
     urllib.request.urlretrieve(url, f"web/assets/fonts/{fname}")
     out.append(block.replace(url, f"/assets/fonts/{fname}"))
+
+if len(out) == 0:
+    # Never overwrite a good fonts.css from an unparsable response.
+    raise SystemExit("no latin @font-face blocks found; not writing fonts.css")
 
 open('web/assets/fonts.css', 'w').write(
     "// Self-hosted Google Fonts (latin subsets), OFL 1.1:\n"

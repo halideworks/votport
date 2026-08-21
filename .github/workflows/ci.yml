@@ -67,9 +67,10 @@ jobs:
       - name: Cargo advisories (cargo-deny)
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
-          workingdir: server
-          # The server is the only workspace member with dependencies.
+          # The workspace is rooted at server/; git dependencies need the CLI.
+          manifest-path: server/Cargo.toml
           command: check advisories
+          use-git-cli: true
 
   docker:
     runs-on: ubuntu-24.04
