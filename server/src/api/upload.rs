@@ -188,17 +188,18 @@ pub async fn create_session(
             "this link is no longer accepting uploads",
         ));
     }
+    // Every create-session request consumes rate budget, whatever the
+    // outcome: without this, holders of a no-password link could churn
+    // sessions into the global cap and evict legitimate senders' uploads.
+    let ip = client_ip(&headers, &peer);
+    if !app.session_rate.allow(&ip) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many uploads started from your address; try again later",
+        ));
+    }
     if !link_authorized(&app, &link, &headers) {
-        let ip = client_ip(&headers, &peer);
         check_link_password(&app, &link, request.password.as_deref(), &ip).await?;
-    } else {
-        let ip = client_ip(&headers, &peer);
-        if !app.session_rate.allow(&ip) {
-            return Err(ApiError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "too many uploads started from your address; try again later",
-            ));
-        }
     }
     if app.sessions.active_for_link(&link.id) >= MAX_SESSIONS_PER_LINK
         || app.sessions.total() >= MAX_SESSIONS
@@ -246,7 +247,8 @@ pub async fn create_session(
     let sender = session::spawn_worker(setup);
     tracing::info!(
         target: "audit", event = "upload_session_created", link = %link.id,
-        session = %session_id, bytes = announced_bytes, "upload session started"
+        session_tag = %session_id.get(..8).unwrap_or(&session_id),
+        bytes = announced_bytes, "upload session started"
     );
     app.sessions.insert(session_id.clone(), link.id, sender);
     Ok(Json(json!({
@@ -388,4 +390,70 @@ pub async fn upload_abort(
     let _ = dispatch(&app, &sid, |reply| Cmd::Abort { reply }).await;
     app.sessions.remove(&sid);
     Json(json!({ "ok": true }))
+}
+
+#[cfg(test)]
+mod session_rate_tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    use crate::api::testing;
+    use crate::app;
+    use crate::store::Link;
+
+    #[tokio::test]
+    async fn session_creation_is_rate_limited_per_ip() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let link = Link {
+            id: "rate-limited-link".to_owned(),
+            label: "open".to_owned(),
+            dest: String::new(),
+            password_hash: None,
+            created_at: 0,
+            expires_at: None,
+            max_bytes: None,
+            active: true,
+            uploads: Vec::new(),
+            events: Vec::new(),
+        };
+        application.store.insert_link(link).unwrap();
+
+        let router = app::router(application);
+        // Invalid packages fail 422 but still consume rate budget, so the
+        // 21st attempt from one address is refused outright.
+        for _ in 0..20 {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/api/r/rate-limited-link/session")
+                .header("content-type", "application/json")
+                .extension(ConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    1234,
+                ))))
+                .body(Body::from(
+                    r#"{"package":{"suite":"blake3","root":"00","length":1}}"#,
+                ))
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/r/rate-limited-link/session")
+            .header("content-type", "application/json")
+            .extension(ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                1234,
+            ))))
+            .body(Body::from(
+                r#"{"package":{"suite":"blake3","root":"00","length":1}}"#,
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
 }

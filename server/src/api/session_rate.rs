@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 /// Session creations allowed per IP per window.
 const MAX_PER_WINDOW: usize = 20;
 const WINDOW: Duration = Duration::from_secs(600);
+/// Distinct IPs tracked before expired entries are swept (~100 bytes each).
+const TABLE_CAP: usize = 4096;
 
 pub struct SessionRate {
     attempts: Mutex<HashMap<String, Vec<Instant>>>,
@@ -30,11 +32,18 @@ impl SessionRate {
         }
     }
 
-    /// Whether this IP may create another session now. Prunes expired
-    /// entries on every call, so abandoned IPs leave no residue.
+    /// Whether this IP may create another session now. Prunes this IP's
+    /// expired entries on every call; entries for IPs that never return are
+    /// dropped when the table hits its cap.
     pub fn allow(&self, ip: &str) -> bool {
         let mut attempts = self.attempts.lock().expect("session rate poisoned");
         let now = Instant::now();
+        if attempts.len() >= TABLE_CAP {
+            attempts.retain(|_, entries| {
+                entries.retain(|at| now.duration_since(*at) < WINDOW);
+                !entries.is_empty()
+            });
+        }
         let entries = attempts.entry(ip.to_owned()).or_default();
         entries.retain(|at| now.duration_since(*at) < WINDOW);
         if entries.len() >= MAX_PER_WINDOW {
