@@ -444,7 +444,7 @@ fn find_delivered(
     let suite = suite_name(object.suite);
     let root = hex::encode(object.root);
     for record in uploads.iter().flat_map(|upload| &upload.files) {
-        if record.root != root || record.suite != suite {
+        if record.deleted || record.root != root || record.suite != suite {
             continue;
         }
         // stored_as is relative to the receive root. A record made under a
@@ -619,6 +619,7 @@ fn handle_finish(
             suite: suite_name(file.object.suite),
             root: hex::encode(file.object.root),
             receipt: file.receipt,
+            deleted: false,
         })
         .collect();
     let upload = UploadRecord {

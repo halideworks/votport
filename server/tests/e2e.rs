@@ -1504,4 +1504,68 @@ async fn identical_resend_is_deduped_not_suffixed() {
         "a record whose file is gone must not dedupe; the transfer redelivers"
     );
     assert!(!server.receive_dir.join("dup-1.bin").exists());
+
+    // --- admin deletes the file, different same-length content reuses the
+    // name: the old root must not dedupe onto the impostor ------------------
+    let links = client
+        .get(format!("{base}/api/admin/links"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let uploads = links["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == json!(token))
+        .unwrap()["uploads"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let (upload_id, file_index) = uploads
+        .iter()
+        .find_map(|upload| {
+            upload["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|file| file["stored_as"] == json!("dup.bin"))
+                .map(|index| (upload["id"].as_str().unwrap().to_owned(), index))
+        })
+        .expect("a record for dup.bin");
+    let response = client
+        .delete(format!(
+            "{base}/api/admin/links/{token}/uploads/{upload_id}/files/{file_index}"
+        ))
+        .header("X-Votport", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    assert!(!server.receive_dir.join("dup.bin").exists());
+
+    // Different bytes, same length and name, land at the freed path.
+    let impostor_bytes: Vec<u8> = dup_bytes.iter().map(|byte| byte.wrapping_add(1)).collect();
+    let impostor = [prepare(vec!["dup.bin"], impostor_bytes.clone())];
+    run_upload(&client, &base, &token, "", &impostor).await;
+    assert_eq!(
+        std::fs::read(server.receive_dir.join("dup.bin")).unwrap(),
+        impostor_bytes
+    );
+
+    // Re-announcing the original root must transfer for real and publish
+    // beside the impostor, never claim its bytes as delivered.
+    let original = [prepare(vec!["dup.bin"], dup_bytes.clone())];
+    run_upload(&client, &base, &token, "", &original).await;
+    assert_eq!(
+        std::fs::read(server.receive_dir.join("dup-1.bin")).unwrap(),
+        dup_bytes
+    );
+    assert_eq!(
+        std::fs::read(server.receive_dir.join("dup.bin")).unwrap(),
+        impostor_bytes,
+        "the impostor stays untouched"
+    );
 }
