@@ -152,18 +152,23 @@ impl Store {
         connection
             .execute_batch(SCHEMA)
             .map_err(|error| format!("schema: {error}"))?;
+        // The db/-wal directory entries are new; sync them like the old JSON
+        // store synced its renames.
+        if let Ok(dir) = std::fs::File::open(data_dir) {
+            let _ = dir.sync_all();
+        }
         let store = Self {
             connection: Mutex::new(connection),
         };
         store.import_legacy(data_dir)?;
-        store
-            .with(|connection| {
-                connection.execute(
+        store.with(|connection| {
+            connection
+                .execute(
                     "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?1)",
                     [SCHEMA_VERSION],
                 )
-            })?
-            .map_err(|error| error.to_string())?;
+                .map(|_| ())
+        })?;
         Ok(store)
     }
 
@@ -178,18 +183,33 @@ impl Store {
         let document: LegacyDocument = serde_json::from_slice(&bytes)
             .map_err(|error| format!("parse {}: {error}", path.display()))?;
         {
-            let connection = self.connection.lock().expect("store poisoned");
+            let mut connection = self.connection.lock().expect("store poisoned");
+            let transaction = connection
+                .transaction()
+                .map_err(|error| error.to_string())?;
             for link in &document.links {
-                insert_link_row(&connection, link).map_err(|error| error.to_string())?;
+                // OR IGNORE keeps a retry idempotent: if a previous run
+                // committed the import but died before the rename, the rows
+                // are already there and identical.
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO links (id, label, dest, password_hash, created_at,
+                                                      expires_at, max_bytes, active,
+                                                      uploads_json, events_json)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        link_params(link),
+                    )
+                    .map_err(|error| error.to_string())?;
             }
             if let Some(hash) = &document.admin_password_hash {
-                connection
+                transaction
                     .execute(
                         "INSERT OR IGNORE INTO meta (key, value) VALUES ('admin_password_hash', ?1)",
                         [hash],
                     )
                     .map_err(|error| error.to_string())?;
             }
+            transaction.commit().map_err(|error| error.to_string())?;
         }
         let imported = data_dir.join("state.json.imported");
         std::fs::rename(&path, imported).map_err(|error| error.to_string())?;
@@ -201,13 +221,10 @@ impl Store {
         Ok(())
     }
 
-    /// Runs `f` with the connection; Ok(Err(..)) carries a mapped SQL error.
-    fn with<T>(
-        &self,
-        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
-    ) -> Result<Result<T, String>, String> {
+    /// Runs `f` with the connection, mapping SQL errors into strings.
+    fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T, String> {
         let connection = self.connection.lock().expect("store poisoned");
-        Ok(f(&connection).map_err(|error| error.to_string()))
+        f(&connection).map_err(|error| error.to_string())
     }
 
     pub fn admin_password_hash(&self) -> Option<String> {
@@ -220,8 +237,7 @@ impl Store {
                 )
                 .optional()
         })
-        .expect("store poisoned")
-        .expect("store poisoned")
+        .expect("store read failed")
     }
 
     pub fn set_admin_password_hash(&self, hash: String) -> Result<(), String> {
@@ -233,7 +249,7 @@ impl Store {
                     [hash],
                 )
                 .map(|_| ())
-        })?
+        })
     }
 
     pub fn links(&self) -> Vec<Link> {
@@ -246,8 +262,7 @@ impl Store {
             let rows = statement.query_map([], row_to_link)?;
             rows.collect::<Result<Vec<_>, _>>()
         })
-        .expect("store poisoned")
-        .expect("store poisoned")
+        .expect("store read failed")
     }
 
     pub fn link(&self, id: &str) -> Option<Link> {
@@ -262,12 +277,11 @@ impl Store {
                 )
                 .optional()
         })
-        .expect("store poisoned")
-        .expect("store poisoned")
+        .expect("store read failed")
     }
 
     pub fn insert_link(&self, link: Link) -> Result<(), String> {
-        self.with(|connection| insert_link_row(connection, &link))?
+        self.with(|connection| insert_link_row(connection, &link))
     }
 
     /// Applies `mutate` to the link and commits; Ok(false) when absent.
@@ -289,7 +303,7 @@ impl Store {
         self.with(|connection| {
             let changed = connection.execute("DELETE FROM links WHERE id = ?1", [id])?;
             Ok(changed > 0)
-        })?
+        })
     }
 }
 
@@ -478,6 +492,58 @@ mod tests {
             reopened.admin_password_hash().as_deref(),
             Some("argon2-hash")
         );
+    }
+
+    #[test]
+    fn optional_columns_round_trip() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut link = test_link("link-1");
+        link.password_hash = Some("argon2".to_owned());
+        link.expires_at = Some(12345);
+        link.max_bytes = Some(999);
+        store.insert_link(link).unwrap();
+        drop(store);
+        let reopened = Store::open(directory.path()).unwrap();
+        let loaded = reopened.link("link-1").unwrap();
+        assert_eq!(loaded.password_hash.as_deref(), Some("argon2"));
+        assert_eq!(loaded.expires_at, Some(12345));
+        assert_eq!(loaded.max_bytes, Some(999));
+        // And the None side survives too.
+        let mut bare = test_link("link-2");
+        bare.expires_at = None;
+        reopened.insert_link(bare).unwrap();
+        assert_eq!(reopened.link("link-2").unwrap().expires_at, None);
+    }
+
+    #[test]
+    fn interrupted_import_retries_cleanly() {
+        let directory = tempfile::tempdir().unwrap();
+        // Simulate a crash after the first link was committed but before the
+        // rename: the database already holds old-link-a while state.json
+        // still lists both.
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .insert_link(test_link_with_label("old-link-a", "old"))
+            .unwrap();
+        drop(store);
+        std::fs::write(
+            directory.path().join("state.json"),
+            r#"{"links":[
+                {"id":"old-link-a","label":"old","dest":"","created_at":0,"active":true},
+                {"id":"old-link-b","label":"old","dest":"","created_at":0,"active":true}]}"#,
+        )
+        .unwrap();
+        let reopened = Store::open(directory.path()).unwrap();
+        assert!(reopened.link("old-link-a").is_some());
+        assert!(reopened.link("old-link-b").is_some());
+        assert!(!directory.path().join("state.json").exists());
+    }
+
+    fn test_link_with_label(id: &str, label: &str) -> Link {
+        let mut link = test_link(id);
+        link.label = label.to_owned();
+        link
     }
 
     #[test]

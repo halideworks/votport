@@ -110,7 +110,7 @@ fn verify_token(secret: &[u8; 32], context: &[&[u8]], token: &str) -> bool {
 
 /// Issues an admin session token: `expires.nonce.mac`. The MAC covers the
 /// stored password hash, so changing the password via the UI invalidates
-/// every outstanding session. `phc` is the state.json hash or empty when the
+/// every outstanding session. `phc` is the stored hash or empty when the
 /// password still comes from the environment; the env-derived hash is salted
 /// fresh each boot and would otherwise log the admin out on every restart.
 pub fn issue_admin_token(secret: &[u8; 32], phc: &str) -> String {

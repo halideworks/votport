@@ -18,7 +18,7 @@ use super::{cookie_attributes, ApiError, ApiResult};
 
 const ADMIN_COOKIE: &str = "votport_admin";
 
-/// Credential tag bound into admin token MACs: the state.json hash when the
+/// Credential tag bound into admin token MACs: the stored hash when the
 /// UI has set one, else the stable tag derived from the environment
 /// credential. Either way, rotating the credential evicts sessions and a
 /// plain restart does not.
@@ -127,7 +127,7 @@ pub struct ChangePasswordRequest {
     new: String,
 }
 
-/// Replaces the admin password. The new hash is persisted in state.json, which
+/// Replaces the admin password. The new hash is persisted in the store, which
 /// from then on takes precedence over the environment. Token MACs cover that
 /// hash, so every outstanding admin session is invalidated by the change; the
 /// response reissues a cookie under the new hash so the acting admin stays
