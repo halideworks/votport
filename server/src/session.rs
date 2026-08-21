@@ -86,6 +86,11 @@ pub enum Cmd {
     Finish {
         reply: Reply<FinishReport>,
     },
+    /// Sender gave up; lets the worker record a "cancelled" event before it
+    /// exits, instead of the generic "interrupted" the drop path records.
+    Abort {
+        reply: Reply<()>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -130,6 +135,8 @@ pub struct WorkerSetup {
     pub signer: Arc<crate::receipt::ReceiptSigner>,
     /// The session id bytes, carried into issued receipts.
     pub session_id: [u8; 16],
+    /// When the session was created, for duration/rate feedback.
+    pub started_at: u64,
 }
 
 struct FileState {
@@ -163,16 +170,54 @@ pub fn spawn_worker(setup: WorkerSetup) -> mpsc::Sender<Cmd> {
     let (sender, mut receiver) = mpsc::channel::<Cmd>(8);
     std::thread::spawn(move || {
         let mut phase = Phase::AwaitSeal;
+        // Feedback for the admin: bytes newly accepted this session and the
+        // last error handed to the sender, recorded if the session dies.
+        let mut received: u64 = 0;
+        let mut replays: u64 = 0;
+        let mut rejected: u64 = 0;
+        let mut last_error: Option<String> = None;
+        // When the sender was last heard from. The worker only exits long
+        // after that (the idle sweep), so stamping the event with now_unix()
+        // there would date a five-minute failure two days late.
+        let mut last_seen = now_unix();
+        // Remembers the error message, then hands the result to the sender.
+        macro_rules! send_noted {
+            ($reply:expr, $result:expr) => {{
+                let result = $result;
+                if let Err(error) = &result {
+                    last_error = Some(error.message.clone());
+                }
+                let _ = $reply.send(result);
+            }};
+        }
         while let Some(cmd) = receiver.blocking_recv() {
+            last_seen = now_unix();
             match cmd {
                 Cmd::Seal { bytes, reply } => {
-                    let _ = reply.send(handle_seal(&setup, &mut phase, &bytes));
+                    send_noted!(reply, handle_seal(&setup, &mut phase, &bytes));
                 }
                 Cmd::Page { bytes, reply } => {
-                    let _ = reply.send(handle_page(&mut phase, &bytes));
+                    send_noted!(reply, handle_page(&mut phase, &bytes));
                 }
                 Cmd::Begin { reply } => {
-                    let _ = reply.send(handle_begin(&setup, &mut phase));
+                    let result = handle_begin(&setup, &mut phase);
+                    // A failed begin has consumed the pages: the phase is
+                    // already Done, the worker exits below, and the exit-time
+                    // "interrupted" fall-through is skipped. Record it here.
+                    if let Err(error) = &result {
+                        if matches!(phase, Phase::Done) {
+                            record_event(
+                                &setup,
+                                received,
+                                last_seen,
+                                "rejected",
+                                error.message.clone(),
+                                replays,
+                                rejected,
+                            );
+                        }
+                    }
+                    send_noted!(reply, result);
                 }
                 Cmd::Chunk {
                     entry,
@@ -181,17 +226,48 @@ pub fn spawn_worker(setup: WorkerSetup) -> mpsc::Sender<Cmd> {
                     data,
                     reply,
                 } => {
-                    let _ = reply.send(handle_chunk(
-                        &setup, &mut phase, entry, offset, &proof, &data,
-                    ));
+                    let result = handle_chunk(&setup, &mut phase, entry, offset, &proof, &data);
+                    match &result {
+                        Ok(progress) if progress.replay => replays += 1,
+                        Ok(progress) if progress.accepted => received += data.len() as u64,
+                        Ok(_) => {}
+                        Err(_) => rejected += 1,
+                    }
+                    send_noted!(reply, result);
                 }
                 Cmd::Finish { reply } => {
-                    let _ = reply.send(handle_finish(&setup, &mut phase));
+                    send_noted!(reply, handle_finish(&setup, &mut phase, replays, rejected));
+                }
+                Cmd::Abort { reply } => {
+                    record_event(
+                        &setup,
+                        received,
+                        last_seen,
+                        "cancelled",
+                        "cancelled by the sender".to_owned(),
+                        replays,
+                        rejected,
+                    );
+                    phase = Phase::Done;
+                    let _ = reply.send(Ok(()));
                 }
             }
             if matches!(phase, Phase::Done) {
                 break;
             }
+        }
+        if !matches!(phase, Phase::Done) {
+            record_event(
+                &setup,
+                received,
+                last_seen,
+                "interrupted",
+                last_error.unwrap_or_else(|| {
+                    "session went idle and expired; the sender likely disconnected".to_owned()
+                }),
+                replays,
+                rejected,
+            );
         }
         // Dropping unpublished NativeFile values removes their staging.
     });
@@ -454,7 +530,12 @@ fn publish_file(setup: &WorkerSetup, file: &mut FileState) -> Result<(), Session
     Ok(())
 }
 
-fn handle_finish(setup: &WorkerSetup, phase: &mut Phase) -> Result<FinishReport, SessionError> {
+fn handle_finish(
+    setup: &WorkerSetup,
+    phase: &mut Phase,
+    replays: u64,
+    rejected: u64,
+) -> Result<FinishReport, SessionError> {
     let Phase::Receiving { files } = phase else {
         return Err(SessionError::conflict("nothing to finish in this state"));
     };
@@ -477,7 +558,10 @@ fn handle_finish(setup: &WorkerSetup, phase: &mut Phase) -> Result<FinishReport,
         .collect();
     let upload = UploadRecord {
         id: crate::auth::random_token(),
+        started_at: setup.started_at,
         completed_at: now_unix(),
+        replayed_chunks: replays,
+        rejected_chunks: rejected,
         package_root: hex::encode(setup.expected_package.root),
         total_bytes: records.iter().map(|record| record.bytes).sum(),
         files: records.clone(),
@@ -492,6 +576,41 @@ fn handle_finish(setup: &WorkerSetup, phase: &mut Phase) -> Result<FinishReport,
         upload_id,
         files: records,
     })
+}
+
+/// How many failed/cancelled session events each link keeps, oldest dropped.
+const EVENTS_KEPT: usize = 20;
+
+/// Best effort: feedback must never fail a session, so the store error is
+/// dropped. `expected_bytes` is the whole package (manifest included) while
+/// `received` counts file payload only, so a near-complete session can read
+/// slightly under 100%.
+fn record_event(
+    setup: &WorkerSetup,
+    received: u64,
+    at: u64,
+    outcome: &str,
+    detail: String,
+    replays: u64,
+    rejected: u64,
+) {
+    let event = crate::store::SessionEvent {
+        at,
+        started_at: setup.started_at,
+        outcome: outcome.to_owned(),
+        detail,
+        received_bytes: received,
+        expected_bytes: setup.expected_package.length,
+        replayed_chunks: replays,
+        rejected_chunks: rejected,
+    };
+    let _ = setup.store.update_link(&setup.link_id, |link| {
+        link.events.push(event);
+        if link.events.len() > EVENTS_KEPT {
+            let excess = link.events.len() - EVENTS_KEPT;
+            link.events.drain(..excess);
+        }
+    });
 }
 
 fn stored_rel(dest_rel: &str, components: &[String]) -> String {

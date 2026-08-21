@@ -58,6 +58,22 @@ function formatWhen(unixSeconds) {
   return new Date(unixSeconds * 1000).toLocaleString();
 }
 
+// Connection-quality proxy: chunks the sender re-sent (its response got lost
+// in transit) or the server refused. Zero for a clean transfer, so shown only
+// when there was trouble.
+function chunkTrouble(record) {
+  let text = '';
+  if (record.replayed_chunks) text += ` · ${record.replayed_chunks} re-sent chunks`;
+  if (record.rejected_chunks) text += ` · ${record.rejected_chunks} rejected chunks`;
+  return text;
+}
+
+function formatDuration(seconds) {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+}
+
 function show(section) {
   $('login').hidden = section !== 'login';
   $('dashboard').hidden = section !== 'dashboard';
@@ -164,6 +180,38 @@ function renderLink(link) {
     details.append(list);
     card.append(details);
   }
+
+  if (link.events?.length) {
+    const details = document.createElement('details');
+    const summary = document.createElement('summary');
+    summary.textContent =
+      `${link.events.length} incomplete session${link.events.length === 1 ? '' : 's'}`;
+    details.append(summary);
+    const list = document.createElement('ul');
+    list.className = 'uploads';
+    for (const event of [...link.events].reverse()) {
+      const item = document.createElement('li');
+      const head = document.createElement('div');
+      head.className = 'upload-head';
+      const when = document.createElement('span');
+      let text = `${formatWhen(event.at)} · ${event.outcome}`;
+      if (event.at > event.started_at) {
+        text += ` after ${formatDuration(event.at - event.started_at)}`;
+      }
+      text += ` · ${formatBytes(event.received_bytes)} of ${formatBytes(event.expected_bytes)} received`;
+      text += chunkTrouble(event);
+      when.textContent = text;
+      head.append(when);
+      item.append(head);
+      const detail = document.createElement('div');
+      detail.className = 'muted file-id';
+      detail.textContent = event.detail;
+      item.append(detail);
+      list.append(item);
+    }
+    details.append(list);
+    card.append(details);
+  }
   return card;
 }
 
@@ -174,6 +222,13 @@ function renderUpload(link, upload) {
   head.className = 'upload-head';
   const when = document.createElement('span');
   when.textContent = `${formatWhen(upload.completed_at)} · ${formatBytes(upload.total_bytes)}`;
+  // started_at is 0 on records from before it was tracked.
+  if (upload.started_at && upload.completed_at > upload.started_at) {
+    const seconds = upload.completed_at - upload.started_at;
+    when.textContent +=
+      ` · ${formatDuration(seconds)} · ${formatBytes(Math.round(upload.total_bytes / seconds))}/s`;
+  }
+  when.textContent += chunkTrouble(upload);
   head.append(
     when,
     button('Clear record', 'tiny ghost', async () => {
