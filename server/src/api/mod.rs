@@ -7,8 +7,9 @@ pub mod session_rate;
 pub mod upload;
 
 pub use admin::{
-    admin_change_password, admin_login, admin_logout, admin_session, create_link, delete_link,
-    delete_received_file, delete_upload_record, link_qr, list_links, update_link,
+    admin_audit_export, admin_change_password, admin_login, admin_logout, admin_session,
+    create_link, delete_link, delete_received_file, delete_upload_record, link_qr, list_links,
+    update_link,
 };
 pub use upload::{
     create_session, link_info, upload_abort, upload_begin, upload_chunk, upload_finish,
@@ -143,6 +144,7 @@ pub(crate) mod testing {
             max_upload_bytes: 1024 * 1024,
             allow_hidden: false,
             session_idle_secs: 60,
+            audit_retention_days: 400,
         };
         app::build(config).unwrap()
     }

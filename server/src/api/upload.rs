@@ -250,6 +250,11 @@ pub async fn create_session(
         session_tag = %session_id.get(..8).unwrap_or(&session_id),
         bytes = announced_bytes, "upload session started"
     );
+    app.store.audit(
+        "upload_session_created",
+        &link.id,
+        &serde_json::json!({ "session_tag": &session_id[..8.min(session_id.len())], "bytes": announced_bytes }),
+    );
     app.sessions.insert(session_id.clone(), link.id, sender);
     Ok(Json(json!({
         "session": session_id,
@@ -370,6 +375,14 @@ pub async fn upload_finish(
         target: "audit", event = "upload_completed", session = %sid,
         files = report.files.len(), bytes = report.files.iter().map(|f| f.bytes).sum::<u64>(),
         "upload finished and recorded"
+    );
+    app.store.audit(
+        "upload_completed",
+        &sid,
+        &serde_json::json!({
+            "files": report.files.len(),
+            "bytes": report.files.iter().map(|f| f.bytes).sum::<u64>()
+        }),
     );
     if let Some(link) = link_id.and_then(|id| app.store.link(&id)) {
         tokio::spawn(crate::notify::uploaded(

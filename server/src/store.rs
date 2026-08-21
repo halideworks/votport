@@ -109,13 +109,22 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-const SCHEMA_VERSION: &str = "1";
+const SCHEMA_VERSION: &str = "2";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS audit_log (
+    at INTEGER NOT NULL,
+    tenant TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT '',
+    event TEXT NOT NULL,
+    subject TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS audit_log_at ON audit_log(at);
 CREATE TABLE IF NOT EXISTS links (
     id TEXT PRIMARY KEY,
     label TEXT NOT NULL,
@@ -164,7 +173,8 @@ impl Store {
         store.with(|connection| {
             connection
                 .execute(
-                    "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?1)",
+                    "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     [SCHEMA_VERSION],
                 )
                 .map(|_| ())
@@ -217,6 +227,11 @@ impl Store {
             target: "audit",
             links = document.links.len(),
             "imported legacy state.json into sqlite"
+        );
+        self.audit(
+            "legacy_state_imported",
+            "",
+            &serde_json::json!({ "links": document.links.len() }),
         );
         Ok(())
     }
@@ -385,6 +400,74 @@ fn read_link(connection: &Connection, id: &str) -> Result<Option<Link>, String> 
         .map_err(|error| error.to_string())
 }
 
+/// One row of the audit log as exported.
+#[derive(Clone, Debug, Serialize)]
+pub struct AuditRow {
+    pub at: u64,
+    pub tenant: String,
+    pub actor: String,
+    pub event: String,
+    pub subject: String,
+    pub detail: serde_json::Value,
+}
+
+impl Store {
+    /// Inserts one audit row. Best effort: the tracing event at the call site
+    /// is the operational record; the row is the queryable one.
+    pub fn audit(&self, event: &str, subject: &str, detail: &serde_json::Value) {
+        let _ = self.with(|connection| {
+            connection.execute(
+                "INSERT INTO audit_log (at, tenant, actor, event, subject, detail)
+                 VALUES (?1, '', '', ?2, ?3, ?4)",
+                rusqlite::params![
+                    i64::try_from(now_unix()).unwrap_or(0),
+                    event,
+                    subject,
+                    detail.to_string()
+                ],
+            )
+        });
+    }
+
+    /// Audit rows after `since`, oldest first, capped.
+    pub fn audit_export(&self, since: u64, limit: u64) -> Result<Vec<AuditRow>, String> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT at, tenant, actor, event, subject, detail
+                 FROM audit_log WHERE at > ?1 ORDER BY at, rowid LIMIT ?2",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![
+                    i64::try_from(since).unwrap_or(0),
+                    i64::try_from(limit).unwrap_or(1000)
+                ],
+                |row| {
+                    Ok(AuditRow {
+                        at: row.get::<_, i64>(0)?.max(0) as u64,
+                        tenant: row.get(1)?,
+                        actor: row.get(2)?,
+                        event: row.get(3)?,
+                        subject: row.get(4)?,
+                        detail: serde_json::from_str(&row.get::<_, String>(5)?)
+                            .unwrap_or(serde_json::Value::Null),
+                    })
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    /// Deletes audit rows older than `before`; returns how many.
+    pub fn audit_prune(&self, before: u64) -> Result<usize, String> {
+        self.with(|connection| {
+            connection.execute(
+                "DELETE FROM audit_log WHERE at < ?1",
+                [i64::try_from(before).unwrap_or(0)],
+            )
+        })
+    }
+}
+
 pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -544,6 +627,36 @@ mod tests {
         let mut link = test_link(id);
         link.label = label.to_owned();
         link
+    }
+
+    #[test]
+    fn audit_rows_round_trip_export_and_prune() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.audit(
+            "link_created",
+            "link-1",
+            &serde_json::json!({ "label": "x" }),
+        );
+        store.audit("admin_login", "10.0.0.1", &serde_json::json!({}));
+
+        let rows = store.audit_export(0, 100).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].event, "link_created");
+        assert_eq!(rows[0].tenant, "");
+        assert_eq!(rows[0].detail["label"], "x");
+        // `since` is strictly greater-than (rows share second granularity).
+        let after_all = store
+            .audit_export(rows.last().unwrap().at + 1, 100)
+            .unwrap();
+        assert!(after_all.is_empty());
+        assert_eq!(store.audit_export(0, 1).unwrap().len(), 1);
+
+        // Pruning removes only rows strictly older than the cutoff.
+        let now = now_unix();
+        let pruned = store.audit_prune(now + 1).unwrap();
+        assert_eq!(pruned, 2);
+        assert!(store.audit_export(0, 100).unwrap().is_empty());
     }
 
     #[test]
