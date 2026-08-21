@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -94,9 +94,12 @@ pub async fn admin_login(
     let ip = super::client_ip(&headers, &peer);
     if !ok {
         tracing::warn!(target: "audit", event = "admin_login_failed", %ip, "admin login refused");
+        app.store
+            .audit("admin_login_failed", &ip, &serde_json::json!({}));
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "wrong password"));
     }
     tracing::info!(target: "audit", event = "admin_login", %ip, "admin signed in");
+    app.store.audit("admin_login", &ip, &serde_json::json!({}));
     let token = auth::issue_admin_token(&app.secret, &admin_token_phc(&app));
     let cookie = format!(
         "{ADMIN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{}",
@@ -111,6 +114,53 @@ pub async fn admin_logout(State(app): State<Arc<App>>) -> Response {
         cookie_attributes(&app)
     );
     ([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response()
+}
+
+/// Streams audit rows after `since` as JSONL, oldest first. Caps at 10_000
+/// rows per call; callers paginate with `since`.
+pub async fn admin_audit_export(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Query(query): Query<AuditQuery>,
+) -> ApiResult<Response> {
+    require_admin(&app, &headers)?;
+    let limit = query.limit.unwrap_or(1000).min(10_000);
+    let rows = app
+        .store
+        .audit_export(query.since.unwrap_or(0), limit)
+        .map_err(ApiError::internal)?;
+    use std::fmt::Write as _;
+    let mut body = String::new();
+    for row in rows {
+        let detail = row.detail;
+        writeln!(
+            body,
+            "{}",
+            serde_json::json!({
+                "at": row.at,
+                "tenant": row.tenant,
+                "actor": row.actor,
+                "event": row.event,
+                "subject": row.subject,
+                "detail": detail,
+            })
+        )
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    }
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-ndjson; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+pub struct AuditQuery {
+    since: Option<u64>,
+    limit: Option<u64>,
 }
 
 pub async fn admin_session(
@@ -174,6 +224,8 @@ pub async fn admin_change_password(
         .set_admin_password_hash(hash)
         .map_err(ApiError::internal)?;
     tracing::info!(target: "audit", event = "admin_password_changed", "admin password changed; outstanding sessions invalidated");
+    app.store
+        .audit("admin_password_changed", "", &serde_json::json!({}));
     let token = auth::issue_admin_token(&app.secret, &admin_token_phc(&app));
     let cookie = format!(
         "{ADMIN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{}",
@@ -364,6 +416,11 @@ pub async fn create_link(
     let view = link_view(&app, link.clone(), &base);
     app.store.insert_link(link).map_err(ApiError::internal)?;
     tracing::info!(target: "audit", event = "link_created", id = %view.id, label = %view.label, dest = %view.dest, "request link created");
+    app.store.audit(
+        "link_created",
+        &view.id,
+        &serde_json::json!({ "label": view.label, "dest": view.dest }),
+    );
     Ok(Json(json!({ "link": view })))
 }
 
@@ -387,6 +444,11 @@ pub async fn update_link(
         return Err(ApiError::not_found());
     }
     tracing::info!(target: "audit", event = "link_active_changed", id = %id, active = request.active, "request link toggled");
+    app.store.audit(
+        "link_active_changed",
+        &id,
+        &serde_json::json!({ "active": request.active }),
+    );
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -400,6 +462,7 @@ pub async fn delete_link(
         return Err(ApiError::not_found());
     }
     tracing::info!(target: "audit", event = "link_deleted", id = %id, "request link deleted");
+    app.store.audit("link_deleted", &id, &serde_json::json!({}));
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -438,6 +501,11 @@ pub async fn delete_upload_record(
         return Err(ApiError::not_found());
     }
     tracing::info!(target: "audit", event = "upload_record_cleared", link = %id, upload = %upload, "upload record cleared from history");
+    app.store.audit(
+        "upload_record_cleared",
+        &id,
+        &serde_json::json!({ "upload": upload }),
+    );
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -491,6 +559,11 @@ pub async fn delete_received_file(
         })
         .map_err(ApiError::internal)?;
     tracing::info!(target: "audit", event = "received_file_deleted", link = %id, stored_as = %stored_as, "received file deleted from disk");
+    app.store.audit(
+        "received_file_deleted",
+        &id,
+        &serde_json::json!({ "stored_as": stored_as }),
+    );
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -579,6 +652,44 @@ mod handler_tests {
             .unwrap();
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn audit_export_requires_sign_in_and_emits_jsonl() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .audit("link_created", "l-1", &serde_json::json!({ "label": "x" }));
+
+        let router = app::router(application.clone());
+        let response = router
+            .oneshot(
+                Request::get("/api/admin/audit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let router = app::router(application);
+        let request = Request::builder()
+            .uri("/api/admin/audit?limit=100")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        use http_body_util::BodyExt as _;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let line: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(line["event"], "link_created");
+        assert_eq!(line["subject"], "l-1");
+        assert_eq!(line["detail"]["label"], "x");
     }
 
     #[tokio::test]

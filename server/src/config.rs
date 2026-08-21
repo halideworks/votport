@@ -38,6 +38,8 @@ pub struct Config {
     pub allow_hidden: bool,
     /// Seconds an upload session may sit idle before it is discarded.
     pub session_idle_secs: u64,
+    /// Days to keep audit rows; 0 disables pruning.
+    pub audit_retention_days: u64,
 }
 
 const DEFAULT_MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024 * 1024; // 50 GiB
@@ -90,6 +92,13 @@ pub fn from_env() -> Result<Config, String> {
 
     let allow_hidden = env::var("VOTPORT_ALLOW_HIDDEN").is_ok_and(|value| value == "1");
 
+    let audit_retention_days = match env::var("VOTPORT_AUDIT_RETENTION_DAYS") {
+        Ok(value) => value
+            .parse()
+            .map_err(|error| format!("VOTPORT_AUDIT_RETENTION_DAYS: {error}"))?,
+        Err(_) => 400,
+    };
+
     let session_idle_secs = match env::var("VOTPORT_SESSION_IDLE_SECS") {
         Ok(value) => value
             .parse()
@@ -128,6 +137,7 @@ pub fn from_env() -> Result<Config, String> {
         max_upload_bytes,
         allow_hidden,
         session_idle_secs,
+        audit_retention_days,
     })
 }
 

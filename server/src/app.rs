@@ -136,6 +136,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/admin/login", post(api::admin_login))
         .route("/api/admin/logout", post(api::admin_logout))
         .route("/api/admin/session", get(api::admin_session))
+        .route("/api/admin/audit", get(api::admin_audit_export))
         .route("/api/admin/password", post(api::admin_change_password))
         .route(
             "/api/admin/links",
@@ -177,11 +178,28 @@ pub fn router(app: Arc<App>) -> Router {
         .with_state(app)
 }
 
-/// Discards idle upload sessions so abandoned staging files get cleaned up.
+/// Discards idle upload sessions and expired audit rows.
 pub async fn session_sweeper(app: Arc<App>) {
     let idle = app.config.session_idle_secs;
+    let mut day = tokio::time::interval(std::time::Duration::from_secs(86_400));
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        app.sessions.sweep(idle);
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                app.sessions.sweep(idle);
+            }
+            _ = day.tick() => {
+                if app.config.audit_retention_days > 0 {
+                    let cutoff =
+                        crate::store::now_unix().saturating_sub(app.config.audit_retention_days * 86_400);
+                    match app.store.audit_prune(cutoff) {
+                        Ok(count) if count > 0 => {
+                            tracing::info!(count, "pruned expired audit rows");
+                        }
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!("audit prune failed: {error}"),
+                    }
+                }
+            }
+        }
     }
 }
