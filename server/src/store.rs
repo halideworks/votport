@@ -28,10 +28,40 @@ pub struct FileRecord {
     pub receipt: bool,
 }
 
+/// A session that ended without a completed upload: cancelled by the sender
+/// or interrupted (disconnect, expiry, terminal error). Kept per link, newest
+/// last, capped, so the admin can see what went wrong and how far it got.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionEvent {
+    pub at: u64,
+    pub started_at: u64,
+    /// "cancelled" or "interrupted".
+    pub outcome: String,
+    pub detail: String,
+    pub received_bytes: u64,
+    pub expected_bytes: u64,
+    /// Chunks the sender re-sent that were already verified: retries after a
+    /// response was lost in transit, so a proxy for how flaky the line was.
+    /// (TCP hides actual wire loss; there is no FEC at this layer.)
+    #[serde(default)]
+    pub replayed_chunks: u64,
+    /// Chunks the server refused (bad proof, bounds, state).
+    #[serde(default)]
+    pub rejected_chunks: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UploadRecord {
     pub id: String,
+    /// When the session was created; 0 on records from before this field.
+    #[serde(default)]
+    pub started_at: u64,
     pub completed_at: u64,
+    /// See [`SessionEvent::replayed_chunks`].
+    #[serde(default)]
+    pub replayed_chunks: u64,
+    #[serde(default)]
+    pub rejected_chunks: u64,
     /// Hex root of the verified package manifest.
     pub package_root: String,
     pub total_bytes: u64,
@@ -54,6 +84,8 @@ pub struct Link {
     pub active: bool,
     #[serde(default)]
     pub uploads: Vec<UploadRecord>,
+    #[serde(default)]
+    pub events: Vec<SessionEvent>,
 }
 
 impl Link {

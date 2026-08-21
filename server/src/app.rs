@@ -82,6 +82,11 @@ pub fn router(app: Arc<App>) -> Router {
                         [
                             (axum::http::header::CONTENT_SECURITY_POLICY, CSP),
                             (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                            // Same policy as /assets: revalidate every visit so
+                            // a redeploy takes effect immediately. Without any
+                            // cache header a browser may replay a stale page,
+                            // error card and all.
+                            (axum::http::header::CACHE_CONTROL, "no-cache"),
                         ],
                         Html(contents),
                     )

@@ -282,12 +282,16 @@ struct LinkView {
     active: bool,
     usable: bool,
     uploads: Vec<UploadView>,
+    events: Vec<crate::store::SessionEvent>,
 }
 
 #[derive(Serialize)]
 struct UploadView {
     id: String,
+    started_at: u64,
     completed_at: u64,
+    replayed_chunks: u64,
+    rejected_chunks: u64,
     package_root: String,
     total_bytes: u64,
     files: Vec<FileView>,
@@ -351,7 +355,10 @@ fn link_view(app: &App, link: Link, base: &str) -> LinkView {
                 })
                 .collect(),
             id: upload.id,
+            started_at: upload.started_at,
             completed_at: upload.completed_at,
+            replayed_chunks: upload.replayed_chunks,
+            rejected_chunks: upload.rejected_chunks,
             package_root: upload.package_root,
             total_bytes: upload.total_bytes,
         })
@@ -368,6 +375,7 @@ fn link_view(app: &App, link: Link, base: &str) -> LinkView {
         max_bytes: link.max_bytes,
         active: link.active,
         uploads,
+        events: link.events,
     }
 }
 
@@ -434,6 +442,7 @@ pub async fn create_link(
         max_bytes: request.max_bytes.filter(|&bytes| bytes > 0),
         active: true,
         uploads: Vec::new(),
+        events: Vec::new(),
     };
     let base = base_url(&app, &headers);
     let view = link_view(&app, link.clone(), &base);
@@ -752,6 +761,7 @@ pub async fn create_session(
         allow_hidden: app.config.allow_hidden,
         signer: Arc::clone(&app.signer),
         session_id: session_bytes,
+        started_at: now_unix(),
     };
     let sender = session::spawn_worker(setup);
     app.sessions.insert(session_id.clone(), link.id, sender);
@@ -884,6 +894,9 @@ pub async fn upload_abort(
     State(app): State<Arc<App>>,
     Path(sid): Path<String>,
 ) -> Json<serde_json::Value> {
+    // Best effort: lets the worker record a "cancelled" event; an unknown or
+    // already-dead session still answers ok.
+    let _ = dispatch(&app, &sid, |reply| Cmd::Abort { reply }).await;
     app.sessions.remove(&sid);
     Json(json!({ "ok": true }))
 }
