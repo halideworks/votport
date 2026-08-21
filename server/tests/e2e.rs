@@ -26,6 +26,10 @@ struct TestServer {
 }
 
 async fn start_server() -> TestServer {
+    start_server_with_cap(64 * 1024 * 1024).await
+}
+
+async fn start_server_with_cap(max_upload_bytes: u64) -> TestServer {
     let data = tempfile::tempdir().expect("data dir");
     let received = tempfile::tempdir().expect("receive dir");
     let config = Config {
@@ -40,7 +44,7 @@ async fn start_server() -> TestServer {
         notify_ntfy_token: None,
         notify_pushover: None,
         public_url: None,
-        max_upload_bytes: 64 * 1024 * 1024,
+        max_upload_bytes,
         allow_hidden: false,
         session_idle_secs: 600,
     };
@@ -1568,4 +1572,56 @@ async fn identical_resend_is_deduped_not_suffixed() {
         impostor_bytes,
         "the impostor stays untouched"
     );
+}
+
+/// Throughput baseline, run explicitly: `cargo test --test e2e -- --ignored
+/// --nocapture throughput_baseline`. Times local hashing and the full upload
+/// of one 256 MiB object through the real HTTP protocol so optimization work
+/// has before/after numbers from a fixed method.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark; run explicitly"]
+async fn throughput_baseline() {
+    let server = start_server_with_cap(512 * 1024 * 1024).await;
+    let base = &server.base;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let response = client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let response = client
+        .post(format!("{base}/api/admin/links"))
+        .header("x-votport", "1")
+        .json(&json!({ "label": "benchmark" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let token = response.json::<Value>().await.unwrap()["link"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    const MIB: usize = 1024 * 1024;
+    let mut bytes = vec![0u8; 256 * MIB];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = (index * 7 % 251) as u8;
+    }
+
+    let started = std::time::Instant::now();
+    let file = prepare(vec!["benchmark.bin"], bytes);
+    let hashed = started.elapsed();
+
+    let started = std::time::Instant::now();
+    run_upload(&client, base, &token, "", &[file]).await;
+    let uploaded = started.elapsed();
+
+    let mib = |seconds: std::time::Duration| format!("{:.0} MiB/s", 256.0 / seconds.as_secs_f64());
+    println!("hash+package 256 MiB: {hashed:.3?} ({})", mib(hashed));
+    println!("upload       256 MiB: {uploaded:.3?} ({})", mib(uploaded));
 }

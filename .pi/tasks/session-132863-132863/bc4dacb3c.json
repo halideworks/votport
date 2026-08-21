@@ -1,0 +1,19 @@
+{
+  "id": "bc4dacb3c",
+  "name": "Rebuild and redeploy votport",
+  "command": "cd /nvme-mirror/apps/votport && docker compose build > /tmp/votport-deploy.log 2>&1 && docker compose up -d >> /tmp/votport-deploy.log 2>&1 && echo DEPLOY-OK >> /tmp/votport-deploy.log || echo DEPLOY-FAILED >> /tmp/votport-deploy.log",
+  "status": "completed",
+  "outputPath": ".pi/tasks/session-132863-132863/bc4dacb3c.output",
+  "cwd": "/nvme-mirror/apps/votport",
+  "startTime": 1787330895895,
+  "endTime": 1787330991646,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 383121,
+  "bytesWritten": 0,
+  "isAgent": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 3600
+}

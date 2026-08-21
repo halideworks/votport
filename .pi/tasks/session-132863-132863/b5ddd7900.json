@@ -1,0 +1,16 @@
+{
+  "id": "b5ddd7900",
+  "name": "CI watch PR 19",
+  "command": "cd /nvme-mirror/apps/votport && sleep 20 && gh pr checks 19 --watch --interval 60 > /tmp/ci-watch-19.log 2>&1; echo \"EXIT=$?\" >> /tmp/ci-watch-19.log",
+  "status": "running",
+  "outputPath": ".pi/tasks/session-132863-132863/b5ddd7900.output",
+  "cwd": "/nvme-mirror/apps/votport",
+  "startTime": 1787332365581,
+  "pid": 470327,
+  "bytesWritten": 0,
+  "isAgent": false,
+  "notified": false,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 3600
+}

@@ -1,0 +1,19 @@
+{
+  "id": "b728b524a",
+  "name": "CI watch PR 12",
+  "command": "cd /nvme-mirror/apps/votport && gh pr checks 12 --watch --interval 30 > /tmp/ci-watch.log 2>&1; echo \"EXIT=$?\" >> /tmp/ci-watch.log",
+  "status": "completed",
+  "outputPath": ".pi/tasks/session-132863-132863/b728b524a.output",
+  "cwd": "/nvme-mirror/apps/votport",
+  "startTime": 1787329282673,
+  "endTime": 1787329647695,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 278511,
+  "bytesWritten": 0,
+  "isAgent": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 3600
+}

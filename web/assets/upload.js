@@ -14,7 +14,7 @@ const token = window.location.pathname.split('/').filter(Boolean).pop();
 
 const UPLOADS_IN_FLIGHT = 8;
 let chunkBytes = 2 * 1024 * 1024;
-let picked = new Map(); // relative path -> File
+const picked = new Map(); // relative path -> File
 let uploading = false;
 let cancelled = false;
 let controller = null; // aborts in-flight requests when the sender cancels

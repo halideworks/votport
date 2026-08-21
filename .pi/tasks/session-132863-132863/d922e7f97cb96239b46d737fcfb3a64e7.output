@@ -1,0 +1,25 @@
+Warning: No project session found with id 'delegate-35049796e815920fb9efc4b80be42072'; creating a new session with that id.
+All checks complete. Here is my independent review of PR #12 scope (non-Rust files) at /nvme-mirror/apps/votport.
+
+## Findings
+
+**1. scripts/fetch-fonts.sh:11 — risk** — `curl -s` lacks `--fail`, so a Google Fonts error/HTML page gets saved to /tmp/votport-gf.css, the python regex finds zero latin blocks, and the script **silently overwrites the good web/assets/fonts.css with a header-only stub while exiting 0**. Fix: add `-f/--fail` to curl and abort when `len(out) == 0`.
+
+**2. .github/workflows/ci.yml:38,46,58 — nit (unverifiable offline)** — All three action pins are correctly formatted (`@<40-hex> # vX.Y`), and `actions/cache@0057852b…` matches the known cache v4 SHA; however I cannot confirm offline that `actions/checkout@11d5960a…` and `cargo-deny-action@3c63498…` map to their commented versions — verify once against git tags (Dependabot will then keep them honest).
+
+That is everything. No bugs found in the rest of the scope.
+
+## Clean areas
+
+- **Dockerfile**: `curl -sf http://127.0.0.1:8080/ -o /dev/null || exit 1` is correct (`-s`+`-f`; `/` serves the admin login page with 200; healthcheck runs fine as uid 1000 since it's loopback-only); `chmod -R a+rX /app/web` runs before `USER 1000:1000`, so placement is correct; the cargo binary keeps its exec bit through `COPY --from=build`; `apt-get install --no-install-recommends curl` adds only a few MB to slim and breaks nothing; `rust:1.97` matches CI's `rustup toolchain install 1.97` and the stated MSRV; wasm-bindgen pin `0.2.126` is consistent across Dockerfile:15, scripts/build-wasm.sh:4, and README.md:157 (the VOT-side pin itself lives in the external repo and can't be checked from here).
+- **ci.yml**: YAML valid; `workingdir: server` + `command: check advisories` are the correct input names/values for EmbarkStudios/cargo-deny-action v2 with the workspace rooted at `server/`; cache paths/key sane (`server/Cargo.lock` hash); docker job needs no secrets and cannot fail for lack of them; timeouts reasonable.
+- **dependabot.yml**: schema-valid; `groups` + `cooldown.default-days` may legitimately coexist on the same update config (independent PR-shaping features); directories `/server` (holds Cargo.toml) and `/` (actions) are correct.
+- **deny.toml**: `[advisories] version = 2, yanked = "deny"` and `[licenses] enabled = false` are both valid cargo-deny forms; the comment explains the deferral honestly.
+- **fonts.css ↔ web/assets/fonts/**: every one of the 9 `url()` targets exists exactly (`InstrumentSerif-400{,-italic}`, `JetBrainsMono-{400,500}`, `PlusJakartaSans-{300..700}`), plus OFL.txt; declarations fully cover style.css usage (Instrument Serif normal+italic 400, PJS 300–700, JBM 400/500); latin unicode-range covers every UI glyph in both pages (`·` U+00B7, `…` U+2026), and non-latin *user-entered* content degrades gracefully to the system fallback stacks.
+- **fetch-fonts.sh otherwise**: `set -eu` present, deterministic filename scheme `{Family}-{weight}[-italic].woff2` matches existing files byte-for-byte.
+- **index.html/request.html**: zero Google Fonts/gstatic references remain; no `<style>` tags, no inline `style=` attributes, no `data:` images (and `img-src 'self' data:` already permits them anyway); the module Worker at upload.js:42 is covered by `worker-src 'self'` in app.rs:75 — nothing the tightened CSP blocks.
+- **README.md:86**: config table exactly matches `parse_bytes` (server/src/config.rs:152–158): plain bytes or case-insensitive K/KiB/KB, M/MiB/MB, G/GiB/GB, T/TiB/TB, example `500G` — accurate.
+
+## Verdict
+
+**APPROVE** — finding #1 is a manual-maintenance-script footgun, not a product defect; fix it in a follow-up (or in this PR if you prefer) along with the one-time SHA-to-tag verification in #2.
