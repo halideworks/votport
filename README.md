@@ -61,7 +61,7 @@ browser and builds the server. Then add the site to your Caddyfile (see
 
 ```caddy
 drop.example.com {
-	reverse_proxy 127.0.0.1:8321
+ reverse_proxy 127.0.0.1:8321
 }
 ```
 
@@ -83,7 +83,7 @@ Everything is environment variables (see `docker-compose.yml`):
 | `VOTPORT_BIND` | `0.0.0.0:8080` | Listen address inside the container. |
 | `VOTPORT_DATA_DIR` | `/data` | State: `state.json` (links, upload records) and the cookie secret. |
 | `VOTPORT_RECEIVE_DIR` | `/received` | Root folder received files are published into. |
-| `VOTPORT_MAX_UPLOAD_BYTES` | 50 GiB | Hard cap per upload session (per-link caps can be lower). |
+| `VOTPORT_MAX_UPLOAD_BYTES` | 50 GiB | Hard cap per upload session (per-link caps can be lower). Accepts plain bytes or a `K/KiB/KB`, `M/MiB/MB`, `G/GiB/GB`, `T/TiB/TB` suffix, e.g. `500G`. |
 | `VOTPORT_ALLOW_HIDDEN` | off | Set `1` to accept dot-file names from uploaders. |
 | `VOTPORT_SESSION_IDLE_SECS` | `1800` | Idle time before an unfinished upload session is discarded. |
 | `VOTPORT_WEB_ROOT` | `./web` | Static assets directory (`/app/web` in Docker). |

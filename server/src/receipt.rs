@@ -41,12 +41,7 @@ impl ReceiptSigner {
                 let mut seed = [0u8; 32];
                 use rand::RngCore as _;
                 rand::rngs::OsRng.fill_bytes(&mut seed);
-                std::fs::write(&path, seed).map_err(|error| error.to_string())?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-                }
+                crate::auth::write_private(&path, &seed).map_err(|error| error.to_string())?;
                 seed
             }
             Err(error) => return Err(format!("read {}: {error}", path.display())),

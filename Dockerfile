@@ -6,7 +6,9 @@
 #   2. compile the votport server
 #   3. slim runtime image
 
-FROM rust:1 AS build
+# Pinned to the version CI tests against; rust-version in Cargo.toml only
+# guards older toolchains, so a floating tag would let production drift.
+FROM rust:1.97 AS build
 
 RUN rustup target add wasm32-unknown-unknown
 # Must match the wasm-bindgen version pinned by vot-wasm.
@@ -27,7 +29,11 @@ COPY server /src/server
 RUN cd /src/server && cargo build --release
 
 FROM debian:stable-slim
-RUN mkdir -p /app /data /received
+# curl exists only for the healthcheck.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /app /data /received
 COPY --from=build /src/server/target/release/votport /app/votport
 COPY web /app/web
 COPY --from=build /wasm-vendor/ /app/web/assets/vendor/
@@ -38,6 +44,11 @@ ENV VOTPORT_BIND=0.0.0.0:8080 \
     VOTPORT_RECEIVE_DIR=/received \
     VOTPORT_WEB_ROOT=/app/web
 
+# Same uid the deployment's compose file uses; state and received volumes must
+# stay writable by it.
+USER 1000:1000
 EXPOSE 8080
 VOLUME ["/data", "/received"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -sf http://127.0.0.1:8080/ -o /dev/null || exit 1
 CMD ["/app/votport"]

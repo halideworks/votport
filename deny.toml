@@ -1,0 +1,8 @@
+# Advisories only for now: a license gate would need a full review of every
+# transitive license, and bans/duplicates add upkeep without a consumer.
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+enabled = false

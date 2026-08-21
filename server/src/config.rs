@@ -82,9 +82,9 @@ pub fn from_env() -> Result<Config, String> {
         .filter(|url| !url.is_empty());
 
     let max_upload_bytes = match env::var("VOTPORT_MAX_UPLOAD_BYTES") {
-        Ok(value) => value
-            .parse()
-            .map_err(|error| format!("VOTPORT_MAX_UPLOAD_BYTES: {error}"))?,
+        Ok(value) => {
+            parse_bytes(&value).map_err(|error| format!("VOTPORT_MAX_UPLOAD_BYTES: {error}"))?
+        }
         Err(_) => DEFAULT_MAX_UPLOAD_BYTES,
     };
 
@@ -136,4 +136,56 @@ fn env_or(name: &str, default: &str) -> String {
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| default.to_owned())
+}
+
+/// Parses a byte count, optionally suffixed K/KiB/KB, M/MiB/MB, G/GiB/GB or
+/// T/TiB/TB (case-insensitive). A bare number stays bytes. All suffix
+/// spellings mean x1024^n; the aliases exist so a hand-typed "500G" cannot
+/// silently mean 500 bytes or 500000000 by typo.
+fn parse_bytes(value: &str) -> Result<u64, String> {
+    let trimmed = value.trim();
+    let split_at = trimmed
+        .char_indices()
+        .find(|(_, ch)| !ch.is_ascii_digit())
+        .map_or(trimmed.len(), |(idx, _)| idx);
+    let (digits, suffix) = trimmed.split_at(split_at);
+    let multiplier = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1u64,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        "t" | "tb" | "tib" => 1024u64 * 1024 * 1024 * 1024,
+        other => return Err(format!("unknown size suffix {other:?}")),
+    };
+    if digits.is_empty() {
+        return Err(format!("{value:?} is not a byte count"));
+    }
+    digits
+        .parse::<u64>()
+        .map(|bytes| bytes.saturating_mul(multiplier))
+        .map_err(|_| format!("{value:?} is out of range"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_counts_accept_suffixes() {
+        assert_eq!(parse_bytes("536870912000").unwrap(), 536_870_912_000);
+        assert_eq!(parse_bytes("500G").unwrap(), 500 * 1024 * 1024 * 1024);
+        assert_eq!(parse_bytes("500GB").unwrap(), 500 * 1024 * 1024 * 1024);
+        assert_eq!(parse_bytes("500GiB").unwrap(), 500 * 1024 * 1024 * 1024);
+        assert_eq!(parse_bytes("2mib").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(parse_bytes("10MB").unwrap(), 10 * 1024 * 1024);
+        assert_eq!(
+            parse_bytes(" 50T ").unwrap(),
+            50 * 1024u64 * 1024 * 1024 * 1024
+        );
+        assert_eq!(parse_bytes("0").unwrap(), 0);
+        assert!(parse_bytes("").is_err());
+        assert!(parse_bytes("500x").is_err());
+        assert!(parse_bytes("-5").is_err());
+        assert!(parse_bytes("G").is_err());
+    }
 }

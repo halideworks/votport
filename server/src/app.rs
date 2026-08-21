@@ -38,6 +38,9 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     std::fs::create_dir_all(&config.receive_dir)
         .map_err(|error| format!("create {}: {error}", config.receive_dir.display()))?;
     crate::paths::tighten_dir(&config.receive_dir);
+    // Staging files from a previous crash or kill have no live session to
+    // sweep them; remove them once at startup.
+    crate::paths::clean_staging(&config.receive_dir);
     let store = Arc::new(Store::open(&config.data_dir)?);
     let secret = crate::auth::load_secret(&config.data_dir)?;
     let signer = Arc::new(crate::receipt::ReceiptSigner::load_or_create(
@@ -64,14 +67,16 @@ pub fn router(app: Arc<App>) -> Router {
     let admin_page = web_root.join("index.html");
     let request_page = web_root.join("request.html");
 
-    // Everything the pages load is same-origin except the Google Fonts pair
-    // imported from style.css. wasm-unsafe-eval is what lets the browser
-    // compile the verification engine; there is no JS eval anywhere.
+    // Everything the pages load is same-origin (fonts are self-hosted in
+    // /assets/fonts). wasm-unsafe-eval is what lets the browser compile the
+    // verification engine; there is no JS eval anywhere.
     const CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; \
-        style-src 'self' https://fonts.googleapis.com; \
-        font-src https://fonts.gstatic.com; connect-src 'self'; \
+        style-src 'self'; font-src 'self'; connect-src 'self'; \
         img-src 'self' data:; worker-src 'self'; \
         frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+    // Request pages carry the secret link token in the URL; never let the
+    // browser forward it as a referrer.
+    const REFERRER_POLICY: &str = "no-referrer";
 
     let serve_page = |path: std::path::PathBuf| {
         get(move || {
@@ -82,6 +87,7 @@ pub fn router(app: Arc<App>) -> Router {
                         [
                             (axum::http::header::CONTENT_SECURITY_POLICY, CSP),
                             (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                            (axum::http::header::REFERRER_POLICY, REFERRER_POLICY),
                             // Same policy as /assets: revalidate every visit so
                             // a redeploy takes effect immediately. Without any
                             // cache header a browser may replay a stale page,
@@ -117,6 +123,10 @@ pub fn router(app: Arc<App>) -> Router {
                         axum::http::HeaderValue::from_static("no-cache"),
                     ),
                 )
+                .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+                    axum::http::header::REFERRER_POLICY,
+                    axum::http::HeaderValue::from_static("no-referrer"),
+                ))
                 .service(ServeDir::new(web_root.join("assets"))),
         )
         // Admin API.

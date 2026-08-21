@@ -1,0 +1,38 @@
+#!/bin/sh
+# Re-downloads the latin woff2 subsets served from /assets/fonts and regenerates
+# web/assets/fonts.css. Run when a font family or weight set changes.
+# Requires curl and python3.
+set -eu
+
+cd "$(dirname "$0")/.."
+
+FAMILIES='family=Instrument+Serif:ital@0;1&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500'
+
+curl -s -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36" \
+    "https://fonts.googleapis.com/css2?${FAMILIES}&display=swap" -o /tmp/votport-gf.css
+
+python3 - <<'EOF'
+import re, urllib.request
+
+css = open('/tmp/votport-gf.css').read()
+blocks = re.findall(r'/\* ([\w-]+) \*/\s*(@font-face \{[^}]+\})', css)
+out = []
+for subset, block in blocks:
+    if subset != 'latin':
+        continue
+    url = re.search(r'url\((https://[^)]+)\)', block).group(1)
+    family = re.search(r"font-family: '([^']+)'", block).group(1).replace(' ', '')
+    style = re.search(r'font-style: (\w+)', block).group(1)
+    weight = re.search(r'font-weight: (\d+)', block).group(1)
+    fname = f"{family}-{weight}{'-italic' if style == 'italic' else ''}.woff2"
+    urllib.request.urlretrieve(url, f"web/assets/fonts/{fname}")
+    out.append(block.replace(url, f"/assets/fonts/{fname}"))
+
+open('web/assets/fonts.css', 'w').write(
+    "// Self-hosted Google Fonts (latin subsets), OFL 1.1:\n"
+    "// Instrument Serif, Plus Jakarta Sans, JetBrains Mono.\n"
+    "// Regenerate with scripts/fetch-fonts.sh if weights change.\n"
+    + "\n".join(out) + "\n"
+)
+print(f"{len(out)} faces written")
+EOF
