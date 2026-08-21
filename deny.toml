@@ -1,0 +1,6 @@
+# Advisories only for now: a license gate would need a full review of every
+# transitive license, and bans/duplicates add upkeep without a consumer.
+# CI runs `deny check advisories`, so other checks are simply not invoked.
+[advisories]
+version = 2
+yanked = "deny"

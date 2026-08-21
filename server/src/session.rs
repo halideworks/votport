@@ -461,7 +461,9 @@ fn find_delivered(
             }
         };
         let components: Vec<String> = rel.split('/').map(str::to_owned).collect();
-        let path = paths::join_under(&setup.dest_dir, &components);
+        let Ok(path) = paths::join_under(&setup.dest_dir, &components) else {
+            continue;
+        };
         match fs::metadata(&path) {
             Ok(meta) if meta.is_file() && meta.len() == object.length => {
                 return Some(Delivered {
@@ -479,8 +481,12 @@ fn open_destination(setup: &WorkerSetup, entry: &PackageEntry) -> Result<FileSta
     let components: Vec<String> = entry.path().map(str::to_owned).collect();
     let display_path = components.join("/");
     let object = entry.object_id();
+    let parent = |stored: &[String]| {
+        paths::join_under(&setup.dest_dir, &stored[..stored.len() - 1])
+            .map_err(SessionError::internal)
+    };
     if components.len() > 1 {
-        let parent = paths::join_under(&setup.dest_dir, &components[..components.len() - 1]);
+        let parent = parent(&components)?;
         fs::create_dir_all(&parent)
             .map_err(|error| SessionError::internal(format!("create folders: {error}")))?;
         // Staging lands in this parent; see paths::tighten_dir.
@@ -490,7 +496,10 @@ fn open_destination(setup: &WorkerSetup, entry: &PackageEntry) -> Result<FileSta
     for attempt in 0..MAX_NAME_ATTEMPTS {
         let mut stored = components.clone();
         *stored.last_mut().expect("non-empty") = paths::with_suffix(name, attempt);
-        let destination = paths::join_under(&setup.dest_dir, &stored);
+        // The full stored path including the file name; `parent` above is
+        // only for creating intermediate directories.
+        let destination =
+            paths::join_under(&setup.dest_dir, &stored).map_err(SessionError::internal)?;
         match NativeFile::create(&object, &destination, CommitProfile::Balanced) {
             Ok(native) => {
                 return Ok(FileState {
@@ -582,12 +591,18 @@ fn publish_file(setup: &WorkerSetup, file: &mut FileState) -> Result<(), Session
     // record notes whether its receipt exists.
     if let Some(observation) = native.publish_observation() {
         let destination = paths::join_under(&setup.dest_dir, &file.stored_components);
-        match setup
-            .signer
-            .write_sidecar(&destination, &file.object, setup.session_id, observation)
-        {
+        match destination
+            .map_err(|error| error.to_string())
+            .and_then(|destination| {
+                setup.signer.write_sidecar(
+                    &destination,
+                    &file.object,
+                    setup.session_id,
+                    observation,
+                )
+            }) {
             Ok(_) => file.receipt = true,
-            Err(error) => eprintln!("votport: receipt for {}: {error}", file.display_path),
+            Err(error) => tracing::warn!(file = %file.display_path, "receipt: {error}"),
         }
     }
     file.published = true;

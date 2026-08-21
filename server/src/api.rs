@@ -20,6 +20,9 @@ use crate::session::{self, Cmd, SessionError};
 use crate::store::{now_unix, Link};
 
 const ADMIN_COOKIE: &str = "votport_admin";
+// Worst case memory: MAX_SESSIONS x 8 in-flight chunks x ~9 MiB of queued
+// request bodies, plus each worker's pinned merkle trees. Raising these caps
+// raises that ceiling linearly.
 const MAX_SESSIONS: usize = 32;
 const MAX_SESSIONS_PER_LINK: usize = 8;
 
@@ -107,6 +110,15 @@ fn client_ip(headers: &HeaderMap, peer: &std::net::SocketAddr) -> String {
 }
 
 fn proxy_peer(ip: &std::net::IpAddr) -> bool {
+    // Docker bridges can present v4 peers as IPv4-mapped IPv6; unwrap those
+    // so the RFC 1918 check still applies.
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => return (v6.segments()[0] & 0xfe00) == 0xfc00 || v6.is_loopback(),
+        },
+        other => *other,
+    };
     match ip {
         std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
         // fc00::/7 unique-local, the v6 analogue of RFC 1918.
@@ -325,14 +337,15 @@ fn base_url(app: &App, headers: &HeaderMap) -> String {
 }
 
 /// The on-disk path a file record points at, from server-recorded components
-/// only; client input never reaches this.
-fn stored_path(app: &App, stored_as: &str) -> std::path::PathBuf {
+/// only; client input never reaches this. None when a stored record fails the
+/// join guard (a corrupted record), which the display treats as "missing".
+fn stored_path(app: &App, stored_as: &str) -> Option<std::path::PathBuf> {
     let components: Vec<String> = stored_as
         .split('/')
         .filter(|part| !part.is_empty())
         .map(str::to_owned)
         .collect();
-    paths::join_under(&app.config.receive_dir, &components)
+    paths::join_under(&app.config.receive_dir, &components).ok()
 }
 
 fn link_view(app: &App, link: Link, base: &str) -> LinkView {
@@ -345,7 +358,7 @@ fn link_view(app: &App, link: Link, base: &str) -> LinkView {
                 .files
                 .into_iter()
                 .map(|file| FileView {
-                    exists: stored_path(app, &file.stored_as).is_file(),
+                    exists: stored_path(app, &file.stored_as).is_some_and(|path| path.is_file()),
                     path: file.path,
                     stored_as: file.stored_as,
                     bytes: file.bytes,
@@ -537,7 +550,8 @@ pub async fn delete_received_file(
         .find(|entry| entry.id == upload)
         .and_then(|entry| entry.files.get(index))
         .ok_or_else(ApiError::not_found)?;
-    let path = stored_path(&app, &record.stored_as);
+    let path = stored_path(&app, &record.stored_as)
+        .ok_or_else(|| ApiError::internal("stored path failed the join guard"))?;
     for target in [path.clone(), {
         let mut sidecar = path.into_os_string();
         sidecar.push(".vot-receipt");
@@ -761,6 +775,9 @@ pub async fn create_session(
         .filter(|part| !part.is_empty())
         .map(str::to_owned)
         .collect();
+    // admit_dest already vetted these; join_under re-checks as defense.
+    let dest_dir =
+        paths::join_under(&app.config.receive_dir, &dest_components).map_err(ApiError::internal)?;
     let session_id = auth::random_token();
     let session_bytes: [u8; 16] = hex::decode(&session_id)
         .ok()
@@ -769,7 +786,7 @@ pub async fn create_session(
     let setup = session::WorkerSetup {
         store: Arc::clone(&app.store),
         link_id: link.id.clone(),
-        dest_dir: paths::join_under(&app.config.receive_dir, &dest_components),
+        dest_dir,
         dest_rel: link.dest.clone(),
         expected_package: expected,
         max_total_bytes: cap,
@@ -931,5 +948,19 @@ mod tests {
         assert_eq!(client_ip(&headers, &private), "5.6.7.8");
         assert_eq!(client_ip(&headers, &public), "203.0.113.9");
         assert_eq!(client_ip(&HeaderMap::new(), &proxy), "127.0.0.1");
+    }
+
+    #[test]
+    fn ipv4_mapped_proxy_peer_is_recognized() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
+        // A v4-mapped docker bridge address must still count as a proxy peer;
+        // treating it as public would put every sender in one throttle bucket.
+        let mapped: std::net::SocketAddr = "[::ffff:172.18.0.2]:80".parse().unwrap();
+        assert_eq!(client_ip(&headers, &mapped), "9.9.9.9");
+        let mapped_public: std::net::SocketAddr = "[::ffff:203.0.113.9]:80".parse().unwrap();
+        // A public mapped peer is not a proxy: its socket address is used and
+        // the forwarded header is ignored.
+        assert_eq!(client_ip(&headers, &mapped_public), "::ffff:203.0.113.9");
     }
 }

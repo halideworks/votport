@@ -45,6 +45,13 @@ pub fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String
             "hidden file names are not accepted (VOTPORT_ALLOW_HIDDEN=1 to allow)".to_owned(),
         );
     }
+    // Reserved even with VOTPORT_ALLOW_HIDDEN: a sender file of this shape
+    // would publish fine and then be deleted by the next boot's staging sweep.
+    if component.starts_with(".vot-")
+        && (component.ends_with(".stage") || component.ends_with(".journal"))
+    {
+        return Err("name is reserved for votport staging files".to_owned());
+    }
     Ok(())
 }
 
@@ -78,13 +85,25 @@ pub fn admit_dest(dest: &str) -> Result<String, String> {
     Ok(parts.join("/"))
 }
 
-/// Joins already-admitted components under a base directory.
-pub fn join_under(base: &Path, components: &[String]) -> PathBuf {
+/// Joins already-admitted components under a base directory. Re-checks each
+/// component so a future caller that skipped admission cannot build a path
+/// escaping the base; [`admit_component`] remains the policy layer applied to
+/// client input.
+pub fn join_under(base: &Path, components: &[String]) -> Result<PathBuf, String> {
     let mut path = base.to_path_buf();
     for component in components {
+        if component.is_empty()
+            || component == "."
+            || component == ".."
+            || component
+                .chars()
+                .any(|ch| ch == '/' || ch == '\\' || ch == '\0')
+        {
+            return Err(format!("unsafe path component {component:?}"));
+        }
         path.push(component);
     }
-    path
+    Ok(path)
 }
 
 /// Produces `name`, `name-1`, `name-2`, ... keeping the extension.
@@ -97,6 +116,44 @@ pub fn with_suffix(name: &str, attempt: u32) -> String {
             format!("{stem}-{attempt}.{extension}")
         }
         _ => format!("{name}-{attempt}"),
+    }
+}
+
+/// Removes staging files orphaned by a crash or kill. The idle sweep only
+/// covers sessions this process created; anything left on disk from a previous
+/// boot would otherwise live forever. vot-sdk-file stages each object as
+/// `<name>.stage` (plus `<name>.journal` under the Balanced profile) next to
+/// its destination, where `<name>` always starts with `.vot-`; nothing else
+/// matches that shape.
+pub fn clean_staging(root: &Path) {
+    #[cfg(unix)]
+    fn is_staging(name: &str) -> bool {
+        name.starts_with(".vot-") && (name.ends_with(".stage") || name.ends_with(".journal"))
+    }
+    #[cfg(not(unix))]
+    let _ = root;
+    #[cfg(unix)]
+    walk(root, &mut |path, name| {
+        if is_staging(name) {
+            let _ = std::fs::remove_file(path);
+        }
+    });
+}
+
+#[cfg(unix)]
+fn walk(dir: &Path, visit: &mut impl FnMut(&Path, &str)) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => {
+                walk(&entry.path(), visit);
+            }
+            Ok(_) => visit(&entry.path(), &name),
+            Err(_) => {}
+        }
     }
 }
 
@@ -113,6 +170,11 @@ mod tests {
         assert!(admit_component(".env", false).is_err());
         assert!(admit_component(".env", true).is_ok());
         assert!(admit_component("", true).is_err());
+        // The staging shape is reserved even when hidden names are allowed:
+        // the boot sweep deletes exactly these.
+        assert!(admit_component(".vot-1a2b-0-3c4d.stage", true).is_err());
+        assert!(admit_component(".vot-1a2b-0-3c4d.journal", true).is_err());
+        assert!(admit_component(".vot-notes.txt", true).is_ok());
     }
 
     #[test]
@@ -130,5 +192,45 @@ mod tests {
         assert_eq!(with_suffix("report.pdf", 2), "report-2.pdf");
         assert_eq!(with_suffix("README", 1), "README-1");
         assert_eq!(with_suffix(".env", 1), ".env-1");
+    }
+
+    #[test]
+    fn clean_staging_removes_only_vot_stage_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("sub");
+        std::fs::create_dir(&nested).unwrap();
+        let orphan = directory.path().join(".vot-1a2b-0-3c4d.stage");
+        let journal = nested.join(".vot-1a2b-1-3c4d.journal");
+        let kept = directory.path().join("report.pdf");
+        let foreign = directory.path().join(".vot-notes.txt");
+        for path in [&orphan, &journal, &kept, &foreign] {
+            std::fs::write(path, b"x").unwrap();
+        }
+        clean_staging(directory.path());
+        assert!(!orphan.exists());
+        assert!(!journal.exists());
+        assert!(kept.exists());
+        assert!(foreign.exists());
+    }
+
+    #[test]
+    fn join_under_refuses_escape_attempts() {
+        let base = Path::new("/receive");
+        let ok = |parts: &[&str]| {
+            let owned: Vec<String> = parts.iter().map(|p| (*p).to_owned()).collect();
+            join_under(base, &owned)
+        };
+        assert_eq!(ok(&["a", "b.txt"]).unwrap(), Path::new("/receive/a/b.txt"));
+        for bad in [
+            vec![".."],
+            vec!["a", ".."],
+            vec![""],
+            vec!["."],
+            vec!["a/b"],
+            vec!["a\\b"],
+        ] {
+            let components: Vec<String> = bad.iter().map(|p| (*p).to_owned()).collect();
+            assert!(join_under(base, &components).is_err(), "{bad:?}");
+        }
     }
 }

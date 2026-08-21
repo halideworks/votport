@@ -51,16 +51,28 @@ pub fn load_secret(data_dir: &std::path::Path) -> Result<[u8; 32], String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let mut secret = [0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut secret);
-            std::fs::write(&path, secret).map_err(|error| error.to_string())?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-            }
+            write_private(&path, &secret).map_err(|error| error.to_string())?;
             Ok(secret)
         }
         Err(error) => Err(format!("read {}: {error}", path.display())),
     }
+}
+
+/// Creates a file readable only by its owner from the first instant: writing
+/// with default permissions and tightening afterwards leaves a window where
+/// the secret is world-readable on disk.
+pub fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 fn token_mac(secret: &[u8; 32], context: &[&[u8]], expires: u64, nonce: &str) -> String {

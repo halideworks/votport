@@ -1,0 +1,23 @@
+---
+# Weekly dependency and action updates; PRs only, a human merges.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /server
+    schedule:
+      interval: weekly
+    # Hold new releases a week before opening a PR: a poisoned upstream
+    # release usually shows up in that window.
+    cooldown:
+      default-days: 7
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Actions are SHA-pinned; Dependabot updates the SHA + tag comment.
+    groups:
+      actions:
+        patterns:
+          - "*"
+    cooldown:
+      default-days: 7

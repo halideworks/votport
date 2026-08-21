@@ -16,10 +16,17 @@ use votport::{app, config};
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt()
+        // RUST_LOG wins; info is the right default for a deployed server.
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
     let config = match config::from_env() {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("votport: {error}");
+            tracing::error!("{error}");
             std::process::exit(2);
         }
     };
@@ -27,7 +34,7 @@ async fn main() {
     let application = match app::build(config) {
         Ok(application) => application,
         Err(error) => {
-            eprintln!("votport: {error}");
+            tracing::error!("{error}");
             std::process::exit(2);
         }
     };
@@ -36,11 +43,11 @@ async fn main() {
     let listener = match tokio::net::TcpListener::bind(bind).await {
         Ok(listener) => listener,
         Err(error) => {
-            eprintln!("votport: bind {bind}: {error}");
+            tracing::error!("bind {bind}: {error}");
             std::process::exit(2);
         }
     };
-    println!(
+    tracing::info!(
         "votport listening on {bind}; receiving into {}",
         application.config.receive_dir.display()
     );
@@ -52,12 +59,30 @@ async fn main() {
     .with_graceful_shutdown(shutdown_signal())
     .await
     {
-        eprintln!("votport: server error: {error}");
+        tracing::error!("server error: {error}");
         std::process::exit(1);
     }
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    println!("votport shutting down");
+    // Docker and systemd stop the process with SIGTERM; ctrl_c is SIGINT
+    // only. Without this a container stop skips graceful shutdown entirely.
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        signal(SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("shutting down");
 }

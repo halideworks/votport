@@ -65,12 +65,9 @@ pub async fn uploaded(app: Arc<App>, label: String, report: FinishReport) {
 fn log_failure(target: &str, result: Result<reqwest::Response, reqwest::Error>) {
     match result {
         Ok(response) if !response.status().is_success() => {
-            eprintln!(
-                "votport: {target} notification failed: {}",
-                response.status()
-            );
+            tracing::warn!(target, status = %response.status(), "notification failed");
         }
-        Err(error) => eprintln!("votport: {target} notification failed: {error}"),
+        Err(error) => tracing::warn!(target, "notification failed: {error}"),
         Ok(_) => {}
     }
 }
