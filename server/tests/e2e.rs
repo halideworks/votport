@@ -247,7 +247,7 @@ async fn run_upload(
             .find(|file| file.path.join("/") == path)
             .expect("entry matches a file");
         if complete {
-            assert!(file.bytes.is_empty(), "only empty files complete at begin");
+            // Empty files and deduped re-sends are complete at begin.
             continue;
         }
         upload_chunks(client, base, &session, index, file).await;
@@ -398,7 +398,7 @@ async fn full_protocol_end_to_end() {
         big
     );
 
-    // --- same names again: nothing is overwritten ---------------------------
+    // --- identical content again: deduped onto the existing copies ----------
     let report = run_upload(&client, &base, &token, LINK_PASSWORD, &files).await;
     let reported: Vec<&str> = report["files"]
         .as_array()
@@ -409,12 +409,21 @@ async fn full_protocol_end_to_end() {
     assert_eq!(
         reported,
         [
-            "inbox/b-1.txt",
-            "inbox/empty-1.txt",
-            "inbox/Résumé Draft-1.pdf",
-            "inbox/sub/data-1.bin"
+            "inbox/b.txt",
+            "inbox/empty.txt",
+            "inbox/Résumé Draft.pdf",
+            "inbox/sub/data.bin"
         ]
     );
+    assert!(
+        !server.receive_dir.join("inbox/b-1.txt").exists(),
+        "identical re-send must not leave a suffixed copy"
+    );
+
+    // --- same name, different content: suffixed, nothing overwritten --------
+    let changed = vec![prepare(vec!["b.txt"], b"changed content".to_vec())];
+    let report = run_upload(&client, &base, &token, LINK_PASSWORD, &changed).await;
+    assert_eq!(report["files"][0]["stored_as"], json!("inbox/b-1.txt"));
     assert_eq!(
         std::fs::read(server.receive_dir.join("inbox/b.txt")).unwrap(),
         b"hello votport",
@@ -422,7 +431,7 @@ async fn full_protocol_end_to_end() {
     );
     assert_eq!(
         std::fs::read(server.receive_dir.join("inbox/b-1.txt")).unwrap(),
-        b"hello votport"
+        b"changed content"
     );
 
     // --- upload records are visible to the admin ----------------------------
@@ -443,7 +452,7 @@ async fn full_protocol_end_to_end() {
         .as_array()
         .unwrap()
         .clone();
-    assert_eq!(uploads.len(), 2);
+    assert_eq!(uploads.len(), 3);
     assert_eq!(uploads[0]["files"].as_array().unwrap().len(), 4);
     let events = links["links"]
         .as_array()
@@ -1357,4 +1366,142 @@ async fn begin_rejection_records_an_event() {
         events[0]["detail"].as_str().unwrap().contains("hidden"),
         "{events:?}"
     );
+}
+
+/// A re-sent file whose object root the link already delivered, and which is
+/// still on disk, is skipped: begin reports it complete, no bytes move, and
+/// no suffixed second copy appears. A genuinely new file in the same package
+/// still transfers.
+#[tokio::test(flavor = "multi_thread")]
+async fn identical_resend_is_deduped_not_suffixed() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+
+    let response = client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let response = client
+        .post(format!("{base}/api/admin/links"))
+        .header("X-Votport", "1")
+        .json(&json!({ "label": "dedupe", "dest": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let token = response.json::<Value>().await.unwrap()["link"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let dup_bytes: Vec<u8> = (0..u32::try_from(2 * CHUNK).unwrap())
+        .map(|index| (index.wrapping_mul(2_654_435_761) >> 9) as u8)
+        .collect();
+    let first = [prepare(vec!["dup.bin"], dup_bytes.clone())];
+    run_upload(&client, &base, &token, "", &first).await;
+
+    // --- the same file again, plus a new one --------------------------------
+    let second = [
+        prepare(vec!["dup.bin"], dup_bytes.clone()),
+        prepare(vec!["new.bin"], b"fresh content".to_vec()),
+    ];
+    let (announcement, pages, seal) = build_package(&second);
+    let response = client
+        .post(format!("{base}/api/r/{token}/session"))
+        .json(&json!({ "password": null, "package": announcement }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let session = response.json::<Value>().await.unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let response = client
+        .post(format!("{base}/api/session/{session}/seal"))
+        .body(seal)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    for page in pages {
+        let response = client
+            .post(format!("{base}/api/session/{session}/page"))
+            .body(page)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    }
+    let begin = client
+        .post(format!("{base}/api/session/{session}/begin"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let entries = begin["entries"].as_array().unwrap();
+    let dup = entries
+        .iter()
+        .find(|entry| entry["path"] == json!("dup.bin"))
+        .unwrap();
+    assert!(dup["complete"].as_bool().unwrap(), "{dup:?}");
+    assert_eq!(
+        dup["covered_bytes"].as_u64().unwrap(),
+        dup_bytes.len() as u64
+    );
+    assert_eq!(dup["stored_as"], json!("dup.bin"));
+    let fresh = entries
+        .iter()
+        .find(|entry| entry["path"] == json!("new.bin"))
+        .unwrap();
+    assert!(!fresh["complete"].as_bool().unwrap());
+
+    upload_chunks(
+        &client,
+        &base,
+        &session,
+        fresh["index"].as_u64().unwrap(),
+        &second[1],
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/session/{session}/finish"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let report = response.json::<Value>().await.unwrap();
+    assert_eq!(report["files"].as_array().unwrap().len(), 2);
+
+    assert!(
+        !server.receive_dir.join("dup-1.bin").exists(),
+        "dedupe must not publish a suffixed second copy"
+    );
+    let landed = std::fs::read(server.receive_dir.join("dup.bin")).unwrap();
+    assert_eq!(landed, dup_bytes);
+    assert_eq!(
+        std::fs::read(server.receive_dir.join("new.bin")).unwrap(),
+        b"fresh content"
+    );
+
+    // --- the copy is deleted: the next re-send transfers for real -----------
+    std::fs::remove_file(server.receive_dir.join("dup.bin")).unwrap();
+    let again = [prepare(vec!["dup.bin"], dup_bytes.clone())];
+    run_upload(&client, &base, &token, "", &again).await;
+    assert_eq!(
+        std::fs::read(server.receive_dir.join("dup.bin")).unwrap(),
+        dup_bytes,
+        "a record whose file is gone must not dedupe; the transfer redelivers"
+    );
+    assert!(!server.receive_dir.join("dup-1.bin").exists());
 }

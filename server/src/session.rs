@@ -370,14 +370,32 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
         .map_err(|error| SessionError::internal(format!("create destination: {error}")))?;
     paths::tighten_dir(&setup.dest_dir);
 
+    // Files this link already delivered, for dedupe on identical roots.
+    let prior_uploads = setup
+        .store
+        .link(&setup.link_id)
+        .map(|link| link.uploads)
+        .unwrap_or_default();
+
     let mut files = Vec::with_capacity(entries.len());
     for entry in &entries {
+        if let Some(existing) = find_delivered(setup, &prior_uploads, &entry.object_id()) {
+            files.push(FileState {
+                display_path: entry.path().collect::<Vec<_>>().join("/"),
+                stored_components: existing.stored_components,
+                object: entry.object_id(),
+                native: None,
+                published: true,
+                receipt: existing.receipt,
+            });
+            continue;
+        }
         files.push(open_destination(setup, entry)?);
     }
 
     // Zero-length objects have complete coverage already; publish now.
     for file in &mut files {
-        if file.object.length == 0 {
+        if file.object.length == 0 && !file.published {
             publish_file(setup, file)?;
         }
     }
@@ -408,6 +426,53 @@ fn entry_infos(setup: &WorkerSetup, files: &[FileState]) -> Vec<EntryInfo> {
             },
         })
         .collect()
+}
+
+struct Delivered {
+    stored_components: Vec<String>,
+    receipt: bool,
+}
+
+/// A file with this object root already delivered on this link and still on
+/// disk at its recorded name: the transfer is skipped and the existing copy
+/// reported, instead of publishing a suffixed duplicate.
+fn find_delivered(
+    setup: &WorkerSetup,
+    uploads: &[UploadRecord],
+    object: &ObjectId,
+) -> Option<Delivered> {
+    let suite = suite_name(object.suite);
+    let root = hex::encode(object.root);
+    for record in uploads.iter().flat_map(|upload| &upload.files) {
+        if record.root != root || record.suite != suite {
+            continue;
+        }
+        // stored_as is relative to the receive root. A record made under a
+        // different link dest no longer lives beneath dest_dir; skip it.
+        let rel = if setup.dest_rel.is_empty() {
+            record.stored_as.as_str()
+        } else {
+            match record
+                .stored_as
+                .strip_prefix(&format!("{}/", setup.dest_rel))
+            {
+                Some(rest) => rest,
+                None => continue,
+            }
+        };
+        let components: Vec<String> = rel.split('/').map(str::to_owned).collect();
+        let path = paths::join_under(&setup.dest_dir, &components);
+        match fs::metadata(&path) {
+            Ok(meta) if meta.is_file() && meta.len() == object.length => {
+                return Some(Delivered {
+                    stored_components: components,
+                    receipt: record.receipt,
+                });
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn open_destination(setup: &WorkerSetup, entry: &PackageEntry) -> Result<FileState, SessionError> {
