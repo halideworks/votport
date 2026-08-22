@@ -346,6 +346,24 @@ async fn metrics(State(app): State<std::sync::Arc<App>>, headers: HeaderMap) -> 
             return (StatusCode::UNAUTHORIZED, "metrics token required").into_response();
         }
     }
+    let app = Arc::clone(&app);
+    let body = match tokio::task::spawn_blocking(move || metrics_text(&app)).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "metrics unavailable").into_response()
+        }
+    };
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
+        .into_response()
+}
+
+fn metrics_text(app: &App) -> String {
     let tenants = app.store.tenants();
     let mut body = format!(
         "# TYPE votport_tenants gauge\nvotport_tenants {}\n",
@@ -382,14 +400,7 @@ async fn metrics(State(app): State<std::sync::Arc<App>>, headers: HeaderMap) -> 
         "# TYPE votport_audit_rows gauge\nvotport_audit_rows {}\n",
         app.store.audit_count()
     );
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/plain; version=0.0.4",
-        )],
-        body,
-    )
-        .into_response()
+    body
 }
 
 /// Discards idle upload sessions and expired audit rows.

@@ -30,22 +30,56 @@ curl -o /dev/null -w '%{http_code}\n' http://127.0.0.1:<debug-port>/r/x   # expe
 
 ## Backups
 
-Two pieces to back up, on different schedules:
+Two stores, two clocks. Litestream (or an equivalent WAL replica) is the
+database RPO. `/received` stays on the existing file backup. `GET
+/api/admin/backup` is a consistent copy-home button, not the HA story.
 
-1. **Database**: `GET /api/admin/backup` (admin session) streams a consistent
-   snapshot produced by SQLite's `VACUUM INTO`. Manually:
+| Store | Mechanism | RPO | RTO |
+| --- | --- | --- | --- |
+| `data/votport.db` | Litestream (or equivalent WAL replica) continuous | seconds (Litestream's default interval is about 1s of WAL) | minutes: stop container, `litestream restore`, start |
+| `data/votport.db` | `GET /api/admin/backup` (`VACUUM INTO`) | last time someone clicked Download (not the DR clock) | same stop-replace-start |
+| `/received` | existing file backup (restic, borg, zfs send, rsync) | that job's interval | restore files, start |
 
-   ```sh
-   sqlite3 data/votport.db ".backup data/backups/manual.db"
-   ```
+### Database copy-home
 
-2. **Received files**: plain files under `/received` — any file-level backup
-   tool works. Back them up together with a database snapshot so records and
-   bytes stay consistent with each other.
+`GET /api/admin/backup` (admin session) streams a consistent snapshot produced
+by SQLite's `VACUUM INTO`, with `Content-Length`. Snapshots land under
+`data/backups/` and are swept after 30 days. Manually:
 
-Restore: stop the container, replace `data/votport.db` with the snapshot,
-restore the files, start. A [litestream](https://litestream.io) recipe works as
--is against `data/votport.db` (replicate on, restore before container start).
+```sh
+sqlite3 data/votport.db ".backup data/backups/manual.db"
+```
+
+### Litestream
+
+Replicate on; restore before the container starts. Keep the recipe
+operator-owned (do not add a sidecar to `docker-compose.yml`).
+
+```yaml
+# litestream.yml (operator-owned)
+dbs:
+  - path: /data/votport.db
+    replicas:
+      - type: s3
+        bucket: example-votport
+        path: votport
+```
+
+Postgres is not on the table.
+
+### Received files
+
+Plain files under `/received`. Any file-level backup tool works (restic, borg,
+zfs send, rsync). Back them up together with a database snapshot so records
+and bytes stay consistent with each other.
+
+### Restore
+
+1. Stop the container.
+2. Replace `data/votport.db` with the Litestream restore or a `VACUUM INTO`
+   snapshot. Do not copy a live `-wal` over a restored file.
+3. Restore `/received` from the file backup taken nearest that snapshot.
+4. Start. Staging leftovers are removed by `paths::clean_staging` at boot.
 
 ## Single sign-on
 

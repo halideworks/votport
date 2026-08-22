@@ -2,12 +2,14 @@
 
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio_util::io::ReaderStream;
 
 use crate::app::App;
 use crate::auth;
@@ -535,17 +537,17 @@ pub async fn backup_database(
         .await
         .map_err(|error| ApiError::internal(error.to_string()))?
         .map_err(ApiError::internal)?;
-    let bytes = tokio::fs::read(&destination)
+    let file = tokio::fs::File::open(&destination)
         .await
-        .map_err(|error| ApiError::internal(format!("read snapshot: {error}")))?;
-    tracing::info!(target: "audit", event = "backup_created", file = %name, bytes = bytes.len(), "database snapshot exported");
-    app.store.audit(
-        "",
-        "",
-        "backup_created",
-        &name,
-        &json!({ "bytes": bytes.len() }),
-    );
+        .map_err(|error| ApiError::internal(format!("open snapshot: {error}")))?;
+    let len = file
+        .metadata()
+        .await
+        .map_err(|error| ApiError::internal(format!("snapshot metadata: {error}")))?
+        .len();
+    tracing::info!(target: "audit", event = "backup_created", file = %name, bytes = len, "database snapshot exported");
+    app.store
+        .audit("", "", "backup_created", &name, &json!({ "bytes": len }));
     Ok((
         [
             (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
@@ -553,8 +555,9 @@ pub async fn backup_database(
                 header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"{name}\""),
             ),
+            (header::CONTENT_LENGTH, len.to_string()),
         ],
-        bytes,
+        Body::from_stream(ReaderStream::new(file)),
     )
         .into_response())
 }
@@ -2110,10 +2113,16 @@ mod backup_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let content_length = response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok());
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(!body.is_empty());
         // SQLite databases begin with the magic string.
         assert!(body.starts_with(b"SQLite format 3\0"));
+        assert_eq!(content_length, Some(body.len()));
     }
 }
 
