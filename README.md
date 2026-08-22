@@ -203,9 +203,10 @@ hashed, verified range by range, independent of every proxy in between.
 1. Open the site, sign in (password and, if configured, SSO).
 2. **Links:** issue a request (label, optional destination, password, expiry,
    size cap). Copy the URL or show a QR code.
-3. When files arrive, each link lists uploads: stored paths, sizes, verified
-   package/object roots, whether each file is still on disk, and whether its
-   receipt sidecar was written. Delete a file (and its receipt) or clear a
+3. When files arrive, each link lists uploads as object cards: stored path,
+   size, and a click-to-copy identity line (`suite:64-hex root`) per file,
+   plus whether the file is still on disk and whether its receipt sidecar
+   was written. Delete a file (and its receipt) or clear a
    transfer from history. Deactivate or delete links when done (files stay
    until you delete them or retention sweeps them).
 4. **Tenants** (platform admin): namespaces, quotas, principals, revoke.

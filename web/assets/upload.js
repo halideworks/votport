@@ -1,6 +1,7 @@
 // votport uploader: hashes files with vot-wasm, builds a VOT package, and
 // streams proven ranges to the server. AGPL-3.0-only.
 
+import { appendObjectCard } from '/assets/object-card.js';
 import init, {
   ObjectId,
   PackageBuilder,
@@ -687,18 +688,15 @@ function showDone(report) {
   const list = $('done-list');
   list.replaceChildren();
   for (const file of report.files) {
-    const item = document.createElement('li');
-    item.className = 'done';
-    const name = document.createElement('span');
-    name.textContent = file.path;
-    const status = document.createElement('span');
-    status.className = 'status';
-    status.textContent = formatBytes(file.bytes) + (file.receipt ? ' · receipt ✓' : '');
-    const id = document.createElement('div');
-    id.className = 'mono muted file-id';
-    id.textContent = `${file.suite}:${file.root}`;
-    item.append(name, status, id);
-    list.append(item);
+    appendObjectCard(
+      list,
+      { name: file.path, suite: file.suite, root: file.root },
+      {
+        tag: 'li',
+        rowClass: 'done',
+        status: formatBytes(file.bytes) + (file.receipt ? ' · receipt ✓' : ''),
+      },
+    );
   }
 }
 

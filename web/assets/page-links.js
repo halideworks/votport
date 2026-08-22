@@ -1,6 +1,7 @@
 // votport links page: issue transfer requests and manage received files.
 // AGPL-3.0-only.
 
+import { appendObjectCard } from '/assets/object-card.js';
 import {
   alertModal,
   api,
@@ -64,27 +65,21 @@ function renderUpload(link, upload) {
   item.append(head);
 
   upload.files.forEach((file, index) => {
-    const row = document.createElement('div');
-    row.className = 'upload-file';
-
-    const name = document.createElement('span');
-    name.textContent = `${file.stored_as} (${formatBytes(file.bytes)})`;
-    row.append(name);
-
+    const extras = [];
     if (!file.exists) {
       const missing = document.createElement('span');
       missing.className = 'badge off';
       missing.textContent = 'missing';
-      row.append(missing);
+      extras.push(missing);
     }
     if (file.receipt) {
       const receipt = document.createElement('span');
       receipt.className = 'badge on';
       receipt.textContent = 'receipt';
-      row.append(receipt);
+      extras.push(receipt);
     }
     if (file.exists) {
-      row.append(
+      extras.push(
         button('Delete file', 'tiny danger', async () => {
           if (
             !(await confirmModal(
@@ -102,12 +97,11 @@ function renderUpload(link, upload) {
         }),
       );
     }
-    item.append(row);
-
-    const id = document.createElement('div');
-    id.className = 'mono muted file-id';
-    id.textContent = `${file.suite}:${file.root}`;
-    item.append(id);
+    appendObjectCard(
+      item,
+      { name: file.stored_as, suite: file.suite, root: file.root },
+      { tag: 'div', rowClass: 'upload-file', status: formatBytes(file.bytes), extras },
+    );
   });
 
   const root = document.createElement('div');
