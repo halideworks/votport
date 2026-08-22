@@ -16,6 +16,8 @@ export default [
         AbortController: 'readonly',
         setTimeout: 'readonly',
         TextEncoder: 'readonly',
+        TextDecoder: 'readonly',
+        URLSearchParams: 'readonly',
         Worker: 'readonly',
         console: 'readonly',
         // Worker context (hash-worker.js).

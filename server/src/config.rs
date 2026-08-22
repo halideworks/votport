@@ -40,6 +40,19 @@ pub struct Config {
     pub session_idle_secs: u64,
     /// Days to keep audit rows; 0 disables pruning.
     pub audit_retention_days: u64,
+    /// OIDC single sign-on for the admin dashboard. None when unset.
+    pub oidc: Option<OidcConfig>,
+}
+
+/// Identity-provider settings for admin SSO (docs/multi-tenancy.md phase 3).
+#[derive(Clone, Debug)]
+pub struct OidcConfig {
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret: String,
+    /// Group whose members sign in as admins; everyone else gets read-only
+    /// access. None means every authenticated principal is an admin.
+    pub admin_group: Option<String>,
 }
 
 const DEFAULT_MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024 * 1024; // 50 GiB
@@ -122,6 +135,38 @@ pub fn from_env() -> Result<Config, String> {
         }
     };
 
+    let oidc = match (
+        optional("VOTPORT_OIDC_ISSUER"),
+        optional("VOTPORT_OIDC_CLIENT_ID"),
+        optional("VOTPORT_OIDC_CLIENT_SECRET"),
+    ) {
+        (Some(issuer), Some(client_id), Some(client_secret)) => {
+            let admin_group = env::var("VOTPORT_OIDC_ADMIN_GROUP")
+                .ok()
+                .filter(|group| !group.trim().is_empty());
+            if admin_group.is_none() {
+                eprintln!(
+                    "votport: VOTPORT_OIDC_ADMIN_GROUP is unset; every principal your \
+                     provider authenticates will have full admin access"
+                );
+            }
+            Some(OidcConfig {
+                issuer,
+                client_id,
+                client_secret,
+                admin_group,
+            })
+        }
+        (None, None, None) => None,
+        _ => {
+            return Err(
+                "set all of VOTPORT_OIDC_ISSUER, VOTPORT_OIDC_CLIENT_ID and \
+                 VOTPORT_OIDC_CLIENT_SECRET, or none"
+                    .to_owned(),
+            )
+        }
+    };
+
     Ok(Config {
         bind,
         data_dir,
@@ -138,6 +183,7 @@ pub fn from_env() -> Result<Config, String> {
         allow_hidden,
         session_idle_secs,
         audit_retention_days,
+        oidc,
     })
 }
 

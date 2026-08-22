@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod session_rate;
+pub mod sso;
 pub mod upload;
 
 pub use admin::{
@@ -11,6 +12,7 @@ pub use admin::{
     create_link, delete_link, delete_received_file, delete_upload_record, link_qr, list_links,
     update_link,
 };
+pub use sso::{sso_available, sso_callback, sso_start};
 pub use upload::{
     create_session, link_info, upload_abort, upload_begin, upload_chunk, upload_finish,
     upload_page, upload_seal, verify_link_password,
@@ -145,6 +147,7 @@ pub(crate) mod testing {
             allow_hidden: false,
             session_idle_secs: 60,
             audit_retention_days: 400,
+            oidc: None,
         };
         app::build(config).unwrap()
     }

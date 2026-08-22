@@ -29,6 +29,31 @@ pub struct App {
     pub signer: Arc<crate::receipt::ReceiptSigner>,
     /// Outbound client for upload notifications.
     pub http: reqwest::Client,
+    /// OIDC configuration when SSO is enabled; the client discovers lazily.
+    pub sso_config: Option<crate::config::OidcConfig>,
+    pub sso_client: tokio::sync::OnceCell<Option<crate::api::sso::SsoClient>>,
+}
+
+/// Discovers the OIDC provider once, on first SSO use.
+pub(crate) async fn discover_sso(
+    config: &crate::config::OidcConfig,
+    public_url: &str,
+) -> Option<crate::api::sso::SsoClient> {
+    let redirect = format!("{public_url}/api/admin/callback");
+    match crate::api::sso::SsoClient::discover(
+        &config.issuer,
+        &config.client_id,
+        &config.client_secret,
+        &redirect,
+    )
+    .await
+    {
+        Ok(client) => Some(client),
+        Err(error) => {
+            tracing::error!("SSO discovery failed, SSO disabled: {error}");
+            None
+        }
+    }
 }
 
 pub fn build(config: Config) -> Result<Arc<App>, String> {
@@ -61,6 +86,8 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         session_rate: crate::api::session_rate::SessionRate::new(),
         signer,
         http,
+        sso_config: config.oidc.clone(),
+        sso_client: tokio::sync::OnceCell::new(),
         config,
     }))
 }
@@ -155,6 +182,10 @@ pub fn router(app: Arc<App>) -> Router {
             "/api/admin/links/{id}/uploads/{upload}/files/{index}",
             axum::routing::delete(api::delete_received_file),
         )
+        // SSO sign-in (phase 3 of docs/multi-tenancy.md).
+        .route("/api/admin/sso", get(api::sso_available))
+        .route("/api/admin/sso/start", get(api::sso_start))
+        .route("/api/admin/callback", get(api::sso_callback))
         // Public upload API.
         .route("/api/r/{token}", get(api::link_info))
         .route("/api/r/{token}/verify", post(api::verify_link_password))

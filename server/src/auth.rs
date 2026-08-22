@@ -108,21 +108,84 @@ fn verify_token(secret: &[u8; 32], context: &[&[u8]], token: &str) -> bool {
     constant_time_eq(expected.as_bytes(), mac.as_bytes())
 }
 
-/// Issues an admin session token: `expires.nonce.mac`. The MAC covers the
-/// stored password hash, so changing the password via the UI invalidates
-/// every outstanding session. `phc` is the stored hash or empty when the
-/// password still comes from the environment; the env-derived hash is salted
-/// fresh each boot and would otherwise log the admin out on every restart.
-pub fn issue_admin_token(secret: &[u8; 32], phc: &str) -> String {
-    issue_token(
-        secret,
-        &[b"votport-admin", phc.as_bytes()],
-        ADMIN_SESSION_SECS,
+/// The principal an admin session cookie stands for: who, which tenant
+/// namespace, and how much power. Local sign-ins use the default tenant.
+#[derive(Clone, Debug)]
+pub struct AdminIdentity {
+    pub subject: String,
+    pub tenant: String,
+    /// "admin" (full control) or "viewer" (read-only dashboard).
+    pub role: String,
+}
+
+fn admin_mac(
+    secret: &[u8; 32],
+    id: &AdminIdentity,
+    version: &str,
+    expires: u64,
+    nonce: &str,
+) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts 32-byte keys");
+    for part in [
+        b"votport-admin-v2".as_slice(),
+        id.subject.as_bytes(),
+        id.tenant.as_bytes(),
+        id.role.as_bytes(),
+        version.as_bytes(),
+    ] {
+        mac.update(part);
+        mac.update(b"\0");
+    }
+    mac.update(expires.to_le_bytes().as_slice());
+    mac.update(nonce.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// Issues an admin session token bound to the identity AND the credential
+/// version: changing the password (or rotating the environment credential)
+/// invalidates every outstanding session, exactly as before, while SSO
+/// identities carry their own subject and role.
+pub fn issue_admin_token(secret: &[u8; 32], id: &AdminIdentity, version: &str) -> String {
+    let expires = now_unix() + ADMIN_SESSION_SECS;
+    let nonce = random_token();
+    let mac = admin_mac(secret, id, version, expires, &nonce);
+    // Fields are dot-delimited; subject/tenant/role are hex so any bytes are
+    // representable without escaping.
+    format!(
+        "{expires}.{}.{}.{}.{}.{}",
+        hex::encode(id.subject.as_bytes()),
+        hex::encode(id.tenant.as_bytes()),
+        hex::encode(id.role.as_bytes()),
+        nonce,
+        mac
     )
 }
 
-pub fn verify_admin_token(secret: &[u8; 32], phc: &str, token: &str) -> bool {
-    verify_token(secret, &[b"votport-admin", phc.as_bytes()], token)
+/// Verifies an admin token and returns its identity. None when anything at
+/// all fails to match: wrong MAC, expired, malformed.
+pub fn verify_admin_token(secret: &[u8; 32], version: &str, token: &str) -> Option<AdminIdentity> {
+    let parts: Vec<&str> = token.split('.').collect();
+    let [expires, subject, tenant, role, nonce, mac] = parts.as_slice() else {
+        return None;
+    };
+    let Ok(expires) = expires.parse::<u64>() else {
+        return None;
+    };
+    if now_unix() >= expires {
+        return None;
+    }
+    let (Ok(subject), Ok(tenant), Ok(role)) =
+        (hex::decode(subject), hex::decode(tenant), hex::decode(role))
+    else {
+        return None;
+    };
+    let id = AdminIdentity {
+        subject: String::from_utf8(subject).ok()?,
+        tenant: String::from_utf8(tenant).ok()?,
+        role: String::from_utf8(role).ok()?,
+    };
+    let expected = admin_mac(secret, &id, version, expires, nonce);
+    constant_time_eq(expected.as_bytes(), mac.as_bytes()).then_some(id)
 }
 
 const LINK_SESSION_SECS: u64 = 30 * 24 * 3600;
@@ -144,6 +207,18 @@ pub fn verify_link_token(secret: &[u8; 32], link_id: &str, phc: &str, token: &st
         &[b"votport-link", link_id.as_bytes(), phc.as_bytes()],
         token,
     )
+}
+
+pub fn hex_encode(bytes: &[u8]) -> String {
+    hex::encode(bytes)
+}
+
+pub fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    hex::decode(text).ok()
+}
+
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    constant_time_eq(a, b)
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

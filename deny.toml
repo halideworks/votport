@@ -4,3 +4,10 @@
 [advisories]
 version = 2
 yanked = "deny"
+# RUSTSEC-2023-0071 (rsa crate, Marvin timing sidechannel): no upstream patch.
+# votport only VERIFIES id-token signatures with public keys via openidconnect;
+# it never holds an RSA private key, which is what the attack recovers.
+# Revisit when RustCrypto ships the constant-time implementation.
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa used for public-key signature verification only" },
+]

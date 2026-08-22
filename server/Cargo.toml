@@ -33,6 +33,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+openidconnect = { version = "4.0.1", features = ["reqwest"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
