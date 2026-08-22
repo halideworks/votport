@@ -741,6 +741,8 @@ struct SessionsInner {
     /// Tenants whose receive subtree is being deleted. Lives on the same
     /// mutex as `map` so [`Sessions::insert`] cannot race the pin.
     pinned: HashSet<String>,
+    #[cfg(test)]
+    delete_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
 }
 
 pub struct SessionHandle {
@@ -767,21 +769,24 @@ impl Sessions {
             inner: Mutex::new(SessionsInner {
                 map: HashMap::new(),
                 pinned: HashSet::new(),
+                #[cfg(test)]
+                delete_stall: None,
             }),
         }
     }
 
-    /// Blocks new sessions for `tenant` until [`Self::unpin_tenant`]. The
-    /// default tenant (`""`) is never pinned.
-    pub fn pin_tenant_for_delete(&self, tenant: &str) {
+    /// Blocks new sessions for `tenant` until the owner calls
+    /// [`Self::unpin_tenant`]. Returns whether this caller acquired the pin.
+    /// The default tenant (`""`) is never pinned.
+    pub fn pin_tenant_for_delete(&self, tenant: &str) -> bool {
         if tenant.is_empty() {
-            return;
+            return false;
         }
         self.inner
             .lock()
             .expect("sessions poisoned")
             .pinned
-            .insert(tenant.to_owned());
+            .insert(tenant.to_owned())
     }
 
     pub fn unpin_tenant(&self, tenant: &str) {
@@ -801,6 +806,28 @@ impl Sessions {
             .expect("sessions poisoned")
             .pinned
             .contains(tenant)
+    }
+
+    #[cfg(test)]
+    pub fn arm_delete_stall(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        self.inner.lock().expect("sessions poisoned").delete_stall = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub async fn wait_delete_stall(&self) {
+        let stall = self
+            .inner
+            .lock()
+            .expect("sessions poisoned")
+            .delete_stall
+            .take();
+        if let Some((entered, release)) = stall {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
     }
 
     /// Fails if `tenant` is pinned. Same lock as pin.
@@ -896,7 +923,7 @@ mod pin_tests {
     #[test]
     fn insert_fails_while_the_tenant_is_pinned() {
         let sessions = Sessions::new();
-        sessions.pin_tenant_for_delete("acme");
+        assert!(sessions.pin_tenant_for_delete("acme"));
         assert!(sessions.tenant_pinned("acme"));
         let err = sessions
             .insert(
@@ -923,9 +950,20 @@ mod pin_tests {
     }
 
     #[test]
+    fn pin_is_exclusive() {
+        let sessions = Sessions::new();
+        assert!(sessions.pin_tenant_for_delete("acme"));
+        assert!(!sessions.pin_tenant_for_delete("acme"));
+        assert!(sessions.tenant_pinned("acme"));
+        sessions.unpin_tenant("acme");
+        assert!(!sessions.tenant_pinned("acme"));
+        assert!(sessions.pin_tenant_for_delete("acme"));
+    }
+
+    #[test]
     fn pin_does_not_apply_to_the_default_tenant() {
         let sessions = Sessions::new();
-        sessions.pin_tenant_for_delete("");
+        assert!(!sessions.pin_tenant_for_delete(""));
         assert!(!sessions.tenant_pinned(""));
         sessions
             .insert(

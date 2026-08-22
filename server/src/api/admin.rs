@@ -266,6 +266,12 @@ pub async fn create_tenant(
     if app.store.tenant(&key).is_some() {
         return Err(ApiError::new(StatusCode::CONFLICT, "tenant already exists"));
     }
+    if app.sessions.tenant_pinned(&key) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "tenant delete already in progress",
+        ));
+    }
     let defaults = app.store.resolved_settings(&app.config);
     let tenant = crate::store::Tenant {
         key: key.clone(),
@@ -317,7 +323,12 @@ pub async fn delete_tenant(
             "that tenant key is reserved",
         ));
     }
-    app.sessions.pin_tenant_for_delete(&key);
+    if !app.sessions.pin_tenant_for_delete(&key) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "tenant delete already in progress",
+        ));
+    }
     let count = app.store.tenant_link_count(&key);
     if count > 0 {
         app.sessions.unpin_tenant(&key);
@@ -377,12 +388,19 @@ pub async fn delete_tenant(
             return Err(ApiError::internal(error));
         }
     };
+    #[cfg(test)]
+    app.sessions.wait_delete_stall().await;
     let purge = tokio::fs::remove_dir_all(&path).await;
     app.sessions.unpin_tenant(&key);
     match purge {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && row_deleted => {}
-        Err(_) => {
+        Err(error) => {
+            tracing::error!(
+                key = %key,
+                error = %error,
+                "receive subtree purge failed"
+            );
             return Err(ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "receive subtree purge failed; retry DELETE",
@@ -1052,15 +1070,12 @@ pub async fn create_link(
     };
     let base = base_url(&app, &headers);
     let view = link_view(&app, link.clone(), &base);
-    app.store.insert_link(link).map_err(|error| {
-        if error == "named tenant is gone" {
-            ApiError::new(
-                StatusCode::GONE,
-                "this session's tenant no longer exists; sign in again",
-            )
-        } else {
-            ApiError::internal(error)
-        }
+    app.store.insert_link(link).map_err(|error| match error {
+        crate::store::InsertLinkError::NamedTenantGone => ApiError::new(
+            StatusCode::GONE,
+            "this session's tenant no longer exists; sign in again",
+        ),
+        crate::store::InsertLinkError::Store(message) => ApiError::internal(message),
     })?;
     tracing::info!(target: "audit", event = "link_created", id = %view.id, label = %view.label, dest = %view.dest, "request link created");
     app.store.audit(
@@ -1641,6 +1656,27 @@ mod tenant_offboard_tests {
         dir
     }
 
+    async fn create_tenant_req(
+        application: Arc<App>,
+        cookie: &str,
+        key: &str,
+    ) -> axum::http::Response<axum::body::Body> {
+        let router = app::router(application);
+        router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/tenants")
+                    .header("cookie", cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"key":"{key}","label":"{key}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
     async fn delete_tenant_req(
         application: Arc<App>,
         cookie: &str,
@@ -1816,10 +1852,80 @@ mod tenant_offboard_tests {
         assert_eq!(deleted.detail["row_deleted"], false);
     }
 
+    #[tokio::test]
+    async fn overlapping_delete_does_not_unpin_until_owner_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(named_tenant("acme"))
+            .unwrap();
+        let tenant_dir = write_dummy(&application.config.receive_dir, "acme");
+
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let (entered, release) = application.sessions.arm_delete_stall();
+        let first_app = application.clone();
+        let first_cookie = cookie.clone();
+        let first =
+            tokio::spawn(async move { delete_tenant_req(first_app, &first_cookie, "acme").await });
+        entered.await.unwrap();
+        assert!(application.sessions.tenant_pinned("acme"));
+        assert!(application.store.tenant("acme").is_none());
+
+        let second = delete_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        let body = second.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("already in progress"),
+            "error was {json}"
+        );
+        assert!(application.sessions.tenant_pinned("acme"));
+        assert!(tenant_dir.join("x.bin").exists());
+
+        let created = create_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(created.status(), StatusCode::CONFLICT);
+        assert!(application.sessions.tenant_pinned("acme"));
+        assert!(application.store.tenant("acme").is_none());
+
+        release.send(()).unwrap();
+        let first_resp = first.await.unwrap();
+        assert_eq!(first_resp.status(), StatusCode::OK);
+        assert!(!application.sessions.tenant_pinned("acme"));
+        assert!(!tenant_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn create_tenant_refuses_a_pinned_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        assert!(application.sessions.pin_tenant_for_delete("acme"));
+
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let response = create_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("already in progress"),
+            "error was {json}"
+        );
+        assert!(application.store.tenant("acme").is_none());
+        assert!(application.sessions.tenant_pinned("acme"));
+    }
+
     #[test]
     fn insert_returns_pinned_while_delete_holds_the_pin() {
         let sessions = crate::session::Sessions::new();
-        sessions.pin_tenant_for_delete("acme");
+        assert!(sessions.pin_tenant_for_delete("acme"));
         let err = sessions
             .insert(
                 "s".to_owned(),

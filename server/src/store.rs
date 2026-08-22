@@ -440,7 +440,7 @@ impl Store {
         .expect("store read failed")
     }
 
-    pub fn insert_link(&self, link: Link) -> Result<(), String> {
+    pub fn insert_link(&self, link: Link) -> Result<(), InsertLinkError> {
         self.with(|connection| {
             // Named tenants have no FK; refuse inside this lock so a concurrent
             // remove_tenant cannot commit an orphan link.
@@ -457,11 +457,12 @@ impl Store {
             insert_link_row(connection, &link)?;
             Ok(true)
         })
+        .map_err(InsertLinkError::Store)
         .and_then(|inserted| {
             if inserted {
                 Ok(())
             } else {
-                Err("named tenant is gone".to_owned())
+                Err(InsertLinkError::NamedTenantGone)
             }
         })
     }
@@ -949,6 +950,13 @@ pub enum TenantRemoval {
     HasLinks,
 }
 
+/// Outcome of [`Store::insert_link`].
+#[derive(Debug, PartialEq)]
+pub enum InsertLinkError {
+    NamedTenantGone,
+    Store(String),
+}
+
 fn schema_version_stored(connection: &Connection) -> Result<u64, String> {
     let value: Option<String> = connection
         .query_row(
@@ -1384,7 +1392,7 @@ mod tenant_tests {
         assert_eq!(store.remove_tenant("acme").unwrap(), TenantRemoval::Deleted);
         assert!(store.tenant("acme").is_none());
         let err = store.insert_link(link_in("acme", "orphan")).unwrap_err();
-        assert_eq!(err, "named tenant is gone");
+        assert_eq!(err, InsertLinkError::NamedTenantGone);
         assert!(store.link("acme", "orphan").is_none());
     }
 

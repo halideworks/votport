@@ -277,12 +277,22 @@ pub async fn create_session(
     }
 
     // Named tenants publish into <receive>/<tenant-key>/...; the default
-    // tenant keeps today's layout.
-    let mut dest_components = app
-        .store
-        .tenant(&link.tenant)
-        .map(|tenant| tenant.path_prefix())
-        .unwrap_or_default();
+    // tenant keeps today's layout. Do not fall back to the receive root
+    // when a named tenant row has vanished.
+    let mut dest_components = if link.tenant.is_empty() {
+        Vec::new()
+    } else {
+        match app.store.tenant(&link.tenant) {
+            Some(tenant) => tenant.path_prefix(),
+            None => {
+                audit_session_rejected(&app, &link.tenant, "link tenant missing");
+                return Err(ApiError::new(
+                    StatusCode::GONE,
+                    "this link's tenant no longer exists",
+                ));
+            }
+        }
+    };
     dest_components.extend(
         link.dest
             .split('/')
