@@ -3,10 +3,11 @@
 A small, self-hosted **file receive portal** built on
 [VOT (Verified Object Transfer)](https://github.com/halideworks/VOT).
 
-You sign in to the admin dashboard, create a unique request link (with an
-optional password), and send it to someone. They open it in a browser, drop
-files on the page, and the files land — cryptographically verified, atomically
-published, never overwriting anything — in a folder you chose on your server.
+You sign in to the admin UI (`/links`, `/tenants`, `/audit`, `/system`), create
+a unique request link (with an optional password), and send it to someone. They
+open it in a browser, drop files on the page, and the files land, cryptographically
+verified, atomically published, never overwriting anything, in a folder you
+chose on your server.
 
 ```
 you (admin)                    them (any modern browser)
@@ -16,7 +17,7 @@ you (admin)                    them (any modern browser)
     ├──────────── send link ───────────▶│
     │                                   │  vot-wasm hashes the files locally,
     │                                   │  builds a VOT package (manifest+seal),
-    │                                   │  streams up to four proven 8 MiB ranges
+    │                                   │  streams up to eight proven 8 MiB ranges
     │                                   ▼
     │                       votport server (this repo)
     │                       verifies every range against the announced
@@ -73,7 +74,11 @@ Received files appear under the host folder you mounted at `/received`
 
 ## Configuration
 
-Everything is environment variables (see `docker-compose.yml`):
+Environment variables are the boot defaults (see `docker-compose.yml`). A
+default-tenant admin can overlay notify channels, retention, and default
+quotas from **System** without SSH (`GET`/`PUT /api/admin/settings`). A written
+settings key wins; `""` disables a URL or token; JSON `null` deletes the row
+so env applies again. Details: [`docs/deployment.md`](docs/deployment.md).
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -134,7 +139,11 @@ principal your provider authenticates is an administrator — votport warns
 loudly at startup.
 
 Local password sign-in always remains available as the break-glass path,
-including when SSO is configured.
+including when SSO is configured. `POST /api/admin/login` is never disabled.
+System can collapse the password form behind a disclosure when SSO is offered;
+the form stays in the page. SSO principals appear on `/tenants` and can be
+revoked (current sessions die; further SSO is refused until unblock). Lasting
+revoke is removing the IdP group.
 
 ## Audit trail
 
@@ -158,10 +167,10 @@ with a key votport generates in the data directory (`receipt.key`), attesting
 that exactly that object (suite, BLAKE3 root, length) reached **Published**
 assurance under the Balanced commit profile, with the session, provider
 incarnation, sequence, and UTC timestamp of the observation. The verifying
-public key is shown at the top of the admin dashboard (and returned by
-`GET /api/admin/links` as `receipt_key`); the receipt's embedded key id is the
-same 32-byte public key. Verify one with the `vot-receipt` crate:
-`decode_authenticated(bytes)` then `verify_ed25519(&decoded, &key)`.
+public key is shown on **System** (and returned by `GET /api/admin/links` as
+`receipt_key`); the receipt's embedded key id is the same 32-byte public key.
+Verify one with the `vot-receipt` crate: `decode_authenticated(bytes)` then
+`verify_ed25519(&decoded, &key)`.
 
 ## Security model
 
@@ -175,7 +184,8 @@ same 32-byte public key. Verify one with the `vot-receipt` crate:
   cannot lock out others.
 * Optional SSO sign-in maps your identity provider's groups to admin or
   read-only viewer access; session cookies bind the role and are invalidated
-  by password changes or role changes.
+  by password changes or role changes. Platform admins can revoke an SSO
+  principal from `/tenants`.
 * Uploaded names pass VOT's portable-path profile (no traversal, no control
   characters, no Windows-reserved names) **and** a server-side re-check; files
   cannot land outside the receive folder.
@@ -190,20 +200,44 @@ hashed, verified range by range, independent of every proxy in between.
 
 ## Admin flow
 
-1. Open the site, sign in.
-2. "New request link": label it, optionally pick a destination subfolder, a
-   password, an expiry, a size cap.
-3. Copy the link, send it (share any password separately).
-4. When files arrive, each link shows its uploads: stored paths, sizes, the
-   full verified package/object roots, whether each file is still on disk,
-   and whether its receipt sidecar was written.
-5. Show a QR code for any link for senders on phones; delete individual
-   received files (with their receipts) or clear a transfer from the history.
-6. Deactivate or delete links when done (files stay on disk).
+1. Open the site, sign in (password and, if configured, SSO).
+2. **Links:** issue a request (label, optional destination, password, expiry,
+   size cap). Copy the URL or show a QR code.
+3. When files arrive, each link lists uploads: stored paths, sizes, verified
+   package/object roots, whether each file is still on disk, and whether its
+   receipt sidecar was written. Delete a file (and its receipt) or clear a
+   transfer from history. Deactivate or delete links when done (files stay
+   until you delete them or retention sweeps them).
+4. **Tenants** (platform admin): namespaces, quotas, principals, revoke.
+5. **Audit:** queryable event log and JSONL export.
+6. **System:** password, backup download, receipt public key, notify/SMTP,
+   retention, default quotas.
 
 Senders can drop folders as well as files; browser support requires
 WebAssembly SIMD and module workers (Safari 16.4, Chrome 91, Firefox 114 or
 newer).
+
+## Performance
+
+The wire unit is an 8 MiB proven range (`CHUNK_BYTES` in `session.rs`). That
+ceiling is protocol-level in VOT, not a votport knob. The browser keeps up to
+eight range PUTs in flight and hashes ahead in module workers. The server
+worker verifies ranges serially against the announced merkle root, then
+publishes each file the moment its coverage is complete.
+
+That serial verify is what leaves headroom on a fast NIC. Raising the range
+size or verifying in parallel is VOT work (improved FEC, then a pin bump here
+in Cargo.toml, the Dockerfile `ARG`, and Cargo.lock together). Do not raise
+`CHUNK_BYTES` in votport ahead of that pin.
+
+Measure on this box:
+
+```sh
+cargo test --test e2e -- --ignored --nocapture throughput_baseline
+```
+
+SQLite is one writer. That is the scale story. Litestream is the documented
+database RPO; `/received` is a file backup. See [`docs/deployment.md`](docs/deployment.md).
 
 ## Development
 
@@ -212,6 +246,11 @@ newer).
 cd server
 cargo test          # unit + full-protocol integration tests
 cargo run           # needs VOTPORT_ADMIN_PASSWORD, VOTPORT_DATA_DIR, etc.
+
+# browser JS
+node --check ../web/assets/*.js
+npx --yes eslint@9.18.0 ../web/assets/*.js
+node --test ../scripts/login-disclosure.test.mjs
 
 # browser wasm bundle (needs wasm32 target + wasm-bindgen-cli 0.2.126)
 scripts/build-wasm.sh /path/to/VOT-checkout
@@ -225,8 +264,9 @@ browser and server always agree on the wire artifacts.
 
 ```
 server/   axum server: admin API, upload protocol, VOT verify + publish
-web/      static frontend: admin UI and the uploader (vot-wasm in browser)
-scripts/  wasm build helper
+web/      static frontend: admin pages and the uploader (vot-wasm in browser)
+scripts/  wasm build helper, login-disclosure tests
+docs/     deployment, multi-tenancy design, enterprise-ops
 ```
 
 ### Upload protocol (what the browser does)
@@ -243,10 +283,21 @@ POST /api/session/{s}/finish   all files verified → recorded
 Each file is published the moment its coverage is complete, so a session that
 dies halfway still delivers the files that finished.
 
-## Roadmap ideas
+## Roadmap
+
+Waiting on VOT: improved FEC, then re-pin. That is the path to larger ranges
+and parallel verify. Until that pin moves, votport stays on
+`b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726`.
+
+Product next, each as its own design first:
 
 * Content dedup when two entries share an object root
 * Outbound mode: serve files to a recipient with verified download
+* Scoped automation tokens (they bypass human-rate throttles; they need
+  grants, expiry, and audit)
+* Legal hold versus upload retention (a do-not-sweep flag)
+
+Not on the table: Postgres, a second store backend, horizontal replicas, SAML.
 
 ## Splitting this out into its own repository
 
