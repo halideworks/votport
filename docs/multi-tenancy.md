@@ -1,12 +1,12 @@
 # Multi-tenancy design
 
 Status: phases 1-5 shipped (#23 store, #24 audit, #25 SSO, #26 tenants,
-#27 ops polish) plus the multi-page admin (#28). Remaining roadmap:
-System-page settings editors, SMTP notifications, SSO discovery retry,
-principals, tenant purge, backup streaming. The settings KV overlay and
-`GET`/`PUT /api/admin/settings` live in [`enterprise-ops.md`](enterprise-ops.md).
-Each phase landed as its own PR with the standard gate
-(fmt, clippy -D warnings, tests, e2e, docker build) and review.
+#27 ops polish) plus the multi-page admin (#28). Phases 6+ shipped (settings
+overlay, SMTP, SSO discovery retry, principals/revoke, tenant purge, backup
+streaming). Design: [`enterprise-ops.md`](enterprise-ops.md). Remaining is
+write-first: scoped automation tokens, legal hold versus retention. Each
+phase landed as its own PR with the standard gate (fmt, clippy -D warnings,
+tests, e2e, docker build) and review.
 
 ## Goal
 
@@ -139,6 +139,7 @@ also inserted into `audit_log(at, tenant, actor, event, subject, detail_json)`.
 
 ## Deliberately unchanged
 
-The single-binary, env-configured, Caddy-fronted deployment. An enterprise should be
+The single-binary, Caddy-fronted deployment. Env remains the boot default;
+System overlays notify, retention, and default quotas. An enterprise should be
 able to `docker compose up` this behind their SSO and pass a security review, and a
 homelabber should never learn the word "tenant".

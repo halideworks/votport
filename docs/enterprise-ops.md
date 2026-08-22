@@ -2,14 +2,15 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Draft |
-| Author | (placeholder) |
+| Status | Shipped on `ece4574` |
 | Date | 2026-08-22 |
-| Head | `7ab2703` Restore the original dashboard design for the admin pages |
+| Head | `ece4574` Move SMTP overlay tests into settings_tests |
 | Continues | `docs/multi-tenancy.md` (phases 1-5 plus multi-page admin #28) |
 | Audience | Senior engineers who already know the votport tree |
 
-This document should later be copied into `docs/enterprise-ops.md` (or similar) in the first docs/settings PR so it is not stuck in a scratch path. Until that copy lands, this file is the source of truth for the work below. Copy into `docs/enterprise-ops.md` happens in PR 1.
+The body below is the design that shipped. Remaining follow-ons (not this
+tree): scoped automation tokens; legal hold versus retention. VOT re-pin
+waits on upstream FEC.
 
 ## Overview
 

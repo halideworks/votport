@@ -210,3 +210,18 @@ records' live status) older than N days, swept daily with audit events.
 `VOTPORT_AUDIT_RETENTION_DAYS` (default 400) prunes audit rows the same way.
 Upload retention defaults to keeping everything; audit rows default to
 400 days.
+
+## Performance
+
+Range size is 8 MiB, set by VOT, advertised as `chunk_bytes` on session
+create. The sender keeps eight range PUTs in flight. The upload worker
+verifies those ranges one at a time. That serial verify, not SQLite, is
+what leaves the NIC idle on a fast path.
+
+Do not raise `CHUNK_BYTES` in votport until VOT's improved FEC lands and
+this repo re-pins `vot-sdk` / `vot-sdk-file` / `vot-wasm` to the same
+revision in Cargo.toml, the Dockerfile `ARG`, and Cargo.lock. Measure with:
+
+```sh
+cargo test --test e2e -- --ignored --nocapture throughput_baseline
+```
