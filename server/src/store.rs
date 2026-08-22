@@ -441,7 +441,29 @@ impl Store {
     }
 
     pub fn insert_link(&self, link: Link) -> Result<(), String> {
-        self.with(|connection| insert_link_row(connection, &link))
+        self.with(|connection| {
+            // Named tenants have no FK; refuse inside this lock so a concurrent
+            // remove_tenant cannot commit an orphan link.
+            if !link.tenant.is_empty() {
+                let exists: i64 = connection.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM tenants WHERE key = ?1)",
+                    [&link.tenant],
+                    |row| row.get(0),
+                )?;
+                if exists == 0 {
+                    return Ok(false);
+                }
+            }
+            insert_link_row(connection, &link)?;
+            Ok(true)
+        })
+        .and_then(|inserted| {
+            if inserted {
+                Ok(())
+            } else {
+                Err("named tenant is gone".to_owned())
+            }
+        })
     }
 
     /// Applies `mutate` to the link and commits; Ok(false) when absent.
@@ -1100,6 +1122,18 @@ mod tests {
         }
     }
 
+    pub(crate) fn test_tenant(key: &str) -> Tenant {
+        Tenant {
+            key: key.to_owned(),
+            label: key.to_owned(),
+            admin_group: None,
+            max_total_bytes: None,
+            max_links: None,
+            max_sessions: None,
+            created_at: 0,
+        }
+    }
+
     #[test]
     fn links_round_trip_with_uploads_and_events() {
         let directory = tempfile::tempdir().unwrap();
@@ -1291,7 +1325,7 @@ mod tests {
 
 #[cfg(test)]
 mod tenant_tests {
-    use super::tests::link_in;
+    use super::tests::{link_in, test_tenant};
     use super::*;
 
     #[test]
@@ -1349,6 +1383,9 @@ mod tenant_tests {
         assert_eq!(store.tenant_link_count("acme"), 0);
         assert_eq!(store.remove_tenant("acme").unwrap(), TenantRemoval::Deleted);
         assert!(store.tenant("acme").is_none());
+        let err = store.insert_link(link_in("acme", "orphan")).unwrap_err();
+        assert_eq!(err, "named tenant is gone");
+        assert!(store.link("acme", "orphan").is_none());
     }
 
     #[test]
@@ -1375,6 +1412,7 @@ mod tenant_tests {
             total_bytes: 500,
             files: vec![file.clone()],
         });
+        store.insert_tenant(test_tenant("acme")).unwrap();
         store.insert_link(link.clone()).unwrap();
         assert_eq!(store.tenant_received_bytes("acme"), 500);
         assert_eq!(store.tenant_received_bytes(""), 0);
@@ -1392,7 +1430,7 @@ mod tenant_tests {
 
 #[cfg(test)]
 mod ops_tests {
-    use super::tests::test_link;
+    use super::tests::{test_link, test_tenant};
     use super::*;
 
     #[test]
@@ -1424,6 +1462,7 @@ mod ops_tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         store.insert_link(test_link("default-link")).unwrap();
+        store.insert_tenant(test_tenant("acme")).unwrap();
         let mut scoped = test_link("scoped-link");
         scoped.tenant = "acme".to_owned();
         store.insert_link(scoped).unwrap();
@@ -1471,6 +1510,9 @@ mod phase4_review_tests {
     fn link_by_id_spans_tenants_for_the_public_protocol() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
+        store
+            .insert_tenant(super::tests::test_tenant("acme"))
+            .unwrap();
         store.insert_link(link_in("acme", "scoped")).unwrap();
         // Senders never know a tenant key; the id is the capability.
         assert!(store.link_by_id("scoped").is_some());

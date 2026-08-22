@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use vot_sdk::object::{ObjectId, Suite};
 
@@ -310,7 +310,25 @@ pub async fn create_session(
         session_id: session_bytes,
         started_at: now_unix(),
     };
-    let sender = session::spawn_worker(setup);
+    // Depth matches the client's chunk concurrency so handlers rarely block
+    // on send. Register the sender before the worker can create_dir_all.
+    let (sender, receiver) = mpsc::channel(8);
+    match app.sessions.insert(
+        session_id.clone(),
+        link.id.clone(),
+        link.tenant.clone(),
+        sender,
+    ) {
+        Err(session::InsertError::Pinned) => {
+            audit_session_rejected(&app, &link.tenant, "tenant pinned for delete");
+            return Err(ApiError::new(
+                StatusCode::GONE,
+                "this link's tenant no longer exists",
+            ));
+        }
+        Ok(()) => {}
+    }
+    session::spawn_worker(setup, receiver);
     tracing::info!(
         target: "audit", event = "upload_session_created", link = %link.id,
         session_tag = %session_id.get(..8).unwrap_or(&session_id),
@@ -323,8 +341,6 @@ pub async fn create_session(
         &link.id,
         &serde_json::json!({ "session_tag": &session_id[..8.min(session_id.len())], "bytes": announced_bytes }),
     );
-    app.sessions
-        .insert(session_id.clone(), link.id, link.tenant.clone(), sender);
     Ok(Json(json!({
         "session": session_id,
         "chunk_bytes": session::CHUNK_BYTES,

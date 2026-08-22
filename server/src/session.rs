@@ -5,7 +5,7 @@
 //! channel. That serializes disk writes per session and keeps the SDK types
 //! off the async executor entirely.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -164,11 +164,10 @@ enum Phase {
     Done,
 }
 
-pub fn spawn_worker(setup: WorkerSetup) -> mpsc::Sender<Cmd> {
-    // Depth matches the client's chunk concurrency so handlers rarely block on
-    // send. Queued chunks are Bytes aliasing the request bodies, not copies,
-    // so the queue holds refcounts rather than duplicated buffers.
-    let (sender, mut receiver) = mpsc::channel::<Cmd>(8);
+/// Runs the per-session worker. The caller creates the channel, registers the
+/// sender, then passes the receiver here so the thread cannot touch disk
+/// before the session is in the map.
+pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
     std::thread::spawn(move || {
         let mut phase = Phase::AwaitSeal;
         // Feedback for the admin: bytes newly accepted this session and the
@@ -272,7 +271,6 @@ pub fn spawn_worker(setup: WorkerSetup) -> mpsc::Sender<Cmd> {
         }
         // Dropping unpublished NativeFile values removes their staging.
     });
-    sender
 }
 
 fn handle_seal(setup: &WorkerSetup, phase: &mut Phase, bytes: &[u8]) -> Result<u64, SessionError> {
@@ -735,7 +733,14 @@ pub fn suite_name(identifier: u16) -> String {
 
 /// Registry of live sessions reachable from async handlers.
 pub struct Sessions {
-    map: Mutex<HashMap<String, SessionHandle>>,
+    inner: Mutex<SessionsInner>,
+}
+
+struct SessionsInner {
+    map: HashMap<String, SessionHandle>,
+    /// Tenants whose receive subtree is being deleted. Lives on the same
+    /// mutex as `map` so [`Sessions::insert`] cannot race the pin.
+    pinned: HashSet<String>,
 }
 
 pub struct SessionHandle {
@@ -743,6 +748,11 @@ pub struct SessionHandle {
     pub tenant: String,
     pub sender: mpsc::Sender<Cmd>,
     pub last_active: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertError {
+    Pinned,
 }
 
 impl Default for Sessions {
@@ -754,12 +764,58 @@ impl Default for Sessions {
 impl Sessions {
     pub fn new() -> Self {
         Self {
-            map: Mutex::new(HashMap::new()),
+            inner: Mutex::new(SessionsInner {
+                map: HashMap::new(),
+                pinned: HashSet::new(),
+            }),
         }
     }
 
-    pub fn insert(&self, id: String, link_id: String, tenant: String, sender: mpsc::Sender<Cmd>) {
-        self.map.lock().expect("sessions poisoned").insert(
+    /// Blocks new sessions for `tenant` until [`Self::unpin_tenant`]. The
+    /// default tenant (`""`) is never pinned.
+    pub fn pin_tenant_for_delete(&self, tenant: &str) {
+        if tenant.is_empty() {
+            return;
+        }
+        self.inner
+            .lock()
+            .expect("sessions poisoned")
+            .pinned
+            .insert(tenant.to_owned());
+    }
+
+    pub fn unpin_tenant(&self, tenant: &str) {
+        self.inner
+            .lock()
+            .expect("sessions poisoned")
+            .pinned
+            .remove(tenant);
+    }
+
+    pub fn tenant_pinned(&self, tenant: &str) -> bool {
+        if tenant.is_empty() {
+            return false;
+        }
+        self.inner
+            .lock()
+            .expect("sessions poisoned")
+            .pinned
+            .contains(tenant)
+    }
+
+    /// Fails if `tenant` is pinned. Same lock as pin.
+    pub fn insert(
+        &self,
+        id: String,
+        link_id: String,
+        tenant: String,
+        sender: mpsc::Sender<Cmd>,
+    ) -> Result<(), InsertError> {
+        let mut inner = self.inner.lock().expect("sessions poisoned");
+        if !tenant.is_empty() && inner.pinned.contains(&tenant) {
+            return Err(InsertError::Pinned);
+        }
+        inner.map.insert(
             id,
             SessionHandle {
                 link_id,
@@ -768,13 +824,15 @@ impl Sessions {
                 last_active: Instant::now(),
             },
         );
+        Ok(())
     }
 
     /// Concurrent sessions for one tenant namespace.
     pub fn active_for_tenant(&self, tenant: &str) -> usize {
-        self.map
+        self.inner
             .lock()
             .expect("sessions poisoned")
+            .map
             .values()
             .filter(|handle| handle.tenant == tenant)
             .count()
@@ -782,33 +840,35 @@ impl Sessions {
 
     /// The link a session belongs to, for completion notifications.
     pub fn link_id(&self, id: &str) -> Option<String> {
-        self.map
+        self.inner
             .lock()
             .expect("sessions poisoned")
+            .map
             .get(id)
             .map(|handle| handle.link_id.clone())
     }
 
     /// Returns the sender for a session and refreshes its idle clock.
     pub fn touch(&self, id: &str) -> Option<mpsc::Sender<Cmd>> {
-        let mut map = self.map.lock().expect("sessions poisoned");
-        let handle = map.get_mut(id)?;
+        let mut inner = self.inner.lock().expect("sessions poisoned");
+        let handle = inner.map.get_mut(id)?;
         handle.last_active = Instant::now();
         Some(handle.sender.clone())
     }
 
     pub fn remove(&self, id: &str) {
-        self.map.lock().expect("sessions poisoned").remove(id);
+        self.inner.lock().expect("sessions poisoned").map.remove(id);
     }
 
     pub fn total(&self) -> usize {
-        self.map.lock().expect("sessions poisoned").len()
+        self.inner.lock().expect("sessions poisoned").map.len()
     }
 
     pub fn active_for_link(&self, link_id: &str) -> usize {
-        self.map
+        self.inner
             .lock()
             .expect("sessions poisoned")
+            .map
             .values()
             .filter(|handle| handle.link_id == link_id)
             .count()
@@ -817,9 +877,63 @@ impl Sessions {
     /// Drops sessions idle beyond `idle_secs`; their workers then exit and
     /// clean up staging files.
     pub fn sweep(&self, idle_secs: u64) {
-        self.map
+        self.inner
             .lock()
             .expect("sessions poisoned")
+            .map
             .retain(|_, handle| handle.last_active.elapsed().as_secs() < idle_secs);
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    fn dummy_sender() -> mpsc::Sender<Cmd> {
+        mpsc::channel(1).0
+    }
+
+    #[test]
+    fn insert_fails_while_the_tenant_is_pinned() {
+        let sessions = Sessions::new();
+        sessions.pin_tenant_for_delete("acme");
+        assert!(sessions.tenant_pinned("acme"));
+        let err = sessions
+            .insert(
+                "s1".to_owned(),
+                "link".to_owned(),
+                "acme".to_owned(),
+                dummy_sender(),
+            )
+            .unwrap_err();
+        assert_eq!(err, InsertError::Pinned);
+        assert_eq!(sessions.total(), 0);
+
+        sessions.unpin_tenant("acme");
+        assert!(!sessions.tenant_pinned("acme"));
+        sessions
+            .insert(
+                "s1".to_owned(),
+                "link".to_owned(),
+                "acme".to_owned(),
+                dummy_sender(),
+            )
+            .unwrap();
+        assert_eq!(sessions.total(), 1);
+    }
+
+    #[test]
+    fn pin_does_not_apply_to_the_default_tenant() {
+        let sessions = Sessions::new();
+        sessions.pin_tenant_for_delete("");
+        assert!(!sessions.tenant_pinned(""));
+        sessions
+            .insert(
+                "s1".to_owned(),
+                "link".to_owned(),
+                String::new(),
+                dummy_sender(),
+            )
+            .unwrap();
     }
 }

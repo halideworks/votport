@@ -58,7 +58,7 @@ function renderTenant(tenant) {
         if (
           !(await confirmModal(
             'Delete tenant',
-            `Delete "${tenant.key}"? Refused while its links still exist; received files on disk stay.`,
+            `Delete "${tenant.key}"? Refused while its links still exist. Files under the tenant prefix are deleted; if purge fails, retry Delete.`,
             'Delete',
           ))
         )

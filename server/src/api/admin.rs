@@ -309,36 +309,94 @@ pub async fn delete_tenant(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_platform_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
+    let key = paths::admit_dest(&key)
+        .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    if key.is_empty() || key == "default" {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "that tenant key is reserved",
+        ));
+    }
+    app.sessions.pin_tenant_for_delete(&key);
     let count = app.store.tenant_link_count(&key);
     if count > 0 {
+        app.sessions.unpin_tenant(&key);
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             format!("{count} link(s) still reference this tenant; delete them first"),
         ));
     }
-    // In-flight uploads would keep writing into the deleted namespace and
-    // their records would silently vanish.
     let active = app.sessions.active_for_tenant(&key);
     if active > 0 {
+        app.sessions.unpin_tenant(&key);
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             format!("{active} upload(s) are in flight; try again when they finish"),
         ));
     }
     use crate::store::TenantRemoval;
-    match app.store.remove_tenant(&key).map_err(ApiError::internal)? {
-        TenantRemoval::Deleted => {}
-        TenantRemoval::Absent => return Err(ApiError::not_found()),
-        TenantRemoval::HasLinks => {
+    let row_deleted = match app.store.remove_tenant(&key) {
+        Ok(TenantRemoval::Deleted) => true,
+        Ok(TenantRemoval::HasLinks) => {
+            app.sessions.unpin_tenant(&key);
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "a link was created concurrently; delete them first",
             ));
         }
+        Ok(TenantRemoval::Absent) => {
+            let path = match tenant_receive_dir(&app.config.receive_dir, &key) {
+                Ok(path) => path,
+                Err(error) => {
+                    app.sessions.unpin_tenant(&key);
+                    return Err(ApiError::internal(error));
+                }
+            };
+            if !path.is_dir() {
+                app.sessions.unpin_tenant(&key);
+                return Err(ApiError::not_found());
+            }
+            if default_tenant_dest_collides(&app.store, &key) {
+                app.sessions.unpin_tenant(&key);
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "refusing leftover purge: default-tenant dest uses that path",
+                ));
+            }
+            false
+        }
+        Err(error) => {
+            app.sessions.unpin_tenant(&key);
+            return Err(ApiError::internal(error));
+        }
+    };
+    let path = match tenant_receive_dir(&app.config.receive_dir, &key) {
+        Ok(path) => path,
+        Err(error) => {
+            app.sessions.unpin_tenant(&key);
+            return Err(ApiError::internal(error));
+        }
+    };
+    let purge = tokio::fs::remove_dir_all(&path).await;
+    app.sessions.unpin_tenant(&key);
+    match purge {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && row_deleted => {}
+        Err(_) => {
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "receive subtree purge failed; retry DELETE",
+            ));
+        }
     }
     tracing::info!(target: "audit", event = "tenant_deleted", key = %key, "tenant namespace deleted");
-    app.store
-        .audit("", &identity.subject, "tenant_deleted", &key, &json!({}));
+    app.store.audit(
+        "",
+        &identity.subject,
+        "tenant_deleted",
+        &key,
+        &json!({ "purged_receive": true, "row_deleted": row_deleted }),
+    );
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -419,6 +477,25 @@ pub async fn update_tenant(
         }),
     );
     Ok(Json(json!({ "ok": true })))
+}
+
+fn tenant_receive_dir(
+    receive_dir: &std::path::Path,
+    key: &str,
+) -> Result<std::path::PathBuf, String> {
+    let path = paths::join_under(receive_dir, &[key.to_owned()])?;
+    if path == *receive_dir {
+        return Err("refusing to purge the receive root".to_owned());
+    }
+    Ok(path)
+}
+
+fn default_tenant_dest_collides(store: &crate::store::Store, key: &str) -> bool {
+    let prefix = format!("{key}/");
+    store
+        .links("")
+        .iter()
+        .any(|link| link.dest == key || link.dest.starts_with(&prefix))
 }
 
 /// Streams a consistent SQLite snapshot as a download. Read-only operation:
@@ -975,7 +1052,16 @@ pub async fn create_link(
     };
     let base = base_url(&app, &headers);
     let view = link_view(&app, link.clone(), &base);
-    app.store.insert_link(link).map_err(ApiError::internal)?;
+    app.store.insert_link(link).map_err(|error| {
+        if error == "named tenant is gone" {
+            ApiError::new(
+                StatusCode::GONE,
+                "this session's tenant no longer exists; sign in again",
+            )
+        } else {
+            ApiError::internal(error)
+        }
+    })?;
     tracing::info!(target: "audit", event = "link_created", id = %view.id, label = %view.label, dest = %view.dest, "request link created");
     app.store.audit(
         &identity.tenant,
@@ -1464,6 +1550,285 @@ mod tenant_authz_tests {
             .unwrap();
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+#[cfg(test)]
+mod tenant_offboard_tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::Request;
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt;
+
+    use std::sync::Arc;
+
+    use crate::api::testing;
+    use crate::app;
+    use crate::session::InsertError;
+    use crate::store::{Link, Tenant};
+
+    async fn login_cookie(router: axum::Router) -> String {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/admin/login")
+            .header("content-type", "application/json")
+            .extension(ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                1234,
+            ))))
+            .body(Body::from(format!(
+                "{{\"password\":\"{}\"}}",
+                testing::TEST_PASSWORD
+            )))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("login sets a cookie")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn named_tenant(key: &str) -> Tenant {
+        Tenant {
+            key: key.to_owned(),
+            label: key.to_owned(),
+            admin_group: None,
+            max_total_bytes: None,
+            max_links: None,
+            max_sessions: None,
+            created_at: 0,
+        }
+    }
+
+    fn default_link(id: &str, dest: &str) -> Link {
+        Link {
+            id: id.to_owned(),
+            tenant: String::new(),
+            label: id.to_owned(),
+            dest: dest.to_owned(),
+            password_hash: None,
+            created_at: 0,
+            expires_at: None,
+            max_bytes: None,
+            active: true,
+            uploads: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    fn named_link(tenant: &str, id: &str) -> Link {
+        Link {
+            tenant: tenant.to_owned(),
+            ..default_link(id, "")
+        }
+    }
+
+    fn write_dummy(receive_dir: &std::path::Path, key: &str) -> std::path::PathBuf {
+        let dir = receive_dir.join(key);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::paths::tighten_dir(&dir);
+        std::fs::write(dir.join("x.bin"), b"hello").unwrap();
+        dir
+    }
+
+    async fn delete_tenant_req(
+        application: Arc<App>,
+        cookie: &str,
+        key: &str,
+    ) -> axum::http::Response<axum::body::Body> {
+        let router = app::router(application);
+        router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/admin/tenants/{key}"))
+                    .header("cookie", cookie)
+                    .header("x-votport", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn delete_purges_the_receive_subtree() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(named_tenant("acme"))
+            .unwrap();
+        let tenant_dir = write_dummy(&application.config.receive_dir, "acme");
+        assert!(tenant_dir.join("x.bin").exists());
+
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let response = delete_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!tenant_dir.exists());
+
+        let rows = application.store.audit_export("", 0, 0, 100).unwrap();
+        let deleted = rows
+            .iter()
+            .find(|row| row.event == "tenant_deleted")
+            .expect("tenant_deleted audit");
+        assert_eq!(deleted.detail["purged_receive"], true);
+        assert_eq!(deleted.detail["row_deleted"], true);
+        assert!(application.store.tenant("acme").is_none());
+    }
+
+    #[tokio::test]
+    async fn live_link_refuses_delete_and_unpins() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(named_tenant("acme"))
+            .unwrap();
+        application
+            .store
+            .insert_link(named_link("acme", "still-live"))
+            .unwrap();
+        let tenant_dir = write_dummy(&application.config.receive_dir, "acme");
+
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let response = delete_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(tenant_dir.join("x.bin").exists());
+        assert!(!application.sessions.tenant_pinned("acme"));
+        application
+            .sessions
+            .insert(
+                "s1".to_owned(),
+                "still-live".to_owned(),
+                "acme".to_owned(),
+                tokio::sync::mpsc::channel(1).0,
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_session_refuses_delete_and_leaves_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(named_tenant("acme"))
+            .unwrap();
+        let tenant_dir = write_dummy(&application.config.receive_dir, "acme");
+        application
+            .sessions
+            .insert(
+                "live".to_owned(),
+                "link".to_owned(),
+                "acme".to_owned(),
+                tokio::sync::mpsc::channel(1).0,
+            )
+            .unwrap();
+
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let response = delete_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(tenant_dir.join("x.bin").exists());
+        assert!(!application.sessions.tenant_pinned("acme"));
+        assert!(application.store.tenant("acme").is_some());
+    }
+
+    #[tokio::test]
+    async fn unknown_key_without_a_directory_is_404() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let keep = application.config.receive_dir.join("keep.bin");
+        std::fs::write(&keep, b"root").unwrap();
+
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let response = delete_tenant_req(application.clone(), &cookie, "ghost").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(keep.exists());
+        let mut entries: Vec<_> = std::fs::read_dir(&application.config.receive_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, vec![std::ffi::OsString::from("keep.bin")]);
+        assert!(!application.sessions.tenant_pinned("ghost"));
+    }
+
+    #[tokio::test]
+    async fn leftover_retry_refuses_a_default_tenant_dest() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let tenant_dir = write_dummy(&application.config.receive_dir, "acme");
+        application
+            .store
+            .insert_link(default_link("root-dest", "acme"))
+            .unwrap();
+
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let response = delete_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("default-tenant dest"),
+            "error was {json}"
+        );
+        assert!(tenant_dir.join("x.bin").exists());
+        assert!(!application.sessions.tenant_pinned("acme"));
+    }
+
+    #[tokio::test]
+    async fn leftover_retry_purges_an_orphaned_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let tenant_dir = write_dummy(&application.config.receive_dir, "acme");
+        assert!(application.store.tenant("acme").is_none());
+
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let response = delete_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!tenant_dir.exists());
+        let rows = application.store.audit_export("", 0, 0, 100).unwrap();
+        let deleted = rows
+            .iter()
+            .find(|row| row.event == "tenant_deleted")
+            .expect("tenant_deleted audit");
+        assert_eq!(deleted.detail["purged_receive"], true);
+        assert_eq!(deleted.detail["row_deleted"], false);
+    }
+
+    #[test]
+    fn insert_returns_pinned_while_delete_holds_the_pin() {
+        let sessions = crate::session::Sessions::new();
+        sessions.pin_tenant_for_delete("acme");
+        let err = sessions
+            .insert(
+                "s".to_owned(),
+                "l".to_owned(),
+                "acme".to_owned(),
+                tokio::sync::mpsc::channel(1).0,
+            )
+            .unwrap_err();
+        assert_eq!(err, InsertError::Pinned);
     }
 }
 

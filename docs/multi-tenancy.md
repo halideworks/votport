@@ -122,7 +122,7 @@ also inserted into `audit_log(at, tenant, actor, event, subject, detail_json)`.
 | Tenant admin confusion | Cookie MAC covers `(subject, tenant, role)`; switching tenant re-issues the cookie |
 | Audit tampering | Audit rows are insert-only from the request path; no admin route deletes them; retention prune is the only writer |
 | Cross-tenant noisy-neighbor DoS | Today's `IpThrottle`, `SessionRate`, and session caps are shared buckets; phase 4 adds per-tenant throttle buckets and per-tenant session caps alongside them |
-| Tenant offboarding and erasure | Tenant deletion purges store rows and the receive subtree, emits an audit tombstone; backup docs cover per-tenant restore (GDPR-style erasure is a standard security-review ask) |
+| Tenant offboarding and erasure | Pin on the Sessions mutex so `insert` fails; register then spawn; drop the tenant row so fail-closed applies; purge `<receive>/<tenant>/` via `join_under`; emit `tenant_deleted` with `purged_receive`. DELETE on an absent key is leftover retry only when the directory exists and no default-tenant dest collides; unknown key with no dir is 404. Snapshots under `data/backups/` (30-day sweep) and Litestream replicas retain rows until they rotate; `/received` file backups retain bytes until they rotate. See `docs/deployment.md`. |
 | OIDC provider outage | Local break-glass account per tenant, created at first boot, password rotated on first login |
 
 ## Non-goals
