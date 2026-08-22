@@ -10,36 +10,35 @@
     <title>VOTPort &middot; Audit</title>
     <link rel="icon" type="image/png" href="/assets/favicon.png" />
     <link rel="stylesheet" href="/assets/style.css" />
-    
   </head>
-  <body class="admin" data-page="audit">
-    <header class="topbar">
-      <a class="brand" href="/links">
-        <img src="/assets/pommern_ship_white.png" alt="" />
-        <span>VOTPort</span>
-      </a>
-      <nav id="nav" class="nav"></nav>
-      <span class="spacer"></span>
-      <select id="tenant-switcher" hidden></select>
-      <button id="logout" class="ghost">Sign out</button>
-    </header>
-    <main class="admin-main">
-<div class="page-head">
-        <h1>Audit log</h1>
-        <div class="bar">
-          <button id="refresh" class="ghost">Refresh</button>
-          <a
-            id="export"
-            class="ghost button-link"
-            href="/api/admin/audit?limit=10000"
-            >Export JSONL</a
-          >
-          <span id="audit-range" class="mono muted"></span>
+  <body>
+    <div class="sheet">
+      <header class="masthead">
+        <div class="hero-brand">
+          <div class="brand-square">
+            <img src="/assets/pommern_ship_white.png" alt="" />
+          </div>
+          <span class="wordmark">VOTPort</span>
         </div>
+        <select id="tenant-switcher" hidden></select>
+      </header>
+
+      <div class="bar">
+        <nav id="nav" class="nav"></nav>
+        <button id="logout" class="ghost">Sign out</button>
       </div>
 
+      <h1>Audit log</h1>
+
+      <div class="bar">
+        <button id="refresh" class="ghost">Refresh</button>
+        <a id="export" class="ghost" href="/api/admin/audit?limit=10000">Export JSONL</a>
+      </div>
+      <p id="audit-range" class="mono muted"></p>
       <div id="audit-log" class="mono"></div>
-    </main>
+      <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
+    </div>
+
     <dialog id="confirm" class="modal">
       <form method="dialog">
         <h2 id="confirm-title">Confirm</h2>
@@ -50,6 +49,7 @@
         </div>
       </form>
     </dialog>
+
     <script type="module" src="/assets/admin-common.js"></script>
     <script type="module" src="/assets/page-audit.js"></script>
   </body>

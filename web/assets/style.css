@@ -824,116 +824,19 @@ details summary:focus-visible {
  border-radius: 2px;
 }
 
-/* ---- admin shell (multi-page) --------------------------------------------
-   Signed-in pages drop the marketing hero entirely: a fixed-width centered
-   column would waste the space, so these pages run a full-width topbar plus
-   a content container that scales from phone to desktop. */
 
-body.admin {
- background: #0d1420;
- color: #e8edf4;
- font-family: inherit;
- min-height: 100vh;
-}
-
-.topbar {
- display: flex;
- align-items: center;
- gap: 1rem;
- flex-wrap: wrap;
- padding: 0.75rem 1.25rem;
- border-bottom: 1px solid rgba(255, 255, 255, 0.08);
- background: rgba(255, 255, 255, 0.03);
-}
-
-.topbar .brand {
- display: flex;
- align-items: center;
- gap: 0.5rem;
- text-decoration: none;
- color: inherit;
- font-weight: 600;
-}
-
-.topbar .brand img {
- height: 1.6rem;
- width: auto;
-}
-
+/* ---- admin nav ------------------------------------------------------------ */
 .nav {
  display: flex;
- gap: 0.25rem;
- flex-wrap: wrap;
+ gap: 0.9rem;
+ align-items: center;
 }
-
 .nav a {
- padding: 0.35rem 0.8rem;
- border-radius: 999px;
- text-decoration: none;
- color: inherit;
- font-weight: 500;
-}
-
-.nav a:hover {
- background: rgba(255, 255, 255, 0.08);
-}
-
-.nav a.active {
- background: rgba(255, 255, 255, 0.16);
-}
-
-.topbar .spacer {
- flex: 1;
-}
-
-.admin-main {
- max-width: 72rem;
- margin: 0 auto;
- padding: 1.5rem 1.25rem 3rem;
-}
-
-.page-head {
- display: flex;
- align-items: baseline;
- justify-content: space-between;
- gap: 1rem;
- flex-wrap: wrap;
- margin-bottom: 1.25rem;
-}
-
-.page-head h1 {
- font-size: 1.5rem;
- margin: 0;
-}
-
-.button-link {
- display: inline-block;
- padding: 0.5rem 1rem;
- border-radius: 8px;
- background: #2f6fed;
- color: #fff;
+ color: var(--muted);
  text-decoration: none;
  font-weight: 600;
- font-size: 0.9rem;
+ font-size: 0.8rem;
 }
-
-.button-link:hover {
- filter: brightness(1.15);
-}
-
-/* Audit rows read as a ledger: time, event, subject, then detail beneath. */
-.audit-row {
- padding: 0.6rem 0.25rem;
- border-bottom: 1px solid rgba(255, 255, 255, 0.06);
- overflow-wrap: anywhere;
-}
-
-.audit-row .muted {
- margin-right: 0.5rem;
-}
-
-@media (min-width: 48rem) {
- .admin-main {
-  padding: 2rem 2rem 4rem;
- }
+.nav a.active {
+ color: var(--text);
 }
