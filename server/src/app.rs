@@ -98,6 +98,7 @@ pub fn router(app: Arc<App>) -> Router {
     let web_root = app.config.web_root.clone();
     let admin_page = web_root.join("index.html");
     let request_page = web_root.join("request.html");
+    let page = |name: &str| web_root.join(format!("{name}.html"));
 
     // Everything the pages load is same-origin (fonts are self-hosted in
     // /assets/fonts). wasm-unsafe-eval is what lets the browser compile the
@@ -195,6 +196,11 @@ pub fn router(app: Arc<App>) -> Router {
             axum::routing::delete(api::delete_received_file),
         )
         .route("/metrics", axum::routing::get(metrics))
+        // Multi-page admin: static shells; authz is enforced per API call.
+        .route("/links", serve_page(page("links")))
+        .route("/tenants", serve_page(page("tenants")))
+        .route("/audit", serve_page(page("audit")))
+        .route("/system", serve_page(page("system")))
         // SSO sign-in (phase 3 of docs/multi-tenancy.md).
         .route("/api/admin/sso", get(api::sso_available))
         .route("/api/admin/sso/start", get(api::sso_start))
