@@ -218,6 +218,15 @@ pub async fn create_tenant(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
+    // Tenant lifecycle is a platform operation: only the default tenant's
+    // admin holds it, so an SSO principal scoped to "acme" cannot mint or
+    // destroy other namespaces.
+    if !identity.tenant.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "tenant administration requires the default-tenant admin",
+        ));
+    }
     let key = paths::admit_dest(&request.key)
         .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     if key.is_empty() {
@@ -261,11 +270,26 @@ pub async fn delete_tenant(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
+    if !identity.tenant.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "tenant administration requires the default-tenant admin",
+        ));
+    }
     let count = app.store.tenant_link_count(&key);
     if count > 0 {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             format!("{count} link(s) still reference this tenant; delete them first"),
+        ));
+    }
+    // In-flight uploads would keep writing into the deleted namespace and
+    // their records would silently vanish.
+    let active = app.sessions.active_for_tenant(&key);
+    if active > 0 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!("{active} upload(s) are in flight; try again when they finish"),
         ));
     }
     if !app.store.remove_tenant(&key).map_err(ApiError::internal)? {
@@ -535,6 +559,14 @@ pub async fn create_link(
         None => None,
     };
     let tenant = identity.tenant.clone();
+    // A cookie can outlive its tenant's deletion; without this check the
+    // link would be created under a namespace nothing manages anymore.
+    if !tenant.is_empty() && app.store.tenant(&tenant).is_none() {
+        return Err(ApiError::new(
+            StatusCode::GONE,
+            "this session's tenant no longer exists; sign in again",
+        ));
+    }
     if let Some(max_links) = app.store.tenant(&tenant).and_then(|t| t.max_links) {
         let count = u64::try_from(app.store.links(&tenant).len()).unwrap_or(u64::MAX);
         if count >= max_links {

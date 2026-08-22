@@ -168,6 +168,7 @@ CREATE TABLE IF NOT EXISTS tenants (
 );
 CREATE TABLE IF NOT EXISTS links (
     id TEXT PRIMARY KEY,
+    tenant TEXT NOT NULL DEFAULT '',
     label TEXT NOT NULL,
     dest TEXT NOT NULL DEFAULT '',
     password_hash TEXT,
