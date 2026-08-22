@@ -1,6 +1,7 @@
 # Multi-tenancy design
 
-Status: design, not yet implemented. Each phase below lands as its own PR with the
+Status: phases 1-3 shipped (#23 SQLite store, #24 audit log, #25 OIDC SSO);
+phases 4-5 designed below. Each phase lands as its own PR with the
 standard gate (fmt, clippy -D warnings, tests, e2e, docker build) and review.
 
 ## Goal

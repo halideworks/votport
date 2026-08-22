@@ -91,10 +91,47 @@ Everything is environment variables (see `docker-compose.yml`):
 | `VOTPORT_NOTIFY_NTFY_URL` | — | Full ntfy topic URL (e.g. `https://ntfy.sh/mytopic`) sent a message per completed upload. |
 | `VOTPORT_NOTIFY_NTFY_TOKEN` | — | Bearer token for the ntfy topic, if it needs one. |
 | `VOTPORT_NOTIFY_PUSHOVER_TOKEN` | — | Pushover application token (set together with the user key). |
-| `VOTPORT_NOTIFY_PUSHOVER_USER` | — | Pushover user key. |
+| `VOTPORT_NOTIFY_PUSHOVER_USER` | — | Pushover application token (set together with the user key). |
+| `VOTPORT_AUDIT_RETENTION_DAYS` | `400` | Days to keep queryable audit rows; `0` disables pruning. |
+| `VOTPORT_OIDC_ISSUER` | — | OIDC issuer URL for admin single sign-on. Requires the client id/secret and `VOTPORT_PUBLIC_URL`; see [Single sign-on](#single-sign-on). |
+| `VOTPORT_OIDC_CLIENT_ID` | — | OAuth client id at the identity provider. |
+| `VOTPORT_OIDC_CLIENT_SECRET` | — | OAuth client secret at the identity provider. |
+| `VOTPORT_OIDC_ADMIN_GROUP` | — | Group whose members sign in as admins. Unset means every principal your provider authenticates gets admin. |
 
 Notifications are best-effort: a delivery failure is logged and never affects
 the upload.
+
+## Single sign-on
+
+Set `VOTPORT_OIDC_ISSUER`, `VOTPORT_OIDC_CLIENT_ID` and
+`VOTPORT_OIDC_CLIENT_SECRET` (plus `VOTPORT_PUBLIC_URL`, which builds the
+redirect URI `<public-url>/api/admin/callback`) and the login page gains a
+**Sign in with SSO** button alongside the local password form. The flow is
+authorization-code with PKCE; the id token is verified against the provider's
+JWKS, with issuer, audience and nonce checks.
+
+Roles come from the provider's `groups` claim: members of
+`VOTPORT_OIDC_ADMIN_GROUP` sign in as administrators, everyone else as
+viewers with read-only dashboard access. When the group is unset, every
+principal your provider authenticates is an administrator — votport warns
+loudly at startup.
+
+Local password sign-in always remains available as the break-glass path,
+including when SSO is configured.
+
+## Audit trail
+
+Every administrative and transfer event — sign-ins (with client IP),
+link lifecycle, received-file deletions, upload completions and failures — is
+written both to the structured log (`RUSTLOG=audit=info`) and to an
+append-only table in the database. Export it as JSONL for a SIEM:
+
+```sh
+curl -b cookies.txt 'https://drop.example.com/api/admin/audit?since=0&limit=1000'
+```
+
+Rows are never modified or deleted through the API; retention prunes them
+after `VOTPORT_AUDIT_RETENTION_DAYS` (default 400).
 
 ## Receipts
 
@@ -116,7 +153,12 @@ same 32-byte public key. Verify one with the `vot-receipt` crate:
 * The admin session is a signed, expiring cookie (`HttpOnly`, `SameSite=Lax`,
   `Secure` behind https); mutating admin calls also require a custom header,
   which closes cross-site request forgery.
-* Login attempts are throttled after repeated failures.
+* Login attempts are throttled after repeated failures; link passwords and
+  upload-session creation are throttled per client address, so one sender
+  cannot lock out others.
+* Optional SSO sign-in maps your identity provider's groups to admin or
+  read-only viewer access; session cookies bind the role and are invalidated
+  by password changes or role changes.
 * Uploaded names pass VOT's portable-path profile (no traversal, no control
   characters, no Windows-reserved names) **and** a server-side re-check; files
   cannot land outside the receive folder.
