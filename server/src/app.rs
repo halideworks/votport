@@ -230,7 +230,7 @@ async fn metrics(State(app): State<std::sync::Arc<App>>, headers: HeaderMap) -> 
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
-            .is_some_and(|token| token == expected);
+            .is_some_and(|token| crate::auth::ct_eq(token.as_bytes(), expected.as_bytes()));
         if !authorized {
             return (StatusCode::UNAUTHORIZED, "metrics token required").into_response();
         }
@@ -302,6 +302,24 @@ pub async fn session_sweeper(app: Arc<App>) {
                         Err(error) => tracing::warn!("audit prune failed: {error}"),
                     }
                 }
+                // Snapshots from /api/admin/backup accumulate on disk;
+                // keep the newest month's worth.
+                let backup_dir = app.config.data_dir.join("backups");
+                let cutoff_modified =
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+                if let Ok(entries) = std::fs::read_dir(&backup_dir) {
+                    for entry in entries.flatten() {
+                        let expired = entry
+                            .metadata()
+                            .and_then(|meta| meta.modified())
+                            .map(|modified| modified < cutoff_modified)
+                            .unwrap_or(false);
+                        if expired {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
+
                 // Received-content lifecycle: delete expired uploads from
                 // disk and tombstone their records, per tenant.
                 if app.config.upload_retention_days > 0 {

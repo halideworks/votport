@@ -327,10 +327,10 @@ pub async fn backup_database(
         .audit("backup_created", &name, &json!({ "bytes": bytes.len() }));
     Ok((
         [
-            (header::CONTENT_TYPE, "application/octet-stream"),
+            (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
             (
                 header::CONTENT_DISPOSITION,
-                Box::leak(format!("attachment; filename=\"{name}\"").into_boxed_str()),
+                format!("attachment; filename=\"{name}\""),
             ),
         ],
         bytes,
