@@ -1204,3 +1204,78 @@ mod ops_tests {
         app::build(config).unwrap()
     }
 }
+
+#[cfg(test)]
+mod backup_tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt;
+
+    use crate::api::testing;
+    use crate::app;
+
+    #[tokio::test]
+    async fn backup_route_serves_a_snapshot_and_requires_sign_in() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application.store.audit("probe", "", &serde_json::json!({}));
+
+        // Unauthenticated requests are refused.
+        let router = app::router(application.clone());
+        let response = router
+            .oneshot(
+                Request::get("/api/admin/backup")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Signed in, the route serves a non-empty SQLite snapshot.
+        let router = app::router(application.clone());
+        let login = Request::builder()
+            .method("POST")
+            .uri("/api/admin/login")
+            .header("content-type", "application/json")
+            .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                1234,
+            ))))
+            .body(Body::from(format!(
+                "{{\"password\":\"{}\"}}",
+                testing::TEST_PASSWORD
+            )))
+            .unwrap();
+        let response = router.oneshot(login).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let router = app::router(application);
+        let response = router
+            .oneshot(
+                Request::get("/api/admin/backup")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.len() > 0);
+        // SQLite databases begin with the magic string.
+        assert!(body.starts_with(b"SQLite format 3\0"));
+    }
+}

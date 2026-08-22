@@ -166,6 +166,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/admin/logout", post(api::admin_logout))
         .route("/api/admin/session", get(api::admin_session))
         .route("/api/admin/audit", get(api::admin_audit_export))
+        .route("/api/admin/backup", get(api::backup_database))
         .route(
             "/api/admin/tenants",
             get(api::list_tenants).post(api::create_tenant),
