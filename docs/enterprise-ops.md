@@ -82,7 +82,7 @@ A security team can put one instance behind their IdP, give each group a namespa
 ### Engineering constraints
 
 - Each PR independently reviewable and mergeable. Schema-version PRs are ordered: PR 5 must not merge before PR 1.
-- Gates: rustup 1.97.1, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (40 unit + 12 e2e today), `node --check` + eslint 9.18.0 on `web/assets/*.js`, cargo-deny advisories, docker build.
+- Gates: rustup 1.97.1, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (40 unit + 12 e2e today), `node --check` + eslint 9.18.0 on `web/assets/*.js`, `node --test scripts/login-disclosure.test.mjs`, cargo-deny advisories, docker build.
 - Tests land with the change. Guards get the test that kills them.
 - Web: CSP has no inline scripts (`app.rs` `CSP`); JS stays in `/assets`. All ids/classes are load-bearing (`web/assets/style.css` header).
 - umask 022 (pinned in `app::build`) plus `paths::tighten_dir` on any new directory-creation path. VOT refuses group-writable staging parents.
