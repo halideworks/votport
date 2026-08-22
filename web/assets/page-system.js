@@ -23,6 +23,13 @@ function gibValue(bytes) {
   return String(bytes / 1024 ** 3);
 }
 
+function setNotifyActions(enabled) {
+  $('notify-save').disabled = !enabled;
+  for (const button of $('notify-form').querySelectorAll('[data-clear]')) {
+    button.disabled = !enabled;
+  }
+}
+
 function fillSettings(data) {
   $('notify-webhook').value = data.notify_webhook || '';
   setSource('notify-webhook-source', data.notify_webhook_source);
@@ -56,6 +63,7 @@ function fillSettings(data) {
   const collapse = $('signin-collapse');
   collapse.checked = data.public_password_login === false;
   collapse.disabled = !data.sso_configured;
+  $('signin-save').disabled = !data.sso_configured;
 }
 
 function formControls(form) {
@@ -118,6 +126,7 @@ $('password-form').addEventListener('submit', async (event) => {
 
 $('notify-form').addEventListener('submit', async (event) => {
   event.preventDefault();
+  if ($('notify-save').disabled) return;
   const body = {
     notify_webhook: $('notify-webhook').value,
     notify_ntfy: $('notify-ntfy').value,
@@ -164,13 +173,15 @@ $('quotas-form').addEventListener('submit', async (event) => {
 
 $('signin-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const collapse = $('signin-collapse');
-  const body = {};
-  // Checkbox is ignored when SSO is not configured.
-  if (!collapse.disabled) {
-    body.public_password_login = !collapse.checked;
+  if ($('signin-collapse').disabled || $('signin-save').disabled) {
+    if ($('signin-collapse').disabled) {
+      formNote(event.currentTarget, 'SSO is not configured.');
+    }
+    return;
   }
-  await saveSettings(event.currentTarget, body);
+  await saveSettings(event.currentTarget, {
+    public_password_login: !$('signin-collapse').checked,
+  });
 });
 
 for (const button of document.querySelectorAll('[data-reset]')) {
@@ -186,12 +197,27 @@ for (const button of document.querySelectorAll('[data-reset]')) {
   });
 }
 
+for (const button of document.querySelectorAll('[data-clear]')) {
+  button.addEventListener('click', async () => {
+    if (button.disabled) return;
+    const form = button.closest('form');
+    formNote(form, '');
+    try {
+      fillSettings(await putSettings({ [button.dataset.clear]: '' }));
+      formNote(form, 'Cleared.');
+    } catch (error) {
+      formError(form, error);
+    }
+  });
+}
+
 const session = await requireSession();
 if (!session.pages.includes('system')) {
   window.location.replace('/links');
 }
 try {
   fillSettings(await api('/api/admin/settings'));
+  setNotifyActions(true);
 } catch (error) {
   formError($('notify-form'), error);
 }

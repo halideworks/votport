@@ -1,6 +1,7 @@
 // votport sign-in page. AGPL-3.0-only.
 
 import { api } from '/assets/admin-common.js';
+import { collapseLocalPassword } from '/assets/login-disclosure.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -46,11 +47,9 @@ try {
   const { available, sso_healthy, public_password_login } = await api('/api/admin/sso');
   const details = $('login-password-details');
   const summary = details.querySelector('summary');
-  // Collapse only when SSO is offered; the API flag alone must not hide break-glass.
-  const collapse = Boolean(available) && public_password_login === false;
-  details.open = !collapse;
-  if (summary) summary.hidden = !available;
+  details.open = !collapseLocalPassword({ available, public_password_login });
   if (available) {
+    if (summary) summary.hidden = false;
     const sso = $('login-sso');
     sso.hidden = false;
     if (sso_healthy === false) sso.textContent = 'SSO is not reachable';

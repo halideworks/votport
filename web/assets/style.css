@@ -415,6 +415,18 @@ button:disabled {
 #login-password-details {
  margin-bottom: 1rem;
 }
+#login-password-details summary {
+ cursor: pointer;
+ color: var(--muted);
+ font-size: 0.68rem;
+ font-weight: 600;
+ letter-spacing: 0.08em;
+ text-transform: uppercase;
+ list-style: none;
+}
+#login-password-details summary::-webkit-details-marker {
+ display: none;
+}
 
 input[type="checkbox"] {
  display: inline-block;
