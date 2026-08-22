@@ -1274,7 +1274,7 @@ mod backup_tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert!(body.len() > 0);
+        assert!(!body.is_empty());
         // SQLite databases begin with the magic string.
         assert!(body.starts_with(b"SQLite format 3\0"));
     }
