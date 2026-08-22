@@ -1,8 +1,10 @@
 # Multi-tenancy design
 
-Status: phases 1-3 shipped (#23 SQLite store, #24 audit log, #25 OIDC SSO);
-phases 4-5 designed below. Each phase lands as its own PR with the
-standard gate (fmt, clippy -D warnings, tests, e2e, docker build) and review.
+Status: phases 1-5 shipped (#23 store, #24 audit, #25 SSO, #26 tenants,
+#27 ops polish) plus the multi-page admin (#28). Remaining roadmap:
+settings-from-UI (DB-backed settings editable in System), SMTP
+notifications. Each phase landed as its own PR with the standard gate
+(fmt, clippy -D warnings, tests, e2e, docker build) and review.
 
 ## Goal
 
