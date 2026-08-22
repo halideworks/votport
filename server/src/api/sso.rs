@@ -222,7 +222,7 @@ pub async fn sso_callback(
             tracing::warn!(target: "audit", event = "sso_failed", reason = message, "SSO sign-in failed");
             app_for_home
                 .store
-                .audit("sso_failed", "", &json!({ "reason": message }));
+                .audit("", "", "sso_failed", "", &json!({ "reason": message }));
         }
         let clear_state =
             format!("{STATE_COOKIE}=; Path=/api/admin; HttpOnly; SameSite=Lax; Max-Age=0");
@@ -366,8 +366,14 @@ pub async fn sso_callback(
         target: "audit", event = "sso_login", subject = %subject, %role,
         "SSO sign-in succeeded"
     );
-    app.store
-        .audit("sso_login", &subject, &json!({ "role": role }));
+    // Login lands in the default tenant; switching happens post-login.
+    app.store.audit(
+        "",
+        &subject,
+        "sso_login",
+        &subject,
+        &json!({ "role": role }),
+    );
 
     // Grant set: the default tenant (role from the global admin group),
     // plus every named tenant whose admin group the principal belongs to.

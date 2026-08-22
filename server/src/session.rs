@@ -695,6 +695,8 @@ fn record_event(
         "upload session ended without completing"
     );
     setup.store.audit(
+        &setup.tenant,
+        "",
         "upload_session_ended",
         &setup.link_id,
         &serde_json::json!({

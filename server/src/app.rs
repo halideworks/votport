@@ -391,6 +391,8 @@ pub async fn session_sweeper(app: Arc<App>) {
                                 "expired received files deleted"
                             );
                             app.store.audit(
+                                &link.tenant,
+                                "",
                                 "uploads_expired",
                                 &link.id,
                                 &serde_json::json!({

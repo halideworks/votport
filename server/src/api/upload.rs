@@ -180,6 +180,18 @@ pub struct VerifyRequest {
     password: Option<String>,
 }
 
+/// Audit helper for rejected session-creation attempts (abuse-probe signals).
+fn audit_session_rejected(app: &App, tenant: &str, reason: &str) {
+    tracing::warn!(target: "audit", event = "session_rejected", %tenant, reason);
+    app.store.audit(
+        tenant,
+        "",
+        "session_rejected",
+        "",
+        &json!({ "reason": reason }),
+    );
+}
+
 pub async fn create_session(
     State(app): State<Arc<App>>,
     Path(token): Path<String>,
@@ -210,9 +222,19 @@ pub async fn create_session(
     if !link_authorized(&app, &link, &headers) {
         check_link_password(&app, &link, request.password.as_deref(), &ip).await?;
     }
+    // Fail closed when a named tenant row has vanished: publishing into the
+    // receive root unprefixed and quota-free would cross a tenant boundary.
+    if !link.tenant.is_empty() && app.store.tenant(&link.tenant).is_none() {
+        audit_session_rejected(&app, &link.tenant, "link tenant missing");
+        return Err(ApiError::new(
+            StatusCode::GONE,
+            "this link's tenant no longer exists",
+        ));
+    }
     if app.sessions.active_for_link(&link.id) >= MAX_SESSIONS_PER_LINK
         || app.sessions.total() >= MAX_SESSIONS
     {
+        audit_session_rejected(&app, &link.tenant, "global or per-link session cap");
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many uploads in progress; try again shortly",
@@ -222,6 +244,7 @@ pub async fn create_session(
     let announced_bytes = expected.length;
     let cap = effective_cap(&app, &link);
     if expected.length > cap {
+        audit_session_rejected(&app, &link.tenant, "per-link size cap");
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             format!("upload exceeds the {cap} byte limit for this link"),
@@ -234,6 +257,7 @@ pub async fn create_session(
         if let Some(max_total) = tenant.max_total_bytes {
             let received = app.store.tenant_received_bytes(&link.tenant);
             if received + expected.length > max_total {
+                audit_session_rejected(&app, &link.tenant, "byte quota exhausted");
                 return Err(ApiError::new(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     format!(
@@ -244,6 +268,7 @@ pub async fn create_session(
         }
         if let Some(max_sessions) = tenant.max_sessions {
             if app.sessions.active_for_tenant(&link.tenant) >= max_sessions as usize {
+                audit_session_rejected(&app, &link.tenant, "tenant session cap reached");
                 return Err(ApiError::new(
                     StatusCode::TOO_MANY_REQUESTS,
                     "too many concurrent uploads for this tenant",
@@ -293,6 +318,8 @@ pub async fn create_session(
         bytes = announced_bytes, "upload session started"
     );
     app.store.audit(
+        &link.tenant,
+        "",
         "upload_session_created",
         &link.id,
         &serde_json::json!({ "session_tag": &session_id[..8.min(session_id.len())], "bytes": announced_bytes }),
@@ -419,7 +446,14 @@ pub async fn upload_finish(
         files = report.files.len(), bytes = report.files.iter().map(|f| f.bytes).sum::<u64>(),
         "upload finished and recorded"
     );
+    let completed_tenant = link_id
+        .clone()
+        .and_then(|id| app.store.link_by_id(&id))
+        .map(|link| link.tenant)
+        .unwrap_or_default();
     app.store.audit(
+        &completed_tenant,
+        "",
         "upload_completed",
         &sid[..8.min(sid.len())],
         &serde_json::json!({

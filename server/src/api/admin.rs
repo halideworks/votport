@@ -110,11 +110,12 @@ pub async fn admin_login(
     if !ok {
         tracing::warn!(target: "audit", event = "admin_login_failed", %ip, "admin login refused");
         app.store
-            .audit("admin_login_failed", &ip, &serde_json::json!({}));
+            .audit("", "", "admin_login_failed", &ip, &serde_json::json!({}));
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "wrong password"));
     }
     tracing::info!(target: "audit", event = "admin_login", %ip, "admin signed in");
-    app.store.audit("admin_login", &ip, &serde_json::json!({}));
+    app.store
+        .audit("", "", "admin_login", &ip, &serde_json::json!({}));
     let cookie = issue_admin_cookie(&app, &auth::AdminIdentity::local_admin());
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
@@ -143,11 +144,19 @@ pub async fn admin_audit_export(
     headers: HeaderMap,
     Query(query): Query<AuditQuery>,
 ) -> ApiResult<Response> {
-    let _identity = require_admin(&app, &headers)?;
+    let identity = require_admin(&app, &headers)?;
+    // Named-tenant principals see only their namespace's rows; the default
+    // tenant (platform admin) sees everything.
+    let tenant_filter = identity.tenant.clone();
     let limit = query.limit.unwrap_or(1000).min(10_000);
     let rows = app
         .store
-        .audit_export(query.since.unwrap_or(0), limit)
+        .audit_export(
+            &tenant_filter,
+            query.since.unwrap_or(0),
+            query.after_rowid.unwrap_or(0),
+            limit,
+        )
         .map_err(ApiError::internal)?;
     use std::fmt::Write as _;
     let mut body = String::new();
@@ -157,6 +166,7 @@ pub async fn admin_audit_export(
             body,
             "{}",
             serde_json::json!({
+                "rowid": row.rowid,
                 "at": row.at,
                 "tenant": row.tenant,
                 "actor": row.actor,
@@ -180,6 +190,9 @@ pub async fn admin_audit_export(
 #[derive(Deserialize)]
 pub struct AuditQuery {
     since: Option<u64>,
+    /// Cursor for rows sharing `since`'s second (from the previous page's
+    /// final `rowid`).
+    after_rowid: Option<u64>,
     limit: Option<u64>,
 }
 
@@ -253,7 +266,8 @@ pub async fn create_tenant(
         .insert_tenant(tenant)
         .map_err(ApiError::internal)?;
     tracing::info!(target: "audit", event = "tenant_created", key = %key, "tenant namespace created");
-    app.store.audit("tenant_created", &key, &json!({}));
+    app.store
+        .audit("", &identity.subject, "tenant_created", &key, &json!({}));
     Ok(Json(json!({ "key": key })))
 }
 
@@ -261,7 +275,14 @@ pub async fn list_tenants(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _ = require_admin(&app, &headers)?;
+    let identity = require_admin(&app, &headers)?;
+    // Namespace keys/labels/quotas are platform metadata, not tenant data.
+    if !identity.tenant.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "tenant administration requires the default-tenant admin",
+        ));
+    }
     Ok(Json(json!({ "tenants": app.store.tenants() })))
 }
 
@@ -294,11 +315,20 @@ pub async fn delete_tenant(
             format!("{active} upload(s) are in flight; try again when they finish"),
         ));
     }
-    if !app.store.remove_tenant(&key).map_err(ApiError::internal)? {
-        return Err(ApiError::not_found());
+    use crate::store::TenantRemoval;
+    match app.store.remove_tenant(&key).map_err(ApiError::internal)? {
+        TenantRemoval::Deleted => {}
+        TenantRemoval::Absent => return Err(ApiError::not_found()),
+        TenantRemoval::HasLinks => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "a link was created concurrently; delete them first",
+            ));
+        }
     }
     tracing::info!(target: "audit", event = "tenant_deleted", key = %key, "tenant namespace deleted");
-    app.store.audit("tenant_deleted", &key, &json!({}));
+    app.store
+        .audit("", &identity.subject, "tenant_deleted", &key, &json!({}));
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -308,7 +338,15 @@ pub async fn backup_database(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let _ = require_admin(&app, &headers)?;
+    let identity = require_admin(&app, &headers)?;
+    // The snapshot spans every tenant plus the credential store: only the
+    // default tenant's admin may take it.
+    if !identity.tenant.is_empty() || identity.role != "admin" {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "default-tenant admin required",
+        ));
+    }
     let backups = app.config.data_dir.join("backups");
     tokio::fs::create_dir_all(&backups)
         .await
@@ -325,8 +363,13 @@ pub async fn backup_database(
         .await
         .map_err(|error| ApiError::internal(format!("read snapshot: {error}")))?;
     tracing::info!(target: "audit", event = "backup_created", file = %name, bytes = bytes.len(), "database snapshot exported");
-    app.store
-        .audit("backup_created", &name, &json!({ "bytes": bytes.len() }));
+    app.store.audit(
+        "",
+        "",
+        "backup_created",
+        &name,
+        &json!({ "bytes": bytes.len() }),
+    );
     Ok((
         [
             (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
@@ -369,6 +412,18 @@ pub async fn switch_tenant(
         grants: identity.grants.clone(),
         subject: identity.subject.clone(),
     };
+    tracing::info!(
+        target: "audit", event = "tenant_switched",
+        subject = %identity.subject, from = %identity.tenant, to = %switched.tenant,
+        "admin switched active tenant"
+    );
+    app.store.audit(
+        &switched.tenant,
+        &identity.subject,
+        "tenant_switched",
+        &switched.tenant,
+        &json!({ "from": identity.tenant }),
+    );
     let cookie = issue_admin_cookie(&app, &switched);
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
@@ -427,8 +482,13 @@ pub async fn admin_change_password(
         .set_admin_password_hash(hash)
         .map_err(ApiError::internal)?;
     tracing::info!(target: "audit", event = "admin_password_changed", "admin password changed; outstanding sessions invalidated");
-    app.store
-        .audit("admin_password_changed", "", &serde_json::json!({}));
+    app.store.audit(
+        "",
+        "local",
+        "admin_password_changed",
+        "",
+        &serde_json::json!({}),
+    );
     let cookie = issue_admin_cookie(&app, &auth::AdminIdentity::local_admin());
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
@@ -636,6 +696,8 @@ pub async fn create_link(
     app.store.insert_link(link).map_err(ApiError::internal)?;
     tracing::info!(target: "audit", event = "link_created", id = %view.id, label = %view.label, dest = %view.dest, "request link created");
     app.store.audit(
+        &identity.tenant,
+        &identity.subject,
         "link_created",
         &view.id,
         &serde_json::json!({ "label": view.label, "dest": view.dest, "tenant": identity.tenant }),
@@ -665,6 +727,8 @@ pub async fn update_link(
     }
     tracing::info!(target: "audit", event = "link_active_changed", id = %id, active = request.active, "request link toggled");
     app.store.audit(
+        &identity.tenant,
+        &identity.subject,
         "link_active_changed",
         &id,
         &serde_json::json!({ "active": request.active }),
@@ -687,7 +751,13 @@ pub async fn delete_link(
         return Err(ApiError::not_found());
     }
     tracing::info!(target: "audit", event = "link_deleted", id = %id, "request link deleted");
-    app.store.audit("link_deleted", &id, &serde_json::json!({}));
+    app.store.audit(
+        &identity.tenant,
+        &identity.subject,
+        "link_deleted",
+        &id,
+        &serde_json::json!({}),
+    );
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -733,6 +803,8 @@ pub async fn delete_upload_record(
     }
     tracing::info!(target: "audit", event = "upload_record_cleared", link = %id, upload = %upload, "upload record cleared from history");
     app.store.audit(
+        &identity.tenant,
+        &identity.subject,
         "upload_record_cleared",
         &id,
         &serde_json::json!({ "upload": upload }),
@@ -795,6 +867,8 @@ pub async fn delete_received_file(
         .map_err(ApiError::internal)?;
     tracing::info!(target: "audit", event = "received_file_deleted", link = %id, stored_as = %stored_as, "received file deleted from disk");
     app.store.audit(
+        &identity.tenant,
+        &identity.subject,
         "received_file_deleted",
         &id,
         &serde_json::json!({ "stored_as": stored_as }),
@@ -893,9 +967,13 @@ mod handler_tests {
     async fn audit_export_requires_sign_in_and_emits_jsonl() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
-        application
-            .store
-            .audit("link_created", "l-1", &serde_json::json!({ "label": "x" }));
+        application.store.audit(
+            "",
+            "",
+            "link_created",
+            "l-1",
+            &serde_json::json!({ "label": "x" }),
+        );
 
         let router = app::router(application.clone());
         let response = router
@@ -1221,7 +1299,9 @@ mod backup_tests {
     async fn backup_route_serves_a_snapshot_and_requires_sign_in() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
-        application.store.audit("probe", "", &serde_json::json!({}));
+        application
+            .store
+            .audit("", "", "probe", "", &serde_json::json!({}));
 
         // Unauthenticated requests are refused.
         let router = app::router(application.clone());
