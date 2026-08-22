@@ -728,6 +728,10 @@ mod sso_slot_tests {
         assert!(first.await.unwrap_err().is_cancelled());
         drop(release_tx);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+        {
+            let guard = slot.inner.lock().expect("sso slot poisoned");
+            assert!(matches!(*guard, SsoSlotState::Failed { .. }));
+        }
 
         let second = slot
             .get_or_discover_with(|| {
