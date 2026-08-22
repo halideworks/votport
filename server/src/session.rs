@@ -125,6 +125,7 @@ pub struct FinishReport {
 pub struct WorkerSetup {
     pub store: Arc<Store>,
     pub link_id: String,
+    pub tenant: String,
     /// Absolute directory this session publishes into.
     pub dest_dir: PathBuf,
     /// Prefix of `dest_dir` relative to the receive root, for records.
@@ -373,7 +374,7 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
     // Files this link already delivered, for dedupe on identical roots.
     let prior_uploads = setup
         .store
-        .link(&setup.link_id)
+        .link_by_id(&setup.link_id)
         .map(|link| link.uploads)
         .unwrap_or_default();
 
@@ -650,7 +651,9 @@ fn handle_finish(
     let upload_id = upload.id.clone();
     setup
         .store
-        .update_link(&setup.link_id, |link| link.uploads.push(upload))
+        .update_link(&setup.tenant, &setup.link_id, |link| {
+            link.uploads.push(upload)
+        })
         .map_err(SessionError::internal)?;
     *phase = Phase::Done;
     Ok(FinishReport {
@@ -700,13 +703,15 @@ fn record_event(
             "expected_bytes": event.expected_bytes
         }),
     );
-    let _ = setup.store.update_link(&setup.link_id, |link| {
-        link.events.push(event);
-        if link.events.len() > EVENTS_KEPT {
-            let excess = link.events.len() - EVENTS_KEPT;
-            link.events.drain(..excess);
-        }
-    });
+    let _ = setup
+        .store
+        .update_link(&setup.tenant, &setup.link_id, |link| {
+            link.events.push(event);
+            if link.events.len() > EVENTS_KEPT {
+                let excess = link.events.len() - EVENTS_KEPT;
+                link.events.drain(..excess);
+            }
+        });
 }
 
 fn stored_rel(dest_rel: &str, components: &[String]) -> String {
@@ -733,6 +738,7 @@ pub struct Sessions {
 
 pub struct SessionHandle {
     pub link_id: String,
+    pub tenant: String,
     pub sender: mpsc::Sender<Cmd>,
     pub last_active: Instant,
 }
@@ -750,15 +756,26 @@ impl Sessions {
         }
     }
 
-    pub fn insert(&self, id: String, link_id: String, sender: mpsc::Sender<Cmd>) {
+    pub fn insert(&self, id: String, link_id: String, tenant: String, sender: mpsc::Sender<Cmd>) {
         self.map.lock().expect("sessions poisoned").insert(
             id,
             SessionHandle {
                 link_id,
+                tenant,
                 sender,
                 last_active: Instant::now(),
             },
         );
+    }
+
+    /// Concurrent sessions for one tenant namespace.
+    pub fn active_for_tenant(&self, tenant: &str) -> usize {
+        self.map
+            .lock()
+            .expect("sessions poisoned")
+            .values()
+            .filter(|handle| handle.tenant == tenant)
+            .count()
     }
 
     /// The link a session belongs to, for completion notifications.

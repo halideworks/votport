@@ -88,7 +88,11 @@ also inserted into `audit_log(at, tenant, actor, event, subject, detail_json)`.
 - Quotas per tenant: `max_total_bytes` (sum of live uploads), `max_sessions`
   (concurrent, enforced next to `MAX_SESSIONS_PER_LINK`), `max_links`. Enforced
   in `create_session`/`create_link` alongside the existing per-link caps and the
-  per-IP `SessionRate`.
+  per-IP `SessionRate`. Known bounded race: concurrent sessions each pass the
+  byte-quota check before uploading, so the total can overshoot by up to
+  (max_sessions - 1) x per-session cap mid-transfer; chunks are merkle-verified
+  against the announced size, so a lying announcement fails verification rather
+  than consuming quota.
 - Admin UI: tenant switcher for admins with multiple tenant roles; otherwise the
   UI is unchanged. Senders see nothing new.
 

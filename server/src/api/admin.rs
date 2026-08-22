@@ -115,19 +115,14 @@ pub async fn admin_login(
     }
     tracing::info!(target: "audit", event = "admin_login", %ip, "admin signed in");
     app.store.audit("admin_login", &ip, &serde_json::json!({}));
-    let identity = auth::AdminIdentity {
-        subject: "local".to_owned(),
-        tenant: String::new(),
-        role: "admin".to_owned(),
-    };
-    let cookie = issue_admin_cookie(&app, &identity);
+    let cookie = issue_admin_cookie(&app, &auth::AdminIdentity::local_admin());
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
 
 pub async fn admin_logout(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Response> {
     // A cross-site form POST can force a logout (denial of convenience, not
     // of security); the CSRF header closes even that.
-    let _ = require_admin(&app, &headers)?;
+    let _identity = require_admin(&app, &headers)?;
     if !headers.contains_key("x-votport") {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -148,7 +143,7 @@ pub async fn admin_audit_export(
     headers: HeaderMap,
     Query(query): Query<AuditQuery>,
 ) -> ApiResult<Response> {
-    let _ = require_admin(&app, &headers)?;
+    let _identity = require_admin(&app, &headers)?;
     let limit = query.limit.unwrap_or(1000).min(10_000);
     let rows = app
         .store
@@ -192,8 +187,150 @@ pub async fn admin_session(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_admin(&app, &headers)?;
+    Ok(Json(json!({
+        "ok": true,
+        "tenant": identity.tenant,
+        "grants": identity.grants,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct CreateTenantRequest {
+    key: String,
+    label: String,
+    #[serde(default)]
+    admin_group: Option<String>,
+    #[serde(default)]
+    max_total_bytes: Option<u64>,
+    #[serde(default)]
+    max_links: Option<u64>,
+    #[serde(default)]
+    max_sessions: Option<u64>,
+}
+
+/// Creates a tenant namespace. Admins only; the key must pass the same
+/// component rules as a link destination (it becomes a folder name).
+pub async fn create_tenant(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateTenantRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
+    // Tenant lifecycle is a platform operation: only the default tenant's
+    // admin holds it, so an SSO principal scoped to "acme" cannot mint or
+    // destroy other namespaces.
+    if !identity.tenant.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "tenant administration requires the default-tenant admin",
+        ));
+    }
+    let key = paths::admit_dest(&request.key)
+        .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    if key.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the default tenant already exists",
+        ));
+    }
+    if app.store.tenant(&key).is_some() {
+        return Err(ApiError::new(StatusCode::CONFLICT, "tenant already exists"));
+    }
+    let tenant = crate::store::Tenant {
+        key: key.clone(),
+        label: request.label.trim().to_owned(),
+        admin_group: request.admin_group.filter(|group| !group.trim().is_empty()),
+        max_total_bytes: request.max_total_bytes.filter(|&bytes| bytes > 0),
+        max_links: request.max_links.filter(|&links| links > 0),
+        max_sessions: request.max_sessions.filter(|&sessions| sessions > 0),
+        created_at: now_unix(),
+    };
+    app.store
+        .insert_tenant(tenant)
+        .map_err(ApiError::internal)?;
+    tracing::info!(target: "audit", event = "tenant_created", key = %key, "tenant namespace created");
+    app.store.audit("tenant_created", &key, &json!({}));
+    Ok(Json(json!({ "key": key })))
+}
+
+pub async fn list_tenants(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
     let _ = require_admin(&app, &headers)?;
+    Ok(Json(json!({ "tenants": app.store.tenants() })))
+}
+
+pub async fn delete_tenant(
+    State(app): State<Arc<App>>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
+    if !identity.tenant.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "tenant administration requires the default-tenant admin",
+        ));
+    }
+    let count = app.store.tenant_link_count(&key);
+    if count > 0 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!("{count} link(s) still reference this tenant; delete them first"),
+        ));
+    }
+    // In-flight uploads would keep writing into the deleted namespace and
+    // their records would silently vanish.
+    let active = app.sessions.active_for_tenant(&key);
+    if active > 0 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!("{active} upload(s) are in flight; try again when they finish"),
+        ));
+    }
+    if !app.store.remove_tenant(&key).map_err(ApiError::internal)? {
+        return Err(ApiError::not_found());
+    }
+    tracing::info!(target: "audit", event = "tenant_deleted", key = %key, "tenant namespace deleted");
+    app.store.audit("tenant_deleted", &key, &json!({}));
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct SwitchTenantRequest {
+    tenant: String,
+}
+
+/// Switches the active tenant, reissuing the session cookie. Only grants
+/// already carried by the session are honored, so this cannot escalate.
+pub async fn switch_tenant(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(request): Json<SwitchTenantRequest>,
+) -> ApiResult<Response> {
+    let identity = require_admin(&app, &headers)?;
+    let Some(grant) = identity
+        .grants
+        .iter()
+        .find(|grant| grant.tenant == request.tenant)
+    else {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "no access to that tenant",
+        ));
+    };
+    let switched = auth::AdminIdentity {
+        tenant: grant.tenant.clone(),
+        role: grant.role.clone(),
+        grants: identity.grants.clone(),
+        subject: identity.subject.clone(),
+    };
+    let cookie = issue_admin_cookie(&app, &switched);
+    Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
 
 #[derive(Deserialize)]
@@ -252,12 +389,7 @@ pub async fn admin_change_password(
     tracing::info!(target: "audit", event = "admin_password_changed", "admin password changed; outstanding sessions invalidated");
     app.store
         .audit("admin_password_changed", "", &serde_json::json!({}));
-    let identity = auth::AdminIdentity {
-        subject: "local".to_owned(),
-        tenant: String::new(),
-        role: "admin".to_owned(),
-    };
-    let cookie = issue_admin_cookie(&app, &identity);
+    let cookie = issue_admin_cookie(&app, &auth::AdminIdentity::local_admin());
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
 
@@ -378,11 +510,11 @@ pub async fn list_links(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _ = require_admin(&app, &headers)?;
+    let identity = require_admin(&app, &headers)?;
     let base = base_url(&app, &headers);
     let links: Vec<LinkView> = app
         .store
-        .links()
+        .links(&identity.tenant)
         .into_iter()
         .map(|link| link_view(&app, link, &base))
         .collect();
@@ -426,8 +558,27 @@ pub async fn create_link(
         Some(password) => Some(auth::hash_password(password).map_err(ApiError::internal)?),
         None => None,
     };
+    let tenant = identity.tenant.clone();
+    // A cookie can outlive its tenant's deletion; without this check the
+    // link would be created under a namespace nothing manages anymore.
+    if !tenant.is_empty() && app.store.tenant(&tenant).is_none() {
+        return Err(ApiError::new(
+            StatusCode::GONE,
+            "this session's tenant no longer exists; sign in again",
+        ));
+    }
+    if let Some(max_links) = app.store.tenant(&tenant).and_then(|t| t.max_links) {
+        let count = u64::try_from(app.store.links(&tenant).len()).unwrap_or(u64::MAX);
+        if count >= max_links {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("this tenant allows at most {max_links} request links"),
+            ));
+        }
+    }
     let link = Link {
         id: auth::random_token(),
+        tenant,
         label,
         dest,
         password_hash,
@@ -447,7 +598,7 @@ pub async fn create_link(
     app.store.audit(
         "link_created",
         &view.id,
-        &serde_json::json!({ "label": view.label, "dest": view.dest }),
+        &serde_json::json!({ "label": view.label, "dest": view.dest, "tenant": identity.tenant }),
     );
     Ok(Json(json!({ "link": view })))
 }
@@ -467,7 +618,7 @@ pub async fn update_link(
     require_admin_write(&headers, &identity)?;
     let found = app
         .store
-        .update_link(&id, |link| link.active = request.active)
+        .update_link(&identity.tenant, &id, |link| link.active = request.active)
         .map_err(ApiError::internal)?;
     if !found {
         return Err(ApiError::not_found());
@@ -488,7 +639,11 @@ pub async fn delete_link(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    if !app.store.remove_link(&id).map_err(ApiError::internal)? {
+    if !app
+        .store
+        .remove_link(&identity.tenant, &id)
+        .map_err(ApiError::internal)?
+    {
         return Err(ApiError::not_found());
     }
     tracing::info!(target: "audit", event = "link_deleted", id = %id, "request link deleted");
@@ -502,8 +657,11 @@ pub async fn link_qr(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let _ = require_admin(&app, &headers)?;
-    let link = app.store.link(&id).ok_or_else(ApiError::not_found)?;
+    let identity = require_admin(&app, &headers)?;
+    let link = app
+        .store
+        .link(&identity.tenant, &id)
+        .ok_or_else(ApiError::not_found)?;
     let url = format!("{}/r/{}", base_url(&app, &headers), link.id);
     let code = qrcode::QrCode::new(url.as_bytes())
         .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -526,7 +684,9 @@ pub async fn delete_upload_record(
     require_admin_write(&headers, &identity)?;
     let found = app
         .store
-        .update_link(&id, |link| link.uploads.retain(|entry| entry.id != upload))
+        .update_link(&identity.tenant, &id, |link| {
+            link.uploads.retain(|entry| entry.id != upload)
+        })
         .map_err(ApiError::internal)?;
     if !found {
         return Err(ApiError::not_found());
@@ -550,7 +710,10 @@ pub async fn delete_received_file(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    let link = app.store.link(&id).ok_or_else(ApiError::not_found)?;
+    let link = app
+        .store
+        .link(&identity.tenant, &id)
+        .ok_or_else(ApiError::not_found)?;
     let record = link
         .uploads
         .iter()
@@ -580,7 +743,7 @@ pub async fn delete_received_file(
     // record still pointing there must never satisfy dedupe again.
     let stored_as = record.stored_as.clone();
     app.store
-        .update_link(&id, |link| {
+        .update_link(&identity.tenant, &id, |link| {
             for upload in &mut link.uploads {
                 for file in &mut upload.files {
                     if file.stored_as == stored_as {
@@ -748,5 +911,158 @@ mod handler_tests {
             .and_then(|value| value.to_str().ok())
             .unwrap();
         assert!(cookie.contains("; Secure"), "cookie was {cookie}");
+    }
+}
+
+#[cfg(test)]
+mod tenant_authz_tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    use crate::api::testing;
+    use crate::app;
+    use crate::auth::{self, TenantGrant};
+
+    /// Mints an admin session cookie for an arbitrary identity, exactly as
+    /// the SSO callback would after verifying a provider response.
+    fn cookie_for(app: &App, tenant: &str, role: &str) -> String {
+        let identity = auth::AdminIdentity {
+            subject: format!("sso:{tenant}"),
+            tenant: tenant.to_owned(),
+            role: role.to_owned(),
+            grants: vec![TenantGrant {
+                tenant: tenant.to_owned(),
+                role: role.to_owned(),
+            }],
+        };
+        format!(
+            "votport_admin={}; Path=/",
+            auth::issue_admin_token(&app.secret, &identity, &admin_token_phc(app))
+        )
+    }
+
+    #[tokio::test]
+    async fn tenant_admins_cannot_reach_other_tenants() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(crate::store::Tenant {
+                key: "acme".to_owned(),
+                label: String::new(),
+                admin_group: None,
+                max_total_bytes: None,
+                max_links: None,
+                max_sessions: None,
+                created_at: 0,
+            })
+            .unwrap();
+        application
+            .store
+            .insert_link(crate::store::Link {
+                tenant: "acme".to_owned(),
+                ..crate::store::Link {
+                    id: "acme-link".to_owned(),
+                    tenant: "acme".to_owned(),
+                    label: "acme".to_owned(),
+                    dest: String::new(),
+                    password_hash: None,
+                    created_at: 0,
+                    expires_at: None,
+                    max_bytes: None,
+                    active: true,
+                    uploads: Vec::new(),
+                    events: Vec::new(),
+                }
+            })
+            .unwrap();
+
+        // An admin whose only grant is the default tenant: acme's link is
+        // invisible, and switching without the grant is refused.
+        let outsider = cookie_for(&application, "", "admin");
+        let router = app::router(application.clone());
+        let response = router
+            .oneshot(
+                Request::get("/api/admin/links")
+                    .header("cookie", &outsider)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        use http_body_util::BodyExt as _;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["links"].as_array().unwrap().len(), 0);
+
+        let router = app::router(application.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/admin/tenant")
+            .header("cookie", &outsider)
+            .header("content-type", "application/json")
+            .header("x-votport", "1")
+            .body(Body::from(r#"{"tenant":"acme"}"#))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // An acme admin sees exactly their own link and can toggle it.
+        let acme_admin = cookie_for(&application, "acme", "admin");
+        let router = app::router(application.clone());
+        let response = router
+            .oneshot(
+                Request::get("/api/admin/links")
+                    .header("cookie", &acme_admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let links = json["links"].as_array().unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0]["id"], "acme-link");
+
+        let router = app::router(application.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/admin/links/acme-link")
+            .header("cookie", &acme_admin)
+            .header("content-type", "application/json")
+            .header("x-votport", "1")
+            .body(Body::from(r#"{"active":false}"#))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // A viewer gets read-only access: reads pass, writes are 403.
+        let viewer = cookie_for(&application, "acme", "viewer");
+        let router = app::router(application.clone());
+        let response = router
+            .oneshot(
+                Request::get("/api/admin/links")
+                    .header("cookie", &viewer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let router = app::router(application);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/admin/links/acme-link")
+            .header("cookie", &viewer)
+            .header("content-type", "application/json")
+            .header("x-votport", "1")
+            .body(Body::from(r#"{"active":true}"#))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }

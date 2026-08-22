@@ -369,10 +369,28 @@ pub async fn sso_callback(
     app.store
         .audit("sso_login", &subject, &json!({ "role": role }));
 
+    // Grant set: the default tenant (role from the global admin group),
+    // plus every named tenant whose admin group the principal belongs to.
+    let mut grants = vec![auth::TenantGrant {
+        tenant: String::new(),
+        role: role.clone(),
+    }];
+    for tenant in app.store.tenants() {
+        let Some(required) = &tenant.admin_group else {
+            continue;
+        };
+        if groups.iter().any(|group| group == required) {
+            grants.push(auth::TenantGrant {
+                tenant: tenant.key.clone(),
+                role: "admin".to_owned(),
+            });
+        }
+    }
     let identity = auth::AdminIdentity {
         subject,
         tenant: String::new(),
         role,
+        grants,
     };
     let admin_cookie = super::admin::issue_admin_cookie(&app, &identity);
     let clear_state =
@@ -408,6 +426,10 @@ mod tests {
     fn admin_tokens_bind_identity_and_version() {
         let secret = [7u8; 32];
         let identity = AdminIdentity {
+            grants: vec![crate::auth::TenantGrant {
+                tenant: "acme".to_owned(),
+                role: "viewer".to_owned(),
+            }],
             subject: "user@example.com".to_owned(),
             tenant: "acme".to_owned(),
             role: "viewer".to_owned(),

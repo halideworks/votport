@@ -46,7 +46,10 @@ pub async fn link_info(
     Path(token): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let link = app.store.link(&token).ok_or_else(ApiError::not_found)?;
+    let link = app
+        .store
+        .link_by_id(&token)
+        .ok_or_else(ApiError::not_found)?;
     let usable = link.usable_now();
     Ok(Json(json!({
         // The label leaks nothing new to an authorized sender, but an old URL
@@ -150,7 +153,10 @@ pub async fn verify_link_password(
     headers: HeaderMap,
     Json(request): Json<VerifyRequest>,
 ) -> ApiResult<Response> {
-    let link = app.store.link(&token).ok_or_else(ApiError::not_found)?;
+    let link = app
+        .store
+        .link_by_id(&token)
+        .ok_or_else(ApiError::not_found)?;
     if !link.usable_now() {
         return Err(ApiError::new(
             StatusCode::GONE,
@@ -181,7 +187,10 @@ pub async fn create_session(
     headers: HeaderMap,
     Json(request): Json<CreateSessionRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let link = app.store.link(&token).ok_or_else(ApiError::not_found)?;
+    let link = app
+        .store
+        .link_by_id(&token)
+        .ok_or_else(ApiError::not_found)?;
     if !link.usable_now() {
         return Err(ApiError::new(
             StatusCode::GONE,
@@ -218,12 +227,44 @@ pub async fn create_session(
             format!("upload exceeds the {cap} byte limit for this link"),
         ));
     }
-    let dest_components: Vec<String> = link
-        .dest
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .map(str::to_owned)
-        .collect();
+    // Quotas: the tenant's received-but-not-deleted bytes plus this upload
+    // must stay under max_total_bytes, and its concurrent sessions under
+    // max_sessions.
+    if let Some(tenant) = app.store.tenant(&link.tenant) {
+        if let Some(max_total) = tenant.max_total_bytes {
+            let received = app.store.tenant_received_bytes(&link.tenant);
+            if received + expected.length > max_total {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!(
+                        "this tenant's storage quota is exhausted ({received} of {max_total} bytes used)"
+                    ),
+                ));
+            }
+        }
+        if let Some(max_sessions) = tenant.max_sessions {
+            if app.sessions.active_for_tenant(&link.tenant) >= max_sessions as usize {
+                return Err(ApiError::new(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many concurrent uploads for this tenant",
+                ));
+            }
+        }
+    }
+
+    // Named tenants publish into <receive>/<tenant-key>/...; the default
+    // tenant keeps today's layout.
+    let mut dest_components = app
+        .store
+        .tenant(&link.tenant)
+        .map(|tenant| tenant.path_prefix())
+        .unwrap_or_default();
+    dest_components.extend(
+        link.dest
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned),
+    );
     // admit_dest already vetted these; join_under re-checks as defense.
     let dest_dir =
         paths::join_under(&app.config.receive_dir, &dest_components).map_err(ApiError::internal)?;
@@ -235,6 +276,7 @@ pub async fn create_session(
     let setup = session::WorkerSetup {
         store: Arc::clone(&app.store),
         link_id: link.id.clone(),
+        tenant: link.tenant.clone(),
         dest_dir,
         dest_rel: link.dest.clone(),
         expected_package: expected,
@@ -255,7 +297,8 @@ pub async fn create_session(
         &link.id,
         &serde_json::json!({ "session_tag": &session_id[..8.min(session_id.len())], "bytes": announced_bytes }),
     );
-    app.sessions.insert(session_id.clone(), link.id, sender);
+    app.sessions
+        .insert(session_id.clone(), link.id, link.tenant.clone(), sender);
     Ok(Json(json!({
         "session": session_id,
         "chunk_bytes": session::CHUNK_BYTES,
@@ -384,7 +427,7 @@ pub async fn upload_finish(
             "bytes": report.files.iter().map(|f| f.bytes).sum::<u64>()
         }),
     );
-    if let Some(link) = link_id.and_then(|id| app.store.link(&id)) {
+    if let Some(link) = link_id.and_then(|id| app.store.link_by_id(&id)) {
         tokio::spawn(crate::notify::uploaded(
             Arc::clone(&app),
             link.label,
@@ -423,6 +466,7 @@ mod session_rate_tests {
         let application = testing::build(directory.path());
         let link = Link {
             id: "rate-limited-link".to_owned(),
+            tenant: String::new(),
             label: "open".to_owned(),
             dest: String::new(),
             password_hash: None,

@@ -164,6 +164,15 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/admin/logout", post(api::admin_logout))
         .route("/api/admin/session", get(api::admin_session))
         .route("/api/admin/audit", get(api::admin_audit_export))
+        .route(
+            "/api/admin/tenants",
+            get(api::list_tenants).post(api::create_tenant),
+        )
+        .route(
+            "/api/admin/tenants/{key}",
+            axum::routing::delete(api::delete_tenant),
+        )
+        .route("/api/admin/tenant", post(api::switch_tenant))
         .route("/api/admin/password", post(api::admin_change_password))
         .route(
             "/api/admin/links",

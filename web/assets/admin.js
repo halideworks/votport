@@ -387,7 +387,29 @@ $('password-form').addEventListener('submit', async (event) => {
     if (available) $('login-sso').hidden = false;
   } catch { /* login page still works without it */ }
   try {
-    await api('/api/admin/session');
+    const session = await api('/api/admin/session');
+    // Tenants the principal may act in; the switcher appears only when
+    // there is a choice to make.
+    if (Array.isArray(session.grants) && session.grants.length > 1) {
+      const switcher = $('tenant-switcher');
+      switcher.replaceChildren(
+        ...session.grants.map((grant) => {
+          const option = document.createElement('option');
+          option.value = grant.tenant;
+          option.textContent = grant.tenant === '' ? 'Default' : grant.tenant;
+          option.selected = grant.tenant === session.tenant;
+          return option;
+        }),
+      );
+      switcher.hidden = false;
+      switcher.addEventListener('change', async () => {
+        await api('/api/admin/tenant', {
+          method: 'POST',
+          body: JSON.stringify({ tenant: switcher.value }),
+        });
+        await refreshLinks();
+      });
+    }
     show('dashboard');
     await refreshLinks();
   } catch {
