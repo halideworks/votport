@@ -106,4 +106,5 @@ require a bearer token, and scrape it over an internal interface only.
 Set `VOTPORT_UPLOAD_RETENTION_DAYS` to delete received files (and their
 records' live status) older than N days, swept daily with audit events.
 `VOTPORT_AUDIT_RETENTION_DAYS` (default 400) prunes audit rows the same way.
-Both default to keeping everything.
+Upload retention defaults to keeping everything; audit rows default to
+400 days.

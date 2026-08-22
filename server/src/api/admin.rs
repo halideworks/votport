@@ -229,10 +229,12 @@ pub async fn create_tenant(
     }
     let key = paths::admit_dest(&request.key)
         .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
-    if key.is_empty() {
+    if key.is_empty() || key == "default" {
+        // "default" would collide with the hard-coded metrics series for the
+        // built-in namespace.
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "the default tenant already exists",
+            "that tenant key is reserved",
         ));
     }
     if app.store.tenant(&key).is_some() {
@@ -311,7 +313,7 @@ pub async fn backup_database(
     tokio::fs::create_dir_all(&backups)
         .await
         .map_err(|error| ApiError::internal(format!("create backups dir: {error}")))?;
-    let name = format!("votport-{}.db", now_unix());
+    let name = format!("votport-{}-{}.db", now_unix(), &auth::random_token()[..8]);
     let destination = backups.join(&name);
     let store = Arc::clone(&app.store);
     let destination_clone = destination.clone();

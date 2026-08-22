@@ -321,15 +321,20 @@ pub async fn session_sweeper(app: Arc<App>) {
                 }
 
                 // Received-content lifecycle: delete expired uploads from
-                // disk and tombstone their records, per tenant.
+                // disk and tombstone their records, per tenant. Only records
+                // whose bytes were actually removed are tombstoned; a failed
+                // disk delete leaves the record live so the sweep retries.
                 if app.config.upload_retention_days > 0 {
                     let cutoff = crate::store::now_unix()
                         .saturating_sub(app.config.upload_retention_days.saturating_mul(86_400));
                     for link in app.store.all_links() {
                         for upload in &link.uploads {
-                            if upload.completed_at >= cutoff {
+                            // completed_at == 0 marks pre-field records; never
+                            // treat those as infinitely expired.
+                            if upload.completed_at == 0 || upload.completed_at >= cutoff {
                                 continue;
                             }
+                            let mut removed: Vec<String> = Vec::new();
                             for file in &upload.files {
                                 if file.deleted {
                                     continue;
@@ -345,45 +350,53 @@ pub async fn session_sweeper(app: Arc<App>) {
                                 else {
                                     continue;
                                 };
-                                let _ = tokio::fs::remove_file(&path).await;
                                 let _ = tokio::fs::remove_file(format!(
                                     "{}.vot-receipt",
                                     path.display()
                                 ))
                                 .await;
+                                match tokio::fs::remove_file(&path).await {
+                                    Ok(()) => removed.push(file.stored_as.clone()),
+                                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                        removed.push(file.stored_as.clone())
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(path = %path.display(), %error, "could not delete expired file");
+                                    }
+                                }
                             }
-                            let expired = upload.files.iter().filter(|f| !f.deleted).count();
-                            if expired > 0 {
-                                let _ = app.store.update_link(
-                                    &link.tenant,
-                                    &link.id,
-                                    |link| {
-                                        for upload in &mut link.uploads {
-                                            for file in &mut upload.files {
-                                                if upload.completed_at < cutoff {
-                                                    file.deleted = true;
-                                                }
+                            if removed.is_empty() {
+                                continue;
+                            }
+                            let _ = app.store.update_link(
+                                &link.tenant,
+                                &link.id,
+                                |link| {
+                                    for upload in &mut link.uploads {
+                                        for file in &mut upload.files {
+                                            if removed.contains(&file.stored_as) {
+                                                file.deleted = true;
                                             }
                                         }
-                                    },
-                                );
-                                tracing::info!(
-                                    target: "audit",
-                                    event = "uploads_expired",
-                                    link = %link.id,
-                                    tenant = %link.tenant,
-                                    files = expired,
-                                    "expired received files deleted"
-                                );
-                                app.store.audit(
-                                    "uploads_expired",
-                                    &link.id,
-                                    &serde_json::json!({
-                                        "tenant": link.tenant,
-                                        "files": expired
-                                    }),
-                                );
-                            }
+                                    }
+                                },
+                            );
+                            tracing::info!(
+                                target: "audit",
+                                event = "uploads_expired",
+                                link = %link.id,
+                                tenant = %link.tenant,
+                                files = removed.len(),
+                                "expired received files deleted"
+                            );
+                            app.store.audit(
+                                "uploads_expired",
+                                &link.id,
+                                &serde_json::json!({
+                                    "tenant": link.tenant,
+                                    "files": removed.len()
+                                }),
+                            );
                         }
                     }
                 }
