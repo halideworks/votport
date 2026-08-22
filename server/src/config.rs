@@ -29,6 +29,17 @@ pub struct Config {
     pub notify_ntfy_token: Option<String>,
     /// Pushover application token + user key for upload notices.
     pub notify_pushover: Option<(String, String)>,
+    /// SMTP host for upload-complete mail. Assembled with from/to at resolve.
+    pub smtp_host: Option<String>,
+    /// SMTP port. Default 587. Port 465 uses implicit TLS.
+    pub smtp_port: u16,
+    /// When true, use STARTTLS on ports other than 465. Default true.
+    pub smtp_starttls: bool,
+    pub smtp_username: Option<String>,
+    pub smtp_password: Option<String>,
+    pub smtp_from: Option<String>,
+    /// Comma-separated recipient addresses.
+    pub smtp_to: Option<String>,
     /// Public base URL (e.g. "https://drop.example.com"); used to render
     /// links in the admin UI and to decide whether cookies are `Secure`.
     pub public_url: Option<String>,
@@ -163,6 +174,22 @@ pub fn from_env() -> Result<Config, String> {
         }
     };
 
+    let smtp_port = match env::var("VOTPORT_NOTIFY_SMTP_PORT") {
+        Ok(value) if !value.trim().is_empty() => {
+            let parsed: u16 = value
+                .parse()
+                .map_err(|error| format!("VOTPORT_NOTIFY_SMTP_PORT: {error}"))?;
+            if parsed == 0 {
+                return Err("VOTPORT_NOTIFY_SMTP_PORT must be 1..=65535".to_owned());
+            }
+            parsed
+        }
+        _ => 587,
+    };
+    let smtp_starttls = env::var("VOTPORT_NOTIFY_SMTP_STARTTLS")
+        .ok()
+        .is_none_or(|value| value != "0");
+
     let oidc = match (
         optional("VOTPORT_OIDC_ISSUER"),
         optional("VOTPORT_OIDC_CLIENT_ID"),
@@ -206,6 +233,13 @@ pub fn from_env() -> Result<Config, String> {
         notify_ntfy: optional("VOTPORT_NOTIFY_NTFY_URL"),
         notify_ntfy_token: optional("VOTPORT_NOTIFY_NTFY_TOKEN"),
         notify_pushover,
+        smtp_host: optional("VOTPORT_NOTIFY_SMTP_HOST"),
+        smtp_port,
+        smtp_starttls,
+        smtp_username: optional("VOTPORT_NOTIFY_SMTP_USERNAME"),
+        smtp_password: optional("VOTPORT_NOTIFY_SMTP_PASSWORD"),
+        smtp_from: optional("VOTPORT_NOTIFY_SMTP_FROM"),
+        smtp_to: optional("VOTPORT_NOTIFY_SMTP_TO"),
         public_url,
         max_upload_bytes,
         allow_hidden,

@@ -671,6 +671,13 @@ const SETTINGS_KEYS: &[&str] = &[
     "notify_ntfy_token",
     "notify_pushover_token",
     "notify_pushover_user",
+    "smtp_host",
+    "smtp_port",
+    "smtp_starttls",
+    "smtp_username",
+    "smtp_password",
+    "smtp_from",
+    "smtp_to",
     "audit_retention_days",
     "upload_retention_days",
     "default_max_total_bytes",
@@ -702,6 +709,20 @@ fn settings_json(app: &App) -> serde_json::Value {
         "notify_pushover_token_source": overlay.notify_pushover_token_source,
         "notify_pushover_user_set": overlay.notify_pushover_user_set,
         "notify_pushover_user_source": overlay.notify_pushover_user_source,
+        "smtp_host": overlay.smtp_host,
+        "smtp_host_source": overlay.smtp_host_source,
+        "smtp_port": overlay.smtp_port,
+        "smtp_port_source": overlay.smtp_port_source,
+        "smtp_starttls": overlay.smtp_starttls,
+        "smtp_starttls_source": overlay.smtp_starttls_source,
+        "smtp_username": overlay.smtp_username,
+        "smtp_username_source": overlay.smtp_username_source,
+        "smtp_password_set": overlay.smtp_password_set,
+        "smtp_password_source": overlay.smtp_password_source,
+        "smtp_from": overlay.smtp_from,
+        "smtp_from_source": overlay.smtp_from_source,
+        "smtp_to": overlay.smtp_to,
+        "smtp_to_source": overlay.smtp_to_source,
         "audit_retention_days": resolved.audit_retention_days,
         "audit_retention_days_source": overlay.audit_retention_days_source,
         "upload_retention_days": resolved.upload_retention_days,
@@ -780,6 +801,31 @@ fn write_u64(
     }
 }
 
+fn write_smtp_port(key: &str, value: &serde_json::Value) -> ApiResult<crate::store::SettingWrite> {
+    match value {
+        serde_json::Value::Null => Ok(crate::store::SettingWrite::Reset),
+        serde_json::Value::Number(number) => {
+            let Some(parsed) = number.as_u64() else {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("{key} must be a non-negative integer"),
+                ));
+            };
+            if !(1..=65535).contains(&parsed) {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("{key} must be 1..=65535"),
+                ));
+            }
+            Ok(crate::store::SettingWrite::Set(parsed.to_string()))
+        }
+        _ => Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{key} must be a number or null"),
+        )),
+    }
+}
+
 fn write_bool(key: &str, value: &serde_json::Value) -> ApiResult<crate::store::SettingWrite> {
     match value {
         serde_json::Value::Null => Ok(crate::store::SettingWrite::Reset),
@@ -819,14 +865,20 @@ pub async fn put_settings(
         };
         let write = match *key {
             "notify_webhook" | "notify_ntfy" => write_url(key, value)?,
-            "notify_ntfy_token" | "notify_pushover_token" | "notify_pushover_user" => {
-                write_secret(key, value)?
-            }
+            "notify_ntfy_token"
+            | "notify_pushover_token"
+            | "notify_pushover_user"
+            | "smtp_host"
+            | "smtp_username"
+            | "smtp_password"
+            | "smtp_from"
+            | "smtp_to" => write_secret(key, value)?,
             "audit_retention_days" | "upload_retention_days" => write_u64(key, value, true)?,
             "default_max_total_bytes" | "default_max_links" | "default_max_sessions" => {
                 write_u64(key, value, false)?
             }
-            "public_password_login" => write_bool(key, value)?,
+            "public_password_login" | "smtp_starttls" => write_bool(key, value)?,
+            "smtp_port" => write_smtp_port(key, value)?,
             _ => unreachable!(),
         };
         match &write {
@@ -2129,6 +2181,13 @@ mod ops_tests {
             notify_ntfy: None,
             notify_ntfy_token: None,
             notify_pushover: None,
+            smtp_host: None,
+            smtp_port: 587,
+            smtp_starttls: true,
+            smtp_username: None,
+            smtp_password: None,
+            smtp_from: None,
+            smtp_to: None,
             public_url: None,
             max_upload_bytes: 1024 * 1024,
             allow_hidden: false,
@@ -2298,6 +2357,38 @@ mod settings_api_tests {
         assert_eq!(json["default_max_total_bytes"], serde_json::Value::Null);
         assert_eq!(json["public_password_login"], true);
         assert_eq!(json["sso_configured"], false);
+        assert_eq!(json["smtp_host"], serde_json::Value::Null);
+        assert_eq!(json["smtp_port"], 587);
+        assert_eq!(json["smtp_starttls"], true);
+        assert_eq!(json["smtp_password_set"], false);
+        assert_eq!(json["smtp_password_source"], "env");
+        assert!(json.get("smtp_password").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_settings_redacts_smtp_password() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = cookie_for(&application, "", "admin");
+        let (status, json) = send(
+            application,
+            Request::builder()
+                .method("PUT")
+                .uri("/api/admin/settings")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"smtp_host":"smtp.example.com","smtp_from":"votport@example.com","smtp_to":"ops@example.com","smtp_password":"s3cret"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["smtp_host"], "smtp.example.com");
+        assert_eq!(json["smtp_password_set"], true);
+        assert_eq!(json["smtp_password_source"], "db");
+        assert!(json.get("smtp_password").is_none());
     }
 
     #[tokio::test]
@@ -2439,7 +2530,7 @@ mod settings_api_tests {
         assert_eq!(json["audit_retention_days"], 0);
 
         let (status, _) = send(
-            application,
+            application.clone(),
             Request::builder()
                 .method("PUT")
                 .uri("/api/admin/settings")
@@ -2447,6 +2538,20 @@ mod settings_api_tests {
                 .header("x-votport", "1")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"notify_webhook":"ftp://nope"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status, _) = send(
+            application,
+            Request::builder()
+                .method("PUT")
+                .uri("/api/admin/settings")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"smtp_port":0}"#))
                 .unwrap(),
         )
         .await;

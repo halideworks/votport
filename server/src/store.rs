@@ -163,12 +163,26 @@ pub struct ResolvedSettings {
     pub notify_ntfy: Option<String>,
     pub notify_ntfy_token: Option<String>,
     pub notify_pushover: Option<(String, String)>,
+    /// Some iff host, from, and at least one `to` all resolve non-empty.
+    pub smtp: Option<ResolvedSmtp>,
     pub audit_retention_days: u64,
     pub upload_retention_days: u64,
     pub default_max_total_bytes: Option<u64>,
     pub default_max_links: Option<u64>,
     pub default_max_sessions: Option<u64>,
     pub public_password_login: bool,
+}
+
+/// Assembled SMTP channel. Username and password are optional.
+#[derive(Clone, Debug)]
+pub struct ResolvedSmtp {
+    pub host: String,
+    pub port: u16,
+    pub starttls: bool,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub from: String,
+    pub to: Vec<String>,
 }
 
 /// Resolved settings plus whether each key came from the database or env.
@@ -183,6 +197,20 @@ pub struct SettingsOverlay {
     pub notify_pushover_token_source: &'static str,
     pub notify_pushover_user_set: bool,
     pub notify_pushover_user_source: &'static str,
+    pub smtp_host: Option<String>,
+    pub smtp_host_source: &'static str,
+    pub smtp_port: u16,
+    pub smtp_port_source: &'static str,
+    pub smtp_starttls: bool,
+    pub smtp_starttls_source: &'static str,
+    pub smtp_username: Option<String>,
+    pub smtp_username_source: &'static str,
+    pub smtp_password_set: bool,
+    pub smtp_password_source: &'static str,
+    pub smtp_from: Option<String>,
+    pub smtp_from_source: &'static str,
+    pub smtp_to: Option<String>,
+    pub smtp_to_source: &'static str,
     pub audit_retention_days_source: &'static str,
     pub upload_retention_days_source: &'static str,
     pub default_max_total_bytes_source: &'static str,
@@ -1136,6 +1164,26 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
         (Some(token), Some(user)) => Some((token, user)),
         _ => None,
     };
+    let (smtp_host, smtp_host_source) = overlay_text(rows, "smtp_host", config.smtp_host.clone());
+    let (smtp_port, smtp_port_source) = overlay_port(rows, "smtp_port", config.smtp_port);
+    let (smtp_starttls, smtp_starttls_source) =
+        overlay_bool(rows, "smtp_starttls", config.smtp_starttls);
+    let (smtp_username, smtp_username_source) =
+        overlay_text(rows, "smtp_username", config.smtp_username.clone());
+    let (smtp_password, smtp_password_source) =
+        overlay_text(rows, "smtp_password", config.smtp_password.clone());
+    let smtp_password_set = smtp_password.is_some();
+    let (smtp_from, smtp_from_source) = overlay_text(rows, "smtp_from", config.smtp_from.clone());
+    let (smtp_to, smtp_to_source) = overlay_text(rows, "smtp_to", config.smtp_to.clone());
+    let smtp = assemble_smtp(
+        smtp_host.clone(),
+        smtp_port,
+        smtp_starttls,
+        smtp_username.clone(),
+        smtp_password.clone(),
+        smtp_from.clone(),
+        smtp_to.clone(),
+    );
     let (audit_retention_days, audit_retention_days_source) =
         overlay_u64(rows, "audit_retention_days", config.audit_retention_days);
     let (upload_retention_days, upload_retention_days_source) =
@@ -1157,6 +1205,7 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
             notify_ntfy,
             notify_ntfy_token,
             notify_pushover,
+            smtp,
             audit_retention_days,
             upload_retention_days,
             default_max_total_bytes,
@@ -1171,6 +1220,20 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
         notify_pushover_token_source,
         notify_pushover_user_set,
         notify_pushover_user_source,
+        smtp_host,
+        smtp_host_source,
+        smtp_port,
+        smtp_port_source,
+        smtp_starttls,
+        smtp_starttls_source,
+        smtp_username,
+        smtp_username_source,
+        smtp_password_set,
+        smtp_password_source,
+        smtp_from,
+        smtp_from_source,
+        smtp_to,
+        smtp_to_source,
         audit_retention_days_source,
         upload_retention_days_source,
         default_max_total_bytes_source,
@@ -1220,6 +1283,60 @@ fn overlay_positive(
             }
         },
     }
+}
+
+fn overlay_port(rows: &HashMap<String, String>, key: &str, env: u16) -> (u16, &'static str) {
+    match rows.get(key) {
+        None => (env, "env"),
+        Some(value) => match value.parse::<u16>() {
+            Ok(parsed) if parsed >= 1 => (parsed, "db"),
+            _ => {
+                tracing::error!(key, value, "invalid settings value; using env default");
+                (env, "env")
+            }
+        },
+    }
+}
+
+fn trimmed_option(value: Option<String>) -> Option<String> {
+    value.and_then(|raw| {
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
+}
+
+fn smtp_recipients(to: &str) -> Vec<String> {
+    to.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn assemble_smtp(
+    host: Option<String>,
+    port: u16,
+    starttls: bool,
+    username: Option<String>,
+    password: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+) -> Option<ResolvedSmtp> {
+    let host = trimmed_option(host)?;
+    let from = trimmed_option(from)?;
+    let recipients = to
+        .as_deref()
+        .map(smtp_recipients)
+        .filter(|parts| !parts.is_empty())?;
+    Some(ResolvedSmtp {
+        host,
+        port,
+        starttls,
+        username: trimmed_option(username),
+        password,
+        from,
+        to: recipients,
+    })
 }
 
 fn overlay_bool(rows: &HashMap<String, String>, key: &str, env: bool) -> (bool, &'static str) {
@@ -1717,6 +1834,13 @@ mod settings_tests {
             notify_ntfy: None,
             notify_ntfy_token: Some("env-token".to_owned()),
             notify_pushover: None,
+            smtp_host: None,
+            smtp_port: 587,
+            smtp_starttls: true,
+            smtp_username: None,
+            smtp_password: None,
+            smtp_from: None,
+            smtp_to: None,
             public_url: None,
             max_upload_bytes: 1024,
             allow_hidden: false,
@@ -1964,5 +2088,68 @@ mod principals_store_tests {
         assert!(!store.principal_allows("user@example.com", 1));
         assert!(!store.revoke_principal("missing").unwrap());
         assert!(!store.unblock_principal("missing").unwrap());
+    }
+
+    #[test]
+    fn smtp_is_none_without_host() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut config = test_config();
+        config.smtp_from = Some("votport@example.com".to_owned());
+        config.smtp_to = Some("ops@example.com".to_owned());
+        assert!(store.resolved_settings(&config).smtp.is_none());
+    }
+
+    #[test]
+    fn smtp_is_none_when_host_and_from_lack_to() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut config = test_config();
+        config.smtp_host = Some("smtp.example.com".to_owned());
+        config.smtp_from = Some("votport@example.com".to_owned());
+        assert!(store.resolved_settings(&config).smtp.is_none());
+    }
+
+    #[test]
+    fn smtp_assembles_when_host_from_and_to_resolve() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .put_settings(
+                "local",
+                &[(
+                    "smtp_host".to_owned(),
+                    SettingWrite::Set("db.example.com".to_owned()),
+                )],
+            )
+            .unwrap();
+        let mut config = test_config();
+        config.smtp_from = Some("votport@example.com".to_owned());
+        config.smtp_to = Some("ops@example.com,  alerts@example.com".to_owned());
+        let smtp = store
+            .resolved_settings(&config)
+            .smtp
+            .expect("host from DB plus from/to from env");
+        assert_eq!(smtp.host, "db.example.com");
+        assert_eq!(smtp.from, "votport@example.com");
+        assert_eq!(smtp.to, vec!["ops@example.com", "alerts@example.com"]);
+        assert_eq!(smtp.port, 587);
+        assert!(smtp.starttls);
+        assert!(smtp.password.is_none());
+    }
+
+    #[test]
+    fn invalid_smtp_port_skips_to_env() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .put_settings(
+                "local",
+                &[("smtp_port".to_owned(), SettingWrite::Set("nope".to_owned()))],
+            )
+            .unwrap();
+        let overlay = store.overlay(&test_config());
+        assert_eq!(overlay.smtp_port, 587);
+        assert_eq!(overlay.smtp_port_source, "env");
     }
 }

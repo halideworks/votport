@@ -30,6 +30,13 @@ function setNotifyActions(enabled) {
   }
 }
 
+function setSmtpActions(enabled) {
+  $('smtp-save').disabled = !enabled;
+  for (const button of $('smtp-form').querySelectorAll('[data-clear]')) {
+    button.disabled = !enabled;
+  }
+}
+
 function fillSettings(data) {
   $('notify-webhook').value = data.notify_webhook || '';
   setSource('notify-webhook-source', data.notify_webhook_source);
@@ -41,6 +48,21 @@ function fillSettings(data) {
   setSource('notify-pushover-token-source', data.notify_pushover_token_source);
   setSecret('notify-pushover-user', data.notify_pushover_user_set);
   setSource('notify-pushover-user-source', data.notify_pushover_user_source);
+
+  $('smtp-host').value = data.smtp_host || '';
+  setSource('smtp-host-source', data.smtp_host_source);
+  $('smtp-port').value = data.smtp_port;
+  setSource('smtp-port-source', data.smtp_port_source);
+  $('smtp-starttls').checked = data.smtp_starttls !== false;
+  setSource('smtp-starttls-source', data.smtp_starttls_source);
+  $('smtp-username').value = data.smtp_username || '';
+  setSource('smtp-username-source', data.smtp_username_source);
+  setSecret('smtp-password', data.smtp_password_set);
+  setSource('smtp-password-source', data.smtp_password_source);
+  $('smtp-from').value = data.smtp_from || '';
+  setSource('smtp-from-source', data.smtp_from_source);
+  $('smtp-to').value = data.smtp_to || '';
+  setSource('smtp-to-source', data.smtp_to_source);
 
   $('audit-retention-days').value = data.audit_retention_days;
   setSource('audit-retention-source', data.audit_retention_days_source);
@@ -144,6 +166,26 @@ $('notify-form').addEventListener('submit', async (event) => {
   await saveSettings(event.currentTarget, body);
 });
 
+$('smtp-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if ($('smtp-save').disabled) return;
+  const body = {
+    smtp_host: $('smtp-host').value,
+    smtp_starttls: $('smtp-starttls').checked,
+    smtp_username: $('smtp-username').value,
+    smtp_from: $('smtp-from').value,
+    smtp_to: $('smtp-to').value,
+  };
+  const port = parseInt($('smtp-port').value, 10);
+  if (Number.isFinite(port) && port >= 1 && port <= 65535) {
+    body.smtp_port = port;
+  }
+  if ($('smtp-password').value !== '') {
+    body.smtp_password = $('smtp-password').value;
+  }
+  await saveSettings(event.currentTarget, body);
+});
+
 $('retention-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const body = {};
@@ -218,8 +260,10 @@ if (!session.pages.includes('system')) {
 try {
   fillSettings(await api('/api/admin/settings'));
   setNotifyActions(true);
+  setSmtpActions(true);
 } catch (error) {
   formError($('notify-form'), error);
+  formError($('smtp-form'), error);
 }
 // The receipt key arrives with the links payload.
 try {

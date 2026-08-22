@@ -146,6 +146,93 @@
         <p class="error" id="notify-error" hidden></p>
       </form>
 
+      <form id="smtp-form" class="card">
+        <h2>SMTP</h2>
+        <p class="muted">
+          Sent when an upload finishes. Requires host, from, and at least one
+          recipient. Port 465 uses implicit TLS.
+        </p>
+        <div class="grid">
+          <div>
+            <label
+              >Host <span class="muted" id="smtp-host-source"></span>
+              <input id="smtp-host" placeholder="smtp.example.com" autocomplete="off" />
+            </label>
+            <button type="button" class="ghost tiny" data-reset="smtp_host">
+              Use environment
+            </button>
+          </div>
+          <div>
+            <label
+              >Port <span class="muted" id="smtp-port-source"></span>
+              <input id="smtp-port" type="number" min="1" max="65535" step="1" />
+            </label>
+            <button type="button" class="ghost tiny" data-reset="smtp_port">
+              Use environment
+            </button>
+          </div>
+          <div>
+            <label
+              ><input type="checkbox" id="smtp-starttls" />
+              STARTTLS
+              <span class="muted" id="smtp-starttls-source"></span>
+            </label>
+            <button type="button" class="ghost tiny" data-reset="smtp_starttls">
+              Use environment
+            </button>
+          </div>
+          <div>
+            <label
+              >Username <span class="muted" id="smtp-username-source"></span>
+              <input id="smtp-username" autocomplete="off" />
+            </label>
+            <button type="button" class="ghost tiny" data-reset="smtp_username">
+              Use environment
+            </button>
+          </div>
+          <div>
+            <label
+              >Password <span class="muted" id="smtp-password-source"></span>
+              <input id="smtp-password" type="password" autocomplete="off" />
+            </label>
+            <button type="button" class="ghost tiny" data-reset="smtp_password">
+              Use environment
+            </button>
+            <button
+              type="button"
+              class="ghost tiny"
+              data-clear="smtp_password"
+              disabled
+            >
+              Clear
+            </button>
+          </div>
+          <div>
+            <label
+              >From <span class="muted" id="smtp-from-source"></span>
+              <input id="smtp-from" placeholder="votport@example.com" autocomplete="off" />
+            </label>
+            <button type="button" class="ghost tiny" data-reset="smtp_from">
+              Use environment
+            </button>
+          </div>
+          <div>
+            <label
+              >To
+              <span class="muted">comma-separated</span>
+              <span class="muted" id="smtp-to-source"></span>
+              <input id="smtp-to" placeholder="ops@example.com" autocomplete="off" />
+            </label>
+            <button type="button" class="ghost tiny" data-reset="smtp_to">
+              Use environment
+            </button>
+          </div>
+        </div>
+        <button type="submit" id="smtp-save" disabled>Save</button>
+        <span id="smtp-note" class="muted"></span>
+        <p class="error" id="smtp-error" hidden></p>
+      </form>
+
       <form id="retention-form" class="card">
         <h2>Retention</h2>
         <div class="grid">
