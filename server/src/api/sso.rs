@@ -6,10 +6,9 @@
 //! Local password sign-in remains the zero-config default and the
 //! break-glass path; this module only exists when VOTPORT_OIDC_* is set.
 //!
-//! Multi-client providers (Entra ID and friends) may require additional
-//! per-client claims checks (azp, hd); with a single client_id configured,
-//! the openidconnect crate's issuer/audience/nonce verification covers the
-//! standard cases.
+//! A single `client_id` is the supported shape. The crate checks issuer,
+//! audience, and nonce; when an id token carries `azp` it must equal that
+//! client id. Hosted-domain (`hd`) checks are not implemented.
 
 use std::fmt::Write as _;
 
@@ -27,7 +26,7 @@ use openidconnect::{OAuth2TokenResponse as _, TokenResponse as _};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::app::{self, App};
+use crate::app::App;
 use crate::auth;
 
 /// The discovered provider plus the client bound to our redirect URI.
@@ -84,6 +83,14 @@ impl SsoClient {
     }
 }
 
+/// True when the token has no azp, or when azp equals the configured client id.
+fn azp_ok(azp: Option<&str>, client_id: &str) -> bool {
+    match azp {
+        None => true,
+        Some(party) => party == client_id,
+    }
+}
+
 /// Role from an optional required-group: no requirement means every
 /// authenticated principal is an admin; otherwise membership decides.
 fn sso_role(admin_group: Option<&str>, groups: &[String]) -> &'static str {
@@ -102,11 +109,13 @@ pub struct CallbackParams {
 }
 
 /// Whether SSO sign-in is configured (drives the login-page button).
+/// Does not start discovery; `sso_healthy` is true only for a Ready slot.
 pub async fn sso_available(State(app): State<std::sync::Arc<App>>) -> Response {
     let available = app.sso_config.is_some();
+    let sso_healthy = app.sso_client.health_peek();
     (
         [(header::CONTENT_TYPE, "application/json")],
-        axum::Json(json!({ "available": available })),
+        axum::Json(json!({ "available": available, "sso_healthy": sso_healthy })),
     )
         .into_response()
 }
@@ -138,15 +147,15 @@ async fn start_flow(
     })?;
     let client = app
         .sso_client
-        .get_or_init(|| async move { app::discover_sso(&config, &public_url).await })
-        .await;
-    let client = client.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SSO discovery failed at startup; check the logs",
-        )
-            .into_response()
-    })?;
+        .get_or_discover(&config, &public_url)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SSO discovery failed; try again shortly",
+            )
+                .into_response()
+        })?;
 
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
     let (url, state, nonce) = client
@@ -285,12 +294,13 @@ pub async fn sso_callback(
         (Some(config), Some(public_url)) => (config, public_url),
         _ => return home("SSO is not configured"),
     };
-    let client = app
+    let client = match app
         .sso_client
-        .get_or_init(|| async move { app::discover_sso(sso_config.0, &sso_config.1).await })
-        .await;
-    let Some(client) = client.as_ref() else {
-        return home("SSO is unavailable");
+        .get_or_discover(sso_config.0, &sso_config.1)
+        .await
+    {
+        Ok(client) => client,
+        Err(()) => return home("SSO is unavailable"),
     };
 
     // The token endpoint is MaybeSet under discovery; a missing URL is a
@@ -337,6 +347,17 @@ pub async fn sso_callback(
             return home("identity could not be verified");
         }
     };
+    if !azp_ok(
+        claims.authorized_party().map(|party| party.as_str()),
+        &sso_config.0.client_id,
+    ) {
+        tracing::warn!(
+            target: "audit",
+            event = "sso_failed",
+            "authorized party does not match client id"
+        );
+        return home("identity could not be verified");
+    }
     let subject = claims.subject().to_string();
 
     // Groups come from the userinfo endpoint; the id token may not carry them.
@@ -427,6 +448,68 @@ pub async fn sso_callback(
 mod tests {
     use super::*;
     use crate::auth::AdminIdentity;
+
+    #[test]
+    fn azp_ok_when_absent_or_matching() {
+        assert!(azp_ok(None, "votport"));
+        assert!(azp_ok(Some("votport"), "votport"));
+        assert!(!azp_ok(Some("other-client"), "votport"));
+        assert!(!azp_ok(Some(""), "votport"));
+    }
+
+    #[tokio::test]
+    async fn sso_available_reports_configured_and_health_without_discovering() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let application = crate::api::testing::build(directory.path());
+        assert!(!application.sso_client.health_peek());
+        let router = crate::app::router(application);
+        let response = router
+            .oneshot(Request::get("/api/admin/sso").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["available"], false);
+        assert_eq!(json["sso_healthy"], false);
+        assert!(json.get("public_password_login").is_none());
+    }
+
+    #[tokio::test]
+    async fn sso_available_is_true_when_oidc_is_configured_even_if_unhealthy() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::api::testing::build(directory.path()).config.clone();
+        config.data_dir = directory.path().join("data-oidc");
+        config.receive_dir = directory.path().join("received-oidc");
+        config.oidc = Some(crate::config::OidcConfig {
+            issuer: "https://idp.example.com".to_owned(),
+            client_id: "votport".to_owned(),
+            client_secret: "secret".to_owned(),
+            admin_group: None,
+        });
+        let application = crate::app::build(config).unwrap();
+        assert!(!application.sso_client.health_peek());
+        let router = crate::app::router(application);
+        let response = router
+            .oneshot(Request::get("/api/admin/sso").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["available"], true);
+        assert_eq!(json["sso_healthy"], false);
+    }
 
     #[test]
     fn role_mapping_follows_the_group_requirement() {

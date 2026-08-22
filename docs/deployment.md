@@ -63,6 +63,15 @@ Roles come from the provider's `groups` claim: members of the admin group are
 administrators, everyone else read-only viewers. The local password always
 remains available as break-glass access.
 
+A single `VOTPORT_OIDC_CLIENT_ID` is the supported shape. When an id token
+carries `azp`, it must equal that client id. The crate already checks issuer,
+audience, and nonce. A second client or a hosted-domain (`hd`) allow-list is
+not supported.
+
+Discovery runs on first SSO use, not at process start. Failed discovery cools
+down for 30 seconds and then retries. A successful discovery stays loaded
+until process restart, so rotating IdP metadata still needs a restart.
+
 ### Authentik
 
 1. Applications > Applications > Create: choose *Authorization code with PKCE*.
