@@ -110,12 +110,21 @@ pub struct CallbackParams {
 
 /// Whether SSO sign-in is configured (drives the login-page button).
 /// Does not start discovery; `sso_healthy` is true only for a Ready slot.
+/// `public_password_login` comes from the settings overlay (env if unwritten).
 pub async fn sso_available(State(app): State<std::sync::Arc<App>>) -> Response {
     let available = app.sso_config.is_some();
     let sso_healthy = app.sso_client.health_peek();
+    let public_password_login = app
+        .store
+        .resolved_settings(&app.config)
+        .public_password_login;
     (
         [(header::CONTENT_TYPE, "application/json")],
-        axum::Json(json!({ "available": available, "sso_healthy": sso_healthy })),
+        axum::Json(json!({
+            "available": available,
+            "sso_healthy": sso_healthy,
+            "public_password_login": public_password_login,
+        })),
     )
         .into_response()
 }
@@ -477,7 +486,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["available"], false);
         assert_eq!(json["sso_healthy"], false);
-        assert!(json.get("public_password_login").is_none());
+        assert_eq!(json["public_password_login"], true);
     }
 
     #[tokio::test]
@@ -509,6 +518,79 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["available"], true);
         assert_eq!(json["sso_healthy"], false);
+        assert_eq!(json["public_password_login"], true);
+    }
+
+    #[tokio::test]
+    async fn sso_available_reads_public_password_login_from_the_overlay() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let application = crate::api::testing::build(directory.path());
+        application
+            .store
+            .put_settings(
+                "test",
+                &[(
+                    "public_password_login".to_owned(),
+                    crate::store::SettingWrite::Set("0".to_owned()),
+                )],
+            )
+            .unwrap();
+        let router = crate::app::router(application);
+        let response = router
+            .oneshot(Request::get("/api/admin/sso").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["available"], false);
+        assert_eq!(json["public_password_login"], false);
+    }
+
+    #[tokio::test]
+    async fn local_password_login_works_when_public_password_login_is_false() {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let application = crate::api::testing::build(directory.path());
+        application
+            .store
+            .put_settings(
+                "test",
+                &[(
+                    "public_password_login".to_owned(),
+                    crate::store::SettingWrite::Set("0".to_owned()),
+                )],
+            )
+            .unwrap();
+        let router = crate::app::router(application);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/login")
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        1234,
+                    ))))
+                    .body(Body::from(format!(
+                        "{{\"password\":\"{}\"}}",
+                        crate::api::testing::TEST_PASSWORD
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]

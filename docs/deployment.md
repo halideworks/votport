@@ -95,7 +95,11 @@ VOTPORT_OIDC_ADMIN_GROUP: "votport-admins"   # omit = every principal is admin
 
 Roles come from the provider's `groups` claim: members of the admin group are
 administrators, everyone else read-only viewers. The local password always
-remains available as break-glass access.
+remains available as break-glass access. `POST /api/admin/login` is never
+disabled. System can collapse the password form behind a "Use local password"
+disclosure when SSO is configured; the form stays in the page. Without SSO
+the form stays expanded even if `VOTPORT_PUBLIC_PASSWORD_LOGIN=0`. An
+unreachable IdP may mute the SSO button, never the password form.
 
 A single `VOTPORT_OIDC_CLIENT_ID` is the supported shape. When an id token
 carries `azp`, it must equal that client id. The crate already checks issuer,
@@ -163,11 +167,12 @@ of the same name lives at the receive root).
 
 ## Settings
 
-Notification URLs, retention days, and default tenant quotas overlay
-environment variables via `GET`/`PUT /api/admin/settings` (default-tenant
-admin; `X-Votport` on PUT). Env remains the boot default; a written key
-wins; `""` disables a URL or token; JSON `null` deletes the row so env
-applies again. See [`enterprise-ops.md`](enterprise-ops.md).
+Default-tenant admins edit notification URLs, retention days, default
+quotas, and the sign-in disclosure from the System page. Those values
+overlay environment variables via `GET`/`PUT /api/admin/settings`
+(`X-Votport` on PUT). Env remains the boot default; a written key wins;
+`""` disables a URL or token; JSON `null` ("Use environment") deletes the
+row so env applies again. See [`enterprise-ops.md`](enterprise-ops.md).
 
 ## Metrics
 

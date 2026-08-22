@@ -28,20 +28,23 @@
           <h1>Sign in</h1>
           <p class="sub">Issue and manage transfer requests.</p>
         </header>
-        <form id="login-form">
-          <label
-            >Administrator password
-            <input
-              type="password"
-              id="login-password"
-              autocomplete="current-password"
-              required
-            />
-          </label>
-          <button type="submit">Sign in</button>
-          <p class="error" id="login-error" hidden></p>
-        </form>
+        <details id="login-password-details" open>
+          <summary>Use local password</summary>
+          <form id="login-form">
+            <label
+              >Administrator password
+              <input
+                type="password"
+                id="login-password"
+                autocomplete="current-password"
+                required
+              />
+            </label>
+            <button type="submit">Sign in</button>
+          </form>
+        </details>
         <button id="login-sso" type="button" hidden>Sign in with SSO</button>
+        <p class="error" id="login-error" hidden></p>
       </section>
 
       <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>

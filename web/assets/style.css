@@ -337,6 +337,9 @@ label .muted::before {
 label .muted::after {
  content: ")";
 }
+label .muted:empty {
+ display: none;
+}
 
 input {
  display: block;
@@ -403,9 +406,22 @@ button:disabled {
 
 /* Primary actions in the narrow sheet span it; dashboard buttons stay inline. */
 #login-form button,
+#login-sso,
 #gate-form button,
 #send {
  width: 100%;
+}
+
+#login-password-details {
+ margin-bottom: 1rem;
+}
+
+input[type="checkbox"] {
+ display: inline-block;
+ width: auto;
+ margin: 0 0.55rem 0 0;
+ padding: 0;
+ vertical-align: middle;
 }
 
 button.ghost {

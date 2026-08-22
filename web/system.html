@@ -58,6 +58,161 @@
         <p class="error" id="password-error" hidden></p>
       </form>
 
+      <form id="notify-form" class="card">
+        <h2>Notifications</h2>
+        <div class="grid">
+          <label
+            >Webhook URL <span class="muted" id="notify-webhook-source"></span>
+            <input id="notify-webhook" placeholder="https://" />
+            <button type="button" class="ghost tiny" data-reset="notify_webhook">
+              Use environment
+            </button>
+          </label>
+          <label
+            >ntfy URL <span class="muted" id="notify-ntfy-source"></span>
+            <input id="notify-ntfy" placeholder="https://" />
+            <button type="button" class="ghost tiny" data-reset="notify_ntfy">
+              Use environment
+            </button>
+          </label>
+          <label
+            >ntfy token <span class="muted" id="notify-ntfy-token-source"></span>
+            <input id="notify-ntfy-token" type="password" autocomplete="off" />
+            <button type="button" class="ghost tiny" data-reset="notify_ntfy_token">
+              Use environment
+            </button>
+          </label>
+          <label
+            >Pushover token
+            <span class="muted" id="notify-pushover-token-source"></span>
+            <input id="notify-pushover-token" type="password" autocomplete="off" />
+            <button
+              type="button"
+              class="ghost tiny"
+              data-reset="notify_pushover_token"
+            >
+              Use environment
+            </button>
+          </label>
+          <label
+            >Pushover user
+            <span class="muted" id="notify-pushover-user-source"></span>
+            <input id="notify-pushover-user" autocomplete="off" />
+            <button
+              type="button"
+              class="ghost tiny"
+              data-reset="notify_pushover_user"
+            >
+              Use environment
+            </button>
+          </label>
+        </div>
+        <button type="submit">Save</button>
+        <span id="notify-note" class="muted"></span>
+        <p class="error" id="notify-error" hidden></p>
+      </form>
+
+      <form id="retention-form" class="card">
+        <h2>Retention</h2>
+        <div class="grid">
+          <label
+            >Audit log
+            <span class="muted">days, 0 is off</span>
+            <span class="muted" id="audit-retention-source"></span>
+            <input id="audit-retention-days" type="number" min="0" step="1" />
+            <button
+              type="button"
+              class="ghost tiny"
+              data-reset="audit_retention_days"
+            >
+              Use environment
+            </button>
+          </label>
+          <label
+            >Received files
+            <span class="muted">days, 0 is off</span>
+            <span class="muted" id="upload-retention-source"></span>
+            <input id="upload-retention-days" type="number" min="0" step="1" />
+            <button
+              type="button"
+              class="ghost tiny"
+              data-reset="upload_retention_days"
+            >
+              Use environment
+            </button>
+          </label>
+        </div>
+        <button type="submit">Save</button>
+        <span id="retention-note" class="muted"></span>
+        <p class="error" id="retention-error" hidden></p>
+      </form>
+
+      <form id="quotas-form" class="card">
+        <h2>Default quotas</h2>
+        <div class="grid">
+          <label
+            >Storage quota <span class="muted">GiB</span>
+            <span class="muted" id="default-max-total-source"></span>
+            <input id="default-max-total" type="number" min="1" placeholder="none" />
+            <button
+              type="button"
+              class="ghost tiny"
+              data-reset="default_max_total_bytes"
+            >
+              Use environment
+            </button>
+          </label>
+          <label
+            >Link limit <span class="muted">optional</span>
+            <span class="muted" id="default-max-links-source"></span>
+            <input id="default-max-links" type="number" min="1" placeholder="none" />
+            <button
+              type="button"
+              class="ghost tiny"
+              data-reset="default_max_links"
+            >
+              Use environment
+            </button>
+          </label>
+          <label
+            >Concurrent uploads <span class="muted">optional</span>
+            <span class="muted" id="default-max-sessions-source"></span>
+            <input
+              id="default-max-sessions"
+              type="number"
+              min="1"
+              placeholder="none"
+            />
+            <button
+              type="button"
+              class="ghost tiny"
+              data-reset="default_max_sessions"
+            >
+              Use environment
+            </button>
+          </label>
+        </div>
+        <button type="submit">Save</button>
+        <span id="quotas-note" class="muted"></span>
+        <p class="error" id="quotas-error" hidden></p>
+      </form>
+
+      <form id="signin-form" class="card">
+        <h2>Sign-in</h2>
+        <p class="muted">
+          The password form stays in the page behind a disclosure.
+          POST /api/admin/login always works. Without SSO the form stays
+          expanded.
+        </p>
+        <label
+          ><input type="checkbox" id="signin-collapse" />
+          Collapse the local password form when SSO is offered
+        </label>
+        <button type="submit">Save</button>
+        <span id="signin-note" class="muted"></span>
+        <p class="error" id="signin-error" hidden></p>
+      </form>
+
       <div class="card">
         <h2>Backups</h2>
         <p class="muted">
