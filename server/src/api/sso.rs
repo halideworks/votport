@@ -83,7 +83,7 @@ impl SsoClient {
     }
 }
 
-/// True when the token has no azp, or when azp equals the configured client id.
+// Present azp must match client_id so a second client at this issuer cannot act as us.
 fn azp_ok(azp: Option<&str>, client_id: &str) -> bool {
     match azp {
         None => true,

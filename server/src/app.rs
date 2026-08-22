@@ -1,6 +1,6 @@
 //! Application state and router assembly.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -40,7 +40,7 @@ const SSO_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Process-local OIDC client. Success is sticky; failure cools down 30s.
 pub struct SsoSlot<T = crate::api::sso::SsoClient> {
-    inner: tokio::sync::Mutex<SsoSlotState<T>>,
+    inner: Mutex<SsoSlotState<T>>,
 }
 
 enum SsoSlotState<T> {
@@ -48,6 +48,23 @@ enum SsoSlotState<T> {
     Discovering,
     Ready(Arc<T>),
     Failed { at: std::time::Instant },
+}
+
+/// If the claiming task is cancelled mid-await, Discovering would stick
+/// until restart. Drop records Failed so the next caller can retry.
+struct DiscoveringClaim<'a, T> {
+    slot: &'a SsoSlot<T>,
+}
+
+impl<T> Drop for DiscoveringClaim<'_, T> {
+    fn drop(&mut self) {
+        let mut guard = self.slot.inner.lock().expect("sso slot poisoned");
+        if matches!(*guard, SsoSlotState::Discovering) {
+            *guard = SsoSlotState::Failed {
+                at: std::time::Instant::now(),
+            };
+        }
+    }
 }
 
 impl<T> Default for SsoSlot<T> {
@@ -59,7 +76,7 @@ impl<T> Default for SsoSlot<T> {
 impl<T> SsoSlot<T> {
     pub fn new() -> Self {
         Self {
-            inner: tokio::sync::Mutex::new(SsoSlotState::Empty),
+            inner: Mutex::new(SsoSlotState::Empty),
         }
     }
 
@@ -71,15 +88,14 @@ impl<T> SsoSlot<T> {
             .unwrap_or(false)
     }
 
-    /// Clones the Arc and drops the mutex before any await so a slow IdP
-    /// cannot stall `sso_available`.
+    /// IdP await must not hold the slot lock.
     pub(crate) async fn get_or_discover_with<F, Fut>(&self, discover: F) -> Result<Arc<T>, ()>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T, String>>,
     {
         {
-            let mut guard = self.inner.lock().await;
+            let mut guard = self.inner.lock().expect("sso slot poisoned");
             match &*guard {
                 SsoSlotState::Ready(client) => return Ok(Arc::clone(client)),
                 SsoSlotState::Failed { at } if at.elapsed() < SSO_COOLDOWN => return Err(()),
@@ -90,9 +106,10 @@ impl<T> SsoSlot<T> {
             }
         }
 
+        let _claim = DiscoveringClaim { slot: self };
         let result = discover().await;
 
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.inner.lock().expect("sso slot poisoned");
         match result {
             Ok(client) => {
                 if let SsoSlotState::Ready(existing) = &*guard {
@@ -510,36 +527,37 @@ mod sso_slot_tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
-    async fn force_failed_at(slot: &SsoSlot<u8>, at: Instant) {
-        *slot.inner.lock().await = SsoSlotState::Failed { at };
+    fn force_failed_at(slot: &SsoSlot<u8>, at: Instant) {
+        *slot.inner.lock().expect("sso slot poisoned") = SsoSlotState::Failed { at };
+    }
+
+    fn past_cooldown() -> Option<Instant> {
+        Instant::now().checked_sub(SSO_COOLDOWN + Duration::from_secs(1))
     }
 
     #[tokio::test]
     async fn health_peek_is_true_only_for_ready() {
-        let slot = SsoSlot::<u8>::new();
-        assert!(!slot.health_peek());
+        let empty = SsoSlot::<u8>::new();
+        assert!(!empty.health_peek());
 
-        let _ = slot
+        let failed = SsoSlot::<u8>::new();
+        let _ = failed
             .get_or_discover_with(|| async { Err("down".to_owned()) })
             .await;
-        assert!(!slot.health_peek());
+        assert!(!failed.health_peek());
 
-        force_failed_at(
-            &slot,
-            Instant::now() - SSO_COOLDOWN - Duration::from_secs(1),
-        )
-        .await;
-        let client = slot
+        let ready = SsoSlot::<u8>::new();
+        let client = ready
             .get_or_discover_with(|| async { Ok(7u8) })
             .await
-            .expect("discover after cooldown");
+            .expect("discover");
         assert_eq!(*client, 7);
-        assert!(slot.health_peek());
+        assert!(ready.health_peek());
 
-        let guard = slot.inner.lock().await;
-        assert!(!slot.health_peek());
+        let guard = ready.inner.lock().expect("sso slot poisoned");
+        assert!(!ready.health_peek());
         drop(guard);
-        assert!(slot.health_peek());
+        assert!(ready.health_peek());
     }
 
     #[tokio::test]
@@ -581,11 +599,10 @@ mod sso_slot_tests {
     #[tokio::test]
     async fn elapsed_cooldown_retries_discovery() {
         let slot = SsoSlot::<u8>::new();
-        force_failed_at(
-            &slot,
-            Instant::now() - SSO_COOLDOWN - Duration::from_secs(1),
-        )
-        .await;
+        let Some(at) = past_cooldown() else {
+            return;
+        };
+        force_failed_at(&slot, at);
         let hits = Arc::new(AtomicU32::new(0));
         let result = slot
             .get_or_discover_with({
@@ -672,6 +689,74 @@ mod sso_slot_tests {
         let _ = release_tx.send(());
         let first = first.await.unwrap().expect("first discover");
         assert_eq!(*first, 7);
+        assert!(slot.health_peek());
+    }
+
+    #[tokio::test]
+    async fn cancelled_discover_does_not_stick_discovering() {
+        let slot = Arc::new(SsoSlot::<u8>::new());
+        let hits = Arc::new(AtomicU32::new(0));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let release_rx = std::sync::Mutex::new(Some(release_rx));
+
+        let slot_a = Arc::clone(&slot);
+        let hits_a = Arc::clone(&hits);
+        let first = tokio::spawn(async move {
+            slot_a
+                .get_or_discover_with(|| {
+                    let hits = Arc::clone(&hits_a);
+                    let entered_tx = entered_tx.lock().unwrap().take();
+                    let release_rx = release_rx.lock().unwrap().take();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        if let Some(tx) = entered_tx {
+                            let _ = tx.send(());
+                        }
+                        if let Some(rx) = release_rx {
+                            let _ = rx.await;
+                        }
+                        Ok(1u8)
+                    }
+                })
+                .await
+        });
+
+        entered_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        drop(release_tx);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let second = slot
+            .get_or_discover_with(|| {
+                let hits = Arc::clone(&hits);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Ok(2u8)
+                }
+            })
+            .await;
+        assert_eq!(second, Err(()));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let Some(at) = past_cooldown() else {
+            return;
+        };
+        force_failed_at(&slot, at);
+        let third = slot
+            .get_or_discover_with(|| {
+                let hits = Arc::clone(&hits);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Ok(3u8)
+                }
+            })
+            .await
+            .expect("retry after cancelled claim");
+        assert_eq!(*third, 3);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
         assert!(slot.health_peek());
     }
 }
