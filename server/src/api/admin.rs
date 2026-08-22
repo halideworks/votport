@@ -862,8 +862,9 @@ pub struct SwitchTenantRequest {
     tenant: String,
 }
 
-/// Switches the active tenant, reissuing the session cookie. Only grants
-/// already carried by the session are honored, so this cannot escalate.
+/// Switches the active tenant, reissuing the session cookie. SSO sessions
+/// honor grants already in the cookie; local sessions use live grants from
+/// `store.tenants()`.
 pub async fn switch_tenant(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -3110,5 +3111,31 @@ mod principals_api_tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn revoke_requires_csrf_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .upsert_sso_principal("user@example.com", &[], &json!([]))
+            .unwrap();
+        let cookie = platform_cookie(&application);
+        let (status, _, _) = send(
+            application.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/principals/revoke")
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"subject":"user@example.com"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let row = application.store.principal("user@example.com").unwrap();
+        assert!(!row.blocked);
+        assert_eq!(row.credential_version, 1);
     }
 }

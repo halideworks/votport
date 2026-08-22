@@ -91,19 +91,76 @@ fn azp_ok(azp: Option<&str>, client_id: &str) -> bool {
     }
 }
 
-/// Role from an optional required-group: no requirement means every
-/// authenticated principal is an admin; otherwise membership decides.
-/// Message `sso_callback` uses when the principal row is blocked.
+/// Error string for a blocked SSO principal.
 fn blocked_principal_error(blocked: bool) -> Option<&'static str> {
     blocked.then_some("this account is blocked")
 }
 
+/// Role from an optional required-group: no requirement means every
+/// authenticated principal is an admin; otherwise membership decides.
 fn sso_role(admin_group: Option<&str>, groups: &[String]) -> &'static str {
     match admin_group {
         None => "admin",
         Some(required) if groups.iter().any(|group| group == required) => "admin",
         Some(_) => "viewer",
     }
+}
+
+/// Builds the SSO session identity. Refuses the reserved break-glass subject
+/// and blocked principals. Records `sso_login` only after those checks pass.
+fn finish_sso_login(
+    store: &crate::store::Store,
+    subject: &str,
+    role: String,
+    groups: &[String],
+) -> Result<auth::AdminIdentity, &'static str> {
+    if subject == "local" {
+        return Err("identity could not be verified");
+    }
+    let mut grants = vec![auth::TenantGrant {
+        tenant: String::new(),
+        role: role.clone(),
+    }];
+    for tenant in store.tenants() {
+        let Some(required) = &tenant.admin_group else {
+            continue;
+        };
+        if groups.iter().any(|group| group == required) {
+            grants.push(auth::TenantGrant {
+                tenant: tenant.key.clone(),
+                role: "admin".to_owned(),
+            });
+        }
+    }
+    let grants_json = serde_json::to_value(&grants).unwrap_or_else(|_| json!([]));
+    let mut identity = auth::AdminIdentity {
+        subject: subject.to_owned(),
+        tenant: String::new(),
+        role: role.clone(),
+        grants,
+        credential_version: 1,
+    };
+    let row = match store.upsert_sso_principal(subject, groups, &grants_json) {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::error!(
+                target: "audit",
+                error = %error,
+                "principal upsert failed"
+            );
+            return Err("could not complete sign-in");
+        }
+    };
+    if let Some(message) = blocked_principal_error(row.blocked) {
+        return Err(message);
+    }
+    identity.credential_version = row.credential_version;
+    tracing::info!(
+        target: "audit", event = "sso_login", subject = %subject, %role,
+        "SSO sign-in succeeded"
+    );
+    store.audit("", subject, "sso_login", subject, &json!({ "role": role }));
+    Ok(identity)
 }
 
 #[derive(Deserialize)]
@@ -408,65 +465,10 @@ pub async fn sso_callback(
     }
 
     let role = sso_role(sso_config.0.admin_group.as_deref(), &groups).to_owned();
-    tracing::info!(
-        target: "audit", event = "sso_login", subject = %subject, %role,
-        "SSO sign-in succeeded"
-    );
-    // Login lands in the default tenant; switching happens post-login.
-    app.store.audit(
-        "",
-        &subject,
-        "sso_login",
-        &subject,
-        &json!({ "role": role }),
-    );
-
-    // Grant set: the default tenant (role from the global admin group),
-    // plus every named tenant whose admin group the principal belongs to.
-    let mut grants = vec![auth::TenantGrant {
-        tenant: String::new(),
-        role: role.clone(),
-    }];
-    for tenant in app.store.tenants() {
-        let Some(required) = &tenant.admin_group else {
-            continue;
-        };
-        if groups.iter().any(|group| group == required) {
-            grants.push(auth::TenantGrant {
-                tenant: tenant.key.clone(),
-                role: "admin".to_owned(),
-            });
-        }
-    }
-    let mut identity = auth::AdminIdentity {
-        subject: subject.clone(),
-        tenant: String::new(),
-        role,
-        grants,
-        credential_version: 1,
+    let identity = match finish_sso_login(&app.store, &subject, role, &groups) {
+        Ok(identity) => identity,
+        Err(message) => return home(message),
     };
-    if subject != "local" {
-        let grants_json = serde_json::to_value(&identity.grants).unwrap_or_else(|_| json!([]));
-        match app
-            .store
-            .upsert_sso_principal(&subject, &groups, &grants_json)
-        {
-            Ok(row) => {
-                if let Some(message) = blocked_principal_error(row.blocked) {
-                    return home(message);
-                }
-                identity.credential_version = row.credential_version;
-            }
-            Err(error) => {
-                tracing::error!(
-                    target: "audit",
-                    error = %error,
-                    "principal upsert failed"
-                );
-                return home("could not complete sign-in");
-            }
-        }
-    }
     let admin_cookie = super::admin::issue_admin_cookie(&app, &identity);
     let clear_state =
         format!("{STATE_COOKIE}=; Path=/api/admin; HttpOnly; SameSite=Lax; Max-Age=0");
@@ -670,5 +672,46 @@ mod tests {
             blocked_principal_error(true),
             Some("this account is blocked")
         );
+    }
+
+    fn test_store() -> (tempfile::TempDir, crate::store::Store) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(directory.path()).unwrap();
+        (directory, store)
+    }
+
+    fn sso_login_events(store: &crate::store::Store) -> Vec<String> {
+        store
+            .audit_export("", 0, 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.event == "sso_login")
+            .map(|row| row.subject)
+            .collect()
+    }
+
+    #[test]
+    fn reserved_sub_is_not_issued() {
+        let (_directory, store) = test_store();
+        let error = finish_sso_login(&store, "local", "admin".to_owned(), &[]).unwrap_err();
+        assert_eq!(error, "identity could not be verified");
+        assert!(store.principal("local").is_none());
+        assert!(sso_login_events(&store).is_empty());
+    }
+
+    #[test]
+    fn blocked_sign_in_is_not_audited_as_sso_login() {
+        let (_directory, store) = test_store();
+        store
+            .upsert_sso_principal("user@example.com", &[], &json!([]))
+            .unwrap();
+        store.revoke_principal("user@example.com").unwrap();
+        let error =
+            finish_sso_login(&store, "user@example.com", "admin".to_owned(), &[]).unwrap_err();
+        assert_eq!(error, "this account is blocked");
+        assert!(sso_login_events(&store).is_empty());
+        let issued = finish_sso_login(&store, "ok@example.com", "viewer".to_owned(), &[]).unwrap();
+        assert_eq!(issued.subject, "ok@example.com");
+        assert_eq!(sso_login_events(&store), vec!["ok@example.com".to_owned()]);
     }
 }
