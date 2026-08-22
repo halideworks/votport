@@ -190,7 +190,7 @@ curl -b cookies.txt -X POST -H 'Content-Type: application/json' \
 
 ## Settings
 
-Default-tenant admins edit notification URLs, retention days, default
+Default-tenant admins edit notification URLs, SMTP, retention days, default
 quotas, and the sign-in disclosure from the System page. Those values
 overlay environment variables via `GET`/`PUT /api/admin/settings`
 (`X-Votport` on PUT). Env remains the boot default; a written key wins;

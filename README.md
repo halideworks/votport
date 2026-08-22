@@ -92,6 +92,13 @@ Everything is environment variables (see `docker-compose.yml`):
 | `VOTPORT_NOTIFY_NTFY_TOKEN` | — | Bearer token for the ntfy topic, if it needs one. |
 | `VOTPORT_NOTIFY_PUSHOVER_TOKEN` | — | Pushover application token (set together with the user key). |
 | `VOTPORT_NOTIFY_PUSHOVER_USER` | — | Pushover application token (set together with the user key). |
+| `VOTPORT_NOTIFY_SMTP_HOST` | — | SMTP host. The channel is inert unless host, from, and at least one `to` all resolve. |
+| `VOTPORT_NOTIFY_SMTP_PORT` | `587` | SMTP port. Port 465 uses implicit TLS. |
+| `VOTPORT_NOTIFY_SMTP_STARTTLS` | on | SMTP STARTTLS. Off only when `0`. Port 465 uses implicit TLS regardless. |
+| `VOTPORT_NOTIFY_SMTP_USERNAME` | — | Optional SMTP AUTH username. |
+| `VOTPORT_NOTIFY_SMTP_PASSWORD` | — | Optional SMTP AUTH password. |
+| `VOTPORT_NOTIFY_SMTP_FROM` | — | SMTP From address (required with host and `to`). |
+| `VOTPORT_NOTIFY_SMTP_TO` | — | Comma-separated SMTP recipients (at least one required with host and from). |
 | `VOTPORT_AUDIT_RETENTION_DAYS` | `400` | Days to keep queryable audit rows; `0` disables pruning. Overridable via `PUT /api/admin/settings`. |
 | `VOTPORT_UPLOAD_RETENTION_DAYS` | off | Days to keep received files and their records; a daily sweep deletes expired content and audits it. `0` (default) keeps everything. Overridable via `PUT /api/admin/settings`. |
 | `VOTPORT_DEFAULT_MAX_TOTAL_BYTES` | unlimited | Fills a new tenant's byte quota when the request omits it, and caps received bytes on the unnamed default tenant. Named tenants keep the quota on their row. |
