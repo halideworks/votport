@@ -2050,45 +2050,6 @@ mod settings_tests {
         assert!(store.principals().is_empty());
         assert!(store.principal("nobody").is_none());
     }
-}
-
-#[cfg(test)]
-mod principals_store_tests {
-    use super::*;
-
-    #[test]
-    fn upsert_revoke_unblock_preserve_version() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        let grants = serde_json::json!([{"tenant":"","role":"admin"}]);
-        let row = store
-            .upsert_sso_principal("user@example.com", &["employees".to_owned()], &grants)
-            .unwrap();
-        assert_eq!(row.credential_version, 1);
-        assert!(!row.blocked);
-        assert_eq!(row.last_groups, vec!["employees".to_owned()]);
-        assert_eq!(row.source, "sso");
-        assert!(store.principal_allows("user@example.com", 1));
-        assert!(!store.principal_allows("user@example.com", 2));
-        assert!(store.principal_allows("missing", 1));
-        assert!(!store.principal_allows("missing", 2));
-
-        assert!(store.revoke_principal("user@example.com").unwrap());
-        let revoked = store.principal("user@example.com").unwrap();
-        assert_eq!(revoked.credential_version, 2);
-        assert!(revoked.blocked);
-        assert!(!store.principal_allows("user@example.com", 1));
-        assert!(!store.principal_allows("user@example.com", 2));
-
-        assert!(store.unblock_principal("user@example.com").unwrap());
-        let unblocked = store.principal("user@example.com").unwrap();
-        assert_eq!(unblocked.credential_version, 2);
-        assert!(!unblocked.blocked);
-        assert!(store.principal_allows("user@example.com", 2));
-        assert!(!store.principal_allows("user@example.com", 1));
-        assert!(!store.revoke_principal("missing").unwrap());
-        assert!(!store.unblock_principal("missing").unwrap());
-    }
 
     #[test]
     fn smtp_is_none_without_host() {
@@ -2151,5 +2112,44 @@ mod principals_store_tests {
         let overlay = store.overlay(&test_config());
         assert_eq!(overlay.smtp_port, 587);
         assert_eq!(overlay.smtp_port_source, "env");
+    }
+}
+
+#[cfg(test)]
+mod principals_store_tests {
+    use super::*;
+
+    #[test]
+    fn upsert_revoke_unblock_preserve_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let grants = serde_json::json!([{"tenant":"","role":"admin"}]);
+        let row = store
+            .upsert_sso_principal("user@example.com", &["employees".to_owned()], &grants)
+            .unwrap();
+        assert_eq!(row.credential_version, 1);
+        assert!(!row.blocked);
+        assert_eq!(row.last_groups, vec!["employees".to_owned()]);
+        assert_eq!(row.source, "sso");
+        assert!(store.principal_allows("user@example.com", 1));
+        assert!(!store.principal_allows("user@example.com", 2));
+        assert!(store.principal_allows("missing", 1));
+        assert!(!store.principal_allows("missing", 2));
+
+        assert!(store.revoke_principal("user@example.com").unwrap());
+        let revoked = store.principal("user@example.com").unwrap();
+        assert_eq!(revoked.credential_version, 2);
+        assert!(revoked.blocked);
+        assert!(!store.principal_allows("user@example.com", 1));
+        assert!(!store.principal_allows("user@example.com", 2));
+
+        assert!(store.unblock_principal("user@example.com").unwrap());
+        let unblocked = store.principal("user@example.com").unwrap();
+        assert_eq!(unblocked.credential_version, 2);
+        assert!(!unblocked.blocked);
+        assert!(store.principal_allows("user@example.com", 2));
+        assert!(!store.principal_allows("user@example.com", 1));
+        assert!(!store.revoke_principal("missing").unwrap());
+        assert!(!store.unblock_principal("missing").unwrap());
     }
 }
