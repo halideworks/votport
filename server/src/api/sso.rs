@@ -93,6 +93,11 @@ fn azp_ok(azp: Option<&str>, client_id: &str) -> bool {
 
 /// Role from an optional required-group: no requirement means every
 /// authenticated principal is an admin; otherwise membership decides.
+/// Message `sso_callback` uses when the principal row is blocked.
+fn blocked_principal_error(blocked: bool) -> Option<&'static str> {
+    blocked.then_some("this account is blocked")
+}
+
 fn sso_role(admin_group: Option<&str>, groups: &[String]) -> &'static str {
     match admin_group {
         None => "admin",
@@ -433,12 +438,35 @@ pub async fn sso_callback(
             });
         }
     }
-    let identity = auth::AdminIdentity {
-        subject,
+    let mut identity = auth::AdminIdentity {
+        subject: subject.clone(),
         tenant: String::new(),
         role,
         grants,
+        credential_version: 1,
     };
+    if subject != "local" {
+        let grants_json = serde_json::to_value(&identity.grants).unwrap_or_else(|_| json!([]));
+        match app
+            .store
+            .upsert_sso_principal(&subject, &groups, &grants_json)
+        {
+            Ok(row) => {
+                if let Some(message) = blocked_principal_error(row.blocked) {
+                    return home(message);
+                }
+                identity.credential_version = row.credential_version;
+            }
+            Err(error) => {
+                tracing::error!(
+                    target: "audit",
+                    error = %error,
+                    "principal upsert failed"
+                );
+                return home("could not complete sign-in");
+            }
+        }
+    }
     let admin_cookie = super::admin::issue_admin_cookie(&app, &identity);
     let clear_state =
         format!("{STATE_COOKIE}=; Path=/api/admin; HttpOnly; SameSite=Lax; Max-Age=0");
@@ -615,6 +643,7 @@ mod tests {
             subject: "user@example.com".to_owned(),
             tenant: "acme".to_owned(),
             role: "viewer".to_owned(),
+            credential_version: 1,
         };
         let token = auth::issue_admin_token(&secret, &identity, "version-1");
         let verified = auth::verify_admin_token(&secret, "version-1", &token).unwrap();
@@ -632,5 +661,14 @@ mod tests {
         let swapped = token.replace(&hex::encode("user@example.com"), &hex::encode("other"));
         assert!(auth::verify_admin_token(&secret, "version-1", &swapped).is_none());
         drop(token_b);
+    }
+
+    #[test]
+    fn blocked_subject_helper_matches_callback() {
+        assert_eq!(blocked_principal_error(false), None);
+        assert_eq!(
+            blocked_principal_error(true),
+            Some("this account is blocked")
+        );
     }
 }

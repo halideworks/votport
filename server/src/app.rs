@@ -281,6 +281,11 @@ pub fn router(app: Arc<App>) -> Router {
             axum::routing::patch(api::update_tenant).delete(api::delete_tenant),
         )
         .route("/api/admin/tenant", post(api::switch_tenant))
+        .route("/api/admin/principals/revoke", post(api::revoke_principal))
+        .route(
+            "/api/admin/principals/unblock",
+            post(api::unblock_principal),
+        )
         .route("/api/admin/password", post(api::admin_change_password))
         .route(
             "/api/admin/links",

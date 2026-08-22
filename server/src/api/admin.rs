@@ -36,12 +36,48 @@ fn require_admin(app: &App, headers: &HeaderMap) -> ApiResult<auth::AdminIdentit
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
         .and_then(|cookies| auth::cookie_value(cookies, ADMIN_COOKIE));
-    auth::verify_admin_token(
+    let mut identity = auth::verify_admin_token(
         &app.secret,
         &admin_token_phc(app),
         token.unwrap_or_default(),
     )
-    .ok_or_else(ApiError::unauthorized)
+    .ok_or_else(ApiError::unauthorized)?;
+    if identity.subject != "local"
+        && !app
+            .store
+            .principal_allows(&identity.subject, identity.credential_version)
+    {
+        return Err(ApiError::unauthorized());
+    }
+    if identity.subject == "local" {
+        identity.grants = local_admin_grants(app);
+        if !identity
+            .grants
+            .iter()
+            .any(|grant| grant.tenant == identity.tenant)
+        {
+            identity.tenant = String::new();
+            identity.role = "admin".to_owned();
+        }
+    }
+    Ok(identity)
+}
+
+fn local_admin_grants(app: &App) -> Vec<auth::TenantGrant> {
+    let mut grants = vec![auth::TenantGrant {
+        tenant: String::new(),
+        role: "admin".to_owned(),
+    }];
+    grants.extend(
+        app.store
+            .tenants()
+            .into_iter()
+            .map(|tenant| auth::TenantGrant {
+                tenant: tenant.key,
+                role: "admin".to_owned(),
+            }),
+    );
+    grants
 }
 
 /// Default-tenant admin only. Same gate as database backup: viewers and
@@ -307,7 +343,74 @@ pub async fn list_tenants(
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     let _identity = require_platform_admin(&app, &headers)?;
-    Ok(Json(json!({ "tenants": app.store.tenants() })))
+    Ok(Json(json!({
+        "tenants": app.store.tenants(),
+        "principals": app.store.principals(),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct PrincipalSubjectRequest {
+    subject: String,
+}
+
+pub async fn revoke_principal(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(request): Json<PrincipalSubjectRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_platform_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
+    mutate_principal(&app, &identity.subject, &request.subject, true)
+}
+
+pub async fn unblock_principal(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(request): Json<PrincipalSubjectRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_platform_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
+    mutate_principal(&app, &identity.subject, &request.subject, false)
+}
+
+fn mutate_principal(
+    app: &App,
+    actor: &str,
+    subject: &str,
+    revoke: bool,
+) -> ApiResult<Json<serde_json::Value>> {
+    let subject = subject.trim();
+    if subject.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subject is required",
+        ));
+    }
+    if subject == "local" {
+        let action = if revoke { "revoke" } else { "unblock" };
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("cannot {action} the local administrator"),
+        ));
+    }
+    let changed = if revoke {
+        app.store.revoke_principal(subject)
+    } else {
+        app.store.unblock_principal(subject)
+    }
+    .map_err(ApiError::internal)?;
+    if !changed {
+        return Err(ApiError::not_found());
+    }
+    let event = if revoke {
+        "principal_revoked"
+    } else {
+        "principal_unblocked"
+    };
+    tracing::info!(target: "audit", event, subject = %subject, "principal updated");
+    app.store.audit("", actor, event, subject, &json!({}));
+    Ok(Json(json!({ "ok": true })))
 }
 
 pub async fn delete_tenant(
@@ -780,6 +883,7 @@ pub async fn switch_tenant(
     let switched = auth::AdminIdentity {
         tenant: grant.tenant.clone(),
         role: grant.role.clone(),
+        credential_version: identity.credential_version,
         grants: identity.grants.clone(),
         subject: identity.subject.clone(),
     };
@@ -1441,6 +1545,7 @@ mod tenant_authz_tests {
                 tenant: tenant.to_owned(),
                 role: role.to_owned(),
             }],
+            credential_version: 1,
         };
         format!(
             "votport_admin={}; Path=/",
@@ -2149,6 +2254,7 @@ mod settings_api_tests {
                 tenant: tenant.to_owned(),
                 role: role.to_owned(),
             }],
+            credential_version: 1,
         };
         format!(
             "votport_admin={}; Path=/",
@@ -2560,5 +2666,449 @@ mod settings_api_tests {
             .unwrap();
         let resolved = application.store.resolved_settings(&application.config);
         assert_eq!(resolved.audit_retention_days, 400);
+    }
+}
+
+#[cfg(test)]
+mod principals_api_tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt;
+
+    use crate::api::testing;
+    use crate::app;
+    use crate::auth::{self, TenantGrant};
+
+    fn cookie_for(app: &App, identity: auth::AdminIdentity) -> String {
+        format!(
+            "votport_admin={}; Path=/",
+            auth::issue_admin_token(&app.secret, &identity, &admin_token_phc(app))
+        )
+    }
+
+    fn sso_identity(subject: &str, cv: u64) -> auth::AdminIdentity {
+        auth::AdminIdentity {
+            subject: subject.to_owned(),
+            tenant: String::new(),
+            role: "admin".to_owned(),
+            grants: vec![TenantGrant {
+                tenant: String::new(),
+                role: "admin".to_owned(),
+            }],
+            credential_version: cv,
+        }
+    }
+
+    fn cookie_without_cv(app: &App, subject: &str) -> String {
+        let payload = serde_json::json!({
+            "subject": subject,
+            "tenant": "",
+            "role": "admin",
+            "grants": []
+        })
+        .to_string();
+        format!(
+            "votport_admin={}; Path=/",
+            auth::issue_admin_token_from_payload(&app.secret, &payload, &admin_token_phc(app))
+        )
+    }
+
+    fn platform_cookie(app: &App) -> String {
+        cookie_for(app, auth::AdminIdentity::local_admin())
+    }
+
+    fn cookie_token(set_cookie: &str) -> &str {
+        set_cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .strip_prefix("votport_admin=")
+            .unwrap()
+    }
+
+    fn payload_cv(set_cookie: &str) -> u64 {
+        let token = cookie_token(set_cookie);
+        let payload_hex = token.split('.').nth(1).unwrap();
+        let payload = hex::decode(payload_hex).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        json["cv"].as_u64().unwrap()
+    }
+
+    async fn send(
+        application: Arc<App>,
+        request: Request<Body>,
+    ) -> (StatusCode, serde_json::Value, Option<String>) {
+        let response = app::router(application).oneshot(request).await.unwrap();
+        let status = response.status();
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+        (status, json, cookie)
+    }
+
+    fn insert_acme(application: &App) {
+        application
+            .store
+            .insert_tenant(crate::store::Tenant {
+                key: "acme".to_owned(),
+                label: String::new(),
+                admin_group: None,
+                max_total_bytes: None,
+                max_links: None,
+                max_sessions: None,
+                created_at: 0,
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn payload_without_cv_still_verifies_when_no_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = cookie_without_cv(&application, "user@example.com");
+        let (status, json, _) = send(
+            application,
+            Request::get("/api/admin/session")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn missing_row_with_cv_2_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = cookie_for(&application, sso_identity("user@example.com", 2));
+        let (status, _, _) = send(
+            application,
+            Request::get("/api/admin/session")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cv_1_against_row_2_fails_require_admin() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .upsert_sso_principal("user@example.com", &[], &json!([]))
+            .unwrap();
+        application
+            .store
+            .revoke_principal("user@example.com")
+            .unwrap();
+        let cookie = cookie_for(&application, sso_identity("user@example.com", 1));
+        let (status, _, _) = send(
+            application,
+            Request::get("/api/admin/session")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn revoke_then_unblock_then_live_version_passes() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .upsert_sso_principal("user@example.com", &[], &json!([]))
+            .unwrap();
+        let platform = platform_cookie(&application);
+        let (status, _, _) = send(
+            application.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/principals/revoke")
+                .header("cookie", &platform)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"subject":"user@example.com"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let stale = cookie_for(&application, sso_identity("user@example.com", 1));
+        let (status, _, _) = send(
+            application.clone(),
+            Request::get("/api/admin/session")
+                .header("cookie", &stale)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, _, _) = send(
+            application.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/principals/unblock")
+                .header("cookie", &platform)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"subject":"user@example.com"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _, _) = send(
+            application.clone(),
+            Request::get("/api/admin/session")
+                .header("cookie", &stale)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let live = application
+            .store
+            .principal("user@example.com")
+            .unwrap()
+            .credential_version;
+        assert_eq!(live, 2);
+        let cookie = cookie_for(&application, sso_identity("user@example.com", live));
+        let (status, json, _) = send(
+            application,
+            Request::get("/api/admin/session")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn switch_tenant_reissues_the_same_cv() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        insert_acme(&application);
+        application
+            .store
+            .upsert_sso_principal("user@example.com", &[], &json!([]))
+            .unwrap();
+        application
+            .store
+            .revoke_principal("user@example.com")
+            .unwrap();
+        application
+            .store
+            .unblock_principal("user@example.com")
+            .unwrap();
+        let mut identity = sso_identity("user@example.com", 2);
+        identity.grants.push(TenantGrant {
+            tenant: "acme".to_owned(),
+            role: "admin".to_owned(),
+        });
+        let cookie = cookie_for(&application, identity);
+        let (status, _, set_cookie) = send(
+            application,
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/tenant")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"tenant":"acme"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let set_cookie = set_cookie.expect("switch reissues a cookie");
+        assert_eq!(payload_cv(&set_cookie), 2);
+    }
+
+    #[tokio::test]
+    async fn local_identity_sees_named_tenant_grants() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        insert_acme(&application);
+        let cookie = platform_cookie(&application);
+        let (status, json, _) = send(
+            application.clone(),
+            Request::get("/api/admin/session")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let grants = json["grants"].as_array().unwrap();
+        assert!(
+            grants
+                .iter()
+                .any(|grant| grant["tenant"] == "acme" && grant["role"] == "admin"),
+            "grants were {grants:?}"
+        );
+        let (status, _, _) = send(
+            application,
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/tenant")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"tenant":"acme"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn upsert_then_list_tenants_contains_the_subject() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .upsert_sso_principal(
+                "user@example.com",
+                &["employees".to_owned()],
+                &json!([{"tenant":"","role":"viewer"}]),
+            )
+            .unwrap();
+        let cookie = platform_cookie(&application);
+        let (status, json, _) = send(
+            application,
+            Request::get("/api/admin/tenants")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let principals = json["principals"].as_array().unwrap();
+        assert_eq!(principals.len(), 1);
+        assert_eq!(principals[0]["subject"], "user@example.com");
+        assert_eq!(principals[0]["blocked"], false);
+        assert_eq!(principals[0]["credential_version"], 1);
+        assert_eq!(principals[0]["last_groups"][0], "employees");
+        assert_eq!(principals[0]["source"], "sso");
+    }
+
+    #[tokio::test]
+    async fn named_tenant_admin_cannot_revoke() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .upsert_sso_principal("user@example.com", &[], &json!([]))
+            .unwrap();
+        let cookie = cookie_for(
+            &application,
+            auth::AdminIdentity {
+                subject: "sso:acme".to_owned(),
+                tenant: "acme".to_owned(),
+                role: "admin".to_owned(),
+                grants: vec![TenantGrant {
+                    tenant: "acme".to_owned(),
+                    role: "admin".to_owned(),
+                }],
+                credential_version: 1,
+            },
+        );
+        let (status, _, _) = send(
+            application,
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/principals/revoke")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"subject":"user@example.com"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn viewer_cannot_list_principals() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .upsert_sso_principal("user@example.com", &[], &json!([]))
+            .unwrap();
+        let cookie = cookie_for(
+            &application,
+            auth::AdminIdentity {
+                subject: "sso:viewer".to_owned(),
+                tenant: String::new(),
+                role: "viewer".to_owned(),
+                grants: vec![TenantGrant {
+                    tenant: String::new(),
+                    role: "viewer".to_owned(),
+                }],
+                credential_version: 1,
+            },
+        );
+        let (status, json, _) = send(
+            application,
+            Request::get("/api/admin/tenants")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(json.get("principals").is_none());
+    }
+
+    #[tokio::test]
+    async fn revoke_refuses_local_and_unknown() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = platform_cookie(&application);
+        let (status, _, _) = send(
+            application.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/principals/revoke")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"subject":"local"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let (status, _, _) = send(
+            application,
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/principals/revoke")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"subject":"missing@example.com"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

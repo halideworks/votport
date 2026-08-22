@@ -165,6 +165,29 @@ default-tenant link has `dest` equal to that key or prefixed by `key/`;
 otherwise DELETE returns 409 and leaves the folder (a default-tenant dest
 of the same name lives at the receive root).
 
+The local platform password is break-glass for every namespace; named
+tenants have no separate password.
+
+### Principals
+
+SSO sign-in records the principal on `/tenants`. Kick someone (current
+sessions die; further SSO is refused until you unblock):
+
+```sh
+curl -b cookies.txt -X POST -H 'Content-Type: application/json' \
+     -H 'X-Votport: 1' https://YOUR-HOST/api/admin/principals/revoke \
+     -d '{"subject":"user@example.com"}'
+```
+
+Unblock does not restore old cookies; they must sign in again. Lasting
+revoke is removing the IdP group.
+
+```sh
+curl -b cookies.txt -X POST -H 'Content-Type: application/json' \
+     -H 'X-Votport: 1' https://YOUR-HOST/api/admin/principals/unblock \
+     -d '{"subject":"user@example.com"}'
+```
+
 ## Settings
 
 Default-tenant admins edit notification URLs, retention days, default

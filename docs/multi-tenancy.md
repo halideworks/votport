@@ -123,7 +123,7 @@ also inserted into `audit_log(at, tenant, actor, event, subject, detail_json)`.
 | Audit tampering | Audit rows are insert-only from the request path; no admin route deletes them; retention prune is the only writer |
 | Cross-tenant noisy-neighbor DoS | Today's `IpThrottle`, `SessionRate`, and session caps are shared buckets; phase 4 adds per-tenant throttle buckets and per-tenant session caps alongside them |
 | Tenant offboarding and erasure | Pin on the Sessions mutex so `insert` fails; register then spawn; drop the tenant row so fail-closed applies; purge `<receive>/<tenant>/` via `join_under`; emit `tenant_deleted` with `purged_receive`. DELETE on an absent key is leftover retry only when the directory exists and no default-tenant dest collides; unknown key with no dir is 404. Snapshots under `data/backups/` (30-day sweep) and Litestream replicas retain rows until they rotate; `/received` file backups retain bytes until they rotate. See `docs/deployment.md`. |
-| OIDC provider outage | Local break-glass account per tenant, created at first boot, password rotated on first login |
+| OIDC provider outage | One platform local password (`AdminIdentity::local_admin`). `require_admin` expands its grants to every named tenant. Named tenants have no separate password. The public password form may be collapsed behind a disclosure that stays in the DOM once the operator prefers SSO; `POST /api/admin/login` remains the break-glass path. `sso_healthy` does not remove that disclosure. |
 
 ## Non-goals
 

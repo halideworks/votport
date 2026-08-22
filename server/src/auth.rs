@@ -118,6 +118,10 @@ pub struct TenantGrant {
     pub role: String,
 }
 
+fn cv_one() -> u64 {
+    1
+}
+
 /// The principal an admin session cookie stands for: who, which tenants it
 /// may act in, and the one it is currently acting in. Local sign-ins use the
 /// default tenant.
@@ -131,6 +135,8 @@ pub struct AdminIdentity {
     /// Every (tenant, role) this principal may switch into.
     #[serde(default)]
     pub grants: Vec<TenantGrant>,
+    #[serde(rename = "cv", default = "cv_one")]
+    pub credential_version: u64,
 }
 
 impl AdminIdentity {
@@ -143,18 +149,13 @@ impl AdminIdentity {
                 tenant: String::new(),
                 role: "admin".to_owned(),
             }],
+            credential_version: 1,
         }
     }
 }
 
 fn identity_payload(id: &AdminIdentity) -> String {
-    serde_json::json!({
-        "subject": id.subject,
-        "tenant": id.tenant,
-        "role": id.role,
-        "grants": id.grants,
-    })
-    .to_string()
+    serde_json::to_string(id).expect("AdminIdentity is serde-json")
 }
 
 fn admin_mac(secret: &[u8; 32], payload: &str, version: &str, expires: u64, nonce: &str) -> String {
@@ -209,6 +210,19 @@ pub fn verify_admin_token(secret: &[u8; 32], version: &str, token: &str) -> Opti
         return None;
     }
     serde_json::from_str(&payload).ok()
+}
+
+#[cfg(test)]
+pub fn issue_admin_token_from_payload(secret: &[u8; 32], payload: &str, version: &str) -> String {
+    let expires = now_unix() + ADMIN_SESSION_SECS;
+    let nonce = random_token();
+    let mac = admin_mac(secret, payload, version, expires, &nonce);
+    format!(
+        "{expires}.{}.{}.{}",
+        hex::encode(payload.as_bytes()),
+        nonce,
+        mac
+    )
 }
 
 const LINK_SESSION_SECS: u64 = 30 * 24 * 3600;
@@ -363,4 +377,26 @@ pub fn cookie_value<'header>(header: &'header str, name: &str) -> Option<&'heade
         let (key, value) = pair.trim().split_once('=')?;
         (key == name).then_some(value)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payload_without_cv_deserializes_as_one() {
+        let secret = [3u8; 32];
+        let payload = serde_json::json!({
+            "subject": "user@example.com",
+            "tenant": "",
+            "role": "admin",
+            "grants": []
+        })
+        .to_string();
+        let token = issue_admin_token_from_payload(&secret, &payload, "v");
+        let identity = verify_admin_token(&secret, "v", &token).unwrap();
+        assert_eq!(identity.credential_version, 1);
+        assert_eq!(identity.subject, "user@example.com");
+        assert!(!payload.contains("cv"));
+    }
 }

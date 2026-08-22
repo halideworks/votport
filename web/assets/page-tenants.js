@@ -75,8 +75,83 @@ function renderTenant(tenant) {
   return card;
 }
 
+function grantText(grants) {
+  if (!Array.isArray(grants) || !grants.length) return 'no grants';
+  return grants
+    .map((grant) => `${grant.tenant === '' ? 'default' : grant.tenant}/${grant.role}`)
+    .join(', ');
+}
+
+function renderPrincipal(principal) {
+  const card = document.createElement('div');
+  card.className = 'card link-item';
+
+  const head = document.createElement('div');
+  head.className = 'head';
+  const title = document.createElement('h3');
+  title.textContent = principal.subject;
+  const badge = document.createElement('span');
+  badge.className = principal.blocked ? 'badge off' : 'badge on';
+  badge.textContent = principal.blocked ? 'blocked' : 'active';
+  head.append(title, badge);
+  card.append(head);
+
+  const meta = document.createElement('p');
+  meta.className = 'muted';
+  const login = principal.last_login_at
+    ? `last sign-in ${formatWhen(principal.last_login_at)}`
+    : 'never signed in';
+  const groups = Array.isArray(principal.last_groups) && principal.last_groups.length
+    ? `groups: ${principal.last_groups.join(', ')}`
+    : 'no groups';
+  meta.textContent = [login, groups, grantText(principal.grants)].join(' · ');
+  card.append(meta);
+
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+  if (principal.blocked) {
+    actions.append(
+      button('Unblock', 'tiny', async () => {
+        if (
+          !(await confirmModal(
+            'Unblock principal',
+            'They can sign in with SSO again. Old sessions stay dead. Lasting access still depends on the IdP group.',
+            'Unblock',
+          ))
+        )
+          return;
+        await api('/api/admin/principals/unblock', {
+          method: 'POST',
+          body: JSON.stringify({ subject: principal.subject }),
+        });
+        await refreshTenants();
+      }),
+    );
+  } else {
+    actions.append(
+      button('Revoke', 'tiny danger', async () => {
+        if (
+          !(await confirmModal(
+            'Revoke principal',
+            'Kicks current sessions and refuses SSO until unblocked; remove the IdP group to make it stick.',
+            'Revoke',
+          ))
+        )
+          return;
+        await api('/api/admin/principals/revoke', {
+          method: 'POST',
+          body: JSON.stringify({ subject: principal.subject }),
+        });
+        await refreshTenants();
+      }),
+    );
+  }
+  card.append(actions);
+  return card;
+}
+
 async function refreshTenants() {
-  const { tenants } = await api('/api/admin/tenants');
+  const { tenants, principals } = await api('/api/admin/tenants');
   const container = $('tenants');
   container.replaceChildren();
   if (!tenants.length) {
@@ -84,10 +159,23 @@ async function refreshTenants() {
     empty.className = 'muted';
     empty.textContent = 'No named tenants yet.';
     container.append(empty);
+  } else {
+    for (const tenant of tenants) {
+      container.append(renderTenant(tenant));
+    }
+  }
+
+  const list = $('principals');
+  list.replaceChildren();
+  if (!principals || !principals.length) {
+    const empty = document.createElement('p');
+    empty.className = 'muted';
+    empty.textContent = 'No SSO principals have signed in yet.';
+    list.append(empty);
     return;
   }
-  for (const tenant of tenants) {
-    container.append(renderTenant(tenant));
+  for (const principal of principals) {
+    list.append(renderPrincipal(principal));
   }
 }
 

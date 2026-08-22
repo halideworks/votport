@@ -135,6 +135,19 @@ impl Tenant {
     }
 }
 
+/// An SSO principal recorded at last successful sign-in.
+#[derive(Clone, Debug, Serialize)]
+pub struct Principal {
+    pub subject: String,
+    pub blocked: bool,
+    pub credential_version: u64,
+    pub last_login_at: u64,
+    pub last_groups: Vec<String>,
+    #[serde(rename = "grants")]
+    pub last_grants: serde_json::Value,
+    pub source: String,
+}
+
 /// One settings PUT: write TEXT (including empty disable) or delete the row.
 #[derive(Clone, Debug)]
 pub enum SettingWrite {
@@ -187,7 +200,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-const SCHEMA_VERSION: u64 = 4;
+const SCHEMA_VERSION: u64 = 5;
 
 const SETTINGS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS settings (
@@ -195,6 +208,18 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL,
     updated_at INTEGER NOT NULL,
     updated_by TEXT NOT NULL DEFAULT ''
+);
+";
+
+const PRINCIPALS_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS principals (
+    subject TEXT PRIMARY KEY,
+    credential_version INTEGER NOT NULL DEFAULT 1,
+    blocked INTEGER NOT NULL DEFAULT 0,
+    last_login_at INTEGER NOT NULL DEFAULT 0,
+    last_groups TEXT NOT NULL DEFAULT '[]',
+    last_grants TEXT NOT NULL DEFAULT '[]',
+    source TEXT NOT NULL DEFAULT 'sso'
 );
 ";
 
@@ -293,6 +318,11 @@ impl Store {
         if stored < 4 {
             connection
                 .execute_batch(SETTINGS_SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
+        }
+        if stored < 5 {
+            connection
+                .execute_batch(PRINCIPALS_SCHEMA)
                 .map_err(|error| format!("schema: {error}"))?;
         }
         if stored < SCHEMA_VERSION {
@@ -598,6 +628,99 @@ impl Store {
         })
     }
 
+    // ----------------------------------------------------------- principals
+
+    pub fn principal(&self, subject: &str) -> Option<Principal> {
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT subject, credential_version, blocked, last_login_at,
+                            last_groups, last_grants, source
+                     FROM principals WHERE subject = ?1",
+                    [subject],
+                    map_principal,
+                )
+                .optional()
+        })
+        .expect("store read failed")
+    }
+
+    pub fn principals(&self) -> Vec<Principal> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT subject, credential_version, blocked, last_login_at,
+                        last_groups, last_grants, source
+                 FROM principals ORDER BY last_login_at DESC, subject",
+            )?;
+            let rows = statement.query_map([], map_principal)?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .expect("store read failed")
+    }
+
+    /// Inserts or refreshes last-login fields without resetting version or block.
+    pub fn upsert_sso_principal(
+        &self,
+        subject: &str,
+        groups: &[String],
+        grants: &serde_json::Value,
+    ) -> Result<Principal, String> {
+        let groups_json = serde_json::to_string(groups).unwrap_or_else(|_| "[]".to_owned());
+        let grants_json = serde_json::to_string(grants).unwrap_or_else(|_| "[]".to_owned());
+        let at = i64::try_from(now_unix()).unwrap_or(0);
+        self.with(|connection| {
+            connection.query_row(
+                "INSERT INTO principals (subject, last_login_at, last_groups, last_grants, source)
+                 VALUES (?1, ?2, ?3, ?4, 'sso')
+                 ON CONFLICT(subject) DO UPDATE SET
+                    last_login_at = excluded.last_login_at,
+                    last_groups = excluded.last_groups,
+                    last_grants = excluded.last_grants
+                 RETURNING subject, credential_version, blocked, last_login_at,
+                           last_groups, last_grants, source",
+                rusqlite::params![subject, at, groups_json, grants_json],
+                map_principal,
+            )
+        })
+    }
+
+    /// Missing row accepts cv 1 only. A present row must match version and be unblocked.
+    pub fn principal_allows(&self, subject: &str, credential_version: u64) -> bool {
+        match self.principal(subject) {
+            None => credential_version == 1,
+            Some(row) => credential_version == row.credential_version && !row.blocked,
+        }
+    }
+
+    pub fn revoke_principal(&self, subject: &str) -> Result<bool, String> {
+        self.with(|connection| {
+            let changed = connection.execute(
+                "UPDATE principals SET credential_version = credential_version + 1, blocked = 1
+                 WHERE subject = ?1",
+                [subject],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    pub fn unblock_principal(&self, subject: &str) -> Result<bool, String> {
+        self.with(|connection| {
+            let exists: i64 = connection.query_row(
+                "SELECT EXISTS (SELECT 1 FROM principals WHERE subject = ?1)",
+                [subject],
+                |row| row.get(0),
+            )?;
+            if exists == 0 {
+                return Ok(false);
+            }
+            connection.execute(
+                "UPDATE principals SET blocked = 0 WHERE subject = ?1",
+                [subject],
+            )?;
+            Ok(true)
+        })
+    }
+
     // ------------------------------------------------- operations helpers
 
     /// Consistent snapshot of the database via SQLite's VACUUM INTO. The
@@ -836,6 +959,20 @@ pub struct AuditRow {
     pub event: String,
     pub subject: String,
     pub detail: serde_json::Value,
+}
+
+fn map_principal(row: &rusqlite::Row<'_>) -> rusqlite::Result<Principal> {
+    let last_groups: String = row.get("last_groups")?;
+    let last_grants: String = row.get("last_grants")?;
+    Ok(Principal {
+        subject: row.get("subject")?,
+        credential_version: row.get::<_, i64>("credential_version")?.max(0) as u64,
+        blocked: row.get::<_, i64>("blocked")? != 0,
+        last_login_at: row.get::<_, i64>("last_login_at")?.max(0) as u64,
+        last_groups: serde_json::from_str(&last_groups).unwrap_or_default(),
+        last_grants: serde_json::from_str(&last_grants).unwrap_or_else(|_| serde_json::json!([])),
+        source: row.get("source")?,
+    })
 }
 
 fn map_audit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRow> {
@@ -1761,8 +1898,71 @@ mod settings_tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         drop(store);
-        assert_eq!(schema_version(directory.path()), "4");
+        assert_eq!(schema_version(directory.path()), "5");
         Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "4");
+        assert_eq!(schema_version(directory.path()), "5");
+    }
+
+    #[test]
+    fn v4_database_gains_principals_and_stamps_5() {
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let connection = Connection::open(directory.path().join("votport.db")).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     CREATE TABLE settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        updated_by TEXT NOT NULL DEFAULT ''
+                     );
+                     INSERT INTO meta (key, value) VALUES ('schema_version', '4');",
+                )
+                .unwrap();
+        }
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(schema_version(directory.path()), "5");
+        assert!(store.principals().is_empty());
+        assert!(store.principal("nobody").is_none());
+    }
+}
+
+#[cfg(test)]
+mod principals_store_tests {
+    use super::*;
+
+    #[test]
+    fn upsert_revoke_unblock_preserve_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let grants = serde_json::json!([{"tenant":"","role":"admin"}]);
+        let row = store
+            .upsert_sso_principal("user@example.com", &["employees".to_owned()], &grants)
+            .unwrap();
+        assert_eq!(row.credential_version, 1);
+        assert!(!row.blocked);
+        assert_eq!(row.last_groups, vec!["employees".to_owned()]);
+        assert_eq!(row.source, "sso");
+        assert!(store.principal_allows("user@example.com", 1));
+        assert!(!store.principal_allows("user@example.com", 2));
+        assert!(store.principal_allows("missing", 1));
+        assert!(!store.principal_allows("missing", 2));
+
+        assert!(store.revoke_principal("user@example.com").unwrap());
+        let revoked = store.principal("user@example.com").unwrap();
+        assert_eq!(revoked.credential_version, 2);
+        assert!(revoked.blocked);
+        assert!(!store.principal_allows("user@example.com", 1));
+        assert!(!store.principal_allows("user@example.com", 2));
+
+        assert!(store.unblock_principal("user@example.com").unwrap());
+        let unblocked = store.principal("user@example.com").unwrap();
+        assert_eq!(unblocked.credential_version, 2);
+        assert!(!unblocked.blocked);
+        assert!(store.principal_allows("user@example.com", 2));
+        assert!(!store.principal_allows("user@example.com", 1));
+        assert!(!store.revoke_principal("missing").unwrap());
+        assert!(!store.unblock_principal("missing").unwrap());
     }
 }
