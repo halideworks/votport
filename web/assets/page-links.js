@@ -32,7 +32,7 @@ function button(text, classes, onClick) {
   return element;
 }
 
-function renderUpload(tenant, link, upload) {
+function renderUpload(link, upload) {
   const item = document.createElement('li');
 
   const head = document.createElement('div');

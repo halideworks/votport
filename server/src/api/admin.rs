@@ -201,10 +201,19 @@ pub async fn admin_session(
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_admin(&app, &headers)?;
+    // Which dashboard pages this principal may open. Named tenants get their
+    // own links plus a tenant-filtered audit view; platform administration
+    // (tenants, system) is default-tenant admin only.
+    let mut pages = vec!["links", "audit"];
+    if identity.tenant.is_empty() && identity.role == "admin" {
+        pages.push("tenants");
+        pages.push("system");
+    }
     Ok(Json(json!({
         "ok": true,
         "tenant": identity.tenant,
         "grants": identity.grants,
+        "pages": pages,
     })))
 }
 
@@ -446,6 +455,14 @@ pub async fn admin_change_password(
 ) -> ApiResult<Response> {
     let identity = require_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
+    // The local password is the break-glass credential for the platform;
+    // SSO tenant admins rotate access at their identity provider instead.
+    if !identity.tenant.is_empty() || identity.role != "admin" {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "the local administrator password is managed by the default-tenant admin",
+        ));
+    }
     if app.throttle.locked() {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,

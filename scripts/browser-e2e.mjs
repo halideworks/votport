@@ -41,7 +41,8 @@ await page.goto(base);
 await page.waitForSelector('#login:not([hidden])');
 await page.fill('#login-password', adminPassword);
 await page.click('#login-form button[type=submit]');
-await page.waitForSelector('#dashboard:not([hidden])');
+// Signed-in users land on /links; the create form is the first element.
+await page.waitForSelector('#create-form:not([hidden])', { timeout: 15000 });
 
 const dest = `e2e-${Date.now().toString(36)}`;
 await page.fill('#create-label', 'browser e2e');
