@@ -9,8 +9,8 @@ pub mod upload;
 
 pub use admin::{
     admin_audit_export, admin_change_password, admin_login, admin_logout, admin_session,
-    create_link, delete_link, delete_received_file, delete_upload_record, link_qr, list_links,
-    update_link,
+    create_link, create_tenant, delete_link, delete_received_file, delete_tenant,
+    delete_upload_record, link_qr, list_links, list_tenants, switch_tenant, update_link,
 };
 pub use sso::{sso_available, sso_callback, sso_start};
 pub use upload::{
@@ -204,6 +204,7 @@ mod handler_tests {
         let application = testing::build(directory.path());
         let link = Link {
             id: "closed-link-id".to_owned(),
+            tenant: String::new(),
             label: "tax documents".to_owned(),
             dest: String::new(),
             password_hash: None,

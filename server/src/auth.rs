@@ -8,6 +8,7 @@ use argon2::password_hash::{PasswordHash, PasswordHasher as _, PasswordVerifier 
 use argon2::Argon2;
 use hmac::{Hmac, Mac as _};
 use rand::RngCore as _;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 use crate::store::now_unix;
@@ -108,29 +109,59 @@ fn verify_token(secret: &[u8; 32], context: &[&[u8]], token: &str) -> bool {
     constant_time_eq(expected.as_bytes(), mac.as_bytes())
 }
 
-/// The principal an admin session cookie stands for: who, which tenant
-/// namespace, and how much power. Local sign-ins use the default tenant.
-#[derive(Clone, Debug)]
-pub struct AdminIdentity {
-    pub subject: String,
+/// One tenant the principal may act in, with its role.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct TenantGrant {
+    /// "" is the default tenant.
     pub tenant: String,
     /// "admin" (full control) or "viewer" (read-only dashboard).
     pub role: String,
 }
 
-fn admin_mac(
-    secret: &[u8; 32],
-    id: &AdminIdentity,
-    version: &str,
-    expires: u64,
-    nonce: &str,
-) -> String {
+/// The principal an admin session cookie stands for: who, which tenants it
+/// may act in, and the one it is currently acting in. Local sign-ins use the
+/// default tenant.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AdminIdentity {
+    pub subject: String,
+    /// The active tenant namespace ("" = default).
+    pub tenant: String,
+    /// Role within the active tenant ("admin" or "viewer").
+    pub role: String,
+    /// Every (tenant, role) this principal may switch into.
+    #[serde(default)]
+    pub grants: Vec<TenantGrant>,
+}
+
+impl AdminIdentity {
+    pub fn local_admin() -> Self {
+        Self {
+            subject: "local".to_owned(),
+            tenant: String::new(),
+            role: "admin".to_owned(),
+            grants: vec![TenantGrant {
+                tenant: String::new(),
+                role: "admin".to_owned(),
+            }],
+        }
+    }
+}
+
+fn identity_payload(id: &AdminIdentity) -> String {
+    serde_json::json!({
+        "subject": id.subject,
+        "tenant": id.tenant,
+        "role": id.role,
+        "grants": id.grants,
+    })
+    .to_string()
+}
+
+fn admin_mac(secret: &[u8; 32], payload: &str, version: &str, expires: u64, nonce: &str) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts 32-byte keys");
     for part in [
-        b"votport-admin-v2".as_slice(),
-        id.subject.as_bytes(),
-        id.tenant.as_bytes(),
-        id.role.as_bytes(),
+        b"votport-admin-v3".as_slice(),
+        payload.as_bytes(),
         version.as_bytes(),
     ] {
         mac.update(part);
@@ -141,21 +172,18 @@ fn admin_mac(
     hex::encode(mac.finalize().into_bytes())
 }
 
-/// Issues an admin session token bound to the identity AND the credential
-/// version: changing the password (or rotating the environment credential)
-/// invalidates every outstanding session, exactly as before, while SSO
-/// identities carry their own subject and role.
+/// Issues an admin session token bound to the full grant set AND the
+/// credential version: changing the password (or rotating the environment
+/// credential) invalidates every outstanding session, while SSO identities
+/// carry their own subjects, tenants and roles.
 pub fn issue_admin_token(secret: &[u8; 32], id: &AdminIdentity, version: &str) -> String {
     let expires = now_unix() + ADMIN_SESSION_SECS;
     let nonce = random_token();
-    let mac = admin_mac(secret, id, version, expires, &nonce);
-    // Fields are dot-delimited; subject/tenant/role are hex so any bytes are
-    // representable without escaping.
+    let payload = identity_payload(id);
+    let mac = admin_mac(secret, &payload, version, expires, &nonce);
     format!(
-        "{expires}.{}.{}.{}.{}.{}",
-        hex::encode(id.subject.as_bytes()),
-        hex::encode(id.tenant.as_bytes()),
-        hex::encode(id.role.as_bytes()),
+        "{expires}.{}.{}.{}",
+        hex::encode(payload.as_bytes()),
         nonce,
         mac
     )
@@ -165,7 +193,7 @@ pub fn issue_admin_token(secret: &[u8; 32], id: &AdminIdentity, version: &str) -
 /// all fails to match: wrong MAC, expired, malformed.
 pub fn verify_admin_token(secret: &[u8; 32], version: &str, token: &str) -> Option<AdminIdentity> {
     let parts: Vec<&str> = token.split('.').collect();
-    let [expires, subject, tenant, role, nonce, mac] = parts.as_slice() else {
+    let [expires, payload_hex, nonce, mac] = parts.as_slice() else {
         return None;
     };
     let Ok(expires) = expires.parse::<u64>() else {
@@ -174,18 +202,13 @@ pub fn verify_admin_token(secret: &[u8; 32], version: &str, token: &str) -> Opti
     if now_unix() >= expires {
         return None;
     }
-    let (Ok(subject), Ok(tenant), Ok(role)) =
-        (hex::decode(subject), hex::decode(tenant), hex::decode(role))
-    else {
+    let payload = hex::decode(payload_hex).ok()?;
+    let payload = String::from_utf8(payload).ok()?;
+    let expected = admin_mac(secret, &payload, version, expires, nonce);
+    if !constant_time_eq(expected.as_bytes(), mac.as_bytes()) {
         return None;
-    };
-    let id = AdminIdentity {
-        subject: String::from_utf8(subject).ok()?,
-        tenant: String::from_utf8(tenant).ok()?,
-        role: String::from_utf8(role).ok()?,
-    };
-    let expected = admin_mac(secret, &id, version, expires, nonce);
-    constant_time_eq(expected.as_bytes(), mac.as_bytes()).then_some(id)
+    }
+    serde_json::from_str(&payload).ok()
 }
 
 const LINK_SESSION_SECS: u64 = 30 * 24 * 3600;
