@@ -140,14 +140,23 @@ pub fn from_env() -> Result<Config, String> {
         optional("VOTPORT_OIDC_CLIENT_ID"),
         optional("VOTPORT_OIDC_CLIENT_SECRET"),
     ) {
-        (Some(issuer), Some(client_id), Some(client_secret)) => Some(OidcConfig {
-            issuer,
-            client_id,
-            client_secret,
-            admin_group: env::var("VOTPORT_OIDC_ADMIN_GROUP")
+        (Some(issuer), Some(client_id), Some(client_secret)) => {
+            let admin_group = env::var("VOTPORT_OIDC_ADMIN_GROUP")
                 .ok()
-                .filter(|group| !group.trim().is_empty()),
-        }),
+                .filter(|group| !group.trim().is_empty());
+            if admin_group.is_none() {
+                eprintln!(
+                    "votport: VOTPORT_OIDC_ADMIN_GROUP is unset; every principal your \
+                     provider authenticates will have full admin access"
+                );
+            }
+            Some(OidcConfig {
+                issuer,
+                client_id,
+                client_secret,
+                admin_group,
+            })
+        }
         (None, None, None) => None,
         _ => {
             return Err(

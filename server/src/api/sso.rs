@@ -5,6 +5,11 @@
 //!
 //! Local password sign-in remains the zero-config default and the
 //! break-glass path; this module only exists when VOTPORT_OIDC_* is set.
+//!
+//! Multi-client providers (Entra ID and friends) may require additional
+//! per-client claims checks (azp, hd); with a single client_id configured,
+//! the openidconnect crate's issuer/audience/nonce verification covers the
+//! standard cases.
 
 use std::fmt::Write as _;
 
@@ -209,16 +214,28 @@ pub async fn sso_callback(
     headers: HeaderMap,
     Query(params): Query<CallbackParams>,
 ) -> Response {
-    let home = |message: &str| {
+    let app_for_home = std::sync::Arc::clone(&app);
+    let home = move |message: &str| {
+        if !message.is_empty() {
+            // Failures are SIEM-relevant; the generic message goes to the
+            // browser, the specific one to the audit trail.
+            tracing::warn!(target: "audit", event = "sso_failed", reason = message, "SSO sign-in failed");
+            app_for_home
+                .store
+                .audit("sso_failed", "", &json!({ "reason": message }));
+        }
+        let clear_state =
+            format!("{STATE_COOKIE}=; Path=/api/admin; HttpOnly; SameSite=Lax; Max-Age=0");
+        let target = if message.is_empty() {
+            "/".to_owned()
+        } else {
+            format!("/?sso_error={}", hex::encode(message.as_bytes()))
+        };
         (
-            [(
-                header::LOCATION,
-                if message.is_empty() {
-                    "/".to_owned()
-                } else {
-                    format!("/?sso_error={}", hex::encode(message.as_bytes()))
-                },
-            )],
+            [
+                (header::SET_COOKIE, clear_state),
+                (header::LOCATION, target),
+            ],
             StatusCode::FOUND,
         )
             .into_response()
@@ -328,6 +345,12 @@ pub async fn sso_callback(
         let token = token_response.access_token().secret();
         if let Ok(response) = app.http.get(url).bearer_auth(token).send().await {
             if let Ok(value) = response.json::<serde_json::Value>().await {
+                // OIDC Core 5.3.2: the userinfo sub must match the verified
+                // id-token subject, or the response is not about this user.
+                if value["sub"].as_str() != Some(subject.as_str()) {
+                    tracing::warn!(target: "audit", event = "sso_failed", "userinfo sub mismatch");
+                    return home("identity could not be verified");
+                }
                 if let Some(list) = value["groups"].as_array() {
                     groups.extend(
                         list.iter()

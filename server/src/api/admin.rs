@@ -124,12 +124,21 @@ pub async fn admin_login(
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
 
-pub async fn admin_logout(State(app): State<Arc<App>>) -> Response {
+pub async fn admin_logout(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Response> {
+    // A cross-site form POST can force a logout (denial of convenience, not
+    // of security); the CSRF header closes even that.
+    let _ = require_admin(&app, &headers)?;
+    if !headers.contains_key("x-votport") {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "missing X-Votport header",
+        ));
+    }
     let cookie = format!(
         "{ADMIN_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}",
         cookie_attributes(&app)
     );
-    ([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response()
+    Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
 
 /// Streams audit rows after `since` as JSONL, oldest first. Caps at 10_000

@@ -369,6 +369,18 @@ $('password-form').addEventListener('submit', async (event) => {
 });
 
 (async () => {
+  // SSO failures come home as ?sso_error=<hex>; show the decoded message.
+  const ssoError = new URLSearchParams(window.location.search).get('sso_error');
+  if (ssoError) {
+    try {
+      const message = new TextDecoder().decode(
+        Uint8Array.from(ssoError.match(/.{2}/g) ?? [], (byte) => parseInt(byte, 16)),
+      );
+      $('login-error').textContent = message;
+      $('login-error').hidden = false;
+      window.history.replaceState({}, '', '/');
+    } catch { /* malformed tag: ignore */ }
+  }
   // SSO sign-in appears whenever the server has an identity provider.
   try {
     const { available } = await api('/api/admin/sso');
