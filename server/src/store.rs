@@ -1703,6 +1703,7 @@ mod settings_tests {
         };
         assert!(error.contains("99"), "{error}");
         assert!(error.contains("newer"), "{error}");
+        assert_eq!(schema_version(directory.path()), "99");
     }
 
     #[test]

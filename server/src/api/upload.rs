@@ -252,7 +252,7 @@ pub async fn create_session(
     }
     // Quotas: the tenant's received-but-not-deleted bytes plus this upload
     // must stay under max_total_bytes, and its concurrent sessions under
-    // max_sessions. The implicit default tenant uses overlay default_max_*.
+    // max_sessions.
     let (max_total, _, max_sessions) = app.store.quotas_for(&link.tenant, &app.config);
     if let Some(max_total) = max_total {
         let received = app.store.tenant_received_bytes(&link.tenant);

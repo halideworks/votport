@@ -94,9 +94,9 @@ Everything is environment variables (see `docker-compose.yml`):
 | `VOTPORT_NOTIFY_PUSHOVER_USER` | — | Pushover application token (set together with the user key). |
 | `VOTPORT_AUDIT_RETENTION_DAYS` | `400` | Days to keep queryable audit rows; `0` disables pruning. Overridable via `PUT /api/admin/settings`. |
 | `VOTPORT_UPLOAD_RETENTION_DAYS` | off | Days to keep received files and their records; a daily sweep deletes expired content and audits it. `0` (default) keeps everything. Overridable via `PUT /api/admin/settings`. |
-| `VOTPORT_DEFAULT_MAX_TOTAL_BYTES` | unlimited | Default byte quota for a newly created tenant when the request omits it. |
-| `VOTPORT_DEFAULT_MAX_LINKS` | unlimited | Default max links for a newly created tenant when the request omits it. |
-| `VOTPORT_DEFAULT_MAX_SESSIONS` | unlimited | Default max concurrent sessions for a newly created tenant when the request omits it. |
+| `VOTPORT_DEFAULT_MAX_TOTAL_BYTES` | unlimited | Fills a new tenant's byte quota when the request omits it, and caps received bytes on the unnamed default tenant. Named tenants keep the quota on their row. |
+| `VOTPORT_DEFAULT_MAX_LINKS` | unlimited | Same overlay for max links (new tenants when omitted, and the unnamed default tenant). |
+| `VOTPORT_DEFAULT_MAX_SESSIONS` | unlimited | Same overlay for max concurrent sessions. |
 | `VOTPORT_PUBLIC_PASSWORD_LOGIN` | on | Set `0` to prefer collapsing the local password form when SSO is offered (login API stays available). |
 | `VOTPORT_METRICS_TOKEN` | — | When set, `GET /metrics` requires this bearer token. Counts only; scrape over an internal interface. |
 | `VOTPORT_OIDC_ISSUER` | — | OIDC issuer URL for admin single sign-on. Requires the client id/secret and `VOTPORT_PUBLIC_URL`; see [Single sign-on](#single-sign-on). |

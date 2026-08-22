@@ -42,8 +42,9 @@ pub struct Config {
     pub audit_retention_days: u64,
     /// Days to keep received files and their records; 0 disables the sweep.
     pub upload_retention_days: u64,
-    /// Default tenant quota when a create-tenant request omits the field.
-    /// None means unlimited.
+    /// Overlay default quotas: filled into a new tenant when the create
+    /// request omits the field, and applied live to the unnamed default
+    /// tenant. Named tenants keep the quotas on their row. None is unlimited.
     pub default_max_total_bytes: Option<u64>,
     pub default_max_links: Option<u64>,
     pub default_max_sessions: Option<u64>,

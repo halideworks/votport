@@ -1976,6 +1976,94 @@ mod settings_api_tests {
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    #[tokio::test]
+    async fn create_tenant_fills_omitted_quotas_from_overlay() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = cookie_for(&application, "", "admin");
+        let (status, _) = send(
+            application.clone(),
+            Request::builder()
+                .method("PUT")
+                .uri("/api/admin/settings")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"default_max_total_bytes":100}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, json) = send(
+            application.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/tenants")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"key":"acme","label":"Acme"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["key"], "acme");
+        let tenant = application.store.tenant("acme").expect("tenant stored");
+        assert_eq!(tenant.max_total_bytes, Some(100));
+        assert_eq!(tenant.max_links, None);
+        assert_eq!(tenant.max_sessions, None);
+    }
+
+    #[tokio::test]
+    async fn default_tenant_create_session_hits_overlay_byte_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_link(crate::store::Link {
+                id: "default-link".to_owned(),
+                tenant: String::new(),
+                label: "open".to_owned(),
+                dest: String::new(),
+                password_hash: None,
+                created_at: 0,
+                expires_at: None,
+                max_bytes: None,
+                active: true,
+                uploads: Vec::new(),
+                events: Vec::new(),
+            })
+            .unwrap();
+        let cookie = cookie_for(&application, "", "admin");
+        let (status, _) = send(
+            application.clone(),
+            Request::builder()
+                .method("PUT")
+                .uri("/api/admin/settings")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"default_max_total_bytes":100}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let router = app::router(application);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/r/default-link/session")
+            .header("content-type", "application/json")
+            .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
+            .body(Body::from(
+                r#"{"package":{"suite":"blake3","root":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","length":200}}"#,
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
     #[test]
     fn overlay_skips_invalid_text_without_panic() {
         let directory = tempfile::tempdir().unwrap();
