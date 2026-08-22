@@ -110,11 +110,12 @@ pub async fn admin_login(
     if !ok {
         tracing::warn!(target: "audit", event = "admin_login_failed", %ip, "admin login refused");
         app.store
-            .audit("admin_login_failed", &ip, &serde_json::json!({}));
+            .audit("", "", "admin_login_failed", &ip, &serde_json::json!({}));
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "wrong password"));
     }
     tracing::info!(target: "audit", event = "admin_login", %ip, "admin signed in");
-    app.store.audit("admin_login", &ip, &serde_json::json!({}));
+    app.store
+        .audit("", "", "admin_login", &ip, &serde_json::json!({}));
     let cookie = issue_admin_cookie(&app, &auth::AdminIdentity::local_admin());
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
@@ -143,11 +144,19 @@ pub async fn admin_audit_export(
     headers: HeaderMap,
     Query(query): Query<AuditQuery>,
 ) -> ApiResult<Response> {
-    let _identity = require_admin(&app, &headers)?;
+    let identity = require_admin(&app, &headers)?;
+    // Named-tenant principals see only their namespace's rows; the default
+    // tenant (platform admin) sees everything.
+    let tenant_filter = identity.tenant.clone();
     let limit = query.limit.unwrap_or(1000).min(10_000);
     let rows = app
         .store
-        .audit_export(query.since.unwrap_or(0), limit)
+        .audit_export(
+            &tenant_filter,
+            query.since.unwrap_or(0),
+            query.after_rowid.unwrap_or(0),
+            limit,
+        )
         .map_err(ApiError::internal)?;
     use std::fmt::Write as _;
     let mut body = String::new();
@@ -157,6 +166,7 @@ pub async fn admin_audit_export(
             body,
             "{}",
             serde_json::json!({
+                "rowid": row.rowid,
                 "at": row.at,
                 "tenant": row.tenant,
                 "actor": row.actor,
@@ -180,6 +190,9 @@ pub async fn admin_audit_export(
 #[derive(Deserialize)]
 pub struct AuditQuery {
     since: Option<u64>,
+    /// Cursor for rows sharing `since`'s second (from the previous page's
+    /// final `rowid`).
+    after_rowid: Option<u64>,
     limit: Option<u64>,
 }
 
@@ -229,10 +242,12 @@ pub async fn create_tenant(
     }
     let key = paths::admit_dest(&request.key)
         .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
-    if key.is_empty() {
+    if key.is_empty() || key == "default" {
+        // "default" would collide with the hard-coded metrics series for the
+        // built-in namespace.
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "the default tenant already exists",
+            "that tenant key is reserved",
         ));
     }
     if app.store.tenant(&key).is_some() {
@@ -251,7 +266,8 @@ pub async fn create_tenant(
         .insert_tenant(tenant)
         .map_err(ApiError::internal)?;
     tracing::info!(target: "audit", event = "tenant_created", key = %key, "tenant namespace created");
-    app.store.audit("tenant_created", &key, &json!({}));
+    app.store
+        .audit("", &identity.subject, "tenant_created", &key, &json!({}));
     Ok(Json(json!({ "key": key })))
 }
 
@@ -259,7 +275,14 @@ pub async fn list_tenants(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _ = require_admin(&app, &headers)?;
+    let identity = require_admin(&app, &headers)?;
+    // Namespace keys/labels/quotas are platform metadata, not tenant data.
+    if !identity.tenant.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "tenant administration requires the default-tenant admin",
+        ));
+    }
     Ok(Json(json!({ "tenants": app.store.tenants() })))
 }
 
@@ -292,12 +315,72 @@ pub async fn delete_tenant(
             format!("{active} upload(s) are in flight; try again when they finish"),
         ));
     }
-    if !app.store.remove_tenant(&key).map_err(ApiError::internal)? {
-        return Err(ApiError::not_found());
+    use crate::store::TenantRemoval;
+    match app.store.remove_tenant(&key).map_err(ApiError::internal)? {
+        TenantRemoval::Deleted => {}
+        TenantRemoval::Absent => return Err(ApiError::not_found()),
+        TenantRemoval::HasLinks => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "a link was created concurrently; delete them first",
+            ));
+        }
     }
     tracing::info!(target: "audit", event = "tenant_deleted", key = %key, "tenant namespace deleted");
-    app.store.audit("tenant_deleted", &key, &json!({}));
+    app.store
+        .audit("", &identity.subject, "tenant_deleted", &key, &json!({}));
     Ok(Json(json!({ "ok": true })))
+}
+
+/// Streams a consistent SQLite snapshot as a download. Read-only operation:
+/// admin session required, CSRF header not (nothing mutates).
+pub async fn backup_database(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let identity = require_admin(&app, &headers)?;
+    // The snapshot spans every tenant plus the credential store: only the
+    // default tenant's admin may take it.
+    if !identity.tenant.is_empty() || identity.role != "admin" {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "default-tenant admin required",
+        ));
+    }
+    let backups = app.config.data_dir.join("backups");
+    tokio::fs::create_dir_all(&backups)
+        .await
+        .map_err(|error| ApiError::internal(format!("create backups dir: {error}")))?;
+    let name = format!("votport-{}-{}.db", now_unix(), &auth::random_token()[..8]);
+    let destination = backups.join(&name);
+    let store = Arc::clone(&app.store);
+    let destination_clone = destination.clone();
+    tokio::task::spawn_blocking(move || store.backup_into(&destination_clone))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .map_err(ApiError::internal)?;
+    let bytes = tokio::fs::read(&destination)
+        .await
+        .map_err(|error| ApiError::internal(format!("read snapshot: {error}")))?;
+    tracing::info!(target: "audit", event = "backup_created", file = %name, bytes = bytes.len(), "database snapshot exported");
+    app.store.audit(
+        "",
+        "",
+        "backup_created",
+        &name,
+        &json!({ "bytes": bytes.len() }),
+    );
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{name}\""),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 #[derive(Deserialize)]
@@ -329,6 +412,18 @@ pub async fn switch_tenant(
         grants: identity.grants.clone(),
         subject: identity.subject.clone(),
     };
+    tracing::info!(
+        target: "audit", event = "tenant_switched",
+        subject = %identity.subject, from = %identity.tenant, to = %switched.tenant,
+        "admin switched active tenant"
+    );
+    app.store.audit(
+        &switched.tenant,
+        &identity.subject,
+        "tenant_switched",
+        &switched.tenant,
+        &json!({ "from": identity.tenant }),
+    );
     let cookie = issue_admin_cookie(&app, &switched);
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
@@ -387,8 +482,13 @@ pub async fn admin_change_password(
         .set_admin_password_hash(hash)
         .map_err(ApiError::internal)?;
     tracing::info!(target: "audit", event = "admin_password_changed", "admin password changed; outstanding sessions invalidated");
-    app.store
-        .audit("admin_password_changed", "", &serde_json::json!({}));
+    app.store.audit(
+        "",
+        "local",
+        "admin_password_changed",
+        "",
+        &serde_json::json!({}),
+    );
     let cookie = issue_admin_cookie(&app, &auth::AdminIdentity::local_admin());
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
@@ -596,6 +696,8 @@ pub async fn create_link(
     app.store.insert_link(link).map_err(ApiError::internal)?;
     tracing::info!(target: "audit", event = "link_created", id = %view.id, label = %view.label, dest = %view.dest, "request link created");
     app.store.audit(
+        &identity.tenant,
+        &identity.subject,
         "link_created",
         &view.id,
         &serde_json::json!({ "label": view.label, "dest": view.dest, "tenant": identity.tenant }),
@@ -625,6 +727,8 @@ pub async fn update_link(
     }
     tracing::info!(target: "audit", event = "link_active_changed", id = %id, active = request.active, "request link toggled");
     app.store.audit(
+        &identity.tenant,
+        &identity.subject,
         "link_active_changed",
         &id,
         &serde_json::json!({ "active": request.active }),
@@ -647,7 +751,13 @@ pub async fn delete_link(
         return Err(ApiError::not_found());
     }
     tracing::info!(target: "audit", event = "link_deleted", id = %id, "request link deleted");
-    app.store.audit("link_deleted", &id, &serde_json::json!({}));
+    app.store.audit(
+        &identity.tenant,
+        &identity.subject,
+        "link_deleted",
+        &id,
+        &serde_json::json!({}),
+    );
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -693,6 +803,8 @@ pub async fn delete_upload_record(
     }
     tracing::info!(target: "audit", event = "upload_record_cleared", link = %id, upload = %upload, "upload record cleared from history");
     app.store.audit(
+        &identity.tenant,
+        &identity.subject,
         "upload_record_cleared",
         &id,
         &serde_json::json!({ "upload": upload }),
@@ -755,6 +867,8 @@ pub async fn delete_received_file(
         .map_err(ApiError::internal)?;
     tracing::info!(target: "audit", event = "received_file_deleted", link = %id, stored_as = %stored_as, "received file deleted from disk");
     app.store.audit(
+        &identity.tenant,
+        &identity.subject,
         "received_file_deleted",
         &id,
         &serde_json::json!({ "stored_as": stored_as }),
@@ -853,9 +967,13 @@ mod handler_tests {
     async fn audit_export_requires_sign_in_and_emits_jsonl() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
-        application
-            .store
-            .audit("link_created", "l-1", &serde_json::json!({ "label": "x" }));
+        application.store.audit(
+            "",
+            "",
+            "link_created",
+            "l-1",
+            &serde_json::json!({ "label": "x" }),
+        );
 
         let router = app::router(application.clone());
         let response = router
@@ -1064,5 +1182,180 @@ mod tenant_authz_tests {
             .unwrap();
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+#[cfg(test)]
+mod ops_tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    use crate::api::testing;
+    use crate::app;
+
+    #[tokio::test]
+    async fn metrics_refuse_a_bad_token_and_serve_counts() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config_source = testing_config_with_token(directory.path(), Some("secret-token"));
+        let application = build_with(config_source.take().unwrap());
+        let router = app::router(application.clone());
+
+        let response = router
+            .oneshot(
+                Request::get("/metrics")
+                    .header("authorization", "Bearer wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let router = app::router(application.clone());
+        let response = router
+            .oneshot(
+                Request::get("/metrics")
+                    .header("authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        use http_body_util::BodyExt as _;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("votport_tenants"));
+        assert!(text.contains("votport_sessions_active"));
+    }
+
+    fn testing_config_with_token(
+        _directory: &std::path::Path,
+        token: Option<&str>,
+    ) -> Option<crate::config::Config> {
+        let mut config = testing_config_snapshot();
+        config.metrics_token = token.map(str::to_owned);
+        Some(config)
+    }
+
+    fn testing_config_snapshot() -> crate::config::Config {
+        // testing::build owns its tempdirs; this variant re-derives the same
+        // config with a metrics token so /metrics authz can be exercised.
+        let directory = std::env::temp_dir().join(format!(
+            "votport-metrics-test-{}",
+            crate::auth::random_token()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut config = testing_config_public();
+        config.data_dir = directory.join("data");
+        config.receive_dir = directory.join("received");
+        config
+    }
+
+    fn testing_config_public() -> crate::config::Config {
+        crate::config::Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            data_dir: std::path::PathBuf::from("/nonexistent"),
+            receive_dir: std::path::PathBuf::from("/nonexistent"),
+            web_root: std::path::PathBuf::from("../web"),
+            admin_password_hash: crate::auth::hash_password(testing::TEST_PASSWORD).unwrap(),
+            admin_token_tag: "tag".to_owned(),
+            notify_webhook: None,
+            notify_ntfy: None,
+            notify_ntfy_token: None,
+            notify_pushover: None,
+            public_url: None,
+            max_upload_bytes: 1024 * 1024,
+            allow_hidden: false,
+            session_idle_secs: 60,
+            audit_retention_days: 400,
+            upload_retention_days: 0,
+            metrics_token: None,
+            oidc: None,
+        }
+    }
+
+    fn build_with(config: crate::config::Config) -> std::sync::Arc<App> {
+        app::build(config).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod backup_tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt;
+
+    use crate::api::testing;
+    use crate::app;
+
+    #[tokio::test]
+    async fn backup_route_serves_a_snapshot_and_requires_sign_in() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .audit("", "", "probe", "", &serde_json::json!({}));
+
+        // Unauthenticated requests are refused.
+        let router = app::router(application.clone());
+        let response = router
+            .oneshot(
+                Request::get("/api/admin/backup")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Signed in, the route serves a non-empty SQLite snapshot.
+        let router = app::router(application.clone());
+        let login = Request::builder()
+            .method("POST")
+            .uri("/api/admin/login")
+            .header("content-type", "application/json")
+            .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                1234,
+            ))))
+            .body(Body::from(format!(
+                "{{\"password\":\"{}\"}}",
+                testing::TEST_PASSWORD
+            )))
+            .unwrap();
+        let response = router.oneshot(login).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let router = app::router(application);
+        let response = router
+            .oneshot(
+                Request::get("/api/admin/backup")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(!body.is_empty());
+        // SQLite databases begin with the magic string.
+        assert!(body.starts_with(b"SQLite format 3\0"));
     }
 }

@@ -222,7 +222,7 @@ pub async fn sso_callback(
             tracing::warn!(target: "audit", event = "sso_failed", reason = message, "SSO sign-in failed");
             app_for_home
                 .store
-                .audit("sso_failed", "", &json!({ "reason": message }));
+                .audit("", "", "sso_failed", "", &json!({ "reason": message }));
         }
         let clear_state =
             format!("{STATE_COOKIE}=; Path=/api/admin; HttpOnly; SameSite=Lax; Max-Age=0");
@@ -343,21 +343,32 @@ pub async fn sso_callback(
     let mut groups: Vec<String> = Vec::new();
     if let Some(url) = client.userinfo_url.clone() {
         let token = token_response.access_token().secret();
-        if let Ok(response) = app.http.get(url).bearer_auth(token).send().await {
-            if let Ok(value) = response.json::<serde_json::Value>().await {
-                // OIDC Core 5.3.2: the userinfo sub must match the verified
-                // id-token subject, or the response is not about this user.
-                if value["sub"].as_str() != Some(subject.as_str()) {
-                    tracing::warn!(target: "audit", event = "sso_failed", "userinfo sub mismatch");
-                    return home("identity could not be verified");
+        // A userinfo failure must not silently downgrade an admin to viewer:
+        // fail the sign-in loudly instead.
+        let value = match app.http.get(url).bearer_auth(token).send().await {
+            Ok(response) => match response.json::<serde_json::Value>().await {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(target: "audit", event = "sso_failed", error = %error, "userinfo parse failed");
+                    return home("could not verify group membership");
                 }
-                if let Some(list) = value["groups"].as_array() {
-                    groups.extend(
-                        list.iter()
-                            .filter_map(|entry| entry.as_str().map(str::to_owned)),
-                    );
-                }
+            },
+            Err(error) => {
+                tracing::warn!(target: "audit", event = "sso_failed", error = %error, "userinfo request failed");
+                return home("could not verify group membership");
             }
+        };
+        // OIDC Core 5.3.2: the userinfo sub must match the verified id-token
+        // subject, or the response is not about this user.
+        if value["sub"].as_str() != Some(subject.as_str()) {
+            tracing::warn!(target: "audit", event = "sso_failed", "userinfo sub mismatch");
+            return home("identity could not be verified");
+        }
+        if let Some(list) = value["groups"].as_array() {
+            groups.extend(
+                list.iter()
+                    .filter_map(|entry| entry.as_str().map(str::to_owned)),
+            );
         }
     }
 
@@ -366,8 +377,14 @@ pub async fn sso_callback(
         target: "audit", event = "sso_login", subject = %subject, %role,
         "SSO sign-in succeeded"
     );
-    app.store
-        .audit("sso_login", &subject, &json!({ "role": role }));
+    // Login lands in the default tenant; switching happens post-login.
+    app.store.audit(
+        "",
+        &subject,
+        "sso_login",
+        &subject,
+        &json!({ "role": role }),
+    );
 
     // Grant set: the default tenant (role from the global admin group),
     // plus every named tenant whose admin group the principal belongs to.

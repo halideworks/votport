@@ -279,6 +279,8 @@ impl Store {
             "imported legacy state.json into sqlite"
         );
         self.audit(
+            "",
+            "",
             "legacy_state_imported",
             "",
             &serde_json::json!({ "links": document.links.len() }),
@@ -453,14 +455,67 @@ impl Store {
         u64::try_from(self.links(key).len()).unwrap_or(u64::MAX)
     }
 
-    /// Deletes a tenant row; Ok(false) when absent. Callers refuse while
-    /// links still reference the namespace ([`Self::tenant_link_count`]);
-    /// received files on disk are the operator's to remove.
-    pub fn remove_tenant(&self, key: &str) -> Result<bool, String> {
+    /// Deletes a tenant row atomically unless links still reference it.
+    /// Ok(Some(())) = deleted, Ok(None) = absent,
+    /// Ok(Some(links)) via Err variant... see [`TenantRemoval`].
+    pub fn remove_tenant(&self, key: &str) -> Result<TenantRemoval, String> {
         self.with(|connection| {
-            let changed = connection.execute("DELETE FROM tenants WHERE key = ?1", [key])?;
-            Ok(changed > 0)
+            let mut statement = connection.prepare(
+                "DELETE FROM tenants WHERE key = ?1
+                 AND NOT EXISTS (SELECT 1 FROM links WHERE tenant = ?1)",
+            )?;
+            let changed = statement.execute([key])?;
+            if changed > 0 {
+                return Ok(TenantRemoval::Deleted);
+            }
+            let exists: i64 = connection.query_row(
+                "SELECT EXISTS (SELECT 1 FROM tenants WHERE key = ?1)",
+                [key],
+                |row| row.get(0),
+            )?;
+            if exists == 0 {
+                Ok(TenantRemoval::Absent)
+            } else {
+                Ok(TenantRemoval::HasLinks)
+            }
         })
+    }
+
+    // ------------------------------------------------- operations helpers
+
+    /// Consistent snapshot of the database via SQLite's VACUUM INTO. The
+    /// destination must not exist.
+    pub fn backup_into(&self, destination: &Path) -> Result<(), String> {
+        self.with(|connection| {
+            connection.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])
+        })
+        .map(|_| ())
+    }
+
+    /// Every link across every tenant. Internal use only (retention sweeps,
+    /// metrics); administrative API reads stay tenant-scoped.
+    pub fn all_links(&self) -> Vec<Link> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
+                        active, uploads_json, events_json
+                 FROM links ORDER BY rowid",
+            )?;
+            let rows = statement.query_map([], row_to_link)?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .expect("store read failed")
+    }
+
+    pub fn audit_count(&self) -> u64 {
+        self.with(|connection| {
+            connection
+                .query_row("SELECT count(*) FROM audit_log", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map(|value| value.max(0) as u64)
+        })
+        .expect("store read failed")
     }
 
     // -------------------------------------------------------------- quotas
@@ -559,6 +614,7 @@ fn read_link(connection: &Connection, tenant: &str, id: &str) -> Result<Option<L
 /// One row of the audit log as exported.
 #[derive(Clone, Debug, Serialize)]
 pub struct AuditRow {
+    pub rowid: i64,
     pub at: u64,
     pub tenant: String,
     pub actor: String,
@@ -567,16 +623,37 @@ pub struct AuditRow {
     pub detail: serde_json::Value,
 }
 
+fn map_audit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRow> {
+    Ok(AuditRow {
+        rowid: row.get(0)?,
+        at: row.get::<_, i64>(1)?.max(0) as u64,
+        tenant: row.get(2)?,
+        actor: row.get(3)?,
+        event: row.get(4)?,
+        subject: row.get(5)?,
+        detail: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or(serde_json::Value::Null),
+    })
+}
+
 impl Store {
     /// Inserts one audit row. Best effort: the tracing event at the call site
     /// is the operational record; the row is the queryable one.
-    pub fn audit(&self, event: &str, subject: &str, detail: &serde_json::Value) {
+    pub fn audit(
+        &self,
+        tenant: &str,
+        actor: &str,
+        event: &str,
+        subject: &str,
+        detail: &serde_json::Value,
+    ) {
         let _ = self.with(|connection| {
             connection.execute(
                 "INSERT INTO audit_log (at, tenant, actor, event, subject, detail)
-                 VALUES (?1, '', '', ?2, ?3, ?4)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![
                     i64::try_from(now_unix()).unwrap_or(0),
+                    tenant,
+                    actor,
                     event,
                     subject,
                     detail.to_string()
@@ -585,32 +662,58 @@ impl Store {
         });
     }
 
-    /// Audit rows after `since`, oldest first, capped.
-    pub fn audit_export(&self, since: u64, limit: u64) -> Result<Vec<AuditRow>, String> {
+    /// Audit rows strictly after the (at, rowid) cursor, oldest first,
+    /// capped. When `tenant` is non-empty only that namespace's rows are
+    /// returned; the empty string sees everything (platform admin).
+    pub fn audit_export(
+        &self,
+        tenant: &str,
+        since: u64,
+        after_rowid: u64,
+        limit: u64,
+    ) -> Result<Vec<AuditRow>, String> {
         self.with(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT at, tenant, actor, event, subject, detail
-                 FROM audit_log WHERE at > ?1 ORDER BY at, rowid LIMIT ?2",
+            if tenant.is_empty() {
+                Self::audit_export_query(connection, "", since, after_rowid, limit)
+            } else {
+                Self::audit_export_query(connection, tenant, since, after_rowid, limit)
+            }
+        })
+    }
+
+    fn audit_export_query(
+        connection: &Connection,
+        tenant: &str,
+        since: u64,
+        after_rowid: u64,
+        limit: u64,
+    ) -> rusqlite::Result<Vec<AuditRow>> {
+        let since = i64::try_from(since).unwrap_or(0);
+        let after_rowid = i64::try_from(after_rowid).unwrap_or(0);
+        let limit = i64::try_from(limit).unwrap_or(1000);
+        if tenant.is_empty() {
+            let mut statement = connection.prepare_cached(
+                "SELECT rowid, at, tenant, actor, event, subject, detail
+                 FROM audit_log
+                 WHERE at > ?1 OR (at = ?1 AND rowid > ?2)
+                 ORDER BY at, rowid LIMIT ?3",
+            )?;
+            let rows =
+                statement.query_map(rusqlite::params![since, after_rowid, limit], map_audit_row)?;
+            rows.collect()
+        } else {
+            let mut statement = connection.prepare_cached(
+                "SELECT rowid, at, tenant, actor, event, subject, detail
+                 FROM audit_log
+                 WHERE tenant = ?4 AND (at > ?1 OR (at = ?1 AND rowid > ?2))
+                 ORDER BY at, rowid LIMIT ?3",
             )?;
             let rows = statement.query_map(
-                rusqlite::params![
-                    i64::try_from(since).unwrap_or(0),
-                    i64::try_from(limit).unwrap_or(1000)
-                ],
-                |row| {
-                    Ok(AuditRow {
-                        at: row.get::<_, i64>(0)?.max(0) as u64,
-                        tenant: row.get(1)?,
-                        actor: row.get(2)?,
-                        event: row.get(3)?,
-                        subject: row.get(4)?,
-                        detail: serde_json::from_str(&row.get::<_, String>(5)?)
-                            .unwrap_or(serde_json::Value::Null),
-                    })
-                },
+                rusqlite::params![since, after_rowid, limit, tenant],
+                map_audit_row,
             )?;
-            rows.collect::<Result<Vec<_>, _>>()
-        })
+            rows.collect()
+        }
     }
 
     /// Deletes audit rows older than `before`; returns how many.
@@ -622,6 +725,14 @@ impl Store {
             )
         })
     }
+}
+
+/// Outcome of [`Store::remove_tenant`].
+#[derive(Debug, PartialEq)]
+pub enum TenantRemoval {
+    Deleted,
+    Absent,
+    HasLinks,
 }
 
 pub fn now_unix() -> u64 {
@@ -647,6 +758,13 @@ mod tests {
             active: true,
             uploads: Vec::new(),
             events: Vec::new(),
+        }
+    }
+
+    pub(crate) fn link_in(tenant: &str, id: &str) -> Link {
+        Link {
+            tenant: tenant.to_owned(),
+            ..test_link(id)
         }
     }
 
@@ -791,29 +909,31 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         store.audit(
+            "",
+            "",
             "link_created",
             "link-1",
             &serde_json::json!({ "label": "x" }),
         );
-        store.audit("admin_login", "10.0.0.1", &serde_json::json!({}));
+        store.audit("", "", "admin_login", "10.0.0.1", &serde_json::json!({}));
 
-        let rows = store.audit_export(0, 100).unwrap();
+        let rows = store.audit_export("", 0, 0, 100).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].event, "link_created");
         assert_eq!(rows[0].tenant, "");
         assert_eq!(rows[0].detail["label"], "x");
         // `since` is strictly greater-than (rows share second granularity).
         let after_all = store
-            .audit_export(rows.last().unwrap().at + 1, 100)
+            .audit_export("", rows.last().unwrap().at + 1, 0, 100)
             .unwrap();
         assert!(after_all.is_empty());
-        assert_eq!(store.audit_export(0, 1).unwrap().len(), 1);
+        assert_eq!(store.audit_export("", 0, 0, 1).unwrap().len(), 1);
 
         // Pruning removes only rows strictly older than the cutoff.
         let now = now_unix();
         let pruned = store.audit_prune(now + 1).unwrap();
         assert_eq!(pruned, 2);
-        assert!(store.audit_export(0, 100).unwrap().is_empty());
+        assert!(store.audit_export("", 0, 0, 100).unwrap().is_empty());
     }
 
     #[test]
@@ -839,15 +959,8 @@ mod tests {
 
 #[cfg(test)]
 mod tenant_tests {
-    use super::tests::test_link;
+    use super::tests::link_in;
     use super::*;
-
-    fn link_in(tenant: &str, id: &str) -> Link {
-        Link {
-            tenant: tenant.to_owned(),
-            ..test_link(id)
-        }
-    }
 
     #[test]
     fn links_are_invisible_across_tenants() {
@@ -902,7 +1015,7 @@ mod tenant_tests {
 
         store.remove_link("acme", "blocked").unwrap();
         assert_eq!(store.tenant_link_count("acme"), 0);
-        assert!(store.remove_tenant("acme").unwrap());
+        assert_eq!(store.remove_tenant("acme").unwrap(), TenantRemoval::Deleted);
         assert!(store.tenant("acme").is_none());
     }
 
@@ -942,5 +1055,129 @@ mod tenant_tests {
             })
             .unwrap();
         assert_eq!(store.tenant_received_bytes("acme"), 0);
+    }
+}
+
+#[cfg(test)]
+mod ops_tests {
+    use super::tests::test_link;
+    use super::*;
+
+    #[test]
+    fn backup_creates_a_queryable_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.insert_link(test_link("link-1")).unwrap();
+
+        let snapshot = directory.path().join("snapshot.db");
+        store.backup_into(&snapshot).unwrap();
+        assert!(snapshot.exists());
+
+        // The snapshot is a real database with the same rows: drop it into
+        // a fresh data dir and open it as one.
+        let restore = tempfile::tempdir().unwrap();
+        std::fs::copy(&snapshot, restore.path().join("votport.db")).unwrap();
+        let reopened = Store::open(restore.path()).unwrap();
+        assert!(reopened.link("", "link-1").is_some());
+
+        // A fresh VACUUM INTO needs the destination gone; that is the
+        // caller's contract.
+        std::fs::remove_file(&snapshot).unwrap();
+        store.backup_into(&snapshot).unwrap();
+        assert!(snapshot.exists());
+    }
+
+    #[test]
+    fn all_links_spans_tenants() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.insert_link(test_link("default-link")).unwrap();
+        let mut scoped = test_link("scoped-link");
+        scoped.tenant = "acme".to_owned();
+        store.insert_link(scoped).unwrap();
+        assert_eq!(store.all_links().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod phase4_review_tests {
+    use super::tests::link_in;
+    use super::*;
+
+    #[test]
+    fn v1_database_without_tenant_column_migrates() {
+        let directory = tempfile::tempdir().unwrap();
+        // Simulate a v1 database: links table without the tenant column.
+        {
+            let connection = Connection::open(directory.path().join("votport.db")).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     CREATE TABLE links (
+                        id TEXT PRIMARY KEY,
+                        label TEXT NOT NULL DEFAULT '',
+                        dest TEXT NOT NULL DEFAULT '',
+                        password_hash TEXT,
+                        created_at INTEGER NOT NULL,
+                        expires_at INTEGER,
+                        max_bytes INTEGER,
+                        active INTEGER NOT NULL DEFAULT 1,
+                        uploads_json TEXT NOT NULL DEFAULT '[]',
+                        events_json TEXT NOT NULL DEFAULT '[]'
+                     );
+                     INSERT INTO links (id, label, created_at, active)
+                     VALUES ('v1-link', 'old', 0, 1);",
+                )
+                .unwrap();
+        }
+        let store = Store::open(directory.path()).unwrap();
+        assert!(store.link("", "v1-link").is_some());
+        assert_eq!(store.link("", "v1-link").unwrap().tenant, "");
+    }
+
+    #[test]
+    fn link_by_id_spans_tenants_for_the_public_protocol() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.insert_link(link_in("acme", "scoped")).unwrap();
+        // Senders never know a tenant key; the id is the capability.
+        assert!(store.link_by_id("scoped").is_some());
+        assert!(store.link_by_id("missing").is_none());
+    }
+
+    #[test]
+    fn audit_export_cursor_survives_same_second_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        for index in 0..3 {
+            store.audit(
+                "",
+                "",
+                "event",
+                &format!("row-{index}"),
+                &serde_json::json!({}),
+            );
+        }
+        // Page size 2: the third row shares the second with the first two
+        // and must still be reachable through the rowid cursor.
+        let page_one = store.audit_export("", 0, 0, 2).unwrap();
+        assert_eq!(page_one.len(), 2);
+        let last = page_one.last().unwrap();
+        let page_two = store
+            .audit_export("", last.at, last.rowid as u64, 2)
+            .unwrap();
+        assert_eq!(page_two.len(), 1);
+        assert_eq!(page_two[0].subject, "row-2");
+    }
+
+    #[test]
+    fn audit_export_filters_by_tenant() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.audit("acme", "", "link_created", "l-1", &serde_json::json!({}));
+        store.audit("", "", "admin_login", "ip", &serde_json::json!({}));
+        let scoped = store.audit_export("acme", 0, 0, 100).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].tenant, "acme");
     }
 }

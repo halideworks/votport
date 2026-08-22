@@ -2,10 +2,12 @@
 
 use std::sync::Arc;
 
-use axum::extract::DefaultBodyLimit;
-use axum::response::{Html, IntoResponse as _};
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{Html, IntoResponse as _, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use std::fmt::Write as _;
 use tower_http::services::ServeDir;
 
 use crate::api;
@@ -164,6 +166,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/admin/logout", post(api::admin_logout))
         .route("/api/admin/session", get(api::admin_session))
         .route("/api/admin/audit", get(api::admin_audit_export))
+        .route("/api/admin/backup", get(api::backup_database))
         .route(
             "/api/admin/tenants",
             get(api::list_tenants).post(api::create_tenant),
@@ -191,6 +194,7 @@ pub fn router(app: Arc<App>) -> Router {
             "/api/admin/links/{id}/uploads/{upload}/files/{index}",
             axum::routing::delete(api::delete_received_file),
         )
+        .route("/metrics", axum::routing::get(metrics))
         // SSO sign-in (phase 3 of docs/multi-tenancy.md).
         .route("/api/admin/sso", get(api::sso_available))
         .route("/api/admin/sso/start", get(api::sso_start))
@@ -218,6 +222,66 @@ pub fn router(app: Arc<App>) -> Router {
         .with_state(app)
 }
 
+/// Prometheus-style plain-text metrics: counts only, no secrets. When
+/// VOTPORT_METRICS_TOKEN is set, requests must carry it as a bearer token;
+/// expose the route on an internal interface regardless.
+async fn metrics(State(app): State<std::sync::Arc<App>>, headers: HeaderMap) -> Response {
+    if let Some(expected) = &app.config.metrics_token {
+        let authorized = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|token| crate::auth::ct_eq(token.as_bytes(), expected.as_bytes()));
+        if !authorized {
+            return (StatusCode::UNAUTHORIZED, "metrics token required").into_response();
+        }
+    }
+    let tenants = app.store.tenants();
+    let mut body = format!(
+        "# TYPE votport_tenants gauge\nvotport_tenants {}\n",
+        tenants.len()
+    );
+    for tenant in &tenants {
+        let links = app.store.links(&tenant.key);
+        let bytes: u64 = links
+            .iter()
+            .flat_map(|link| link.uploads.iter().flat_map(|upload| &upload.files))
+            .filter(|file| !file.deleted)
+            .map(|file| file.bytes)
+            .sum();
+        let key = &tenant.key;
+        let _ = write!(
+            body,
+            "votport_links{{tenant=\"{key}\"}} {}\nvotport_received_bytes{{tenant=\"{key}\"}} {bytes}\n",
+            links.len()
+        );
+    }
+    let default_links = app.store.links("");
+    let _ = writeln!(
+        body,
+        "votport_links{{tenant=\"default\"}} {}",
+        default_links.len()
+    );
+    let _ = write!(
+        body,
+        "# TYPE votport_sessions_active gauge\nvotport_sessions_active {}\n",
+        app.sessions.total()
+    );
+    let _ = write!(
+        body,
+        "# TYPE votport_audit_rows gauge\nvotport_audit_rows {}\n",
+        app.store.audit_count()
+    );
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
+        .into_response()
+}
+
 /// Discards idle upload sessions and expired audit rows.
 pub async fn session_sweeper(app: Arc<App>) {
     let idle = app.config.session_idle_secs;
@@ -239,7 +303,109 @@ pub async fn session_sweeper(app: Arc<App>) {
                         Err(error) => tracing::warn!("audit prune failed: {error}"),
                     }
                 }
+                // Snapshots from /api/admin/backup accumulate on disk;
+                // keep the newest month's worth.
+                let backup_dir = app.config.data_dir.join("backups");
+                let cutoff_modified =
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+                if let Ok(entries) = std::fs::read_dir(&backup_dir) {
+                    for entry in entries.flatten() {
+                        let expired = entry
+                            .metadata()
+                            .and_then(|meta| meta.modified())
+                            .map(|modified| modified < cutoff_modified)
+                            .unwrap_or(false);
+                        if expired {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
+
+                // Received-content lifecycle: delete expired uploads from
+                // disk and tombstone their records, per tenant. Only records
+                // whose bytes were actually removed are tombstoned; a failed
+                // disk delete leaves the record live so the sweep retries.
+                if app.config.upload_retention_days > 0 {
+                    let cutoff = crate::store::now_unix()
+                        .saturating_sub(app.config.upload_retention_days.saturating_mul(86_400));
+                    for link in app.store.all_links() {
+                        for upload in &link.uploads {
+                            // completed_at == 0 marks pre-field records; never
+                            // treat those as infinitely expired.
+                            if upload.completed_at == 0 || upload.completed_at >= cutoff {
+                                continue;
+                            }
+                            let mut removed: Vec<String> = Vec::new();
+                            for file in &upload.files {
+                                if file.deleted {
+                                    continue;
+                                }
+                                let components: Vec<String> = file
+                                    .stored_as
+                                    .split('/')
+                                    .filter(|part| !part.is_empty())
+                                    .map(str::to_owned)
+                                    .collect();
+                                let Ok(path) =
+                                    crate::paths::join_under(&app.config.receive_dir, &components)
+                                else {
+                                    continue;
+                                };
+                                let _ = tokio::fs::remove_file(format!(
+                                    "{}.vot-receipt",
+                                    path.display()
+                                ))
+                                .await;
+                                match tokio::fs::remove_file(&path).await {
+                                    Ok(()) => removed.push(file.stored_as.clone()),
+                                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                        removed.push(file.stored_as.clone())
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(path = %path.display(), %error, "could not delete expired file");
+                                    }
+                                }
+                            }
+                            if removed.is_empty() {
+                                continue;
+                            }
+                            let _ = app.store.update_link(
+                                &link.tenant,
+                                &link.id,
+                                |link| {
+                                    for upload in &mut link.uploads {
+                                        for file in &mut upload.files {
+                                            if removed.contains(&file.stored_as) {
+                                                file.deleted = true;
+                                            }
+                                        }
+                                    }
+                                },
+                            );
+                            tracing::info!(
+                                target: "audit",
+                                event = "uploads_expired",
+                                link = %link.id,
+                                tenant = %link.tenant,
+                                files = removed.len(),
+                                "expired received files deleted"
+                            );
+                            app.store.audit(
+                                &link.tenant,
+                                "",
+                                "uploads_expired",
+                                &link.id,
+                                &serde_json::json!({
+                                    "tenant": link.tenant,
+                                    "files": removed.len()
+                                }),
+                            );
+                        }
+                    }
+                }
             }
+
+
         }
     }
 }
