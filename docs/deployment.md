@@ -95,6 +95,23 @@ SSO principals whose groups include `acme-admins` may switch into `acme`
 from the dashboard switcher. Named tenants publish into
 `/received/acme/...`; the default tenant keeps the receive root.
 
+Update quotas, label, or admin group without recreating the namespace
+(JSON `null` clears a quota back to unlimited; `0` is rejected):
+
+```sh
+curl -b cookies.txt -X PATCH -H 'Content-Type: application/json' \
+     -H 'X-Votport: 1' https://YOUR-HOST/api/admin/tenants/acme \
+     -d '{"max_total_bytes":214748364800,"max_links":100}'
+```
+
+## Settings
+
+Notification URLs, retention days, and default tenant quotas overlay
+environment variables via `GET`/`PUT /api/admin/settings` (default-tenant
+admin; `X-Votport` on PUT). Env remains the boot default; a written key
+wins; `""` disables a URL or token; JSON `null` deletes the row so env
+applies again. See [`enterprise-ops.md`](enterprise-ops.md).
+
 ## Metrics
 
 `GET /metrics` serves Prometheus-format counters and gauges (tenants, links,

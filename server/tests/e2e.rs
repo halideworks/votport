@@ -49,6 +49,10 @@ async fn start_server_with_cap(max_upload_bytes: u64) -> TestServer {
         session_idle_secs: 600,
         audit_retention_days: 400,
         upload_retention_days: 0,
+        default_max_total_bytes: None,
+        default_max_links: None,
+        default_max_sessions: None,
+        public_password_login: true,
         metrics_token: None,
         oidc: None,
     };

@@ -42,6 +42,14 @@ pub struct Config {
     pub audit_retention_days: u64,
     /// Days to keep received files and their records; 0 disables the sweep.
     pub upload_retention_days: u64,
+    /// Default tenant quota when a create-tenant request omits the field.
+    /// None means unlimited.
+    pub default_max_total_bytes: Option<u64>,
+    pub default_max_links: Option<u64>,
+    pub default_max_sessions: Option<u64>,
+    /// When false, the login page may collapse the local password form if
+    /// SSO is offered. The login API itself always stays available.
+    pub public_password_login: bool,
     /// When set, /metrics requires this bearer token.
     pub metrics_token: Option<String>,
     /// OIDC single sign-on for the admin dashboard. None when unset.
@@ -125,6 +133,13 @@ pub fn from_env() -> Result<Config, String> {
         Err(_) => 400,
     };
 
+    let default_max_total_bytes = optional_positive_u64("VOTPORT_DEFAULT_MAX_TOTAL_BYTES")?;
+    let default_max_links = optional_positive_u64("VOTPORT_DEFAULT_MAX_LINKS")?;
+    let default_max_sessions = optional_positive_u64("VOTPORT_DEFAULT_MAX_SESSIONS")?;
+    let public_password_login = env::var("VOTPORT_PUBLIC_PASSWORD_LOGIN")
+        .ok()
+        .is_none_or(|value| value != "0");
+
     let session_idle_secs = match env::var("VOTPORT_SESSION_IDLE_SECS") {
         Ok(value) => value
             .parse()
@@ -196,6 +211,10 @@ pub fn from_env() -> Result<Config, String> {
         session_idle_secs,
         audit_retention_days,
         upload_retention_days,
+        default_max_total_bytes,
+        default_max_links,
+        default_max_sessions,
+        public_password_login,
         metrics_token,
         oidc,
     })
@@ -206,6 +225,17 @@ fn env_or(name: &str, default: &str) -> String {
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| default.to_owned())
+}
+
+fn optional_positive_u64(name: &str) -> Result<Option<u64>, String> {
+    match env::var(name) {
+        Err(_) => Ok(None),
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => {
+            let parsed: u64 = value.parse().map_err(|error| format!("{name}: {error}"))?;
+            Ok((parsed > 0).then_some(parsed))
+        }
+    }
 }
 
 /// Parses a byte count, optionally suffixed K/KiB/KB, M/MiB/MB, G/GiB/GB or

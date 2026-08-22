@@ -42,6 +42,19 @@ fn require_admin(app: &App, headers: &HeaderMap) -> ApiResult<auth::AdminIdentit
     .ok_or_else(ApiError::unauthorized)
 }
 
+/// Default-tenant admin only. Same gate as database backup: viewers and
+/// named-tenant admins cannot read platform configuration.
+fn require_platform_admin(app: &App, headers: &HeaderMap) -> ApiResult<auth::AdminIdentity> {
+    let identity = require_admin(app, headers)?;
+    if !identity.tenant.is_empty() || identity.role != "admin" {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "default-tenant admin required",
+        ));
+    }
+    Ok(identity)
+}
+
 /// Mutating admin routes require the admin role AND a custom header;
 /// cross-site forms cannot set one, which closes CSRF without token
 /// bookkeeping. Viewers (SSO principals outside the admin group) get
@@ -238,17 +251,8 @@ pub async fn create_tenant(
     headers: HeaderMap,
     Json(request): Json<CreateTenantRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_admin(&app, &headers)?;
+    let identity = require_platform_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    // Tenant lifecycle is a platform operation: only the default tenant's
-    // admin holds it, so an SSO principal scoped to "acme" cannot mint or
-    // destroy other namespaces.
-    if !identity.tenant.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "tenant administration requires the default-tenant admin",
-        ));
-    }
     let key = paths::admit_dest(&request.key)
         .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     if key.is_empty() || key == "default" {
@@ -262,13 +266,23 @@ pub async fn create_tenant(
     if app.store.tenant(&key).is_some() {
         return Err(ApiError::new(StatusCode::CONFLICT, "tenant already exists"));
     }
+    let defaults = app.store.resolved_settings(&app.config);
     let tenant = crate::store::Tenant {
         key: key.clone(),
         label: request.label.trim().to_owned(),
         admin_group: request.admin_group.filter(|group| !group.trim().is_empty()),
-        max_total_bytes: request.max_total_bytes.filter(|&bytes| bytes > 0),
-        max_links: request.max_links.filter(|&links| links > 0),
-        max_sessions: request.max_sessions.filter(|&sessions| sessions > 0),
+        max_total_bytes: request
+            .max_total_bytes
+            .or(defaults.default_max_total_bytes)
+            .filter(|&bytes| bytes > 0),
+        max_links: request
+            .max_links
+            .or(defaults.default_max_links)
+            .filter(|&links| links > 0),
+        max_sessions: request
+            .max_sessions
+            .or(defaults.default_max_sessions)
+            .filter(|&sessions| sessions > 0),
         created_at: now_unix(),
     };
     app.store
@@ -284,14 +298,7 @@ pub async fn list_tenants(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_admin(&app, &headers)?;
-    // Namespace keys/labels/quotas are platform metadata, not tenant data.
-    if !identity.tenant.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "tenant administration requires the default-tenant admin",
-        ));
-    }
+    let _identity = require_platform_admin(&app, &headers)?;
     Ok(Json(json!({ "tenants": app.store.tenants() })))
 }
 
@@ -300,14 +307,8 @@ pub async fn delete_tenant(
     Path(key): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_admin(&app, &headers)?;
+    let identity = require_platform_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    if !identity.tenant.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "tenant administration requires the default-tenant admin",
-        ));
-    }
     let count = app.store.tenant_link_count(&key);
     if count > 0 {
         return Err(ApiError::new(
@@ -341,21 +342,92 @@ pub async fn delete_tenant(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[derive(Deserialize)]
+pub struct PatchTenantRequest {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    admin_group: Option<Option<String>>,
+    #[serde(default)]
+    max_total_bytes: Option<Option<u64>>,
+    #[serde(default)]
+    max_links: Option<Option<u64>>,
+    #[serde(default)]
+    max_sessions: Option<Option<u64>>,
+}
+
+fn patch_quota(field: &str, value: Option<u64>) -> ApiResult<Option<u64>> {
+    match value {
+        None => Ok(None),
+        Some(0) => Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{field} must be greater than zero"),
+        )),
+        Some(n) => Ok(Some(n)),
+    }
+}
+
+/// Updates label, admin group, or quotas on an existing tenant. The key is
+/// a folder name and cannot be renamed here.
+pub async fn update_tenant(
+    State(app): State<Arc<App>>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<PatchTenantRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_platform_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
+    let Some(mut tenant) = app.store.tenant(&key) else {
+        return Err(ApiError::not_found());
+    };
+    if let Some(label) = request.label {
+        tenant.label = label.trim().to_owned();
+    }
+    if let Some(group) = request.admin_group {
+        tenant.admin_group = group
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_owned());
+    }
+    if let Some(bytes) = request.max_total_bytes {
+        tenant.max_total_bytes = patch_quota("max_total_bytes", bytes)?;
+    }
+    if let Some(links) = request.max_links {
+        tenant.max_links = patch_quota("max_links", links)?;
+    }
+    if let Some(sessions) = request.max_sessions {
+        tenant.max_sessions = patch_quota("max_sessions", sessions)?;
+    }
+    if !app
+        .store
+        .update_tenant(&tenant)
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::not_found());
+    }
+    tracing::info!(target: "audit", event = "tenant_updated", key = %key, "tenant namespace updated");
+    app.store.audit(
+        "",
+        &identity.subject,
+        "tenant_updated",
+        &key,
+        &json!({
+            "label": tenant.label,
+            "admin_group": tenant.admin_group,
+            "max_total_bytes": tenant.max_total_bytes,
+            "max_links": tenant.max_links,
+            "max_sessions": tenant.max_sessions,
+        }),
+    );
+    Ok(Json(json!({ "ok": true })))
+}
+
 /// Streams a consistent SQLite snapshot as a download. Read-only operation:
 /// admin session required, CSRF header not (nothing mutates).
 pub async fn backup_database(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let identity = require_admin(&app, &headers)?;
-    // The snapshot spans every tenant plus the credential store: only the
-    // default tenant's admin may take it.
-    if !identity.tenant.is_empty() || identity.role != "admin" {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "default-tenant admin required",
-        ));
-    }
+    let _identity = require_platform_admin(&app, &headers)?;
     let backups = app.config.data_dir.join("backups");
     tokio::fs::create_dir_all(&backups)
         .await
@@ -390,6 +462,198 @@ pub async fn backup_database(
         bytes,
     )
         .into_response())
+}
+
+const SETTINGS_KEYS: &[&str] = &[
+    "notify_webhook",
+    "notify_ntfy",
+    "notify_ntfy_token",
+    "notify_pushover_token",
+    "notify_pushover_user",
+    "audit_retention_days",
+    "upload_retention_days",
+    "default_max_total_bytes",
+    "default_max_links",
+    "default_max_sessions",
+    "public_password_login",
+];
+
+pub async fn get_settings(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let _identity = require_platform_admin(&app, &headers)?;
+    Ok(Json(settings_json(&app)))
+}
+
+fn settings_json(app: &App) -> serde_json::Value {
+    let overlay = app.store.overlay(&app.config);
+    let resolved = &overlay.resolved;
+    json!({
+        "notify_webhook": resolved.notify_webhook,
+        "notify_webhook_source": overlay.notify_webhook_source,
+        "notify_ntfy": resolved.notify_ntfy,
+        "notify_ntfy_source": overlay.notify_ntfy_source,
+        "notify_ntfy_token_set": resolved.notify_ntfy_token.is_some(),
+        "notify_ntfy_token_source": overlay.notify_ntfy_token_source,
+        "notify_pushover_set": resolved.notify_pushover.is_some(),
+        "notify_pushover_token_set": overlay.notify_pushover_token_set,
+        "notify_pushover_token_source": overlay.notify_pushover_token_source,
+        "notify_pushover_user_set": overlay.notify_pushover_user_set,
+        "notify_pushover_user_source": overlay.notify_pushover_user_source,
+        "audit_retention_days": resolved.audit_retention_days,
+        "audit_retention_days_source": overlay.audit_retention_days_source,
+        "upload_retention_days": resolved.upload_retention_days,
+        "upload_retention_days_source": overlay.upload_retention_days_source,
+        "default_max_total_bytes": resolved.default_max_total_bytes,
+        "default_max_total_bytes_source": overlay.default_max_total_bytes_source,
+        "default_max_links": resolved.default_max_links,
+        "default_max_links_source": overlay.default_max_links_source,
+        "default_max_sessions": resolved.default_max_sessions,
+        "default_max_sessions_source": overlay.default_max_sessions_source,
+        "public_password_login": resolved.public_password_login,
+        "public_password_login_source": overlay.public_password_login_source,
+        "sso_configured": app.sso_config.is_some(),
+    })
+}
+
+fn write_url(key: &str, value: &serde_json::Value) -> ApiResult<crate::store::SettingWrite> {
+    match value {
+        serde_json::Value::Null => Ok(crate::store::SettingWrite::Reset),
+        serde_json::Value::String(text) if text.is_empty() => {
+            Ok(crate::store::SettingWrite::Set(String::new()))
+        }
+        serde_json::Value::String(text)
+            if text.starts_with("http://") || text.starts_with("https://") =>
+        {
+            Ok(crate::store::SettingWrite::Set(text.clone()))
+        }
+        serde_json::Value::String(_) => Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{key} must be an http:// or https:// URL"),
+        )),
+        _ => Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{key} must be a string or null"),
+        )),
+    }
+}
+
+fn write_secret(key: &str, value: &serde_json::Value) -> ApiResult<crate::store::SettingWrite> {
+    match value {
+        serde_json::Value::Null => Ok(crate::store::SettingWrite::Reset),
+        serde_json::Value::String(text) => Ok(crate::store::SettingWrite::Set(text.clone())),
+        _ => Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{key} must be a string or null"),
+        )),
+    }
+}
+
+fn write_u64(
+    key: &str,
+    value: &serde_json::Value,
+    allow_zero: bool,
+) -> ApiResult<crate::store::SettingWrite> {
+    match value {
+        serde_json::Value::Null => Ok(crate::store::SettingWrite::Reset),
+        serde_json::Value::Number(number) => {
+            let Some(parsed) = number.as_u64() else {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("{key} must be a non-negative integer"),
+                ));
+            };
+            if !allow_zero && parsed == 0 {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("{key} must be greater than zero"),
+                ));
+            }
+            Ok(crate::store::SettingWrite::Set(parsed.to_string()))
+        }
+        _ => Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{key} must be a number or null"),
+        )),
+    }
+}
+
+fn write_bool(key: &str, value: &serde_json::Value) -> ApiResult<crate::store::SettingWrite> {
+    match value {
+        serde_json::Value::Null => Ok(crate::store::SettingWrite::Reset),
+        serde_json::Value::Bool(true) => Ok(crate::store::SettingWrite::Set("1".to_owned())),
+        serde_json::Value::Bool(false) => Ok(crate::store::SettingWrite::Set("0".to_owned())),
+        _ => Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{key} must be a boolean or null"),
+        )),
+    }
+}
+
+pub async fn put_settings(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_platform_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
+    let object = body
+        .as_object()
+        .ok_or_else(|| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "expected a JSON object"))?;
+    for key in object.keys() {
+        if !SETTINGS_KEYS.contains(&key.as_str()) {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("unknown setting {key}"),
+            ));
+        }
+    }
+    let mut writes = Vec::new();
+    let mut keys = Vec::new();
+    let mut reset = Vec::new();
+    for key in SETTINGS_KEYS {
+        let Some(value) = object.get(*key) else {
+            continue;
+        };
+        let write = match *key {
+            "notify_webhook" | "notify_ntfy" => write_url(key, value)?,
+            "notify_ntfy_token" | "notify_pushover_token" | "notify_pushover_user" => {
+                write_secret(key, value)?
+            }
+            "audit_retention_days" | "upload_retention_days" => write_u64(key, value, true)?,
+            "default_max_total_bytes" | "default_max_links" | "default_max_sessions" => {
+                write_u64(key, value, false)?
+            }
+            "public_password_login" => write_bool(key, value)?,
+            _ => unreachable!(),
+        };
+        match &write {
+            crate::store::SettingWrite::Reset => reset.push((*key).to_owned()),
+            crate::store::SettingWrite::Set(_) => keys.push((*key).to_owned()),
+        }
+        writes.push(((*key).to_owned(), write));
+    }
+    if !writes.is_empty() {
+        app.store
+            .put_settings(&identity.subject, &writes)
+            .map_err(ApiError::internal)?;
+        tracing::info!(
+            target: "audit",
+            event = "settings_updated",
+            keys = keys.len(),
+            reset = reset.len(),
+            "admin settings updated"
+        );
+        app.store.audit(
+            "",
+            &identity.subject,
+            "settings_updated",
+            "",
+            &json!({ "keys": keys, "reset": reset }),
+        );
+    }
+    Ok(Json(settings_json(&app)))
 }
 
 #[derive(Deserialize)]
@@ -684,7 +948,8 @@ pub async fn create_link(
             "this session's tenant no longer exists; sign in again",
         ));
     }
-    if let Some(max_links) = app.store.tenant(&tenant).and_then(|t| t.max_links) {
+    let (_, max_links, _) = app.store.quotas_for(&tenant, &app.config);
+    if let Some(max_links) = max_links {
         let count = u64::try_from(app.store.links(&tenant).len()).unwrap_or(u64::MAX);
         if count >= max_links {
             return Err(ApiError::new(
@@ -1290,6 +1555,10 @@ mod ops_tests {
             session_idle_secs: 60,
             audit_retention_days: 400,
             upload_retention_days: 0,
+            default_max_total_bytes: None,
+            default_max_links: None,
+            default_max_sessions: None,
+            public_password_login: true,
             metrics_token: None,
             oidc: None,
         }
@@ -1374,5 +1643,354 @@ mod backup_tests {
         assert!(!body.is_empty());
         // SQLite databases begin with the magic string.
         assert!(body.starts_with(b"SQLite format 3\0"));
+    }
+}
+
+#[cfg(test)]
+mod settings_api_tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt;
+
+    use crate::api::testing;
+    use crate::app;
+    use crate::auth::{self, TenantGrant};
+    use crate::store::SettingWrite;
+
+    fn cookie_for(app: &App, tenant: &str, role: &str) -> String {
+        let identity = auth::AdminIdentity {
+            subject: format!("sso:{tenant}:{role}"),
+            tenant: tenant.to_owned(),
+            role: role.to_owned(),
+            grants: vec![TenantGrant {
+                tenant: tenant.to_owned(),
+                role: role.to_owned(),
+            }],
+        };
+        format!(
+            "votport_admin={}; Path=/",
+            auth::issue_admin_token(&app.secret, &identity, &admin_token_phc(app))
+        )
+    }
+
+    async fn send(
+        application: Arc<App>,
+        request: Request<Body>,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = app::router(application).oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn get_settings_returns_env_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = cookie_for(&application, "", "admin");
+        let (status, json) = send(
+            application,
+            Request::get("/api/admin/settings")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["audit_retention_days"], 400);
+        assert_eq!(json["audit_retention_days_source"], "env");
+        assert_eq!(json["upload_retention_days"], 0);
+        assert_eq!(json["upload_retention_days_source"], "env");
+        assert_eq!(json["notify_webhook"], serde_json::Value::Null);
+        assert_eq!(json["notify_webhook_source"], "env");
+        assert_eq!(json["notify_ntfy_token_set"], false);
+        assert_eq!(json["default_max_total_bytes"], serde_json::Value::Null);
+        assert_eq!(json["public_password_login"], true);
+        assert_eq!(json["sso_configured"], false);
+    }
+
+    #[tokio::test]
+    async fn put_then_get_shows_db_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = cookie_for(&application, "", "admin");
+        let (status, json) = send(
+            application.clone(),
+            Request::builder()
+                .method("PUT")
+                .uri("/api/admin/settings")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"audit_retention_days":7,"notify_webhook":"https://db.example/hook"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["audit_retention_days"], 7);
+        assert_eq!(json["audit_retention_days_source"], "db");
+        assert_eq!(json["notify_webhook"], "https://db.example/hook");
+        assert_eq!(json["notify_webhook_source"], "db");
+        assert_eq!(json["upload_retention_days_source"], "env");
+    }
+
+    #[tokio::test]
+    async fn put_omitting_a_secret_leaves_the_previous_value() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = cookie_for(&application, "", "admin");
+        let (status, _) = send(
+            application.clone(),
+            Request::builder()
+                .method("PUT")
+                .uri("/api/admin/settings")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"notify_ntfy_token":"secret-token"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, json) = send(
+            application,
+            Request::builder()
+                .method("PUT")
+                .uri("/api/admin/settings")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"audit_retention_days":10}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["notify_ntfy_token_set"], true);
+        assert_eq!(json["notify_ntfy_token_source"], "db");
+        assert!(json.get("notify_ntfy_token").is_none());
+        assert_eq!(json["audit_retention_days"], 10);
+    }
+
+    #[tokio::test]
+    async fn put_empty_url_disables_env_webhook() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = testing::config(directory.path());
+        config.notify_webhook = Some("https://env.example/hook".to_owned());
+        let application = app::build(config).unwrap();
+        let cookie = cookie_for(&application, "", "admin");
+        let (status, json) = send(
+            application.clone(),
+            Request::builder()
+                .method("PUT")
+                .uri("/api/admin/settings")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"notify_webhook":""}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["notify_webhook"], serde_json::Value::Null);
+        assert_eq!(json["notify_webhook_source"], "db");
+
+        let (status, json) = send(
+            application,
+            Request::builder()
+                .method("PUT")
+                .uri("/api/admin/settings")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"notify_webhook":null}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["notify_webhook"], "https://env.example/hook");
+        assert_eq!(json["notify_webhook_source"], "env");
+    }
+
+    #[tokio::test]
+    async fn put_rejects_zero_default_quota_and_non_http_url() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = cookie_for(&application, "", "admin");
+        let (status, _) = send(
+            application.clone(),
+            Request::builder()
+                .method("PUT")
+                .uri("/api/admin/settings")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"default_max_total_bytes":0}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status, json) = send(
+            application.clone(),
+            Request::builder()
+                .method("PUT")
+                .uri("/api/admin/settings")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"audit_retention_days":0}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["audit_retention_days"], 0);
+
+        let (status, _) = send(
+            application,
+            Request::builder()
+                .method("PUT")
+                .uri("/api/admin/settings")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"notify_webhook":"ftp://nope"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn viewer_and_named_admin_cannot_read_settings_or_tenants() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let viewer = cookie_for(&application, "", "viewer");
+        let named = cookie_for(&application, "acme", "admin");
+
+        for cookie in [&viewer, &named] {
+            let (status, _) = send(
+                application.clone(),
+                Request::get("/api/admin/settings")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            let (status, _) = send(
+                application.clone(),
+                Request::get("/api/admin/tenants")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[tokio::test]
+    async fn put_settings_requires_csrf_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = cookie_for(&application, "", "admin");
+        let (status, json) = send(
+            application,
+            Request::builder()
+                .method("PUT")
+                .uri("/api/admin/settings")
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"audit_retention_days":1}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(json["error"], "missing X-Votport header");
+    }
+
+    #[tokio::test]
+    async fn patch_tenant_quota_then_create_session_hits_the_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(crate::store::Tenant {
+                key: "acme".to_owned(),
+                label: String::new(),
+                admin_group: None,
+                max_total_bytes: None,
+                max_links: None,
+                max_sessions: None,
+                created_at: 0,
+            })
+            .unwrap();
+        application
+            .store
+            .insert_link(crate::store::Link {
+                id: "acme-link".to_owned(),
+                tenant: "acme".to_owned(),
+                label: "open".to_owned(),
+                dest: String::new(),
+                password_hash: None,
+                created_at: 0,
+                expires_at: None,
+                max_bytes: None,
+                active: true,
+                uploads: Vec::new(),
+                events: Vec::new(),
+            })
+            .unwrap();
+        let cookie = cookie_for(&application, "", "admin");
+        let (status, _) = send(
+            application.clone(),
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/admin/tenants/acme")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"max_total_bytes":100}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let router = app::router(application);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/r/acme-link/session")
+            .header("content-type", "application/json")
+            .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
+            .body(Body::from(
+                r#"{"package":{"suite":"blake3","root":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","length":200}}"#,
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn overlay_skips_invalid_text_without_panic() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .put_settings(
+                "local",
+                &[(
+                    "audit_retention_days".to_owned(),
+                    SettingWrite::Set("nope".to_owned()),
+                )],
+            )
+            .unwrap();
+        let resolved = application.store.resolved_settings(&application.config);
+        assert_eq!(resolved.audit_retention_days, 400);
     }
 }

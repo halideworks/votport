@@ -6,12 +6,15 @@
 //! embedded JSON on the link row; splitting them into tables is phase 2 work
 //! (see docs/multi-tenancy.md).
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension as _};
 use serde::{Deserialize, Serialize};
+
+use crate::config::Config;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileRecord {
@@ -132,6 +135,49 @@ impl Tenant {
     }
 }
 
+/// One settings PUT: write TEXT (including empty disable) or delete the row.
+#[derive(Clone, Debug)]
+pub enum SettingWrite {
+    Set(String),
+    Reset,
+}
+
+/// Env values with a written settings row overlaid. Callers must not cache
+/// this across requests: a PUT is visible on the next read.
+#[derive(Clone, Debug)]
+pub struct ResolvedSettings {
+    pub notify_webhook: Option<String>,
+    pub notify_ntfy: Option<String>,
+    pub notify_ntfy_token: Option<String>,
+    pub notify_pushover: Option<(String, String)>,
+    pub audit_retention_days: u64,
+    pub upload_retention_days: u64,
+    pub default_max_total_bytes: Option<u64>,
+    pub default_max_links: Option<u64>,
+    pub default_max_sessions: Option<u64>,
+    pub public_password_login: bool,
+}
+
+/// Resolved settings plus whether each key came from the database or env.
+/// `source` is `"env"` when the row is absent or its TEXT was invalid.
+#[derive(Clone, Debug)]
+pub struct SettingsOverlay {
+    pub resolved: ResolvedSettings,
+    pub notify_webhook_source: &'static str,
+    pub notify_ntfy_source: &'static str,
+    pub notify_ntfy_token_source: &'static str,
+    pub notify_pushover_token_set: bool,
+    pub notify_pushover_token_source: &'static str,
+    pub notify_pushover_user_set: bool,
+    pub notify_pushover_user_source: &'static str,
+    pub audit_retention_days_source: &'static str,
+    pub upload_retention_days_source: &'static str,
+    pub default_max_total_bytes_source: &'static str,
+    pub default_max_links_source: &'static str,
+    pub default_max_sessions_source: &'static str,
+    pub public_password_login_source: &'static str,
+}
+
 /// The pre-SQLite state document, kept only to import legacy state.json files.
 #[derive(Deserialize)]
 struct LegacyDocument {
@@ -141,7 +187,16 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-const SCHEMA_VERSION: &str = "3";
+const SCHEMA_VERSION: u64 = 4;
+
+const SETTINGS_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    updated_by TEXT NOT NULL DEFAULT ''
+);
+";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -220,16 +275,36 @@ impl Store {
             })
             .ok();
         store.import_legacy(data_dir)?;
-        store.with(|connection| {
+        store.migrate()?;
+        Ok(store)
+    }
+
+    /// Forward-only schema steps. A file written by a newer binary is refused
+    /// rather than stamped down: rewriting `schema_version` would hide tables
+    /// this process cannot read.
+    fn migrate(&self) -> Result<(), String> {
+        let connection = self.connection.lock().expect("store poisoned");
+        let stored = schema_version_stored(&connection)?;
+        if stored > SCHEMA_VERSION {
+            return Err(format!(
+                "database schema version {stored} is newer than this binary ({SCHEMA_VERSION}); refusing to start"
+            ));
+        }
+        if stored < 4 {
+            connection
+                .execute_batch(SETTINGS_SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
+        }
+        if stored < SCHEMA_VERSION {
             connection
                 .execute(
                     "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
                      ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    [SCHEMA_VERSION],
+                    [SCHEMA_VERSION.to_string()],
                 )
-                .map(|_| ())
-        })?;
-        Ok(store)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     /// Imports a legacy state.json once: links and the admin hash move into
@@ -481,6 +556,25 @@ impl Store {
         })
     }
 
+    pub fn update_tenant(&self, tenant: &Tenant) -> Result<bool, String> {
+        self.with(|connection| {
+            let changed = connection.execute(
+                "UPDATE tenants SET label = ?2, admin_group = ?3, max_total_bytes = ?4,
+                                    max_links = ?5, max_sessions = ?6
+                 WHERE key = ?1",
+                rusqlite::params![
+                    tenant.key,
+                    tenant.label,
+                    tenant.admin_group,
+                    tenant.max_total_bytes.map(|bytes| bytes as i64),
+                    tenant.max_links.map(|links| links as i64),
+                    tenant.max_sessions.map(|sessions| sessions as i64),
+                ],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
     // ------------------------------------------------- operations helpers
 
     /// Consistent snapshot of the database via SQLite's VACUUM INTO. The
@@ -516,6 +610,104 @@ impl Store {
                 .map(|value| value.max(0) as u64)
         })
         .expect("store read failed")
+    }
+
+    // -------------------------------------------------------------- settings
+
+    pub fn setting(&self, key: &str) -> Option<String> {
+        self.with(|connection| {
+            connection
+                .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                    row.get(0)
+                })
+                .optional()
+        })
+        .expect("store read failed")
+    }
+
+    pub fn settings_map(&self) -> HashMap<String, String> {
+        self.with(|connection| {
+            let mut statement = connection.prepare("SELECT key, value FROM settings")?;
+            let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<Result<HashMap<_, _>, _>>()
+        })
+        .expect("store read failed")
+    }
+
+    pub fn put_settings(
+        &self,
+        actor: &str,
+        writes: &[(String, SettingWrite)],
+    ) -> Result<(), String> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let now = i64::try_from(now_unix()).unwrap_or(0);
+        for (key, write) in writes {
+            match write {
+                SettingWrite::Set(value) => {
+                    transaction
+                        .execute(
+                            "INSERT INTO settings (key, value, updated_at, updated_by)
+                             VALUES (?1, ?2, ?3, ?4)
+                             ON CONFLICT(key) DO UPDATE SET
+                                value = excluded.value,
+                                updated_at = excluded.updated_at,
+                                updated_by = excluded.updated_by",
+                            rusqlite::params![key, value, now, actor],
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+                SettingWrite::Reset => {
+                    transaction
+                        .execute("DELETE FROM settings WHERE key = ?1", [key])
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn delete_setting(&self, key: &str) -> Result<(), String> {
+        self.with(|connection| connection.execute("DELETE FROM settings WHERE key = ?1", [key]))
+            .map(|_| ())
+    }
+
+    pub fn overlay(&self, config: &Config) -> SettingsOverlay {
+        overlay_rows(&self.settings_map(), config)
+    }
+
+    pub fn resolved_settings(&self, config: &Config) -> ResolvedSettings {
+        self.overlay(config).resolved
+    }
+
+    /// Quotas that apply to `tenant_key`: the tenant row for a named
+    /// namespace, or `default_max_*` for the implicit default tenant.
+    pub fn quotas_for(
+        &self,
+        tenant_key: &str,
+        config: &Config,
+    ) -> (Option<u64>, Option<u64>, Option<u64>) {
+        if tenant_key.is_empty() {
+            let settings = self.resolved_settings(config);
+            (
+                settings.default_max_total_bytes,
+                settings.default_max_links,
+                settings.default_max_sessions,
+            )
+        } else {
+            self.tenant(tenant_key)
+                .map(|tenant| {
+                    (
+                        tenant.max_total_bytes,
+                        tenant.max_links,
+                        tenant.max_sessions,
+                    )
+                })
+                .unwrap_or((None, None, None))
+        }
     }
 
     // -------------------------------------------------------------- quotas
@@ -733,6 +925,146 @@ pub enum TenantRemoval {
     Deleted,
     Absent,
     HasLinks,
+}
+
+fn schema_version_stored(connection: &Connection) -> Result<u64, String> {
+    let value: Option<String> = connection
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    match value {
+        None => Ok(3),
+        Some(raw) => raw
+            .parse::<u64>()
+            .map_err(|_| format!("meta.schema_version is not a number ({raw})")),
+    }
+}
+
+fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOverlay {
+    let (notify_webhook, notify_webhook_source) =
+        overlay_text(rows, "notify_webhook", config.notify_webhook.clone());
+    let (notify_ntfy, notify_ntfy_source) =
+        overlay_text(rows, "notify_ntfy", config.notify_ntfy.clone());
+    let (notify_ntfy_token, notify_ntfy_token_source) =
+        overlay_text(rows, "notify_ntfy_token", config.notify_ntfy_token.clone());
+    let env_pushover_token = config
+        .notify_pushover
+        .as_ref()
+        .map(|(token, _)| token.clone());
+    let env_pushover_user = config
+        .notify_pushover
+        .as_ref()
+        .map(|(_, user)| user.clone());
+    let (pushover_token, notify_pushover_token_source) =
+        overlay_text(rows, "notify_pushover_token", env_pushover_token);
+    let (pushover_user, notify_pushover_user_source) =
+        overlay_text(rows, "notify_pushover_user", env_pushover_user);
+    let notify_pushover_token_set = pushover_token.is_some();
+    let notify_pushover_user_set = pushover_user.is_some();
+    let notify_pushover = match (pushover_token, pushover_user) {
+        (Some(token), Some(user)) => Some((token, user)),
+        _ => None,
+    };
+    let (audit_retention_days, audit_retention_days_source) =
+        overlay_u64(rows, "audit_retention_days", config.audit_retention_days);
+    let (upload_retention_days, upload_retention_days_source) =
+        overlay_u64(rows, "upload_retention_days", config.upload_retention_days);
+    let (default_max_total_bytes, default_max_total_bytes_source) = overlay_positive(
+        rows,
+        "default_max_total_bytes",
+        config.default_max_total_bytes,
+    );
+    let (default_max_links, default_max_links_source) =
+        overlay_positive(rows, "default_max_links", config.default_max_links);
+    let (default_max_sessions, default_max_sessions_source) =
+        overlay_positive(rows, "default_max_sessions", config.default_max_sessions);
+    let (public_password_login, public_password_login_source) =
+        overlay_bool(rows, "public_password_login", config.public_password_login);
+    SettingsOverlay {
+        resolved: ResolvedSettings {
+            notify_webhook,
+            notify_ntfy,
+            notify_ntfy_token,
+            notify_pushover,
+            audit_retention_days,
+            upload_retention_days,
+            default_max_total_bytes,
+            default_max_links,
+            default_max_sessions,
+            public_password_login,
+        },
+        notify_webhook_source,
+        notify_ntfy_source,
+        notify_ntfy_token_source,
+        notify_pushover_token_set,
+        notify_pushover_token_source,
+        notify_pushover_user_set,
+        notify_pushover_user_source,
+        audit_retention_days_source,
+        upload_retention_days_source,
+        default_max_total_bytes_source,
+        default_max_links_source,
+        default_max_sessions_source,
+        public_password_login_source,
+    }
+}
+
+fn overlay_text(
+    rows: &HashMap<String, String>,
+    key: &str,
+    env: Option<String>,
+) -> (Option<String>, &'static str) {
+    match rows.get(key) {
+        None => (env, "env"),
+        Some(value) if value.is_empty() => (None, "db"),
+        Some(value) => (Some(value.clone()), "db"),
+    }
+}
+
+fn overlay_u64(rows: &HashMap<String, String>, key: &str, env: u64) -> (u64, &'static str) {
+    match rows.get(key) {
+        None => (env, "env"),
+        Some(value) => match value.parse::<u64>() {
+            Ok(parsed) => (parsed, "db"),
+            Err(_) => {
+                tracing::error!(key, value, "invalid settings value; using env default");
+                (env, "env")
+            }
+        },
+    }
+}
+
+fn overlay_positive(
+    rows: &HashMap<String, String>,
+    key: &str,
+    env: Option<u64>,
+) -> (Option<u64>, &'static str) {
+    match rows.get(key) {
+        None => (env, "env"),
+        Some(value) => match value.parse::<u64>() {
+            Ok(parsed) if parsed > 0 => (Some(parsed), "db"),
+            _ => {
+                tracing::error!(key, value, "invalid settings value; using env default");
+                (env, "env")
+            }
+        },
+    }
+}
+
+fn overlay_bool(rows: &HashMap<String, String>, key: &str, env: bool) -> (bool, &'static str) {
+    match rows.get(key) {
+        None => (env, "env"),
+        Some(value) if value == "1" => (true, "db"),
+        Some(value) if value == "0" => (false, "db"),
+        Some(value) => {
+            tracing::error!(key, value, "invalid settings value; using env default");
+            (env, "env")
+        }
+    }
 }
 
 pub fn now_unix() -> u64 {
@@ -1179,5 +1511,207 @@ mod phase4_review_tests {
         let scoped = store.audit_export("acme", 0, 0, 100).unwrap();
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].tenant, "acme");
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    fn test_config() -> Config {
+        Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            data_dir: std::path::PathBuf::from("/nonexistent"),
+            receive_dir: std::path::PathBuf::from("/nonexistent"),
+            web_root: std::path::PathBuf::from("../web"),
+            admin_password_hash: "x".to_owned(),
+            admin_token_tag: "tag".to_owned(),
+            notify_webhook: Some("https://env.example/hook".to_owned()),
+            notify_ntfy: None,
+            notify_ntfy_token: Some("env-token".to_owned()),
+            notify_pushover: None,
+            public_url: None,
+            max_upload_bytes: 1024,
+            allow_hidden: false,
+            session_idle_secs: 60,
+            audit_retention_days: 400,
+            upload_retention_days: 0,
+            metrics_token: None,
+            oidc: None,
+            default_max_total_bytes: None,
+            default_max_links: None,
+            default_max_sessions: None,
+            public_password_login: true,
+        }
+    }
+
+    fn schema_version(data_dir: &Path) -> String {
+        let connection = Connection::open(data_dir.join("votport.db")).unwrap();
+        connection
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn empty_settings_table_follows_env() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let overlay = store.overlay(&test_config());
+        assert_eq!(
+            overlay.resolved.notify_webhook.as_deref(),
+            Some("https://env.example/hook")
+        );
+        assert_eq!(overlay.notify_webhook_source, "env");
+        assert_eq!(overlay.resolved.audit_retention_days, 400);
+        assert_eq!(overlay.audit_retention_days_source, "env");
+        assert_eq!(overlay.resolved.upload_retention_days, 0);
+        assert_eq!(
+            overlay.resolved.notify_ntfy_token.as_deref(),
+            Some("env-token")
+        );
+        assert!(overlay.resolved.default_max_total_bytes.is_none());
+        assert!(overlay.resolved.public_password_login);
+    }
+
+    #[test]
+    fn written_key_wins_unwritten_keys_keep_env() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .put_settings(
+                "local",
+                &[(
+                    "notify_webhook".to_owned(),
+                    SettingWrite::Set("https://db.example/hook".to_owned()),
+                )],
+            )
+            .unwrap();
+        let overlay = store.overlay(&test_config());
+        assert_eq!(
+            overlay.resolved.notify_webhook.as_deref(),
+            Some("https://db.example/hook")
+        );
+        assert_eq!(overlay.notify_webhook_source, "db");
+        assert_eq!(overlay.resolved.audit_retention_days, 400);
+        assert_eq!(overlay.audit_retention_days_source, "env");
+    }
+
+    #[test]
+    fn empty_string_disables_url_despite_env() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .put_settings(
+                "local",
+                &[(
+                    "notify_webhook".to_owned(),
+                    SettingWrite::Set(String::new()),
+                )],
+            )
+            .unwrap();
+        let overlay = store.overlay(&test_config());
+        assert_eq!(overlay.resolved.notify_webhook, None);
+        assert_eq!(overlay.notify_webhook_source, "db");
+    }
+
+    #[test]
+    fn reset_deletes_the_row_and_env_applies() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .put_settings(
+                "local",
+                &[(
+                    "notify_webhook".to_owned(),
+                    SettingWrite::Set("https://db.example/hook".to_owned()),
+                )],
+            )
+            .unwrap();
+        store
+            .put_settings(
+                "local",
+                &[("notify_webhook".to_owned(), SettingWrite::Reset)],
+            )
+            .unwrap();
+        let overlay = store.overlay(&test_config());
+        assert_eq!(
+            overlay.resolved.notify_webhook.as_deref(),
+            Some("https://env.example/hook")
+        );
+        assert_eq!(overlay.notify_webhook_source, "env");
+        assert!(store.setting("notify_webhook").is_none());
+    }
+
+    #[test]
+    fn invalid_stored_days_skip_to_env() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .put_settings(
+                "local",
+                &[(
+                    "audit_retention_days".to_owned(),
+                    SettingWrite::Set("nope".to_owned()),
+                )],
+            )
+            .unwrap();
+        let overlay = store.overlay(&test_config());
+        assert_eq!(overlay.resolved.audit_retention_days, 400);
+        assert_eq!(overlay.audit_retention_days_source, "env");
+    }
+
+    #[test]
+    fn db_retention_is_what_the_sweeper_would_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .put_settings(
+                "local",
+                &[(
+                    "audit_retention_days".to_owned(),
+                    SettingWrite::Set("7".to_owned()),
+                )],
+            )
+            .unwrap();
+        assert_eq!(
+            store.resolved_settings(&test_config()).audit_retention_days,
+            7
+        );
+    }
+
+    #[test]
+    fn open_refuses_a_newer_schema_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        drop(store);
+        {
+            let connection = Connection::open(directory.path().join("votport.db")).unwrap();
+            connection
+                .execute(
+                    "UPDATE meta SET value = '99' WHERE key = 'schema_version'",
+                    [],
+                )
+                .unwrap();
+        }
+        let error = match Store::open(directory.path()) {
+            Err(error) => error,
+            Ok(_) => panic!("expected open to refuse a newer schema"),
+        };
+        assert!(error.contains("99"), "{error}");
+        assert!(error.contains("newer"), "{error}");
+    }
+
+    #[test]
+    fn open_does_not_stamp_schema_version_down() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        drop(store);
+        assert_eq!(schema_version(directory.path()), "4");
+        Store::open(directory.path()).unwrap();
+        assert_eq!(schema_version(directory.path()), "4");
     }
 }

@@ -173,8 +173,12 @@ pub fn router(app: Arc<App>) -> Router {
             get(api::list_tenants).post(api::create_tenant),
         )
         .route(
+            "/api/admin/settings",
+            get(api::get_settings).put(api::put_settings),
+        )
+        .route(
             "/api/admin/tenants/{key}",
-            axum::routing::delete(api::delete_tenant),
+            axum::routing::patch(api::update_tenant).delete(api::delete_tenant),
         )
         .route("/api/admin/tenant", post(api::switch_tenant))
         .route("/api/admin/password", post(api::admin_change_password))
@@ -298,9 +302,10 @@ pub async fn session_sweeper(app: Arc<App>) {
                 app.sessions.sweep(idle);
             }
             _ = day.tick() => {
-                if app.config.audit_retention_days > 0 {
+                let settings = app.store.resolved_settings(&app.config);
+                if settings.audit_retention_days > 0 {
                     let cutoff =
-                        crate::store::now_unix().saturating_sub(app.config.audit_retention_days.saturating_mul(86_400));
+                        crate::store::now_unix().saturating_sub(settings.audit_retention_days.saturating_mul(86_400));
                     match app.store.audit_prune(cutoff) {
                         Ok(count) if count > 0 => {
                             tracing::info!(count, "pruned expired audit rows");
@@ -331,9 +336,9 @@ pub async fn session_sweeper(app: Arc<App>) {
                 // disk and tombstone their records, per tenant. Only records
                 // whose bytes were actually removed are tombstoned; a failed
                 // disk delete leaves the record live so the sweep retries.
-                if app.config.upload_retention_days > 0 {
+                if settings.upload_retention_days > 0 {
                     let cutoff = crate::store::now_unix()
-                        .saturating_sub(app.config.upload_retention_days.saturating_mul(86_400));
+                        .saturating_sub(settings.upload_retention_days.saturating_mul(86_400));
                     for link in app.store.all_links() {
                         for upload in &link.uploads {
                             // completed_at == 0 marks pre-field records; never

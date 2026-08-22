@@ -3,7 +3,7 @@
 A small, self-hosted **file receive portal** built on
 [VOT (Verified Object Transfer)](https://github.com/halideworks/VOT).
 
-You sign in to a one-page admin UI, create a unique request link (with an
+You sign in to the admin dashboard, create a unique request link (with an
 optional password), and send it to someone. They open it in a browser, drop
 files on the page, and the files land — cryptographically verified, atomically
 published, never overwriting anything — in a folder you chose on your server.
@@ -92,8 +92,12 @@ Everything is environment variables (see `docker-compose.yml`):
 | `VOTPORT_NOTIFY_NTFY_TOKEN` | — | Bearer token for the ntfy topic, if it needs one. |
 | `VOTPORT_NOTIFY_PUSHOVER_TOKEN` | — | Pushover application token (set together with the user key). |
 | `VOTPORT_NOTIFY_PUSHOVER_USER` | — | Pushover application token (set together with the user key). |
-| `VOTPORT_AUDIT_RETENTION_DAYS` | `400` | Days to keep queryable audit rows; `0` disables pruning. |
-| `VOTPORT_UPLOAD_RETENTION_DAYS` | off | Days to keep received files and their records; a daily sweep deletes expired content and audits it. `0` (default) keeps everything. |
+| `VOTPORT_AUDIT_RETENTION_DAYS` | `400` | Days to keep queryable audit rows; `0` disables pruning. Overridable via `PUT /api/admin/settings`. |
+| `VOTPORT_UPLOAD_RETENTION_DAYS` | off | Days to keep received files and their records; a daily sweep deletes expired content and audits it. `0` (default) keeps everything. Overridable via `PUT /api/admin/settings`. |
+| `VOTPORT_DEFAULT_MAX_TOTAL_BYTES` | unlimited | Default byte quota for a newly created tenant when the request omits it. |
+| `VOTPORT_DEFAULT_MAX_LINKS` | unlimited | Default max links for a newly created tenant when the request omits it. |
+| `VOTPORT_DEFAULT_MAX_SESSIONS` | unlimited | Default max concurrent sessions for a newly created tenant when the request omits it. |
+| `VOTPORT_PUBLIC_PASSWORD_LOGIN` | on | Set `0` to prefer collapsing the local password form when SSO is offered (login API stays available). |
 | `VOTPORT_METRICS_TOKEN` | — | When set, `GET /metrics` requires this bearer token. Counts only; scrape over an internal interface. |
 | `VOTPORT_OIDC_ISSUER` | — | OIDC issuer URL for admin single sign-on. Requires the client id/secret and `VOTPORT_PUBLIC_URL`; see [Single sign-on](#single-sign-on). |
 | `VOTPORT_OIDC_CLIENT_ID` | — | OAuth client id at the identity provider. |

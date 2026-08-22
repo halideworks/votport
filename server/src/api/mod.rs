@@ -10,7 +10,8 @@ pub mod upload;
 pub use admin::{
     admin_audit_export, admin_change_password, admin_login, admin_logout, admin_session,
     backup_database, create_link, create_tenant, delete_link, delete_received_file, delete_tenant,
-    delete_upload_record, link_qr, list_links, list_tenants, switch_tenant, update_link,
+    delete_upload_record, get_settings, link_qr, list_links, list_tenants, put_settings,
+    switch_tenant, update_link, update_tenant,
 };
 pub use sso::{sso_available, sso_callback, sso_start};
 pub use upload::{
@@ -131,7 +132,11 @@ pub(crate) mod testing {
     /// An App over temp directories with an https public URL, so cookies
     /// carry the Secure attribute and handlers run without a listener.
     pub(crate) fn build(directory: &std::path::Path) -> Arc<App> {
-        let config = Config {
+        app::build(config(directory)).unwrap()
+    }
+
+    pub(crate) fn config(directory: &std::path::Path) -> Config {
+        Config {
             bind: "127.0.0.1:0".parse().unwrap(),
             data_dir: directory.join("data"),
             receive_dir: directory.join("received"),
@@ -148,10 +153,13 @@ pub(crate) mod testing {
             session_idle_secs: 60,
             audit_retention_days: 400,
             upload_retention_days: 0,
+            default_max_total_bytes: None,
+            default_max_links: None,
+            default_max_sessions: None,
+            public_password_login: true,
             metrics_token: None,
             oidc: None,
-        };
-        app::build(config).unwrap()
+        }
     }
 }
 

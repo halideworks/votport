@@ -252,28 +252,27 @@ pub async fn create_session(
     }
     // Quotas: the tenant's received-but-not-deleted bytes plus this upload
     // must stay under max_total_bytes, and its concurrent sessions under
-    // max_sessions.
-    if let Some(tenant) = app.store.tenant(&link.tenant) {
-        if let Some(max_total) = tenant.max_total_bytes {
-            let received = app.store.tenant_received_bytes(&link.tenant);
-            if received + expected.length > max_total {
-                audit_session_rejected(&app, &link.tenant, "byte quota exhausted");
-                return Err(ApiError::new(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!(
-                        "this tenant's storage quota is exhausted ({received} of {max_total} bytes used)"
-                    ),
-                ));
-            }
+    // max_sessions. The implicit default tenant uses overlay default_max_*.
+    let (max_total, _, max_sessions) = app.store.quotas_for(&link.tenant, &app.config);
+    if let Some(max_total) = max_total {
+        let received = app.store.tenant_received_bytes(&link.tenant);
+        if received + expected.length > max_total {
+            audit_session_rejected(&app, &link.tenant, "byte quota exhausted");
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "this tenant's storage quota is exhausted ({received} of {max_total} bytes used)"
+                ),
+            ));
         }
-        if let Some(max_sessions) = tenant.max_sessions {
-            if app.sessions.active_for_tenant(&link.tenant) >= max_sessions as usize {
-                audit_session_rejected(&app, &link.tenant, "tenant session cap reached");
-                return Err(ApiError::new(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "too many concurrent uploads for this tenant",
-                ));
-            }
+    }
+    if let Some(max_sessions) = max_sessions {
+        if app.sessions.active_for_tenant(&link.tenant) >= max_sessions as usize {
+            audit_session_rejected(&app, &link.tenant, "tenant session cap reached");
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many concurrent uploads for this tenant",
+            ));
         }
     }
 
