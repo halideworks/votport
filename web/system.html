@@ -10,23 +10,26 @@
     <title>VOTPort &middot; System</title>
     <link rel="icon" type="image/png" href="/assets/favicon.png" />
     <link rel="stylesheet" href="/assets/style.css" />
+    
   </head>
-  <body data-page="system">
-    <div class="sheet wide">
-      <header class="masthead">
-        <div class="hero-brand">
-          <div class="brand-square">
-            <img src="/assets/pommern_ship_white.png" alt="" />
-          </div>
-          <span class="wordmark">VOTPort</span>
-        </div>
-        <nav id="nav" class="nav"></nav>
-        <select id="tenant-switcher" hidden></select>
-        <button id="logout" class="ghost">Sign out</button>
-      </header>
+  <body class="admin" data-page="system">
+    <header class="topbar">
+      <a class="brand" href="/links">
+        <img src="/assets/pommern_ship_white.png" alt="" />
+        <span>VOTPort</span>
+      </a>
+      <nav id="nav" class="nav"></nav>
+      <span class="spacer"></span>
+      <select id="tenant-switcher" hidden></select>
+      <button id="logout" class="ghost">Sign out</button>
+    </header>
+    <main class="admin-main">
+<div class="page-head">
+        <h1>System</h1>
+      </div>
 
       <form id="password-form" class="card">
-        <h2>Change administrator password</h2>
+        <h2>Administrator password</h2>
         <div class="grid">
           <label
             >Current password
@@ -73,10 +76,18 @@
         </p>
         <p class="mono" id="receipt-key"></p>
       </div>
-
-      <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
-    </div>
-
+    </main>
+    <dialog id="confirm" class="modal">
+      <form method="dialog">
+        <h2 id="confirm-title">Confirm</h2>
+        <p id="confirm-detail"></p>
+        <div class="modal-actions">
+          <button value="cancel" class="ghost" id="confirm-cancel">Cancel</button>
+          <button value="ok" class="danger" id="confirm-ok">Delete</button>
+        </div>
+      </form>
+    </dialog>
+    <script type="module" src="/assets/admin-common.js"></script>
     <script type="module" src="/assets/page-system.js"></script>
   </body>
 </html>

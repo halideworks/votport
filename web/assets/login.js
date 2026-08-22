@@ -20,6 +20,21 @@ $('login-form').addEventListener('submit', async (event) => {
   }
 });
 
+// Already-signed-in visitors skip the form entirely.
+try {
+  await api('/api/admin/session');
+  window.location.replace('/links');
+} catch {
+  /* not signed in: stay here */
+}
+
+try {
+  const { available } = await api('/api/admin/sso');
+  if (available) $('login-sso').hidden = false;
+} catch {
+  /* password sign-in still works */
+}
+
 $('login-sso').addEventListener('click', () => {
   window.location.assign('/api/admin/sso/start');
 });

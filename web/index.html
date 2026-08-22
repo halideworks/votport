@@ -47,22 +47,8 @@
       <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
     </div>
 
-    <!-- Already-signed-in visitors skip the form entirely. -->
-    <script type="module">
-      import { api } from '/assets/admin-common.js';
-      try {
-        await api('/api/admin/session');
-        // Constant target: this is navigation, not a redirect controlled by
-        // request data.
-        window.location.replace('/links');
-      } catch {
-        /* not signed in: stay here */
-      }
-      try {
-        const { available } = await api('/api/admin/sso');
-        if (available) document.getElementById('login-sso').hidden = false;
-      } catch { /* password sign-in still works */ }
-    </script>
+    <!-- Already-signed-in visitors skip the form entirely; login.js
+         handles that check plus SSO availability. -->
     <script type="module" src="/assets/login.js"></script>
   </body>
 </html>

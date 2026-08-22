@@ -1,7 +1,7 @@
 // votport audit page: queryable event log viewer + JSONL export.
 // AGPL-3.0-only.
 
-import { api, formatWhen, requireSession } from '/assets/admin-common.js';
+import { formatWhen, requireSession } from '/assets/admin-common.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -34,9 +34,17 @@ function renderRow(row) {
 }
 
 async function load() {
-  // Newest window first: fetch a bounded page from the beginning of the log
-  // and display its tail; the JSONL export covers full-history needs.
-  const rows = await api('/api/admin/audit?limit=10000');
+  // The endpoint streams JSONL; an empty log is an empty body, so parse as
+  // text rather than JSON.
+  const response = await fetch('/api/admin/audit?limit=10000', {
+    credentials: 'same-origin',
+  });
+  if (!response.ok) throw new Error(`request failed (${response.status})`);
+  const text = await response.text();
+  const rows = text
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
   const container = $('audit-log');
   container.replaceChildren();
   $('audit-range').textContent = `${rows.length} rows shown`;

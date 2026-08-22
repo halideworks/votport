@@ -10,20 +10,24 @@
     <title>VOTPort &middot; Links</title>
     <link rel="icon" type="image/png" href="/assets/favicon.png" />
     <link rel="stylesheet" href="/assets/style.css" />
+    
   </head>
-  <body data-page="links">
-    <div class="sheet wide">
-      <header class="masthead">
-        <div class="hero-brand">
-          <div class="brand-square">
-            <img src="/assets/pommern_ship_white.png" alt="" />
-          </div>
-          <span class="wordmark">VOTPort</span>
-        </div>
-        <nav id="nav" class="nav"></nav>
-        <select id="tenant-switcher" hidden></select>
-        <button id="logout" class="ghost">Sign out</button>
-      </header>
+  <body class="admin" data-page="links">
+    <header class="topbar">
+      <a class="brand" href="/links">
+        <img src="/assets/pommern_ship_white.png" alt="" />
+        <span>VOTPort</span>
+      </a>
+      <nav id="nav" class="nav"></nav>
+      <span class="spacer"></span>
+      <select id="tenant-switcher" hidden></select>
+      <button id="logout" class="ghost">Sign out</button>
+    </header>
+    <main class="admin-main">
+<div class="page-head">
+        <h1>Transfer requests</h1>
+        <span id="receive-dir" class="mono muted"></span>
+      </div>
 
       <form id="create-form" class="card">
         <h2>New transfer request</h2>
@@ -82,13 +86,8 @@
         <span id="new-link-note" class="muted"></span>
       </div>
 
-      <h2>Issued requests</h2>
-      <p id="receive-dir" class="mono muted"></p>
       <div id="links"></div>
-
-      <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
-    </div>
-
+    </main>
     <dialog id="confirm" class="modal">
       <form method="dialog">
         <h2 id="confirm-title">Confirm</h2>
@@ -99,7 +98,7 @@
         </div>
       </form>
     </dialog>
-
+    <script type="module" src="/assets/admin-common.js"></script>
     <script type="module" src="/assets/page-links.js"></script>
   </body>
 </html>
