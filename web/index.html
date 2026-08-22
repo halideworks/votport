@@ -7,7 +7,7 @@
       content="width=device-width, initial-scale=1, viewport-fit=cover"
     />
     <meta name="robots" content="noindex" />
-    <title>VOTPort &middot; Administration</title>
+    <title>VOTPort &middot; Sign in</title>
     <link rel="icon" type="image/png" href="/assets/favicon.png" />
     <link rel="stylesheet" href="/assets/style.css" />
   </head>
@@ -23,7 +23,7 @@
     </div>
 
     <div class="sheet">
-      <section id="login" hidden>
+      <section id="login">
         <header class="masthead">
           <h1>Sign in</h1>
           <p class="sub">Issue and manage transfer requests.</p>
@@ -44,130 +44,25 @@
         <button id="login-sso" type="button" hidden>Sign in with SSO</button>
       </section>
 
-      <section id="dashboard" hidden>
-        <header class="masthead">
-          <div class="hero-brand">
-            <div class="brand-square">
-              <img src="/assets/pommern_ship_white.png" alt="" />
-            </div>
-            <span class="wordmark">VOTPort</span>
-          </div>
-          <select id="tenant-switcher" hidden></select>
-        </header>
-
-        <div class="bar">
-          <span id="receive-dir" class="mono muted"></span>
-          <button id="logout" class="ghost">Sign out</button>
-        </div>
-
-        <form id="create-form" class="card">
-          <h2>New transfer request</h2>
-          <div class="grid">
-            <label
-              >Reference
-              <input
-                id="create-label"
-                placeholder="Files from Alex"
-                required
-                maxlength="200"
-              />
-            </label>
-            <label
-              >Destination folder <span class="muted">optional</span>
-              <input id="create-dest" placeholder="clients/alex" />
-            </label>
-            <label
-              >Access password <span class="muted">optional</span>
-              <input
-                id="create-password"
-                type="text"
-                autocomplete="off"
-                placeholder="none"
-              />
-            </label>
-            <label
-              >Expires after <span class="muted">days, optional</span>
-              <input
-                id="create-expires"
-                type="number"
-                min="1"
-                max="3650"
-                placeholder="never"
-              />
-            </label>
-            <label
-              >Transfer limit <span class="muted">GiB, optional</span>
-              <input
-                id="create-max"
-                type="number"
-                min="1"
-                max="10000"
-                placeholder="server default"
-              />
-            </label>
-          </div>
-          <button type="submit">Issue request</button>
-          <p class="error" id="create-error" hidden></p>
-        </form>
-
-        <div id="new-link" class="card ok" hidden>
-          <h2>Request issued</h2>
-          <p class="mono" id="new-link-url"></p>
-          <button id="new-link-copy">Copy address</button>
-          <span id="new-link-note" class="muted"></span>
-        </div>
-
-        <h2>Issued requests</h2>
-        <div id="links"></div>
-
-        <form id="password-form" class="card">
-          <h2>Change administrator password</h2>
-          <div class="grid">
-            <label
-              >Current password
-              <input
-                type="password"
-                id="password-current"
-                autocomplete="current-password"
-                required
-              />
-            </label>
-            <label
-              >New password <span class="muted">12 characters minimum</span>
-              <input
-                type="password"
-                id="password-new"
-                autocomplete="new-password"
-                required
-                minlength="12"
-              />
-            </label>
-          </div>
-          <button type="submit">Update password</button>
-          <span id="password-note" class="muted"></span>
-          <p class="error" id="password-error" hidden></p>
-        </form>
-      </section>
-
       <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
     </div>
 
-    <!-- Shared confirm/alert dialog; admin.js fills the text and buttons.
-     Native <dialog>: focus trap, Esc to dismiss and a backdrop come with it.
-     Cancel is first so Enter is the safe answer. -->
-    <dialog id="confirm" class="modal">
-      <form method="dialog">
-        <h2 id="confirm-title">Confirm</h2>
-        <p id="confirm-detail"></p>
-        <div class="modal-actions">
-          <button value="cancel" class="ghost" id="confirm-cancel">
-            Cancel
-          </button>
-          <button value="ok" class="danger" id="confirm-ok">Delete</button>
-        </div>
-      </form>
-    </dialog>
-
-    <script type="module" src="/assets/admin.js"></script>
+    <!-- Already-signed-in visitors skip the form entirely. -->
+    <script type="module">
+      import { api } from '/assets/admin-common.js';
+      try {
+        await api('/api/admin/session');
+        // Constant target: this is navigation, not a redirect controlled by
+        // request data.
+        window.location.replace('/links');
+      } catch {
+        /* not signed in: stay here */
+      }
+      try {
+        const { available } = await api('/api/admin/sso');
+        if (available) document.getElementById('login-sso').hidden = false;
+      } catch { /* password sign-in still works */ }
+    </script>
+    <script type="module" src="/assets/login.js"></script>
   </body>
 </html>

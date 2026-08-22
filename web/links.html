@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="robots" content="noindex" />
+    <title>VOTPort &middot; Links</title>
+    <link rel="icon" type="image/png" href="/assets/favicon.png" />
+    <link rel="stylesheet" href="/assets/style.css" />
+  </head>
+  <body data-page="links">
+    <div class="sheet wide">
+      <header class="masthead">
+        <div class="hero-brand">
+          <div class="brand-square">
+            <img src="/assets/pommern_ship_white.png" alt="" />
+          </div>
+          <span class="wordmark">VOTPort</span>
+        </div>
+        <nav id="nav" class="nav"></nav>
+        <select id="tenant-switcher" hidden></select>
+        <button id="logout" class="ghost">Sign out</button>
+      </header>
+
+      <form id="create-form" class="card">
+        <h2>New transfer request</h2>
+        <div class="grid">
+          <label
+            >Reference
+            <input
+              id="create-label"
+              placeholder="Files from Alex"
+              required
+              maxlength="200"
+            />
+          </label>
+          <label
+            >Destination folder <span class="muted">optional</span>
+            <input id="create-dest" placeholder="clients/alex" />
+          </label>
+          <label
+            >Access password <span class="muted">optional</span>
+            <input
+              id="create-password"
+              type="text"
+              autocomplete="off"
+              placeholder="none"
+            />
+          </label>
+          <label
+            >Expires after <span class="muted">days, optional</span>
+            <input
+              id="create-expires"
+              type="number"
+              min="1"
+              max="3650"
+              placeholder="never"
+            />
+          </label>
+          <label
+            >Transfer limit <span class="muted">GiB, optional</span>
+            <input
+              id="create-max"
+              type="number"
+              min="1"
+              max="10000"
+              placeholder="server default"
+            />
+          </label>
+        </div>
+        <button type="submit">Issue request</button>
+        <p class="error" id="create-error" hidden></p>
+      </form>
+
+      <div id="new-link" class="card ok" hidden>
+        <h2>Request issued</h2>
+        <p class="mono" id="new-link-url"></p>
+        <button id="new-link-copy">Copy address</button>
+        <span id="new-link-note" class="muted"></span>
+      </div>
+
+      <h2>Issued requests</h2>
+      <p id="receive-dir" class="mono muted"></p>
+      <div id="links"></div>
+
+      <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
+    </div>
+
+    <dialog id="confirm" class="modal">
+      <form method="dialog">
+        <h2 id="confirm-title">Confirm</h2>
+        <p id="confirm-detail"></p>
+        <div class="modal-actions">
+          <button value="cancel" class="ghost" id="confirm-cancel">Cancel</button>
+          <button value="ok" class="danger" id="confirm-ok">Delete</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script type="module" src="/assets/page-links.js"></script>
+  </body>
+</html>
