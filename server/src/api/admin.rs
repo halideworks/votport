@@ -28,34 +28,35 @@ fn admin_token_phc(app: &App) -> String {
         .unwrap_or_else(|| app.config.admin_token_tag.clone())
 }
 
-fn is_admin(app: &App, headers: &HeaderMap) -> bool {
-    headers
+/// Returns the authenticated principal, or unauthorized.
+fn require_admin(app: &App, headers: &HeaderMap) -> ApiResult<auth::AdminIdentity> {
+    let token = headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
-        .and_then(|cookies| auth::cookie_value(cookies, ADMIN_COOKIE))
-        .is_some_and(|token| auth::verify_admin_token(&app.secret, &admin_token_phc(app), token))
+        .and_then(|cookies| auth::cookie_value(cookies, ADMIN_COOKIE));
+    auth::verify_admin_token(
+        &app.secret,
+        &admin_token_phc(app),
+        token.unwrap_or_default(),
+    )
+    .ok_or_else(ApiError::unauthorized)
 }
 
-fn require_admin(app: &App, headers: &HeaderMap) -> ApiResult<()> {
-    if is_admin(app, headers) {
-        Ok(())
-    } else {
-        Err(ApiError::unauthorized())
+/// Mutating admin routes require the admin role AND a custom header;
+/// cross-site forms cannot set one, which closes CSRF without token
+/// bookkeeping. Viewers (SSO principals outside the admin group) get
+/// read-only access.
+fn require_admin_write(headers: &HeaderMap, identity: &auth::AdminIdentity) -> ApiResult<()> {
+    if identity.role != "admin" {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "read-only session"));
     }
-}
-
-/// Mutating admin routes also require a custom header; cross-site forms
-/// cannot set one, which closes CSRF without token bookkeeping.
-fn require_admin_write(app: &App, headers: &HeaderMap) -> ApiResult<()> {
-    require_admin(app, headers)?;
-    if headers.contains_key("x-votport") {
-        Ok(())
-    } else {
-        Err(ApiError::new(
+    if !headers.contains_key("x-votport") {
+        return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "missing X-Votport header",
-        ))
+        ));
     }
+    Ok(())
 }
 
 /// The admin password in force: a hash stored by "change password" wins over
@@ -65,6 +66,20 @@ fn admin_hash(app: &App) -> String {
     app.store
         .admin_password_hash()
         .unwrap_or_else(|| app.config.admin_password_hash.clone())
+}
+
+/// Builds the signed admin session cookie value for `identity`.
+pub(crate) fn issue_admin_cookie(app: &App, identity: &auth::AdminIdentity) -> String {
+    let token = auth::issue_admin_token(&app.secret, identity, &admin_token_phc(app));
+    format!(
+        "{ADMIN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{}",
+        cookie_attributes(app)
+    )
+}
+
+/// Cookie attributes for non-admin cookies too (Secure behind https).
+pub(crate) fn sso_cookie_attributes(app: &App) -> &'static str {
+    cookie_attributes(app)
 }
 
 #[derive(Deserialize)]
@@ -100,11 +115,12 @@ pub async fn admin_login(
     }
     tracing::info!(target: "audit", event = "admin_login", %ip, "admin signed in");
     app.store.audit("admin_login", &ip, &serde_json::json!({}));
-    let token = auth::issue_admin_token(&app.secret, &admin_token_phc(&app));
-    let cookie = format!(
-        "{ADMIN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{}",
-        cookie_attributes(&app)
-    );
+    let identity = auth::AdminIdentity {
+        subject: "local".to_owned(),
+        tenant: String::new(),
+        role: "admin".to_owned(),
+    };
+    let cookie = issue_admin_cookie(&app, &identity);
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
 
@@ -123,7 +139,7 @@ pub async fn admin_audit_export(
     headers: HeaderMap,
     Query(query): Query<AuditQuery>,
 ) -> ApiResult<Response> {
-    require_admin(&app, &headers)?;
+    let _ = require_admin(&app, &headers)?;
     let limit = query.limit.unwrap_or(1000).min(10_000);
     let rows = app
         .store
@@ -167,7 +183,7 @@ pub async fn admin_session(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_admin(&app, &headers)?;
+    let _ = require_admin(&app, &headers)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -187,7 +203,8 @@ pub async fn admin_change_password(
     headers: HeaderMap,
     Json(request): Json<ChangePasswordRequest>,
 ) -> ApiResult<Response> {
-    require_admin_write(&app, &headers)?;
+    let identity = require_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
     if app.throttle.locked() {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -226,11 +243,12 @@ pub async fn admin_change_password(
     tracing::info!(target: "audit", event = "admin_password_changed", "admin password changed; outstanding sessions invalidated");
     app.store
         .audit("admin_password_changed", "", &serde_json::json!({}));
-    let token = auth::issue_admin_token(&app.secret, &admin_token_phc(&app));
-    let cookie = format!(
-        "{ADMIN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{}",
-        cookie_attributes(&app)
-    );
+    let identity = auth::AdminIdentity {
+        subject: "local".to_owned(),
+        tenant: String::new(),
+        role: "admin".to_owned(),
+    };
+    let cookie = issue_admin_cookie(&app, &identity);
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
 
@@ -351,7 +369,7 @@ pub async fn list_links(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_admin(&app, &headers)?;
+    let _ = require_admin(&app, &headers)?;
     let base = base_url(&app, &headers);
     let links: Vec<LinkView> = app
         .store
@@ -384,7 +402,8 @@ pub async fn create_link(
     headers: HeaderMap,
     Json(request): Json<CreateLinkRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_admin_write(&app, &headers)?;
+    let identity = require_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
     let label = request.label.trim().to_owned();
     if label.is_empty() || label.len() > 200 {
         return Err(ApiError::new(
@@ -435,7 +454,8 @@ pub async fn update_link(
     headers: HeaderMap,
     Json(request): Json<UpdateLinkRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_admin_write(&app, &headers)?;
+    let identity = require_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
     let found = app
         .store
         .update_link(&id, |link| link.active = request.active)
@@ -457,7 +477,8 @@ pub async fn delete_link(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_admin_write(&app, &headers)?;
+    let identity = require_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
     if !app.store.remove_link(&id).map_err(ApiError::internal)? {
         return Err(ApiError::not_found());
     }
@@ -472,7 +493,7 @@ pub async fn link_qr(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    require_admin(&app, &headers)?;
+    let _ = require_admin(&app, &headers)?;
     let link = app.store.link(&id).ok_or_else(ApiError::not_found)?;
     let url = format!("{}/r/{}", base_url(&app, &headers), link.id);
     let code = qrcode::QrCode::new(url.as_bytes())
@@ -492,7 +513,8 @@ pub async fn delete_upload_record(
     Path((id, upload)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_admin_write(&app, &headers)?;
+    let identity = require_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
     let found = app
         .store
         .update_link(&id, |link| link.uploads.retain(|entry| entry.id != upload))
@@ -517,7 +539,8 @@ pub async fn delete_received_file(
     Path((id, upload, index)): Path<(String, String, usize)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_admin_write(&app, &headers)?;
+    let identity = require_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
     let link = app.store.link(&id).ok_or_else(ApiError::not_found)?;
     let record = link
         .uploads

@@ -48,6 +48,7 @@ async fn start_server_with_cap(max_upload_bytes: u64) -> TestServer {
         allow_hidden: false,
         session_idle_secs: 600,
         audit_retention_days: 400,
+        oidc: None,
     };
     let application = app::build(config).expect("app builds");
     let router = app::router(Arc::clone(&application));

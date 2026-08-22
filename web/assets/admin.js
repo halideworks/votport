@@ -369,6 +369,11 @@ $('password-form').addEventListener('submit', async (event) => {
 });
 
 (async () => {
+  // SSO sign-in appears whenever the server has an identity provider.
+  try {
+    const { available } = await api('/api/admin/sso');
+    if (available) $('login-sso').hidden = false;
+  } catch { /* login page still works without it */ }
   try {
     await api('/api/admin/session');
     show('dashboard');
@@ -377,3 +382,7 @@ $('password-form').addEventListener('submit', async (event) => {
     show('login');
   }
 })();
+
+$('login-sso').addEventListener('click', () => {
+  window.location.href = '/api/admin/sso/start';
+});
