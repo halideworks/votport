@@ -93,6 +93,8 @@ Everything is environment variables (see `docker-compose.yml`):
 | `VOTPORT_NOTIFY_PUSHOVER_TOKEN` | — | Pushover application token (set together with the user key). |
 | `VOTPORT_NOTIFY_PUSHOVER_USER` | — | Pushover application token (set together with the user key). |
 | `VOTPORT_AUDIT_RETENTION_DAYS` | `400` | Days to keep queryable audit rows; `0` disables pruning. |
+| `VOTPORT_UPLOAD_RETENTION_DAYS` | off | Days to keep received files and their records; a daily sweep deletes expired content and audits it. `0` (default) keeps everything. |
+| `VOTPORT_METRICS_TOKEN` | — | When set, `GET /metrics` requires this bearer token. Counts only; scrape over an internal interface. |
 | `VOTPORT_OIDC_ISSUER` | — | OIDC issuer URL for admin single sign-on. Requires the client id/secret and `VOTPORT_PUBLIC_URL`; see [Single sign-on](#single-sign-on). |
 | `VOTPORT_OIDC_CLIENT_ID` | — | OAuth client id at the identity provider. |
 | `VOTPORT_OIDC_CLIENT_SECRET` | — | OAuth client secret at the identity provider. |
@@ -100,6 +102,10 @@ Everything is environment variables (see `docker-compose.yml`):
 
 Notifications are best-effort: a delivery failure is logged and never affects
 the upload.
+
+Production setup beyond the quick start - SSO walkthroughs (Authentik,
+Entra ID), backups and restore, metrics scraping, tenant provisioning, and
+content lifecycle - lives in [`docs/deployment.md`](docs/deployment.md).
 
 ## Single sign-on
 

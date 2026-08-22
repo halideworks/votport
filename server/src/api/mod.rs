@@ -9,7 +9,7 @@ pub mod upload;
 
 pub use admin::{
     admin_audit_export, admin_change_password, admin_login, admin_logout, admin_session,
-    create_link, create_tenant, delete_link, delete_received_file, delete_tenant,
+    backup_database, create_link, create_tenant, delete_link, delete_received_file, delete_tenant,
     delete_upload_record, link_qr, list_links, list_tenants, switch_tenant, update_link,
 };
 pub use sso::{sso_available, sso_callback, sso_start};
@@ -147,6 +147,8 @@ pub(crate) mod testing {
             allow_hidden: false,
             session_idle_secs: 60,
             audit_retention_days: 400,
+            upload_retention_days: 0,
+            metrics_token: None,
             oidc: None,
         };
         app::build(config).unwrap()

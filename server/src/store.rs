@@ -463,6 +463,43 @@ impl Store {
         })
     }
 
+    // ------------------------------------------------- operations helpers
+
+    /// Consistent snapshot of the database via SQLite's VACUUM INTO. The
+    /// destination must not exist.
+    pub fn backup_into(&self, destination: &Path) -> Result<(), String> {
+        self.with(|connection| {
+            connection.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])
+        })
+        .map(|_| ())
+    }
+
+    /// Every link across every tenant. Internal use only (retention sweeps,
+    /// metrics); administrative API reads stay tenant-scoped.
+    pub fn all_links(&self) -> Vec<Link> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
+                        active, uploads_json, events_json
+                 FROM links ORDER BY rowid",
+            )?;
+            let rows = statement.query_map([], row_to_link)?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .expect("store read failed")
+    }
+
+    pub fn audit_count(&self) -> u64 {
+        self.with(|connection| {
+            connection
+                .query_row("SELECT count(*) FROM audit_log", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map(|value| value.max(0) as u64)
+        })
+        .expect("store read failed")
+    }
+
     // -------------------------------------------------------------- quotas
 
     /// Bytes received-and-not-deleted across a tenant's links.
@@ -942,5 +979,46 @@ mod tenant_tests {
             })
             .unwrap();
         assert_eq!(store.tenant_received_bytes("acme"), 0);
+    }
+}
+
+#[cfg(test)]
+mod ops_tests {
+    use super::tests::test_link;
+    use super::*;
+
+    #[test]
+    fn backup_creates_a_queryable_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.insert_link(test_link("link-1")).unwrap();
+
+        let snapshot = directory.path().join("snapshot.db");
+        store.backup_into(&snapshot).unwrap();
+        assert!(snapshot.exists());
+
+        // The snapshot is a real database with the same rows: drop it into
+        // a fresh data dir and open it as one.
+        let restore = tempfile::tempdir().unwrap();
+        std::fs::copy(&snapshot, restore.path().join("votport.db")).unwrap();
+        let reopened = Store::open(restore.path()).unwrap();
+        assert!(reopened.link("", "link-1").is_some());
+
+        // A fresh VACUUM INTO needs the destination gone; that is the
+        // caller's contract.
+        std::fs::remove_file(&snapshot).unwrap();
+        store.backup_into(&snapshot).unwrap();
+        assert!(snapshot.exists());
+    }
+
+    #[test]
+    fn all_links_spans_tenants() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.insert_link(test_link("default-link")).unwrap();
+        let mut scoped = test_link("scoped-link");
+        scoped.tenant = "acme".to_owned();
+        store.insert_link(scoped).unwrap();
+        assert_eq!(store.all_links().len(), 2);
     }
 }

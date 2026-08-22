@@ -40,6 +40,10 @@ pub struct Config {
     pub session_idle_secs: u64,
     /// Days to keep audit rows; 0 disables pruning.
     pub audit_retention_days: u64,
+    /// Days to keep received files and their records; 0 disables the sweep.
+    pub upload_retention_days: u64,
+    /// When set, /metrics requires this bearer token.
+    pub metrics_token: Option<String>,
     /// OIDC single sign-on for the admin dashboard. None when unset.
     pub oidc: Option<OidcConfig>,
 }
@@ -105,6 +109,15 @@ pub fn from_env() -> Result<Config, String> {
 
     let allow_hidden = env::var("VOTPORT_ALLOW_HIDDEN").is_ok_and(|value| value == "1");
 
+    let optional = |name: &str| env::var(name).ok().filter(|value| !value.trim().is_empty());
+    let upload_retention_days = match env::var("VOTPORT_UPLOAD_RETENTION_DAYS") {
+        Ok(value) => value
+            .parse()
+            .map_err(|error| format!("VOTPORT_UPLOAD_RETENTION_DAYS: {error}"))?,
+        Err(_) => 0,
+    };
+    let metrics_token = optional("VOTPORT_METRICS_TOKEN");
+
     let audit_retention_days = match env::var("VOTPORT_AUDIT_RETENTION_DAYS") {
         Ok(value) => value
             .parse()
@@ -119,7 +132,6 @@ pub fn from_env() -> Result<Config, String> {
         Err(_) => 1800,
     };
 
-    let optional = |name: &str| env::var(name).ok().filter(|value| !value.trim().is_empty());
     let notify_pushover = match (
         optional("VOTPORT_NOTIFY_PUSHOVER_TOKEN"),
         optional("VOTPORT_NOTIFY_PUSHOVER_USER"),
@@ -183,6 +195,8 @@ pub fn from_env() -> Result<Config, String> {
         allow_hidden,
         session_idle_secs,
         audit_retention_days,
+        upload_retention_days,
+        metrics_token,
         oidc,
     })
 }
