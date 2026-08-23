@@ -404,8 +404,8 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
         .store
         .link_by_id(&setup.link_id)
         .map_err(|error| SessionError::internal(format!("link read failed: {error}")))?
-        .map(|link| link.uploads)
-        .unwrap_or_default();
+        .ok_or_else(|| SessionError::conflict("request link no longer exists"))?
+        .uploads;
 
     fs::create_dir_all(&setup.dest_dir)
         .map_err(|error| SessionError::internal(format!("create destination: {error}")))?;
@@ -841,6 +841,10 @@ struct SessionsInner {
     delete_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
     #[cfg(test)]
     create_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    #[cfg(test)]
+    session_create_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    #[cfg(test)]
+    finish_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
 }
 
 pub struct SessionHandle {
@@ -873,6 +877,10 @@ impl Sessions {
                 delete_stall: None,
                 #[cfg(test)]
                 create_stall: None,
+                #[cfg(test)]
+                session_create_stall: None,
+                #[cfg(test)]
+                finish_stall: None,
             }),
         }
     }
@@ -943,6 +951,25 @@ impl Sessions {
         (entered_rx, release_tx)
     }
 
+    #[cfg(test)]
+    pub fn arm_session_create_stall(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        self.inner
+            .lock()
+            .expect("sessions poisoned")
+            .session_create_stall = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub fn arm_finish_stall(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        self.inner.lock().expect("sessions poisoned").finish_stall = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
     /// Held between writing a tenant row and rechecking its folder, so a test
     /// can take the folder in exactly that window.
     #[cfg(test)]
@@ -966,6 +993,34 @@ impl Sessions {
             .lock()
             .expect("sessions poisoned")
             .delete_stall
+            .take();
+        if let Some((entered, release)) = stall {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn wait_session_create_stall(&self) {
+        let stall = self
+            .inner
+            .lock()
+            .expect("sessions poisoned")
+            .session_create_stall
+            .take();
+        if let Some((entered, release)) = stall {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn wait_finish_stall(&self) {
+        let stall = self
+            .inner
+            .lock()
+            .expect("sessions poisoned")
+            .finish_stall
             .take();
         if let Some((entered, release)) = stall {
             let _ = entered.send(());

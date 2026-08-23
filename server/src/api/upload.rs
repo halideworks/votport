@@ -361,6 +361,8 @@ pub async fn create_session(
     // Depth matches the client's chunk concurrency so handlers rarely block
     // on send. Register the sender before the worker can create_dir_all.
     let (sender, receiver) = mpsc::channel(8);
+    #[cfg(test)]
+    app.sessions.wait_session_create_stall().await;
     match app.sessions.insert(
         session_id.clone(),
         link.id.clone(),
@@ -382,6 +384,21 @@ pub async fn create_session(
             ));
         }
         Ok(()) => {}
+    }
+    match app.store.link_by_id(&link.id) {
+        Ok(Some(current)) if current.tenant == link.tenant && current.usable_now() => {}
+        Ok(_) => {
+            app.sessions.remove(&session_id);
+            audit_session_rejected(&app, &link.tenant, "link deleted during session creation");
+            return Err(ApiError::new(
+                StatusCode::GONE,
+                "this link is no longer accepting uploads",
+            ));
+        }
+        Err(error) => {
+            app.sessions.remove(&session_id);
+            return Err(super::store_unavailable(error));
+        }
     }
     session::spawn_worker(setup, receiver);
     tracing::info!(
@@ -510,7 +527,8 @@ pub async fn upload_finish(
 ) -> ApiResult<Json<session::FinishReport>> {
     let link_id = app.sessions.link_id(&sid);
     let report = dispatch(&app, &sid, |reply| Cmd::Finish { reply }).await?;
-    app.sessions.remove(&sid);
+    #[cfg(test)]
+    app.sessions.wait_finish_stall().await;
     tracing::info!(
         target: "audit", event = "upload_completed", session = %sid,
         files = report.files.len(), bytes = report.files.iter().map(|f| f.bytes).sum::<u64>(),
@@ -544,6 +562,7 @@ pub async fn upload_finish(
             report.clone(),
         ));
     }
+    app.sessions.remove(&sid);
     Ok(Json(report))
 }
 
@@ -570,12 +589,9 @@ mod session_rate_tests {
     use crate::app;
     use crate::store::Link;
 
-    #[tokio::test]
-    async fn session_creation_is_rate_limited_per_ip() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        let link = Link {
-            id: "rate-limited-link".to_owned(),
+    fn open_link(id: &str) -> Link {
+        Link {
+            id: id.to_owned(),
             tenant: String::new(),
             label: "open".to_owned(),
             dest: String::new(),
@@ -586,8 +602,17 @@ mod session_rate_tests {
             active: true,
             uploads: Vec::new(),
             events: Vec::new(),
-        };
-        application.store.insert_link(link).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn session_creation_is_rate_limited_per_ip() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_link(open_link("rate-limited-link"))
+            .unwrap();
 
         let router = app::router(application);
         // Invalid packages fail 422 but still consume rate budget, so the
@@ -622,5 +647,91 @@ mod session_rate_tests {
             .unwrap();
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn session_creation_rechecks_a_link_deleted_before_registration() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_link(open_link("delete-race"))
+            .unwrap();
+        let (entered, release) = application.sessions.arm_session_create_stall();
+        let router = app::router(application.clone());
+        let create = tokio::spawn(async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/r/delete-race/session")
+                        .header("content-type", "application/json")
+                        .extension(ConnectInfo(std::net::SocketAddr::from((
+                            [127, 0, 0, 1],
+                            1234,
+                        ))))
+                        .body(Body::from(
+                            r#"{"package":{"suite":"blake3","root":"0000000000000000000000000000000000000000000000000000000000000000","length":1}}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        entered.await.unwrap();
+        assert!(application.store.remove_link("", "delete-race").unwrap());
+        release.send(()).unwrap();
+
+        assert_eq!(create.await.unwrap().status(), StatusCode::GONE);
+        assert_eq!(application.sessions.total(), 0);
+    }
+
+    #[tokio::test]
+    async fn finish_keeps_the_session_registered_through_metadata_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_link(open_link("finishing"))
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        application
+            .sessions
+            .insert(
+                "session".to_owned(),
+                "finishing".to_owned(),
+                String::new(),
+                sender,
+            )
+            .unwrap();
+        tokio::spawn(async move {
+            let Some(Cmd::Finish { reply }) = receiver.recv().await else {
+                panic!("finish command");
+            };
+            reply
+                .send(Ok(session::FinishReport {
+                    upload_id: "upload".to_owned(),
+                    files: Vec::new(),
+                }))
+                .unwrap();
+        });
+        let (entered, release) = application.sessions.arm_finish_stall();
+        let router = app::router(application.clone());
+        let finish = tokio::spawn(async move {
+            router
+                .oneshot(
+                    Request::post("/api/session/session/finish")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        entered.await.unwrap();
+        assert_eq!(application.sessions.active_for_link("finishing"), 1);
+        release.send(()).unwrap();
+
+        assert_eq!(finish.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(application.sessions.active_for_link("finishing"), 0);
     }
 }
