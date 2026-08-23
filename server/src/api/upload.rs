@@ -509,13 +509,19 @@ pub async fn upload_finish(
         files = report.files.len(), bytes = report.files.iter().map(|f| f.bytes).sum::<u64>(),
         "upload finished and recorded"
     );
-    let completed_tenant = link_id
-        .clone()
-        .and_then(|id| app.store.link_by_id(&id).ok().flatten())
-        .map(|link| link.tenant)
+    let link = link_id.and_then(|id| {
+        app.store
+            .link_by_id(&id)
+            .inspect_err(|error| tracing::warn!(%error, "link read failed after upload"))
+            .ok()
+            .flatten()
+    });
+    let completed_tenant = link
+        .as_ref()
+        .map(|link| link.tenant.as_str())
         .unwrap_or_default();
     app.store.audit(
-        &completed_tenant,
+        completed_tenant,
         "",
         "upload_completed",
         &sid[..8.min(sid.len())],
@@ -524,7 +530,7 @@ pub async fn upload_finish(
             "bytes": report.files.iter().map(|f| f.bytes).sum::<u64>()
         }),
     );
-    if let Some(link) = link_id.and_then(|id| app.store.link_by_id(&id).ok().flatten()) {
+    if let Some(link) = link {
         tokio::spawn(crate::notify::uploaded(
             Arc::clone(&app),
             link.label,
