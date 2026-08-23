@@ -363,7 +363,14 @@ pub async fn create_tenant(
     // also catches a root session already writing there, since begin creates
     // the directory before any byte lands.
     let folder = tenant_receive_dir(&app.config.receive_dir, &key).map_err(ApiError::internal)?;
-    if folder_has_entries(&folder) {
+    let free = folder_is_free(&folder).map_err(|error| {
+        tracing::error!(%error, "receive folder could not be read");
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "that folder could not be read; check it before creating this tenant",
+        )
+    })?;
+    if !free {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "that folder already holds received files; move them aside first",
@@ -676,10 +683,17 @@ pub async fn update_tenant(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// Whether a directory exists and holds anything. An empty one is not a
-/// collision: nobody's files are in it.
-fn folder_has_entries(path: &std::path::Path) -> bool {
-    std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
+/// Whether the receive folder for a tenant key is free to claim. Absent is
+/// free and so is an empty directory, since nobody's files are in it.
+/// Anything else refuses, including an unreadable directory and a plain file
+/// at that path: a wrong answer here lets a tenant be created over somebody
+/// else's data, and a later delete purges the whole subtree.
+fn folder_is_free(path: &std::path::Path) -> Result<bool, String> {
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => Ok(entries.next().is_none()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
 }
 
 /// Whether deleting `key` may remove a receive subtree. A key with a
@@ -2566,6 +2580,24 @@ mod tenant_offboard_tests {
         // Creating the tenant would have put those files inside a namespace
         // whose delete purges the whole folder.
         assert!(occupied.join("invoice.pdf").exists());
+    }
+
+    #[test]
+    fn a_folder_is_free_only_when_absent_or_empty() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        assert!(folder_is_free(&root.join("absent")).unwrap());
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        assert!(folder_is_free(&root.join("empty")).unwrap());
+        std::fs::create_dir_all(root.join("full")).unwrap();
+        std::fs::write(root.join("full").join("x"), b"x").unwrap();
+        assert!(!folder_is_free(&root.join("full")).unwrap());
+        // A plain file at that path is reachable: a root link may deliver a
+        // single-component entry named exactly like a future tenant key.
+        // read_dir answers ENOTDIR, which must refuse rather than read as
+        // empty, or the tenant is created and every upload into it fails.
+        std::fs::write(root.join("afile"), b"x").unwrap();
+        assert!(folder_is_free(&root.join("afile")).is_err());
     }
 
     #[tokio::test]

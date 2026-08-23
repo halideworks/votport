@@ -370,8 +370,11 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
         }
         if let Some(first) = entry.path().next() {
             if reserved.contains(first) {
+                // Deliberately not saying why. Naming the reason would let
+                // anyone holding a link token probe tenant keys one package
+                // at a time, and senders never see those otherwise.
                 return Err(SessionError::bad(format!(
-                    "{first:?} is a tenant folder and is not writable through this link"
+                    "{first:?} is not writable through this link"
                 )));
             }
         }
