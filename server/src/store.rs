@@ -805,21 +805,23 @@ impl Store {
         let transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
-        let Some((history_type, upload_index)) = transaction
+        let Some((uploads_json, events_json)) = transaction
             .query_row(
-                "SELECT json_type(uploads_json), json_array_length(uploads_json)
-                 FROM links WHERE tenant = ?1 AND id = ?2",
+                "SELECT uploads_json, events_json FROM links WHERE tenant = ?1 AND id = ?2",
                 rusqlite::params![tenant, id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
             .map_err(|error| error.to_string())?
         else {
             return Ok(false);
         };
-        if history_type != "array" {
-            return Err("links.uploads_json is not an array".to_owned());
-        }
+        let uploads: Vec<UploadRecord> =
+            parse_json(&uploads_json, 0).map_err(|error| error.to_string())?;
+        let _: Vec<SessionEvent> =
+            parse_json(&events_json, 1).map_err(|error| error.to_string())?;
+        let upload_index = i64::try_from(uploads.len()).unwrap_or(i64::MAX);
+        drop((uploads, uploads_json, events_json));
         transaction
             .execute(
                 "UPDATE links
@@ -2649,7 +2651,19 @@ mod tenant_tests {
         store
             .with(|connection| {
                 connection.execute(
-                    "UPDATE links SET uploads_json = '{}' WHERE id = 'large'",
+                    "UPDATE links SET uploads_json = '[{}]' WHERE id = 'large'",
+                    [],
+                )
+            })
+            .unwrap();
+        assert!(store
+            .append_upload("acme", "large", uploads[1].clone())
+            .is_err());
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE links SET uploads_json = '[]', events_json = 'broken'
+                     WHERE id = 'large'",
                     [],
                 )
             })
