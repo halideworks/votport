@@ -558,10 +558,13 @@ pub async fn delete_tenant(
             "tenant delete already in progress",
         ));
     }
-    let count = app
-        .store
-        .tenant_link_count(&key)
-        .map_err(super::store_unavailable)?;
+    let count = match app.store.tenant_link_count(&key) {
+        Ok(count) => count,
+        Err(error) => {
+            app.sessions.unpin_tenant(&key);
+            return Err(super::store_unavailable(error));
+        }
+    };
     if count > 0 {
         app.sessions.unpin_tenant(&key);
         return Err(ApiError::new(
@@ -597,9 +600,18 @@ pub async fn delete_tenant(
     // removed, so a refusal leaves nothing half done. This stays the backstop
     // for pre-existing rows and for a link created after the create-time
     // checks below have passed.
-    if purge_target.is_some()
-        && default_tenant_dest_collides(&app.store, &key).map_err(super::store_unavailable)?
-    {
+    let default_dest_collides = if purge_target.is_some() {
+        match default_tenant_dest_collides(&app.store, &key) {
+            Ok(collides) => collides,
+            Err(error) => {
+                app.sessions.unpin_tenant(&key);
+                return Err(super::store_unavailable(error));
+            }
+        }
+    } else {
+        false
+    };
+    if default_dest_collides {
         app.sessions.unpin_tenant(&key);
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -1505,11 +1517,28 @@ pub async fn delete_link(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    if !app
-        .store
-        .remove_link(&identity.tenant, &id)
-        .map_err(ApiError::internal)?
-    {
+    if !app.sessions.pin_link_for_delete(&id) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "link delete already in progress",
+        ));
+    }
+    if app.sessions.active_for_link(&id) > 0 {
+        app.sessions.unpin_link(&id);
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "uploads are in flight; try again when they finish",
+        ));
+    }
+    let removed = match app.store.remove_link(&identity.tenant, &id) {
+        Ok(removed) => removed,
+        Err(error) => {
+            app.sessions.unpin_link(&id);
+            return Err(ApiError::internal(error));
+        }
+    };
+    app.sessions.unpin_link(&id);
+    if !removed {
         return Err(ApiError::not_found());
     }
     tracing::info!(target: "audit", event = "link_deleted", id = %id, "request link deleted");
@@ -2372,6 +2401,98 @@ mod tenant_offboard_tests {
     }
 
     #[tokio::test]
+    async fn store_read_failure_during_delete_unpins_the_tenant() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(named_tenant("acme"))
+            .unwrap();
+
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        rusqlite::Connection::open(application.config.data_dir.join("votport.db"))
+            .unwrap()
+            .execute_batch("DROP TABLE links")
+            .unwrap();
+
+        let response = delete_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!application.sessions.tenant_pinned("acme"));
+    }
+
+    #[tokio::test]
+    async fn collision_read_failure_during_delete_unpins_the_tenant() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(named_tenant("acme"))
+            .unwrap();
+        application
+            .store
+            .insert_link(default_link("broken", "elsewhere"))
+            .unwrap();
+        write_dummy(&application.config.receive_dir, "acme");
+
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        rusqlite::Connection::open(application.config.data_dir.join("votport.db"))
+            .unwrap()
+            .execute("UPDATE links SET active = 'broken' WHERE id = 'broken'", [])
+            .unwrap();
+
+        let response = delete_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!application.sessions.tenant_pinned("acme"));
+    }
+
+    #[tokio::test]
+    async fn link_delete_refuses_an_active_session_then_unpins() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_link(default_link("busy", ""))
+            .unwrap();
+        application
+            .sessions
+            .insert(
+                "session".to_owned(),
+                "busy".to_owned(),
+                String::new(),
+                tokio::sync::mpsc::channel(1).0,
+            )
+            .unwrap();
+
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let request = || {
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/admin/links/busy")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = app::router(application.clone())
+            .oneshot(request())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(application.store.link("", "busy").unwrap().is_some());
+
+        application.sessions.remove("session");
+        let response = app::router(application.clone())
+            .oneshot(request())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(application.store.link("", "busy").unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn live_session_refuses_delete_and_leaves_files() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
@@ -2892,7 +3013,7 @@ mod tenant_offboard_tests {
                 tokio::sync::mpsc::channel(1).0,
             )
             .unwrap_err();
-        assert_eq!(err, InsertError::Pinned);
+        assert_eq!(err, InsertError::TenantPinned);
     }
 }
 

@@ -588,6 +588,76 @@ async fn corrupted_chunks_are_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn begin_store_failure_creates_no_destination() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    let token = client
+        .post(format!("{base}/api/admin/links"))
+        .header("X-Votport", "1")
+        .json(&json!({ "label": "broken store", "dest": "failed" }))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["link"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let files = vec![prepare(vec!["untracked.bin"], vec![7u8; 1024])];
+    let (announcement, pages, seal) = build_package(&files);
+    let session = client
+        .post(format!("{base}/api/r/{token}/session"))
+        .json(&json!({ "package": announcement }))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    client
+        .post(format!("{base}/api/session/{session}/seal"))
+        .body(seal)
+        .send()
+        .await
+        .unwrap();
+    for page in pages {
+        client
+            .post(format!("{base}/api/session/{session}/page"))
+            .body(page)
+            .send()
+            .await
+            .unwrap();
+    }
+    rusqlite::Connection::open(server._data.path().join("votport.db"))
+        .unwrap()
+        .execute_batch("DROP TABLE links")
+        .unwrap();
+
+    let response = client
+        .post(format!("{base}/api/session/{session}/begin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 500);
+    assert!(!server.receive_dir.join("failed").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_api_requires_sign_in() {
     let server = start_server().await;
     let client = reqwest::Client::new();

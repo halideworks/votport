@@ -367,11 +367,18 @@ pub async fn create_session(
         link.tenant.clone(),
         sender,
     ) {
-        Err(session::InsertError::Pinned) => {
+        Err(session::InsertError::TenantPinned) => {
             audit_session_rejected(&app, &link.tenant, "tenant pinned for delete");
             return Err(ApiError::new(
                 StatusCode::GONE,
                 "this link's tenant no longer exists",
+            ));
+        }
+        Err(session::InsertError::LinkPinned) => {
+            audit_session_rejected(&app, &link.tenant, "link pinned for delete");
+            return Err(ApiError::new(
+                StatusCode::GONE,
+                "this link no longer exists",
             ));
         }
         Ok(()) => {}
