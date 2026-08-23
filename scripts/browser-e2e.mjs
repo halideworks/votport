@@ -68,6 +68,12 @@ if (
 ) {
   throw new Error(`object card identity malformed: ${JSON.stringify(ids)}`);
 }
+const statuses = await page.$$eval('#done-list .status', (els) =>
+  els.map((el) => el.textContent),
+);
+if (!statuses.every((s) => s.includes('receipt ✓'))) {
+  throw new Error(`receipt mark missing: ${JSON.stringify(statuses)}`);
+}
 await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
 await page.click('#done-list li:first-child .file-id');
 const copied = await page.evaluate(() => navigator.clipboard.readText());
