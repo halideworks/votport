@@ -161,6 +161,10 @@ curl -b cookies.txt 'https://drop.example.com/api/admin/audit?since=0&limit=1000
 Rows are never modified or deleted through the API; retention prunes them
 after `VOTPORT_AUDIT_RETENTION_DAYS` (default 400).
 
+Platform admins can read current link and live-byte totals for every tenant at
+`GET /api/admin/holdings`. Quota checks, holdings, and `/metrics` use the
+schema-v7 SQL file projection rather than loading upload-history JSON.
+
 ## Receipts
 
 Every published file gets a sidecar, `<name>.vot-receipt`: a canonical

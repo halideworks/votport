@@ -106,6 +106,8 @@ also inserted into `audit_log(at, tenant, actor, event, subject, detail_json)`.
   sqlite3 command; received files are plain files, already backup-friendly.
 - Optional: litestream recipe in the deployment guide.
 - Per-tenant metrics lines on a plain-text `/metrics` (counts only, no new framework).
+- Platform-admin `GET /api/admin/holdings` returns grouped link and live-byte
+  totals from the schema-v7 SQL file projection.
 - Deployment guide: single instance behind Caddy, volume layout, SSO setup with
   two worked examples (Authentik, Entra ID).
 - Upload-content lifecycle: `VOTPORT_UPLOAD_RETENTION_DAYS` (off by default) with

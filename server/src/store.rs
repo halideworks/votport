@@ -124,6 +124,13 @@ pub struct Tenant {
     pub created_at: u64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct TenantUsage {
+    pub tenant: String,
+    pub links: u64,
+    pub received_bytes: u64,
+}
+
 impl Tenant {
     /// The namespace files for this tenant publish into, relative to the
     /// receive root. The default tenant keeps today's layout so existing
@@ -226,7 +233,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-const SCHEMA_VERSION: u64 = 6;
+const SCHEMA_VERSION: u64 = 7;
 
 const SETTINGS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS settings (
@@ -251,6 +258,19 @@ CREATE TABLE IF NOT EXISTS principals (
 
 const LEGAL_HOLD_SCHEMA: &str =
     "ALTER TABLE links ADD COLUMN legal_hold INTEGER NOT NULL DEFAULT 0;";
+
+const FILES_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS files (
+    link_id TEXT NOT NULL,
+    tenant TEXT NOT NULL DEFAULT '',
+    upload_index INTEGER NOT NULL,
+    file_index INTEGER NOT NULL,
+    bytes INTEGER NOT NULL,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (link_id, upload_index, file_index)
+);
+CREATE INDEX IF NOT EXISTS files_tenant_live ON files(tenant, deleted, bytes);
+";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -502,6 +522,28 @@ impl Store {
                 .execute_batch(LEGAL_HOLD_SCHEMA)
                 .map_err(|error| format!("schema: {error}"))?;
         }
+        if stored < 7 {
+            transaction
+                .execute_batch(FILES_SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
+            let links = {
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT id, tenant, label, dest, password_hash, created_at, expires_at,
+                                max_bytes, active, legal_hold, uploads_json, events_json
+                         FROM links ORDER BY rowid",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let rows = statement
+                    .query_map([], row_to_link)
+                    .map_err(|error| error.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?
+            };
+            for link in &links {
+                rebuild_link_files(&transaction, link).map_err(|error| error.to_string())?;
+            }
+        }
         transaction
             .execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
@@ -532,7 +574,7 @@ impl Store {
                 // OR IGNORE keeps a retry idempotent: if a previous run
                 // committed the import but died before the rename, the rows
                 // are already there and identical.
-                transaction
+                let inserted = transaction
                     .execute(
                         "INSERT OR IGNORE INTO links (id, tenant, label, dest, password_hash,
                                                       created_at, expires_at, max_bytes, active,
@@ -541,6 +583,9 @@ impl Store {
                         link_params(link),
                     )
                     .map_err(|error| error.to_string())?;
+                if inserted > 0 {
+                    rebuild_link_files(&transaction, link).map_err(|error| error.to_string())?;
+                }
             }
             if let Some(hash) = &document.admin_password_hash {
                 transaction
@@ -643,28 +688,30 @@ impl Store {
     }
 
     pub fn insert_link(&self, link: Link) -> Result<(), InsertLinkError> {
-        self.with(|connection| {
-            // Named tenants have no FK; refuse inside this lock so a concurrent
-            // remove_tenant cannot commit an orphan link.
-            if !link.tenant.is_empty() {
-                let exists: i64 = connection.query_row(
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| InsertLinkError::Store(error.to_string()))?;
+        // Named tenants have no FK; refuse inside this lock so a concurrent
+        // remove_tenant cannot commit an orphan link.
+        if !link.tenant.is_empty() {
+            let exists: i64 = transaction
+                .query_row(
                     "SELECT EXISTS (SELECT 1 FROM tenants WHERE key = ?1)",
                     [&link.tenant],
                     |row| row.get(0),
-                )?;
-                if exists == 0 {
-                    return Ok(false);
-                }
+                )
+                .map_err(|error| InsertLinkError::Store(error.to_string()))?;
+            if exists == 0 {
+                return Err(InsertLinkError::NamedTenantGone);
             }
-            insert_link_row(connection, &link)?;
-            Ok(true)
-        })
-        .map_err(InsertLinkError::Store)
-        .and_then(|inserted| {
-            inserted
-                .then_some(())
-                .ok_or(InsertLinkError::NamedTenantGone)
-        })
+        }
+        insert_link_row(&transaction, &link)
+            .map_err(|error| InsertLinkError::Store(error.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| InsertLinkError::Store(error.to_string()))?;
+        Ok(())
     }
 
     /// Applies `mutate` to the link and commits; Ok(false) when absent.
@@ -690,13 +737,25 @@ impl Store {
     }
 
     pub fn remove_link(&self, tenant: &str, id: &str) -> Result<bool, String> {
-        self.with(|connection| {
-            let changed = connection.execute(
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM files
+                 WHERE link_id IN (SELECT id FROM links WHERE tenant = ?1 AND id = ?2)",
+                rusqlite::params![tenant, id],
+            )
+            .map_err(|error| error.to_string())?;
+        let changed = transaction
+            .execute(
                 "DELETE FROM links WHERE tenant = ?1 AND id = ?2",
                 [tenant, id],
-            )?;
-            Ok(changed > 0)
-        })
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(changed > 0)
     }
 
     // ------------------------------------------------------------- tenants
@@ -1044,13 +1103,48 @@ impl Store {
 
     /// Bytes received-and-not-deleted across a tenant's links.
     pub fn tenant_received_bytes(&self, tenant: &str) -> Result<u64, String> {
-        Ok(self
-            .links(tenant)?
-            .into_iter()
-            .flat_map(|link| link.uploads.into_iter().flat_map(|upload| upload.files))
-            .filter(|file| !file.deleted)
-            .map(|file| file.bytes)
-            .sum())
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT COALESCE(SUM(bytes), 0) FROM files
+                     WHERE tenant = ?1 AND deleted = 0",
+                    [tenant],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|bytes| bytes.max(0) as u64)
+        })
+    }
+
+    /// Link and live-byte totals for every tenant in one grouped query.
+    pub fn tenant_usage(&self) -> Result<Vec<TenantUsage>, String> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "WITH namespaces(tenant) AS (
+                     SELECT ''
+                     UNION SELECT key FROM tenants
+                     UNION SELECT tenant FROM links
+                 ), link_counts AS (
+                     SELECT tenant, COUNT(*) AS links FROM links GROUP BY tenant
+                 ), file_bytes AS (
+                     SELECT tenant, SUM(bytes) AS received_bytes
+                     FROM files WHERE deleted = 0 GROUP BY tenant
+                 )
+                 SELECT namespaces.tenant, COALESCE(link_counts.links, 0),
+                        COALESCE(file_bytes.received_bytes, 0)
+                 FROM namespaces
+                 LEFT JOIN link_counts USING (tenant)
+                 LEFT JOIN file_bytes USING (tenant)
+                 ORDER BY namespaces.tenant",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(TenantUsage {
+                    tenant: row.get(0)?,
+                    links: row.get::<_, i64>(1)?.max(0) as u64,
+                    received_bytes: row.get::<_, i64>(2)?.max(0) as u64,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
     }
 }
 
@@ -1061,6 +1155,7 @@ fn insert_link_row(connection: &Connection, link: &Link) -> rusqlite::Result<()>
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         link_params(link),
     )?;
+    rebuild_link_files(connection, link)?;
     Ok(())
 }
 
@@ -1072,6 +1167,28 @@ fn write_link_row(connection: &Connection, link: &Link) -> rusqlite::Result<()> 
          WHERE id = ?1 AND tenant = ?2",
         link_params(link),
     )?;
+    rebuild_link_files(connection, link)?;
+    Ok(())
+}
+
+fn rebuild_link_files(connection: &Connection, link: &Link) -> rusqlite::Result<()> {
+    connection.execute("DELETE FROM files WHERE link_id = ?1", [&link.id])?;
+    let mut insert = connection.prepare_cached(
+        "INSERT INTO files (link_id, tenant, upload_index, file_index, bytes, deleted)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for (upload_index, upload) in link.uploads.iter().enumerate() {
+        for (file_index, file) in upload.files.iter().enumerate() {
+            insert.execute(rusqlite::params![
+                link.id,
+                link.tenant,
+                i64::try_from(upload_index).unwrap_or(i64::MAX),
+                i64::try_from(file_index).unwrap_or(i64::MAX),
+                i64::try_from(file.bytes).unwrap_or(i64::MAX),
+                file.deleted,
+            ])?;
+        }
+    }
     Ok(())
 }
 
@@ -1987,7 +2104,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
             directory.path().join("state.json"),
-            r#"{"links":[{"id":"old-link","label":"old","dest":"","created_at":0,"active":true}],
+            r#"{"links":[{"id":"old-link","label":"old","dest":"","created_at":0,"active":true,
+                "uploads":[{"id":"up","completed_at":1,"package_root":"root","total_bytes":3,
+                "files":[{"path":"a","stored_as":"a","bytes":3,"suite":"blake3","root":"object","receipt":false}]}]}],
                 "admin_password_hash":"old-hash"}"#,
         )
         .unwrap();
@@ -1997,6 +2116,7 @@ mod tests {
             store.admin_password_hash().unwrap().as_deref(),
             Some("old-hash")
         );
+        assert_eq!(store.tenant_received_bytes("").unwrap(), 3);
         assert!(!directory.path().join("state.json").exists());
         assert!(directory.path().join("state.json.imported").exists());
         // Reopening must not re-import stale state over newer rows.
@@ -2099,6 +2219,32 @@ mod tenant_tests {
         store.insert_link(link.clone()).unwrap();
         assert_eq!(store.tenant_received_bytes("acme").unwrap(), 500);
         assert_eq!(store.tenant_received_bytes("").unwrap(), 0);
+        let usage = store.tenant_usage().unwrap();
+        assert_eq!(usage.len(), 2);
+        assert_eq!(usage[0].tenant, "");
+        assert_eq!(usage[0].links, 0);
+        assert_eq!(usage[1].tenant, "acme");
+        assert_eq!(usage[1].links, 1);
+        assert_eq!(usage[1].received_bytes, 500);
+
+        store
+            .with(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER fail_file_insert BEFORE INSERT ON files
+                     BEGIN SELECT RAISE(FAIL, 'test file failure'); END;",
+                )
+            })
+            .unwrap();
+        assert!(store
+            .update_link("acme", "link-1", |link| {
+                link.uploads[0].files[0].deleted = true
+            })
+            .is_err());
+        assert!(!store.link("acme", "link-1").unwrap().unwrap().uploads[0].files[0].deleted);
+        assert_eq!(store.tenant_received_bytes("acme").unwrap(), 500);
+        store
+            .with(|connection| connection.execute_batch("DROP TRIGGER fail_file_insert"))
+            .unwrap();
 
         file.deleted = true;
         link.uploads[0].files[0] = file;
@@ -2108,6 +2254,14 @@ mod tenant_tests {
             })
             .unwrap();
         assert_eq!(store.tenant_received_bytes("acme").unwrap(), 0);
+        assert_eq!(store.tenant_usage().unwrap()[1].received_bytes, 0);
+        assert!(store.remove_link("acme", "link-1").unwrap());
+        let files = store
+            .with(|connection| {
+                connection.query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))
+            })
+            .unwrap();
+        assert_eq!(files, 0);
     }
 }
 
@@ -2241,6 +2395,7 @@ mod phase4_review_tests {
 
 #[cfg(test)]
 mod settings_tests {
+    use super::tests::test_link;
     use super::*;
 
     fn test_config() -> Config {
@@ -2447,13 +2602,13 @@ mod settings_tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         drop(store);
-        assert_eq!(schema_version(directory.path()), "6");
+        assert_eq!(schema_version(directory.path()), "7");
         Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "6");
+        assert_eq!(schema_version(directory.path()), "7");
     }
 
     #[test]
-    fn v4_database_gains_principals_and_stamps_6() {
+    fn v4_database_gains_principals_and_stamps_7() {
         let directory = tempfile::tempdir().unwrap();
         {
             let connection = Connection::open(directory.path().join("votport.db")).unwrap();
@@ -2471,13 +2626,13 @@ mod settings_tests {
                 .unwrap();
         }
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "6");
+        assert_eq!(schema_version(directory.path()), "7");
         assert!(store.principals().unwrap().is_empty());
         assert!(store.principal("nobody").unwrap().is_none());
     }
 
     #[test]
-    fn v5_database_gains_legal_hold_and_stamps_6() {
+    fn v5_database_gains_legal_hold_and_stamps_7() {
         let directory = tempfile::tempdir().unwrap();
         {
             let connection = Connection::open(directory.path().join("votport.db")).unwrap();
@@ -2493,8 +2648,47 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "6");
+        assert_eq!(schema_version(directory.path()), "7");
         assert!(!store.link("", "old-link").unwrap().unwrap().legal_hold);
+    }
+
+    #[test]
+    fn v6_database_backfills_files_and_stamps_7() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut link = test_link("old-link");
+        link.uploads.push(UploadRecord {
+            id: "up".to_owned(),
+            started_at: 0,
+            completed_at: 1,
+            replayed_chunks: 0,
+            rejected_chunks: 0,
+            package_root: "root".to_owned(),
+            total_bytes: 9,
+            files: vec![FileRecord {
+                path: "a".to_owned(),
+                stored_as: "a".to_owned(),
+                bytes: 9,
+                suite: "blake3".to_owned(),
+                root: "object".to_owned(),
+                receipt: false,
+                deleted: false,
+            }],
+        });
+        store.insert_link(link).unwrap();
+        store
+            .with(|connection| {
+                connection.execute_batch(
+                    "DROP TABLE files;
+                     UPDATE meta SET value = '6' WHERE key = 'schema_version';",
+                )
+            })
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(directory.path()).unwrap();
+        assert_eq!(schema_version(directory.path()), "7");
+        assert_eq!(reopened.tenant_received_bytes("").unwrap(), 9);
     }
 
     #[test]

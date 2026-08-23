@@ -266,6 +266,16 @@ pub async fn admin_audit_export(
         .into_response())
 }
 
+/// Platform-wide link and live-byte totals without loading upload history.
+pub async fn holdings(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_platform_admin(&app, &headers)?;
+    let holdings = app.store.tenant_usage().map_err(ApiError::internal)?;
+    Ok(Json(json!({ "holdings": holdings })))
+}
+
 #[derive(Deserialize)]
 pub struct AuditQuery {
     since: Option<u64>,
@@ -1951,6 +1961,45 @@ mod handler_tests {
     }
 
     #[tokio::test]
+    async fn holdings_reports_platform_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = login_cookie(app::router(application.clone())).await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/admin/links")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"label":"holdings"}"#))
+            .unwrap();
+        assert_eq!(
+            app::router(application.clone())
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let response = app::router(application)
+            .oneshot(
+                Request::get("/api/admin/holdings")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        use http_body_util::BodyExt as _;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["holdings"][0]["tenant"], "");
+        assert_eq!(json["holdings"][0]["links"], 1);
+        assert_eq!(json["holdings"][0]["received_bytes"], 0);
+    }
+
+    #[tokio::test]
     async fn https_public_url_marks_cookies_secure() {
         let directory = tempfile::tempdir().unwrap();
         let router = app::router(testing::build(directory.path()));
@@ -2917,6 +2966,7 @@ mod ops_tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("votport_tenants"));
+        assert!(text.contains("votport_received_bytes{tenant=\"default\"} 0"));
         assert!(text.contains("votport_sessions_active"));
     }
 

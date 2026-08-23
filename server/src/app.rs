@@ -300,6 +300,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/admin/logout", post(api::admin_logout))
         .route("/api/admin/session", get(api::admin_session))
         .route("/api/admin/audit", get(api::admin_audit_export))
+        .route("/api/admin/holdings", get(api::holdings))
         .route("/api/admin/backup", get(api::backup_database))
         .route(
             "/api/admin/tenants",
@@ -411,32 +412,23 @@ async fn metrics(State(app): State<std::sync::Arc<App>>, headers: HeaderMap) -> 
 }
 
 fn metrics_text(app: &App) -> Result<String, String> {
-    let tenants = app.store.tenants()?;
+    let usage = app.store.tenant_usage()?;
     let mut body = format!(
         "# TYPE votport_tenants gauge\nvotport_tenants {}\n",
-        tenants.len()
+        usage.iter().filter(|row| !row.tenant.is_empty()).count()
     );
-    for tenant in &tenants {
-        let links = app.store.links(&tenant.key)?;
-        let bytes: u64 = links
-            .iter()
-            .flat_map(|link| link.uploads.iter().flat_map(|upload| &upload.files))
-            .filter(|file| !file.deleted)
-            .map(|file| file.bytes)
-            .sum();
-        let key = &tenant.key;
+    for row in usage {
+        let key = if row.tenant.is_empty() {
+            "default"
+        } else {
+            &row.tenant
+        };
         let _ = write!(
             body,
-            "votport_links{{tenant=\"{key}\"}} {}\nvotport_received_bytes{{tenant=\"{key}\"}} {bytes}\n",
-            links.len()
+            "votport_links{{tenant=\"{key}\"}} {}\nvotport_received_bytes{{tenant=\"{key}\"}} {}\n",
+            row.links, row.received_bytes
         );
     }
-    let default_links = app.store.links("")?;
-    let _ = writeln!(
-        body,
-        "votport_links{{tenant=\"default\"}} {}",
-        default_links.len()
-    );
     let _ = write!(
         body,
         "# TYPE votport_sessions_active gauge\nvotport_sessions_active {}\n",
