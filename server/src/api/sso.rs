@@ -124,7 +124,11 @@ fn finish_sso_login(
         tenant: String::new(),
         role: role.clone(),
     }];
-    for tenant in store.tenants() {
+    let tenants = store.tenants().map_err(|error| {
+        tracing::error!(%error, "tenant read failed during sign-in");
+        "could not complete sign-in"
+    })?;
+    for tenant in tenants {
         let Some(required) = &tenant.admin_group else {
             continue;
         };
@@ -179,10 +183,15 @@ pub struct CallbackParams {
 pub async fn sso_available(State(app): State<std::sync::Arc<App>>) -> Response {
     let available = app.sso_config.is_some();
     let sso_healthy = app.sso_client.health_peek();
-    let public_password_login = app
-        .store
-        .resolved_settings(&app.config)
-        .public_password_login;
+    // A read failure must not answer "password sign-in is off": the login
+    // page would hide the break-glass form. Fall back to the env default.
+    let public_password_login = match app.store.resolved_settings(&app.config) {
+        Ok(settings) => settings.public_password_login,
+        Err(error) => {
+            tracing::error!(%error, "settings read failed; using the environment default");
+            app.config.public_password_login
+        }
+    };
     (
         [(header::CONTENT_TYPE, "application/json")],
         axum::Json(json!({
@@ -480,7 +489,10 @@ pub async fn sso_callback(
         Ok(identity) => identity,
         Err(message) => return home(message),
     };
-    let admin_cookie = super::admin::issue_admin_cookie(&app, &identity);
+    let admin_cookie = match super::admin::issue_admin_cookie(&app, &identity) {
+        Ok(cookie) => cookie,
+        Err(_) => return home("could not complete sign-in"),
+    };
     let clear_state =
         format!("{STATE_COOKIE}=; Path=/api/admin; HttpOnly; SameSite=Lax; Max-Age=0");
     (
@@ -706,7 +718,7 @@ mod tests {
         let (_directory, store) = test_store();
         let error = finish_sso_login(&store, "local", "admin".to_owned(), &[]).unwrap_err();
         assert_eq!(error, "identity could not be verified");
-        assert!(store.principal("local").is_none());
+        assert!(store.principal("local").unwrap().is_none());
         assert!(sso_login_events(&store).is_empty());
     }
 

@@ -351,9 +351,13 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
     // only case where a package path can name a tenant folder.
     let publishes_into_receive_root = setup.tenant.is_empty() && setup.dest_rel.is_empty();
     let reserved: HashSet<String> = if publishes_into_receive_root {
+        // A read failure refuses the package rather than admitting it: this
+        // guard exists to keep a root link out of a tenant's folder, and
+        // guessing "no tenants" is the answer that lets it in.
         setup
             .store
             .tenants()
+            .map_err(|error| SessionError::internal(format!("tenant read failed: {error}")))?
             .into_iter()
             .map(|tenant| tenant.key)
             .collect()
@@ -394,16 +398,18 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
         )));
     }
 
-    fs::create_dir_all(&setup.dest_dir)
-        .map_err(|error| SessionError::internal(format!("create destination: {error}")))?;
-    paths::tighten_dir(&setup.dest_dir);
-
-    // Files this link already delivered, for dedupe on identical roots.
+    // A read failure also means finish cannot record the upload, so refuse
+    // before opening destinations rather than leave untracked files.
     let prior_uploads = setup
         .store
         .link_by_id(&setup.link_id)
-        .map(|link| link.uploads)
-        .unwrap_or_default();
+        .map_err(|error| SessionError::internal(format!("link read failed: {error}")))?
+        .ok_or_else(|| SessionError::conflict("request link no longer exists"))?
+        .uploads;
+
+    fs::create_dir_all(&setup.dest_dir)
+        .map_err(|error| SessionError::internal(format!("create destination: {error}")))?;
+    paths::tighten_dir(&setup.dest_dir);
 
     let mut files = Vec::with_capacity(entries.len());
     for entry in &entries {
@@ -429,6 +435,7 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
         let now_reserved: HashSet<String> = setup
             .store
             .tenants()
+            .map_err(|error| SessionError::internal(format!("tenant read failed: {error}")))?
             .into_iter()
             .map(|tenant| tenant.key)
             .collect();
@@ -672,6 +679,7 @@ fn publish_file(setup: &WorkerSetup, file: &mut FileState) -> Result<(), Session
         let taken = setup
             .store
             .tenants()
+            .map_err(|error| SessionError::internal(format!("tenant read failed: {error}")))?
             .into_iter()
             .any(|tenant| &tenant.key == name);
         if taken {
@@ -731,12 +739,15 @@ fn handle_finish(
         files: records.clone(),
     };
     let upload_id = upload.id.clone();
-    setup
+    let recorded = setup
         .store
         .update_link(&setup.tenant, &setup.link_id, |link| {
             link.uploads.push(upload)
         })
         .map_err(SessionError::internal)?;
+    if !recorded {
+        return Err(SessionError::conflict("request link no longer exists"));
+    }
     *phase = Phase::Done;
     Ok(FinishReport {
         upload_id,
@@ -825,10 +836,15 @@ struct SessionsInner {
     /// Tenants whose receive subtree is being deleted. Lives on the same
     /// mutex as `map` so [`Sessions::insert`] cannot race the pin.
     pinned: HashSet<String>,
+    pinned_links: HashSet<String>,
     #[cfg(test)]
     delete_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
     #[cfg(test)]
     create_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    #[cfg(test)]
+    session_create_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    #[cfg(test)]
+    finish_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
 }
 
 pub struct SessionHandle {
@@ -840,7 +856,8 @@ pub struct SessionHandle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertError {
-    Pinned,
+    TenantPinned,
+    LinkPinned,
 }
 
 impl Default for Sessions {
@@ -855,10 +872,15 @@ impl Sessions {
             inner: Mutex::new(SessionsInner {
                 map: HashMap::new(),
                 pinned: HashSet::new(),
+                pinned_links: HashSet::new(),
                 #[cfg(test)]
                 delete_stall: None,
                 #[cfg(test)]
                 create_stall: None,
+                #[cfg(test)]
+                session_create_stall: None,
+                #[cfg(test)]
+                finish_stall: None,
             }),
         }
     }
@@ -896,6 +918,23 @@ impl Sessions {
             .contains(tenant)
     }
 
+    /// Blocks new sessions for `link_id` while its row is being deleted.
+    pub fn pin_link_for_delete(&self, link_id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("sessions poisoned")
+            .pinned_links
+            .insert(link_id.to_owned())
+    }
+
+    pub fn unpin_link(&self, link_id: &str) {
+        self.inner
+            .lock()
+            .expect("sessions poisoned")
+            .pinned_links
+            .remove(link_id);
+    }
+
     #[cfg(test)]
     pub fn arm_delete_stall(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (entered_tx, entered_rx) = oneshot::channel();
@@ -909,6 +948,25 @@ impl Sessions {
         let (entered_tx, entered_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
         self.inner.lock().expect("sessions poisoned").create_stall = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub fn arm_session_create_stall(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        self.inner
+            .lock()
+            .expect("sessions poisoned")
+            .session_create_stall = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub fn arm_finish_stall(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        self.inner.lock().expect("sessions poisoned").finish_stall = Some((entered_tx, release_rx));
         (entered_rx, release_tx)
     }
 
@@ -942,6 +1000,34 @@ impl Sessions {
         }
     }
 
+    #[cfg(test)]
+    pub async fn wait_session_create_stall(&self) {
+        let stall = self
+            .inner
+            .lock()
+            .expect("sessions poisoned")
+            .session_create_stall
+            .take();
+        if let Some((entered, release)) = stall {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn wait_finish_stall(&self) {
+        let stall = self
+            .inner
+            .lock()
+            .expect("sessions poisoned")
+            .finish_stall
+            .take();
+        if let Some((entered, release)) = stall {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
+
     /// Fails if `tenant` is pinned. Same lock as pin.
     pub fn insert(
         &self,
@@ -952,7 +1038,10 @@ impl Sessions {
     ) -> Result<(), InsertError> {
         let mut inner = self.inner.lock().expect("sessions poisoned");
         if !tenant.is_empty() && inner.pinned.contains(&tenant) {
-            return Err(InsertError::Pinned);
+            return Err(InsertError::TenantPinned);
+        }
+        if inner.pinned_links.contains(&link_id) {
+            return Err(InsertError::LinkPinned);
         }
         inner.map.insert(
             id,
@@ -1045,7 +1134,7 @@ mod pin_tests {
                 dummy_sender(),
             )
             .unwrap_err();
-        assert_eq!(err, InsertError::Pinned);
+        assert_eq!(err, InsertError::TenantPinned);
         assert_eq!(sessions.total(), 0);
 
         sessions.unpin_tenant("acme");
@@ -1077,6 +1166,32 @@ mod pin_tests {
         let sessions = Sessions::new();
         assert!(!sessions.pin_tenant_for_delete(""));
         assert!(!sessions.tenant_pinned(""));
+        sessions
+            .insert(
+                "s1".to_owned(),
+                "link".to_owned(),
+                String::new(),
+                dummy_sender(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn insert_fails_while_the_link_is_pinned() {
+        let sessions = Sessions::new();
+        assert!(sessions.pin_link_for_delete("link"));
+        let err = sessions
+            .insert(
+                "s1".to_owned(),
+                "link".to_owned(),
+                String::new(),
+                dummy_sender(),
+            )
+            .unwrap_err();
+        assert_eq!(err, InsertError::LinkPinned);
+        assert_eq!(sessions.total(), 0);
+
+        sessions.unpin_link("link");
         sessions
             .insert(
                 "s1".to_owned(),

@@ -30,7 +30,15 @@ pub async fn uploaded(app: Arc<App>, label: String, report: FinishReport) {
             .join("\n")
     );
 
-    let settings = app.store.resolved_settings(&app.config);
+    // Best effort like the rest of this path: a settings read failure logs
+    // and sends nothing, rather than failing an upload that already landed.
+    let settings = match app.store.resolved_settings(&app.config) {
+        Ok(settings) => settings,
+        Err(error) => {
+            tracing::error!(%error, "settings read failed; skipping notifications");
+            return;
+        }
+    };
 
     if let Some(url) = &settings.notify_webhook {
         let payload = json!({

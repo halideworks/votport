@@ -389,7 +389,11 @@ async fn metrics(State(app): State<std::sync::Arc<App>>, headers: HeaderMap) -> 
     }
     let app = Arc::clone(&app);
     let body = match tokio::task::spawn_blocking(move || metrics_text(&app)).await {
-        Ok(body) => body,
+        Ok(Ok(body)) => body,
+        Ok(Err(error)) => {
+            tracing::error!(%error, "metrics read failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "metrics unavailable").into_response();
+        }
         Err(_) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, "metrics unavailable").into_response()
         }
@@ -404,14 +408,14 @@ async fn metrics(State(app): State<std::sync::Arc<App>>, headers: HeaderMap) -> 
         .into_response()
 }
 
-fn metrics_text(app: &App) -> String {
-    let tenants = app.store.tenants();
+fn metrics_text(app: &App) -> Result<String, String> {
+    let tenants = app.store.tenants()?;
     let mut body = format!(
         "# TYPE votport_tenants gauge\nvotport_tenants {}\n",
         tenants.len()
     );
     for tenant in &tenants {
-        let links = app.store.links(&tenant.key);
+        let links = app.store.links(&tenant.key)?;
         let bytes: u64 = links
             .iter()
             .flat_map(|link| link.uploads.iter().flat_map(|upload| &upload.files))
@@ -425,7 +429,7 @@ fn metrics_text(app: &App) -> String {
             links.len()
         );
     }
-    let default_links = app.store.links("");
+    let default_links = app.store.links("")?;
     let _ = writeln!(
         body,
         "votport_links{{tenant=\"default\"}} {}",
@@ -439,9 +443,9 @@ fn metrics_text(app: &App) -> String {
     let _ = write!(
         body,
         "# TYPE votport_audit_rows gauge\nvotport_audit_rows {}\n",
-        app.store.audit_count()
+        app.store.audit_count()?
     );
-    body
+    Ok(body)
 }
 
 /// Discards idle upload sessions and expired audit rows.
@@ -454,7 +458,16 @@ pub async fn session_sweeper(app: Arc<App>) {
                 app.sessions.sweep(idle);
             }
             _ = day.tick() => {
-                let settings = app.store.resolved_settings(&app.config);
+                // Skip this tick rather than sweep on guessed settings: a
+                // retention sweep deletes, and a wrong answer here deletes
+                // the wrong things.
+                let settings = match app.store.resolved_settings(&app.config) {
+                    Ok(settings) => settings,
+                    Err(error) => {
+                        tracing::error!(%error, "settings read failed; skipping this sweep");
+                        continue;
+                    }
+                };
                 if settings.audit_retention_days > 0 {
                     let cutoff =
                         crate::store::now_unix().saturating_sub(settings.audit_retention_days.saturating_mul(86_400));
@@ -491,7 +504,14 @@ pub async fn session_sweeper(app: Arc<App>) {
                 if settings.upload_retention_days > 0 {
                     let cutoff = crate::store::now_unix()
                         .saturating_sub(settings.upload_retention_days.saturating_mul(86_400));
-                    for link in app.store.all_links() {
+                    let links = match app.store.all_links() {
+                        Ok(links) => links,
+                        Err(error) => {
+                            tracing::error!(%error, "link read failed; skipping the retention sweep");
+                            continue;
+                        }
+                    };
+                    for link in links {
                         for upload in &link.uploads {
                             // completed_at == 0 marks pre-field records; never
                             // treat those as infinitely expired.
