@@ -51,6 +51,12 @@ impl ReceiptSigner {
         Ok(Self { key, public_hex })
     }
 
+    /// Verifying key for checking issued receipts; avoids re-parsing the
+    /// hex on every request.
+    pub fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
+        self.key.verifying_key()
+    }
+
     /// Writes `<destination>.vot-receipt` attesting the published object.
     pub fn write_sidecar(
         &self,

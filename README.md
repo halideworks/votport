@@ -169,8 +169,11 @@ assurance under the Balanced commit profile, with the session, provider
 incarnation, sequence, and UTC timestamp of the observation. The verifying
 public key is shown on **System** (and returned by `GET /api/admin/links` as
 `receipt_key`); the receipt's embedded key id is the same 32-byte public key.
-Verify one with the `vot-receipt` crate: `decode_authenticated(bytes)` then
-`verify_ed25519(&decoded, &key)`.
+Anyone can check a sidecar without an account: open `/verify`, drop the file
+and its sidecar (the file is hashed in your browser and never uploaded), or
+post the sidecar bytes to `POST /api/verify` after fetching the key from
+`GET /api/receipt-key`. Programmatically, verify with the `vot-receipt`
+crate: `decode_authenticated(bytes)` then `verify_ed25519(&decoded, &key)`.
 
 ## Security model
 
