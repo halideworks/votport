@@ -497,8 +497,9 @@ fn find_delivered(
         if record.deleted || record.root != root || record.suite != suite {
             continue;
         }
-        // stored_as is relative to this session's destination directory,
-        // which already carries the tenant prefix. A record made under a
+        // stored_as is relative to the tenant's subtree: it carries the link
+        // dest but not the tenant prefix, which is why dest_rel is stripped
+        // before joining under dest_dir. A record made under a
         // different link dest no longer lives beneath dest_dir; skip it.
         let rel = if setup.dest_rel.is_empty() {
             record.stored_as.as_str()
@@ -628,6 +629,24 @@ fn handle_chunk(
 }
 
 fn publish_file(setup: &WorkerSetup, file: &mut FileState) -> Result<(), SessionError> {
+    // A single-component entry never creates a directory: open_destination
+    // only calls create_dir_all below depth one, and staging lands in the
+    // parent. So nothing claims receive/<name> until this rename, and the
+    // checks at begin cannot see a tenant created during the transfer. This
+    // is the last moment before the name is taken.
+    if setup.tenant.is_empty() && setup.dest_rel.is_empty() && file.stored_components.len() == 1 {
+        let name = &file.stored_components[0];
+        let taken = setup
+            .store
+            .tenants()
+            .into_iter()
+            .any(|tenant| &tenant.key == name);
+        if taken {
+            return Err(SessionError::bad(format!(
+                "{name:?} is not writable through this link"
+            )));
+        }
+    }
     let native = file
         .native
         .as_mut()

@@ -1293,6 +1293,121 @@ async fn aborted_sessions_record_a_cancelled_event() {
     assert!(events[0]["expected_bytes"].as_u64().unwrap() > stopped);
 }
 
+/// A single-component entry creates no directory, so nothing claims the name
+/// until publish. A tenant created during the transfer must still win, or the
+/// upload lands a plain file where that tenant's folder has to be.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_root_link_cannot_publish_a_file_over_a_tenant_name() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+
+    let response = client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let response = client
+        .post(format!("{base}/api/admin/links"))
+        .header("X-Votport", "1")
+        .json(&json!({ "label": "root", "dest": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let token = response.json::<Value>().await.unwrap()["link"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // One top-level file named exactly like the tenant created below.
+    let files = [prepare(vec!["acme"], b"a plain file".to_vec())];
+    let (announcement, pages, seal) = build_package(&files);
+
+    let response = client
+        .post(format!("{base}/api/r/{token}/session"))
+        .json(&json!({ "password": null, "package": announcement }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let session = response.json::<Value>().await.unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let response = client
+        .post(format!("{base}/api/session/{session}/seal"))
+        .body(seal)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    for page in pages {
+        let response = client
+            .post(format!("{base}/api/session/{session}/page"))
+            .body(page)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    }
+    // begin passes: no tenant exists yet, and nothing on disk is claimed.
+    let response = client
+        .post(format!("{base}/api/session/{session}/begin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let entries = response.json::<Value>().await.unwrap();
+    let entry = entries["entries"][0]["index"].as_u64().unwrap();
+
+    // The tenant appears mid-transfer, which is the window this covers.
+    let response = client
+        .post(format!("{base}/api/admin/tenants"))
+        .header("X-Votport", "1")
+        .json(&json!({ "key": "acme", "label": "acme" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+
+    // Sending the only chunk completes the object and reaches publish, so
+    // this request is the one that carries the refusal.
+    let file = &files[0];
+    let proof = file
+        .prepared
+        .prove(0, file.bytes.len() as u64)
+        .expect("prove");
+    let mut body = proof.proof().to_vec();
+    let proof_len = body.len();
+    body.extend_from_slice(&file.bytes);
+    let response = client
+        .post(format!(
+            "{base}/api/session/{session}/chunk?entry={entry}&offset=0"
+        ))
+        .header("X-Votport-Proof", proof_len.to_string())
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        422,
+        "publish must refuse to put a file where the tenant folder belongs"
+    );
+    assert!(
+        !server.receive_dir.join("acme").is_file(),
+        "a plain file at that path wedges the tenant permanently"
+    );
+}
+
 /// A tenant's own link publishes under its prefix already, so a package whose
 /// top-level folder happens to match the tenant key resolves to
 /// receive/<key>/<key>/... and is nobody else's business.
