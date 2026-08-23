@@ -15,6 +15,14 @@ function showError(message) {
   $('verify-error').hidden = false;
 }
 
+function reportIgnored(count) {
+  showError(
+    count === 1
+      ? 'One extra file was ignored; only a file and its receipt are checked.'
+      : `${count} extra files were ignored; only a file and its receipt are checked.`,
+  );
+}
+
 function clearError() {
   $('verify-error').hidden = true;
 }
@@ -49,7 +57,7 @@ function takeFiles(files) {
   for (const file of files) {
     if (!sidecarFile && file.name.endsWith('.vot-receipt')) {
       sidecarFile = file;
-    } else if (!payloadFile) {
+    } else if (!payloadFile && !file.name.endsWith('.vot-receipt')) {
       payloadFile = file;
     } else {
       ignored += 1;
@@ -77,7 +85,12 @@ function showResult({ ok, title, file, bytes, next, suite, root }) {
   appendObjectCard(
     list,
     { name: file, suite, root },
-    { tag: 'li', rowClass: 'done', status: `${formatBytes(bytes)} · receipt ✓` },
+    {
+      tag: 'li',
+      rowClass: ok ? 'done' : '',
+      // The receipt mark is only true when the bytes matched too.
+      status: `${formatBytes(bytes)}${ok ? ' · receipt ✓' : ''}`,
+    },
   );
 
   const nextLine = $('verify-next');
@@ -199,7 +212,7 @@ try {
   const response = await fetch('/api/receipt-key');
   if (!response.ok) throw new Error(response.status);
   const { receipt_key: key } = await response.json();
-  $('receipt-key').textContent = key.replace(/(..)(..)(..).*(..)/, '$1 $2 $3 … $4');
+  $('receipt-key').textContent = key;
 } catch {
   $('receipt-key').textContent = 'unavailable';
 }
@@ -218,28 +231,25 @@ $('clear-sidecar').addEventListener('click', () => {
   clearError();
   renderSlots();
 });
-$('payload-input').addEventListener('change', (e) => takeFiles(e.target.files));
-$('sidecar-input').addEventListener('change', (e) =>
-  takeFiles(e.target.files),
-);
+$('payload-input').addEventListener('change', (e) => {
+  const ignored = takeFiles(e.target.files);
+  if (ignored) reportIgnored(ignored);
+});
+$('sidecar-input').addEventListener('change', (e) => {
+  const ignored = takeFiles(e.target.files);
+  if (ignored) reportIgnored(ignored);
+});
 const dropZone = $('verify-drop');
 dropZone.addEventListener('dragover', (e) => e.preventDefault());
 dropZone.addEventListener('drop', (e) => {
   e.preventDefault();
   const ignored = takeFiles([...e.dataTransfer.files]);
-  if (ignored) {
-    showError(
-      ignored === 1
-        ? 'One extra file was ignored; only a file and its receipt are checked.'
-        : `${ignored} extra files were ignored; only a file and its receipt are checked.`,
-    );
-  }
+  if (ignored) reportIgnored(ignored);
 });
 dropZone.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' || e.key === ' ') $('payload-input').click();
 });
-$('reset').addEventListener('click', reset);
-$('verify-form').addEventListener('submit', (e) => {
+$('reset').addEventListener('click', reset);$('verify-form').addEventListener('submit', (e) => {
   e.preventDefault();
   check();
 });

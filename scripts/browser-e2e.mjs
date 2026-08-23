@@ -110,6 +110,52 @@ if (`${verdict.suite}:${verdict.root}` !== ids[0]) {
   throw new Error(`verify root mismatch: ${JSON.stringify(verdict)}`);
 }
 console.log("verified:", ids[0]);
+
+// The /verify page itself: slot UI, sidecar-only, full match, mismatch.
+const payloadPath = path.join(stored, "Résumé Draft.pdf");
+const sidecarPath = path.join(stored, sidecarName);
+await page.goto(`${base}/verify`);
+await page.waitForSelector("#verify-drop", { timeout: 15000 });
+const shownKey = await page.textContent("#receipt-key");
+if (shownKey.trim() !== key) {
+  throw new Error("verify page shows a different receipt key");
+}
+await page.setInputFiles("#sidecar-input", sidecarPath);
+await page.click("#check");
+await page.waitForSelector("#verify-result:not([hidden])", {
+  timeout: 15000,
+});
+let title = await page.textContent("#verify-title");
+if (title !== "Genuine receipt") {
+  throw new Error(`sidecar-only verdict: ${title}`);
+}
+let okClass = await page.$eval("#verify-result", (el) => el.classList.contains("ok"));
+if (okClass) throw new Error("sidecar-only check must not be .ok");
+
+await page.click("#reset");
+await page.setInputFiles("#payload-input", payloadPath);
+await page.setInputFiles("#sidecar-input", sidecarPath);
+await page.click("#check");
+await page.waitForFunction(
+  () => !document.getElementById("verify-result").hidden &&
+    document.getElementById("verify-title").textContent !== "",
+  { timeout: 60000 },
+);
+title = await page.textContent("#verify-title");
+okClass = await page.$eval("#verify-result", (el) => el.classList.contains("ok"));
+if (title !== "Verified" || !okClass) {
+  throw new Error(`full-match verdict: ${title} ok=${okClass}`);
+}
+
+await page.click("#reset");
+await page.setInputFiles("#payload-input", path.join(dir, "archive.tar"));
+await page.setInputFiles("#sidecar-input", sidecarPath);
+await page.click("#check");
+await page.waitForFunction(
+  () => document.getElementById("verify-title").textContent === "Does not match",
+  { timeout: 60000 },
+);
+console.log("verify page flow ok");
 await browser.close();
 
 const stored = path.join(receiveDir, dest);

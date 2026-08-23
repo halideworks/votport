@@ -5,7 +5,7 @@
  * wordmark, Plus Jakarta Sans body, JetBrains Mono for numbers. Committed
  * dark navy — one palette, no light mode.
  *
- * Every id and class here is load-bearing: admin.js and upload.js bind them.
+ * Every id and class here is load-bearing: the pages' modules bind them.
  * Rename nothing without grepping web/assets/*.js first.
  */
 
