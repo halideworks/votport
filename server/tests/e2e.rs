@@ -1295,6 +1295,88 @@ async fn aborted_sessions_record_a_cancelled_event() {
 
 /// A package refused at begin (hidden path here) consumes the session, so
 /// the worker must record a "rejected" event rather than exiting silently.
+#[tokio::test]
+async fn a_root_link_cannot_write_into_a_tenant_folder() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+
+    let response = client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let response = client
+        .post(format!("{base}/api/admin/tenants"))
+        .header("X-Votport", "1")
+        .json(&json!({ "key": "acme", "label": "acme" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+
+    // A link at the receive root. Its dest names no tenant, so both creation
+    // checks pass; the collision only exists in the file's own path.
+    let response = client
+        .post(format!("{base}/api/admin/links"))
+        .header("X-Votport", "1")
+        .json(&json!({ "label": "root", "dest": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let token = response.json::<Value>().await.unwrap()["link"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let files = [prepare(vec!["acme", "invoice.pdf"], b"not yours".to_vec())];
+    let (announcement, pages, seal) = build_package(&files);
+
+    let response = client
+        .post(format!("{base}/api/r/{token}/session"))
+        .json(&json!({ "password": null, "package": announcement }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let session = response.json::<Value>().await.unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let response = client
+        .post(format!("{base}/api/session/{session}/seal"))
+        .body(seal)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    for page in pages {
+        let response = client
+            .post(format!("{base}/api/session/{session}/page"))
+            .body(page)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    }
+    let response = client
+        .post(format!("{base}/api/session/{session}/begin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 422, "{}", response.text().await.unwrap());
+    // Nothing was written under the tenant's folder.
+    assert!(!server.receive_dir.join("acme").join("invoice.pdf").exists());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn begin_rejection_records_an_event() {
     let server = start_server().await;

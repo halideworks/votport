@@ -344,6 +344,20 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
         .finish()
         .map_err(|error| SessionError::bad(format!("manifest rejected: {:?}", error.code())))?;
 
+    // A package delivered to the receive root can still reach into a tenant's
+    // folder through its own leading path component. The link's dest is
+    // checked when the link is created; a file's path is only known here.
+    let reserved: HashSet<String> = if setup.tenant.is_empty() && setup.dest_rel.is_empty() {
+        setup
+            .store
+            .tenants()
+            .into_iter()
+            .map(|tenant| tenant.key)
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
     let mut total: u64 = 0;
     for entry in &entries {
         if !matches!(entry.storage(), EntryStorage::Direct) {
@@ -353,6 +367,13 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
         }
         for component in entry.path() {
             paths::admit_component(component, setup.allow_hidden).map_err(SessionError::bad)?;
+        }
+        if let Some(first) = entry.path().next() {
+            if reserved.contains(first) {
+                return Err(SessionError::bad(format!(
+                    "{first:?} is a tenant folder and is not writable through this link"
+                )));
+            }
         }
         total = total
             .checked_add(entry.object_id().length)

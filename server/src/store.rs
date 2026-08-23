@@ -596,8 +596,19 @@ impl Store {
             for dest in dests {
                 let dest = dest?;
                 if dest == tenant.key || dest.starts_with(&prefix) {
-                    return Ok(false);
+                    return Ok(Some(InsertTenantError::DefaultLinkPublishesThere));
                 }
+            }
+            // Existence too: two concurrent creates both passed a handler
+            // check and the loser hit the UNIQUE constraint, which reads as a
+            // 500 with a raw SQL message instead of a conflict.
+            let exists: i64 = connection.query_row(
+                "SELECT EXISTS (SELECT 1 FROM tenants WHERE key = ?1)",
+                [&tenant.key],
+                |row| row.get(0),
+            )?;
+            if exists != 0 {
+                return Ok(Some(InsertTenantError::AlreadyExists));
             }
             connection.execute(
                 "INSERT INTO tenants (key, label, admin_group, max_total_bytes, max_links, max_sessions, created_at)
@@ -612,15 +623,12 @@ impl Store {
                     i64::try_from(tenant.created_at).unwrap_or(0)
                 ],
             )?;
-            Ok(true)
+            Ok(None)
         })
         .map_err(InsertTenantError::Store)
-        .and_then(|inserted| {
-            if inserted {
-                Ok(())
-            } else {
-                Err(InsertTenantError::DefaultLinkPublishesThere)
-            }
+        .and_then(|refusal| match refusal {
+            None => Ok(()),
+            Some(error) => Err(error),
         })
     }
 
@@ -1166,6 +1174,8 @@ pub enum TenantRemoval {
 pub enum InsertTenantError {
     /// A default-tenant link already publishes into that folder.
     DefaultLinkPublishesThere,
+    /// A tenant with that key is already there.
+    AlreadyExists,
     Store(String),
 }
 

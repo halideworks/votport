@@ -379,14 +379,15 @@ pub async fn create_tenant(
     // concurrent create_link cannot slip a colliding dest in beside it.
     app.store
         .insert_tenant(tenant)
-        .map_err(|error| {
-            match error {
-        crate::store::InsertTenantError::DefaultLinkPublishesThere => ApiError::new(
-            StatusCode::CONFLICT,
-            "a default-tenant link already publishes into that folder; repoint or delete it first",
-        ),
-        crate::store::InsertTenantError::Store(message) => ApiError::internal(message),
-    }
+        .map_err(|error| match error {
+            crate::store::InsertTenantError::DefaultLinkPublishesThere => ApiError::new(
+                StatusCode::CONFLICT,
+                "a default-tenant link publishes into that folder; repoint or delete it first",
+            ),
+            crate::store::InsertTenantError::AlreadyExists => {
+                ApiError::new(StatusCode::CONFLICT, "tenant already exists")
+            }
+            crate::store::InsertTenantError::Store(message) => ApiError::internal(message),
         })?;
     tracing::info!(target: "audit", event = "tenant_created", key = %key, "tenant namespace created");
     app.store
