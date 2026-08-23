@@ -465,6 +465,17 @@ pub async fn delete_tenant(
             format!("{active} upload(s) are in flight; try again when they finish"),
         ));
     }
+    // A default-tenant link may publish straight into <receive>/<key>, in
+    // which case that subtree holds files this delete does not own. Checked
+    // before the row is removed, so a refusal leaves nothing half done. Keys
+    // that skip the purge cannot collide with anything.
+    if purges_receive_subtree(&key) && default_tenant_dest_collides(&app.store, &key) {
+        app.sessions.unpin_tenant(&key);
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "refusing purge: a default-tenant dest uses that path",
+        ));
+    }
     use crate::store::TenantRemoval;
     let row_deleted = match app.store.remove_tenant(&key) {
         Ok(TenantRemoval::Deleted) => true,
@@ -490,13 +501,6 @@ pub async fn delete_tenant(
             if !path.is_dir() {
                 app.sessions.unpin_tenant(&key);
                 return Err(ApiError::not_found());
-            }
-            if default_tenant_dest_collides(&app.store, &key) {
-                app.sessions.unpin_tenant(&key);
-                return Err(ApiError::new(
-                    StatusCode::CONFLICT,
-                    "refusing leftover purge: default-tenant dest uses that path",
-                ));
             }
             false
         }
@@ -2162,6 +2166,48 @@ mod tenant_offboard_tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(application.store.tenants().is_empty());
         assert!(bystander.join("statement.pdf").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_when_a_default_link_publishes_into_the_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        // A default-tenant link whose dest is the tenant key: its files land
+        // in the same subtree, and nothing stops both from existing.
+        application
+            .store
+            .insert_link(Link {
+                id: "default-link".to_owned(),
+                tenant: String::new(),
+                label: "invoices".to_owned(),
+                dest: "acme".to_owned(),
+                password_hash: None,
+                created_at: 0,
+                expires_at: None,
+                max_bytes: None,
+                active: true,
+                uploads: Vec::new(),
+                events: Vec::new(),
+            })
+            .unwrap();
+        let shared = application.config.receive_dir.join("acme");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("invoice.pdf"), b"kept").unwrap();
+
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        assert_eq!(
+            create_tenant_req(application.clone(), &cookie, "acme")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let response = delete_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        // The refusal comes before remove_tenant, so nothing is half done.
+        assert!(application.store.tenant("acme").is_some());
+        assert!(shared.join("invoice.pdf").exists());
+        assert!(!application.sessions.tenant_pinned("acme"));
     }
 
     #[test]

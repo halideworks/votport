@@ -253,7 +253,7 @@ $('verify-form').addEventListener('submit', (e) => {
     const response = await fetch('/api/receipt-key');
     if (!response.ok) throw new Error(response.status);
     const { receipt_key: key } = await response.json();
-    $('receipt-key').textContent = key;
+    $('receipt-key').textContent = key || 'unavailable';
   } catch {
     $('receipt-key').textContent = 'unavailable';
   }

@@ -64,7 +64,11 @@ function renderTenant(tenant) {
         )
           return;
         try {
-          await api(`/api/admin/tenants/${tenant.key}`, { method: 'DELETE' });
+          // Encoded: a key stored before the server required one segment
+          // would otherwise build a two-segment path that matches no route.
+          await api(`/api/admin/tenants/${encodeURIComponent(tenant.key)}`, {
+            method: 'DELETE',
+          });
           await refreshTenants();
         } catch (error) {
           alertModal(error.message);
