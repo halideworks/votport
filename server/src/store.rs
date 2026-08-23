@@ -370,7 +370,9 @@ impl Store {
         let default_owns_prefix = |key: &str| {
             let uses_prefix = |path: &str| {
                 let component = path.split('/').next().unwrap_or_default();
-                !component.is_ascii() || component.eq_ignore_ascii_case(key)
+                component.contains('~')
+                    || !component.is_ascii()
+                    || component.eq_ignore_ascii_case(key)
             };
             default_links.iter().any(|link| {
                 uses_prefix(&link.dest)
@@ -1762,6 +1764,12 @@ mod tests {
 
         store
             .update_link("", "dest", |link| link.dest = "ſ".to_owned())
+            .unwrap();
+        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        assert!(error.contains("cannot determine ownership"), "{error}");
+
+        store
+            .update_link("", "dest", |link| link.dest = "TENANT~1".to_owned())
             .unwrap();
         let error = store.migrate_tenant_storage(&receive).unwrap_err();
         assert!(error.contains("cannot determine ownership"), "{error}");

@@ -55,9 +55,12 @@ pub fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String
     }
     if component
         .chars()
-        .any(|ch| ch == '/' || ch == '\\' || ch == '\0' || ch <= '\u{1f}')
+        .any(|ch| ch == '/' || ch == '\\' || ch == '~' || ch == '\0' || ch <= '\u{1f}')
     {
-        return Err("path component contains a separator or control character".to_owned());
+        return Err(
+            "path component contains a separator, control character, or DOS alias marker"
+                .to_owned(),
+        );
     }
     if !allow_hidden && component.starts_with('.') {
         return Err(
@@ -203,6 +206,7 @@ mod tests {
         assert!(admit_component(TENANT_STORAGE_DIR, true).is_err());
         assert!(admit_component(".VOT-TENANTS.STAGE", true).is_err());
         assert!(admit_component(".VOT-TENANTſ.STAGE", true).is_err());
+        assert!(admit_component("VOTTEN~1", true).is_err());
     }
 
     #[test]
