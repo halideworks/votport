@@ -708,9 +708,13 @@ impl Store {
         self.with(|connection| {
             connection
                 .query_row(
-                    "SELECT uploads_json FROM links WHERE id = ?1",
+                    "SELECT uploads_json, events_json FROM links WHERE id = ?1",
                     [id],
-                    |row| parse_json(&row.get::<_, String>(0)?, 0),
+                    |row| {
+                        let uploads = parse_json(&row.get::<_, String>(0)?, 0)?;
+                        let _: Vec<SessionEvent> = parse_json(&row.get::<_, String>(1)?, 1)?;
+                        Ok(uploads)
+                    },
                 )
                 .optional()
         })
@@ -2069,6 +2073,7 @@ mod tests {
                 )
             })
             .unwrap();
+        assert!(store.uploads_by_id("link-1").is_err());
         assert!(store.link("", "link-1").is_err());
     }
 
