@@ -11,7 +11,7 @@ pub mod verify;
 pub use admin::{
     admin_audit_export, admin_change_password, admin_login, admin_logout, admin_session,
     backup_database, create_link, create_tenant, delete_link, delete_received_file, delete_tenant,
-    delete_upload_record, get_settings, link_qr, list_links, list_tenants, put_settings,
+    delete_upload_record, get_settings, holdings, link_qr, list_links, list_tenants, put_settings,
     revoke_principal, switch_tenant, unblock_principal, update_link, update_tenant,
 };
 pub use sso::{sso_available, sso_callback, sso_start};

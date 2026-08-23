@@ -266,6 +266,16 @@ pub async fn admin_audit_export(
         .into_response())
 }
 
+/// Platform-wide link and live-byte totals without loading upload history.
+pub async fn holdings(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_platform_admin(&app, &headers)?;
+    let holdings = app.store.tenant_usage().map_err(ApiError::internal)?;
+    Ok(Json(json!({ "holdings": holdings })))
+}
+
 #[derive(Deserialize)]
 pub struct AuditQuery {
     since: Option<u64>,
@@ -1504,7 +1514,7 @@ pub async fn delete_upload_record(
     require_admin_write(&headers, &identity)?;
     let found = app
         .store
-        .update_link(&identity.tenant, &id, |link| {
+        .update_link_uploads(&identity.tenant, &id, |link| {
             link.uploads.retain(|entry| entry.id != upload)
         })
         .map_err(ApiError::internal)?;
@@ -1566,15 +1576,7 @@ pub async fn delete_received_file(
     // record still pointing there must never satisfy dedupe again.
     let stored_as = record.stored_as.clone();
     app.store
-        .update_link(&identity.tenant, &id, |link| {
-            for upload in &mut link.uploads {
-                for file in &mut upload.files {
-                    if file.stored_as == stored_as {
-                        file.deleted = true;
-                    }
-                }
-            }
-        })
+        .tombstone_files(&identity.tenant, &id, |file| file.stored_as == stored_as)
         .map_err(ApiError::internal)?;
     tracing::info!(target: "audit", event = "received_file_deleted", link = %id, stored_as = %stored_as, "received file deleted from disk");
     app.store.audit(
@@ -1948,6 +1950,45 @@ mod handler_tests {
         assert_eq!(line["event"], "link_created");
         assert_eq!(line["subject"], "l-1");
         assert_eq!(line["detail"]["label"], "x");
+    }
+
+    #[tokio::test]
+    async fn holdings_reports_platform_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = login_cookie(app::router(application.clone())).await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/admin/links")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"label":"holdings"}"#))
+            .unwrap();
+        assert_eq!(
+            app::router(application.clone())
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let response = app::router(application)
+            .oneshot(
+                Request::get("/api/admin/holdings")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        use http_body_util::BodyExt as _;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["holdings"][0]["tenant"], "");
+        assert_eq!(json["holdings"][0]["links"], 1);
+        assert_eq!(json["holdings"][0]["received_bytes"], 0);
     }
 
     #[tokio::test]
@@ -2917,6 +2958,7 @@ mod ops_tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("votport_tenants"));
+        assert!(text.contains("votport_received_bytes{tenant=\"default\"} 0"));
         assert!(text.contains("votport_sessions_active"));
     }
 
@@ -3485,6 +3527,54 @@ mod settings_api_tests {
         assert_eq!(tenant.max_total_bytes, Some(100));
         assert_eq!(tenant.max_links, None);
         assert_eq!(tenant.max_sessions, None);
+    }
+
+    #[tokio::test]
+    async fn tenant_api_round_trips_full_u64_quotas() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = cookie_for(&application, "", "admin");
+        let (status, json) = send(
+            application.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/tenants")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"key":"acme","label":"Acme","max_total_bytes":18446744073709551615,"max_links":18446744073709551615,"max_sessions":18446744073709551615}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["key"], "acme");
+        let tenant = application.store.tenant("acme").unwrap().unwrap();
+        assert_eq!(tenant.max_total_bytes, Some(u64::MAX));
+        assert_eq!(tenant.max_links, Some(u64::MAX));
+        assert_eq!(tenant.max_sessions, Some(u64::MAX));
+
+        let (status, json) = send(
+            application.clone(),
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/admin/tenants/acme")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"max_total_bytes":18446744073709551614,"max_links":18446744073709551614,"max_sessions":18446744073709551614}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["ok"], true);
+        let tenant = application.store.tenant("acme").unwrap().unwrap();
+        assert_eq!(tenant.max_total_bytes, Some(u64::MAX - 1));
+        assert_eq!(tenant.max_links, Some(u64::MAX - 1));
+        assert_eq!(tenant.max_sessions, Some(u64::MAX - 1));
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -68,13 +69,16 @@ pub enum Cmd {
     Seal {
         bytes: Bytes,
         reply: Reply<u64>,
+        _lease: SessionLease,
     },
     Page {
         bytes: Bytes,
         reply: Reply<u64>,
+        _lease: SessionLease,
     },
     Begin {
         reply: Reply<Vec<EntryInfo>>,
+        _lease: SessionLease,
     },
     Chunk {
         entry: usize,
@@ -82,14 +86,17 @@ pub enum Cmd {
         proof: Bytes,
         data: Bytes,
         reply: Reply<ChunkProgress>,
+        _lease: SessionLease,
     },
     Finish {
         reply: Reply<FinishReport>,
+        _lease: SessionLease,
     },
     /// Sender gave up; lets the worker record a "cancelled" event before it
     /// exits, instead of the generic "interrupted" the drop path records.
     Abort {
         reply: Reply<()>,
+        _lease: SessionLease,
     },
 }
 
@@ -193,13 +200,21 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
         while let Some(cmd) = receiver.blocking_recv() {
             last_seen = now_unix();
             match cmd {
-                Cmd::Seal { bytes, reply } => {
+                Cmd::Seal {
+                    bytes,
+                    reply,
+                    _lease,
+                } => {
                     send_noted!(reply, handle_seal(&setup, &mut phase, &bytes));
                 }
-                Cmd::Page { bytes, reply } => {
+                Cmd::Page {
+                    bytes,
+                    reply,
+                    _lease,
+                } => {
                     send_noted!(reply, handle_page(&mut phase, &bytes));
                 }
-                Cmd::Begin { reply } => {
+                Cmd::Begin { reply, _lease } => {
                     let result = handle_begin(&setup, &mut phase);
                     // A failed begin has consumed the pages: the phase is
                     // already Done, the worker exits below, and the exit-time
@@ -225,6 +240,7 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
                     proof,
                     data,
                     reply,
+                    _lease,
                 } => {
                     let result = handle_chunk(&setup, &mut phase, entry, offset, &proof, &data);
                     match &result {
@@ -235,10 +251,10 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
                     }
                     send_noted!(reply, result);
                 }
-                Cmd::Finish { reply } => {
+                Cmd::Finish { reply, _lease } => {
                     send_noted!(reply, handle_finish(&setup, &mut phase, replays, rejected));
                 }
-                Cmd::Abort { reply } => {
+                Cmd::Abort { reply, _lease } => {
                     record_event(
                         &setup,
                         received,
@@ -653,9 +669,7 @@ fn handle_finish(
     let upload_id = upload.id.clone();
     let recorded = setup
         .store
-        .update_link(&setup.tenant, &setup.link_id, |link| {
-            link.uploads.push(upload)
-        })
+        .append_upload(&setup.tenant, &setup.link_id, upload)
         .map_err(SessionError::internal)?;
     if !recorded {
         return Err(SessionError::conflict("request link no longer exists"));
@@ -757,7 +771,7 @@ impl Drop for LinkPin<'_> {
 struct SessionsInner {
     map: HashMap<String, SessionHandle>,
     /// Tenants whose receive subtree is being deleted. Lives on the same
-    /// mutex as `map` so [`Sessions::insert`] cannot race the pin.
+    /// mutex as `map` so [`Sessions::insert_admitted`] cannot race the pin.
     pinned: HashSet<String>,
     pinned_links: HashSet<String>,
     #[cfg(test)]
@@ -771,14 +785,55 @@ struct SessionsInner {
 pub struct SessionHandle {
     pub link_id: String,
     pub tenant: String,
+    pub reserved_bytes: u64,
     pub sender: mpsc::Sender<Cmd>,
-    pub last_active: Instant,
+    activity: Arc<SessionActivity>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionActivity {
+    in_flight: AtomicUsize,
+    last_active: Mutex<Instant>,
+}
+
+pub struct SessionCommand {
+    pub sender: mpsc::Sender<Cmd>,
+    pub lease: SessionLease,
+}
+
+pub struct SessionLease {
+    activity: Arc<SessionActivity>,
+}
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        *self
+            .activity
+            .last_active
+            .lock()
+            .expect("session activity poisoned") = Instant::now();
+        self.activity.in_flight.fetch_sub(1, Ordering::Release);
+    }
+}
+
+pub struct SessionAdmission {
+    pub id: String,
+    pub link_id: String,
+    pub tenant: String,
+    pub reserved_bytes: u64,
+    pub max_total_bytes: Option<u64>,
+    pub max_tenant_sessions: Option<u64>,
+    pub max_link_sessions: usize,
+    pub max_sessions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InsertError {
     TenantPinned,
     LinkPinned,
+    ByteQuota,
+    TenantSessionLimit,
+    Capacity,
+    Store(String),
 }
 
 impl Default for Sessions {
@@ -931,14 +986,24 @@ impl Sessions {
         }
     }
 
-    /// Fails if `tenant` is pinned. Same lock as pin.
-    pub fn insert(
+    /// Atomically reserves tenant capacity and fails if a delete pin or quota
+    /// prevents admission. All checks share the same lock as insertion.
+    pub fn insert_admitted(
         &self,
-        id: String,
-        link_id: String,
-        tenant: String,
+        admission: SessionAdmission,
         sender: mpsc::Sender<Cmd>,
+        received_bytes: impl FnOnce() -> Result<u64, String>,
     ) -> Result<(), InsertError> {
+        let SessionAdmission {
+            id,
+            link_id,
+            tenant,
+            reserved_bytes,
+            max_total_bytes,
+            max_tenant_sessions,
+            max_link_sessions,
+            max_sessions,
+        } = admission;
         let mut inner = self.inner.lock().expect("sessions poisoned");
         if !tenant.is_empty() && inner.pinned.contains(&tenant) {
             return Err(InsertError::TenantPinned);
@@ -946,16 +1011,79 @@ impl Sessions {
         if inner.pinned_links.contains(&link_id) {
             return Err(InsertError::LinkPinned);
         }
+        if inner.map.len() >= max_sessions
+            || inner
+                .map
+                .values()
+                .filter(|handle| handle.link_id == link_id)
+                .count()
+                >= max_link_sessions
+        {
+            return Err(InsertError::Capacity);
+        }
+        let tenant_sessions = inner
+            .map
+            .values()
+            .filter(|handle| handle.tenant == tenant)
+            .count();
+        if max_tenant_sessions.is_some_and(|max| tenant_sessions as u64 >= max) {
+            return Err(InsertError::TenantSessionLimit);
+        }
+        if let Some(max_total) = max_total_bytes {
+            let received = received_bytes().map_err(InsertError::Store)?;
+            let already_reserved = inner
+                .map
+                .values()
+                .filter(|handle| handle.tenant == tenant)
+                .fold(0_u64, |total, handle| {
+                    total.saturating_add(handle.reserved_bytes)
+                });
+            if reserved_bytes
+                > max_total
+                    .saturating_sub(received)
+                    .saturating_sub(already_reserved)
+            {
+                return Err(InsertError::ByteQuota);
+            }
+        }
         inner.map.insert(
             id,
             SessionHandle {
                 link_id,
                 tenant,
+                reserved_bytes,
                 sender,
-                last_active: Instant::now(),
+                activity: Arc::new(SessionActivity {
+                    in_flight: AtomicUsize::new(0),
+                    last_active: Mutex::new(Instant::now()),
+                }),
             },
         );
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn insert(
+        &self,
+        id: String,
+        link_id: String,
+        tenant: String,
+        sender: mpsc::Sender<Cmd>,
+    ) -> Result<(), InsertError> {
+        self.insert_admitted(
+            SessionAdmission {
+                id,
+                link_id,
+                tenant,
+                reserved_bytes: 0,
+                max_total_bytes: None,
+                max_tenant_sessions: None,
+                max_link_sessions: usize::MAX,
+                max_sessions: usize::MAX,
+            },
+            sender,
+            || Ok(0),
+        )
     }
 
     /// Concurrent sessions for one tenant namespace.
@@ -979,12 +1107,22 @@ impl Sessions {
             .map(|handle| handle.link_id.clone())
     }
 
-    /// Returns the sender for a session and refreshes its idle clock.
-    pub fn touch(&self, id: &str) -> Option<mpsc::Sender<Cmd>> {
-        let mut inner = self.inner.lock().expect("sessions poisoned");
-        let handle = inner.map.get_mut(id)?;
-        handle.last_active = Instant::now();
-        Some(handle.sender.clone())
+    /// Keeps the session registered until the returned command guard drops.
+    pub fn touch(&self, id: &str) -> Option<SessionCommand> {
+        let inner = self.inner.lock().expect("sessions poisoned");
+        let handle = inner.map.get(id)?;
+        *handle
+            .activity
+            .last_active
+            .lock()
+            .expect("session activity poisoned") = Instant::now();
+        handle.activity.in_flight.fetch_add(1, Ordering::AcqRel);
+        Some(SessionCommand {
+            sender: handle.sender.clone(),
+            lease: SessionLease {
+                activity: Arc::clone(&handle.activity),
+            },
+        })
     }
 
     pub fn remove(&self, id: &str) {
@@ -1012,7 +1150,17 @@ impl Sessions {
             .lock()
             .expect("sessions poisoned")
             .map
-            .retain(|_, handle| handle.last_active.elapsed().as_secs() < idle_secs);
+            .retain(|_, handle| {
+                handle.activity.in_flight.load(Ordering::Acquire) > 0
+                    || handle
+                        .activity
+                        .last_active
+                        .lock()
+                        .expect("session activity poisoned")
+                        .elapsed()
+                        .as_secs()
+                        < idle_secs
+            });
     }
 }
 
@@ -1022,6 +1170,24 @@ mod pin_tests {
 
     fn dummy_sender() -> mpsc::Sender<Cmd> {
         mpsc::channel(1).0
+    }
+
+    fn admission(
+        id: &str,
+        bytes: u64,
+        max_total_bytes: u64,
+        max_tenant_sessions: u64,
+    ) -> SessionAdmission {
+        SessionAdmission {
+            id: id.to_owned(),
+            link_id: "link".to_owned(),
+            tenant: "acme".to_owned(),
+            reserved_bytes: bytes,
+            max_total_bytes: Some(max_total_bytes),
+            max_tenant_sessions: Some(max_tenant_sessions),
+            max_link_sessions: usize::MAX,
+            max_sessions: usize::MAX,
+        }
     }
 
     #[test]
@@ -1077,6 +1243,99 @@ mod pin_tests {
                 dummy_sender(),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn admission_reserves_bytes_and_session_slots_without_overflow() {
+        let sessions = Sessions::new();
+        sessions
+            .insert_admitted(admission("s1", 60, 100, 2), dummy_sender(), || Ok(0))
+            .unwrap();
+        let mut full = admission("full", 1, 100, 2);
+        full.tenant = "other".to_owned();
+        full.max_sessions = 1;
+        assert_eq!(
+            sessions.insert_admitted(full, dummy_sender(), || Ok(0)),
+            Err(InsertError::Capacity)
+        );
+        assert_eq!(
+            sessions.insert_admitted(admission("s2", 60, 100, 2), dummy_sender(), || Ok(0),),
+            Err(InsertError::ByteQuota)
+        );
+        assert_eq!(
+            sessions.insert_admitted(
+                admission("s2", u64::MAX, u64::MAX, 1),
+                dummy_sender(),
+                || Ok(0),
+            ),
+            Err(InsertError::TenantSessionLimit)
+        );
+        sessions.remove("s1");
+        assert_eq!(
+            sessions.insert_admitted(admission("stale", 60, 100, 1), dummy_sender(), || Ok(60),),
+            Err(InsertError::ByteQuota)
+        );
+        assert_eq!(
+            sessions.insert_admitted(admission("full", 1, u64::MAX, 1), dummy_sender(), || Ok(
+                u64::MAX
+            ),),
+            Err(InsertError::ByteQuota)
+        );
+        sessions
+            .insert_admitted(
+                admission("s2", u64::MAX, u64::MAX, 1),
+                dummy_sender(),
+                || Ok(0),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn sweep_keeps_cancelled_dispatch_commands_registered_until_worker_finishes() {
+        let sessions = Sessions::new();
+        let (sender, mut receiver) = mpsc::channel(1);
+        sessions
+            .insert(
+                "s1".to_owned(),
+                "link".to_owned(),
+                "acme".to_owned(),
+                sender,
+            )
+            .unwrap();
+        let command = sessions.touch("s1").unwrap();
+        let (reply, cancelled_dispatch) = oneshot::channel();
+        drop(cancelled_dispatch);
+        assert!(command
+            .sender
+            .try_send(Cmd::Finish {
+                reply,
+                _lease: command.lease,
+            })
+            .is_ok());
+        sessions.sweep(0);
+        assert_eq!(sessions.total(), 1);
+        let Cmd::Finish { reply, _lease } = receiver.try_recv().unwrap() else {
+            panic!("finish command");
+        };
+        sessions.sweep(0);
+        assert_eq!(sessions.total(), 1);
+        *_lease
+            .activity
+            .last_active
+            .lock()
+            .expect("session activity poisoned") =
+            Instant::now() - std::time::Duration::from_secs(2);
+        assert!(reply
+            .send(Ok(FinishReport {
+                upload_id: "upload".to_owned(),
+                files: Vec::new(),
+            }))
+            .is_err());
+        drop(_lease);
+        sessions.sweep(1);
+        assert_eq!(sessions.total(), 1);
+        sessions.sweep(0);
+        assert_eq!(sessions.total(), 0);
     }
 
     #[test]

@@ -276,6 +276,8 @@ values.
 `GET /metrics` serves Prometheus-format counters and gauges (tenants, links,
 received bytes, active sessions, audit rows). Set `VOTPORT_METRICS_TOKEN` to
 require a bearer token, and scrape it over an internal interface only.
+Platform admins can fetch the same per-tenant link and live-byte totals as JSON
+from `GET /api/admin/holdings`.
 
 ## Content lifecycle
 
