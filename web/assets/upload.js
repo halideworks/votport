@@ -49,10 +49,15 @@ function startWorkers() {
         return;
       }
       workerRequests.delete(data.req);
-      if (data.error !== undefined) pending.reject(new Error(data.error));
-      else pending.resolve(data.done);
+      if (data.error !== undefined) {
+        // A failed prove means the tree was not on that worker yet — a
+        // recovery straggler, retried as a pause. Hash failures are real.
+        const error = new Error(data.error);
+        if (pending.op !== 'hash') error.paused = true;
+        pending.reject(error);
+      } else pending.resolve(data.done);
     };
-    worker.onerror = () => stopWorkers(new Error('a hash worker failed'));
+    worker.onerror = () => recoverWorkers();
     return worker;
   });
 }
@@ -71,12 +76,14 @@ function workerCall(message, index = 0, onStep = null) {
   return new Promise((resolve, reject) => {
     const worker = hashWorkers.length ? workerFor(message, index) : null;
     if (!worker) {
-      reject(new Cancelled());
+      // An empty pool mid-transfer is a dead worker awaiting recovery, not
+      // a user cancel; the send loop retries after the pool is restored.
+      reject(uploading ? new Paused() : new Cancelled());
       return;
     }
     const req = nextRequest;
     nextRequest += 1;
-    workerRequests.set(req, { resolve, reject, onStep });
+    workerRequests.set(req, { resolve, reject, onStep, op: message.op });
     worker.postMessage({ ...message, req });
   });
 }
@@ -91,6 +98,65 @@ function stopWorkers(error) {
     pending.reject(error || new Cancelled());
   }
   workerRequests.clear();
+}
+
+class Paused extends Error {
+  constructor() {
+    super('connection interrupted');
+    this.paused = true;
+  }
+}
+
+// Worker death is a pause, not a failure. Only this function touches the
+// pool while uploading: it snapshots the pinned trees, restarts the workers,
+// and re-hashes every path whose tree is gone. The send loop is the only
+// place that begins sessions or sends ranges; it waits for recovery to finish
+// before its next prove and re-begins from the server's covered_bytes.
+const WORKER_RESTART_CAP = 3;
+let workerRestarts = 0;
+let sendCursor = null; // path sendOne is currently on, if not in workerByPath
+let recovering = false;
+let readySignal = null; // promise owned by the recovery round in flight
+let workerFatal = null; // set once the restart cap fires; every pause turns fatal
+
+async function recoverWorkers() {
+  if (!uploading || cancelled) {
+    stopWorkers();
+    return;
+  }
+  if (recovering) return;
+  if (workerRestarts >= WORKER_RESTART_CAP) {
+    workerFatal = new Error('Verification stopped. Try sending again.');
+    stopWorkers(workerFatal);
+    return;
+  }
+  recovering = true;
+  const paths = [...workerByPath.keys()];
+  if (sendCursor && !paths.includes(sendCursor)) paths.push(sendCursor);
+  // In-flight calls reject with Paused so their owners retry instead of
+  // treating the death as a cancel.
+  stopWorkers(new Paused());
+  let release;
+  readySignal = new Promise((resolve) => { release = resolve; });
+  workerRestarts += 1;
+  startWorkers();
+  setPhase('Preparing');
+  try {
+    for (const path of paths) {
+      const file = picked.get(path);
+      if (!file) continue;
+      await workerCall({ op: 'hash', key: path, file });
+    }
+  } catch (error) {
+    // Another death mid-recovery: its owner retries through the normal pause
+    // paths, which re-enter here once this round releases.
+  }
+  recovering = false;
+  release();
+}
+// The send loop awaits this before touching any tree after a pause.
+function waitWorkersReady() {
+  return readySignal || Promise.resolve();
 }
 
 class Cancelled extends Error {
@@ -192,7 +258,11 @@ async function releaseWakeLock() {
 // The browser auto-releases the lock whenever the tab is hidden; take it back
 // as soon as the sender returns while an upload is still running.
 document.addEventListener('visibilitychange', () => {
-  if (uploading && document.visibilityState === 'visible') keepAwake();
+  if (!(uploading && document.visibilityState === 'visible')) return;
+  keepAwake();
+  // iOS may have killed the pool while the tab was hidden; run the same
+  // recovery a worker death would. If the pool is alive this is a no-op.
+  if (!hashWorkers.length) recoverWorkers();
 });
 
 function fail(message) {
@@ -365,8 +435,8 @@ async function apiJson(path, options = {}) {
   return body;
 }
 
-async function postWithRetry(path, options, attempts = 3) {
-  for (let attempt = 1; ; attempt += 1) {
+async function postWithRetry(path, options = {}) {
+  for (let attempt = 0; ; attempt += 1) {
     checkCancelled();
     try {
       const response = await fetch(path, {
@@ -375,44 +445,104 @@ async function postWithRetry(path, options, attempts = 3) {
         ...options,
       });
       if (response.status >= 500 || response.status === 429) {
-        throw new Error(`server busy (${response.status})`);
+        throw Object.assign(new Error(`server busy (${response.status})`), { transient: true });
       }
       let body = null;
       try { body = await response.json(); } catch { /* not JSON */ }
-      if (!response.ok) throw Object.assign(new Error(body?.error || `failed (${response.status})`), { fatal: true });
+      if (!response.ok) {
+        throw Object.assign(new Error(body?.error || `failed (${response.status})`), {
+          status: response.status,
+          fatal: true,
+        });
+      }
+      resumePhase();
       return body;
     } catch (error) {
       if (cancelled) throw new Cancelled();
-      if (error.fatal || attempt >= attempts) throw error;
-      await new Promise((resolve) => { setTimeout(resolve, 1000 * attempt); });
+      // A user cancel is the only thing that aborts in-flight requests, so
+      // an AbortError here is a network-layer pause unless cancel won the race.
+      const transient = error.transient
+        || error.name === 'AbortError'
+        || error instanceof TypeError
+        || navigator.onLine === false;
+      if (!transient) throw error;
+      await pauseBackoff(attempt);
     }
   }
 }
 
+// Sleep that wakes early when the sender cancels.
+function sleepCancellable(ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      clearInterval(poll);
+      resolve();
+    }, ms);
+    const poll = setInterval(() => {
+      if (!cancelled) return;
+      clearTimeout(timer);
+      clearInterval(poll);
+      reject(new Cancelled());
+    }, 250);
+  });
+}
+
+// Transient failures pause instead of failing: back off 1s, 2s, 4s, 8s, then
+// hold at 15s until the line or server comes back, or the sender cancels.
+async function pauseBackoff(attempt) {
+  setPhase('Paused');
+  await sleepCancellable(Math.min(15, 2 ** attempt) * 1000);
+  resumePhase();
+}
+
 // ------------------------------------------------------------------- phases
 
-function setPhase(text, note = '') {
+// #phase is only ever Preparing, Sending, or Paused. Sending starts with the
+// first range POST, not with session setup.
+let rangePostSeen = false;
+
+function resumePhase() {
+  setPhase(rangePostSeen ? 'Sending' : 'Preparing');
+}
+
+function setPhase(text) {
   $('progress-card').hidden = false;
   $('phase').textContent = text;
-  $('progress-note').textContent = note;
+}
+
+// The note shows the honest rates: preparing while hashing is live, sending
+// while ranges move, sizes always. A clause whose sample is stale prints
+// nothing rather than a frozen or zero rate.
+let totalForNote = 0;
+let sentForNote = 0;
+let lastHashBps = null;
+let lastSendBps = null;
+let lastHashAt = 0;
+let lastSendAt = 0;
+
+function renderNote() {
+  const now = performance.now();
+  const parts = [];
+  if (now - lastHashAt < RATE_WINDOW_MS && lastHashBps > 0) {
+    const rate = formatRate(lastHashBps);
+    if (rate) parts.push(`preparing ${rate}`);
+  }
+  if (now - lastSendAt < RATE_WINDOW_MS && lastSendBps > 0) {
+    const rate = formatRate(lastSendBps);
+    if (rate) {
+      parts.push(`sending ${rate}`);
+      const remaining = totalForNote - sentForNote;
+      if (remaining > 0) parts.push(`${formatDuration(remaining / lastSendBps)} left`);
+    }
+  }
+  parts.push(`${formatBytes(sentForNote)} of ${formatBytes(totalForNote)}`);
+  $('progress-note').textContent = parts.join(' · ');
 }
 
 function setMeter(fraction) {
   $('meter-fill').style.width = `${Math.min(100, Math.round(fraction * 100))}%`;
 }
 
-function setNote(done, total, bytesPerSecond) {
-  const parts = [`${formatBytes(done)} of ${formatBytes(total)}`];
-  const rate = formatRate(bytesPerSecond);
-  if (rate) {
-    parts.push(rate);
-    const remaining = total - done;
-    if (remaining > 0 && bytesPerSecond > 0) {
-      parts.push(`${formatDuration(remaining / bytesPerSecond)} left`);
-    }
-  }
-  $('progress-note').textContent = parts.join(' · ');
-}
 
 function formatDuration(seconds) {
   if (seconds < 60) return `${Math.ceil(seconds)}s`;
@@ -513,35 +643,52 @@ async function runUpload() {
   const totalBytes = files.reduce((sum, [, file]) => sum + file.size, 0);
   const hashRate = makeRate();
   const sendRate = makeRate();
-  let hashed = 0;
   let sent = 0;
   const delivered = [];
+  totalForNote = totalBytes;
+  sentForNote = 0;
+  lastHashBps = null;
+  lastSendBps = null;
+  lastHashAt = 0;
+  lastSendAt = 0;
+  rangePostSeen = false;
+  workerRestarts = 0;
+  workerFatal = null;
 
   async function hashOne([path, file], index) {
     checkCancelled();
     const components = path.split('/');
-    let fileHashed = 0;
-    setStatus(path, 'hashing 0%');
-    const done = await workerCall({ op: 'hash', key: path, file }, index, (step) => {
-      hashed += step;
-      fileHashed += step;
-      const rate = hashRate(step);
-      setStatus(path, `hashing ${Math.floor((fileHashed / (file.size || 1)) * 100)}%`);
-      // Before the first upload starts there is no send rate to show, so the
-      // note reports what is actually happening: local hashing throughput.
-      if (sent === 0) {
-        $('progress-note').textContent =
-          [`verifying ${formatBytes(hashed)} of ${formatBytes(totalBytes)}`, formatRate(rate)]
-            .filter(Boolean)
-            .join(' \u00b7 ');
+    setStatus(path, 'Preparing');
+    let done = null;
+    // A worker death mid-hash rejects this call with Paused; wait for the
+    // restored pool and hash again rather than failing the transfer.
+    for (;;) {
+      await waitWorkersReady();
+      try {
+        done = await workerCall({ op: 'hash', key: path, file }, index, (step) => {
+          lastHashBps = hashRate(step);
+          lastHashAt = performance.now();
+          renderNote();
+        });
+        break;
+      } catch (error) {
+        if (error.cancelled || !error.paused) throw error;
+        if (workerFatal) throw workerFatal;
+        setStatus(path, 'Paused');
       }
-    });
-    setStatus(path, 'ready');
+    }
+    setStatus(path, 'Ready');
     const objectId = new ObjectId(done.suite, done.root, done.length);
     return { path, components, file, objectId, key: pathKeyBytes(components) };
   }
 
-  async function sendOne(item, position) {
+  function isExpiredSession(error) {
+    return error.status === 404
+      || error.status === 410
+      || /unknown or expired session/.test(error.message || '');
+  }
+
+  async function sendOne(item) {
     // One VOT package per file. A package root is a hash over every entry it
     // contains, so a batch package cannot be announced until the last file is
     // hashed — which is precisely what would prevent overlapping hashing with
@@ -552,7 +699,8 @@ async function runUpload() {
     const packageId = summary.objectId;
     const rootHex = hex(packageId.root);
     const suite = packageId.suite === Suite.Blake3Bao64 ? 'blake3' : 'sha256';
-    setPhase(`Sending ${position} of ${files.length}`);
+    sendCursor = item.path;
+    setStatus(item.path, 'Preparing');
 
     // Re-attach to an interrupted session for this exact file. The root is
     // part of the match, so a file edited since the interruption starts over
@@ -562,92 +710,127 @@ async function runUpload() {
       ? saved
       : null;
     let sessionId = resume?.session || null;
-    let entries = null;
     if (sessionId) {
-      try {
-        ({ entries } = await postWithRetry(`/api/session/${sessionId}/begin`, {}, 1));
-        setStatus(item.path, 'resuming…');
-        // Keep the interrupted run's chunk grid: a different chunk size would
-        // straddle extents the server already accepted and be rejected as
-        // partial overlaps.
-        chunkBytes = resume.chunk || chunkBytes;
-      } catch (error) {
-        if (error.cancelled) throw error;
-        sessionId = null; // session swept or server restarted; start over
-      }
-    }
-    if (!sessionId) {
-      const session = await apiJson(`/api/r/${token}/session`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          password: password || null,
-          package: { suite, root: rootHex, length: Number(packageId.length) },
-        }),
-      });
-      sessionId = session.session;
-      chunkBytes = session.chunk_bytes || chunkBytes;
-      // Written once per session: the server's begin reply is the authority
-      // on how far the transfer got, so nothing needs saving per chunk.
-      saveResume({
-        session: sessionId,
-        path: item.path,
-        size: item.file.size,
-        root: rootHex,
-        chunk: chunkBytes,
-      });
-      await postWithRetry(`/api/session/${sessionId}/seal`, {
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: seal,
-      });
-      for (const page of pages) {
-        await postWithRetry(`/api/session/${sessionId}/page`, {
-          headers: { 'Content-Type': 'application/octet-stream' },
-          body: page,
-        });
-      }
-      ({ entries } = await postWithRetry(`/api/session/${sessionId}/begin`, {}));
+      // Keep the interrupted run's chunk grid: a different chunk size would
+      // straddle extents the server already accepted and be rejected as
+      // partial overlaps.
+      chunkBytes = resume.chunk || chunkBytes;
     }
 
-    try {
-      for (const entry of entries) {
-        // covered_bytes is the server's contiguous verified prefix, so it is
-        // safe to restart from even when chunks landed out of order.
-        const already = entry.complete
-          ? item.file.size
-          : Math.min(entry.covered_bytes ?? 0, item.file.size);
-        sent += already;
-        if (entry.complete) {
-          setMeter(totalBytes ? sent / totalBytes : 1);
+    // Per-entry bytes already counted into `sent`, so a recovery round that
+    // re-reads begin's covered_bytes does not double-count them.
+    const counted = new Map();
+
+    for (;;) {
+      // After a worker-death pause the trees are not back until recovery
+      // says so; proving before that would just reject again.
+      await waitWorkersReady();
+      try {
+        let entries = null;
+        if (sessionId) {
+          try {
+            ({ entries } = await postWithRetry(`/api/session/${sessionId}/begin`, {}));
+            setStatus(item.path, 'Continuing');
+          } catch (error) {
+            if (error.cancelled || error.paused) throw error;
+            // Session swept or server restarted: fall through and create a
+            // fresh one, seal and pages included. Anything else is fatal.
+            if (!isExpiredSession(error)) throw error;
+            sessionId = null;
+          }
+        }
+        if (!entries) {
+          const session = await apiJson(`/api/r/${token}/session`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              password: password || null,
+              package: { suite, root: rootHex, length: Number(packageId.length) },
+            }),
+          });
+          sessionId = session.session;
+          chunkBytes = session.chunk_bytes || chunkBytes;
+          // Written once per session: the server's begin reply is the authority
+          // on how far the transfer got, so nothing needs saving per chunk.
+          saveResume({
+            session: sessionId,
+            path: item.path,
+            size: item.file.size,
+            root: rootHex,
+            chunk: chunkBytes,
+          });
+          await postWithRetry(`/api/session/${sessionId}/seal`, {
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: seal,
+          });
+          for (const page of pages) {
+            await postWithRetry(`/api/session/${sessionId}/page`, {
+              headers: { 'Content-Type': 'application/octet-stream' },
+              body: page,
+            });
+          }
+          ({ entries } = await postWithRetry(`/api/session/${sessionId}/begin`, {}));
+        }
+
+        rangePostSeen ||= entries.some((entry) => !entry.complete);
+        for (const entry of entries) {
+          // covered_bytes is the server's contiguous verified prefix, so it is
+          // safe to restart from even when chunks landed out of order.
+          const already = entry.complete
+            ? item.file.size
+            : Math.min(entry.covered_bytes ?? 0, item.file.size);
+          const countedBefore = counted.get(entry.index) ?? 0;
+          if (already > countedBefore) {
+            sent += already - countedBefore;
+            counted.set(entry.index, already);
+          }
+          if (entry.complete) {
+            setMeter(totalBytes ? sent / totalBytes : 1);
+            continue;
+          }
+          let fileSent = already;
+          await uploadEntryChunks(sessionId, entry.index, item, BigInt(already), (step) => {
+            sent += step;
+            sentForNote = sent;
+            fileSent += step;
+            setMeter(totalBytes ? sent / totalBytes : 1);
+            lastSendBps = sendRate(step);
+            lastSendAt = performance.now();
+            renderNote();
+            setStatus(item.path, `${formatBytes(fileSent)} / ${formatBytes(item.file.size)}`);
+          });
+        }
+        const report = await postWithRetry(`/api/session/${sessionId}/finish`, {});
+        delivered.push(...report.files);
+        clearResume();
+        workerByPath.get(item.path)?.postMessage({ op: 'drop', key: item.path }); // frees the tree
+        sendCursor = null;
+        setStatus(item.path, 'delivered \u2713', true);
+        return;
+      } catch (error) {
+        // Only a deliberate cancel throws the session away. A network failure
+        // or dead worker pauses and retries this same session; the partially
+        // written bytes stay on the server until it goes idle.
+        if (error.cancelled) {
+          fetch(`/api/session/${sessionId}/abort`, { method: 'POST' }).catch(() => {});
+          clearResume();
+          sendCursor = null;
+          throw error;
+        }
+        if (error.paused) {
+          // The pool may have died again while we were between proves.
+          if (!hashWorkers.length && !recovering) recoverWorkers();
+          if (workerFatal) throw workerFatal;
           continue;
         }
-        let fileSent = already;
-        await uploadEntryChunks(sessionId, entry.index, item, BigInt(already), (step) => {
-          sent += step;
-          fileSent += step;
-          setMeter(totalBytes ? sent / totalBytes : 1);
-          setNote(sent, totalBytes, sendRate(step));
-          setStatus(item.path, `${formatBytes(fileSent)} / ${formatBytes(item.file.size)}`);
-        });
+        sendCursor = null;
+        throw error;
       }
-      const report = await postWithRetry(`/api/session/${sessionId}/finish`, {});
-      delivered.push(...report.files);
-      clearResume();
-      workerByPath.get(item.path)?.postMessage({ op: 'drop', key: item.path }); // frees the tree
-      setStatus(item.path, 'delivered \u2713', true);
-    } catch (error) {
-      // Only a deliberate cancel throws the session away. A network failure is
-      // precisely what the resume record exists for, so it is left in place
-      // and the partially written bytes stay on the server until it goes idle.
-      if (error.cancelled) {
-        fetch(`/api/session/${sessionId}/abort`, { method: 'POST' }).catch(() => {});
-        clearResume();
-      }
-      throw error;
     }
   }
 
-  setPhase('Preparing', 'verifying the first file locally');
+  setPhase('Preparing');
+  $('progress-note').textContent = 'verifying the first file locally';
   setMeter(0);
 
   // Hashing runs ahead of uploading by up to LOOKAHEAD files, and those files
@@ -669,7 +852,7 @@ async function runUpload() {
   for (let index = 0; index < files.length; index += 1) {
     const item = await hashes[index];
     try {
-      await sendOne(item, index + 1);
+      await sendOne(item);
     } catch (error) {
       if (delivered.length) {
         error.message += ` (${delivered.length} file(s) already delivered and kept)`;
@@ -807,17 +990,22 @@ $('upload-form').addEventListener('submit', async (event) => {
     // keeps the advice below honest.
     const expired = /unknown or expired session/.test(error.message);
     if (expired) clearResume();
+    // A refused range or publish is not a network story; say what it means.
+    const unverified = error.status === 422 || error.status === 409;
     fail(error.cancelled
       ? error.message
-      : expired
-        ? `${error.message}. The partial transfer was discarded, reselect the same files to send them again from the start.`
-        : `${error.message}. Reselect the same files to resume where this stopped.`);
+      : unverified
+        ? 'This file could not be verified. Try sending it again.'
+        : expired
+          ? `${error.message}. The partial transfer was discarded, reselect the same files to send them again from the start.`
+          : `${error.message}. Reselect the same files to resume where this stopped.`);
     $('progress-card').hidden = true;
     $('send').disabled = false;
     showResumeNote();
   } finally {
     uploading = false;
     controller = null;
+    sendCursor = null;
     stopWorkers();
     releaseWakeLock();
   }
