@@ -1293,9 +1293,7 @@ async fn aborted_sessions_record_a_cancelled_event() {
     assert!(events[0]["expected_bytes"].as_u64().unwrap() > stopped);
 }
 
-/// A package refused at begin (hidden path here) consumes the session, so
-/// the worker must record a "rejected" event rather than exiting silently.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_root_link_cannot_write_into_a_tenant_folder() {
     let server = start_server().await;
     let base = server.base.clone();
@@ -1377,6 +1375,8 @@ async fn a_root_link_cannot_write_into_a_tenant_folder() {
     assert!(!server.receive_dir.join("acme").join("invoice.pdf").exists());
 }
 
+/// A package refused at begin (hidden path here) consumes the session, so
+/// the worker must record a "rejected" event rather than exiting silently.
 #[tokio::test(flavor = "multi_thread")]
 async fn begin_rejection_records_an_event() {
     let server = start_server().await;

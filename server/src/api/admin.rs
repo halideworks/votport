@@ -356,6 +356,19 @@ pub async fn create_tenant(
             "tenant delete already in progress",
         ));
     }
+    // The string checks compare link dests, and the collision that matters is
+    // on disk: a root link that delivered acme/invoice.pdf before any tenant
+    // existed owns that folder, and its dest is empty so no dest check sees
+    // it. Deleting a tenant created over it would purge those files. This
+    // also catches a root session already writing there, since begin creates
+    // the directory before any byte lands.
+    let folder = tenant_receive_dir(&app.config.receive_dir, &key).map_err(ApiError::internal)?;
+    if folder_has_entries(&folder) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "that folder already holds received files; move them aside first",
+        ));
+    }
     let defaults = app.store.resolved_settings(&app.config);
     let tenant = crate::store::Tenant {
         key: key.clone(),
@@ -661,6 +674,12 @@ pub async fn update_tenant(
         }),
     );
     Ok(Json(json!({ "ok": true })))
+}
+
+/// Whether a directory exists and holds anything. An empty one is not a
+/// collision: nobody's files are in it.
+fn folder_has_entries(path: &std::path::Path) -> bool {
+    std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
 }
 
 /// Whether deleting `key` may remove a receive subtree. A key with a
@@ -2526,6 +2545,39 @@ mod tenant_offboard_tests {
         let cookie = login_cookie(router).await;
         let response = delete_tenant_req(application.clone(), &cookie, "acme").await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn create_tenant_refuses_a_folder_that_already_holds_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        // What a root link delivered as acme/invoice.pdf back when no tenant
+        // owned that name. No link dest mentions "acme", so every string
+        // check passes and only the filesystem knows.
+        let occupied = application.config.receive_dir.join("acme");
+        std::fs::create_dir_all(&occupied).unwrap();
+        std::fs::write(occupied.join("invoice.pdf"), b"someone else's").unwrap();
+
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let response = create_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(application.store.tenants().is_empty());
+        // Creating the tenant would have put those files inside a namespace
+        // whose delete purges the whole folder.
+        assert!(occupied.join("invoice.pdf").exists());
+    }
+
+    #[tokio::test]
+    async fn create_tenant_accepts_an_empty_folder() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        // An empty directory holds nobody's files, so it is not a collision.
+        std::fs::create_dir_all(application.config.receive_dir.join("acme")).unwrap();
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let response = create_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
