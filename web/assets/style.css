@@ -755,6 +755,16 @@ button.danger:hover:not(:disabled) {
  font-size: 0.68rem;
  opacity: 0.8;
 }
+.object-card > .status {
+ color: var(--muted);
+ white-space: nowrap;
+ font-family: "JetBrains Mono", ui-monospace, monospace;
+ font-variant-numeric: tabular-nums;
+ font-size: 0.72rem;
+}
+.object-card > .file-id {
+ cursor: pointer;
+}
 
 .meter {
  height: 4px;

@@ -61,6 +61,25 @@ await page.setInputFiles('#file-input', [
 await page.click('#send');
 await page.waitForSelector('#done-card:not([hidden])', { timeout: 120000 });
 console.log('uploaded:', (await page.textContent('#done-list')).trim().replace(/\s+/g, ' '));
+const ids = await page.$$eval('#done-list .file-id', (els) => els.map((el) => el.textContent));
+if (
+  ids.length !== 2 ||
+  ids.some((id) => !/^[a-z0-9]+:[0-9a-f]{64}$/.test(id))
+) {
+  throw new Error(`object card identity malformed: ${JSON.stringify(ids)}`);
+}
+const statuses = await page.$$eval('#done-list .status', (els) =>
+  els.map((el) => el.textContent),
+);
+if (!statuses.every((s) => s.includes('receipt ✓'))) {
+  throw new Error(`receipt mark missing: ${JSON.stringify(statuses)}`);
+}
+await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+await page.click('#done-list li:first-child .file-id');
+const copied = await page.evaluate(() => navigator.clipboard.readText());
+if (copied !== ids[0]) {
+  throw new Error(`copy mismatch: ${copied}`);
+}
 await browser.close();
 
 const stored = path.join(receiveDir, dest);
