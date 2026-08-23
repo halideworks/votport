@@ -350,12 +350,6 @@ pub async fn create_tenant(
     if app.store.tenant(&key).is_some() {
         return Err(ApiError::new(StatusCode::CONFLICT, "tenant already exists"));
     }
-    if default_tenant_dest_collides(&app.store, &key) {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "a default-tenant link already publishes into that folder; repoint or delete it first",
-        ));
-    }
     if app.sessions.tenant_pinned(&key) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -381,9 +375,19 @@ pub async fn create_tenant(
             .filter(|&sessions| sessions > 0),
         created_at: now_unix(),
     };
+    // The refusal lives in the store, under the connection mutex, so a
+    // concurrent create_link cannot slip a colliding dest in beside it.
     app.store
         .insert_tenant(tenant)
-        .map_err(ApiError::internal)?;
+        .map_err(|error| {
+            match error {
+        crate::store::InsertTenantError::DefaultLinkPublishesThere => ApiError::new(
+            StatusCode::CONFLICT,
+            "a default-tenant link already publishes into that folder; repoint or delete it first",
+        ),
+        crate::store::InsertTenantError::Store(message) => ApiError::internal(message),
+    }
+        })?;
     tracing::info!(target: "audit", event = "tenant_created", key = %key, "tenant namespace created");
     app.store
         .audit("", &identity.subject, "tenant_created", &key, &json!({}));
@@ -676,18 +680,6 @@ fn tenant_receive_dir(
         return Err("refusing to purge the receive root".to_owned());
     }
     Ok(path)
-}
-
-/// The tenant key whose subtree `dest` would publish into, if any. A
-/// default-tenant link with dest "acme" writes to the same directory tenant
-/// "acme" owns, which mixes two namespaces in one folder and leaves the
-/// tenant undeletable. The two creation paths refuse each other.
-fn dest_collides_with_a_tenant(store: &crate::store::Store, dest: &str) -> Option<String> {
-    store
-        .tenants()
-        .into_iter()
-        .map(|tenant| tenant.key)
-        .find(|key| dest == key || dest.starts_with(&format!("{key}/")))
 }
 
 fn default_tenant_dest_collides(store: &crate::store::Store, key: &str) -> bool {
@@ -1292,17 +1284,6 @@ pub async fn create_link(
         Some(password) => Some(auth::hash_password(password).map_err(ApiError::internal)?),
         None => None,
     };
-    // The other half of the same invariant: a default-tenant link may not
-    // publish into a namespace a tenant owns. Named tenants publish under
-    // their own prefix, so only default-tenant links can reach one.
-    if identity.tenant.is_empty() && !dest.is_empty() {
-        if let Some(key) = dest_collides_with_a_tenant(&app.store, &dest) {
-            return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                format!("that folder belongs to tenant {key:?}; choose another"),
-            ));
-        }
-    }
     let tenant = identity.tenant.clone();
     // A cookie can outlive its tenant's deletion; without this check the
     // link would be created under a namespace nothing manages anymore.
@@ -1343,6 +1324,10 @@ pub async fn create_link(
         crate::store::InsertLinkError::NamedTenantGone => ApiError::new(
             StatusCode::GONE,
             "this session's tenant no longer exists; sign in again",
+        ),
+        crate::store::InsertLinkError::DestBelongsToTenant(key) => ApiError::new(
+            StatusCode::CONFLICT,
+            format!("that folder belongs to tenant {key:?}; choose another"),
         ),
         crate::store::InsertLinkError::Store(message) => ApiError::internal(message),
     })?;
@@ -2478,11 +2463,25 @@ mod tenant_offboard_tests {
     async fn delete_refuses_when_a_default_link_publishes_into_the_path() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
-        // A default-tenant link whose dest is the tenant key: its files land
-        // in the same subtree, and nothing stops both from existing.
+        // Both creation paths refuse this pairing now, so it is built the way
+        // an older binary left it: the tenant first, then a default-tenant
+        // link written past the check. The delete guard is the backstop for
+        // exactly that state, and it still has to hold.
         application
             .store
-            .insert_link(Link {
+            .insert_tenant(crate::store::Tenant {
+                key: "acme".to_owned(),
+                label: "acme".to_owned(),
+                admin_group: None,
+                max_total_bytes: None,
+                max_links: None,
+                max_sessions: None,
+                created_at: 0,
+            })
+            .unwrap();
+        application
+            .store
+            .insert_link_unchecked(Link {
                 id: "default-link".to_owned(),
                 tenant: String::new(),
                 label: "invoices".to_owned(),
@@ -2496,24 +2495,10 @@ mod tenant_offboard_tests {
                 events: Vec::new(),
             })
             .unwrap();
+        // What that link received. The delete must not reach it.
         let shared = application.config.receive_dir.join("acme");
         std::fs::create_dir_all(&shared).unwrap();
         std::fs::write(shared.join("invoice.pdf"), b"kept").unwrap();
-
-        // Inserted directly: create_tenant now refuses this pairing, and the
-        // delete guard has to keep covering rows that predate that check.
-        application
-            .store
-            .insert_tenant(crate::store::Tenant {
-                key: "acme".to_owned(),
-                label: "acme".to_owned(),
-                admin_group: None,
-                max_total_bytes: None,
-                max_links: None,
-                max_sessions: None,
-                created_at: 0,
-            })
-            .unwrap();
 
         let router = app::router(application.clone());
         let cookie = login_cookie(router).await;
