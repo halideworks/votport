@@ -350,8 +350,27 @@ impl Store {
         }
 
         let target_root = receive_dir.join(crate::paths::TENANT_STORAGE_DIR);
-        let mut moved = false;
-        for tenant in self.tenants()? {
+        let metadata = |path: &Path| match std::fs::symlink_metadata(path) {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("inspect {}: {error}", path.display())),
+        };
+        let target_root_metadata = metadata(&target_root)?;
+        if target_root_metadata
+            .as_ref()
+            .is_some_and(|metadata| !metadata.file_type().is_dir())
+        {
+            return Err(format!(
+                "tenant storage migration expected a directory at {}; move it aside",
+                target_root.display()
+            ));
+        }
+
+        let default_links = self.links("")?;
+        let tenants = self.tenants()?;
+        let mut folded_keys = HashMap::new();
+        let mut moves = Vec::new();
+        for tenant in tenants {
             // Older releases accepted multi-segment rows, but could never
             // publish through them because join_under rejects separators.
             let Ok(source) =
@@ -359,12 +378,13 @@ impl Store {
             else {
                 continue;
             };
+            if let Some(other) = folded_keys.insert(tenant.key.to_lowercase(), tenant.key.clone()) {
+                return Err(format!(
+                    "tenant keys {other:?} and {:?} alias on case-insensitive storage",
+                    tenant.key
+                ));
+            }
             let target = target_root.join(&tenant.key);
-            let metadata = |path: &Path| match std::fs::symlink_metadata(path) {
-                Ok(metadata) => Ok(Some(metadata)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(error) => Err(format!("inspect {}: {error}", path.display())),
-            };
             let source_metadata = metadata(&source)?;
             let target_metadata = metadata(&target)?;
             for (path, metadata) in [(&source, &source_metadata), (&target, &target_metadata)] {
@@ -378,35 +398,63 @@ impl Store {
                     ));
                 }
             }
-            match (source_metadata.is_some(), target_metadata.is_some()) {
-                (true, true) => {
-                    return Err(format!(
-                        "tenant storage migration found both {} and {}; move one aside",
-                        source.display(),
-                        target.display()
-                    ));
-                }
-                (true, false) => {
-                    std::fs::create_dir_all(&target_root)
-                        .map_err(|error| format!("create {}: {error}", target_root.display()))?;
-                    crate::paths::tighten_dir(&target_root);
-                    std::fs::rename(&source, &target).map_err(|error| {
-                        format!("move {} to {}: {error}", source.display(), target.display())
-                    })?;
-                    moved = true;
-                }
-                (false, _) => {}
+            let source_exists = source_metadata.is_some();
+            let target_exists = target_metadata.is_some();
+            if source_exists && target_exists {
+                return Err(format!(
+                    "tenant storage migration found both {} and {}; move one aside",
+                    source.display(),
+                    target.display()
+                ));
             }
+            if (source_exists || target_exists)
+                && default_links.iter().any(|link| {
+                    let prefix = format!("{}/", tenant.key);
+                    link.dest == tenant.key
+                        || link.dest.starts_with(&prefix)
+                        || link
+                            .uploads
+                            .iter()
+                            .flat_map(|upload| &upload.files)
+                            .any(|file| {
+                                !file.deleted
+                                    && (file.stored_as == tenant.key
+                                        || file.stored_as.starts_with(&prefix))
+                            })
+                })
+            {
+                return Err(format!(
+                    "tenant storage migration cannot determine ownership of {}; a default-tenant link also uses that prefix",
+                    source.display()
+                ));
+            }
+            moves.push((source, target, source_exists));
+        }
+
+        for (source, target, source_exists) in moves {
+            if !source_exists {
+                continue;
+            }
+            std::fs::create_dir_all(&target_root)
+                .map_err(|error| format!("create {}: {error}", target_root.display()))?;
+            crate::paths::tighten_dir(&target_root);
+            std::fs::rename(&source, &target).map_err(|error| {
+                format!("move {} to {}: {error}", source.display(), target.display())
+            })?;
         }
         // The database marker must not reach durable storage before the
-        // directory renames it represents.
+        // directory renames it represents, including renames resumed from an
+        // earlier process.
         #[cfg(unix)]
-        if moved {
-            for path in [&target_root, receive_dir] {
-                std::fs::File::open(path)
+        {
+            if target_root.exists() {
+                std::fs::File::open(&target_root)
                     .and_then(|directory| directory.sync_all())
-                    .map_err(|error| format!("sync {}: {error}", path.display()))?;
+                    .map_err(|error| format!("sync {}: {error}", target_root.display()))?;
             }
+            std::fs::File::open(receive_dir)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| format!("sync {}: {error}", receive_dir.display()))?;
         }
         self.with(|connection| {
             connection.execute(
@@ -640,17 +688,17 @@ impl Store {
 
     pub fn insert_tenant(&self, tenant: Tenant) -> Result<(), InsertTenantError> {
         self.with(|connection| {
-            // Existence too: two concurrent creates both passed a handler
-            // check and the loser hit the UNIQUE constraint, which reads as a
-            // 500 with a raw SQL message instead of a conflict.
-            let exists: i64 = connection.query_row(
-                "SELECT EXISTS (SELECT 1 FROM tenants WHERE key = ?1)",
-                [&tenant.key],
-                |row| row.get(0),
-            )?;
-            if exists != 0 {
-                return Ok(Some(InsertTenantError::AlreadyExists));
+            // Filesystems commonly compare names case-insensitively even
+            // though SQLite's primary key does not.
+            let folded = tenant.key.to_lowercase();
+            let mut statement = connection.prepare("SELECT key FROM tenants")?;
+            let keys = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for key in keys {
+                if key?.to_lowercase() == folded {
+                    return Ok(Some(InsertTenantError::AlreadyExists));
+                }
             }
+            drop(statement);
             connection.execute(
                 "INSERT INTO tenants (key, label, admin_group, max_total_bytes, max_links, max_sessions, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -1615,6 +1663,79 @@ mod tests {
         std::fs::write(receive.join("acme"), b"default tenant").unwrap();
         let error = store.migrate_tenant_storage(&receive).unwrap_err();
         assert!(error.contains("expected a directory"), "{error}");
+    }
+
+    #[test]
+    fn tenant_storage_migration_refuses_default_owned_prefixes() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let receive = directory.path().join("receive");
+        let store = Store::open(&data).unwrap();
+        store.insert_tenant(test_tenant("acme")).unwrap();
+        std::fs::create_dir_all(receive.join("acme")).unwrap();
+        std::fs::write(receive.join("acme/invoice.pdf"), b"default").unwrap();
+        let mut link = test_link("root");
+        link.uploads.push(UploadRecord {
+            id: "upload".to_owned(),
+            started_at: 0,
+            completed_at: 1,
+            replayed_chunks: 0,
+            rejected_chunks: 0,
+            package_root: "root".to_owned(),
+            total_bytes: 7,
+            files: vec![FileRecord {
+                path: "acme/invoice.pdf".to_owned(),
+                stored_as: "acme/invoice.pdf".to_owned(),
+                bytes: 7,
+                suite: "blake3".to_owned(),
+                root: "object".to_owned(),
+                receipt: false,
+                deleted: false,
+            }],
+        });
+        store.insert_link(link).unwrap();
+
+        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        assert!(error.contains("cannot determine ownership"), "{error}");
+        assert!(receive.join("acme/invoice.pdf").exists());
+        assert!(!receive.join(crate::paths::TENANT_STORAGE_DIR).exists());
+    }
+
+    #[test]
+    fn tenant_storage_migration_refuses_default_destinations_and_case_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let receive = directory.path().join("receive");
+        let store = Store::open(&data).unwrap();
+        store.insert_tenant(test_tenant("Acme")).unwrap();
+        assert_eq!(
+            store.insert_tenant(test_tenant("acme")).unwrap_err(),
+            InsertTenantError::AlreadyExists
+        );
+        store
+            .with(|connection| {
+                connection.execute(
+                    "INSERT INTO tenants (key, label) VALUES ('acme', 'legacy duplicate')",
+                    [],
+                )
+            })
+            .unwrap();
+        std::fs::create_dir_all(receive.join("Acme")).unwrap();
+
+        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        assert!(
+            error.contains("alias on case-insensitive storage"),
+            "{error}"
+        );
+
+        store
+            .with(|connection| connection.execute("DELETE FROM tenants WHERE key = 'acme'", []))
+            .unwrap();
+        let mut link = test_link("dest");
+        link.dest = "Acme".to_owned();
+        store.insert_link(link).unwrap();
+        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        assert!(error.contains("cannot determine ownership"), "{error}");
     }
 
     #[test]

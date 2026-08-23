@@ -327,15 +327,17 @@ fn admit_tenant_ref(key: &str) -> ApiResult<String> {
     Ok(key)
 }
 
-/// Admits a tenant key for creation: one path segment. A key with a separator
-/// is unreachable, since `Tenant::path_prefix` hands it to `join_under` as a
-/// single component and every upload into it fails.
+/// Admits a portable tenant key for creation. Legacy keys remain addressable
+/// through `admit_tenant_ref`, but new on-disk namespaces are lowercase ASCII
+/// so case-insensitive and normalization-insensitive filesystems agree.
 fn admit_tenant_key(key: &str) -> ApiResult<String> {
     let key = admit_tenant_ref(key)?;
-    if key.contains('/') {
+    if !key.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+    }) {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "tenant key must be a single folder name",
+            "tenant key must use lowercase ASCII letters, digits, '-' or '_'",
         ));
     }
     Ok(key)
@@ -2705,7 +2707,21 @@ mod tenant_offboard_tests {
     fn tenant_keys_are_single_segments() {
         assert_eq!(admit_tenant_key("acme").ok().as_deref(), Some("acme"));
         assert_eq!(admit_tenant_key("/acme/").ok().as_deref(), Some("acme"));
-        for bad in ["a/b", "", "default", "..", "clients/acme"] {
+        assert_eq!(
+            admit_tenant_key("acme-1_ok").ok().as_deref(),
+            Some("acme-1_ok")
+        );
+        for bad in [
+            "a/b",
+            "",
+            "default",
+            "..",
+            "clients/acme",
+            "Acme",
+            "café",
+            "acme.inc",
+            "acme corp",
+        ] {
             assert!(admit_tenant_key(bad).is_err(), "{bad} was admitted");
         }
         // Delete admits a multi-segment key so legacy rows stay removable.

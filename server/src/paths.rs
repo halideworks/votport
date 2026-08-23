@@ -59,7 +59,7 @@ pub fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String
     }
     // Reserved even with VOTPORT_ALLOW_HIDDEN: a sender file of this shape
     // would publish fine and then be deleted by the next boot's staging sweep.
-    if component == TENANT_STORAGE_DIR {
+    if component.eq_ignore_ascii_case(TENANT_STORAGE_DIR) {
         return Err("name is reserved for tenant storage".to_owned());
     }
     if component.starts_with(".vot-")
@@ -191,6 +191,7 @@ mod tests {
         assert!(admit_component(".vot-1a2b-0-3c4d.journal", true).is_err());
         assert!(admit_component(".vot-notes.txt", true).is_ok());
         assert!(admit_component(TENANT_STORAGE_DIR, true).is_err());
+        assert!(admit_component(".VOT-TENANTS.STAGE", true).is_err());
     }
 
     #[test]

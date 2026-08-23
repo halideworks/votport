@@ -169,6 +169,9 @@ The first start after upgrading moves each existing named tenant from
 `<receive>/<key>/` into the reserved subtree. The move is same-filesystem and
 resumable. If both old and new paths exist for a tenant, startup refuses so an
 operator can move one aside instead of guessing which data owns the name.
+Startup also refuses when a default-tenant link or live record uses the legacy
+prefix, or when legacy tenant keys differ only by case. Reconcile those names
+and records before retrying the upgrade.
 
 The local platform password is break-glass for every namespace; named
 tenants have no separate password.
