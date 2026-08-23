@@ -359,9 +359,13 @@ pub async fn create_tenant(
     // The string checks compare link dests, and the collision that matters is
     // on disk: a root link that delivered acme/invoice.pdf before any tenant
     // existed owns that folder, and its dest is empty so no dest check sees
-    // it. Deleting a tenant created over it would purge those files. This
-    // also catches a root session already writing there, since begin creates
-    // the directory before any byte lands.
+    // it. Deleting a tenant created over it would purge those files.
+    //
+    // This is checked again after the row is written. A root session that
+    // opens that folder concurrently stages a file in it, and only a check
+    // that runs after the insert can see a session which began between the
+    // two. Both checks are needed: this one refuses without writing anything
+    // in the common case.
     let folder = tenant_receive_dir(&app.config.receive_dir, &key).map_err(ApiError::internal)?;
     let free = folder_is_free(&folder).map_err(|error| {
         tracing::error!(%error, "receive folder could not be read");
@@ -409,6 +413,25 @@ pub async fn create_tenant(
             }
             crate::store::InsertTenantError::Store(message) => ApiError::internal(message),
         })?;
+    // Recheck now that the row exists. A session that began before the first
+    // check and staged into that folder afterwards would otherwise publish
+    // inside a namespace whose delete purges the whole subtree. Undo rather
+    // than keep a tenant over somebody else's bytes.
+    #[cfg(test)]
+    app.sessions.wait_create_stall().await;
+    let still_free = folder_is_free(&folder).unwrap_or(false);
+    if !still_free {
+        match app.store.remove_tenant(&key) {
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(%error, key = %key, "could not undo a tenant created over an occupied folder");
+            }
+        }
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "that folder was taken while the tenant was being created; try again",
+        ));
+    }
     tracing::info!(target: "audit", event = "tenant_created", key = %key, "tenant namespace created");
     app.store
         .audit("", &identity.subject, "tenant_created", &key, &json!({}));
@@ -2580,6 +2603,39 @@ mod tenant_offboard_tests {
         // Creating the tenant would have put those files inside a namespace
         // whose delete purges the whole folder.
         assert!(occupied.join("invoice.pdf").exists());
+    }
+
+    #[tokio::test]
+    async fn a_tenant_created_over_a_folder_taken_mid_flight_is_undone() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+
+        // Stall between the insert and the recheck, which is the window a
+        // root session that began before the first check writes into.
+        let (entered, release) = application.sessions.arm_create_stall();
+        let create = tokio::spawn({
+            let application = application.clone();
+            let cookie = cookie.clone();
+            async move { create_tenant_req(application, &cookie, "acme").await }
+        });
+        entered.await.expect("create reached the recheck");
+        assert!(
+            application.store.tenant("acme").is_some(),
+            "the row exists at this point, which is what makes the recheck necessary"
+        );
+        let taken = application.config.receive_dir.join("acme");
+        std::fs::create_dir_all(&taken).unwrap();
+        std::fs::write(taken.join(".vot-1-0-1.stage"), b"staging").unwrap();
+        release.send(()).unwrap();
+
+        let response = create.await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            application.store.tenant("acme").is_none(),
+            "a refused create must leave no tenant row over those bytes"
+        );
     }
 
     #[test]

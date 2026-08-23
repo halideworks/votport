@@ -370,9 +370,11 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
         }
         if let Some(first) = entry.path().next() {
             if reserved.contains(first) {
-                // Deliberately not saying why. Naming the reason would let
-                // anyone holding a link token probe tenant keys one package
-                // at a time, and senders never see those otherwise.
+                // The message is generic, but the refusal itself still
+                // tells a link holder that this name is taken: 422 here and
+                // 200 otherwise. What bounds the probe is the cost of each
+                // attempt, since every try needs a fresh session and those
+                // are rate limited per address.
                 return Err(SessionError::bad(format!(
                     "{first:?} is not writable through this link"
                 )));
@@ -767,6 +769,8 @@ struct SessionsInner {
     pinned: HashSet<String>,
     #[cfg(test)]
     delete_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    #[cfg(test)]
+    create_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
 }
 
 pub struct SessionHandle {
@@ -795,6 +799,8 @@ impl Sessions {
                 pinned: HashSet::new(),
                 #[cfg(test)]
                 delete_stall: None,
+                #[cfg(test)]
+                create_stall: None,
             }),
         }
     }
@@ -838,6 +844,30 @@ impl Sessions {
         let (release_tx, release_rx) = oneshot::channel();
         self.inner.lock().expect("sessions poisoned").delete_stall = Some((entered_tx, release_rx));
         (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub fn arm_create_stall(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        self.inner.lock().expect("sessions poisoned").create_stall = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    /// Held between writing a tenant row and rechecking its folder, so a test
+    /// can take the folder in exactly that window.
+    #[cfg(test)]
+    pub async fn wait_create_stall(&self) {
+        let stall = self
+            .inner
+            .lock()
+            .expect("sessions poisoned")
+            .create_stall
+            .take();
+        if let Some((entered, release)) = stall {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
     }
 
     #[cfg(test)]
