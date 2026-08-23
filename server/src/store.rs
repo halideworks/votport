@@ -265,11 +265,12 @@ CREATE TABLE IF NOT EXISTS files (
     tenant TEXT NOT NULL DEFAULT '',
     upload_index INTEGER NOT NULL,
     file_index INTEGER NOT NULL,
-    bytes INTEGER NOT NULL,
+    bytes_hi INTEGER NOT NULL,
+    bytes_lo INTEGER NOT NULL,
     deleted INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (link_id, upload_index, file_index)
 );
-CREATE INDEX IF NOT EXISTS files_tenant_live ON files(tenant, deleted, bytes);
+CREATE INDEX IF NOT EXISTS files_tenant_live ON files(tenant, deleted, bytes_hi, bytes_lo);
 ";
 
 const SCHEMA: &str = "
@@ -732,6 +733,7 @@ impl Store {
         };
         mutate(&mut link);
         write_link_row(&transaction, &link).map_err(|error| error.to_string())?;
+        sync_link_files(&transaction, &link).map_err(|error| error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(true)
     }
@@ -1106,12 +1108,12 @@ impl Store {
         self.with(|connection| {
             connection
                 .query_row(
-                    "SELECT COALESCE(SUM(bytes), 0) FROM files
+                    "SELECT COALESCE(SUM(bytes_hi), 0), COALESCE(SUM(bytes_lo), 0) FROM files
                      WHERE tenant = ?1 AND deleted = 0",
                     [tenant],
-                    |row| row.get::<_, i64>(0),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
                 )
-                .map(|bytes| bytes.max(0) as u64)
+                .map(|(hi, lo)| combine_byte_sums(hi, lo))
         })
     }
 
@@ -1126,11 +1128,11 @@ impl Store {
                  ), link_counts AS (
                      SELECT tenant, COUNT(*) AS links FROM links GROUP BY tenant
                  ), file_bytes AS (
-                     SELECT tenant, SUM(bytes) AS received_bytes
+                     SELECT tenant, SUM(bytes_hi) AS bytes_hi, SUM(bytes_lo) AS bytes_lo
                      FROM files WHERE deleted = 0 GROUP BY tenant
                  )
                  SELECT namespaces.tenant, COALESCE(link_counts.links, 0),
-                        COALESCE(file_bytes.received_bytes, 0)
+                        COALESCE(file_bytes.bytes_hi, 0), COALESCE(file_bytes.bytes_lo, 0)
                  FROM namespaces
                  LEFT JOIN link_counts USING (tenant)
                  LEFT JOIN file_bytes USING (tenant)
@@ -1140,7 +1142,7 @@ impl Store {
                 Ok(TenantUsage {
                     tenant: row.get(0)?,
                     links: row.get::<_, i64>(1)?.max(0) as u64,
-                    received_bytes: row.get::<_, i64>(2)?.max(0) as u64,
+                    received_bytes: combine_byte_sums(row.get(2)?, row.get(3)?),
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>()
@@ -1167,29 +1169,101 @@ fn write_link_row(connection: &Connection, link: &Link) -> rusqlite::Result<()> 
          WHERE id = ?1 AND tenant = ?2",
         link_params(link),
     )?;
-    rebuild_link_files(connection, link)?;
     Ok(())
 }
 
 fn rebuild_link_files(connection: &Connection, link: &Link) -> rusqlite::Result<()> {
     connection.execute("DELETE FROM files WHERE link_id = ?1", [&link.id])?;
     let mut insert = connection.prepare_cached(
-        "INSERT INTO files (link_id, tenant, upload_index, file_index, bytes, deleted)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO files
+             (link_id, tenant, upload_index, file_index, bytes_hi, bytes_lo, deleted)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
     for (upload_index, upload) in link.uploads.iter().enumerate() {
         for (file_index, file) in upload.files.iter().enumerate() {
+            let (bytes_hi, bytes_lo) = split_bytes(file.bytes);
             insert.execute(rusqlite::params![
                 link.id,
                 link.tenant,
                 i64::try_from(upload_index).unwrap_or(i64::MAX),
                 i64::try_from(file_index).unwrap_or(i64::MAX),
-                i64::try_from(file.bytes).unwrap_or(i64::MAX),
+                bytes_hi,
+                bytes_lo,
                 file.deleted,
             ])?;
         }
     }
     Ok(())
+}
+
+fn sync_link_files(connection: &Connection, link: &Link) -> rusqlite::Result<()> {
+    let mut existing = {
+        let mut statement = connection.prepare_cached(
+            "SELECT upload_index, file_index, bytes_hi, bytes_lo, deleted
+             FROM files WHERE link_id = ?1",
+        )?;
+        let rows = statement.query_map([&link.id], |row| {
+            Ok((
+                (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?),
+                (
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, bool>(4)?,
+                ),
+            ))
+        })?;
+        rows.collect::<Result<HashMap<_, _>, _>>()?
+    };
+    let mut upsert = connection.prepare_cached(
+        "INSERT INTO files
+             (link_id, tenant, upload_index, file_index, bytes_hi, bytes_lo, deleted)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(link_id, upload_index, file_index) DO UPDATE SET
+             tenant = excluded.tenant, bytes_hi = excluded.bytes_hi,
+             bytes_lo = excluded.bytes_lo, deleted = excluded.deleted",
+    )?;
+    for (upload_index, upload) in link.uploads.iter().enumerate() {
+        for (file_index, file) in upload.files.iter().enumerate() {
+            let key = (
+                i64::try_from(upload_index).unwrap_or(i64::MAX),
+                i64::try_from(file_index).unwrap_or(i64::MAX),
+            );
+            let (bytes_hi, bytes_lo) = split_bytes(file.bytes);
+            let value = (bytes_hi, bytes_lo, file.deleted);
+            if existing.remove(&key) == Some(value) {
+                continue;
+            }
+            upsert.execute(rusqlite::params![
+                link.id,
+                link.tenant,
+                key.0,
+                key.1,
+                bytes_hi,
+                bytes_lo,
+                file.deleted,
+            ])?;
+        }
+    }
+    drop(upsert);
+    let mut delete = connection.prepare_cached(
+        "DELETE FROM files WHERE link_id = ?1 AND upload_index = ?2 AND file_index = ?3",
+    )?;
+    for ((upload_index, file_index), _) in existing {
+        delete.execute(rusqlite::params![link.id, upload_index, file_index])?;
+    }
+    Ok(())
+}
+
+fn split_bytes(bytes: u64) -> (i64, i64) {
+    ((bytes >> 32) as i64, (bytes & 0xffff_ffff) as i64)
+}
+
+fn combine_byte_sums(hi: i64, lo: i64) -> u64 {
+    u64::try_from(hi)
+        .ok()
+        .and_then(|hi| hi.checked_mul(1 << 32))
+        .and_then(|bytes| u64::try_from(lo).ok().and_then(|lo| bytes.checked_add(lo)))
+        .unwrap_or(u64::MAX)
 }
 
 fn link_params(link: &Link) -> [rusqlite::types::Value; 12] {
@@ -1340,11 +1414,15 @@ impl Store {
         let transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
-        let Some(mut link) = read_link(&transaction, tenant, id)? else {
+        let updated = transaction
+            .execute(
+                "UPDATE links SET legal_hold = ?3 WHERE tenant = ?1 AND id = ?2",
+                rusqlite::params![tenant, id, legal_hold],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated == 0 {
             return Ok(false);
-        };
-        link.legal_hold = legal_hold;
-        write_link_row(&transaction, &link).map_err(|error| error.to_string())?;
+        }
         insert_audit_row(
             &transaction,
             tenant,
@@ -2230,7 +2308,7 @@ mod tenant_tests {
         store
             .with(|connection| {
                 connection.execute_batch(
-                    "CREATE TRIGGER fail_file_insert BEFORE INSERT ON files
+                    "CREATE TRIGGER fail_file_update BEFORE UPDATE ON files
                      BEGIN SELECT RAISE(FAIL, 'test file failure'); END;",
                 )
             })
@@ -2243,7 +2321,7 @@ mod tenant_tests {
         assert!(!store.link("acme", "link-1").unwrap().unwrap().uploads[0].files[0].deleted);
         assert_eq!(store.tenant_received_bytes("acme").unwrap(), 500);
         store
-            .with(|connection| connection.execute_batch("DROP TRIGGER fail_file_insert"))
+            .with(|connection| connection.execute_batch("DROP TRIGGER fail_file_update"))
             .unwrap();
 
         file.deleted = true;
@@ -2262,6 +2340,116 @@ mod tenant_tests {
             })
             .unwrap();
         assert_eq!(files, 0);
+    }
+
+    #[test]
+    fn received_bytes_preserve_u64_and_saturate_aggregate() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.insert_tenant(test_tenant("acme")).unwrap();
+        let mut link = link_in("acme", "large");
+        link.uploads.push(UploadRecord {
+            id: "up".to_owned(),
+            started_at: 0,
+            completed_at: 0,
+            replayed_chunks: 0,
+            rejected_chunks: 0,
+            package_root: "root".to_owned(),
+            total_bytes: u64::MAX,
+            files: vec![
+                FileRecord {
+                    path: "large".to_owned(),
+                    stored_as: "large".to_owned(),
+                    bytes: u64::MAX,
+                    suite: "blake3".to_owned(),
+                    root: "aa".to_owned(),
+                    receipt: false,
+                    deleted: false,
+                },
+                FileRecord {
+                    path: "one".to_owned(),
+                    stored_as: "one".to_owned(),
+                    bytes: 1,
+                    suite: "blake3".to_owned(),
+                    root: "bb".to_owned(),
+                    receipt: false,
+                    deleted: false,
+                },
+            ],
+        });
+        store.insert_link(link).unwrap();
+
+        assert_eq!(store.tenant_received_bytes("acme").unwrap(), u64::MAX);
+        assert_eq!(store.tenant_usage().unwrap()[1].received_bytes, u64::MAX);
+        let limbs = store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT bytes_hi, bytes_lo FROM files WHERE file_index = 0",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(limbs, (u32::MAX as i64, u32::MAX as i64));
+    }
+
+    #[test]
+    fn projection_writes_only_changed_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.insert_tenant(test_tenant("acme")).unwrap();
+        let mut link = link_in("acme", "link");
+        let file = FileRecord {
+            path: "a".to_owned(),
+            stored_as: "a".to_owned(),
+            bytes: 1,
+            suite: "blake3".to_owned(),
+            root: "aa".to_owned(),
+            receipt: false,
+            deleted: false,
+        };
+        link.uploads.push(UploadRecord {
+            id: "up".to_owned(),
+            started_at: 0,
+            completed_at: 0,
+            replayed_chunks: 0,
+            rejected_chunks: 0,
+            package_root: "root".to_owned(),
+            total_bytes: 50,
+            files: vec![file; 50],
+        });
+        store.insert_link(link).unwrap();
+        store
+            .with(|connection| {
+                connection.execute_batch(
+                    "CREATE TABLE projection_writes (count INTEGER NOT NULL);
+                     INSERT INTO projection_writes VALUES (0);
+                     CREATE TRIGGER count_file_insert AFTER INSERT ON files BEGIN
+                       UPDATE projection_writes SET count = count + 1; END;
+                     CREATE TRIGGER count_file_update AFTER UPDATE ON files BEGIN
+                       UPDATE projection_writes SET count = count + 1; END;
+                     CREATE TRIGGER count_file_delete AFTER DELETE ON files BEGIN
+                       UPDATE projection_writes SET count = count + 1; END;",
+                )
+            })
+            .unwrap();
+
+        store
+            .update_link("acme", "link", |link| link.active = false)
+            .unwrap();
+        store
+            .update_link("acme", "link", |link| {
+                link.uploads[0].files[0].deleted = true
+            })
+            .unwrap();
+        let writes = store
+            .with(|connection| {
+                connection.query_row("SELECT count FROM projection_writes", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(writes, 1);
     }
 }
 

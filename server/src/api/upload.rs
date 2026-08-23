@@ -290,22 +290,14 @@ pub async fn create_session(
             .store
             .tenant_received_bytes(&link.tenant)
             .map_err(super::store_unavailable)?;
-        if received + expected.length > max_total {
+        let remaining = max_total.saturating_sub(received);
+        if expected.length > remaining {
             audit_session_rejected(&app, &link.tenant, "byte quota exhausted");
             return Err(ApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 format!(
                     "this tenant's storage quota is exhausted ({received} of {max_total} bytes used)"
                 ),
-            ));
-        }
-    }
-    if let Some(max_sessions) = max_sessions {
-        if app.sessions.active_for_tenant(&link.tenant) >= max_sessions as usize {
-            audit_session_rejected(&app, &link.tenant, "tenant session cap reached");
-            return Err(ApiError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "too many concurrent uploads for this tenant",
             ));
         }
     }
@@ -363,11 +355,19 @@ pub async fn create_session(
     let (sender, receiver) = mpsc::channel(8);
     #[cfg(test)]
     app.sessions.wait_session_create_stall().await;
-    match app.sessions.insert(
-        session_id.clone(),
-        link.id.clone(),
-        link.tenant.clone(),
+    match app.sessions.insert_admitted(
+        session::SessionAdmission {
+            id: session_id.clone(),
+            link_id: link.id.clone(),
+            tenant: link.tenant.clone(),
+            reserved_bytes: announced_bytes,
+            max_total_bytes: max_total,
+            max_tenant_sessions: max_sessions,
+            max_link_sessions: MAX_SESSIONS_PER_LINK,
+            max_sessions: MAX_SESSIONS,
+        },
         sender,
+        || app.store.tenant_received_bytes(&link.tenant),
     ) {
         Err(session::InsertError::TenantPinned) => {
             audit_session_rejected(&app, &link.tenant, "tenant pinned for delete");
@@ -382,6 +382,30 @@ pub async fn create_session(
                 StatusCode::GONE,
                 "this link no longer exists",
             ));
+        }
+        Err(session::InsertError::ByteQuota) => {
+            audit_session_rejected(&app, &link.tenant, "byte quota exhausted");
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "this tenant's storage quota is exhausted",
+            ));
+        }
+        Err(session::InsertError::TenantSessionLimit) => {
+            audit_session_rejected(&app, &link.tenant, "tenant session cap reached");
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many concurrent uploads for this tenant",
+            ));
+        }
+        Err(session::InsertError::Capacity) => {
+            audit_session_rejected(&app, &link.tenant, "global or per-link session cap");
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many uploads in progress; try again shortly",
+            ));
+        }
+        Err(session::InsertError::Store(error)) => {
+            return Err(super::store_unavailable(error));
         }
         Ok(()) => {}
     }
