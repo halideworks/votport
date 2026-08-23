@@ -21,25 +21,24 @@ pub struct App {
     pub store: Arc<Store>,
     pub sessions: Sessions,
     pub secret: [u8; 32],
-    /// Counts sign-in failures from every source. Sign-in never refuses on
-    /// this; it delays. The per-IP throttle is the precise bound, but its key
-    /// comes from a header some deployments let the caller choose, so this
-    /// one exists to be independent of the key.
-    pub throttle: LoginThrottle,
-    /// Separate counter for `admin_change_password`, which does refuse when
-    /// tripped. Sharing the sign-in counter let anonymous login failures keep
-    /// an authenticated operator from rotating the password.
+    /// Counter for `admin_change_password`, which refuses when tripped.
+    /// Reaching that endpoint needs a valid session, so a global bound there
+    /// cannot be used to deny anyone. Sign-in has no global counter: refusing
+    /// or delaying there was how the break-glass credential got denied.
     pub change_password_throttle: LoginThrottle,
     /// Per-IP throttle for admin sign-in. A separate map from
     /// `link_throttle` so public link guessing cannot consume an operator's
     /// sign-in budget, or the reverse.
     pub login_throttle: crate::auth::IpThrottle,
-    /// One argon2 budget shared by admin sign-in and link password checks,
-    /// the two unauthenticated paths that verify a password. argon2 is memory
-    /// hard by design, so a caller must not be able to start an unbounded
-    /// number of verifications; both paths contend for the same pool because
-    /// it is one machine's memory being protected.
-    pub verify_permits: tokio::sync::Semaphore,
+    /// argon2 budget for admin sign-in. Separate from the link budget below:
+    /// sharing one meant a flood of link password guesses queued ahead of the
+    /// operator, which is a lockout with extra steps. Holding the whole
+    /// process to a few concurrent verifications is also the bound on guess
+    /// rate, and unlike a counter it does not depend on the throttle key or
+    /// refuse anybody.
+    pub login_permits: Arc<tokio::sync::Semaphore>,
+    /// argon2 budget for public link password checks.
+    pub link_verify_permits: Arc<tokio::sync::Semaphore>,
     /// Per-IP throttle for public link password checks.
     pub link_throttle: crate::auth::IpThrottle,
     /// Per-IP rate limit on upload-session creation.
@@ -58,8 +57,7 @@ pub struct App {
 
 const SSO_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Concurrent argon2 verifications allowed process wide across the
-/// unauthenticated password paths.
+/// Concurrent argon2 verifications allowed per unauthenticated password path.
 const VERIFY_PERMITS: usize = 2;
 
 /// Process-local OIDC client. Success is sticky; failure cools down 30s.
@@ -207,10 +205,10 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         store,
         sessions: Sessions::new(),
         secret,
-        throttle: LoginThrottle::new(),
         change_password_throttle: LoginThrottle::new(),
         login_throttle: crate::auth::IpThrottle::new(),
-        verify_permits: tokio::sync::Semaphore::new(VERIFY_PERMITS),
+        login_permits: Arc::new(tokio::sync::Semaphore::new(VERIFY_PERMITS)),
+        link_verify_permits: Arc::new(tokio::sync::Semaphore::new(VERIFY_PERMITS)),
         link_throttle: crate::auth::IpThrottle::new(),
         session_rate: crate::api::session_rate::SessionRate::new(),
         verify_rate: crate::api::session_rate::SessionRate::new(),

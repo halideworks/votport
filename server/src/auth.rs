@@ -360,11 +360,18 @@ impl IpThrottle {
                     .filter(|(_, entry)| !entry.locked_until.is_some_and(|until| now < until))
                     .min_by_key(|(_, entry)| entry.last_seen)
                     .map(|(key, _)| key.clone());
-                match victim {
-                    Some(key) => {
-                        state.remove(&key);
-                    }
-                    None => return,
+                let victim = victim.or_else(|| {
+                    // Every entry holds a live lockout. Evict the one closest
+                    // to expiring rather than declining to track this key:
+                    // declining is how a full table becomes a way to switch
+                    // throttling off.
+                    state
+                        .iter()
+                        .min_by_key(|(_, entry)| entry.locked_until)
+                        .map(|(key, _)| key.clone())
+                });
+                if let Some(key) = victim {
+                    state.remove(&key);
                 }
             }
         }

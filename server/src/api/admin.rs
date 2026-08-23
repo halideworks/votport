@@ -20,11 +20,6 @@ use super::{cookie_attributes, ApiError, ApiResult};
 
 const ADMIN_COOKIE: &str = "votport_admin";
 
-/// How long a sign-in attempt waits once the global failure counter trips.
-/// Long enough to bound guessing to roughly one attempt per second per
-/// permit, short enough that a real operator barely notices.
-const GLOBAL_TARPIT: std::time::Duration = std::time::Duration::from_secs(2);
-
 /// Credential tag bound into admin token MACs: the stored hash when the
 /// UI has set one, else the stable tag derived from the environment
 /// credential. Either way, rotating the credential evicts sessions and a
@@ -161,33 +156,25 @@ pub async fn admin_login(
             "too many failed attempts; wait a minute",
         ));
     }
-    if app.throttle.locked() {
-        // The key-independent bound delays every attempt instead of refusing
-        // them: a correct password still signs in during a flood, which is
-        // the whole point, since refusing is what made this a way to deny the
-        // operator the break-glass credential. The wait holds no permit. A
-        // sleeping task costs nothing, and holding one here would drain the
-        // argon2 budget at one attempt per delay, putting the operator behind
-        // a queue instead of a lockout.
-        tokio::time::sleep(GLOBAL_TARPIT).await;
-    }
-    let ok = {
-        // Bounds concurrent argon2 verifications; each costs about 19 MiB and
-        // spawn_blocking would otherwise run hundreds at once.
-        let _permit = app
-            .verify_permits
-            .acquire()
-            .await
-            .map_err(|_| ApiError::internal("verify semaphore closed"))?;
-        tokio::task::spawn_blocking({
-            let hash = admin_hash(&app);
-            move || auth::verify_password(&request.password, &hash)
-        })
+    // Sign-in's own argon2 budget, and nothing global that can refuse or
+    // delay a correct password. The permit moves into the blocking task, so
+    // it is held for exactly as long as the verification runs: a client that
+    // disconnects mid-verify would otherwise release it while the work, and
+    // its memory, carried on.
+    let permit = Arc::clone(&app.login_permits)
+        .acquire_owned()
         .await
-        .map_err(|error| ApiError::internal(error.to_string()))?
-    };
+        .map_err(|_| ApiError::internal("login semaphore closed"))?;
+    let ok = tokio::task::spawn_blocking({
+        let hash = admin_hash(&app);
+        move || {
+            let _permit = permit;
+            auth::verify_password(&request.password, &hash)
+        }
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?;
     app.login_throttle.record(&bucket, ok);
-    app.throttle.record(ok);
     if !ok {
         tracing::warn!(target: "audit", event = "admin_login_failed", %ip, "admin login refused");
         app.store
@@ -1548,17 +1535,13 @@ mod handler_tests {
             .unwrap()
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_flood_of_attempts_does_not_queue_the_operator_out() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
         // Every attempt from a different bucket, so none is refused by the
-        // per-IP throttle and all of them reach the delay. This is a liveness
-        // check: the operator signs in with a flood in flight. It does not
-        // prove the delay holds no argon2 permit, which is what would put the
-        // operator behind a queue; that is a latency property, and a paused
-        // clock makes both orderings finish. The ordering is held by the
-        // permit's scope in admin_login, not by this test.
+        // per-IP throttle. The operator must still sign in while they are in
+        // flight.
         let mut flood = Vec::new();
         for index in 0..20u8 {
             let application = application.clone();
@@ -1566,9 +1549,8 @@ mod handler_tests {
                 login_attempt(application, [10, 0, 0, index], "wrong").await;
             }));
         }
-        // Bounded: if the operator ends up behind the flood in a permit
-        // queue this must fail with a diagnosis, not hang the suite. The
-        // clock is paused, so the bound costs no wall time.
+        // Bounded: a regression that queues the operator has to fail with a
+        // diagnosis rather than hang the suite.
         let operator = tokio::time::timeout(
             std::time::Duration::from_secs(60),
             login_attempt(
@@ -1589,17 +1571,16 @@ mod handler_tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn sign_in_failures_do_not_block_a_password_change() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
         let cookie = login_cookie(app::router(application.clone())).await;
-        // Past the lockout threshold on the sign-in counter. An operator
-        // holding a session must still be able to rotate the password.
+        // Sign-in failures must not reach the counter that guards password
+        // rotation: an operator holding a session has to be able to rotate.
         for index in 0..6u8 {
             login_attempt(application.clone(), [203, 0, 113, index], "wrong").await;
         }
-        assert!(application.throttle.locked(), "the sign-in counter tripped");
         let response = app::router(application.clone())
             .oneshot(
                 Request::builder()
@@ -1619,28 +1600,25 @@ mod handler_tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    // Paused clock: the global tarpit sleep auto-advances instead of costing
-    // two real seconds per attempt. IpThrottle keys off std::time::Instant,
-    // so the lockout logic under test is unaffected.
-    #[tokio::test(start_paused = true)]
-    async fn a_tripped_global_counter_still_admits_the_right_password() {
+    #[tokio::test]
+    async fn spread_out_failures_never_reach_a_fresh_address() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
-        // Four failures from each of two addresses: past the global threshold
-        // of five, but neither address is locked on its own. The global bound
-        // must delay the next attempt, never refuse it, or an attacker who
-        // can spread guesses denies the operator the break-glass credential.
-        for peer in [[203, 0, 113, 9], [203, 0, 113, 10]] {
+        // Twelve failures, spread four per address so no single address
+        // locks itself, and well past the five that used to trip a global
+        // counter. Nothing may accumulate across addresses, or an attacker
+        // who spreads guesses denies the operator the break-glass credential.
+        // Kept small on purpose: every one of these runs a real argon2.
+        for index in 0..3u8 {
             for _ in 0..4 {
                 assert_eq!(
-                    login_attempt(application.clone(), peer, "wrong")
+                    login_attempt(application.clone(), [203, 0, 113, index], "wrong")
                         .await
                         .status(),
                     StatusCode::UNAUTHORIZED
                 );
             }
         }
-        assert!(application.throttle.locked(), "the global counter tripped");
         assert_eq!(
             login_attempt(
                 application.clone(),
@@ -1650,14 +1628,41 @@ mod handler_tests {
             .await
             .status(),
             StatusCode::OK,
-            "a correct password signs in while the global counter is tripped"
+            "a fresh address signs in normally"
         );
     }
 
-    // Paused clock: the global tarpit sleep auto-advances instead of costing
-    // two real seconds per attempt. IpThrottle keys off std::time::Instant,
-    // so the lockout logic under test is unaffected.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
+    async fn a_link_password_flood_cannot_queue_the_operator_out() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        // Every permit of the public link budget held: that path is the one
+        // an unauthenticated caller can flood. Sign-in has its own budget, so
+        // it must not wait on this one.
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            held.push(
+                Arc::clone(&application.link_verify_permits)
+                    .acquire_owned()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let signed_in = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            login_attempt(
+                application.clone(),
+                [198, 51, 100, 4],
+                testing::TEST_PASSWORD,
+            ),
+        )
+        .await
+        .expect("sign-in waited on the link password budget");
+        assert_eq!(signed_in.status(), StatusCode::OK);
+        drop(held);
+    }
+
+    #[tokio::test]
     async fn a_guessing_address_cannot_lock_out_the_operator() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());

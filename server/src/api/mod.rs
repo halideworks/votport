@@ -45,11 +45,24 @@ fn client_ip(headers: &HeaderMap, peer: &std::net::SocketAddr) -> String {
         .and_then(|value| value.to_str().ok())
         .and_then(|list| list.rsplit(',').next())
         .map(|ip| ip.trim().to_owned())
-        // An unparseable value is not an address. Without this the header
+        // Keep only what is actually an address. Without this the header
         // picks the throttle key, so a caller that reaches the port from a
-        // private peer could mint an unbounded number of them.
-        .filter(|ip| ip.parse::<std::net::IpAddr>().is_ok())
+        // private peer could mint an unbounded number of them. Some proxies
+        // append host:port, so an address with a port is accepted and stored
+        // without it rather than discarded: discarding would collapse every
+        // client behind such a proxy into the proxy's own bucket.
+        .and_then(|value| parse_forwarded(&value))
         .unwrap_or_else(|| peer.ip().to_string())
+}
+
+fn parse_forwarded(value: &str) -> Option<String> {
+    if let Ok(ip) = value.parse::<std::net::IpAddr>() {
+        return Some(ip.to_string());
+    }
+    value
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|socket| socket.ip().to_string())
 }
 
 /// Throttle bucket for a client address. IPv6 clients routinely hold a whole
@@ -220,6 +233,15 @@ mod ip_tests {
         for bad in ["not-an-ip", "", "   ", "1.2.3.4.5", "<script>"] {
             headers.insert("x-forwarded-for", bad.parse().unwrap());
             assert_eq!(client_ip(&headers, &proxy), "127.0.0.1", "value {bad:?}");
+        }
+        // A proxy that appends a port still names a client. Rejecting these
+        // would put every client behind that proxy in one bucket.
+        for (value, expected) in [
+            ("1.2.3.4:5678", "1.2.3.4"),
+            ("[2001:db8::1]:443", "2001:db8::1"),
+        ] {
+            headers.insert("x-forwarded-for", value.parse().unwrap());
+            assert_eq!(client_ip(&headers, &proxy), expected, "value {value:?}");
         }
     }
 

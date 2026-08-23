@@ -132,19 +132,19 @@ async fn check_link_password(
     }
     let password = password.unwrap_or_default().to_owned();
     let hash = hash.clone();
-    let ok = {
-        // Same argon2 budget as admin sign-in: this is the other
-        // unauthenticated path that verifies a password, and it is one
-        // machine's memory both are spending.
-        let _permit = app
-            .verify_permits
-            .acquire()
-            .await
-            .map_err(|_| ApiError::internal("verify semaphore closed"))?;
-        tokio::task::spawn_blocking(move || auth::verify_password(&password, &hash))
-            .await
-            .map_err(|error| ApiError::internal(error.to_string()))?
-    };
+    // This path's own argon2 budget, separate from sign-in so a flood of
+    // link guesses cannot queue ahead of the operator. The permit moves into
+    // the blocking task so a disconnect cannot release it early.
+    let permit = Arc::clone(&app.link_verify_permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::internal("verify semaphore closed"))?;
+    let ok = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        auth::verify_password(&password, &hash)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?;
     app.link_throttle.record(&bucket, ok);
     if !ok {
         return Err(ApiError::new(
