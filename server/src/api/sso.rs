@@ -58,6 +58,9 @@ impl SsoClient {
         let http = reqwest::ClientBuilder::new()
             // Following redirects opens the client up to SSRF vulnerabilities.
             .redirect(reqwest::redirect::Policy::none())
+            // Every IdP call runs inside a browser redirect; without this a
+            // hung endpoint holds the callback open indefinitely.
+            .timeout(std::time::Duration::from_secs(15))
             .build()
             .map_err(|error| format!("oidc http client: {error}"))?;
         let metadata = CoreProviderMetadata::discover_async(
@@ -437,7 +440,9 @@ pub async fn sso_callback(
         let token = token_response.access_token().secret();
         // A userinfo failure must not silently downgrade an admin to viewer:
         // fail the sign-in loudly instead.
-        let value = match app.http.get(url).bearer_auth(token).send().await {
+        // The client's own no-redirect transport, not app.http: a redirecting
+        // userinfo endpoint must not carry the access token onward.
+        let value = match client.http.get(url).bearer_auth(token).send().await {
             Ok(response) => match response.json::<serde_json::Value>().await {
                 Ok(value) => value,
                 Err(error) => {

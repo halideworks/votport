@@ -282,17 +282,18 @@ pub struct CreateTenantRequest {
     max_sessions: Option<u64>,
 }
 
-/// Creates a tenant namespace. Admins only; the key must pass the same
-/// component rules as a link destination (it becomes a folder name).
-pub async fn create_tenant(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    Json(request): Json<CreateTenantRequest>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_platform_admin(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
-    let key = paths::admit_dest(&request.key)
+/// Admits a tenant key: destination rules plus a single path segment. A key
+/// with a separator would be created but never reachable, since the route
+/// matches one segment and `join_under` refuses the component.
+fn admit_tenant_key(key: &str) -> ApiResult<String> {
+    let key = paths::admit_dest(key)
         .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    if key.contains('/') {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "tenant key must be a single folder name",
+        ));
+    }
     if key.is_empty() || key == "default" {
         // "default" would collide with the hard-coded metrics series for the
         // built-in namespace.
@@ -301,6 +302,19 @@ pub async fn create_tenant(
             "that tenant key is reserved",
         ));
     }
+    Ok(key)
+}
+
+/// Creates a tenant namespace. Admins only; the key becomes a folder name
+/// directly under the receive root.
+pub async fn create_tenant(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateTenantRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_platform_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
+    let key = admit_tenant_key(&request.key)?;
     if app.store.tenant(&key).is_some() {
         return Err(ApiError::new(StatusCode::CONFLICT, "tenant already exists"));
     }
@@ -420,14 +434,7 @@ pub async fn delete_tenant(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_platform_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    let key = paths::admit_dest(&key)
-        .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
-    if key.is_empty() || key == "default" {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "that tenant key is reserved",
-        ));
-    }
+    let key = admit_tenant_key(&key)?;
     if !app.sessions.pin_tenant_for_delete(&key) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -2081,6 +2088,29 @@ mod tenant_offboard_tests {
         );
         assert!(application.store.tenant("acme").is_none());
         assert!(application.sessions.tenant_pinned("acme"));
+    }
+
+    #[tokio::test]
+    async fn create_tenant_refuses_a_multi_segment_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        // A key with a separator passes admit_dest but would be unreachable:
+        // DELETE matches one path segment and join_under refuses the
+        // component, so uploads into it fail too.
+        let response = create_tenant_req(application.clone(), &cookie, "a/b").await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(application.store.tenants().is_empty());
+    }
+
+    #[test]
+    fn tenant_keys_are_single_segments() {
+        assert_eq!(admit_tenant_key("acme").ok().as_deref(), Some("acme"));
+        assert_eq!(admit_tenant_key("/acme/").ok().as_deref(), Some("acme"));
+        for bad in ["a/b", "", "default", "..", "clients/acme"] {
+            assert!(admit_tenant_key(bad).is_err(), "{bad} was admitted");
+        }
     }
 
     #[test]

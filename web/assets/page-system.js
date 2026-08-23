@@ -265,10 +265,11 @@ try {
   formError($('notify-form'), error);
   formError($('smtp-form'), error);
 }
-// The receipt key arrives with the links payload.
+// The public endpoint answers with the key alone; the links payload carries
+// it too, but that is every link with every upload for one hex string.
 try {
-  const { receipt_key } = await api('/api/admin/links');
-  $('receipt-key').textContent = receipt_key || 'unavailable';
+  const { receipt_key: key } = await api('/api/receipt-key');
+  $('receipt-key').textContent = key || 'unavailable';
 } catch {
   $('receipt-key').textContent = 'unavailable';
 }
