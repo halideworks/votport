@@ -419,12 +419,31 @@ pub async fn create_tenant(
     // than keep a tenant over somebody else's bytes.
     #[cfg(test)]
     app.sessions.wait_create_stall().await;
-    let still_free = folder_is_free(&folder).unwrap_or(false);
+    let still_free = match folder_is_free(&folder) {
+        Ok(free) => free,
+        Err(error) => {
+            tracing::error!(%error, "receive folder could not be read after the insert");
+            false
+        }
+    };
     if !still_free {
+        // The undo has to succeed or the caller is told nothing was created
+        // while a tenant row sits over somebody else's bytes, which a later
+        // delete purges. Say so loudly rather than report a clean refusal.
+        use crate::store::TenantRemoval;
         match app.store.remove_tenant(&key) {
-            Ok(_) => {}
+            Ok(TenantRemoval::Deleted) | Ok(TenantRemoval::Absent) => {}
+            Ok(TenantRemoval::HasLinks) => {
+                tracing::error!(key = %key, "tenant created over an occupied folder gained a link before it could be undone");
+                return Err(ApiError::internal(format!(
+                    "tenant {key:?} was created over an occupied folder and now has links; delete them and it by hand"
+                )));
+            }
             Err(error) => {
                 tracing::error!(%error, key = %key, "could not undo a tenant created over an occupied folder");
+                return Err(ApiError::internal(format!(
+                    "tenant {key:?} was created over an occupied folder and could not be removed; remove it by hand"
+                )));
             }
         }
         return Err(ApiError::new(
@@ -1236,17 +1255,29 @@ fn base_url(app: &App, headers: &HeaderMap) -> String {
 /// The on-disk path a file record points at, from server-recorded components
 /// only; client input never reaches this. None when a stored record fails the
 /// join guard (a corrupted record), which the display treats as "missing".
-fn stored_path(app: &App, stored_as: &str) -> Option<std::path::PathBuf> {
-    let components: Vec<String> = stored_as
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .map(str::to_owned)
-        .collect();
+fn stored_path(app: &App, tenant: &str, stored_as: &str) -> Option<std::path::PathBuf> {
+    // stored_as is relative to the tenant's own subtree: the session builds
+    // it from the link dest, while the tenant prefix is added separately when
+    // the destination directory is assembled. Joining it straight under the
+    // receive root resolves a tenant's file to the default tenant's path,
+    // which is one namespace reading and deleting another's bytes.
+    let mut components: Vec<String> = if tenant.is_empty() {
+        Vec::new()
+    } else {
+        vec![tenant.to_owned()]
+    };
+    components.extend(
+        stored_as
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned),
+    );
     paths::join_under(&app.config.receive_dir, &components).ok()
 }
 
 fn link_view(app: &App, link: Link, base: &str) -> LinkView {
     let usable = link.usable_now();
+    let tenant = link.tenant.clone();
     let uploads = link
         .uploads
         .into_iter()
@@ -1255,7 +1286,8 @@ fn link_view(app: &App, link: Link, base: &str) -> LinkView {
                 .files
                 .into_iter()
                 .map(|file| FileView {
-                    exists: stored_path(app, &file.stored_as).is_some_and(|path| path.is_file()),
+                    exists: stored_path(app, &tenant, &file.stored_as)
+                        .is_some_and(|path| path.is_file()),
                     path: file.path,
                     stored_as: file.stored_as,
                     bytes: file.bytes,
@@ -1526,7 +1558,7 @@ pub async fn delete_received_file(
         .find(|entry| entry.id == upload)
         .and_then(|entry| entry.files.get(index))
         .ok_or_else(ApiError::not_found)?;
-    let path = stored_path(&app, &record.stored_as)
+    let path = stored_path(&app, &identity.tenant, &record.stored_as)
         .ok_or_else(|| ApiError::internal("stored path failed the join guard"))?;
     for target in [path.clone(), {
         let mut sidecar = path.into_os_string();
@@ -2635,6 +2667,82 @@ mod tenant_offboard_tests {
         assert!(
             application.store.tenant("acme").is_none(),
             "a refused create must leave no tenant row over those bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_undo_that_cannot_run_is_reported_not_swallowed() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+
+        let (entered, release) = application.sessions.arm_create_stall();
+        let create = tokio::spawn({
+            let application = application.clone();
+            let cookie = cookie.clone();
+            async move { create_tenant_req(application, &cookie, "acme").await }
+        });
+        entered.await.expect("create reached the recheck");
+        // The folder is taken, so the undo will run, and a link now
+        // references the tenant, so the undo cannot complete. Reporting a
+        // clean refusal here would leave a row over those bytes.
+        let taken = application.config.receive_dir.join("acme");
+        std::fs::create_dir_all(&taken).unwrap();
+        std::fs::write(taken.join(".vot-1-0-1.stage"), b"staging").unwrap();
+        application
+            .store
+            .insert_link_unchecked(Link {
+                id: "in-flight".to_owned(),
+                tenant: "acme".to_owned(),
+                label: "inbox".to_owned(),
+                dest: String::new(),
+                password_hash: None,
+                created_at: 0,
+                expires_at: None,
+                max_bytes: None,
+                active: true,
+                uploads: Vec::new(),
+                events: Vec::new(),
+            })
+            .unwrap();
+        release.send(()).unwrap();
+
+        let response = create.await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("by hand"),
+            "the operator has to be told the row survived: {json}"
+        );
+    }
+
+    #[test]
+    fn stored_paths_resolve_inside_the_owning_tenant() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let root = &application.config.receive_dir;
+        // stored_as is relative to the tenant's own subtree, because the
+        // session builds it from the link dest while the tenant prefix is
+        // added separately when the destination directory is assembled.
+        assert_eq!(
+            stored_path(&application, "acme", "inbox/a.txt").unwrap(),
+            root.join("acme").join("inbox").join("a.txt")
+        );
+        // The default tenant has no prefix.
+        assert_eq!(
+            stored_path(&application, "", "inbox/a.txt").unwrap(),
+            root.join("inbox").join("a.txt")
+        );
+        // The two must never resolve to the same file: that is one namespace
+        // deleting another's bytes.
+        assert_ne!(
+            stored_path(&application, "acme", "inbox/a.txt").unwrap(),
+            stored_path(&application, "", "inbox/a.txt").unwrap()
         );
     }
 

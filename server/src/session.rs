@@ -347,7 +347,8 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
     // A package delivered to the receive root can still reach into a tenant's
     // folder through its own leading path component. The link's dest is
     // checked when the link is created; a file's path is only known here.
-    let reserved: HashSet<String> = if setup.tenant.is_empty() && setup.dest_rel.is_empty() {
+    let reserved_lookup_is_empty = setup.tenant.is_empty() && setup.dest_rel.is_empty();
+    let reserved: HashSet<String> = if reserved_lookup_is_empty {
         setup
             .store
             .tenants()
@@ -416,6 +417,28 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
             continue;
         }
         files.push(open_destination(setup, entry)?);
+    }
+
+    // Recheck after the destinations exist. create_tenant writes its row and
+    // then reads the folder; this reads the tenants after the folder is
+    // taken, so in either interleaving one of the two sees the other. The
+    // staged files are removed when the FileState values drop.
+    if !reserved_lookup_is_empty {
+        let now_reserved: HashSet<String> = setup
+            .store
+            .tenants()
+            .into_iter()
+            .map(|tenant| tenant.key)
+            .collect();
+        for file in &files {
+            if let Some(first) = file.stored_components.first() {
+                if now_reserved.contains(first) {
+                    return Err(SessionError::bad(format!(
+                        "{first:?} is not writable through this link"
+                    )));
+                }
+            }
+        }
     }
 
     // Zero-length objects have complete coverage already; publish now.
