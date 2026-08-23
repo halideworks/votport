@@ -629,24 +629,6 @@ fn handle_chunk(
 }
 
 fn publish_file(setup: &WorkerSetup, file: &mut FileState) -> Result<(), SessionError> {
-    // A single-component entry never creates a directory: open_destination
-    // only calls create_dir_all below depth one, and staging lands in the
-    // parent. So nothing claims receive/<name> until this rename, and the
-    // checks at begin cannot see a tenant created during the transfer. This
-    // is the last moment before the name is taken.
-    if setup.tenant.is_empty() && setup.dest_rel.is_empty() && file.stored_components.len() == 1 {
-        let name = &file.stored_components[0];
-        let taken = setup
-            .store
-            .tenants()
-            .into_iter()
-            .any(|tenant| &tenant.key == name);
-        if taken {
-            return Err(SessionError::bad(format!(
-                "{name:?} is not writable through this link"
-            )));
-        }
-    }
     let native = file
         .native
         .as_mut()
@@ -677,6 +659,37 @@ fn publish_file(setup: &WorkerSetup, file: &mut FileState) -> Result<(), Session
     }
     file.published = true;
     file.native = None;
+
+    // A single-component entry never creates a directory, so nothing claims
+    // receive/<name> until the rename above; the checks at begin cannot see a
+    // tenant created during the transfer. Read the tenants after taking the
+    // name rather than before, the way create_tenant writes its row before
+    // reading the folder: whichever order the two run in, one sees the other.
+    // A plain file where a tenant folder belongs wedges that tenant, so undo
+    // the publish rather than leave it.
+    if setup.tenant.is_empty() && setup.dest_rel.is_empty() && file.stored_components.len() == 1 {
+        let name = &file.stored_components[0];
+        let taken = setup
+            .store
+            .tenants()
+            .into_iter()
+            .any(|tenant| &tenant.key == name);
+        if taken {
+            let published = paths::join_under(&setup.dest_dir, &file.stored_components)
+                .map_err(SessionError::internal)?;
+            let _ = fs::remove_file(format!("{}.vot-receipt", published.display()));
+            if let Err(error) = fs::remove_file(&published) {
+                tracing::error!(
+                    path = %published.display(), %error,
+                    "could not undo a publish onto a tenant name"
+                );
+            }
+            file.published = false;
+            return Err(SessionError::bad(format!(
+                "{name:?} is not writable through this link"
+            )));
+        }
+    }
     Ok(())
 }
 
