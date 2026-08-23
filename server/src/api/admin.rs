@@ -476,6 +476,10 @@ pub async fn delete_tenant(
             ));
         }
         Ok(TenantRemoval::Absent) => {
+            if !purges_receive_subtree(&key) {
+                app.sessions.unpin_tenant(&key);
+                return Err(ApiError::not_found());
+            }
             let path = match tenant_receive_dir(&app.config.receive_dir, &key) {
                 Ok(path) => path,
                 Err(error) => {
@@ -501,31 +505,36 @@ pub async fn delete_tenant(
             return Err(ApiError::internal(error));
         }
     };
-    let path = match tenant_receive_dir(&app.config.receive_dir, &key) {
-        Ok(path) => path,
-        Err(error) => {
-            app.sessions.unpin_tenant(&key);
-            return Err(ApiError::internal(error));
+    let purged_receive = purges_receive_subtree(&key);
+    if purged_receive {
+        let path = match tenant_receive_dir(&app.config.receive_dir, &key) {
+            Ok(path) => path,
+            Err(error) => {
+                app.sessions.unpin_tenant(&key);
+                return Err(ApiError::internal(error));
+            }
+        };
+        #[cfg(test)]
+        app.sessions.wait_delete_stall().await;
+        let purge = tokio::fs::remove_dir_all(&path).await;
+        app.sessions.unpin_tenant(&key);
+        match purge {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && row_deleted => {}
+            Err(error) => {
+                tracing::error!(
+                    key = %key,
+                    error = %error,
+                    "receive subtree purge failed"
+                );
+                return Err(ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "receive subtree purge failed; retry DELETE",
+                ));
+            }
         }
-    };
-    #[cfg(test)]
-    app.sessions.wait_delete_stall().await;
-    let purge = tokio::fs::remove_dir_all(&path).await;
-    app.sessions.unpin_tenant(&key);
-    match purge {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && row_deleted => {}
-        Err(error) => {
-            tracing::error!(
-                key = %key,
-                error = %error,
-                "receive subtree purge failed"
-            );
-            return Err(ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "receive subtree purge failed; retry DELETE",
-            ));
-        }
+    } else {
+        app.sessions.unpin_tenant(&key);
     }
     tracing::info!(target: "audit", event = "tenant_deleted", key = %key, "tenant namespace deleted");
     app.store.audit(
@@ -533,7 +542,7 @@ pub async fn delete_tenant(
         &identity.subject,
         "tenant_deleted",
         &key,
-        &json!({ "purged_receive": true, "row_deleted": row_deleted }),
+        &json!({ "purged_receive": purged_receive, "row_deleted": row_deleted }),
     );
     Ok(Json(json!({ "ok": true })))
 }
@@ -617,18 +626,20 @@ pub async fn update_tenant(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// Whether deleting `key` may remove a receive subtree. A key with a
+/// separator was never usable as a namespace: `Tenant::path_prefix` hands the
+/// whole key to `join_under` as one component, so no upload ever published
+/// beneath it, and anything at that path belongs to a default-tenant link
+/// whose dest is that string.
+fn purges_receive_subtree(key: &str) -> bool {
+    !key.contains('/')
+}
+
 fn tenant_receive_dir(
     receive_dir: &std::path::Path,
     key: &str,
 ) -> Result<std::path::PathBuf, String> {
-    // Split: a legacy multi-segment key is several components, and
-    // join_under refuses a component that still contains a separator.
-    let components: Vec<String> = key
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .map(str::to_owned)
-        .collect();
-    let path = paths::join_under(receive_dir, &components)?;
+    let path = paths::join_under(receive_dir, &[key.to_owned()])?;
     if path == *receive_dir {
         return Err("refusing to purge the receive root".to_owned());
     }
@@ -2123,8 +2134,10 @@ mod tenant_offboard_tests {
     async fn delete_removes_a_legacy_multi_segment_tenant() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
-        // A row of the shape create_tenant used to accept. It must stay
-        // deletable, or it sits in the tenants list and /metrics forever.
+        // A row of the shape create_tenant used to accept. Deleting it must
+        // drop the row without touching disk: no upload ever published under
+        // such a key, so that path can only hold a default-tenant link's
+        // files.
         application
             .store
             .insert_tenant(crate::store::Tenant {
@@ -2137,11 +2150,18 @@ mod tenant_offboard_tests {
                 created_at: 0,
             })
             .unwrap();
+        // What a default-tenant link with dest "clients/acme" would have
+        // received. The delete must not reach it.
+        let bystander = application.config.receive_dir.join("clients").join("acme");
+        std::fs::create_dir_all(&bystander).unwrap();
+        std::fs::write(bystander.join("statement.pdf"), b"kept").unwrap();
+
         let router = app::router(application.clone());
         let cookie = login_cookie(router).await;
         let response = delete_tenant_req(application.clone(), &cookie, "clients%2Facme").await;
         assert_eq!(response.status(), StatusCode::OK);
         assert!(application.store.tenants().is_empty());
+        assert!(bystander.join("statement.pdf").exists());
     }
 
     #[test]
