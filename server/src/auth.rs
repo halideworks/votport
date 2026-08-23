@@ -312,19 +312,6 @@ impl LoginThrottle {
     pub fn succeeded(&self) {
         *self.state.lock().expect("throttle poisoned") = (0, None);
     }
-
-    pub fn record(&self, success: bool) {
-        let mut state = self.state.lock().expect("throttle poisoned");
-        if success {
-            *state = (0, None);
-        } else {
-            state.0 += 1;
-            if state.0 >= LOCKOUT_THRESHOLD {
-                state.1 = Some(Instant::now() + Duration::from_secs(LOCKOUT_SECS));
-                state.0 = 0;
-            }
-        }
-    }
 }
 
 /// Per-IP throttle for link password checks. The global [`LoginThrottle`]
@@ -435,26 +422,6 @@ impl IpThrottle {
             }
         }
     }
-
-    pub fn record(&self, ip: &str, success: bool) {
-        let mut state = self.state.lock().expect("throttle poisoned");
-        Self::evict_if_full(&mut state, ip);
-        if success {
-            state.remove(ip);
-            return;
-        }
-        let entry = state.entry(ip.to_owned()).or_insert(IpState {
-            failures: 0,
-            locked_until: None,
-            last_seen: Instant::now(),
-        });
-        entry.last_seen = Instant::now();
-        entry.failures += 1;
-        if entry.failures >= LOCKOUT_THRESHOLD {
-            entry.locked_until = Some(Instant::now() + Duration::from_secs(LOCKOUT_SECS));
-            entry.failures = 0;
-        }
-    }
 }
 
 pub struct IpThrottle {
@@ -517,18 +484,18 @@ mod tests {
         let throttle = IpThrottle::new();
         // Lock one address, then flood with fresh keys the sweep cannot evict.
         for _ in 0..LOCKOUT_THRESHOLD {
-            throttle.record("10.0.0.1", false);
+            throttle.claim("10.0.0.1");
         }
         assert!(throttle.locked("10.0.0.1"));
         for index in 0..(IP_TABLE_CAP * 2) {
-            throttle.record(&format!("10.9.{}.{}", index / 256, index % 256), false);
+            throttle.claim(&format!("10.9.{}.{}", index / 256, index % 256));
         }
         let size = throttle.state.lock().unwrap().len();
         assert!(size <= IP_TABLE_CAP, "table grew to {size}");
         assert!(throttle.locked("10.0.0.1"), "the live lockout survived");
         // A full table must not switch throttling off for new addresses.
         for _ in 0..LOCKOUT_THRESHOLD {
-            throttle.record("10.0.0.2", false);
+            throttle.claim("10.0.0.2");
         }
         assert!(
             throttle.locked("10.0.0.2"),

@@ -39,6 +39,9 @@ pub struct App {
     pub login_permits: Arc<tokio::sync::Semaphore>,
     /// argon2 budget for public link password checks.
     pub link_verify_permits: Arc<tokio::sync::Semaphore>,
+    /// argon2 budget for password rotation. Separate again: rotation is what
+    /// an operator reaches for while under attack.
+    pub change_password_permits: Arc<tokio::sync::Semaphore>,
     /// Per-IP throttle for public link password checks.
     pub link_throttle: crate::auth::IpThrottle,
     /// Per-IP rate limit on upload-session creation.
@@ -209,6 +212,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         login_throttle: crate::auth::IpThrottle::new(),
         login_permits: Arc::new(tokio::sync::Semaphore::new(VERIFY_PERMITS)),
         link_verify_permits: Arc::new(tokio::sync::Semaphore::new(VERIFY_PERMITS)),
+        change_password_permits: Arc::new(tokio::sync::Semaphore::new(VERIFY_PERMITS)),
         link_throttle: crate::auth::IpThrottle::new(),
         session_rate: crate::api::session_rate::SessionRate::new(),
         verify_rate: crate::api::session_rate::SessionRate::new(),

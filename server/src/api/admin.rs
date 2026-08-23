@@ -1059,15 +1059,9 @@ pub async fn admin_change_password(
             "the local administrator password is managed by the default-tenant admin",
         ));
     }
-    // Claimed before the verify, like sign-in: a caller holding a session
-    // could otherwise fire many concurrent guesses that all pass the check
-    // together, making this the oracle the throttle exists to prevent.
-    if !app.change_password_throttle.claim() {
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many failed attempts; wait a minute",
-        ));
-    }
+    // Validate before claiming. A request rejected on its own shape never
+    // reaches a password, so charging it against the guess budget would let a
+    // script with a too-short new password lock every admin out of rotation.
     if request.new.chars().count() < crate::config::MIN_ADMIN_PASSWORD_CHARS {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -1077,10 +1071,19 @@ pub async fn admin_change_password(
             ),
         ));
     }
-    // The third argon2 path, and it takes a permit for the same reason the
-    // other two do: a session holder must not be able to start an unbounded
-    // number of verifications.
-    let permit = Arc::clone(&app.login_permits)
+    // Claimed before the verify, like sign-in: a caller holding a session
+    // could otherwise fire many concurrent guesses that all pass the check
+    // together, making this the oracle the throttle exists to prevent.
+    if !app.change_password_throttle.claim() {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed attempts; wait a minute",
+        ));
+    }
+    // Its own budget, not the sign-in one: rotating the password is what an
+    // operator does while under attack, so an anonymous sign-in flood must
+    // not queue ahead of it.
+    let permit = Arc::clone(&app.change_password_permits)
         .acquire_owned()
         .await
         .map_err(|_| ApiError::internal("login semaphore closed"))?;
@@ -1591,6 +1594,58 @@ mod handler_tests {
         for task in flood {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(60), task).await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_new_password_costs_no_guess_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = login_cookie(app::router(application.clone())).await;
+        // Six requests whose new password is too short. None of them reaches
+        // a verification, so none may spend the budget that guards the
+        // current password, or a script could lock every admin out of
+        // rotation without guessing anything.
+        for _ in 0..6 {
+            let response = change_password_req(
+                application.clone(),
+                &cookie,
+                testing::TEST_PASSWORD,
+                "short",
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = change_password_req(
+            application.clone(),
+            &cookie,
+            testing::TEST_PASSWORD,
+            "a-much-longer-passphrase",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    async fn change_password_req(
+        application: Arc<App>,
+        cookie: &str,
+        current: &str,
+        new: &str,
+    ) -> axum::http::Response<axum::body::Body> {
+        app::router(application)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/password")
+                    .header("cookie", cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"current":"{current}","new":"{new}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
     }
 
     #[tokio::test]

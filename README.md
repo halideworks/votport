@@ -184,9 +184,12 @@ crate: `decode_authenticated(bytes)` then `verify_ed25519(&decoded, &key)`.
   `Secure` behind https); mutating admin calls also require a custom header,
   which closes cross-site request forgery.
 * Password guessing is throttled per client bucket, and each password path
-  holds a small budget of concurrent argon2 verifications. Nothing global
-  refuses or delays a correct password, so no one can lock the administrator
-  out of the break-glass credential. Guessing buckets group an IPv6 client by
+  holds its own small budget of concurrent argon2 verifications. Nothing
+  refuses a correct password, so no one can lock the administrator out of the
+  break-glass credential. A sustained flood can still make sign-in wait behind
+  the queue for that budget; the wait is bounded by the queue and ends with
+  the flood, and rate limiting at the reverse proxy is the answer to it.
+  Guessing buckets group an IPv6 client by
   /64, since a client holding a routed prefix would otherwise get a fresh
   budget per address; the cost is that neighbours in one prefix share a
   lockout. Upload-session creation and receipt checks are quotas rather than
