@@ -264,15 +264,6 @@ pub async fn create_session(
             }
         }
     };
-    if app.sessions.active_for_link(&link.id) >= MAX_SESSIONS_PER_LINK
-        || app.sessions.total() >= MAX_SESSIONS
-    {
-        audit_session_rejected(&app, &link.tenant, "global or per-link session cap");
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many uploads in progress; try again shortly",
-        ));
-    }
     let expected = parse_object(&request.package)?;
     let announced_bytes = expected.length;
     let cap = effective_cap(&app, &link);
@@ -663,6 +654,50 @@ mod session_rate_tests {
             .unwrap();
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn session_creation_uses_the_atomic_link_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_link(open_link("full-link"))
+            .unwrap();
+        let mut receivers = Vec::new();
+        for index in 0..MAX_SESSIONS_PER_LINK {
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            application
+                .sessions
+                .insert(
+                    format!("session-{index}"),
+                    "full-link".to_owned(),
+                    String::new(),
+                    sender,
+                )
+                .unwrap();
+            receivers.push(receiver);
+        }
+
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/r/full-link/session")
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        1234,
+                    ))))
+                    .body(Body::from(
+                        r#"{"package":{"suite":"blake3","root":"0000000000000000000000000000000000000000000000000000000000000000","length":1}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(application.sessions.total(), MAX_SESSIONS_PER_LINK);
     }
 
     #[tokio::test]
