@@ -58,13 +58,19 @@ function renderTenant(tenant) {
         if (
           !(await confirmModal(
             'Delete tenant',
-            `Delete "${tenant.key}"? Refused while its links still exist. Files under the tenant prefix are deleted; if purge fails, retry Delete.`,
+            tenant.key.includes('/')
+              ? `Delete "${tenant.key}"? Refused while its links still exist. No files are deleted: nothing was ever stored under a key with a separator.`
+              : `Delete "${tenant.key}"? Refused while its links still exist. Files under the tenant prefix are deleted; if purge fails, retry Delete.`,
             'Delete',
           ))
         )
           return;
         try {
-          await api(`/api/admin/tenants/${tenant.key}`, { method: 'DELETE' });
+          // Encoded: a key stored before the server required one segment
+          // would otherwise build a two-segment path that matches no route.
+          await api(`/api/admin/tenants/${encodeURIComponent(tenant.key)}`, {
+            method: 'DELETE',
+          });
           await refreshTenants();
         } catch (error) {
           alertModal(error.message);

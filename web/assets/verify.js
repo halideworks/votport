@@ -208,15 +208,6 @@ async function runCheck() {
   });
 }
 
-try {
-  const response = await fetch('/api/receipt-key');
-  if (!response.ok) throw new Error(response.status);
-  const { receipt_key: key } = await response.json();
-  $('receipt-key').textContent = key;
-} catch {
-  $('receipt-key').textContent = 'unavailable';
-}
-
 $('pick-payload').addEventListener('click', () => $('payload-input').click());
 $('pick-sidecar').addEventListener('click', () => $('sidecar-input').click());
 $('clear-payload').addEventListener('click', () => {
@@ -249,7 +240,21 @@ dropZone.addEventListener('drop', (e) => {
 dropZone.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' || e.key === ' ') $('payload-input').click();
 });
-$('reset').addEventListener('click', reset);$('verify-form').addEventListener('submit', (e) => {
+$('reset').addEventListener('click', reset);
+$('verify-form').addEventListener('submit', (e) => {
   e.preventDefault();
   check();
 });
+
+// Last, and not awaited at module scope: a slow answer here must not delay
+// wiring the controls above.
+(async () => {
+  try {
+    const response = await fetch('/api/receipt-key');
+    if (!response.ok) throw new Error(response.status);
+    const { receipt_key: key } = await response.json();
+    $('receipt-key').textContent = key || 'unavailable';
+  } catch {
+    $('receipt-key').textContent = 'unavailable';
+  }
+})();
