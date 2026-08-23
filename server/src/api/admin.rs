@@ -1059,7 +1059,10 @@ pub async fn admin_change_password(
             "the local administrator password is managed by the default-tenant admin",
         ));
     }
-    if app.change_password_throttle.locked() {
+    // Claimed before the verify, like sign-in: a caller holding a session
+    // could otherwise fire many concurrent guesses that all pass the check
+    // together, making this the oracle the throttle exists to prevent.
+    if !app.change_password_throttle.claim() {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed attempts; wait a minute",
@@ -1074,18 +1077,28 @@ pub async fn admin_change_password(
             ),
         ));
     }
+    // The third argon2 path, and it takes a permit for the same reason the
+    // other two do: a session holder must not be able to start an unbounded
+    // number of verifications.
+    let permit = Arc::clone(&app.login_permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::internal("login semaphore closed"))?;
     let current_ok = tokio::task::spawn_blocking({
         let hash = admin_hash(&app);
         let current = request.current.clone();
-        move || auth::verify_password(&current, &hash)
+        move || {
+            let _permit = permit;
+            auth::verify_password(&current, &hash)
+        }
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?;
-    // Throttled on its own counter: this endpoint verifies a password too, so
-    // it would otherwise be an unthrottled oracle for an attacker holding a
-    // session. Sharing the sign-in counter let anonymous login failures keep
-    // an operator from rotating the password.
-    app.change_password_throttle.record(current_ok);
+    // Its own counter: sharing the sign-in one let anonymous login failures
+    // keep an operator from rotating the password.
+    if current_ok {
+        app.change_password_throttle.succeeded();
+    }
     if !current_ok {
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,

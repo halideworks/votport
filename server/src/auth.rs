@@ -291,6 +291,28 @@ impl LoginThrottle {
         state.1.is_some_and(|until| Instant::now() < until)
     }
 
+    /// Claims one attempt, counting it before it is checked. See
+    /// [`IpThrottle::claim`]: checking and then recording lets any number of
+    /// concurrent attempts through together, which turns the threshold into a
+    /// limit per batch the caller can open.
+    pub fn claim(&self) -> bool {
+        let mut state = self.state.lock().expect("throttle poisoned");
+        if state.1.is_some_and(|until| Instant::now() < until) {
+            return false;
+        }
+        state.0 += 1;
+        if state.0 >= LOCKOUT_THRESHOLD {
+            state.1 = Some(Instant::now() + Duration::from_secs(LOCKOUT_SECS));
+            state.0 = 0;
+        }
+        true
+    }
+
+    /// Clears the claims after a correct password.
+    pub fn succeeded(&self) {
+        *self.state.lock().expect("throttle poisoned") = (0, None);
+    }
+
     pub fn record(&self, success: bool) {
         let mut state = self.state.lock().expect("throttle poisoned");
         if success {
@@ -375,8 +397,9 @@ impl IpThrottle {
     /// nothing else can be, which costs an attacker a full set of failures.
     fn evict_if_full(state: &mut std::collections::HashMap<String, IpState>, ip: &str) {
         if state.len() >= IP_TABLE_CAP {
-            // Evict only dead weight: expired, idle entries. Live lockouts
-            // survive, so filling the table cannot reset anyone's penalty.
+            // Evict dead weight first: expired, idle entries. A live lockout
+            // is only ever evicted by the fallback below, when every entry
+            // holds one and there is nothing else to free.
             let now = Instant::now();
             state.retain(|_, entry| {
                 entry.locked_until.is_some_and(|until| now < until)
@@ -455,6 +478,22 @@ pub fn cookie_value<'header>(header: &'header str, name: &str) -> Option<&'heade
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_global_counter_also_counts_before_it_checks() {
+        let throttle = LoginThrottle::new();
+        // The password-change endpoint verifies a password for a caller that
+        // already holds a session. Counting only on the way out would let one
+        // batch of concurrent guesses through per lockout.
+        for index in 0..LOCKOUT_THRESHOLD {
+            assert!(throttle.claim(), "claim {index} refused early");
+        }
+        assert!(!throttle.claim(), "the sixth concurrent claim");
+        assert!(throttle.locked());
+        throttle.succeeded();
+        assert!(!throttle.locked());
+        assert!(throttle.claim());
+    }
 
     #[test]
     fn concurrent_attempts_cannot_outrun_the_counter() {

@@ -247,7 +247,13 @@ pub fn from_env() -> Result<Config, String> {
     };
     let metrics_token = optional("VOTPORT_METRICS_TOKEN");
 
-    let trusted_proxies = match optional("VOTPORT_TRUSTED_PROXIES") {
+    // Read raw, not through `optional`: that helper treats a whitespace-only
+    // value as unset, which for this variable means "trust every private
+    // peer" rather than the refusal below.
+    let trusted_proxies = match env::var("VOTPORT_TRUSTED_PROXIES")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
         Some(list) => {
             let blocks = list
                 .split(',')
