@@ -326,6 +326,12 @@ pub async fn create_tenant(
     if app.store.tenant(&key).is_some() {
         return Err(ApiError::new(StatusCode::CONFLICT, "tenant already exists"));
     }
+    if default_tenant_dest_collides(&app.store, &key) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "a default-tenant link already publishes into that folder; repoint or delete it first",
+        ));
+    }
     if app.sessions.tenant_pinned(&key) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -465,11 +471,27 @@ pub async fn delete_tenant(
             format!("{active} upload(s) are in flight; try again when they finish"),
         ));
     }
-    // A default-tenant link may publish straight into <receive>/<key>, in
-    // which case that subtree holds files this delete does not own. Checked
-    // before the row is removed, so a refusal leaves nothing half done. Keys
-    // that skip the purge cannot collide with anything.
-    if purges_receive_subtree(&key) && default_tenant_dest_collides(&app.store, &key) {
+    // The subtree this delete would purge, if there is one. A key with a
+    // separator never had one, and neither does a namespace that never
+    // received anything.
+    let purge_target = if purges_receive_subtree(&key) {
+        match tenant_receive_dir(&app.config.receive_dir, &key) {
+            Ok(path) if path.is_dir() => Some(path),
+            Ok(_) => None,
+            Err(error) => {
+                app.sessions.unpin_tenant(&key);
+                return Err(ApiError::internal(error));
+            }
+        }
+    } else {
+        None
+    };
+    // A default-tenant link may publish straight into that subtree, in which
+    // case it holds files this delete does not own. Checked before the row is
+    // removed, so a refusal leaves nothing half done. This stays the backstop
+    // for pre-existing rows and for a link created after the create-time
+    // checks below have passed.
+    if purge_target.is_some() && default_tenant_dest_collides(&app.store, &key) {
         app.sessions.unpin_tenant(&key);
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -487,18 +509,7 @@ pub async fn delete_tenant(
             ));
         }
         Ok(TenantRemoval::Absent) => {
-            if !purges_receive_subtree(&key) {
-                app.sessions.unpin_tenant(&key);
-                return Err(ApiError::not_found());
-            }
-            let path = match tenant_receive_dir(&app.config.receive_dir, &key) {
-                Ok(path) => path,
-                Err(error) => {
-                    app.sessions.unpin_tenant(&key);
-                    return Err(ApiError::internal(error));
-                }
-            };
-            if !path.is_dir() {
+            if purge_target.is_none() {
                 app.sessions.unpin_tenant(&key);
                 return Err(ApiError::not_found());
             }
@@ -509,15 +520,8 @@ pub async fn delete_tenant(
             return Err(ApiError::internal(error));
         }
     };
-    let purged_receive = purges_receive_subtree(&key);
-    if purged_receive {
-        let path = match tenant_receive_dir(&app.config.receive_dir, &key) {
-            Ok(path) => path,
-            Err(error) => {
-                app.sessions.unpin_tenant(&key);
-                return Err(ApiError::internal(error));
-            }
-        };
+    let purged_receive = purge_target.is_some();
+    if let Some(path) = purge_target {
         #[cfg(test)]
         app.sessions.wait_delete_stall().await;
         let purge = tokio::fs::remove_dir_all(&path).await;
@@ -648,6 +652,18 @@ fn tenant_receive_dir(
         return Err("refusing to purge the receive root".to_owned());
     }
     Ok(path)
+}
+
+/// The tenant key whose subtree `dest` would publish into, if any. A
+/// default-tenant link with dest "acme" writes to the same directory tenant
+/// "acme" owns, which mixes two namespaces in one folder and leaves the
+/// tenant undeletable. The two creation paths refuse each other.
+fn dest_collides_with_a_tenant(store: &crate::store::Store, dest: &str) -> Option<String> {
+    store
+        .tenants()
+        .into_iter()
+        .map(|tenant| tenant.key)
+        .find(|key| dest == key || dest.starts_with(&format!("{key}/")))
 }
 
 fn default_tenant_dest_collides(store: &crate::store::Store, key: &str) -> bool {
@@ -1231,6 +1247,17 @@ pub async fn create_link(
         Some(password) => Some(auth::hash_password(password).map_err(ApiError::internal)?),
         None => None,
     };
+    // The other half of the same invariant: a default-tenant link may not
+    // publish into a namespace a tenant owns. Named tenants publish under
+    // their own prefix, so only default-tenant links can reach one.
+    if identity.tenant.is_empty() && !dest.is_empty() {
+        if let Some(key) = dest_collides_with_a_tenant(&app.store, &dest) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("that folder belongs to tenant {key:?}; choose another"),
+            ));
+        }
+    }
     let tenant = identity.tenant.clone();
     // A cookie can outlive its tenant's deletion; without this check the
     // link would be created under a namespace nothing manages anymore.
@@ -2194,6 +2221,67 @@ mod tenant_offboard_tests {
         std::fs::create_dir_all(&shared).unwrap();
         std::fs::write(shared.join("invoice.pdf"), b"kept").unwrap();
 
+        // Inserted directly: create_tenant now refuses this pairing, and the
+        // delete guard has to keep covering rows that predate that check.
+        application
+            .store
+            .insert_tenant(crate::store::Tenant {
+                key: "acme".to_owned(),
+                label: "acme".to_owned(),
+                admin_group: None,
+                max_total_bytes: None,
+                max_links: None,
+                max_sessions: None,
+                created_at: 0,
+            })
+            .unwrap();
+
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let response = delete_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        // The refusal comes before remove_tenant, so nothing is half done.
+        assert!(application.store.tenant("acme").is_some());
+        assert!(shared.join("invoice.pdf").exists());
+        assert!(!application.sessions.tenant_pinned("acme"));
+    }
+
+    #[tokio::test]
+    async fn unknown_key_with_a_colliding_link_but_no_directory_is_404() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        // A colliding link exists, but there is no tenant row and nothing on
+        // disk, so there is no purge to conflict with: this is a 404, not the
+        // purge refusal.
+        application
+            .store
+            .insert_link(default_link("root-dest", "acme"))
+            .unwrap();
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let response = delete_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn create_tenant_refuses_a_key_a_default_link_publishes_into() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_link(default_link("root-dest", "acme"))
+            .unwrap();
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let response = create_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(application.store.tenants().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_link_refuses_a_dest_inside_a_tenant() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
         let router = app::router(application.clone());
         let cookie = login_cookie(router).await;
         assert_eq!(
@@ -2202,12 +2290,26 @@ mod tenant_offboard_tests {
                 .status(),
             StatusCode::OK
         );
-        let response = delete_tenant_req(application.clone(), &cookie, "acme").await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        // The refusal comes before remove_tenant, so nothing is half done.
-        assert!(application.store.tenant("acme").is_some());
-        assert!(shared.join("invoice.pdf").exists());
-        assert!(!application.sessions.tenant_pinned("acme"));
+        // Both the key itself and anything beneath it belong to the tenant.
+        for dest in ["acme", "acme/invoices"] {
+            let response = app::router(application.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/admin/links")
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(
+                            r#"{{"label":"invoices","dest":"{dest}"}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "dest {dest}");
+        }
+        assert!(application.store.links("").is_empty());
     }
 
     #[test]
