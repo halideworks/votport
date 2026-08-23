@@ -248,6 +248,7 @@ pub fn router(app: Arc<App>) -> Router {
         // Pages.
         .route("/", serve_page(admin_page))
         .route("/r/{token}", serve_page(request_page))
+        .route("/verify", serve_page(page("verify")))
         // no-cache means revalidate, not never-cache: repeat visits answer
         // conditional GETs with 304s instead of re-downloading the wasm and
         // the hero image, while a redeploy still takes effect immediately.

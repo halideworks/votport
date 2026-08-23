@@ -2,7 +2,7 @@
 // when a payload file is present, hash it locally with the same worker the
 // sender uses. The payload never leaves the tab. AGPL-3.0-only.
 
-import { appendObjectCard } from '/assets/object-card.js';
+import { appendObjectCard, formatBytes } from '/assets/object-card.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -23,6 +23,7 @@ function refreshPickedNote() {
   const parts = [];
   if (payloadFile) parts.push(`file: ${payloadFile.name}`);
   if (sidecarFile) parts.push(`receipt: ${sidecarFile.name}`);
+  if (payloadFile && !sidecarFile) parts.push('pick the .vot-receipt to check');
   const note = $('picked-note');
   if (parts.length) {
     note.textContent = parts.join(' · ');
@@ -68,8 +69,8 @@ function hashPayload(file) {
         reject(new Error(data.error));
         return;
       }
-      // The ObjectBuilder pins its merkle tree until drop; free it and stop.
-      worker.postMessage({ op: 'drop', req: 2, key: 'verify' });
+      // Terminate frees the worker heap including any pinned tree; no drop
+      // round-trip needed on a worker we are about to destroy.
       worker.terminate();
       resolve(data.done);
     };
@@ -125,7 +126,7 @@ async function check() {
         {
           tag: 'li',
           rowClass: 'done',
-          status: `${result.length} B · receipt ✓`,
+          status: `${formatBytes(result.length)} · receipt ✓`,
         },
       );
       next.textContent =
@@ -149,7 +150,7 @@ async function check() {
     appendObjectCard(
       list,
       { name: payloadFile.name, suite: result.suite, root },
-      { tag: 'li', rowClass: 'done', status: `${length} B · receipt ✓` },
+      { tag: 'li', rowClass: 'done', status: `${formatBytes(length)} · receipt ✓` },
     );
     if (match) {
       resultCard.classList.add('ok');
