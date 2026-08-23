@@ -1,5 +1,6 @@
 //! Application state and router assembly.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{DefaultBodyLimit, State};
@@ -467,71 +468,88 @@ async fn expire_link_uploads(app: &App, candidate: crate::store::Link, cutoff: u
             return;
         }
     };
-    for upload in &link.uploads {
-        // completed_at == 0 marks pre-field records; never treat those as
-        // infinitely expired.
-        if upload.completed_at == 0 || upload.completed_at >= cutoff {
+    let protected: HashSet<&str> = link
+        .uploads
+        .iter()
+        .filter(|upload| upload.completed_at == 0 || upload.completed_at >= cutoff)
+        .flat_map(|upload| &upload.files)
+        .filter(|file| !file.deleted)
+        .map(|file| file.stored_as.as_str())
+        .collect();
+    let candidates: HashSet<&str> = link
+        .uploads
+        .iter()
+        .filter(|upload| upload.completed_at > 0 && upload.completed_at < cutoff)
+        .flat_map(|upload| &upload.files)
+        .filter(|file| !file.deleted && !protected.contains(file.stored_as.as_str()))
+        .map(|file| file.stored_as.as_str())
+        .collect();
+    let mut removed = HashSet::new();
+    for stored_as in candidates {
+        // Same shape as admin::stored_path: the tenant prefix is not part of
+        // stored_as, so omitting it here deletes the default tenant's file at
+        // that relative path.
+        let mut components = crate::paths::tenant_prefix(&link.tenant);
+        components.extend(
+            stored_as
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .map(str::to_owned),
+        );
+        let Ok(path) = crate::paths::join_under(&app.config.receive_dir, &components) else {
             continue;
-        }
-        let mut removed: Vec<String> = Vec::new();
-        for file in &upload.files {
-            if file.deleted {
-                continue;
+        };
+        let _ = tokio::fs::remove_file(format!("{}.vot-receipt", path.display())).await;
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {
+                removed.insert(stored_as.to_owned());
             }
-            // Same shape as admin::stored_path: the tenant prefix is not part
-            // of stored_as, so omitting it here deletes the default tenant's
-            // file at that relative path.
-            let mut components = crate::paths::tenant_prefix(&link.tenant);
-            components.extend(
-                file.stored_as
-                    .split('/')
-                    .filter(|part| !part.is_empty())
-                    .map(str::to_owned),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                removed.insert(stored_as.to_owned());
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "could not delete expired file");
+            }
+        }
+    }
+    if removed.is_empty() {
+        return;
+    }
+    match app.store.update_link(&link.tenant, &link.id, |link| {
+        for upload in &mut link.uploads {
+            for file in &mut upload.files {
+                if removed.contains(&file.stored_as) {
+                    file.deleted = true;
+                }
+            }
+        }
+    }) {
+        Ok(true) => {
+            tracing::info!(
+                target: "audit",
+                event = "uploads_expired",
+                link = %link.id,
+                tenant = %link.tenant,
+                files = removed.len(),
+                "expired received files deleted"
             );
-            let Ok(path) = crate::paths::join_under(&app.config.receive_dir, &components) else {
-                continue;
-            };
-            let _ = tokio::fs::remove_file(format!("{}.vot-receipt", path.display())).await;
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => removed.push(file.stored_as.clone()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    removed.push(file.stored_as.clone())
-                }
-                Err(error) => {
-                    tracing::warn!(path = %path.display(), %error, "could not delete expired file");
-                }
-            }
+            app.store.audit(
+                &link.tenant,
+                "",
+                "uploads_expired",
+                &link.id,
+                &serde_json::json!({
+                    "tenant": link.tenant,
+                    "files": removed.len()
+                }),
+            );
         }
-        if removed.is_empty() {
-            continue;
+        Ok(false) => {
+            tracing::warn!(link = %link.id, "expired files removed after link disappeared");
         }
-        let _ = app.store.update_link(&link.tenant, &link.id, |link| {
-            for upload in &mut link.uploads {
-                for file in &mut upload.files {
-                    if removed.contains(&file.stored_as) {
-                        file.deleted = true;
-                    }
-                }
-            }
-        });
-        tracing::info!(
-            target: "audit",
-            event = "uploads_expired",
-            link = %link.id,
-            tenant = %link.tenant,
-            files = removed.len(),
-            "expired received files deleted"
-        );
-        app.store.audit(
-            &link.tenant,
-            "",
-            "uploads_expired",
-            &link.id,
-            &serde_json::json!({
-                "tenant": link.tenant,
-                "files": removed.len()
-            }),
-        );
+        Err(error) => {
+            tracing::error!(link = %link.id, %error, "expired files removed but tombstone failed");
+        }
     }
 }
 
@@ -616,6 +634,7 @@ mod retention_tests {
     async fn legal_hold_skips_only_automatic_retention() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
+        let cutoff = crate::store::now_unix();
         app.store
             .put_settings(
                 "test",
@@ -629,9 +648,13 @@ mod retention_tests {
         let held_path = app.config.receive_dir.join("held.txt");
         let expired_path = app.config.receive_dir.join("expired.txt");
         let active_path = app.config.receive_dir.join("active.txt");
+        let shared_path = app.config.receive_dir.join("shared.txt");
+        let failed_path = app.config.receive_dir.join("failed.txt");
         std::fs::write(&held_path, b"held").unwrap();
         std::fs::write(&expired_path, b"expired").unwrap();
         std::fs::write(&active_path, b"active").unwrap();
+        std::fs::write(&shared_path, b"shared").unwrap();
+        std::fs::write(&failed_path, b"failed").unwrap();
 
         let held = Link {
             id: "held".to_owned(),
@@ -675,15 +698,30 @@ mod retention_tests {
         active.label = "active".to_owned();
         active.uploads[0].files[0].path = "active.txt".to_owned();
         active.uploads[0].files[0].stored_as = "active.txt".to_owned();
+        let mut shared = expired.clone();
+        shared.id = "shared".to_owned();
+        shared.label = "shared".to_owned();
+        shared.uploads[0].files[0].path = "shared.txt".to_owned();
+        shared.uploads[0].files[0].stored_as = "shared.txt".to_owned();
+        shared.uploads.push(shared.uploads[0].clone());
+        shared.uploads[1].id = "recent".to_owned();
+        shared.uploads[1].completed_at = cutoff;
+        let mut failed = expired.clone();
+        failed.id = "failed".to_owned();
+        failed.label = "failed".to_owned();
+        failed.uploads[0].files[0].path = "failed.txt".to_owned();
+        failed.uploads[0].files[0].stored_as = "failed.txt".to_owned();
         app.store.insert_link(held.clone()).unwrap();
         app.store.insert_link(expired).unwrap();
         app.store.insert_link(active).unwrap();
+        app.store.insert_link(shared).unwrap();
+        app.store.insert_link(failed).unwrap();
 
         // The candidate came from the first read before an administrator set
         // the hold. The re-read under the lifecycle pin must still preserve it.
         let mut stale_held = held;
         stale_held.legal_hold = false;
-        expire_link_uploads(&app, stale_held, crate::store::now_unix()).await;
+        expire_link_uploads(&app, stale_held, cutoff).await;
 
         let (active_tx, _active_rx) = tokio::sync::mpsc::channel(1);
         app.sessions
@@ -695,8 +733,42 @@ mod retention_tests {
             )
             .unwrap();
         let active_candidate = app.store.link("", "active").unwrap().unwrap();
-        expire_link_uploads(&app, active_candidate, crate::store::now_unix()).await;
+        expire_link_uploads(&app, active_candidate, cutoff).await;
         assert!(active_path.exists());
+
+        let shared_candidate = app.store.link("", "shared").unwrap().unwrap();
+        expire_link_uploads(&app, shared_candidate, cutoff).await;
+        assert!(shared_path.exists());
+        assert!(app
+            .store
+            .link("", "shared")
+            .unwrap()
+            .unwrap()
+            .uploads
+            .iter()
+            .all(|upload| !upload.files[0].deleted));
+
+        let connection =
+            rusqlite::Connection::open(app.config.data_dir.join("votport.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_link_update BEFORE UPDATE ON links
+                 BEGIN SELECT RAISE(FAIL, 'test update failure'); END;",
+            )
+            .unwrap();
+        let failed_candidate = app.store.link("", "failed").unwrap().unwrap();
+        expire_link_uploads(&app, failed_candidate, cutoff).await;
+        connection
+            .execute_batch("DROP TRIGGER fail_link_update")
+            .unwrap();
+        assert!(!failed_path.exists());
+        assert!(!app.store.link("", "failed").unwrap().unwrap().uploads[0].files[0].deleted);
+        assert!(app
+            .store
+            .audit_export("", 0, 0, 100)
+            .unwrap()
+            .iter()
+            .all(|row| row.subject != "failed"));
 
         let sweeper = tokio::spawn(session_sweeper(Arc::clone(&app)));
         for _ in 0..100 {

@@ -1383,6 +1383,14 @@ pub async fn update_link(
         ));
     }
     if let Some(legal_hold) = request.legal_hold {
+        if app
+            .store
+            .link(&identity.tenant, &id)
+            .map_err(ApiError::internal)?
+            .is_none()
+        {
+            return Err(ApiError::not_found());
+        }
         let _pin = app.sessions.try_pin_link(&id).ok_or_else(|| {
             ApiError::new(
                 StatusCode::CONFLICT,
@@ -1426,6 +1434,14 @@ pub async fn delete_link(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
+    if app
+        .store
+        .link(&identity.tenant, &id)
+        .map_err(ApiError::internal)?
+        .is_none()
+    {
+        return Err(ApiError::not_found());
+    }
     let _pin = app
         .sessions
         .try_pin_link(&id)
@@ -2046,6 +2062,35 @@ mod tenant_authz_tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["links"].as_array().unwrap().len(), 0);
+
+        // Foreign IDs are rejected before touching the global lifecycle pin.
+        assert!(application.sessions.pin_link_for_delete("acme-link"));
+        let router = app::router(application.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/admin/links/acme-link")
+            .header("cookie", &outsider)
+            .header("content-type", "application/json")
+            .header("x-votport", "1")
+            .body(Body::from(r#"{"legal_hold":true}"#))
+            .unwrap();
+        assert_eq!(
+            router.oneshot(request).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        let router = app::router(application.clone());
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/api/admin/links/acme-link")
+            .header("cookie", &outsider)
+            .header("x-votport", "1")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.oneshot(request).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        application.sessions.unpin_link("acme-link");
 
         let router = app::router(application.clone());
         let request = Request::builder()
