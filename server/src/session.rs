@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -68,13 +69,16 @@ pub enum Cmd {
     Seal {
         bytes: Bytes,
         reply: Reply<u64>,
+        _lease: SessionLease,
     },
     Page {
         bytes: Bytes,
         reply: Reply<u64>,
+        _lease: SessionLease,
     },
     Begin {
         reply: Reply<Vec<EntryInfo>>,
+        _lease: SessionLease,
     },
     Chunk {
         entry: usize,
@@ -82,14 +86,17 @@ pub enum Cmd {
         proof: Bytes,
         data: Bytes,
         reply: Reply<ChunkProgress>,
+        _lease: SessionLease,
     },
     Finish {
         reply: Reply<FinishReport>,
+        _lease: SessionLease,
     },
     /// Sender gave up; lets the worker record a "cancelled" event before it
     /// exits, instead of the generic "interrupted" the drop path records.
     Abort {
         reply: Reply<()>,
+        _lease: SessionLease,
     },
 }
 
@@ -193,13 +200,21 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
         while let Some(cmd) = receiver.blocking_recv() {
             last_seen = now_unix();
             match cmd {
-                Cmd::Seal { bytes, reply } => {
+                Cmd::Seal {
+                    bytes,
+                    reply,
+                    _lease,
+                } => {
                     send_noted!(reply, handle_seal(&setup, &mut phase, &bytes));
                 }
-                Cmd::Page { bytes, reply } => {
+                Cmd::Page {
+                    bytes,
+                    reply,
+                    _lease,
+                } => {
                     send_noted!(reply, handle_page(&mut phase, &bytes));
                 }
-                Cmd::Begin { reply } => {
+                Cmd::Begin { reply, _lease } => {
                     let result = handle_begin(&setup, &mut phase);
                     // A failed begin has consumed the pages: the phase is
                     // already Done, the worker exits below, and the exit-time
@@ -225,6 +240,7 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
                     proof,
                     data,
                     reply,
+                    _lease,
                 } => {
                     let result = handle_chunk(&setup, &mut phase, entry, offset, &proof, &data);
                     match &result {
@@ -235,10 +251,10 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
                     }
                     send_noted!(reply, result);
                 }
-                Cmd::Finish { reply } => {
+                Cmd::Finish { reply, _lease } => {
                     send_noted!(reply, handle_finish(&setup, &mut phase, replays, rejected));
                 }
-                Cmd::Abort { reply } => {
+                Cmd::Abort { reply, _lease } => {
                     record_event(
                         &setup,
                         received,
@@ -771,23 +787,31 @@ pub struct SessionHandle {
     pub tenant: String,
     pub reserved_bytes: u64,
     pub sender: mpsc::Sender<Cmd>,
-    pub last_active: Instant,
-    pub in_flight: usize,
+    activity: Arc<SessionActivity>,
 }
 
-pub struct SessionCommand<'a> {
-    sessions: &'a Sessions,
-    id: String,
+struct SessionActivity {
+    in_flight: AtomicUsize,
+    last_active: Mutex<Instant>,
+}
+
+pub struct SessionCommand {
     pub sender: mpsc::Sender<Cmd>,
+    pub lease: SessionLease,
 }
 
-impl Drop for SessionCommand<'_> {
+pub struct SessionLease {
+    activity: Arc<SessionActivity>,
+}
+
+impl Drop for SessionLease {
     fn drop(&mut self) {
-        let mut inner = self.sessions.inner.lock().expect("sessions poisoned");
-        if let Some(handle) = inner.map.get_mut(&self.id) {
-            handle.in_flight = handle.in_flight.saturating_sub(1);
-            handle.last_active = Instant::now();
-        }
+        self.activity.in_flight.fetch_sub(1, Ordering::AcqRel);
+        *self
+            .activity
+            .last_active
+            .lock()
+            .expect("session activity poisoned") = Instant::now();
     }
 }
 
@@ -1029,8 +1053,10 @@ impl Sessions {
                 tenant,
                 reserved_bytes,
                 sender,
-                last_active: Instant::now(),
-                in_flight: 0,
+                activity: Arc::new(SessionActivity {
+                    in_flight: AtomicUsize::new(0),
+                    last_active: Mutex::new(Instant::now()),
+                }),
             },
         );
         Ok(())
@@ -1082,15 +1108,20 @@ impl Sessions {
     }
 
     /// Keeps the session registered until the returned command guard drops.
-    pub fn touch(&self, id: &str) -> Option<SessionCommand<'_>> {
-        let mut inner = self.inner.lock().expect("sessions poisoned");
-        let handle = inner.map.get_mut(id)?;
-        handle.last_active = Instant::now();
-        handle.in_flight = handle.in_flight.saturating_add(1);
+    pub fn touch(&self, id: &str) -> Option<SessionCommand> {
+        let inner = self.inner.lock().expect("sessions poisoned");
+        let handle = inner.map.get(id)?;
+        *handle
+            .activity
+            .last_active
+            .lock()
+            .expect("session activity poisoned") = Instant::now();
+        handle.activity.in_flight.fetch_add(1, Ordering::AcqRel);
         Some(SessionCommand {
-            sessions: self,
-            id: id.to_owned(),
             sender: handle.sender.clone(),
+            lease: SessionLease {
+                activity: Arc::clone(&handle.activity),
+            },
         })
     }
 
@@ -1120,7 +1151,15 @@ impl Sessions {
             .expect("sessions poisoned")
             .map
             .retain(|_, handle| {
-                handle.in_flight > 0 || handle.last_active.elapsed().as_secs() < idle_secs
+                handle.activity.in_flight.load(Ordering::Acquire) > 0
+                    || handle
+                        .activity
+                        .last_active
+                        .lock()
+                        .expect("session activity poisoned")
+                        .elapsed()
+                        .as_secs()
+                        < idle_secs
             });
     }
 }
@@ -1252,20 +1291,41 @@ mod pin_tests {
     }
 
     #[test]
-    fn sweep_keeps_in_flight_commands_registered() {
+    fn sweep_keeps_cancelled_dispatch_commands_registered_until_worker_finishes() {
         let sessions = Sessions::new();
+        let (sender, mut receiver) = mpsc::channel(1);
         sessions
             .insert(
                 "s1".to_owned(),
                 "link".to_owned(),
                 "acme".to_owned(),
-                dummy_sender(),
+                sender,
             )
             .unwrap();
         let command = sessions.touch("s1").unwrap();
+        let (reply, cancelled_dispatch) = oneshot::channel();
+        drop(cancelled_dispatch);
+        assert!(command
+            .sender
+            .try_send(Cmd::Finish {
+                reply,
+                _lease: command.lease,
+            })
+            .is_ok());
         sessions.sweep(0);
         assert_eq!(sessions.total(), 1);
-        drop(command);
+        let Cmd::Finish { reply, _lease } = receiver.try_recv().unwrap() else {
+            panic!("finish command");
+        };
+        sessions.sweep(0);
+        assert_eq!(sessions.total(), 1);
+        assert!(reply
+            .send(Ok(FinishReport {
+                upload_id: "upload".to_owned(),
+                files: Vec::new(),
+            }))
+            .is_err());
+        drop(_lease);
         sessions.sweep(0);
         assert_eq!(sessions.total(), 0);
     }

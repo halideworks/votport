@@ -446,7 +446,7 @@ pub async fn create_session(
 async fn dispatch<T>(
     app: &App,
     session_id: &str,
-    build: impl FnOnce(oneshot::Sender<Result<T, SessionError>>) -> Cmd,
+    build: impl FnOnce(oneshot::Sender<Result<T, SessionError>>, session::SessionLease) -> Cmd,
 ) -> ApiResult<T> {
     let command = app
         .sessions
@@ -455,7 +455,7 @@ async fn dispatch<T>(
     let (reply, receive) = oneshot::channel();
     command
         .sender
-        .send(build(reply))
+        .send(build(reply, command.lease))
         .await
         .map_err(|_| ApiError::new(StatusCode::GONE, "upload session ended"))?;
     receive
@@ -475,7 +475,12 @@ pub async fn upload_seal(
             "seal too large",
         ));
     }
-    let pages = dispatch(&app, &sid, |reply| Cmd::Seal { bytes: body, reply }).await?;
+    let pages = dispatch(&app, &sid, |reply, _lease| Cmd::Seal {
+        bytes: body,
+        reply,
+        _lease,
+    })
+    .await?;
     Ok(Json(json!({ "pages": pages })))
 }
 
@@ -490,7 +495,12 @@ pub async fn upload_page(
             "page too large",
         ));
     }
-    let remaining = dispatch(&app, &sid, |reply| Cmd::Page { bytes: body, reply }).await?;
+    let remaining = dispatch(&app, &sid, |reply, _lease| Cmd::Page {
+        bytes: body,
+        reply,
+        _lease,
+    })
+    .await?;
     Ok(Json(json!({ "remaining_pages": remaining })))
 }
 
@@ -498,7 +508,7 @@ pub async fn upload_begin(
     State(app): State<Arc<App>>,
     Path(sid): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let entries = dispatch(&app, &sid, |reply| Cmd::Begin { reply }).await?;
+    let entries = dispatch(&app, &sid, |reply, _lease| Cmd::Begin { reply, _lease }).await?;
     Ok(Json(json!({ "entries": entries })))
 }
 
@@ -535,12 +545,13 @@ pub async fn upload_chunk(
     // the same buffers the request body arrived in.
     let proof = body.slice(..proof_len);
     let data = body.slice(proof_len..);
-    let progress = dispatch(&app, &sid, |reply| Cmd::Chunk {
+    let progress = dispatch(&app, &sid, |reply, _lease| Cmd::Chunk {
         entry: query.entry,
         offset: query.offset,
         proof,
         data,
         reply,
+        _lease,
     })
     .await?;
     Ok(Json(progress))
@@ -551,7 +562,7 @@ pub async fn upload_finish(
     Path(sid): Path<String>,
 ) -> ApiResult<Json<session::FinishReport>> {
     let link_id = app.sessions.link_id(&sid);
-    let report = dispatch(&app, &sid, |reply| Cmd::Finish { reply }).await?;
+    let report = dispatch(&app, &sid, |reply, _lease| Cmd::Finish { reply, _lease }).await?;
     #[cfg(test)]
     app.sessions.wait_finish_stall().await;
     tracing::info!(
@@ -597,7 +608,7 @@ pub async fn upload_abort(
 ) -> Json<serde_json::Value> {
     // Best effort: lets the worker record a "cancelled" event; an unknown or
     // already-dead session still answers ok.
-    let _ = dispatch(&app, &sid, |reply| Cmd::Abort { reply }).await;
+    let _ = dispatch(&app, &sid, |reply, _lease| Cmd::Abort { reply, _lease }).await;
     app.sessions.remove(&sid);
     Json(json!({ "ok": true }))
 }
@@ -731,7 +742,7 @@ mod session_rate_tests {
             )
             .unwrap();
         tokio::spawn(async move {
-            let Some(Cmd::Finish { reply }) = receiver.recv().await else {
+            let Some(Cmd::Finish { reply, _lease }) = receiver.recv().await else {
                 panic!("finish command");
             };
             reply
