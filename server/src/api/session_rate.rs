@@ -43,6 +43,20 @@ impl SessionRate {
                 entries.retain(|at| now.duration_since(*at) < WINDOW);
                 !entries.is_empty()
             });
+            // A caller rotating addresses keeps every entry live, so the
+            // sweep can free nothing. Evict the bucket whose newest attempt
+            // is oldest rather than allowing the request untracked: an
+            // untracked allow would turn a full table into a way to switch
+            // this limit off entirely, which is what it exists to prevent.
+            if attempts.len() >= TABLE_CAP && !attempts.contains_key(ip) {
+                let victim = attempts
+                    .iter()
+                    .min_by_key(|(_, entries)| entries.iter().max().copied())
+                    .map(|(key, _)| key.clone());
+                if let Some(key) = victim {
+                    attempts.remove(&key);
+                }
+            }
         }
         let entries = attempts.entry(ip.to_owned()).or_default();
         entries.retain(|at| now.duration_since(*at) < WINDOW);
@@ -67,6 +81,21 @@ mod tests {
         assert!(!rate.allow("10.0.0.1"));
         // Other IPs are unaffected.
         assert!(rate.allow("10.0.0.2"));
+    }
+
+    #[test]
+    fn the_table_stops_growing_under_address_rotation() {
+        let rate = SessionRate::new();
+        for index in 0..(TABLE_CAP * 2) {
+            assert!(rate.allow(&format!("10.9.{}.{}", index / 256, index % 256)));
+        }
+        let size = rate.attempts.lock().unwrap().len();
+        assert!(size <= TABLE_CAP, "table grew to {size}");
+        // A full table must not switch the limit off for new addresses.
+        for _ in 0..MAX_PER_WINDOW {
+            assert!(rate.allow("10.0.0.1"));
+        }
+        assert!(!rate.allow("10.0.0.1"), "still capped with a full table");
     }
 
     #[test]

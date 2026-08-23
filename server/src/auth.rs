@@ -265,7 +265,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Global login throttle: after repeated failures every login pauses briefly.
+/// Global failure counter with a lockout. Its one user is the password-change
+/// endpoint, which is reachable only with a valid session, so a global bound
+/// there cannot be used to deny anyone. Sign-in deliberately has no counter
+/// like this: a global refusal is how the break-glass credential got denied.
 pub struct LoginThrottle {
     state: Mutex<(u32, Option<Instant>)>,
 }
@@ -288,17 +291,26 @@ impl LoginThrottle {
         state.1.is_some_and(|until| Instant::now() < until)
     }
 
-    pub fn record(&self, success: bool) {
+    /// Claims one attempt, counting it before it is checked. See
+    /// [`IpThrottle::claim`]: checking and then recording lets any number of
+    /// concurrent attempts through together, which turns the threshold into a
+    /// limit per batch the caller can open.
+    pub fn claim(&self) -> bool {
         let mut state = self.state.lock().expect("throttle poisoned");
-        if success {
-            *state = (0, None);
-        } else {
-            state.0 += 1;
-            if state.0 >= LOCKOUT_THRESHOLD {
-                state.1 = Some(Instant::now() + Duration::from_secs(LOCKOUT_SECS));
-                state.0 = 0;
-            }
+        if state.1.is_some_and(|until| Instant::now() < until) {
+            return false;
         }
+        state.0 += 1;
+        if state.0 >= LOCKOUT_THRESHOLD {
+            state.1 = Some(Instant::now() + Duration::from_secs(LOCKOUT_SECS));
+            state.0 = 0;
+        }
+        true
+    }
+
+    /// Clears the claims after a correct password.
+    pub fn succeeded(&self) {
+        *self.state.lock().expect("throttle poisoned") = (0, None);
     }
 }
 
@@ -332,21 +344,22 @@ impl IpThrottle {
         })
     }
 
-    pub fn record(&self, ip: &str, success: bool) {
+    /// Claims one attempt for `ip`, counting it as a failure up front, and
+    /// reports whether it may proceed. Checking `locked` and recording the
+    /// outcome afterwards leaves a window where any number of concurrent
+    /// attempts pass the check together, so the five-per-window limit becomes
+    /// a limit per connection count instead. Call [`Self::succeeded`] to
+    /// clear the claim when the password turns out to be right.
+    pub fn claim(&self, ip: &str) -> bool {
         let mut state = self.state.lock().expect("throttle poisoned");
-        if state.len() >= IP_TABLE_CAP {
-            // Evict only dead weight: expired, idle entries. Live lockouts
-            // survive, so filling the table cannot reset anyone's penalty.
-            let now = Instant::now();
-            state.retain(|_, entry| {
-                entry.locked_until.is_some_and(|until| now < until)
-                    || now.duration_since(entry.last_seen).as_secs() < IP_ENTRY_TTL_SECS
-            });
+        if state.get(ip).is_some_and(|entry| {
+            entry
+                .locked_until
+                .is_some_and(|until| Instant::now() < until)
+        }) {
+            return false;
         }
-        if success {
-            state.remove(ip);
-            return;
-        }
+        Self::evict_if_full(&mut state, ip);
         let entry = state.entry(ip.to_owned()).or_insert(IpState {
             failures: 0,
             locked_until: None,
@@ -357,6 +370,56 @@ impl IpThrottle {
         if entry.failures >= LOCKOUT_THRESHOLD {
             entry.locked_until = Some(Instant::now() + Duration::from_secs(LOCKOUT_SECS));
             entry.failures = 0;
+        }
+        true
+    }
+
+    /// Clears a claim after a correct password.
+    pub fn succeeded(&self, ip: &str) {
+        self.state.lock().expect("throttle poisoned").remove(ip);
+    }
+
+    /// Frees a slot when the table is at cap, so a caller rotating addresses
+    /// cannot grow it without bound. Live lockouts are evicted only when
+    /// nothing else can be, which costs an attacker a full set of failures.
+    fn evict_if_full(state: &mut std::collections::HashMap<String, IpState>, ip: &str) {
+        if state.len() >= IP_TABLE_CAP {
+            // Evict dead weight first: expired, idle entries. A live lockout
+            // is only ever evicted by the fallback below, when every entry
+            // holds one and there is nothing else to free.
+            let now = Instant::now();
+            state.retain(|_, entry| {
+                entry.locked_until.is_some_and(|until| now < until)
+                    || now.duration_since(entry.last_seen).as_secs() < IP_ENTRY_TTL_SECS
+            });
+            // A caller rotating addresses keeps every entry fresh, so the
+            // sweep above can free nothing. Evict the least recently seen
+            // entry that is not serving a lockout, rather than declining to
+            // track the new key: not tracking it would turn a full table into
+            // a way to switch throttling off for every new address. If every
+            // entry holds a live lockout the table is doing its job and the
+            // new key waits.
+            if state.len() >= IP_TABLE_CAP && !state.contains_key(ip) {
+                let now = Instant::now();
+                let victim = state
+                    .iter()
+                    .filter(|(_, entry)| !entry.locked_until.is_some_and(|until| now < until))
+                    .min_by_key(|(_, entry)| entry.last_seen)
+                    .map(|(key, _)| key.clone());
+                let victim = victim.or_else(|| {
+                    // Every entry holds a live lockout. Evict the one closest
+                    // to expiring rather than declining to track this key:
+                    // declining is how a full table becomes a way to switch
+                    // throttling off.
+                    state
+                        .iter()
+                        .min_by_key(|(_, entry)| entry.locked_until)
+                        .map(|(key, _)| key.clone())
+                });
+                if let Some(key) = victim {
+                    state.remove(&key);
+                }
+            }
         }
     }
 }
@@ -382,6 +445,63 @@ pub fn cookie_value<'header>(header: &'header str, name: &str) -> Option<&'heade
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_global_counter_also_counts_before_it_checks() {
+        let throttle = LoginThrottle::new();
+        // The password-change endpoint verifies a password for a caller that
+        // already holds a session. Counting only on the way out would let one
+        // batch of concurrent guesses through per lockout.
+        for index in 0..LOCKOUT_THRESHOLD {
+            assert!(throttle.claim(), "claim {index} refused early");
+        }
+        assert!(!throttle.claim(), "the sixth concurrent claim");
+        assert!(throttle.locked());
+        throttle.succeeded();
+        assert!(!throttle.locked());
+        assert!(throttle.claim());
+    }
+
+    #[test]
+    fn concurrent_attempts_cannot_outrun_the_counter() {
+        let throttle = IpThrottle::new();
+        // Every attempt is counted as it starts, so five claims exhaust the
+        // budget whether or not any of them has finished verifying. Checking
+        // locked() and recording afterwards would let all of these through.
+        for index in 0..LOCKOUT_THRESHOLD {
+            assert!(throttle.claim("10.0.0.1"), "claim {index} refused early");
+        }
+        assert!(!throttle.claim("10.0.0.1"), "the sixth concurrent claim");
+        assert!(throttle.locked("10.0.0.1"));
+        // A correct password clears the claims it made.
+        throttle.succeeded("10.0.0.1");
+        assert!(!throttle.locked("10.0.0.1"));
+        assert!(throttle.claim("10.0.0.1"));
+    }
+
+    #[test]
+    fn the_ip_table_stops_growing_and_keeps_live_lockouts() {
+        let throttle = IpThrottle::new();
+        // Lock one address, then flood with fresh keys the sweep cannot evict.
+        for _ in 0..LOCKOUT_THRESHOLD {
+            throttle.claim("10.0.0.1");
+        }
+        assert!(throttle.locked("10.0.0.1"));
+        for index in 0..(IP_TABLE_CAP * 2) {
+            throttle.claim(&format!("10.9.{}.{}", index / 256, index % 256));
+        }
+        let size = throttle.state.lock().unwrap().len();
+        assert!(size <= IP_TABLE_CAP, "table grew to {size}");
+        assert!(throttle.locked("10.0.0.1"), "the live lockout survived");
+        // A full table must not switch throttling off for new addresses.
+        for _ in 0..LOCKOUT_THRESHOLD {
+            throttle.claim("10.0.0.2");
+        }
+        assert!(
+            throttle.locked("10.0.0.2"),
+            "a new address is still throttled once the table is full"
+        );
+    }
 
     #[test]
     fn payload_without_cv_deserializes_as_one() {

@@ -21,8 +21,27 @@ pub struct App {
     pub store: Arc<Store>,
     pub sessions: Sessions,
     pub secret: [u8; 32],
-    /// Global throttle for the admin password endpoints.
-    pub throttle: LoginThrottle,
+    /// Counter for `admin_change_password`, which refuses when tripped.
+    /// Reaching that endpoint needs a valid session, so a global bound there
+    /// cannot be used to deny anyone. Sign-in has no global counter: refusing
+    /// or delaying there was how the break-glass credential got denied.
+    pub change_password_throttle: LoginThrottle,
+    /// Per-IP throttle for admin sign-in. A separate map from
+    /// `link_throttle` so public link guessing cannot consume an operator's
+    /// sign-in budget, or the reverse.
+    pub login_throttle: crate::auth::IpThrottle,
+    /// argon2 budget for admin sign-in. Separate from the link budget below:
+    /// sharing one meant a flood of link password guesses queued ahead of the
+    /// operator, which is a lockout with extra steps. Holding the whole
+    /// process to a few concurrent verifications is also the bound on guess
+    /// rate, and unlike a counter it does not depend on the throttle key or
+    /// refuse anybody.
+    pub login_permits: Arc<tokio::sync::Semaphore>,
+    /// argon2 budget for public link password checks.
+    pub link_verify_permits: Arc<tokio::sync::Semaphore>,
+    /// argon2 budget for password rotation. Separate again: rotation is what
+    /// an operator reaches for while under attack.
+    pub change_password_permits: Arc<tokio::sync::Semaphore>,
     /// Per-IP throttle for public link password checks.
     pub link_throttle: crate::auth::IpThrottle,
     /// Per-IP rate limit on upload-session creation.
@@ -40,6 +59,9 @@ pub struct App {
 }
 
 const SSO_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Concurrent argon2 verifications allowed per unauthenticated password path.
+const VERIFY_PERMITS: usize = 2;
 
 /// Process-local OIDC client. Success is sticky; failure cools down 30s.
 pub struct SsoSlot<T = crate::api::sso::SsoClient> {
@@ -186,7 +208,11 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         store,
         sessions: Sessions::new(),
         secret,
-        throttle: LoginThrottle::new(),
+        change_password_throttle: LoginThrottle::new(),
+        login_throttle: crate::auth::IpThrottle::new(),
+        login_permits: Arc::new(tokio::sync::Semaphore::new(VERIFY_PERMITS)),
+        link_verify_permits: Arc::new(tokio::sync::Semaphore::new(VERIFY_PERMITS)),
+        change_password_permits: Arc::new(tokio::sync::Semaphore::new(VERIFY_PERMITS)),
         link_throttle: crate::auth::IpThrottle::new(),
         session_rate: crate::api::session_rate::SessionRate::new(),
         verify_rate: crate::api::session_rate::SessionRate::new(),

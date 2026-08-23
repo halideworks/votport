@@ -121,7 +121,12 @@ async fn check_link_password(
     let Some(hash) = &link.password_hash else {
         return Ok(());
     };
-    if app.link_throttle.locked(ip) {
+    // One bucket per v4 address and per IPv6 /64: a client holding a routed
+    // prefix would otherwise get a fresh five-guess budget per address.
+    let bucket = super::throttle_key(ip);
+    // Claimed before the verify; see admin_login for why checking and then
+    // recording is not enough.
+    if !app.link_throttle.claim(&bucket) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed attempts; wait a minute",
@@ -129,10 +134,22 @@ async fn check_link_password(
     }
     let password = password.unwrap_or_default().to_owned();
     let hash = hash.clone();
-    let ok = tokio::task::spawn_blocking(move || auth::verify_password(&password, &hash))
+    // This path's own argon2 budget, separate from sign-in so a flood of
+    // link guesses cannot queue ahead of the operator. The permit moves into
+    // the blocking task so a disconnect cannot release it early.
+    let permit = Arc::clone(&app.link_verify_permits)
+        .acquire_owned()
         .await
-        .map_err(|error| ApiError::internal(error.to_string()))?;
-    app.link_throttle.record(ip, ok);
+        .map_err(|_| ApiError::internal("verify semaphore closed"))?;
+    let ok = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        auth::verify_password(&password, &hash)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?;
+    if ok {
+        app.link_throttle.succeeded(&bucket);
+    }
     if !ok {
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -163,7 +180,7 @@ pub async fn verify_link_password(
             "this link is no longer accepting uploads",
         ));
     }
-    let ip = client_ip(&headers, &peer);
+    let ip = client_ip(&headers, &peer, &app.config.trusted_proxies);
     check_link_password(&app, &link, request.password.as_deref(), &ip).await?;
     let phc = link.password_hash.as_deref().unwrap_or_default();
     let value = auth::issue_link_token(&app.secret, &link.id, phc);
@@ -212,7 +229,9 @@ pub async fn create_session(
     // Every create-session request consumes rate budget, whatever the
     // outcome: without this, holders of a no-password link could churn
     // sessions into the global cap and evict legitimate senders' uploads.
-    let ip = client_ip(&headers, &peer);
+    let ip = client_ip(&headers, &peer, &app.config.trusted_proxies);
+    // The full address, not the /64 a guessing throttle uses: this is a
+    // per-sender quota, and people in one office share a prefix.
     if !app.session_rate.allow(&ip) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,

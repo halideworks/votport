@@ -61,6 +61,7 @@ async fn start_server_with_cap(max_upload_bytes: u64) -> TestServer {
         default_max_sessions: None,
         public_password_login: true,
         metrics_token: None,
+        trusted_proxies: Vec::new(),
         oidc: None,
     };
     let application = app::build(config).expect("app builds");

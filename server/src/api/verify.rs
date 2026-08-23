@@ -25,7 +25,8 @@ pub async fn verify_receipt(
 ) -> ApiResult<Json<serde_json::Value>> {
     // Every POST consumes rate budget, including ones that will 422, same as
     // create_session. A folder of sidecars is not a batch API.
-    let ip = client_ip(&headers, &peer);
+    let ip = client_ip(&headers, &peer, &app.config.trusted_proxies);
+    // Full address: a quota, not a guessing throttle. See create_session.
     if !app.verify_rate.allow(&ip) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,

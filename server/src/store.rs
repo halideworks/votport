@@ -1848,6 +1848,7 @@ mod settings_tests {
             audit_retention_days: 400,
             upload_retention_days: 0,
             metrics_token: None,
+            trusted_proxies: Vec::new(),
             oidc: None,
             default_max_total_bytes: None,
             default_max_links: None,

@@ -144,22 +144,46 @@ pub async fn admin_login(
     headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> ApiResult<Response> {
-    if app.throttle.locked() {
+    // Per IP first, because it is precise: a wrong password locks out the
+    // address that typed it and nobody else. It cannot be the only bound,
+    // because the key comes from a header a caller behind a private peer can
+    // choose, and because one IPv6 client holds a whole prefix.
+    let ip = super::client_ip(&headers, &peer, &app.config.trusted_proxies);
+    let bucket = super::throttle_key(&ip);
+    // Counted before the verify, not after: checking and then recording lets
+    // any number of concurrent attempts pass the check together, which turns
+    // five per window into five per connection the caller opens.
+    if !app.login_throttle.claim(&bucket) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed attempts; wait a minute",
         ));
     }
+    // Sign-in's own argon2 budget, and nothing global that can refuse or
+    // delay a correct password. The permit moves into the blocking task, so
+    // it is held for exactly as long as the verification runs: a client that
+    // disconnects mid-verify would otherwise release it while the work, and
+    // its memory, carried on.
+    let permit = Arc::clone(&app.login_permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::internal("login semaphore closed"))?;
     let ok = tokio::task::spawn_blocking({
         let hash = admin_hash(&app);
-        move || auth::verify_password(&request.password, &hash)
+        move || {
+            let _permit = permit;
+            auth::verify_password(&request.password, &hash)
+        }
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?;
-    app.throttle.record(ok);
-    let ip = super::client_ip(&headers, &peer);
+    if ok {
+        app.login_throttle.succeeded(&bucket);
+    }
     if !ok {
-        tracing::warn!(target: "audit", event = "admin_login_failed", %ip, "admin login refused");
+        // peer is the socket address; ip is what the forwarded header named,
+        // when it was believed. VOTPORT_TRUSTED_PROXIES wants the peer.
+        tracing::warn!(target: "audit", event = "admin_login_failed", %ip, peer = %peer.ip(), "admin login refused");
         app.store
             .audit("", "", "admin_login_failed", &ip, &serde_json::json!({}));
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "wrong password"));
@@ -1035,28 +1059,49 @@ pub async fn admin_change_password(
             "the local administrator password is managed by the default-tenant admin",
         ));
     }
-    if app.throttle.locked() {
+    // Validate before claiming. A request rejected on its own shape never
+    // reaches a password, so charging it against the guess budget would let a
+    // script with a too-short new password lock every admin out of rotation.
+    if request.new.chars().count() < crate::config::MIN_ADMIN_PASSWORD_CHARS {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "new password must be at least {} characters",
+                crate::config::MIN_ADMIN_PASSWORD_CHARS
+            ),
+        ));
+    }
+    // Claimed before the verify, like sign-in: a caller holding a session
+    // could otherwise fire many concurrent guesses that all pass the check
+    // together, making this the oracle the throttle exists to prevent.
+    if !app.change_password_throttle.claim() {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed attempts; wait a minute",
         ));
     }
-    if request.new.chars().count() < 12 {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "new password must be at least 12 characters",
-        ));
-    }
+    // Its own budget, not the sign-in one: rotating the password is what an
+    // operator does while under attack, so an anonymous sign-in flood must
+    // not queue ahead of it.
+    let permit = Arc::clone(&app.change_password_permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::internal("login semaphore closed"))?;
     let current_ok = tokio::task::spawn_blocking({
         let hash = admin_hash(&app);
         let current = request.current.clone();
-        move || auth::verify_password(&current, &hash)
+        move || {
+            let _permit = permit;
+            auth::verify_password(&current, &hash)
+        }
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?;
-    // Throttled like login: this endpoint verifies a password too, so it would
-    // otherwise be an unthrottled oracle for an attacker holding a session.
-    app.throttle.record(current_ok);
+    // Its own counter: sharing the sign-in one let anonymous login failures
+    // keep an operator from rotating the password.
+    if current_ok {
+        app.change_password_throttle.succeeded();
+    }
     if !current_ok {
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -1493,6 +1538,240 @@ mod handler_tests {
 
     use crate::api::testing;
     use crate::app;
+
+    async fn login_attempt(
+        application: Arc<App>,
+        peer: [u8; 4],
+        password: &str,
+    ) -> axum::http::Response<axum::body::Body> {
+        app::router(application)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/login")
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo(std::net::SocketAddr::from((peer, 1234))))
+                    .body(Body::from(format!("{{\"password\":\"{password}\"}}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_flood_of_attempts_does_not_refuse_the_operator() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        // Every attempt from a different bucket, so none is refused by the
+        // per-IP throttle. The operator must still sign in while they are in
+        // flight.
+        let mut flood = Vec::new();
+        for index in 0..20u8 {
+            let application = application.clone();
+            flood.push(tokio::spawn(async move {
+                login_attempt(application, [10, 0, 0, index], "wrong").await;
+            }));
+        }
+        // Bounded so a regression fails with a diagnosis rather than hanging.
+        // This checks that the operator is not refused, not that the wait is
+        // short: queue latency under a flood is an accepted residual, and the
+        // semaphore is FIFO.
+        let operator = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            login_attempt(
+                application.clone(),
+                [198, 51, 100, 4],
+                testing::TEST_PASSWORD,
+            ),
+        )
+        .await
+        .expect("the operator never completed sign-in during a flood");
+        assert_eq!(
+            operator.status(),
+            StatusCode::OK,
+            "the operator signs in while the flood is in flight"
+        );
+        for task in flood {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(60), task).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_new_password_costs_no_guess_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = login_cookie(app::router(application.clone())).await;
+        // Six requests whose new password is too short. None of them reaches
+        // a verification, so none may spend the budget that guards the
+        // current password, or a script could lock every admin out of
+        // rotation without guessing anything.
+        for _ in 0..6 {
+            let response = change_password_req(
+                application.clone(),
+                &cookie,
+                testing::TEST_PASSWORD,
+                "short",
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = change_password_req(
+            application.clone(),
+            &cookie,
+            testing::TEST_PASSWORD,
+            "a-much-longer-passphrase",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    async fn change_password_req(
+        application: Arc<App>,
+        cookie: &str,
+        current: &str,
+        new: &str,
+    ) -> axum::http::Response<axum::body::Body> {
+        app::router(application)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/password")
+                    .header("cookie", cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"current":"{current}","new":"{new}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sign_in_failures_do_not_block_a_password_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = login_cookie(app::router(application.clone())).await;
+        // Sign-in failures must not reach the counter that guards password
+        // rotation: an operator holding a session has to be able to rotate.
+        for index in 0..6u8 {
+            login_attempt(application.clone(), [203, 0, 113, index], "wrong").await;
+        }
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/password")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"current":"{}","new":"a-much-longer-passphrase"}}"#,
+                        testing::TEST_PASSWORD
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn spread_out_failures_never_reach_a_fresh_address() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        // Twelve failures, spread four per address so no single address
+        // locks itself, and well past the five that used to trip a global
+        // counter. Nothing may accumulate across addresses, or an attacker
+        // who spreads guesses denies the operator the break-glass credential.
+        // Kept small on purpose: every one of these runs a real argon2.
+        for index in 0..3u8 {
+            for _ in 0..4 {
+                assert_eq!(
+                    login_attempt(application.clone(), [203, 0, 113, index], "wrong")
+                        .await
+                        .status(),
+                    StatusCode::UNAUTHORIZED
+                );
+            }
+        }
+        assert_eq!(
+            login_attempt(
+                application.clone(),
+                [198, 51, 100, 4],
+                testing::TEST_PASSWORD
+            )
+            .await
+            .status(),
+            StatusCode::OK,
+            "a fresh address signs in normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_link_password_flood_cannot_queue_the_operator_out() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        // Every permit of the public link budget held: that path is the one
+        // an unauthenticated caller can flood. Sign-in has its own budget, so
+        // it must not wait on this one.
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            held.push(
+                Arc::clone(&application.link_verify_permits)
+                    .acquire_owned()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let signed_in = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            login_attempt(
+                application.clone(),
+                [198, 51, 100, 4],
+                testing::TEST_PASSWORD,
+            ),
+        )
+        .await
+        .expect("sign-in waited on the link password budget");
+        assert_eq!(signed_in.status(), StatusCode::OK);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_guessing_address_cannot_lock_out_the_operator() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        // Well past the five-failure lockout: a global throttle here would
+        // deny the break-glass credential to everyone, which is exactly what
+        // an operator needs during an identity-provider outage.
+        for _ in 0..15 {
+            let response = login_attempt(application.clone(), [203, 0, 113, 9], "wrong").await;
+            assert!(
+                response.status() == StatusCode::UNAUTHORIZED
+                    || response.status() == StatusCode::TOO_MANY_REQUESTS
+            );
+        }
+        assert_eq!(
+            login_attempt(application.clone(), [203, 0, 113, 9], "wrong")
+                .await
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the guessing address is locked"
+        );
+        assert_eq!(
+            login_attempt(
+                application.clone(),
+                [198, 51, 100, 4],
+                testing::TEST_PASSWORD
+            )
+            .await
+            .status(),
+            StatusCode::OK,
+            "another address still signs in"
+        );
+    }
 
     async fn login_cookie(router: axum::Router) -> String {
         let request = Request::builder()
@@ -2445,6 +2724,7 @@ mod ops_tests {
             default_max_sessions: None,
             public_password_login: true,
             metrics_token: None,
+            trusted_proxies: Vec::new(),
             oidc: None,
         }
     }
