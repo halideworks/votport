@@ -26,7 +26,7 @@ pub async fn verify_receipt(
     // Every POST consumes rate budget, including ones that will 422, same as
     // create_session. A folder of sidecars is not a batch API.
     let ip = client_ip(&headers, &peer);
-    if !app.verify_rate.allow(&ip) {
+    if !app.verify_rate.allow(&crate::api::throttle_key(&ip)) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many checks from your address; try again later",

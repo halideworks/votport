@@ -44,11 +44,18 @@ impl SessionRate {
                 !entries.is_empty()
             });
             // A caller rotating addresses keeps every entry live, so the
-            // sweep can free nothing. Allow the request without tracking it
-            // rather than growing without bound: the global session cap is
-            // the real limit, and refusing would deny every new sender.
+            // sweep can free nothing. Evict the bucket whose newest attempt
+            // is oldest rather than allowing the request untracked: an
+            // untracked allow would turn a full table into a way to switch
+            // this limit off entirely, which is what it exists to prevent.
             if attempts.len() >= TABLE_CAP && !attempts.contains_key(ip) {
-                return true;
+                let victim = attempts
+                    .iter()
+                    .min_by_key(|(_, entries)| entries.iter().max().copied())
+                    .map(|(key, _)| key.clone());
+                if let Some(key) = victim {
+                    attempts.remove(&key);
+                }
             }
         }
         let entries = attempts.entry(ip.to_owned()).or_default();
@@ -84,6 +91,11 @@ mod tests {
         }
         let size = rate.attempts.lock().unwrap().len();
         assert!(size <= TABLE_CAP, "table grew to {size}");
+        // A full table must not switch the limit off for new addresses.
+        for _ in 0..MAX_PER_WINDOW {
+            assert!(rate.allow("10.0.0.1"));
+        }
+        assert!(!rate.allow("10.0.0.1"), "still capped with a full table");
     }
 
     #[test]

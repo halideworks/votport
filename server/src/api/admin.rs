@@ -161,28 +161,31 @@ pub async fn admin_login(
             "too many failed attempts; wait a minute",
         ));
     }
-    // Bounds concurrent argon2 verifications. Each one costs ~19 MiB, and
-    // spawn_blocking would otherwise run hundreds at once for an
-    // unauthenticated caller. Held across the delay below so it bounds the
-    // rate of guessing, not just its concurrency.
-    let _permit = app
-        .login_verify
-        .acquire()
-        .await
-        .map_err(|_| ApiError::internal("login semaphore closed"))?;
     if app.throttle.locked() {
-        // The global bound delays every attempt instead of refusing them.
-        // A correct password still signs in during a flood, which is the
-        // whole point: refusing is what made this a way to deny the
-        // break-glass credential to the operator.
+        // The key-independent bound delays every attempt instead of refusing
+        // them: a correct password still signs in during a flood, which is
+        // the whole point, since refusing is what made this a way to deny the
+        // operator the break-glass credential. The wait holds no permit. A
+        // sleeping task costs nothing, and holding one here would drain the
+        // argon2 budget at one attempt per delay, putting the operator behind
+        // a queue instead of a lockout.
         tokio::time::sleep(GLOBAL_TARPIT).await;
     }
-    let ok = tokio::task::spawn_blocking({
-        let hash = admin_hash(&app);
-        move || auth::verify_password(&request.password, &hash)
-    })
-    .await
-    .map_err(|error| ApiError::internal(error.to_string()))?;
+    let ok = {
+        // Bounds concurrent argon2 verifications; each costs about 19 MiB and
+        // spawn_blocking would otherwise run hundreds at once.
+        let _permit = app
+            .verify_permits
+            .acquire()
+            .await
+            .map_err(|_| ApiError::internal("verify semaphore closed"))?;
+        tokio::task::spawn_blocking({
+            let hash = admin_hash(&app);
+            move || auth::verify_password(&request.password, &hash)
+        })
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+    };
     app.login_throttle.record(&bucket, ok);
     app.throttle.record(ok);
     if !ok {
@@ -1062,7 +1065,7 @@ pub async fn admin_change_password(
             "the local administrator password is managed by the default-tenant admin",
         ));
     }
-    if app.throttle.locked() {
+    if app.change_password_throttle.locked() {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed attempts; wait a minute",
@@ -1084,9 +1087,11 @@ pub async fn admin_change_password(
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?;
-    // Throttled like login: this endpoint verifies a password too, so it would
-    // otherwise be an unthrottled oracle for an attacker holding a session.
-    app.throttle.record(current_ok);
+    // Throttled on its own counter: this endpoint verifies a password too, so
+    // it would otherwise be an unthrottled oracle for an attacker holding a
+    // session. Sharing the sign-in counter let anonymous login failures keep
+    // an operator from rotating the password.
+    app.change_password_throttle.record(current_ok);
     if !current_ok {
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -1541,6 +1546,77 @@ mod handler_tests {
             )
             .await
             .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_flood_of_attempts_does_not_queue_the_operator_out() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        // Every attempt from a different bucket, so none is refused by the
+        // per-IP throttle and all of them reach the delay. This is a liveness
+        // check: the operator signs in with a flood in flight. It does not
+        // prove the delay holds no argon2 permit, which is what would put the
+        // operator behind a queue; that is a latency property, and a paused
+        // clock makes both orderings finish. The ordering is held by the
+        // permit's scope in admin_login, not by this test.
+        let mut flood = Vec::new();
+        for index in 0..20u8 {
+            let application = application.clone();
+            flood.push(tokio::spawn(async move {
+                login_attempt(application, [10, 0, 0, index], "wrong").await;
+            }));
+        }
+        // Bounded: if the operator ends up behind the flood in a permit
+        // queue this must fail with a diagnosis, not hang the suite. The
+        // clock is paused, so the bound costs no wall time.
+        let operator = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            login_attempt(
+                application.clone(),
+                [198, 51, 100, 4],
+                testing::TEST_PASSWORD,
+            ),
+        )
+        .await
+        .expect("the operator waited behind the flood instead of signing in");
+        assert_eq!(
+            operator.status(),
+            StatusCode::OK,
+            "the operator signs in while the flood is in flight"
+        );
+        for task in flood {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(60), task).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sign_in_failures_do_not_block_a_password_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = login_cookie(app::router(application.clone())).await;
+        // Past the lockout threshold on the sign-in counter. An operator
+        // holding a session must still be able to rotate the password.
+        for index in 0..6u8 {
+            login_attempt(application.clone(), [203, 0, 113, index], "wrong").await;
+        }
+        assert!(application.throttle.locked(), "the sign-in counter tripped");
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/password")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"current":"{}","new":"a-much-longer-passphrase"}}"#,
+                        testing::TEST_PASSWORD
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     // Paused clock: the global tarpit sleep auto-advances instead of costing

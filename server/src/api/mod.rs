@@ -58,10 +58,17 @@ fn client_ip(headers: &HeaderMap, peer: &std::net::SocketAddr) -> String {
 /// this is only the key for rate limiting.
 pub(crate) fn throttle_key(ip: &str) -> String {
     match ip.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V6(v6)) => {
-            let [a, b, c, d, ..] = v6.segments();
-            format!("{:x}:{:x}:{:x}:{:x}::/64", a, b, c, d)
-        }
+        // A v4-mapped address is a v4 client: docker bridges and a dual-stack
+        // bind both present them this way. Bucketing them as v6 would put
+        // every v4 client, and ::1, in one bucket whose first four segments
+        // are zero, so one guesser would lock out everybody.
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let [a, b, c, d, ..] = v6.segments();
+                format!("{a:x}:{b:x}:{c:x}:{d:x}::/64")
+            }
+        },
         _ => ip.to_owned(),
     }
 }
@@ -214,6 +221,19 @@ mod ip_tests {
             headers.insert("x-forwarded-for", bad.parse().unwrap());
             assert_eq!(client_ip(&headers, &proxy), "127.0.0.1", "value {bad:?}");
         }
+    }
+
+    #[test]
+    fn mapped_v4_addresses_keep_their_own_buckets() {
+        // The whole point of the per-IP bucket is that one guesser locks only
+        // itself; treating mapped addresses as v6 put every v4 client in one
+        // bucket keyed on four zero segments.
+        let first = throttle_key("::ffff:203.0.113.9");
+        let second = throttle_key("::ffff:203.0.113.10");
+        assert_eq!(first, "203.0.113.9");
+        assert_ne!(first, second);
+        assert_ne!(first, throttle_key("::1"));
+        assert_ne!(second, throttle_key("::1"));
     }
 
     #[test]

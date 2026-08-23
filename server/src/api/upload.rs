@@ -121,7 +121,10 @@ async fn check_link_password(
     let Some(hash) = &link.password_hash else {
         return Ok(());
     };
-    if app.link_throttle.locked(ip) {
+    // One bucket per v4 address and per IPv6 /64: a client holding a routed
+    // prefix would otherwise get a fresh five-guess budget per address.
+    let bucket = super::throttle_key(ip);
+    if app.link_throttle.locked(&bucket) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed attempts; wait a minute",
@@ -129,10 +132,20 @@ async fn check_link_password(
     }
     let password = password.unwrap_or_default().to_owned();
     let hash = hash.clone();
-    let ok = tokio::task::spawn_blocking(move || auth::verify_password(&password, &hash))
-        .await
-        .map_err(|error| ApiError::internal(error.to_string()))?;
-    app.link_throttle.record(ip, ok);
+    let ok = {
+        // Same argon2 budget as admin sign-in: this is the other
+        // unauthenticated path that verifies a password, and it is one
+        // machine's memory both are spending.
+        let _permit = app
+            .verify_permits
+            .acquire()
+            .await
+            .map_err(|_| ApiError::internal("verify semaphore closed"))?;
+        tokio::task::spawn_blocking(move || auth::verify_password(&password, &hash))
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?
+    };
+    app.link_throttle.record(&bucket, ok);
     if !ok {
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -213,7 +226,7 @@ pub async fn create_session(
     // outcome: without this, holders of a no-password link could churn
     // sessions into the global cap and evict legitimate senders' uploads.
     let ip = client_ip(&headers, &peer);
-    if !app.session_rate.allow(&ip) {
+    if !app.session_rate.allow(&super::throttle_key(&ip)) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many uploads started from your address; try again later",

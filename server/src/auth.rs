@@ -347,12 +347,25 @@ impl IpThrottle {
                     || now.duration_since(entry.last_seen).as_secs() < IP_ENTRY_TTL_SECS
             });
             // A caller rotating addresses keeps every entry fresh, so the
-            // sweep above can free nothing. Drop the new key rather than grow
-            // without bound: existing lockouts keep working, and the global
-            // tarpit is what bounds a flood from many addresses. Refusing
-            // instead would let a full table deny everyone.
+            // sweep above can free nothing. Evict the least recently seen
+            // entry that is not serving a lockout, rather than declining to
+            // track the new key: not tracking it would turn a full table into
+            // a way to switch throttling off for every new address. If every
+            // entry holds a live lockout the table is doing its job and the
+            // new key waits.
             if state.len() >= IP_TABLE_CAP && !state.contains_key(ip) {
-                return;
+                let now = Instant::now();
+                let victim = state
+                    .iter()
+                    .filter(|(_, entry)| !entry.locked_until.is_some_and(|until| now < until))
+                    .min_by_key(|(_, entry)| entry.last_seen)
+                    .map(|(key, _)| key.clone());
+                match victim {
+                    Some(key) => {
+                        state.remove(&key);
+                    }
+                    None => return,
+                }
             }
         }
         if success {
@@ -409,6 +422,14 @@ mod tests {
         let size = throttle.state.lock().unwrap().len();
         assert!(size <= IP_TABLE_CAP, "table grew to {size}");
         assert!(throttle.locked("10.0.0.1"), "the live lockout survived");
+        // A full table must not switch throttling off for new addresses.
+        for _ in 0..LOCKOUT_THRESHOLD {
+            throttle.record("10.0.0.2", false);
+        }
+        assert!(
+            throttle.locked("10.0.0.2"),
+            "a new address is still throttled once the table is full"
+        );
     }
 
     #[test]
