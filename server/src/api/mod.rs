@@ -6,6 +6,7 @@ pub mod admin;
 pub mod session_rate;
 pub mod sso;
 pub mod upload;
+pub mod verify;
 
 pub use admin::{
     admin_audit_export, admin_change_password, admin_login, admin_logout, admin_session,
@@ -18,6 +19,7 @@ pub use upload::{
     create_session, link_info, upload_abort, upload_begin, upload_chunk, upload_finish,
     upload_page, upload_seal, verify_link_password,
 };
+pub use verify::{receipt_key, verify_receipt};
 
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};

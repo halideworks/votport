@@ -1640,3 +1640,142 @@ async fn throughput_baseline() {
     println!("hash+package 256 MiB: {hashed:.3?} ({})", mib(hashed));
     println!("upload       256 MiB: {uploaded:.3?} ({})", mib(uploaded));
 }
+
+#[tokio::test]
+async fn public_verify_checks_sidecars() {
+    let server = start_server().await;
+    let base = &server.base;
+
+    // Admin session only to create a link and produce a real sidecar.
+    let admin = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    admin
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    let response = admin
+        .post(format!("{base}/api/admin/links"))
+        .header("X-Votport", "1")
+        .json(&json!({ "label": "verify" }))
+        .send()
+        .await
+        .unwrap();
+    let token = response.json::<Value>().await.unwrap()["link"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let report = run_upload(
+        &admin,
+        base,
+        &token,
+        "",
+        &[prepare(vec!["receipted.bin"], vec![5u8; 300_000])],
+    )
+    .await;
+    let root = report["files"][0]["root"].as_str().unwrap().to_owned();
+
+    // The key GET is public: no cookies, no X-Votport.
+    let anon = reqwest::Client::new();
+    let response = anon
+        .get(format!("{base}/api/receipt-key"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let receipt_key = response.json::<Value>().await.unwrap()["receipt_key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(receipt_key.len(), 64, "64 lowercase hex");
+
+    let post = |body: Vec<u8>| {
+        let anon = &anon;
+        async move {
+            anon.post(format!("{base}/api/verify"))
+                .header("Content-Type", "application/octet-stream")
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // A valid sidecar checks out with lowercase JSON enum names.
+    let sidecar = std::fs::read(server.receive_dir.join("receipted.bin.vot-receipt"))
+        .expect("sidecar exists");
+    let response = post(sidecar.clone()).await;
+    assert_eq!(response.status(), 200);
+    let body = response.json::<Value>().await.unwrap();
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["suite"], json!("blake3"));
+    assert_eq!(body["root"], json!(root));
+    assert_eq!(body["length"], json!(300_000u64));
+    assert_eq!(body["subject_kind"], json!("object"));
+    assert_eq!(body["assurance"], json!("published"));
+    assert_eq!(body["profile"], json!("balanced"));
+    assert!(!body["observed_at"].as_str().unwrap().is_empty());
+
+    // Truncated and garbage envelopes are not receipts. Budget is consumed
+    // either way, so these count toward the rate limit below.
+    for malformed in [sidecar[..8].to_vec(), vec![0xff; 64]] {
+        let response = post(malformed).await;
+        assert_eq!(response.status(), 422);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            json!("This is not a vot-receipt.")
+        );
+    }
+
+    // A receipt signed by another key is well-formed but not ours.
+    let stranger = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let receipt = vot_receipt::Receipt {
+        subject_kind: vot_receipt::SubjectKind::Object,
+        suite_id: 1,
+        subject_digest: [7; 32],
+        subject_length: 300_000,
+        assurance: vot_receipt::AssuranceLevel::Published,
+        profile: vot_receipt::CommitProfile::Balanced,
+        actual_predecessor: vot_receipt::required_predecessor(vot_receipt::CommitProfile::Balanced),
+        provider: 1,
+        provider_version: [0, 1, 0],
+        session_id: [0; 16],
+        incarnation_id: [0; 16],
+        sequence: 1,
+        observed_at: "2026-08-22T00:00:00Z".to_owned(),
+        clock_source: 1,
+        flags: 0,
+        previous: None,
+    };
+    let authenticated =
+        vot_receipt::sign_ed25519(receipt, &stranger.verifying_key().to_bytes(), &stranger)
+            .unwrap();
+    let foreign = vot_receipt::encode_authenticated(&authenticated).unwrap();
+    let response = post(foreign).await;
+    assert_eq!(response.status(), 422);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"],
+        json!("This receipt was not issued by this server.")
+    );
+
+    // One byte over the cap is rejected by the router without reaching the
+    // handler (no rate budget spent).
+    let response = post(vec![0u8; 65_537]).await;
+    assert_eq!(response.status(), 413, "payload limit");
+
+    // 20 POSTs per IP per window; the 21st is refused even though every body
+    // so far was legitimate or at worst a small malformed one.
+    for _ in 4..20 {
+        let response = post(sidecar.clone()).await;
+        assert_eq!(response.status(), 200);
+    }
+    let response = post(sidecar).await;
+    assert_eq!(response.status(), 429);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"],
+        json!("too many checks from your address; try again later")
+    );
+}

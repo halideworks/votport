@@ -27,6 +27,9 @@ pub struct App {
     pub link_throttle: crate::auth::IpThrottle,
     /// Per-IP rate limit on upload-session creation.
     pub session_rate: crate::api::session_rate::SessionRate,
+    /// Per-IP rate limit on public receipt checks; a separate map so a
+    /// verifier cannot starve upload creates and vice versa.
+    pub verify_rate: crate::api::session_rate::SessionRate,
     /// Signs the `.vot-receipt` sidecars written next to received files.
     pub signer: Arc<crate::receipt::ReceiptSigner>,
     /// Outbound client for upload notifications.
@@ -186,6 +189,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         throttle: LoginThrottle::new(),
         link_throttle: crate::auth::IpThrottle::new(),
         session_rate: crate::api::session_rate::SessionRate::new(),
+        verify_rate: crate::api::session_rate::SessionRate::new(),
         signer,
         http,
         sso_config: config.oidc.clone(),
@@ -244,6 +248,7 @@ pub fn router(app: Arc<App>) -> Router {
         // Pages.
         .route("/", serve_page(admin_page))
         .route("/r/{token}", serve_page(request_page))
+        .route("/verify", serve_page(page("verify")))
         // no-cache means revalidate, not never-cache: repeat visits answer
         // conditional GETs with 304s instead of re-downloading the wasm and
         // the hero image, while a redeploy still takes effect immediately.
@@ -316,6 +321,11 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/admin/callback", get(api::sso_callback))
         // Public upload API.
         .route("/api/r/{token}", get(api::link_info))
+        .route("/api/receipt-key", get(api::receipt_key))
+        .route(
+            "/api/verify",
+            post(api::verify_receipt).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         .route("/api/r/{token}/verify", post(api::verify_link_password))
         .route("/api/r/{token}/session", post(api::create_session))
         .route(
