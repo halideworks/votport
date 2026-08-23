@@ -124,7 +124,13 @@ async function recoverWorkers() {
     stopWorkers();
     return;
   }
-  if (recovering) return;
+  if (recovering) {
+    // A second death during this round: tear the pool down so the round's
+    // own re-hash calls reject Paused and the round releases; the pause
+    // paths then re-enter here for a fresh round.
+    stopWorkers(new Paused());
+    return;
+  }
   if (workerRestarts >= WORKER_RESTART_CAP) {
     workerFatal = new Error('Verification stopped. Try sending again.');
     stopWorkers(workerFatal);
@@ -154,6 +160,7 @@ async function recoverWorkers() {
   recovering = false;
   release();
 }
+
 // The send loop awaits this before touching any tree after a pause.
 function waitWorkersReady() {
   return readySignal || Promise.resolve();
@@ -663,6 +670,7 @@ async function runUpload() {
     // A worker death mid-hash rejects this call with Paused; wait for the
     // restored pool and hash again rather than failing the transfer.
     for (;;) {
+      checkCancelled();
       await waitWorkersReady();
       try {
         done = await workerCall({ op: 'hash', key: path, file }, index, (step) => {
@@ -674,6 +682,7 @@ async function runUpload() {
       } catch (error) {
         if (error.cancelled || !error.paused) throw error;
         if (workerFatal) throw workerFatal;
+        if (!hashWorkers.length && !recovering) recoverWorkers();
         setStatus(path, 'Paused');
       }
     }
@@ -720,8 +729,10 @@ async function runUpload() {
     // Per-entry bytes already counted into `sent`, so a recovery round that
     // re-reads begin's covered_bytes does not double-count them.
     const counted = new Map();
+    let stalledRounds = 0;
 
     for (;;) {
+      checkCancelled();
       // After a worker-death pause the trees are not back until recovery
       // says so; proving before that would just reject again.
       await waitWorkersReady();
@@ -780,7 +791,9 @@ async function runUpload() {
             ? item.file.size
             : Math.min(entry.covered_bytes ?? 0, item.file.size);
           const countedBefore = counted.get(entry.index) ?? 0;
-          if (already > countedBefore) {
+          if (already !== countedBefore) {
+            // Reconcile in both directions: ranges posted past the server's
+            // contiguous prefix come back off `sent` at the next begin.
             sent += already - countedBefore;
             counted.set(entry.index, already);
           }
@@ -792,6 +805,7 @@ async function runUpload() {
           await uploadEntryChunks(sessionId, entry.index, item, BigInt(already), (step) => {
             sent += step;
             sentForNote = sent;
+            stalledRounds = 0;
             fileSent += step;
             setMeter(totalBytes ? sent / totalBytes : 1);
             lastSendBps = sendRate(step);
@@ -821,6 +835,12 @@ async function runUpload() {
           // The pool may have died again while we were between proves.
           if (!hashWorkers.length && !recovering) recoverWorkers();
           if (workerFatal) throw workerFatal;
+          stalledRounds += 1;
+          if (stalledRounds > 100) {
+            throw new Error(
+              'Transfer kept pausing. Reselect the same files to resume where this stopped.',
+            );
+          }
           continue;
         }
         sendCursor = null;
@@ -988,7 +1008,9 @@ $('upload-form').addEventListener('submit', async (event) => {
     // The server no longer holds the session, so the saved resume record is
     // useless; clearing it also hides the stale "held on the server" note and
     // keeps the advice below honest.
-    const expired = /unknown or expired session/.test(error.message);
+    const expired = error.status === 404
+      || error.status === 410
+      || /unknown or expired session/.test(error.message);
     if (expired) clearResume();
     // A refused range or publish is not a network story; say what it means.
     const unverified = error.status === 422 || error.status === 409;
