@@ -449,6 +449,92 @@ fn metrics_text(app: &App) -> Result<String, String> {
     Ok(body)
 }
 
+async fn expire_link_uploads(app: &App, candidate: crate::store::Link, cutoff: u64) {
+    if candidate.legal_hold {
+        return;
+    }
+    let Some(_pin) = app.sessions.try_pin_link(&candidate.id) else {
+        return;
+    };
+    if app.sessions.active_for_link(&candidate.id) > 0 {
+        return;
+    }
+    let link = match app.store.link(&candidate.tenant, &candidate.id) {
+        Ok(Some(link)) if !link.legal_hold => link,
+        Ok(_) => return,
+        Err(error) => {
+            tracing::error!(%error, "link re-read failed; skipping retention for link");
+            return;
+        }
+    };
+    for upload in &link.uploads {
+        // completed_at == 0 marks pre-field records; never treat those as
+        // infinitely expired.
+        if upload.completed_at == 0 || upload.completed_at >= cutoff {
+            continue;
+        }
+        let mut removed: Vec<String> = Vec::new();
+        for file in &upload.files {
+            if file.deleted {
+                continue;
+            }
+            // Same shape as admin::stored_path: the tenant prefix is not part
+            // of stored_as, so omitting it here deletes the default tenant's
+            // file at that relative path.
+            let mut components = crate::paths::tenant_prefix(&link.tenant);
+            components.extend(
+                file.stored_as
+                    .split('/')
+                    .filter(|part| !part.is_empty())
+                    .map(str::to_owned),
+            );
+            let Ok(path) = crate::paths::join_under(&app.config.receive_dir, &components) else {
+                continue;
+            };
+            let _ = tokio::fs::remove_file(format!("{}.vot-receipt", path.display())).await;
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => removed.push(file.stored_as.clone()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    removed.push(file.stored_as.clone())
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "could not delete expired file");
+                }
+            }
+        }
+        if removed.is_empty() {
+            continue;
+        }
+        let _ = app.store.update_link(&link.tenant, &link.id, |link| {
+            for upload in &mut link.uploads {
+                for file in &mut upload.files {
+                    if removed.contains(&file.stored_as) {
+                        file.deleted = true;
+                    }
+                }
+            }
+        });
+        tracing::info!(
+            target: "audit",
+            event = "uploads_expired",
+            link = %link.id,
+            tenant = %link.tenant,
+            files = removed.len(),
+            "expired received files deleted"
+        );
+        app.store.audit(
+            &link.tenant,
+            "",
+            "uploads_expired",
+            &link.id,
+            &serde_json::json!({
+                "tenant": link.tenant,
+                "files": removed.len()
+            }),
+        );
+    }
+}
+
 /// Discards idle upload sessions and expired audit rows.
 pub async fn session_sweeper(app: Arc<App>) {
     let idle = app.config.session_idle_secs;
@@ -513,102 +599,7 @@ pub async fn session_sweeper(app: Arc<App>) {
                         }
                     };
                     for link in links {
-                        if link.legal_hold {
-                            continue;
-                        }
-                        if !app.sessions.pin_link_for_delete(&link.id) {
-                            continue;
-                        }
-                        let link = match app.store.link(&link.tenant, &link.id) {
-                            Ok(Some(link)) if !link.legal_hold => link,
-                            Ok(_) => {
-                                app.sessions.unpin_link(&link.id);
-                                continue;
-                            }
-                            Err(error) => {
-                                app.sessions.unpin_link(&link.id);
-                                tracing::error!(%error, "link re-read failed; skipping retention for link");
-                                continue;
-                            }
-                        };
-                        for upload in &link.uploads {
-                            // completed_at == 0 marks pre-field records; never
-                            // treat those as infinitely expired.
-                            if upload.completed_at == 0 || upload.completed_at >= cutoff {
-                                continue;
-                            }
-                            let mut removed: Vec<String> = Vec::new();
-                            for file in &upload.files {
-                                if file.deleted {
-                                    continue;
-                                }
-                                // Same shape as admin::stored_path: the
-                                // tenant prefix is not part of stored_as, so
-                                // omitting it here deletes the default
-                                // tenant's file at that relative path.
-                                let mut components = crate::paths::tenant_prefix(&link.tenant);
-                                components.extend(
-                                    file.stored_as
-                                        .split('/')
-                                        .filter(|part| !part.is_empty())
-                                        .map(str::to_owned),
-                                );
-                                let Ok(path) =
-                                    crate::paths::join_under(&app.config.receive_dir, &components)
-                                else {
-                                    continue;
-                                };
-                                let _ = tokio::fs::remove_file(format!(
-                                    "{}.vot-receipt",
-                                    path.display()
-                                ))
-                                .await;
-                                match tokio::fs::remove_file(&path).await {
-                                    Ok(()) => removed.push(file.stored_as.clone()),
-                                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                                        removed.push(file.stored_as.clone())
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!(path = %path.display(), %error, "could not delete expired file");
-                                    }
-                                }
-                            }
-                            if removed.is_empty() {
-                                continue;
-                            }
-                            let _ = app.store.update_link(
-                                &link.tenant,
-                                &link.id,
-                                |link| {
-                                    for upload in &mut link.uploads {
-                                        for file in &mut upload.files {
-                                            if removed.contains(&file.stored_as) {
-                                                file.deleted = true;
-                                            }
-                                        }
-                                    }
-                                },
-                            );
-                            tracing::info!(
-                                target: "audit",
-                                event = "uploads_expired",
-                                link = %link.id,
-                                tenant = %link.tenant,
-                                files = removed.len(),
-                                "expired received files deleted"
-                            );
-                            app.store.audit(
-                                &link.tenant,
-                                "",
-                                "uploads_expired",
-                                &link.id,
-                                &serde_json::json!({
-                                    "tenant": link.tenant,
-                                    "files": removed.len()
-                                }),
-                            );
-                        }
-                        app.sessions.unpin_link(&link.id);
+                        expire_link_uploads(&app, link, cutoff).await;
                     }
                 }
             }
@@ -637,8 +628,10 @@ mod retention_tests {
         std::fs::create_dir_all(&app.config.receive_dir).unwrap();
         let held_path = app.config.receive_dir.join("held.txt");
         let expired_path = app.config.receive_dir.join("expired.txt");
+        let active_path = app.config.receive_dir.join("active.txt");
         std::fs::write(&held_path, b"held").unwrap();
         std::fs::write(&expired_path, b"expired").unwrap();
+        std::fs::write(&active_path, b"active").unwrap();
 
         let held = Link {
             id: "held".to_owned(),
@@ -677,8 +670,33 @@ mod retention_tests {
         expired.legal_hold = false;
         expired.uploads[0].files[0].path = "expired.txt".to_owned();
         expired.uploads[0].files[0].stored_as = "expired.txt".to_owned();
-        app.store.insert_link(held).unwrap();
+        let mut active = expired.clone();
+        active.id = "active".to_owned();
+        active.label = "active".to_owned();
+        active.uploads[0].files[0].path = "active.txt".to_owned();
+        active.uploads[0].files[0].stored_as = "active.txt".to_owned();
+        app.store.insert_link(held.clone()).unwrap();
         app.store.insert_link(expired).unwrap();
+        app.store.insert_link(active).unwrap();
+
+        // The candidate came from the first read before an administrator set
+        // the hold. The re-read under the lifecycle pin must still preserve it.
+        let mut stale_held = held;
+        stale_held.legal_hold = false;
+        expire_link_uploads(&app, stale_held, crate::store::now_unix()).await;
+
+        let (active_tx, _active_rx) = tokio::sync::mpsc::channel(1);
+        app.sessions
+            .insert(
+                "active-session".to_owned(),
+                "active".to_owned(),
+                String::new(),
+                active_tx,
+            )
+            .unwrap();
+        let active_candidate = app.store.link("", "active").unwrap().unwrap();
+        expire_link_uploads(&app, active_candidate, crate::store::now_unix()).await;
+        assert!(active_path.exists());
 
         let sweeper = tokio::spawn(session_sweeper(Arc::clone(&app)));
         for _ in 0..100 {
@@ -688,11 +706,16 @@ mod retention_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         sweeper.abort();
+        let _ = sweeper.await;
 
         assert!(held_path.exists());
         assert!(!expired_path.exists());
+        assert!(active_path.exists());
         assert!(!app.store.link("", "held").unwrap().unwrap().uploads[0].files[0].deleted);
         assert!(app.store.link("", "expired").unwrap().unwrap().uploads[0].files[0].deleted);
+        assert!(!app.store.link("", "active").unwrap().unwrap().uploads[0].files[0].deleted);
+        assert!(app.sessions.pin_link_for_delete("expired"));
+        app.sessions.unpin_link("expired");
     }
 }
 

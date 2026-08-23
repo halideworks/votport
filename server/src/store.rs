@@ -1174,6 +1174,28 @@ fn map_audit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRow> {
     })
 }
 
+fn insert_audit_row(
+    connection: &Connection,
+    tenant: &str,
+    actor: &str,
+    event: &str,
+    subject: &str,
+    detail: &serde_json::Value,
+) -> rusqlite::Result<usize> {
+    connection.execute(
+        "INSERT INTO audit_log (at, tenant, actor, event, subject, detail)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            i64::try_from(now_unix()).unwrap_or(0),
+            tenant,
+            actor,
+            event,
+            subject,
+            detail.to_string()
+        ],
+    )
+}
+
 impl Store {
     /// Inserts one audit row. Best effort: the tracing event at the call site
     /// is the operational record; the row is the queryable one.
@@ -1185,20 +1207,38 @@ impl Store {
         subject: &str,
         detail: &serde_json::Value,
     ) {
-        let _ = self.with(|connection| {
-            connection.execute(
-                "INSERT INTO audit_log (at, tenant, actor, event, subject, detail)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    i64::try_from(now_unix()).unwrap_or(0),
-                    tenant,
-                    actor,
-                    event,
-                    subject,
-                    detail.to_string()
-                ],
-            )
-        });
+        let _ = self
+            .with(|connection| insert_audit_row(connection, tenant, actor, event, subject, detail));
+    }
+
+    /// Changes a legal hold and records it in the same transaction.
+    pub fn set_link_legal_hold(
+        &self,
+        tenant: &str,
+        id: &str,
+        legal_hold: bool,
+        actor: &str,
+    ) -> Result<bool, String> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let Some(mut link) = read_link(&transaction, tenant, id)? else {
+            return Ok(false);
+        };
+        link.legal_hold = legal_hold;
+        write_link_row(&transaction, &link).map_err(|error| error.to_string())?;
+        insert_audit_row(
+            &transaction,
+            tenant,
+            actor,
+            "link_legal_hold_changed",
+            id,
+            &serde_json::json!({ "legal_hold": legal_hold }),
+        )
+        .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(true)
     }
 
     /// Audit rows strictly after the (at, rowid) cursor, oldest first,
@@ -1586,6 +1626,21 @@ mod tests {
             max_sessions: None,
             created_at: 0,
         }
+    }
+
+    #[test]
+    fn legal_hold_rolls_back_when_audit_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.insert_link(test_link("held")).unwrap();
+        store
+            .with(|connection| connection.execute_batch("DROP TABLE audit_log"))
+            .unwrap();
+
+        assert!(store
+            .set_link_legal_hold("", "held", true, "admin")
+            .is_err());
+        assert!(!store.link("", "held").unwrap().unwrap().legal_hold);
     }
 
     #[test]

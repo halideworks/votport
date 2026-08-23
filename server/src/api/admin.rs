@@ -1376,48 +1376,46 @@ pub async fn update_link(
             "active or legal_hold is required",
         ));
     }
-    let pins_lifecycle = request.legal_hold.is_some();
-    if pins_lifecycle && !app.sessions.pin_link_for_delete(&id) {
+    if request.active.is_some() && request.legal_hold.is_some() {
         return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "link lifecycle update in progress; try again",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "update one link lifecycle field at a time",
         ));
     }
-    let update = app.store.update_link(&identity.tenant, &id, |link| {
-        if let Some(active) = request.active {
-            link.active = active;
+    if let Some(legal_hold) = request.legal_hold {
+        let _pin = app.sessions.try_pin_link(&id).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "link lifecycle update in progress; try again",
+            )
+        })?;
+        let found = app
+            .store
+            .set_link_legal_hold(&identity.tenant, &id, legal_hold, &identity.subject)
+            .map_err(ApiError::internal)?;
+        if !found {
+            return Err(ApiError::not_found());
         }
-        if let Some(legal_hold) = request.legal_hold {
-            link.legal_hold = legal_hold;
-        }
-    });
-    if pins_lifecycle {
-        app.sessions.unpin_link(&id);
+        tracing::info!(target: "audit", event = "link_legal_hold_changed", id = %id, legal_hold, "request link legal hold changed");
+        return Ok(Json(json!({ "ok": true })));
     }
-    let found = update.map_err(ApiError::internal)?;
+
+    let active = request.active.expect("validated above");
+    let found = app
+        .store
+        .update_link(&identity.tenant, &id, |link| link.active = active)
+        .map_err(ApiError::internal)?;
     if !found {
         return Err(ApiError::not_found());
     }
-    if let Some(active) = request.active {
-        tracing::info!(target: "audit", event = "link_active_changed", id = %id, active, "request link toggled");
-        app.store.audit(
-            &identity.tenant,
-            &identity.subject,
-            "link_active_changed",
-            &id,
-            &serde_json::json!({ "active": active }),
-        );
-    }
-    if let Some(legal_hold) = request.legal_hold {
-        tracing::info!(target: "audit", event = "link_legal_hold_changed", id = %id, legal_hold, "request link legal hold changed");
-        app.store.audit(
-            &identity.tenant,
-            &identity.subject,
-            "link_legal_hold_changed",
-            &id,
-            &serde_json::json!({ "legal_hold": legal_hold }),
-        );
-    }
+    tracing::info!(target: "audit", event = "link_active_changed", id = %id, active, "request link toggled");
+    app.store.audit(
+        &identity.tenant,
+        &identity.subject,
+        "link_active_changed",
+        &id,
+        &serde_json::json!({ "active": active }),
+    );
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -1428,27 +1426,20 @@ pub async fn delete_link(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    if !app.sessions.pin_link_for_delete(&id) {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "link delete already in progress",
-        ));
-    }
+    let _pin = app
+        .sessions
+        .try_pin_link(&id)
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "link delete already in progress"))?;
     if app.sessions.active_for_link(&id) > 0 {
-        app.sessions.unpin_link(&id);
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "uploads are in flight; try again when they finish",
         ));
     }
-    let removed = match app.store.remove_link(&identity.tenant, &id) {
-        Ok(removed) => removed,
-        Err(error) => {
-            app.sessions.unpin_link(&id);
-            return Err(ApiError::internal(error));
-        }
-    };
-    app.sessions.unpin_link(&id);
+    let removed = app
+        .store
+        .remove_link(&identity.tenant, &id)
+        .map_err(ApiError::internal)?;
     if !removed {
         return Err(ApiError::not_found());
     }
