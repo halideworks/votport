@@ -139,8 +139,9 @@ curl -b cookies.txt -X POST -H 'Content-Type: application/json' \
 ```
 
 SSO principals whose groups include `acme-admins` may switch into `acme`
-from the dashboard switcher. Named tenants publish into
-`/received/acme/...`; the default tenant keeps the receive root.
+from the dashboard switcher. Named tenants publish into the reserved
+`/received/.vot-tenants.stage/acme/...` subtree; the default tenant keeps the
+receive root and cannot upload a path that names the reserved subtree.
 
 Update quotas, label, or admin group without recreating the namespace
 (JSON `null` clears a quota back to unlimited; `0` is rejected):
@@ -152,18 +153,25 @@ curl -b cookies.txt -X PATCH -H 'Content-Type: application/json' \
 ```
 
 `DELETE /api/admin/tenants/{key}` drops the namespace row and purges
-`<receive>/<key>/`. Point-in-time snapshots under `data/backups/` (30-day
+`<receive>/.vot-tenants.stage/<key>/`. Point-in-time snapshots under
+`data/backups/` (30-day
 sweep in the session sweeper) and Litestream replicas still contain the
 tenant's rows and, for file backups of `/received`, the bytes until those
 backups rotate. GDPR-style erasure of backups is an operator job, not an
 API.
 
-Retry DELETE if purge fails (the row is already gone; leftover retry
-removes the directory). An unknown key with no leftover directory is 404
-and does not touch disk. A leftover directory is retried only when no
-default-tenant link has `dest` equal to that key or prefixed by `key/`;
-otherwise DELETE returns 409 and leaves the folder (a default-tenant dest
-of the same name lives at the receive root).
+Retry DELETE if purge fails (the row is already gone; leftover retry removes
+the reserved directory). An unknown key with no leftover directory is 404
+and does not touch disk. A default-tenant path with the same name is separate
+and is never purged.
+
+The first start after upgrading moves each existing named tenant from
+`<receive>/<key>/` into the reserved subtree. The move is same-filesystem and
+resumable. If both old and new paths exist for a tenant, startup refuses so an
+operator can move one aside instead of guessing which data owns the name.
+Startup also refuses when a default-tenant link or live record uses the legacy
+prefix, or when a legacy tenant key falls outside `[a-z0-9_-]`. Reconcile those
+names and records before retrying the upgrade.
 
 The local platform password is break-glass for every namespace; named
 tenants have no separate password.

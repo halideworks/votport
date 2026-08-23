@@ -20,7 +20,7 @@ use crate::config::Config;
 pub struct FileRecord {
     /// Path as named inside the uploaded package.
     pub path: String,
-    /// Path actually stored on disk, relative to the receive root.
+    /// Path actually stored on disk, relative to the owning tenant's subtree.
     pub stored_as: String,
     pub bytes: u64,
     /// Hash suite of the object root ("blake3" or "sha256").
@@ -84,7 +84,7 @@ pub struct Link {
     /// Owning tenant key ("" = the default tenant).
     #[serde(default)]
     pub tenant: String,
-    /// Destination subdirectory relative to the receive root ("" = root).
+    /// Destination subdirectory relative to the owning tenant's subtree.
     pub dest: String,
     #[serde(default)]
     pub password_hash: Option<String>,
@@ -127,11 +127,7 @@ impl Tenant {
     /// receive root. The default tenant keeps today's layout so existing
     /// deployments see no path change.
     pub fn path_prefix(&self) -> Vec<String> {
-        if self.key.is_empty() {
-            Vec::new()
-        } else {
-            vec![self.key.clone()]
-        }
+        crate::paths::tenant_prefix(&self.key)
     }
 }
 
@@ -332,6 +328,143 @@ impl Store {
         Ok(store)
     }
 
+    /// Moves pre-isolation named-tenant subtrees under the reserved storage
+    /// directory. The marker is written last, so a crash between renames can
+    /// resume without moving a subtree twice.
+    pub fn migrate_tenant_storage(&self, receive_dir: &Path) -> Result<(), String> {
+        const KEY: &str = "tenant_storage_layout";
+        const LAYOUT: &str = "reserved-v1";
+        let marker = self.with(|connection| {
+            connection
+                .query_row("SELECT value FROM meta WHERE key = ?1", [KEY], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()
+        })?;
+        if let Some(marker) = marker {
+            return if marker == LAYOUT {
+                Ok(())
+            } else {
+                Err(format!("unsupported tenant storage layout {marker:?}"))
+            };
+        }
+
+        let target_root = receive_dir.join(crate::paths::TENANT_STORAGE_DIR);
+        let metadata = |path: &Path| match std::fs::symlink_metadata(path) {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("inspect {}: {error}", path.display())),
+        };
+        let target_root_metadata = metadata(&target_root)?;
+        if target_root_metadata
+            .as_ref()
+            .is_some_and(|metadata| !metadata.file_type().is_dir())
+        {
+            return Err(format!(
+                "tenant storage migration expected a directory at {}; move it aside",
+                target_root.display()
+            ));
+        }
+
+        let default_links = self.links("")?;
+        let default_owns_prefix = |key: &str| {
+            let uses_prefix = |path: &str| {
+                let component = path.split('/').next().unwrap_or_default();
+                component.contains('~')
+                    || !component.is_ascii()
+                    || component.eq_ignore_ascii_case(key)
+            };
+            default_links.iter().any(|link| {
+                uses_prefix(&link.dest)
+                    || link
+                        .uploads
+                        .iter()
+                        .flat_map(|upload| &upload.files)
+                        .any(|file| !file.deleted && uses_prefix(&file.stored_as))
+            })
+        };
+        if target_root_metadata.is_some() && default_owns_prefix(crate::paths::TENANT_STORAGE_DIR) {
+            return Err(format!(
+                "tenant storage migration cannot determine ownership of {}; a default-tenant link also uses that prefix",
+                target_root.display()
+            ));
+        }
+        let tenants = self.tenants()?;
+        let mut moves = Vec::new();
+        for tenant in tenants {
+            if !crate::paths::portable_tenant_key(&tenant.key) {
+                return Err(format!(
+                    "tenant key {:?} is not portable; rename it using lowercase ASCII letters, digits, '-' or '_'",
+                    tenant.key
+                ));
+            }
+            let source = crate::paths::join_under(receive_dir, std::slice::from_ref(&tenant.key))?;
+            let target = target_root.join(&tenant.key);
+            let source_metadata = metadata(&source)?;
+            let target_metadata = metadata(&target)?;
+            for (path, metadata) in [(&source, &source_metadata), (&target, &target_metadata)] {
+                if metadata
+                    .as_ref()
+                    .is_some_and(|metadata| !metadata.file_type().is_dir())
+                {
+                    return Err(format!(
+                        "tenant storage migration expected a directory at {}; move it aside",
+                        path.display()
+                    ));
+                }
+            }
+            let source_exists = source_metadata.is_some();
+            let target_exists = target_metadata.is_some();
+            if source_exists && target_exists {
+                return Err(format!(
+                    "tenant storage migration found both {} and {}; move one aside",
+                    source.display(),
+                    target.display()
+                ));
+            }
+            if (source_exists || target_exists) && default_owns_prefix(&tenant.key) {
+                return Err(format!(
+                    "tenant storage migration cannot determine ownership of {}; a default-tenant link also uses that prefix",
+                    source.display()
+                ));
+            }
+            moves.push((source, target, source_exists));
+        }
+
+        for (source, target, source_exists) in moves {
+            if !source_exists {
+                continue;
+            }
+            std::fs::create_dir_all(&target_root)
+                .map_err(|error| format!("create {}: {error}", target_root.display()))?;
+            crate::paths::tighten_dir(&target_root);
+            std::fs::rename(&source, &target).map_err(|error| {
+                format!("move {} to {}: {error}", source.display(), target.display())
+            })?;
+        }
+        // The database marker must not reach durable storage before the
+        // directory renames it represents, including renames resumed from an
+        // earlier process.
+        #[cfg(unix)]
+        {
+            if target_root.exists() {
+                std::fs::File::open(&target_root)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|error| format!("sync {}: {error}", target_root.display()))?;
+            }
+            std::fs::File::open(receive_dir)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| format!("sync {}: {error}", receive_dir.display()))?;
+        }
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+                [KEY, LAYOUT],
+            )
+        })?;
+        Ok(())
+    }
+
     /// Forward-only schema steps. A file written by a newer binary is refused
     /// rather than stamped down: rewriting `schema_version` would hide tables
     /// this process cannot read.
@@ -495,10 +628,6 @@ impl Store {
     }
 
     pub fn insert_link(&self, link: Link) -> Result<(), InsertLinkError> {
-        enum Refusal {
-            NamedTenantGone,
-            DestBelongsToTenant(String),
-        }
         self.with(|connection| {
             // Named tenants have no FK; refuse inside this lock so a concurrent
             // remove_tenant cannot commit an orphan link.
@@ -509,42 +638,18 @@ impl Store {
                     |row| row.get(0),
                 )?;
                 if exists == 0 {
-                    return Ok(Some(Refusal::NamedTenantGone));
-                }
-            }
-            // A default-tenant link publishes straight under the receive root,
-            // so its dest may not name a tenant's folder or sit beneath one.
-            // Checked here rather than in the handler because the connection
-            // mutex is what makes it exclusive of a concurrent create_tenant.
-            if link.tenant.is_empty() && !link.dest.is_empty() {
-                let mut statement = connection.prepare("SELECT key FROM tenants")?;
-                let keys = statement.query_map([], |row| row.get::<_, String>(0))?;
-                for key in keys {
-                    let key = key?;
-                    if link.dest == key || link.dest.starts_with(&format!("{key}/")) {
-                        return Ok(Some(Refusal::DestBelongsToTenant(key)));
-                    }
+                    return Ok(false);
                 }
             }
             insert_link_row(connection, &link)?;
-            Ok(None)
+            Ok(true)
         })
         .map_err(InsertLinkError::Store)
-        .and_then(|refusal| match refusal {
-            None => Ok(()),
-            Some(Refusal::NamedTenantGone) => Err(InsertLinkError::NamedTenantGone),
-            Some(Refusal::DestBelongsToTenant(key)) => {
-                Err(InsertLinkError::DestBelongsToTenant(key))
-            }
+        .and_then(|inserted| {
+            inserted
+                .then_some(())
+                .ok_or(InsertLinkError::NamedTenantGone)
         })
-    }
-
-    /// Writes a link row without the checks `insert_link` applies, standing in
-    /// for a database written before those checks existed. The delete-time
-    /// guard has to keep covering that state.
-    #[cfg(test)]
-    pub fn insert_link_unchecked(&self, link: Link) -> Result<(), String> {
-        self.with(|connection| insert_link_row(connection, &link))
     }
 
     /// Applies `mutate` to the link and commits; Ok(false) when absent.
@@ -583,29 +688,17 @@ impl Store {
 
     pub fn insert_tenant(&self, tenant: Tenant) -> Result<(), InsertTenantError> {
         self.with(|connection| {
-            // The other half of the same invariant, under the same lock: a
-            // default-tenant link may already publish into this folder.
-            let mut statement =
-                connection.prepare("SELECT dest FROM links WHERE tenant = '' AND dest <> ''")?;
-            let dests = statement.query_map([], |row| row.get::<_, String>(0))?;
-            let prefix = format!("{}/", tenant.key);
-            for dest in dests {
-                let dest = dest?;
-                if dest == tenant.key || dest.starts_with(&prefix) {
-                    return Ok(Some(InsertTenantError::DefaultLinkPublishesThere));
+            // Filesystems commonly compare names case-insensitively even
+            // though SQLite's primary key does not.
+            let folded = tenant.key.to_lowercase();
+            let mut statement = connection.prepare("SELECT key FROM tenants")?;
+            let keys = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for key in keys {
+                if key?.to_lowercase() == folded {
+                    return Ok(Some(InsertTenantError::AlreadyExists));
                 }
             }
-            // Existence too: two concurrent creates both passed a handler
-            // check and the loser hit the UNIQUE constraint, which reads as a
-            // 500 with a raw SQL message instead of a conflict.
-            let exists: i64 = connection.query_row(
-                "SELECT EXISTS (SELECT 1 FROM tenants WHERE key = ?1)",
-                [&tenant.key],
-                |row| row.get(0),
-            )?;
-            if exists != 0 {
-                return Ok(Some(InsertTenantError::AlreadyExists));
-            }
+            drop(statement);
             connection.execute(
                 "INSERT INTO tenants (key, label, admin_group, max_total_bytes, max_links, max_sessions, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -1171,8 +1264,6 @@ pub type Quotas = (Option<u64>, Option<u64>, Option<u64>);
 /// Outcome of [`Store::insert_tenant`].
 #[derive(Debug, PartialEq)]
 pub enum InsertTenantError {
-    /// A default-tenant link already publishes into that folder.
-    DefaultLinkPublishesThere,
     /// A tenant with that key is already there.
     AlreadyExists,
     Store(String),
@@ -1182,8 +1273,6 @@ pub enum InsertTenantError {
 #[derive(Debug, PartialEq)]
 pub enum InsertLinkError {
     NamedTenantGone,
-    /// The dest names a tenant's folder, or sits beneath one.
-    DestBelongsToTenant(String),
     Store(String),
 }
 
@@ -1521,6 +1610,169 @@ mod tests {
         assert!(loaded.uploads[0].files[0].receipt);
         assert_eq!(loaded.events[0].outcome, "cancelled");
         assert_eq!(store.links("").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tenant_storage_migration_resumes_and_marks_completion() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let receive = directory.path().join("receive");
+        std::fs::create_dir_all(&receive).unwrap();
+        let store = Store::open(&data).unwrap();
+        store.insert_tenant(test_tenant("acme")).unwrap();
+        store.insert_tenant(test_tenant("globex")).unwrap();
+
+        std::fs::create_dir_all(receive.join("acme")).unwrap();
+        std::fs::write(receive.join("acme/invoice.pdf"), b"acme").unwrap();
+        let target_root = receive.join(crate::paths::TENANT_STORAGE_DIR);
+        std::fs::create_dir_all(target_root.join("globex")).unwrap();
+        std::fs::write(target_root.join("globex/done.pdf"), b"globex").unwrap();
+
+        store.migrate_tenant_storage(&receive).unwrap();
+        assert!(!receive.join("acme").exists());
+        assert_eq!(
+            std::fs::read(target_root.join("acme/invoice.pdf")).unwrap(),
+            b"acme"
+        );
+        assert!(target_root.join("globex/done.pdf").exists());
+
+        // Once marked, a root path named after a tenant belongs to the
+        // default tenant and must never be reinterpreted on restart.
+        std::fs::create_dir_all(receive.join("acme")).unwrap();
+        std::fs::write(receive.join("acme/root.txt"), b"root").unwrap();
+        store.migrate_tenant_storage(&receive).unwrap();
+        assert!(receive.join("acme/root.txt").exists());
+    }
+
+    #[test]
+    fn tenant_storage_migration_refuses_ambiguous_subtrees() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let receive = directory.path().join("receive");
+        let store = Store::open(&data).unwrap();
+        store.insert_tenant(test_tenant("acme")).unwrap();
+        std::fs::create_dir_all(receive.join("acme")).unwrap();
+        std::fs::create_dir_all(receive.join(crate::paths::TENANT_STORAGE_DIR).join("acme"))
+            .unwrap();
+
+        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        assert!(error.contains("found both"), "{error}");
+
+        std::fs::remove_dir_all(receive.join(crate::paths::TENANT_STORAGE_DIR)).unwrap();
+        std::fs::remove_dir_all(receive.join("acme")).unwrap();
+        std::fs::write(receive.join("acme"), b"default tenant").unwrap();
+        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        assert!(error.contains("expected a directory"), "{error}");
+    }
+
+    #[test]
+    fn tenant_storage_migration_refuses_default_owned_prefixes() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let receive = directory.path().join("receive");
+        let store = Store::open(&data).unwrap();
+        store.insert_tenant(test_tenant("acme")).unwrap();
+        std::fs::create_dir_all(receive.join("acme")).unwrap();
+        std::fs::write(receive.join("acme/invoice.pdf"), b"default").unwrap();
+        let mut link = test_link("root");
+        link.uploads.push(UploadRecord {
+            id: "upload".to_owned(),
+            started_at: 0,
+            completed_at: 1,
+            replayed_chunks: 0,
+            rejected_chunks: 0,
+            package_root: "root".to_owned(),
+            total_bytes: 7,
+            files: vec![FileRecord {
+                path: "acme/invoice.pdf".to_owned(),
+                stored_as: "Acme/invoice.pdf".to_owned(),
+                bytes: 7,
+                suite: "blake3".to_owned(),
+                root: "object".to_owned(),
+                receipt: false,
+                deleted: false,
+            }],
+        });
+        store.insert_link(link).unwrap();
+
+        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        assert!(error.contains("cannot determine ownership"), "{error}");
+        assert!(receive.join("acme/invoice.pdf").exists());
+        assert!(!receive.join(crate::paths::TENANT_STORAGE_DIR).exists());
+
+        std::fs::remove_dir_all(receive.join("acme")).unwrap();
+        std::fs::create_dir_all(receive.join(crate::paths::TENANT_STORAGE_DIR).join("acme"))
+            .unwrap();
+        store
+            .update_link("", "root", |link| {
+                link.uploads[0].files[0].stored_as =
+                    ".VOT-TENANTS.STAGE/acme/invoice.pdf".to_owned();
+            })
+            .unwrap();
+
+        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        assert!(error.contains("cannot determine ownership"), "{error}");
+        assert!(receive
+            .join(crate::paths::TENANT_STORAGE_DIR)
+            .join("acme")
+            .exists());
+    }
+
+    #[test]
+    fn tenant_storage_migration_refuses_nonportable_legacy_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let receive = directory.path().join("receive");
+        let store = Store::open(&data).unwrap();
+        store.insert_tenant(test_tenant("Acme")).unwrap();
+        assert_eq!(
+            store.insert_tenant(test_tenant("acme")).unwrap_err(),
+            InsertTenantError::AlreadyExists
+        );
+
+        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        assert!(error.contains("is not portable"), "{error}");
+
+        store
+            .with(|connection| {
+                connection.execute("DELETE FROM tenants", [])?;
+                connection.execute(
+                    "INSERT INTO tenants (key, label) VALUES ('가', 'legacy unicode')",
+                    [],
+                )
+            })
+            .unwrap();
+
+        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        assert!(error.contains("is not portable"), "{error}");
+    }
+
+    #[test]
+    fn tenant_storage_migration_case_folds_default_destinations() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let receive = directory.path().join("receive");
+        let store = Store::open(&data).unwrap();
+        store.insert_tenant(test_tenant("s")).unwrap();
+        std::fs::create_dir_all(receive.join("s")).unwrap();
+        let mut link = test_link("dest");
+        link.dest = "S".to_owned();
+        store.insert_link(link).unwrap();
+
+        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        assert!(error.contains("cannot determine ownership"), "{error}");
+
+        store
+            .update_link("", "dest", |link| link.dest = "ſ".to_owned())
+            .unwrap();
+        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        assert!(error.contains("cannot determine ownership"), "{error}");
+
+        store
+            .update_link("", "dest", |link| link.dest = "TENANT~1".to_owned())
+            .unwrap();
+        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        assert!(error.contains("cannot determine ownership"), "{error}");
     }
 
     #[test]

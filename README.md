@@ -69,8 +69,9 @@ drop.example.com {
 Reload Caddy, open `https://drop.example.com`, sign in with your admin
 password, create a link, and send it to someone.
 
-Received files appear under the host folder you mounted at `/received`
-(per-link subfolders are configurable when you create a link).
+Default-tenant files appear under the host folder mounted at `/received`.
+Named tenants use `/received/.vot-tenants.stage/<tenant>/`; per-link
+subfolders are configurable when you create a link.
 
 ## Configuration
 
