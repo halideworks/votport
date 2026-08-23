@@ -38,6 +38,9 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 openidconnect = { version = "4.0.1", features = ["reqwest"] }
 
 [dev-dependencies]
+# test-util only: start_paused lets the sign-in tests advance past the global
+# tarpit instead of sleeping through it.
+tokio = { version = "1", features = ["test-util"] }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "cookies"] }

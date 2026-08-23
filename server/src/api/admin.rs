@@ -20,6 +20,11 @@ use super::{cookie_attributes, ApiError, ApiResult};
 
 const ADMIN_COOKIE: &str = "votport_admin";
 
+/// How long a sign-in attempt waits once the global failure counter trips.
+/// Long enough to bound guessing to roughly one attempt per second per
+/// permit, short enough that a real operator barely notices.
+const GLOBAL_TARPIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Credential tag bound into admin token MACs: the stored hash when the
 /// UI has set one, else the stable tag derived from the environment
 /// credential. Either way, rotating the credential evicts sessions and a
@@ -144,16 +149,33 @@ pub async fn admin_login(
     headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> ApiResult<Response> {
-    // Per IP, not global: a global lockout here lets anyone who can reach
-    // this endpoint hold the break-glass credential down with five wrong
-    // guesses, which is the credential the operator needs when the identity
-    // provider is the thing that is down.
+    // Per IP first, because it is precise: a wrong password locks out the
+    // address that typed it and nobody else. It cannot be the only bound,
+    // because the key comes from a header a caller behind a private peer can
+    // choose, and because one IPv6 client holds a whole prefix.
     let ip = super::client_ip(&headers, &peer);
-    if app.login_throttle.locked(&ip) {
+    let bucket = super::throttle_key(&ip);
+    if app.login_throttle.locked(&bucket) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed attempts; wait a minute",
         ));
+    }
+    // Bounds concurrent argon2 verifications. Each one costs ~19 MiB, and
+    // spawn_blocking would otherwise run hundreds at once for an
+    // unauthenticated caller. Held across the delay below so it bounds the
+    // rate of guessing, not just its concurrency.
+    let _permit = app
+        .login_verify
+        .acquire()
+        .await
+        .map_err(|_| ApiError::internal("login semaphore closed"))?;
+    if app.throttle.locked() {
+        // The global bound delays every attempt instead of refusing them.
+        // A correct password still signs in during a flood, which is the
+        // whole point: refusing is what made this a way to deny the
+        // break-glass credential to the operator.
+        tokio::time::sleep(GLOBAL_TARPIT).await;
     }
     let ok = tokio::task::spawn_blocking({
         let hash = admin_hash(&app);
@@ -161,7 +183,8 @@ pub async fn admin_login(
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?;
-    app.login_throttle.record(&ip, ok);
+    app.login_throttle.record(&bucket, ok);
+    app.throttle.record(ok);
     if !ok {
         tracing::warn!(target: "audit", event = "admin_login_failed", %ip, "admin login refused");
         app.store
@@ -1045,10 +1068,13 @@ pub async fn admin_change_password(
             "too many failed attempts; wait a minute",
         ));
     }
-    if request.new.chars().count() < 12 {
+    if request.new.chars().count() < crate::config::MIN_ADMIN_PASSWORD_CHARS {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "new password must be at least 12 characters",
+            format!(
+                "new password must be at least {} characters",
+                crate::config::MIN_ADMIN_PASSWORD_CHARS
+            ),
         ));
     }
     let current_ok = tokio::task::spawn_blocking({
@@ -1517,7 +1543,45 @@ mod handler_tests {
             .unwrap()
     }
 
-    #[tokio::test]
+    // Paused clock: the global tarpit sleep auto-advances instead of costing
+    // two real seconds per attempt. IpThrottle keys off std::time::Instant,
+    // so the lockout logic under test is unaffected.
+    #[tokio::test(start_paused = true)]
+    async fn a_tripped_global_counter_still_admits_the_right_password() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        // Four failures from each of two addresses: past the global threshold
+        // of five, but neither address is locked on its own. The global bound
+        // must delay the next attempt, never refuse it, or an attacker who
+        // can spread guesses denies the operator the break-glass credential.
+        for peer in [[203, 0, 113, 9], [203, 0, 113, 10]] {
+            for _ in 0..4 {
+                assert_eq!(
+                    login_attempt(application.clone(), peer, "wrong")
+                        .await
+                        .status(),
+                    StatusCode::UNAUTHORIZED
+                );
+            }
+        }
+        assert!(application.throttle.locked(), "the global counter tripped");
+        assert_eq!(
+            login_attempt(
+                application.clone(),
+                [198, 51, 100, 4],
+                testing::TEST_PASSWORD
+            )
+            .await
+            .status(),
+            StatusCode::OK,
+            "a correct password signs in while the global counter is tripped"
+        );
+    }
+
+    // Paused clock: the global tarpit sleep auto-advances instead of costing
+    // two real seconds per attempt. IpThrottle keys off std::time::Instant,
+    // so the lockout logic under test is unaffected.
+    #[tokio::test(start_paused = true)]
     async fn a_guessing_address_cannot_lock_out_the_operator() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());

@@ -43,6 +43,13 @@ impl SessionRate {
                 entries.retain(|at| now.duration_since(*at) < WINDOW);
                 !entries.is_empty()
             });
+            // A caller rotating addresses keeps every entry live, so the
+            // sweep can free nothing. Allow the request without tracking it
+            // rather than growing without bound: the global session cap is
+            // the real limit, and refusing would deny every new sender.
+            if attempts.len() >= TABLE_CAP && !attempts.contains_key(ip) {
+                return true;
+            }
         }
         let entries = attempts.entry(ip.to_owned()).or_default();
         entries.retain(|at| now.duration_since(*at) < WINDOW);
@@ -67,6 +74,16 @@ mod tests {
         assert!(!rate.allow("10.0.0.1"));
         // Other IPs are unaffected.
         assert!(rate.allow("10.0.0.2"));
+    }
+
+    #[test]
+    fn the_table_stops_growing_under_address_rotation() {
+        let rate = SessionRate::new();
+        for index in 0..(TABLE_CAP * 2) {
+            assert!(rate.allow(&format!("10.9.{}.{}", index / 256, index % 256)));
+        }
+        let size = rate.attempts.lock().unwrap().len();
+        assert!(size <= TABLE_CAP, "table grew to {size}");
     }
 
     #[test]

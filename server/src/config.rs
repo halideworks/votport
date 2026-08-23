@@ -81,6 +81,11 @@ pub struct OidcConfig {
 
 const DEFAULT_MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024 * 1024; // 50 GiB
 
+/// Shortest admin password this build considers reasonable. Enforced on
+/// anything set through the UI; only warned about for the environment
+/// credential, which may predate the check.
+pub const MIN_ADMIN_PASSWORD_CHARS: usize = 12;
+
 pub fn from_env() -> Result<Config, String> {
     let bind = env_or("VOTPORT_BIND", "0.0.0.0:8080")
         .parse()
@@ -99,6 +104,16 @@ pub fn from_env() -> Result<Config, String> {
         }
         _ => match env::var("VOTPORT_ADMIN_PASSWORD") {
             Ok(password) if !password.is_empty() => {
+                // Warned, not refused: refusing would strand a deployment
+                // whose credential predates this check. admin_change_password
+                // enforces the same minimum on anything set through the UI.
+                if password.chars().count() < MIN_ADMIN_PASSWORD_CHARS {
+                    tracing::warn!(
+                        "VOTPORT_ADMIN_PASSWORD is shorter than {MIN_ADMIN_PASSWORD_CHARS} \
+                         characters; sign-in throttling bounds guessing but a short \
+                         break-glass password is the weakest part of this deployment"
+                    );
+                }
                 use sha2::Digest as _;
                 let tag = hex::encode(sha2::Sha256::digest(password.as_bytes()));
                 let hash = crate::auth::hash_password(&password)

@@ -45,8 +45,25 @@ fn client_ip(headers: &HeaderMap, peer: &std::net::SocketAddr) -> String {
         .and_then(|value| value.to_str().ok())
         .and_then(|list| list.rsplit(',').next())
         .map(|ip| ip.trim().to_owned())
-        .filter(|ip| !ip.is_empty())
+        // An unparseable value is not an address. Without this the header
+        // picks the throttle key, so a caller that reaches the port from a
+        // private peer could mint an unbounded number of them.
+        .filter(|ip| ip.parse::<std::net::IpAddr>().is_ok())
         .unwrap_or_else(|| peer.ip().to_string())
+}
+
+/// Throttle bucket for a client address. IPv6 clients routinely hold a whole
+/// /64, so the full address would give one guesser as many buckets as it
+/// wants; v4 addresses are their own bucket. Audit rows keep the real address:
+/// this is only the key for rate limiting.
+pub(crate) fn throttle_key(ip: &str) -> String {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let [a, b, c, d, ..] = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", a, b, c, d)
+        }
+        _ => ip.to_owned(),
+    }
 }
 
 fn proxy_peer(ip: &std::net::IpAddr) -> bool {
@@ -187,6 +204,27 @@ mod ip_tests {
         assert_eq!(client_ip(&headers, &private), "5.6.7.8");
         assert_eq!(client_ip(&headers, &public), "203.0.113.9");
         assert_eq!(client_ip(&HeaderMap::new(), &proxy), "127.0.0.1");
+    }
+
+    #[test]
+    fn garbage_forwarded_values_fall_back_to_the_peer() {
+        let mut headers = HeaderMap::new();
+        let proxy: std::net::SocketAddr = "127.0.0.1:80".parse().unwrap();
+        for bad in ["not-an-ip", "", "   ", "1.2.3.4.5", "<script>"] {
+            headers.insert("x-forwarded-for", bad.parse().unwrap());
+            assert_eq!(client_ip(&headers, &proxy), "127.0.0.1", "value {bad:?}");
+        }
+    }
+
+    #[test]
+    fn throttle_keys_collapse_an_ipv6_prefix() {
+        // One /64 is one bucket, so rotating the host part buys nothing.
+        let first = throttle_key("2001:db8:1:2:3:4:5:6");
+        assert_eq!(first, throttle_key("2001:db8:1:2:ffff:ffff:ffff:ffff"));
+        assert_ne!(first, throttle_key("2001:db8:1:3::1"));
+        // v4 and anything unparseable are their own bucket, unchanged.
+        assert_eq!(throttle_key("203.0.113.9"), "203.0.113.9");
+        assert_eq!(throttle_key("127.0.0.1"), "127.0.0.1");
     }
 
     #[test]

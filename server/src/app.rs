@@ -30,6 +30,10 @@ pub struct App {
     /// `link_throttle` so public link guessing cannot consume an operator's
     /// sign-in budget, or the reverse.
     pub login_throttle: crate::auth::IpThrottle,
+    /// Caps concurrent password verifications at sign-in. argon2 is memory
+    /// hard by design, so an unauthenticated caller must not be able to start
+    /// an unbounded number of them.
+    pub login_verify: tokio::sync::Semaphore,
     /// Per-IP throttle for public link password checks.
     pub link_throttle: crate::auth::IpThrottle,
     /// Per-IP rate limit on upload-session creation.
@@ -47,6 +51,9 @@ pub struct App {
 }
 
 const SSO_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Concurrent sign-in password verifications allowed process wide.
+const LOGIN_VERIFY_PERMITS: usize = 2;
 
 /// Process-local OIDC client. Success is sticky; failure cools down 30s.
 pub struct SsoSlot<T = crate::api::sso::SsoClient> {
@@ -195,6 +202,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         secret,
         throttle: LoginThrottle::new(),
         login_throttle: crate::auth::IpThrottle::new(),
+        login_verify: tokio::sync::Semaphore::new(LOGIN_VERIFY_PERMITS),
         link_throttle: crate::auth::IpThrottle::new(),
         session_rate: crate::api::session_rate::SessionRate::new(),
         verify_rate: crate::api::session_rate::SessionRate::new(),

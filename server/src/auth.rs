@@ -265,7 +265,11 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Global login throttle: after repeated failures every login pauses briefly.
+/// Global, key-independent bound on password guessing. The per-IP throttle is
+/// the precise one, but its key comes from a header a caller can sometimes
+/// choose, so this backstop counts every attempt from every source. Sign-in
+/// treats `locked` as "delay this attempt", never as "refuse it": refusing is
+/// what let anyone deny the break-glass credential.
 pub struct LoginThrottle {
     state: Mutex<(u32, Option<Instant>)>,
 }
@@ -342,6 +346,14 @@ impl IpThrottle {
                 entry.locked_until.is_some_and(|until| now < until)
                     || now.duration_since(entry.last_seen).as_secs() < IP_ENTRY_TTL_SECS
             });
+            // A caller rotating addresses keeps every entry fresh, so the
+            // sweep above can free nothing. Drop the new key rather than grow
+            // without bound: existing lockouts keep working, and the global
+            // tarpit is what bounds a flood from many addresses. Refusing
+            // instead would let a full table deny everyone.
+            if state.len() >= IP_TABLE_CAP && !state.contains_key(ip) {
+                return;
+            }
         }
         if success {
             state.remove(ip);
@@ -382,6 +394,22 @@ pub fn cookie_value<'header>(header: &'header str, name: &str) -> Option<&'heade
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ip_table_stops_growing_and_keeps_live_lockouts() {
+        let throttle = IpThrottle::new();
+        // Lock one address, then flood with fresh keys the sweep cannot evict.
+        for _ in 0..LOCKOUT_THRESHOLD {
+            throttle.record("10.0.0.1", false);
+        }
+        assert!(throttle.locked("10.0.0.1"));
+        for index in 0..(IP_TABLE_CAP * 2) {
+            throttle.record(&format!("10.9.{}.{}", index / 256, index % 256), false);
+        }
+        let size = throttle.state.lock().unwrap().len();
+        assert!(size <= IP_TABLE_CAP, "table grew to {size}");
+        assert!(throttle.locked("10.0.0.1"), "the live lockout survived");
+    }
 
     #[test]
     fn payload_without_cv_deserializes_as_one() {
