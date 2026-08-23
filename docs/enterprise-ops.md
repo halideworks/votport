@@ -8,9 +8,12 @@
 | Continues | `docs/multi-tenancy.md` (phases 1-5 plus multi-page admin #28) |
 | Audience | Senior engineers who already know the votport tree |
 
-The body below is the design that shipped. Per-link legal hold shipped later
-in schema v6. The remaining follow-on is scoped automation tokens. VOT re-pin
-waits on upstream FEC.
+The body below preserves the design and pre-implementation baseline that
+shipped. Later hardening added per-link legal hold in schema v6, the schema-v7
+exact-byte files projection, atomic announced-byte/session reservations, and
+reserved tenant storage. See [`multi-tenancy.md`](multi-tenancy.md) for current
+behavior. The remaining follow-on is scoped automation tokens. VOT re-pin waits
+on upstream FEC.
 
 ## Overview
 
