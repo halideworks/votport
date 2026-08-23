@@ -600,6 +600,7 @@ mod session_rate_tests {
             expires_at: None,
             max_bytes: None,
             active: true,
+            legal_hold: false,
             uploads: Vec::new(),
             events: Vec::new(),
         }

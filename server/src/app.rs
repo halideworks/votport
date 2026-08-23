@@ -513,6 +513,24 @@ pub async fn session_sweeper(app: Arc<App>) {
                         }
                     };
                     for link in links {
+                        if link.legal_hold {
+                            continue;
+                        }
+                        if !app.sessions.pin_link_for_delete(&link.id) {
+                            continue;
+                        }
+                        let link = match app.store.link(&link.tenant, &link.id) {
+                            Ok(Some(link)) if !link.legal_hold => link,
+                            Ok(_) => {
+                                app.sessions.unpin_link(&link.id);
+                                continue;
+                            }
+                            Err(error) => {
+                                app.sessions.unpin_link(&link.id);
+                                tracing::error!(%error, "link re-read failed; skipping retention for link");
+                                continue;
+                            }
+                        };
                         for upload in &link.uploads {
                             // completed_at == 0 marks pre-field records; never
                             // treat those as infinitely expired.
@@ -590,12 +608,91 @@ pub async fn session_sweeper(app: Arc<App>) {
                                 }),
                             );
                         }
+                        app.sessions.unpin_link(&link.id);
                     }
                 }
             }
-
-
         }
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use crate::store::{FileRecord, Link, SettingWrite, UploadRecord};
+
+    #[tokio::test]
+    async fn legal_hold_skips_only_automatic_retention() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        app.store
+            .put_settings(
+                "test",
+                &[(
+                    "upload_retention_days".to_owned(),
+                    SettingWrite::Set("1".to_owned()),
+                )],
+            )
+            .unwrap();
+        std::fs::create_dir_all(&app.config.receive_dir).unwrap();
+        let held_path = app.config.receive_dir.join("held.txt");
+        let expired_path = app.config.receive_dir.join("expired.txt");
+        std::fs::write(&held_path, b"held").unwrap();
+        std::fs::write(&expired_path, b"expired").unwrap();
+
+        let held = Link {
+            id: "held".to_owned(),
+            tenant: String::new(),
+            label: "held".to_owned(),
+            dest: String::new(),
+            password_hash: None,
+            created_at: 0,
+            expires_at: None,
+            max_bytes: None,
+            active: true,
+            legal_hold: true,
+            uploads: vec![UploadRecord {
+                id: "upload".to_owned(),
+                started_at: 0,
+                completed_at: 1,
+                replayed_chunks: 0,
+                rejected_chunks: 0,
+                package_root: "root".to_owned(),
+                total_bytes: 4,
+                files: vec![FileRecord {
+                    path: "held.txt".to_owned(),
+                    stored_as: "held.txt".to_owned(),
+                    bytes: 4,
+                    suite: "blake3".to_owned(),
+                    root: "object".to_owned(),
+                    receipt: false,
+                    deleted: false,
+                }],
+            }],
+            events: Vec::new(),
+        };
+        let mut expired = held.clone();
+        expired.id = "expired".to_owned();
+        expired.label = "expired".to_owned();
+        expired.legal_hold = false;
+        expired.uploads[0].files[0].path = "expired.txt".to_owned();
+        expired.uploads[0].files[0].stored_as = "expired.txt".to_owned();
+        app.store.insert_link(held).unwrap();
+        app.store.insert_link(expired).unwrap();
+
+        let sweeper = tokio::spawn(session_sweeper(Arc::clone(&app)));
+        for _ in 0..100 {
+            if !expired_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        sweeper.abort();
+
+        assert!(held_path.exists());
+        assert!(!expired_path.exists());
+        assert!(!app.store.link("", "held").unwrap().unwrap().uploads[0].files[0].deleted);
+        assert!(app.store.link("", "expired").unwrap().unwrap().uploads[0].files[0].deleted);
     }
 }
 

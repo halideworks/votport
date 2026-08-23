@@ -3,10 +3,10 @@
 Status: phases 1-5 shipped (#23 store, #24 audit, #25 SSO, #26 tenants,
 #27 ops polish) plus the multi-page admin (#28). Phases 6+ shipped (settings
 overlay, SMTP, SSO discovery retry, principals/revoke, tenant purge, backup
-streaming). Design: [`enterprise-ops.md`](enterprise-ops.md). Remaining is
-write-first: scoped automation tokens, legal hold versus retention. Each
-phase landed as its own PR with the standard gate (fmt, clippy -D warnings,
-tests, e2e, docker build) and review.
+streaming). Design: [`enterprise-ops.md`](enterprise-ops.md). Per-link legal
+hold is also shipped. Remaining write-first work is scoped automation tokens.
+Each phase landed as its own PR with the standard gate (fmt, clippy -D
+warnings, tests, e2e, docker build) and review.
 
 ## Goal
 

@@ -95,6 +95,8 @@ pub struct Link {
     pub max_bytes: Option<u64>,
     pub active: bool,
     #[serde(default)]
+    pub legal_hold: bool,
+    #[serde(default)]
     pub uploads: Vec<UploadRecord>,
     #[serde(default)]
     pub events: Vec<SessionEvent>,
@@ -224,7 +226,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-const SCHEMA_VERSION: u64 = 5;
+const SCHEMA_VERSION: u64 = 6;
 
 const SETTINGS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS settings (
@@ -246,6 +248,9 @@ CREATE TABLE IF NOT EXISTS principals (
     source TEXT NOT NULL DEFAULT 'sso'
 );
 ";
+
+const LEGAL_HOLD_SCHEMA: &str =
+    "ALTER TABLE links ADD COLUMN legal_hold INTEGER NOT NULL DEFAULT 0;";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -323,8 +328,8 @@ impl Store {
                     .execute_batch("ALTER TABLE links ADD COLUMN tenant TEXT NOT NULL DEFAULT ''")
             })
             .ok();
-        store.import_legacy(data_dir)?;
         store.migrate()?;
+        store.import_legacy(data_dir)?;
         Ok(store)
     }
 
@@ -469,32 +474,42 @@ impl Store {
     /// rather than stamped down: rewriting `schema_version` would hide tables
     /// this process cannot read.
     fn migrate(&self) -> Result<(), String> {
-        let connection = self.connection.lock().expect("store poisoned");
+        let mut connection = self.connection.lock().expect("store poisoned");
         let stored = schema_version_stored(&connection)?;
         if stored > SCHEMA_VERSION {
             return Err(format!(
                 "database schema version {stored} is newer than this binary ({SCHEMA_VERSION}); refusing to start"
             ));
         }
+        if stored == SCHEMA_VERSION {
+            return Ok(());
+        }
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
         if stored < 4 {
-            connection
+            transaction
                 .execute_batch(SETTINGS_SCHEMA)
                 .map_err(|error| format!("schema: {error}"))?;
         }
         if stored < 5 {
-            connection
+            transaction
                 .execute_batch(PRINCIPALS_SCHEMA)
                 .map_err(|error| format!("schema: {error}"))?;
         }
-        if stored < SCHEMA_VERSION {
-            connection
-                .execute(
-                    "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
-                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    [SCHEMA_VERSION.to_string()],
-                )
-                .map_err(|error| error.to_string())?;
+        if stored < 6 {
+            transaction
+                .execute_batch(LEGAL_HOLD_SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
         }
+        transaction
+            .execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [SCHEMA_VERSION.to_string()],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -521,8 +536,8 @@ impl Store {
                     .execute(
                         "INSERT OR IGNORE INTO links (id, tenant, label, dest, password_hash,
                                                       created_at, expires_at, max_bytes, active,
-                                                      uploads_json, events_json)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                                      legal_hold, uploads_json, events_json)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                         link_params(link),
                     )
                     .map_err(|error| error.to_string())?;
@@ -588,7 +603,7 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                        active, uploads_json, events_json
+                        active, legal_hold, uploads_json, events_json
                  FROM links WHERE tenant = ?1 ORDER BY rowid",
             )?;
             let rows = statement.query_map([tenant], row_to_link)?;
@@ -601,7 +616,7 @@ impl Store {
             connection
                 .query_row(
                     "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                            active, uploads_json, events_json
+                            active, legal_hold, uploads_json, events_json
                      FROM links WHERE tenant = ?1 AND id = ?2",
                     rusqlite::params![tenant, id],
                     row_to_link,
@@ -618,7 +633,7 @@ impl Store {
             connection
                 .query_row(
                     "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                            active, uploads_json, events_json
+                            active, legal_hold, uploads_json, events_json
                      FROM links WHERE id = ?1",
                     [id],
                     row_to_link,
@@ -914,7 +929,7 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                        active, uploads_json, events_json
+                        active, legal_hold, uploads_json, events_json
                  FROM links ORDER BY rowid",
             )?;
             let rows = statement.query_map([], row_to_link)?;
@@ -1042,8 +1057,8 @@ impl Store {
 fn insert_link_row(connection: &Connection, link: &Link) -> rusqlite::Result<()> {
     connection.execute(
         "INSERT INTO links (id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                            active, uploads_json, events_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                            active, legal_hold, uploads_json, events_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         link_params(link),
     )?;
     Ok(())
@@ -1053,14 +1068,14 @@ fn write_link_row(connection: &Connection, link: &Link) -> rusqlite::Result<()> 
     connection.execute(
         "UPDATE links SET label = ?3, dest = ?4, password_hash = ?5, created_at = ?6,
                           expires_at = ?7, max_bytes = ?8, active = ?9,
-                          uploads_json = ?10, events_json = ?11
+                          legal_hold = ?10, uploads_json = ?11, events_json = ?12
          WHERE id = ?1 AND tenant = ?2",
         link_params(link),
     )?;
     Ok(())
 }
 
-fn link_params(link: &Link) -> [rusqlite::types::Value; 11] {
+fn link_params(link: &Link) -> [rusqlite::types::Value; 12] {
     use rusqlite::types::Value as V;
     let uploads = serde_json::to_string(&link.uploads).unwrap_or_else(|_| "[]".to_owned());
     let events = serde_json::to_string(&link.events).unwrap_or_else(|_| "[]".to_owned());
@@ -1079,6 +1094,7 @@ fn link_params(link: &Link) -> [rusqlite::types::Value; 11] {
             .map(V::from)
             .unwrap_or(V::Null),
         V::from(link.active),
+        V::from(link.legal_hold),
         V::from(uploads),
         V::from(events),
     ]
@@ -1101,6 +1117,7 @@ fn row_to_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<Link> {
             .get::<_, Option<i64>>("max_bytes")?
             .and_then(|value| u64::try_from(value).ok()),
         active: row.get::<_, i64>("active")? != 0,
+        legal_hold: row.get::<_, i64>("legal_hold")? != 0,
         uploads: serde_json::from_str(&uploads_json).unwrap_or_default(),
         events: serde_json::from_str(&events_json).unwrap_or_default(),
     })
@@ -1110,7 +1127,7 @@ fn read_link(connection: &Connection, tenant: &str, id: &str) -> Result<Option<L
     connection
         .query_row(
             "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                    active, uploads_json, events_json
+                    active, legal_hold, uploads_json, events_json
              FROM links WHERE tenant = ?1 AND id = ?2",
             rusqlite::params![tenant, id],
             row_to_link,
@@ -1546,6 +1563,7 @@ mod tests {
             expires_at: None,
             max_bytes: None,
             active: true,
+            legal_hold: false,
             uploads: Vec::new(),
             events: Vec::new(),
         }
@@ -2374,13 +2392,13 @@ mod settings_tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         drop(store);
-        assert_eq!(schema_version(directory.path()), "5");
+        assert_eq!(schema_version(directory.path()), "6");
         Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "5");
+        assert_eq!(schema_version(directory.path()), "6");
     }
 
     #[test]
-    fn v4_database_gains_principals_and_stamps_5() {
+    fn v4_database_gains_principals_and_stamps_6() {
         let directory = tempfile::tempdir().unwrap();
         {
             let connection = Connection::open(directory.path().join("votport.db")).unwrap();
@@ -2398,9 +2416,30 @@ mod settings_tests {
                 .unwrap();
         }
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "5");
+        assert_eq!(schema_version(directory.path()), "6");
         assert!(store.principals().unwrap().is_empty());
         assert!(store.principal("nobody").unwrap().is_none());
+    }
+
+    #[test]
+    fn v5_database_gains_legal_hold_and_stamps_6() {
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let connection = Connection::open(directory.path().join("votport.db")).unwrap();
+            connection.execute_batch(SCHEMA).unwrap();
+            connection.execute_batch(SETTINGS_SCHEMA).unwrap();
+            connection.execute_batch(PRINCIPALS_SCHEMA).unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO meta (key, value) VALUES ('schema_version', '5');
+                     INSERT INTO links (id, label, created_at) VALUES ('old-link', 'old', 0);",
+                )
+                .unwrap();
+        }
+
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(schema_version(directory.path()), "6");
+        assert!(!store.link("", "old-link").unwrap().unwrap().legal_hold);
     }
 
     #[test]
