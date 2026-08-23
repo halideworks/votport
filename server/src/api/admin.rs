@@ -282,24 +282,32 @@ pub struct CreateTenantRequest {
     max_sessions: Option<u64>,
 }
 
-/// Admits a tenant key: destination rules plus a single path segment. A key
-/// with a separator would be created but never reachable, since the route
-/// matches one segment and `join_under` refuses the component.
-fn admit_tenant_key(key: &str) -> ApiResult<String> {
+/// Admits a tenant key for lookup: destination rules plus the reserved names.
+/// Multi-segment keys pass here so a namespace stored before
+/// [`admit_tenant_key`] existed can still be deleted.
+fn admit_tenant_ref(key: &str) -> ApiResult<String> {
     let key = paths::admit_dest(key)
         .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
-    if key.contains('/') {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "tenant key must be a single folder name",
-        ));
-    }
     if key.is_empty() || key == "default" {
         // "default" would collide with the hard-coded metrics series for the
         // built-in namespace.
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "that tenant key is reserved",
+        ));
+    }
+    Ok(key)
+}
+
+/// Admits a tenant key for creation: one path segment. A key with a separator
+/// is unreachable, since `Tenant::path_prefix` hands it to `join_under` as a
+/// single component and every upload into it fails.
+fn admit_tenant_key(key: &str) -> ApiResult<String> {
+    let key = admit_tenant_ref(key)?;
+    if key.contains('/') {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "tenant key must be a single folder name",
         ));
     }
     Ok(key)
@@ -434,7 +442,7 @@ pub async fn delete_tenant(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_platform_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    let key = admit_tenant_key(&key)?;
+    let key = admit_tenant_ref(&key)?;
     if !app.sessions.pin_tenant_for_delete(&key) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -613,7 +621,14 @@ fn tenant_receive_dir(
     receive_dir: &std::path::Path,
     key: &str,
 ) -> Result<std::path::PathBuf, String> {
-    let path = paths::join_under(receive_dir, &[key.to_owned()])?;
+    // Split: a legacy multi-segment key is several components, and
+    // join_under refuses a component that still contains a separator.
+    let components: Vec<String> = key
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let path = paths::join_under(receive_dir, &components)?;
     if path == *receive_dir {
         return Err("refusing to purge the receive root".to_owned());
     }
@@ -2104,12 +2119,45 @@ mod tenant_offboard_tests {
         assert!(application.store.tenants().is_empty());
     }
 
+    #[tokio::test]
+    async fn delete_removes_a_legacy_multi_segment_tenant() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        // A row of the shape create_tenant used to accept. It must stay
+        // deletable, or it sits in the tenants list and /metrics forever.
+        application
+            .store
+            .insert_tenant(crate::store::Tenant {
+                key: "clients/acme".to_owned(),
+                label: "legacy".to_owned(),
+                admin_group: None,
+                max_total_bytes: None,
+                max_links: None,
+                max_sessions: None,
+                created_at: 0,
+            })
+            .unwrap();
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let response = delete_tenant_req(application.clone(), &cookie, "clients%2Facme").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(application.store.tenants().is_empty());
+    }
+
     #[test]
     fn tenant_keys_are_single_segments() {
         assert_eq!(admit_tenant_key("acme").ok().as_deref(), Some("acme"));
         assert_eq!(admit_tenant_key("/acme/").ok().as_deref(), Some("acme"));
         for bad in ["a/b", "", "default", "..", "clients/acme"] {
             assert!(admit_tenant_key(bad).is_err(), "{bad} was admitted");
+        }
+        // Delete admits a multi-segment key so legacy rows stay removable.
+        assert_eq!(
+            admit_tenant_ref("clients/acme").ok().as_deref(),
+            Some("clients/acme")
+        );
+        for bad in ["", "default", ".."] {
+            assert!(admit_tenant_ref(bad).is_err(), "{bad} was admitted");
         }
     }
 

@@ -443,6 +443,12 @@ pub async fn sso_callback(
         // The client's own no-redirect transport, not app.http: a redirecting
         // userinfo endpoint must not carry the access token onward.
         let value = match client.http.get(url).bearer_auth(token).send().await {
+            // A redirect answers here rather than being followed, so the
+            // status has to be named or the failure is undiagnosable.
+            Ok(response) if !response.status().is_success() => {
+                tracing::warn!(target: "audit", event = "sso_failed", status = %response.status(), "userinfo returned a non-success status");
+                return home("could not verify group membership");
+            }
             Ok(response) => match response.json::<serde_json::Value>().await {
                 Ok(value) => value,
                 Err(error) => {
