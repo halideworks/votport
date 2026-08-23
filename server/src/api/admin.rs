@@ -144,7 +144,12 @@ pub async fn admin_login(
     headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> ApiResult<Response> {
-    if app.throttle.locked() {
+    // Per IP, not global: a global lockout here lets anyone who can reach
+    // this endpoint hold the break-glass credential down with five wrong
+    // guesses, which is the credential the operator needs when the identity
+    // provider is the thing that is down.
+    let ip = super::client_ip(&headers, &peer);
+    if app.login_throttle.locked(&ip) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed attempts; wait a minute",
@@ -156,8 +161,7 @@ pub async fn admin_login(
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?;
-    app.throttle.record(ok);
-    let ip = super::client_ip(&headers, &peer);
+    app.login_throttle.record(&ip, ok);
     if !ok {
         tracing::warn!(target: "audit", event = "admin_login_failed", %ip, "admin login refused");
         app.store
@@ -1493,6 +1497,59 @@ mod handler_tests {
 
     use crate::api::testing;
     use crate::app;
+
+    async fn login_attempt(
+        application: Arc<App>,
+        peer: [u8; 4],
+        password: &str,
+    ) -> axum::http::Response<axum::body::Body> {
+        app::router(application)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/login")
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo(std::net::SocketAddr::from((peer, 1234))))
+                    .body(Body::from(format!("{{\"password\":\"{password}\"}}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_guessing_address_cannot_lock_out_the_operator() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        // Well past the five-failure lockout: a global throttle here would
+        // deny the break-glass credential to everyone, which is exactly what
+        // an operator needs during an identity-provider outage.
+        for _ in 0..15 {
+            let response = login_attempt(application.clone(), [203, 0, 113, 9], "wrong").await;
+            assert!(
+                response.status() == StatusCode::UNAUTHORIZED
+                    || response.status() == StatusCode::TOO_MANY_REQUESTS
+            );
+        }
+        assert_eq!(
+            login_attempt(application.clone(), [203, 0, 113, 9], "wrong")
+                .await
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the guessing address is locked"
+        );
+        assert_eq!(
+            login_attempt(
+                application.clone(),
+                [198, 51, 100, 4],
+                testing::TEST_PASSWORD
+            )
+            .await
+            .status(),
+            StatusCode::OK,
+            "another address still signs in"
+        );
+    }
 
     async fn login_cookie(router: axum::Router) -> String {
         let request = Request::builder()

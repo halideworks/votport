@@ -21,8 +21,15 @@ pub struct App {
     pub store: Arc<Store>,
     pub sessions: Sessions,
     pub secret: [u8; 32],
-    /// Global throttle for the admin password endpoints.
+    /// Global throttle for `admin_change_password`, which verifies a password
+    /// for a caller that already holds a session. Sign-in uses
+    /// `login_throttle`: a global lockout there is a denial of service against
+    /// the break-glass credential.
     pub throttle: LoginThrottle,
+    /// Per-IP throttle for admin sign-in. A separate map from
+    /// `link_throttle` so public link guessing cannot consume an operator's
+    /// sign-in budget, or the reverse.
+    pub login_throttle: crate::auth::IpThrottle,
     /// Per-IP throttle for public link password checks.
     pub link_throttle: crate::auth::IpThrottle,
     /// Per-IP rate limit on upload-session creation.
@@ -187,6 +194,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         sessions: Sessions::new(),
         secret,
         throttle: LoginThrottle::new(),
+        login_throttle: crate::auth::IpThrottle::new(),
         link_throttle: crate::auth::IpThrottle::new(),
         session_rate: crate::api::session_rate::SessionRate::new(),
         verify_rate: crate::api::session_rate::SessionRate::new(),
