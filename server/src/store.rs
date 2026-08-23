@@ -688,6 +688,42 @@ impl Store {
         })
     }
 
+    /// Public upload routes need link policy, not its ever-growing history.
+    pub fn upload_link(&self, id: &str) -> Result<Option<Link>, String> {
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT id, tenant, label, dest, password_hash, created_at, expires_at,
+                            max_bytes, active, legal_hold, '[]' AS uploads_json,
+                            '[]' AS events_json
+                     FROM links WHERE id = ?1",
+                    [id],
+                    row_to_link,
+                )
+                .optional()
+        })
+    }
+
+    pub fn uploads_by_id(&self, id: &str) -> Result<Option<Vec<UploadRecord>>, String> {
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT uploads_json FROM links WHERE id = ?1",
+                    [id],
+                    |row| {
+                        serde_json::from_str(&row.get::<_, String>(0)?).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })
+                    },
+                )
+                .optional()
+        })
+    }
+
     pub fn insert_link(&self, link: Link) -> Result<(), InsertLinkError> {
         let mut connection = self.connection.lock().expect("store poisoned");
         let transaction = connection
@@ -2007,6 +2043,21 @@ mod tests {
         assert!(loaded.uploads[0].files[0].receipt);
         assert_eq!(loaded.events[0].outcome, "cancelled");
         assert_eq!(store.links("").unwrap().len(), 1);
+        let upload_link = store.upload_link("link-1").unwrap().unwrap();
+        assert!(upload_link.uploads.is_empty());
+        assert!(upload_link.events.is_empty());
+        assert_eq!(store.uploads_by_id("link-1").unwrap().unwrap().len(), 1);
+        assert!(store.upload_link("missing").unwrap().is_none());
+        assert!(store.uploads_by_id("missing").unwrap().is_none());
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE links SET uploads_json = 'broken' WHERE id = 'link-1'",
+                    [],
+                )
+            })
+            .unwrap();
+        assert!(store.uploads_by_id("link-1").is_err());
     }
 
     #[test]

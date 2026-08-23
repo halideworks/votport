@@ -385,10 +385,10 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
     // before opening destinations rather than leave untracked files.
     let prior_uploads = setup
         .store
-        .link_by_id(&setup.link_id)
+        .uploads_by_id(&setup.link_id)
         .map_err(|error| SessionError::internal(format!("link read failed: {error}")))?
-        .ok_or_else(|| SessionError::conflict("request link no longer exists"))?
-        .uploads;
+        .ok_or_else(|| SessionError::conflict("request link no longer exists"))?;
+    let delivered = delivered_index(&prior_uploads);
 
     fs::create_dir_all(&setup.dest_dir)
         .map_err(|error| SessionError::internal(format!("create destination: {error}")))?;
@@ -396,7 +396,7 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
 
     let mut files = Vec::with_capacity(entries.len());
     for entry in &entries {
-        if let Some(existing) = find_delivered(setup, &prior_uploads, &entry.object_id()) {
+        if let Some(existing) = find_delivered(setup, &delivered, &entry.object_id()) {
             files.push(FileState {
                 display_path: entry.path().collect::<Vec<_>>().join("/"),
                 stored_components: existing.stored_components,
@@ -450,20 +450,30 @@ struct Delivered {
     receipt: bool,
 }
 
+fn delivered_index(uploads: &[UploadRecord]) -> HashMap<(&str, &str), Vec<&FileRecord>> {
+    let mut index: HashMap<_, Vec<_>> = HashMap::new();
+    for record in uploads.iter().flat_map(|upload| &upload.files) {
+        if !record.deleted {
+            index
+                .entry((record.suite.as_str(), record.root.as_str()))
+                .or_default()
+                .push(record);
+        }
+    }
+    index
+}
+
 /// A file with this object root already delivered on this link and still on
 /// disk at its recorded name: the transfer is skipped and the existing copy
 /// reported, instead of publishing a suffixed duplicate.
 fn find_delivered(
     setup: &WorkerSetup,
-    uploads: &[UploadRecord],
+    delivered: &HashMap<(&str, &str), Vec<&FileRecord>>,
     object: &ObjectId,
 ) -> Option<Delivered> {
     let suite = suite_name(object.suite);
     let root = hex::encode(object.root);
-    for record in uploads.iter().flat_map(|upload| &upload.files) {
-        if record.deleted || record.root != root || record.suite != suite {
-            continue;
-        }
+    for record in delivered.get(&(suite.as_str(), root.as_str()))? {
         // stored_as is relative to the tenant's subtree: it carries the link
         // dest but not the tenant prefix, which is why dest_rel is stripped
         // before joining under dest_dir. A record made under a
