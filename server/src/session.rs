@@ -347,8 +347,10 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
     // A package delivered to the receive root can still reach into a tenant's
     // folder through its own leading path component. The link's dest is
     // checked when the link is created; a file's path is only known here.
-    let reserved_lookup_is_empty = setup.tenant.is_empty() && setup.dest_rel.is_empty();
-    let reserved: HashSet<String> = if reserved_lookup_is_empty {
+    // True when this session publishes into the receive root, which is the
+    // only case where a package path can name a tenant folder.
+    let publishes_into_receive_root = setup.tenant.is_empty() && setup.dest_rel.is_empty();
+    let reserved: HashSet<String> = if publishes_into_receive_root {
         setup
             .store
             .tenants()
@@ -423,7 +425,7 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
     // then reads the folder; this reads the tenants after the folder is
     // taken, so in either interleaving one of the two sees the other. The
     // staged files are removed when the FileState values drop.
-    if !reserved_lookup_is_empty {
+    if publishes_into_receive_root {
         let now_reserved: HashSet<String> = setup
             .store
             .tenants()
@@ -495,7 +497,8 @@ fn find_delivered(
         if record.deleted || record.root != root || record.suite != suite {
             continue;
         }
-        // stored_as is relative to the receive root. A record made under a
+        // stored_as is relative to this session's destination directory,
+        // which already carries the tenant prefix. A record made under a
         // different link dest no longer lives beneath dest_dir; skip it.
         let rel = if setup.dest_rel.is_empty() {
             record.stored_as.as_str()

@@ -1293,6 +1293,102 @@ async fn aborted_sessions_record_a_cancelled_event() {
     assert!(events[0]["expected_bytes"].as_u64().unwrap() > stopped);
 }
 
+/// A tenant's own link publishes under its prefix already, so a package whose
+/// top-level folder happens to match the tenant key resolves to
+/// receive/<key>/<key>/... and is nobody else's business.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_may_upload_a_folder_named_like_its_own_key() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+
+    let response = client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let response = client
+        .post(format!("{base}/api/admin/tenants"))
+        .header("X-Votport", "1")
+        .json(&json!({ "key": "acme", "label": "acme" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+
+    // Act inside the tenant so the link belongs to it.
+    let response = client
+        .post(format!("{base}/api/admin/tenant"))
+        .header("X-Votport", "1")
+        .json(&json!({ "tenant": "acme" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+
+    let response = client
+        .post(format!("{base}/api/admin/links"))
+        .header("X-Votport", "1")
+        .json(&json!({ "label": "tenant inbox", "dest": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let token = response.json::<Value>().await.unwrap()["link"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let files = [prepare(vec!["acme", "report.bin"], b"mine".to_vec())];
+    let (announcement, pages, seal) = build_package(&files);
+
+    let response = client
+        .post(format!("{base}/api/r/{token}/session"))
+        .json(&json!({ "password": null, "package": announcement }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let session = response.json::<Value>().await.unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let response = client
+        .post(format!("{base}/api/session/{session}/seal"))
+        .body(seal)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    for page in pages {
+        let response = client
+            .post(format!("{base}/api/session/{session}/page"))
+            .body(page)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    }
+    let response = client
+        .post(format!("{base}/api/session/{session}/begin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "a tenant may name a folder after itself: {}",
+        response.text().await.unwrap()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_root_link_cannot_write_into_a_tenant_folder() {
     let server = start_server().await;
