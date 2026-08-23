@@ -499,6 +499,10 @@ impl Store {
     }
 
     pub fn insert_link(&self, link: Link) -> Result<(), InsertLinkError> {
+        enum Refusal {
+            NamedTenantGone,
+            DestBelongsToTenant(String),
+        }
         self.with(|connection| {
             // Named tenants have no FK; refuse inside this lock so a concurrent
             // remove_tenant cannot commit an orphan link.
@@ -509,20 +513,42 @@ impl Store {
                     |row| row.get(0),
                 )?;
                 if exists == 0 {
-                    return Ok(false);
+                    return Ok(Some(Refusal::NamedTenantGone));
+                }
+            }
+            // A default-tenant link publishes straight under the receive root,
+            // so its dest may not name a tenant's folder or sit beneath one.
+            // Checked here rather than in the handler because the connection
+            // mutex is what makes it exclusive of a concurrent create_tenant.
+            if link.tenant.is_empty() && !link.dest.is_empty() {
+                let mut statement = connection.prepare("SELECT key FROM tenants")?;
+                let keys = statement.query_map([], |row| row.get::<_, String>(0))?;
+                for key in keys {
+                    let key = key?;
+                    if link.dest == key || link.dest.starts_with(&format!("{key}/")) {
+                        return Ok(Some(Refusal::DestBelongsToTenant(key)));
+                    }
                 }
             }
             insert_link_row(connection, &link)?;
-            Ok(true)
+            Ok(None)
         })
         .map_err(InsertLinkError::Store)
-        .and_then(|inserted| {
-            if inserted {
-                Ok(())
-            } else {
-                Err(InsertLinkError::NamedTenantGone)
+        .and_then(|refusal| match refusal {
+            None => Ok(()),
+            Some(Refusal::NamedTenantGone) => Err(InsertLinkError::NamedTenantGone),
+            Some(Refusal::DestBelongsToTenant(key)) => {
+                Err(InsertLinkError::DestBelongsToTenant(key))
             }
         })
+    }
+
+    /// Writes a link row without the checks `insert_link` applies, standing in
+    /// for a database written before those checks existed. The delete-time
+    /// guard has to keep covering that state.
+    #[cfg(test)]
+    pub fn insert_link_unchecked(&self, link: Link) -> Result<(), String> {
+        self.with(|connection| insert_link_row(connection, &link))
     }
 
     /// Applies `mutate` to the link and commits; Ok(false) when absent.
@@ -559,8 +585,31 @@ impl Store {
 
     // ------------------------------------------------------------- tenants
 
-    pub fn insert_tenant(&self, tenant: Tenant) -> Result<(), String> {
+    pub fn insert_tenant(&self, tenant: Tenant) -> Result<(), InsertTenantError> {
         self.with(|connection| {
+            // The other half of the same invariant, under the same lock: a
+            // default-tenant link may already publish into this folder.
+            let mut statement =
+                connection.prepare("SELECT dest FROM links WHERE tenant = '' AND dest <> ''")?;
+            let dests = statement.query_map([], |row| row.get::<_, String>(0))?;
+            let prefix = format!("{}/", tenant.key);
+            for dest in dests {
+                let dest = dest?;
+                if dest == tenant.key || dest.starts_with(&prefix) {
+                    return Ok(Some(InsertTenantError::DefaultLinkPublishesThere));
+                }
+            }
+            // Existence too: two concurrent creates both passed a handler
+            // check and the loser hit the UNIQUE constraint, which reads as a
+            // 500 with a raw SQL message instead of a conflict.
+            let exists: i64 = connection.query_row(
+                "SELECT EXISTS (SELECT 1 FROM tenants WHERE key = ?1)",
+                [&tenant.key],
+                |row| row.get(0),
+            )?;
+            if exists != 0 {
+                return Ok(Some(InsertTenantError::AlreadyExists));
+            }
             connection.execute(
                 "INSERT INTO tenants (key, label, admin_group, max_total_bytes, max_links, max_sessions, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -573,9 +622,14 @@ impl Store {
                     tenant.max_sessions.map(|s| s as i64),
                     i64::try_from(tenant.created_at).unwrap_or(0)
                 ],
-            )
+            )?;
+            Ok(None)
         })
-        .map(|_| ())
+        .map_err(InsertTenantError::Store)
+        .and_then(|refusal| match refusal {
+            None => Ok(()),
+            Some(error) => Err(error),
+        })
     }
 
     pub fn tenants(&self) -> Vec<Tenant> {
@@ -1115,10 +1169,22 @@ pub enum TenantRemoval {
     HasLinks,
 }
 
+/// Outcome of [`Store::insert_tenant`].
+#[derive(Debug, PartialEq)]
+pub enum InsertTenantError {
+    /// A default-tenant link already publishes into that folder.
+    DefaultLinkPublishesThere,
+    /// A tenant with that key is already there.
+    AlreadyExists,
+    Store(String),
+}
+
 /// Outcome of [`Store::insert_link`].
 #[derive(Debug, PartialEq)]
 pub enum InsertLinkError {
     NamedTenantGone,
+    /// The dest names a tenant's folder, or sits beneath one.
+    DestBelongsToTenant(String),
     Store(String),
 }
 

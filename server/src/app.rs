@@ -503,12 +503,21 @@ pub async fn session_sweeper(app: Arc<App>) {
                                 if file.deleted {
                                     continue;
                                 }
-                                let components: Vec<String> = file
-                                    .stored_as
-                                    .split('/')
-                                    .filter(|part| !part.is_empty())
-                                    .map(str::to_owned)
-                                    .collect();
+                                // Same shape as admin::stored_path: the
+                                // tenant prefix is not part of stored_as, so
+                                // omitting it here deletes the default
+                                // tenant's file at that relative path.
+                                let mut components: Vec<String> = if link.tenant.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    vec![link.tenant.clone()]
+                                };
+                                components.extend(
+                                    file.stored_as
+                                        .split('/')
+                                        .filter(|part| !part.is_empty())
+                                        .map(str::to_owned),
+                                );
                                 let Ok(path) =
                                     crate::paths::join_under(&app.config.receive_dir, &components)
                                 else {

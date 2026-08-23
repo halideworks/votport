@@ -344,6 +344,23 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
         .finish()
         .map_err(|error| SessionError::bad(format!("manifest rejected: {:?}", error.code())))?;
 
+    // A package delivered to the receive root can still reach into a tenant's
+    // folder through its own leading path component. The link's dest is
+    // checked when the link is created; a file's path is only known here.
+    // True when this session publishes into the receive root, which is the
+    // only case where a package path can name a tenant folder.
+    let publishes_into_receive_root = setup.tenant.is_empty() && setup.dest_rel.is_empty();
+    let reserved: HashSet<String> = if publishes_into_receive_root {
+        setup
+            .store
+            .tenants()
+            .into_iter()
+            .map(|tenant| tenant.key)
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
     let mut total: u64 = 0;
     for entry in &entries {
         if !matches!(entry.storage(), EntryStorage::Direct) {
@@ -353,6 +370,18 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
         }
         for component in entry.path() {
             paths::admit_component(component, setup.allow_hidden).map_err(SessionError::bad)?;
+        }
+        if let Some(first) = entry.path().next() {
+            if reserved.contains(first) {
+                // The message is generic, but the refusal itself still
+                // tells a link holder that this name is taken: 422 here and
+                // 200 otherwise. What bounds the probe is the cost of each
+                // attempt, since every try needs a fresh session and those
+                // are rate limited per address.
+                return Err(SessionError::bad(format!(
+                    "{first:?} is not writable through this link"
+                )));
+            }
         }
         total = total
             .checked_add(entry.object_id().length)
@@ -390,6 +419,28 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
             continue;
         }
         files.push(open_destination(setup, entry)?);
+    }
+
+    // Recheck after the destinations exist. create_tenant writes its row and
+    // then reads the folder; this reads the tenants after the folder is
+    // taken, so in either interleaving one of the two sees the other. The
+    // staged files are removed when the FileState values drop.
+    if publishes_into_receive_root {
+        let now_reserved: HashSet<String> = setup
+            .store
+            .tenants()
+            .into_iter()
+            .map(|tenant| tenant.key)
+            .collect();
+        for file in &files {
+            if let Some(first) = file.stored_components.first() {
+                if now_reserved.contains(first) {
+                    return Err(SessionError::bad(format!(
+                        "{first:?} is not writable through this link"
+                    )));
+                }
+            }
+        }
     }
 
     // Zero-length objects have complete coverage already; publish now.
@@ -446,7 +497,9 @@ fn find_delivered(
         if record.deleted || record.root != root || record.suite != suite {
             continue;
         }
-        // stored_as is relative to the receive root. A record made under a
+        // stored_as is relative to the tenant's subtree: it carries the link
+        // dest but not the tenant prefix, which is why dest_rel is stripped
+        // before joining under dest_dir. A record made under a
         // different link dest no longer lives beneath dest_dir; skip it.
         let rel = if setup.dest_rel.is_empty() {
             record.stored_as.as_str()
@@ -606,6 +659,37 @@ fn publish_file(setup: &WorkerSetup, file: &mut FileState) -> Result<(), Session
     }
     file.published = true;
     file.native = None;
+
+    // A single-component entry never creates a directory, so nothing claims
+    // receive/<name> until the rename above; the checks at begin cannot see a
+    // tenant created during the transfer. Read the tenants after taking the
+    // name rather than before, the way create_tenant writes its row before
+    // reading the folder: whichever order the two run in, one sees the other.
+    // A plain file where a tenant folder belongs wedges that tenant, so undo
+    // the publish rather than leave it.
+    if setup.tenant.is_empty() && setup.dest_rel.is_empty() && file.stored_components.len() == 1 {
+        let name = &file.stored_components[0];
+        let taken = setup
+            .store
+            .tenants()
+            .into_iter()
+            .any(|tenant| &tenant.key == name);
+        if taken {
+            let published = paths::join_under(&setup.dest_dir, &file.stored_components)
+                .map_err(SessionError::internal)?;
+            let _ = fs::remove_file(format!("{}.vot-receipt", published.display()));
+            if let Err(error) = fs::remove_file(&published) {
+                tracing::error!(
+                    path = %published.display(), %error,
+                    "could not undo a publish onto a tenant name"
+                );
+            }
+            file.published = false;
+            return Err(SessionError::bad(format!(
+                "{name:?} is not writable through this link"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -743,6 +827,8 @@ struct SessionsInner {
     pinned: HashSet<String>,
     #[cfg(test)]
     delete_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    #[cfg(test)]
+    create_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
 }
 
 pub struct SessionHandle {
@@ -771,6 +857,8 @@ impl Sessions {
                 pinned: HashSet::new(),
                 #[cfg(test)]
                 delete_stall: None,
+                #[cfg(test)]
+                create_stall: None,
             }),
         }
     }
@@ -814,6 +902,30 @@ impl Sessions {
         let (release_tx, release_rx) = oneshot::channel();
         self.inner.lock().expect("sessions poisoned").delete_stall = Some((entered_tx, release_rx));
         (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub fn arm_create_stall(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        self.inner.lock().expect("sessions poisoned").create_stall = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    /// Held between writing a tenant row and rechecking its folder, so a test
+    /// can take the folder in exactly that window.
+    #[cfg(test)]
+    pub async fn wait_create_stall(&self) {
+        let stall = self
+            .inner
+            .lock()
+            .expect("sessions poisoned")
+            .create_stall
+            .take();
+        if let Some((entered, release)) = stall {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
     }
 
     #[cfg(test)]
