@@ -1,7 +1,7 @@
 // votport uploader: hashes files with vot-wasm, builds a VOT package, and
 // streams proven ranges to the server. AGPL-3.0-only.
 
-import { appendObjectCard } from '/assets/object-card.js';
+import { appendObjectCard, formatBytes } from '/assets/object-card.js';
 import init, {
   ObjectId,
   PackageBuilder,
@@ -204,14 +204,6 @@ function hex(bytes) {
 }
 
 // ---------------------------------------------------------------- formatting
-
-function formatBytes(bytes) {
-  if (bytes === 0) return '0 B';
-  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
-  const exponent = Math.min(Math.floor(Math.log2(bytes) / 10), units.length - 1);
-  const value = bytes / 2 ** (10 * exponent);
-  return `${value >= 100 || exponent === 0 ? Math.round(value) : value.toFixed(1)} ${units[exponent]}`;
-}
 
 // Throughput over a trailing window. A cumulative average keeps reporting a
 // speed the transfer no longer has once it stalls, which is exactly when
