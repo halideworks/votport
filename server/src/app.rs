@@ -192,10 +192,11 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     std::fs::create_dir_all(&config.receive_dir)
         .map_err(|error| format!("create {}: {error}", config.receive_dir.display()))?;
     crate::paths::tighten_dir(&config.receive_dir);
+    let store = Arc::new(Store::open(&config.data_dir)?);
+    store.migrate_tenant_storage(&config.receive_dir)?;
     // Staging files from a previous crash or kill have no live session to
     // sweep them; remove them once at startup.
     crate::paths::clean_staging(&config.receive_dir);
-    let store = Arc::new(Store::open(&config.data_dir)?);
     let secret = crate::auth::load_secret(&config.data_dir)?;
     let signer = Arc::new(crate::receipt::ReceiptSigner::load_or_create(
         &config.data_dir,
@@ -527,11 +528,7 @@ pub async fn session_sweeper(app: Arc<App>) {
                                 // tenant prefix is not part of stored_as, so
                                 // omitting it here deletes the default
                                 // tenant's file at that relative path.
-                                let mut components: Vec<String> = if link.tenant.is_empty() {
-                                    Vec::new()
-                                } else {
-                                    vec![link.tenant.clone()]
-                                };
+                                let mut components = crate::paths::tenant_prefix(&link.tenant);
                                 components.extend(
                                     file.stored_as
                                         .split('/')

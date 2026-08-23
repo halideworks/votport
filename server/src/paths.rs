@@ -7,6 +7,18 @@
 
 use std::path::{Path, PathBuf};
 
+/// Private subtree for named tenants. Package paths can never name it, so
+/// the default tenant and named tenants cannot collide on disk.
+pub const TENANT_STORAGE_DIR: &str = ".vot-tenants.stage";
+
+pub fn tenant_prefix(key: &str) -> Vec<String> {
+    if key.is_empty() {
+        Vec::new()
+    } else {
+        vec![TENANT_STORAGE_DIR.to_owned(), key.to_owned()]
+    }
+}
+
 /// Drops group/other write bits on a directory files are received into. VOT
 /// stages next to the destination and refuses a group-writable parent, so a
 /// mount created 0775 (umask 002 hosts) would fail every upload into it.
@@ -47,6 +59,9 @@ pub fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String
     }
     // Reserved even with VOTPORT_ALLOW_HIDDEN: a sender file of this shape
     // would publish fine and then be deleted by the next boot's staging sweep.
+    if component == TENANT_STORAGE_DIR {
+        return Err("name is reserved for tenant storage".to_owned());
+    }
     if component.starts_with(".vot-")
         && (component.ends_with(".stage") || component.ends_with(".journal"))
     {
@@ -175,6 +190,7 @@ mod tests {
         assert!(admit_component(".vot-1a2b-0-3c4d.stage", true).is_err());
         assert!(admit_component(".vot-1a2b-0-3c4d.journal", true).is_err());
         assert!(admit_component(".vot-notes.txt", true).is_ok());
+        assert!(admit_component(TENANT_STORAGE_DIR, true).is_err());
     }
 
     #[test]
@@ -192,6 +208,12 @@ mod tests {
         assert_eq!(with_suffix("report.pdf", 2), "report-2.pdf");
         assert_eq!(with_suffix("README", 1), "README-1");
         assert_eq!(with_suffix(".env", 1), ".env-1");
+    }
+
+    #[test]
+    fn named_tenants_use_the_reserved_subtree() {
+        assert!(tenant_prefix("").is_empty());
+        assert_eq!(tenant_prefix("acme"), [TENANT_STORAGE_DIR, "acme"]);
     }
 
     #[test]

@@ -1363,11 +1363,10 @@ async fn aborted_sessions_record_a_cancelled_event() {
     assert!(events[0]["expected_bytes"].as_u64().unwrap() > stopped);
 }
 
-/// A single-component entry creates no directory, so nothing claims the name
-/// until publish. A tenant created during the transfer must still win, or the
-/// upload lands a plain file where that tenant's folder has to be.
+/// Named tenants use a private subtree, so a default-tenant file may have the
+/// same name even when the tenant is created during the transfer.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_root_link_cannot_publish_a_file_over_a_tenant_name() {
+async fn a_root_link_can_publish_a_file_named_after_a_tenant() {
     let server = start_server().await;
     let base = server.base.clone();
     let client = reqwest::Client::builder()
@@ -1448,8 +1447,7 @@ async fn a_root_link_cannot_publish_a_file_over_a_tenant_name() {
         .unwrap();
     assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
 
-    // Sending the only chunk completes the object and reaches publish, so
-    // this request is the one that carries the refusal.
+    // Sending the only chunk completes and publishes the object.
     let file = &files[0];
     let proof = file
         .prepared
@@ -1467,20 +1465,16 @@ async fn a_root_link_cannot_publish_a_file_over_a_tenant_name() {
         .send()
         .await
         .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
     assert_eq!(
-        response.status(),
-        422,
-        "publish must refuse to put a file where the tenant folder belongs"
-    );
-    assert!(
-        !server.receive_dir.join("acme").is_file(),
-        "a plain file at that path wedges the tenant permanently"
+        std::fs::read(server.receive_dir.join("acme")).unwrap(),
+        b"a plain file"
     );
 }
 
 /// A tenant's own link publishes under its prefix already, so a package whose
 /// top-level folder happens to match the tenant key resolves to
-/// receive/<key>/<key>/... and is nobody else's business.
+/// receive/.vot-tenants.stage/<key>/<key>/... and is nobody else's business.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tenant_may_upload_a_folder_named_like_its_own_key() {
     let server = start_server().await;
@@ -1575,7 +1569,7 @@ async fn a_tenant_may_upload_a_folder_named_like_its_own_key() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_root_link_cannot_write_into_a_tenant_folder() {
+async fn a_root_link_can_upload_a_folder_named_after_a_tenant() {
     let server = start_server().await;
     let base = server.base.clone();
     let client = reqwest::Client::builder()
@@ -1651,9 +1645,36 @@ async fn a_root_link_cannot_write_into_a_tenant_folder() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 422, "{}", response.text().await.unwrap());
-    // Nothing was written under the tenant's folder.
-    assert!(!server.receive_dir.join("acme").join("invoice.pdf").exists());
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let entry = response.json::<Value>().await.unwrap()["entries"][0]["index"]
+        .as_u64()
+        .unwrap();
+    let file = &files[0];
+    let proof = file
+        .prepared
+        .prove(0, file.bytes.len() as u64)
+        .expect("prove");
+    let mut body = proof.proof().to_vec();
+    let proof_len = body.len();
+    body.extend_from_slice(&file.bytes);
+    let response = client
+        .post(format!(
+            "{base}/api/session/{session}/chunk?entry={entry}&offset=0"
+        ))
+        .header("X-Votport-Proof", proof_len.to_string())
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    assert_eq!(
+        std::fs::read(server.receive_dir.join("acme/invoice.pdf")).unwrap(),
+        b"not yours"
+    );
+    assert!(!server
+        .receive_dir
+        .join(".vot-tenants.stage/acme/invoice.pdf")
+        .exists());
 }
 
 /// A package refused at begin (hidden path here) consumes the session, so
