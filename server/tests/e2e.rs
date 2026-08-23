@@ -588,7 +588,7 @@ async fn corrupted_chunks_are_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn begin_store_failure_creates_no_destination() {
+async fn corrupt_events_fail_begin_before_destination() {
     let server = start_server().await;
     let base = server.base.clone();
     let client = reqwest::Client::builder()
@@ -645,7 +645,10 @@ async fn begin_store_failure_creates_no_destination() {
     }
     rusqlite::Connection::open(server._data.path().join("votport.db"))
         .unwrap()
-        .execute_batch("DROP TABLE links")
+        .execute(
+            "UPDATE links SET events_json = 'broken' WHERE id = ?1",
+            [&token],
+        )
         .unwrap();
 
     let response = client

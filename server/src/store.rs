@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension as _};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::config::Config;
 
@@ -708,16 +708,12 @@ impl Store {
         self.with(|connection| {
             connection
                 .query_row(
-                    "SELECT uploads_json FROM links WHERE id = ?1",
+                    "SELECT uploads_json, events_json FROM links WHERE id = ?1",
                     [id],
                     |row| {
-                        serde_json::from_str(&row.get::<_, String>(0)?).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })
+                        let uploads = parse_json(&row.get::<_, String>(0)?, 0)?;
+                        let _: Vec<SessionEvent> = parse_json(&row.get::<_, String>(1)?, 1)?;
+                        Ok(uploads)
                     },
                 )
                 .optional()
@@ -1474,8 +1470,8 @@ fn row_to_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<Link> {
             .and_then(|value| u64::try_from(value).ok()),
         active: row.get::<_, i64>("active")? != 0,
         legal_hold: row.get::<_, i64>("legal_hold")? != 0,
-        uploads: serde_json::from_str(&uploads_json).unwrap_or_default(),
-        events: serde_json::from_str(&events_json).unwrap_or_default(),
+        uploads: parse_json(&uploads_json, 10)?,
+        events: parse_json(&events_json, 11)?,
     })
 }
 
@@ -1512,8 +1508,8 @@ fn map_principal(row: &rusqlite::Row<'_>) -> rusqlite::Result<Principal> {
         credential_version: row.get::<_, i64>("credential_version")?.max(0) as u64,
         blocked: row.get::<_, i64>("blocked")? != 0,
         last_login_at: row.get::<_, i64>("last_login_at")?.max(0) as u64,
-        last_groups: serde_json::from_str(&last_groups).unwrap_or_default(),
-        last_grants: serde_json::from_str(&last_grants).unwrap_or_else(|_| serde_json::json!([])),
+        last_groups: parse_json(&last_groups, 4)?,
+        last_grants: parse_json(&last_grants, 5)?,
         source: row.get("source")?,
     })
 }
@@ -1526,7 +1522,17 @@ fn map_audit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRow> {
         actor: row.get(3)?,
         event: row.get(4)?,
         subject: row.get(5)?,
-        detail: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or(serde_json::Value::Null),
+        detail: parse_json(&row.get::<_, String>(6)?, 6)?,
+    })
+}
+
+fn parse_json<T: DeserializeOwned>(text: &str, column: usize) -> rusqlite::Result<T> {
+    serde_json::from_str(text).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
     })
 }
 
@@ -2058,6 +2064,17 @@ mod tests {
             })
             .unwrap();
         assert!(store.uploads_by_id("link-1").is_err());
+        assert!(store.link("", "link-1").is_err());
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE links SET uploads_json = '[]', events_json = 'broken' WHERE id = 'link-1'",
+                    [],
+                )
+            })
+            .unwrap();
+        assert!(store.uploads_by_id("link-1").is_err());
+        assert!(store.link("", "link-1").is_err());
     }
 
     #[test]
@@ -2355,6 +2372,12 @@ mod tests {
         let pruned = store.audit_prune(now + 1).unwrap();
         assert_eq!(pruned, 2);
         assert!(store.audit_export("", 0, 0, 100).unwrap().is_empty());
+
+        store.audit("", "", "test", "corrupt", &serde_json::json!({}));
+        store
+            .with(|connection| connection.execute("UPDATE audit_log SET detail = 'broken'", []))
+            .unwrap();
+        assert!(store.audit_export("", 0, 0, 100).is_err());
     }
 
     #[test]
@@ -3205,5 +3228,27 @@ mod principals_store_tests {
         assert!(!store.principal_allows("user@example.com", 1));
         assert!(!store.revoke_principal("missing").unwrap());
         assert!(!store.unblock_principal("missing").unwrap());
+
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE principals SET last_groups = 'broken' WHERE subject = ?1",
+                    ["user@example.com"],
+                )
+            })
+            .unwrap();
+        assert!(store.principal("user@example.com").is_err());
+        assert!(!store.principal_allows("user@example.com", 2));
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE principals SET last_groups = '[]', last_grants = 'broken'
+                     WHERE subject = ?1",
+                    ["user@example.com"],
+                )
+            })
+            .unwrap();
+        assert!(store.principal("user@example.com").is_err());
+        assert!(!store.principal_allows("user@example.com", 2));
     }
 }
