@@ -41,9 +41,10 @@ implementation, not the API.
   for quota and holdings accounting, updated atomically by upload append and
   file deletion. Full history normalization remains deferred until the
   embedded representation measurably limits a deployment.
-- Migration: if `state.json` exists and the DB is absent, import and rename the
-  JSON to `state.json.imported`. The importer runs before the listener binds; a
-  failed import refuses startup rather than silently dropping links.
+- Migration: whenever legacy `state.json` remains, import it with idempotent
+  inserts and rename it to `state.json.imported`. This safely resumes a crash
+  after the database commit but before the rename. The importer runs before the
+  listener binds; a failed import refuses startup rather than dropping links.
 - `persist()`'s temp-file-plus-fsync dance disappears; SQLite WAL + `synchronous
   FULL` gives the same durability with less code.
 
@@ -66,9 +67,9 @@ still leave only the tracing event.
 
 ## Phase 3: OIDC admin auth (local auth stays)
 
-- Config: `VOTPORT_OIDC_ISSUER`, `VOTPORT_OIDC_CLIENT_ID`, secret file ref.
-  Authorization-code flow with PKCE; discovery is lazy and retries after a
-  cooldown when the provider is unavailable.
+- Config: `VOTPORT_OIDC_ISSUER`, `VOTPORT_OIDC_CLIENT_ID`, and
+  `VOTPORT_OIDC_CLIENT_SECRET`. Authorization-code flow uses PKCE; discovery is
+  lazy and retries after a cooldown when the provider is unavailable.
 - SSO session cookies are stateless HMAC tokens containing the subject, grants,
   and `credential_version`. Explicit principal revoke bumps that version and
   blocks new sessions. Group changes apply on the next login; revoke existing
@@ -85,10 +86,11 @@ still leave only the tracing event.
 
 ## Phase 4: Tenant scoping and quotas
 
-- Every `Link` gains `tenant`. Administrative store reads require the tenant
-  from the authenticated context. Public upload reads intentionally use the
-  unguessable link id as a capability, while internal retention and metrics may
-  span tenants explicitly.
+- Every `Link` gains `tenant`. Named-tenant link and audit reads use the tenant
+  from the authenticated context; authorized platform administration,
+  retention, and metrics may span tenants explicitly. Public link metadata uses
+  the unguessable link id as a capability, while any configured link password
+  gates authorization and session creation.
 - Path layout: named tenants publish under the reserved
   `<receive_dir>/.vot-tenants.stage/<tenant>/<dest>/...` subtree; the default
   tenant retains the receive root layout. The existing `admit_dest` +
@@ -122,7 +124,7 @@ still leave only the tracing event.
 | Change | Mitigation |
 | --- | --- |
 | Cross-tenant path escape | Tenant prefix is server-chosen below the reserved `.vot-tenants.stage` subtree; `join_under` rejects traversal components; stored records remain server-generated |
-| Cross-tenant data read | Administrative reads are tenant-scoped; public upload reads require the unguessable capability id and any configured link password |
+| Cross-tenant data read | Named-tenant link and audit reads are scoped; authorized platform admins may aggregate across tenants. The capability id exposes public link metadata, while any configured link password gates session creation |
 | Tenant admin confusion | SSO cookie MAC covers the embedded grants; group changes apply on next login, while explicit revoke invalidates existing sessions |
 | Audit tampering | Audit rows are insert-only from the request path; no admin route deletes them; retention prune is the only writer |
 | Cross-tenant noisy-neighbor DoS | `IpThrottle` and `SessionRate` remain shared IP-keyed controls; per-tenant session caps and atomic byte reservations bound each tenant's admitted work |
