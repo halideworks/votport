@@ -21,7 +21,7 @@ A tenant is an isolated namespace:
 
 - its own admins (via SSO group/claim mapping),
 - its own request links, upload history, and session events,
-- its own receive subtree `<receive_dir>/<tenant>/...`,
+- its own receive subtree `<receive_dir>/.vot-tenants.stage/<tenant>/...`,
 - its own byte quota and concurrent-session cap.
 
 Tenants never share links, files, history, or quota. There is no cross-tenant
@@ -35,14 +35,16 @@ implementation, not the API.
 
 - rusqlite (bundled SQLite, WAL mode), one database file `data/votport.db`.
 - `Store` keeps its current method set; signatures gain no tenant concept yet.
-- Schema: `links`, `uploads`, `files`, `meta` (schema version), plus an
-  `audit_log` table created now but written only from phase 2. Session events
-  stay embedded in the `links` row exactly as today (`Link.events`, capped) —
-  splitting them into a table changes the read API, so that moves to phase 2
-  with the audit work. Foreign keys on, `busy_timeout` set.
-- Migration: if `state.json` exists and the DB is absent, import and rename the
-  JSON to `state.json.imported`. The importer runs before the listener binds; a
-  failed import refuses startup rather than silently dropping links.
+- Schema began with `links`, `meta` (schema version), and an `audit_log` table
+  written from phase 2. Completed uploads and capped session events remain
+  embedded in each link row; schema v7 adds an exact-byte `files` projection
+  for quota and holdings accounting, updated atomically by upload append and
+  file deletion. Full history normalization remains deferred until the
+  embedded representation measurably limits a deployment.
+- Migration: whenever legacy `state.json` remains, import it with idempotent
+  inserts and rename it to `state.json.imported`. This safely resumes a crash
+  after the database commit but before the rename. The importer runs before the
+  listener binds; a failed import refuses startup rather than dropping links.
 - `persist()`'s temp-file-plus-fsync dance disappears; SQLite WAL + `synchronous
   FULL` gives the same durability with less code.
 
@@ -51,52 +53,54 @@ retrofitting tenancy onto the JSON document twice is wasted work.
 
 ## Phase 2: Queryable audit log
 
-The tracing `audit` target stays (operators grep logs), and every audit event is
-also inserted into `audit_log(at, tenant, actor, event, subject, detail_json)`.
+The tracing `audit` target stays as the operational record. Core security and
+lifecycle request paths also insert best-effort rows into
+`audit_log(at, tenant, actor, event, subject, detail)`; a database failure can
+still leave only the tracing event.
 
 - Retention: `VOTPORT_AUDIT_RETENTION_DAYS` (default 400), swept daily.
-- Export: admin endpoint `GET /api/admin/audit?since=...` streams JSONL, the format
-  SIEMs ingest without conversion.
-- Login attempts, link lifecycle, file deletions, password changes, and upload
-  completions all land here with the client IP already captured by `client_ip`.
+- Export: `GET /api/admin/audit?since=...&after_rowid=...&limit=...` returns a
+  capped, buffered JSONL page with a stable cursor, a format SIEMs ingest
+  without conversion.
+- Login, link lifecycle, file deletion, password-change, and upload-completion
+  request paths persist rows alongside their tracing events.
 
 ## Phase 3: OIDC admin auth (local auth stays)
 
-- Config: `VOTPORT_OIDC_ISSUER`, `VOTPORT_OIDC_CLIENT_ID`, secret file ref.
-  Authorization-code flow with PKCE; discovery document fetched at boot.
-- The admin session cookie stays a stateless HMAC token, but its MAC now covers
-  `(subject, tenant, role, credential_version)` instead of the password hash.
-  `credential_version` bumps on a local password change (preserving today's
-  guarantee that changing the break-glass password evicts every session) and on
-  role or tenant-mapping changes, reusing the existing binding trick.
-- Tenant mapping: the `tenant` claim if present, else group-to-tenant mapping in
-  the DB, else the single default tenant. Role: `admin` or `viewer` from claims;
-  `viewer` gets read-only admin routes (enforced where `require_admin_write`
-  sits today); finer roles are deferred until someone asks with a use case.
+- Config: `VOTPORT_OIDC_ISSUER`, `VOTPORT_OIDC_CLIENT_ID`, and
+  `VOTPORT_OIDC_CLIENT_SECRET`. Authorization-code flow uses PKCE; discovery is
+  lazy and retries after a cooldown when the provider is unavailable.
+- SSO session cookies are stateless HMAC tokens containing the subject, grants,
+  and `credential_version`. Explicit principal revoke bumps that version and
+  blocks new sessions. Group changes apply on the next login; revoke existing
+  sessions when a grant must disappear immediately.
+- Tenant mapping uses the OIDC `groups` claim against configured platform groups
+  and each tenant's `admin_group`. `viewer` gets read-only admin routes (enforced
+  by `require_admin_write`); finer roles are deferred until a concrete use case.
   SAML is out of scope: OIDC covers every provider named above, and SAML-in-front
   of an OIDC bridge is the standard enterprise answer.
 - Local password auth remains the zero-config default and the break-glass path;
-  it maps to the default tenant. When OIDC is configured, the login page offers
-  SSO first.
+  it grants platform access, and changing the password invalidates its existing
+  cookies. When OIDC is configured, the login page offers SSO first.
 - CSRF posture unchanged (custom header on mutations).
 
 ## Phase 4: Tenant scoping and quotas
 
-- Every `Link` gains `tenant`. Every store query takes the tenant from the
-  authenticated context; the store API makes unscoped queries unrepresentable
-  (methods take `tenant: &str`, no method lists all tenants' links).
-- Path layout: published files land under `<receive_dir>/<tenant>/<dest>/...`.
-  The existing `admit_dest` + `join_under` guards apply unchanged below the
-  tenant prefix, so the traversal story is: tenant prefix is server-chosen,
-  everything under it already proven safe.
+- Every `Link` gains `tenant`. Named-tenant link and audit reads use the tenant
+  from the authenticated context; authorized platform administration,
+  retention, and metrics may span tenants explicitly. Public link metadata uses
+  the unguessable link id as a capability, while any configured link password
+  gates authorization and session creation.
+- Path layout: named tenants publish under the reserved
+  `<receive_dir>/.vot-tenants.stage/<tenant>/<dest>/...` subtree; the default
+  tenant retains the receive root layout. The existing `admit_dest` +
+  `join_under` guards apply unchanged below the server-chosen tenant prefix.
 - Quotas per tenant: `max_total_bytes` (sum of live uploads), `max_sessions`
-  (concurrent, enforced next to `MAX_SESSIONS_PER_LINK`), `max_links`. Enforced
-  in `create_session`/`create_link` alongside the existing per-link caps and the
-  per-IP `SessionRate`. Known bounded race: concurrent sessions each pass the
-  byte-quota check before uploading, so the total can overshoot by up to
-  (max_sessions - 1) x per-session cap mid-transfer; chunks are merkle-verified
-  against the announced size, so a lying announcement fails verification rather
-  than consuming quota.
+  (concurrent, enforced next to `MAX_SESSIONS_PER_LINK`), `max_links`. Session
+  admission atomically combines SQL-accounted live bytes with every in-flight
+  session's announced-byte reservation under the same lock that enforces
+  tenant, link, and global session caps. Cancellation-safe leases retain those
+  reservations until queued worker commands actually finish.
 - Admin UI: tenant switcher for admins with multiple tenant roles; otherwise the
   UI is unchanged. Senders see nothing new.
 
@@ -111,20 +115,20 @@ also inserted into `audit_log(at, tenant, actor, event, subject, detail_json)`.
 - Deployment guide: single instance behind Caddy, volume layout, SSO setup with
   two worked examples (Authentik, Entra ID).
 - Upload-content lifecycle: `VOTPORT_UPLOAD_RETENTION_DAYS` (off by default) with
-  a daily sweep deleting expired received files and their records, emitting audit
-  events; audit retention alone does not answer "how long does received data
-  live", which every security review asks.
+  a daily sweep deleting expired received files and tombstoning their file
+  records, emitting audit events; audit retention alone does not answer "how
+  long does received data live", which every security review asks.
 
 ## Threat-model deltas
 
 | Change | Mitigation |
 | --- | --- |
-| Cross-tenant path escape | Tenant prefix is server-chosen; `join_under` guard already rejects traversal components; stored records remain server-generated |
-| Cross-tenant data read | Tenant is in every store query signature, not remembered by callers; token MAC binds tenant |
-| Tenant admin confusion | Cookie MAC covers `(subject, tenant, role)`; switching tenant re-issues the cookie |
+| Cross-tenant path escape | Tenant prefix is server-chosen below the reserved `.vot-tenants.stage` subtree; `join_under` rejects traversal components; stored records remain server-generated |
+| Cross-tenant data read | Named-tenant link and audit reads are scoped; authorized platform admins may aggregate across tenants. The capability id exposes public link metadata, while any configured link password gates session creation |
+| Tenant admin confusion | SSO cookie MAC covers the embedded grants; group changes apply on next login, while explicit revoke invalidates existing sessions |
 | Audit tampering | Audit rows are insert-only from the request path; no admin route deletes them; retention prune is the only writer |
-| Cross-tenant noisy-neighbor DoS | Today's `IpThrottle`, `SessionRate`, and session caps are shared buckets; phase 4 adds per-tenant throttle buckets and per-tenant session caps alongside them |
-| Tenant offboarding and erasure | Pin on the Sessions mutex so `insert` fails; register then spawn; drop the tenant row so fail-closed applies; purge `<receive>/<tenant>/` via `join_under`; emit `tenant_deleted` with `purged_receive`. DELETE on an absent key is leftover retry only when the directory exists and no default-tenant dest collides; unknown key with no dir is 404. Snapshots under `data/backups/` (30-day sweep) and Litestream replicas retain rows until they rotate; `/received` file backups retain bytes until they rotate. See `docs/deployment.md`. |
+| Cross-tenant noisy-neighbor DoS | `IpThrottle` and `SessionRate` remain shared IP-keyed controls; per-tenant session caps and atomic byte reservations bound each tenant's admitted work |
+| Tenant offboarding and erasure | Pin on the Sessions mutex so `insert` fails; register then spawn; drop the tenant row so fail-closed applies; purge `<receive>/.vot-tenants.stage/<tenant>/` via `join_under`; emit `tenant_deleted` with `purged_receive`. DELETE on an absent key is leftover retry only when the directory exists and no default-tenant dest collides; unknown key with no dir is 404. Snapshots under `data/backups/` (30-day sweep) and Litestream replicas retain rows until they rotate; `/received` file backups retain bytes until they rotate. See `docs/deployment.md`. |
 | OIDC provider outage | One platform local password (`AdminIdentity::local_admin`). `require_admin` expands its grants to every named tenant. Named tenants have no separate password. |
 
 ## Non-goals
