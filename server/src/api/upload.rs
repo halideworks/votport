@@ -246,19 +246,24 @@ pub async fn create_session(
     }
     // Fail closed when a named tenant row has vanished: publishing into the
     // receive root unprefixed and quota-free would cross a tenant boundary.
-    if !link.tenant.is_empty()
-        && app
+    let tenant = if link.tenant.is_empty() {
+        None
+    } else {
+        match app
             .store
             .tenant(&link.tenant)
             .map_err(super::store_unavailable)?
-            .is_none()
-    {
-        audit_session_rejected(&app, &link.tenant, "link tenant missing");
-        return Err(ApiError::new(
-            StatusCode::GONE,
-            "this link's tenant no longer exists",
-        ));
-    }
+        {
+            Some(tenant) => Some(tenant),
+            None => {
+                audit_session_rejected(&app, &link.tenant, "link tenant missing");
+                return Err(ApiError::new(
+                    StatusCode::GONE,
+                    "this link's tenant no longer exists",
+                ));
+            }
+        }
+    };
     if app.sessions.active_for_link(&link.id) >= MAX_SESSIONS_PER_LINK
         || app.sessions.total() >= MAX_SESSIONS
     {
@@ -281,48 +286,22 @@ pub async fn create_session(
     // Quotas: the tenant's received-but-not-deleted bytes plus this upload
     // must stay under max_total_bytes, and its concurrent sessions under
     // max_sessions.
-    let (max_total, _, max_sessions) = app
-        .store
-        .quotas_for(&link.tenant, &app.config)
-        .map_err(super::store_unavailable)?;
-    if let Some(max_total) = max_total {
-        let received = app
-            .store
-            .tenant_received_bytes(&link.tenant)
-            .map_err(super::store_unavailable)?;
-        let remaining = max_total.saturating_sub(received);
-        if expected.length > remaining {
-            audit_session_rejected(&app, &link.tenant, "byte quota exhausted");
-            return Err(ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!(
-                    "this tenant's storage quota is exhausted ({received} of {max_total} bytes used)"
-                ),
-            ));
-        }
-    }
+    let (max_total, _, max_sessions) = if let Some(tenant) = &tenant {
+        (
+            tenant.max_total_bytes,
+            tenant.max_links,
+            tenant.max_sessions,
+        )
+    } else {
+        app.store
+            .quotas_for("", &app.config)
+            .map_err(super::store_unavailable)?
+    };
 
     // Named tenants publish into <receive>/<tenant-key>/...; the default
     // tenant keeps today's layout. Do not fall back to the receive root
     // when a named tenant row has vanished.
-    let mut dest_components = if link.tenant.is_empty() {
-        Vec::new()
-    } else {
-        match app
-            .store
-            .tenant(&link.tenant)
-            .map_err(super::store_unavailable)?
-        {
-            Some(tenant) => tenant.path_prefix(),
-            None => {
-                audit_session_rejected(&app, &link.tenant, "link tenant missing");
-                return Err(ApiError::new(
-                    StatusCode::GONE,
-                    "this link's tenant no longer exists",
-                ));
-            }
-        }
-    };
+    let mut dest_components = tenant.map_or_else(Vec::new, |tenant| tenant.path_prefix());
     dest_components.extend(
         link.dest
             .split('/')
