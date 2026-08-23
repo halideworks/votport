@@ -806,12 +806,12 @@ pub struct SessionLease {
 
 impl Drop for SessionLease {
     fn drop(&mut self) {
-        self.activity.in_flight.fetch_sub(1, Ordering::AcqRel);
         *self
             .activity
             .last_active
             .lock()
             .expect("session activity poisoned") = Instant::now();
+        self.activity.in_flight.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -1319,6 +1319,12 @@ mod pin_tests {
         };
         sessions.sweep(0);
         assert_eq!(sessions.total(), 1);
+        *_lease
+            .activity
+            .last_active
+            .lock()
+            .expect("session activity poisoned") =
+            Instant::now() - std::time::Duration::from_secs(2);
         assert!(reply
             .send(Ok(FinishReport {
                 upload_id: "upload".to_owned(),
@@ -1326,6 +1332,8 @@ mod pin_tests {
             }))
             .is_err());
         drop(_lease);
+        sessions.sweep(1);
+        assert_eq!(sessions.total(), 1);
         sessions.sweep(0);
         assert_eq!(sessions.total(), 0);
     }
