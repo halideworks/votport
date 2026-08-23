@@ -367,6 +367,28 @@ impl Store {
         }
 
         let default_links = self.links("")?;
+        let default_owns_prefix = |key: &str| {
+            let key = key.to_lowercase();
+            let prefix = format!("{key}/");
+            let uses_prefix = |path: &str| {
+                let path = path.to_lowercase();
+                path == key || path.starts_with(&prefix)
+            };
+            default_links.iter().any(|link| {
+                uses_prefix(&link.dest)
+                    || link
+                        .uploads
+                        .iter()
+                        .flat_map(|upload| &upload.files)
+                        .any(|file| !file.deleted && uses_prefix(&file.stored_as))
+            })
+        };
+        if target_root_metadata.is_some() && default_owns_prefix(crate::paths::TENANT_STORAGE_DIR) {
+            return Err(format!(
+                "tenant storage migration cannot determine ownership of {}; a default-tenant link also uses that prefix",
+                target_root.display()
+            ));
+        }
         let tenants = self.tenants()?;
         let mut moves = Vec::new();
         for tenant in tenants {
@@ -400,22 +422,7 @@ impl Store {
                     target.display()
                 ));
             }
-            if (source_exists || target_exists)
-                && default_links.iter().any(|link| {
-                    let key = tenant.key.to_lowercase();
-                    let prefix = format!("{key}/");
-                    let uses_prefix = |path: &str| {
-                        let path = path.to_lowercase();
-                        path == key || path.starts_with(&prefix)
-                    };
-                    uses_prefix(&link.dest)
-                        || link
-                            .uploads
-                            .iter()
-                            .flat_map(|upload| &upload.files)
-                            .any(|file| !file.deleted && uses_prefix(&file.stored_as))
-                })
-            {
+            if (source_exists || target_exists) && default_owns_prefix(&tenant.key) {
                 return Err(format!(
                     "tenant storage migration cannot determine ownership of {}; a default-tenant link also uses that prefix",
                     source.display()
@@ -1692,6 +1699,23 @@ mod tests {
         assert!(error.contains("cannot determine ownership"), "{error}");
         assert!(receive.join("acme/invoice.pdf").exists());
         assert!(!receive.join(crate::paths::TENANT_STORAGE_DIR).exists());
+
+        std::fs::remove_dir_all(receive.join("acme")).unwrap();
+        std::fs::create_dir_all(receive.join(crate::paths::TENANT_STORAGE_DIR).join("acme"))
+            .unwrap();
+        store
+            .update_link("", "root", |link| {
+                link.uploads[0].files[0].stored_as =
+                    ".VOT-TENANTS.STAGE/acme/invoice.pdf".to_owned();
+            })
+            .unwrap();
+
+        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        assert!(error.contains("cannot determine ownership"), "{error}");
+        assert!(receive
+            .join(crate::paths::TENANT_STORAGE_DIR)
+            .join("acme")
+            .exists());
     }
 
     #[test]
