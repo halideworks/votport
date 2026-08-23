@@ -197,6 +197,20 @@ overlay environment variables via `GET`/`PUT /api/admin/settings`
 `""` disables a URL or token; JSON `null` ("Use environment") deletes the
 row so env applies again. See [`enterprise-ops.md`](enterprise-ops.md).
 
+## Admin password minimum
+
+`VOTPORT_ADMIN_PASSWORD` must be at least 12 characters, and votport exits at
+startup when it is shorter. Throttling bounds how fast a guess is checked and
+cannot make a short password safe, and this is the credential that still works
+when the identity provider does not.
+
+Upgrading a deployment whose password is shorter will fail to start. Either
+set a longer one, or switch to `VOTPORT_ADMIN_PASSWORD_HASH`, which is exempt
+because a PHC string says nothing about the length of the password behind it.
+A password already changed through the System page lives in the database and
+takes precedence over both, so rotating the environment value does not sign
+anyone out.
+
 ## Client addresses
 
 Throttles and audit rows need to know which client made a request. Behind a
@@ -220,21 +234,34 @@ environment:
 
 Do not copy an address out of this document, and do not assume a container
 bridge gateway is stable, because Docker assigns those when it creates the
-network. Determine it for your own deployment: make one request through the
-proxy with a deliberately wrong admin password and read the address votport
+network. Determine it for your own deployment: send one request **through the
+proxy** with a deliberately wrong admin password, then read what votport
 logged.
 
 ```sh
-curl -sS -o /dev/null -X POST http://127.0.0.1:8103/api/admin/login \
+curl -sk --resolve receive.example.com:443:127.0.0.1 \
+  -X POST https://receive.example.com/api/admin/login \
   -H 'content-type: application/json' -d '{"password":"wrong"}'
 docker logs --since 30s votport | grep admin_login_failed
 ```
 
-The `ip` field in that line is the peer votport saw. If the deployment is
-behind a proxy, that is the value to name. Recheck it after recreating the
-network. Setting the variable to an address the proxy does not use collapses
-every client into one bucket, so confirm sign-in still records distinct
-addresses afterwards.
+That line carries two addresses, and the difference between them is the whole
+point:
+
+- `peer` is the socket address votport accepted the connection from. Behind a
+  proxy this is the proxy. **This is the value to name in the variable.**
+- `ip` is the address votport decided the client has, which is the forwarded
+  header when it was believed. Naming this one would trust a client rather
+  than the proxy, and leave the proxy untrusted.
+
+Send the request through the proxy, not straight to the published port: a
+direct request makes both fields the same and tells you nothing about which
+is which.
+
+Recheck after recreating the network. Naming an address the proxy does not
+connect from collapses every client into one bucket, so confirm afterwards
+that failed sign-ins from two different clients still log two different `ip`
+values.
 
 ## Metrics
 

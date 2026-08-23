@@ -150,7 +150,10 @@ pub async fn admin_login(
     // choose, and because one IPv6 client holds a whole prefix.
     let ip = super::client_ip(&headers, &peer, &app.config.trusted_proxies);
     let bucket = super::throttle_key(&ip);
-    if app.login_throttle.locked(&bucket) {
+    // Counted before the verify, not after: checking and then recording lets
+    // any number of concurrent attempts pass the check together, which turns
+    // five per window into five per connection the caller opens.
+    if !app.login_throttle.claim(&bucket) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed attempts; wait a minute",
@@ -174,9 +177,13 @@ pub async fn admin_login(
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?;
-    app.login_throttle.record(&bucket, ok);
+    if ok {
+        app.login_throttle.succeeded(&bucket);
+    }
     if !ok {
-        tracing::warn!(target: "audit", event = "admin_login_failed", %ip, "admin login refused");
+        // peer is the socket address; ip is what the forwarded header named,
+        // when it was believed. VOTPORT_TRUSTED_PROXIES wants the peer.
+        tracing::warn!(target: "audit", event = "admin_login_failed", %ip, peer = %peer.ip(), "admin login refused");
         app.store
             .audit("", "", "admin_login_failed", &ip, &serde_json::json!({}));
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "wrong password"));

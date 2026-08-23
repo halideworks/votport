@@ -124,7 +124,9 @@ async fn check_link_password(
     // One bucket per v4 address and per IPv6 /64: a client holding a routed
     // prefix would otherwise get a fresh five-guess budget per address.
     let bucket = super::throttle_key(ip);
-    if app.link_throttle.locked(&bucket) {
+    // Claimed before the verify; see admin_login for why checking and then
+    // recording is not enough.
+    if !app.link_throttle.claim(&bucket) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed attempts; wait a minute",
@@ -145,7 +147,9 @@ async fn check_link_password(
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?;
-    app.link_throttle.record(&bucket, ok);
+    if ok {
+        app.link_throttle.succeeded(&bucket);
+    }
     if !ok {
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,

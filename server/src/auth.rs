@@ -335,8 +335,45 @@ impl IpThrottle {
         })
     }
 
-    pub fn record(&self, ip: &str, success: bool) {
+    /// Claims one attempt for `ip`, counting it as a failure up front, and
+    /// reports whether it may proceed. Checking `locked` and recording the
+    /// outcome afterwards leaves a window where any number of concurrent
+    /// attempts pass the check together, so the five-per-window limit becomes
+    /// a limit per connection count instead. Call [`Self::succeeded`] to
+    /// clear the claim when the password turns out to be right.
+    pub fn claim(&self, ip: &str) -> bool {
         let mut state = self.state.lock().expect("throttle poisoned");
+        if state.get(ip).is_some_and(|entry| {
+            entry
+                .locked_until
+                .is_some_and(|until| Instant::now() < until)
+        }) {
+            return false;
+        }
+        Self::evict_if_full(&mut state, ip);
+        let entry = state.entry(ip.to_owned()).or_insert(IpState {
+            failures: 0,
+            locked_until: None,
+            last_seen: Instant::now(),
+        });
+        entry.last_seen = Instant::now();
+        entry.failures += 1;
+        if entry.failures >= LOCKOUT_THRESHOLD {
+            entry.locked_until = Some(Instant::now() + Duration::from_secs(LOCKOUT_SECS));
+            entry.failures = 0;
+        }
+        true
+    }
+
+    /// Clears a claim after a correct password.
+    pub fn succeeded(&self, ip: &str) {
+        self.state.lock().expect("throttle poisoned").remove(ip);
+    }
+
+    /// Frees a slot when the table is at cap, so a caller rotating addresses
+    /// cannot grow it without bound. Live lockouts are evicted only when
+    /// nothing else can be, which costs an attacker a full set of failures.
+    fn evict_if_full(state: &mut std::collections::HashMap<String, IpState>, ip: &str) {
         if state.len() >= IP_TABLE_CAP {
             // Evict only dead weight: expired, idle entries. Live lockouts
             // survive, so filling the table cannot reset anyone's penalty.
@@ -374,6 +411,11 @@ impl IpThrottle {
                 }
             }
         }
+    }
+
+    pub fn record(&self, ip: &str, success: bool) {
+        let mut state = self.state.lock().expect("throttle poisoned");
+        Self::evict_if_full(&mut state, ip);
         if success {
             state.remove(ip);
             return;
@@ -413,6 +455,23 @@ pub fn cookie_value<'header>(header: &'header str, name: &str) -> Option<&'heade
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_attempts_cannot_outrun_the_counter() {
+        let throttle = IpThrottle::new();
+        // Every attempt is counted as it starts, so five claims exhaust the
+        // budget whether or not any of them has finished verifying. Checking
+        // locked() and recording afterwards would let all of these through.
+        for index in 0..LOCKOUT_THRESHOLD {
+            assert!(throttle.claim("10.0.0.1"), "claim {index} refused early");
+        }
+        assert!(!throttle.claim("10.0.0.1"), "the sixth concurrent claim");
+        assert!(throttle.locked("10.0.0.1"));
+        // A correct password clears the claims it made.
+        throttle.succeeded("10.0.0.1");
+        assert!(!throttle.locked("10.0.0.1"));
+        assert!(throttle.claim("10.0.0.1"));
+    }
 
     #[test]
     fn the_ip_table_stops_growing_and_keeps_live_lockouts() {

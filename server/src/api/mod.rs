@@ -46,7 +46,13 @@ fn client_ip(
         return peer.ip().to_string();
     }
     headers
-        .get("x-forwarded-for")
+        // The last header line, not the first: the invariant below is about
+        // the rightmost entry the proxy appended, and a hop that emits its
+        // own line rather than appending would otherwise hand back a value
+        // the client chose.
+        .get_all("x-forwarded-for")
+        .iter()
+        .next_back()
         .and_then(|value| value.to_str().ok())
         .and_then(|list| list.rsplit(',').next())
         .map(|ip| ip.trim().to_owned())
@@ -235,6 +241,17 @@ mod ip_tests {
         assert_eq!(client_ip(&headers, &private, &[]), "5.6.7.8");
         assert_eq!(client_ip(&headers, &public, &[]), "203.0.113.9");
         assert_eq!(client_ip(&HeaderMap::new(), &proxy, &[]), "127.0.0.1");
+    }
+
+    #[test]
+    fn a_second_forwarded_line_does_not_win() {
+        // A hop that emits its own header line instead of appending must not
+        // let the client's line choose the bucket.
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", "9.9.9.9".parse().unwrap());
+        headers.append("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        let proxy: std::net::SocketAddr = "127.0.0.1:80".parse().unwrap();
+        assert_eq!(client_ip(&headers, &proxy, &[]), "203.0.113.9");
     }
 
     #[test]

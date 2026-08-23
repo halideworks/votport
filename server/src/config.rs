@@ -86,9 +86,11 @@ pub struct OidcConfig {
 
 const DEFAULT_MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024 * 1024; // 50 GiB
 
-/// Shortest admin password this build considers reasonable. Enforced on
-/// anything set through the UI; only warned about for the environment
-/// credential, which may predate the check.
+/// Shortest admin password this build accepts. Enforced on anything set
+/// through the UI and on `VOTPORT_ADMIN_PASSWORD`, which refuses to start
+/// below it. An existing deployment with a shorter one will not boot after
+/// upgrading; `VOTPORT_ADMIN_PASSWORD_HASH` is the escape hatch, since a PHC
+/// string says nothing about the length of its input.
 pub const MIN_ADMIN_PASSWORD_CHARS: usize = 12;
 
 /// Refuses a break-glass password too short to survive guessing. Throttling
@@ -133,6 +135,20 @@ impl IpCidr {
         let bits = bits.unwrap_or(width);
         if bits > width {
             return Err(format!("{text:?}: prefix longer than the address family"));
+        }
+        // A v4-mapped network is a v4 network. Peers are compared in their
+        // unwrapped form, so leaving this as v6 would build a block that
+        // matches nothing, and a dual-stack bind logs peers in the mapped
+        // form an operator would copy.
+        if let std::net::IpAddr::V6(v6) = network {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                if bits >= 96 {
+                    return Ok(Self {
+                        network: std::net::IpAddr::V4(v4),
+                        bits: bits - 96,
+                    });
+                }
+            }
         }
         Ok(Self { network, bits })
     }
@@ -232,13 +248,24 @@ pub fn from_env() -> Result<Config, String> {
     let metrics_token = optional("VOTPORT_METRICS_TOKEN");
 
     let trusted_proxies = match optional("VOTPORT_TRUSTED_PROXIES") {
-        Some(list) => list
-            .split(',')
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-            .map(IpCidr::parse)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("VOTPORT_TRUSTED_PROXIES: {error}"))?,
+        Some(list) => {
+            let blocks = list
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(IpCidr::parse)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("VOTPORT_TRUSTED_PROXIES: {error}"))?;
+            if blocks.is_empty() {
+                // Empty means "use the built-in guess", so a setting that
+                // names nothing would quietly widen trust instead of
+                // narrowing it. Unset the variable to get the default.
+                return Err("VOTPORT_TRUSTED_PROXIES is set but names no address; \
+                     unset it to trust loopback and private peers"
+                    .to_owned());
+            }
+            blocks
+        }
         None => Vec::new(),
     };
 
@@ -451,6 +478,15 @@ mod cidr_tests {
         assert!(private.contains(&"172.31.255.255".parse().unwrap()));
         assert!(!private.contains(&"172.32.0.1".parse().unwrap()));
         assert!(!private.contains(&"203.0.113.9".parse().unwrap()));
+
+        // A mapped network matches the unwrapped peer, in both notations.
+        let mapped = IpCidr::parse("::ffff:192.0.2.7").unwrap();
+        assert!(mapped.contains(&"192.0.2.7".parse().unwrap()));
+        assert!(mapped.contains(&"::ffff:192.0.2.7".parse().unwrap()));
+        assert!(!mapped.contains(&"192.0.2.8".parse().unwrap()));
+        let mapped_block = IpCidr::parse("::ffff:192.0.2.0/120").unwrap();
+        assert!(mapped_block.contains(&"192.0.2.9".parse().unwrap()));
+        assert!(!mapped_block.contains(&"192.0.3.9".parse().unwrap()));
 
         let v6 = IpCidr::parse("2001:db8::/32").unwrap();
         assert!(v6.contains(&"2001:db8:1:2::3".parse().unwrap()));
