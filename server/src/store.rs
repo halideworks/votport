@@ -564,8 +564,10 @@ impl Store {
     /// stale state over newer rows.
     fn import_legacy(&self, data_dir: &Path) -> Result<(), String> {
         let path = data_dir.join("state.json");
-        let Ok(bytes) = std::fs::read(&path) else {
-            return Ok(());
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("read {}: {error}", path.display())),
         };
         let document: LegacyDocument = serde_json::from_slice(&bytes)
             .map_err(|error| format!("parse {}: {error}", path.display()))?;
@@ -2347,6 +2349,13 @@ mod tests {
             reopened.link("", "link-2").unwrap().unwrap().expires_at,
             None
         );
+    }
+
+    #[test]
+    fn legacy_import_read_errors_refuse_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("state.json")).unwrap();
+        assert!(Store::open(directory.path()).is_err());
     }
 
     #[test]
