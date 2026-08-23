@@ -19,6 +19,13 @@ pub fn tenant_prefix(key: &str) -> Vec<String> {
     }
 }
 
+pub fn portable_tenant_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
 /// Drops group/other write bits on a directory files are received into. VOT
 /// stages next to the destination and refuses a group-writable parent, so a
 /// mount created 0775 (umask 002 hosts) would fail every upload into it.
@@ -215,6 +222,9 @@ mod tests {
     fn named_tenants_use_the_reserved_subtree() {
         assert!(tenant_prefix("").is_empty());
         assert_eq!(tenant_prefix("acme"), [TENANT_STORAGE_DIR, "acme"]);
+        assert!(portable_tenant_key("acme-1_ok"));
+        assert!(!portable_tenant_key("Acme"));
+        assert!(!portable_tenant_key("café"));
     }
 
     #[test]

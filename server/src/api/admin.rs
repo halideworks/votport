@@ -332,9 +332,7 @@ fn admit_tenant_ref(key: &str) -> ApiResult<String> {
 /// so case-insensitive and normalization-insensitive filesystems agree.
 fn admit_tenant_key(key: &str) -> ApiResult<String> {
     let key = admit_tenant_ref(key)?;
-    if !key.bytes().all(|byte| {
-        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
-    }) {
+    if !paths::portable_tenant_key(&key) {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "tenant key must use lowercase ASCII letters, digits, '-' or '_'",

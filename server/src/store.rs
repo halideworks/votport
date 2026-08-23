@@ -368,22 +368,15 @@ impl Store {
 
         let default_links = self.links("")?;
         let tenants = self.tenants()?;
-        let mut folded_keys = HashMap::new();
         let mut moves = Vec::new();
         for tenant in tenants {
-            // Older releases accepted multi-segment rows, but could never
-            // publish through them because join_under rejects separators.
-            let Ok(source) =
-                crate::paths::join_under(receive_dir, std::slice::from_ref(&tenant.key))
-            else {
-                continue;
-            };
-            if let Some(other) = folded_keys.insert(tenant.key.to_lowercase(), tenant.key.clone()) {
+            if !crate::paths::portable_tenant_key(&tenant.key) {
                 return Err(format!(
-                    "tenant keys {other:?} and {:?} alias on case-insensitive storage",
+                    "tenant key {:?} is not portable; rename it using lowercase ASCII letters, digits, '-' or '_'",
                     tenant.key
                 ));
             }
+            let source = crate::paths::join_under(receive_dir, std::slice::from_ref(&tenant.key))?;
             let target = target_root.join(&tenant.key);
             let source_metadata = metadata(&source)?;
             let target_metadata = metadata(&target)?;
@@ -409,18 +402,18 @@ impl Store {
             }
             if (source_exists || target_exists)
                 && default_links.iter().any(|link| {
-                    let prefix = format!("{}/", tenant.key);
-                    link.dest == tenant.key
-                        || link.dest.starts_with(&prefix)
+                    let key = tenant.key.to_lowercase();
+                    let prefix = format!("{key}/");
+                    let uses_prefix = |path: &str| {
+                        let path = path.to_lowercase();
+                        path == key || path.starts_with(&prefix)
+                    };
+                    uses_prefix(&link.dest)
                         || link
                             .uploads
                             .iter()
                             .flat_map(|upload| &upload.files)
-                            .any(|file| {
-                                !file.deleted
-                                    && (file.stored_as == tenant.key
-                                        || file.stored_as.starts_with(&prefix))
-                            })
+                            .any(|file| !file.deleted && uses_prefix(&file.stored_as))
                 })
             {
                 return Err(format!(
@@ -1685,7 +1678,7 @@ mod tests {
             total_bytes: 7,
             files: vec![FileRecord {
                 path: "acme/invoice.pdf".to_owned(),
-                stored_as: "acme/invoice.pdf".to_owned(),
+                stored_as: "Acme/invoice.pdf".to_owned(),
                 bytes: 7,
                 suite: "blake3".to_owned(),
                 root: "object".to_owned(),
@@ -1702,7 +1695,7 @@ mod tests {
     }
 
     #[test]
-    fn tenant_storage_migration_refuses_default_destinations_and_case_aliases() {
+    fn tenant_storage_migration_refuses_nonportable_legacy_keys() {
         let directory = tempfile::tempdir().unwrap();
         let data = directory.path().join("data");
         let receive = directory.path().join("receive");
@@ -1712,28 +1705,36 @@ mod tests {
             store.insert_tenant(test_tenant("acme")).unwrap_err(),
             InsertTenantError::AlreadyExists
         );
+
+        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        assert!(error.contains("is not portable"), "{error}");
+
         store
             .with(|connection| {
+                connection.execute("DELETE FROM tenants", [])?;
                 connection.execute(
-                    "INSERT INTO tenants (key, label) VALUES ('acme', 'legacy duplicate')",
+                    "INSERT INTO tenants (key, label) VALUES ('가', 'legacy unicode')",
                     [],
                 )
             })
             .unwrap();
-        std::fs::create_dir_all(receive.join("Acme")).unwrap();
 
         let error = store.migrate_tenant_storage(&receive).unwrap_err();
-        assert!(
-            error.contains("alias on case-insensitive storage"),
-            "{error}"
-        );
+        assert!(error.contains("is not portable"), "{error}");
+    }
 
-        store
-            .with(|connection| connection.execute("DELETE FROM tenants WHERE key = 'acme'", []))
-            .unwrap();
+    #[test]
+    fn tenant_storage_migration_case_folds_default_destinations() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let receive = directory.path().join("receive");
+        let store = Store::open(&data).unwrap();
+        store.insert_tenant(test_tenant("acme")).unwrap();
+        std::fs::create_dir_all(receive.join("acme")).unwrap();
         let mut link = test_link("dest");
         link.dest = "Acme".to_owned();
         store.insert_link(link).unwrap();
+
         let error = store.migrate_tenant_storage(&receive).unwrap_err();
         assert!(error.contains("cannot determine ownership"), "{error}");
     }
