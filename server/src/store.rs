@@ -427,7 +427,7 @@ impl Store {
         f(&connection).map_err(|error| error.to_string())
     }
 
-    pub fn admin_password_hash(&self) -> Option<String> {
+    pub fn admin_password_hash(&self) -> Result<Option<String>, String> {
         self.with(|connection| {
             connection
                 .query_row(
@@ -437,7 +437,6 @@ impl Store {
                 )
                 .optional()
         })
-        .expect("store read failed")
     }
 
     pub fn set_admin_password_hash(&self, hash: String) -> Result<(), String> {
@@ -452,7 +451,7 @@ impl Store {
         })
     }
 
-    pub fn links(&self, tenant: &str) -> Vec<Link> {
+    pub fn links(&self, tenant: &str) -> Result<Vec<Link>, String> {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
@@ -462,10 +461,9 @@ impl Store {
             let rows = statement.query_map([tenant], row_to_link)?;
             rows.collect::<Result<Vec<_>, _>>()
         })
-        .expect("store read failed")
     }
 
-    pub fn link(&self, tenant: &str, id: &str) -> Option<Link> {
+    pub fn link(&self, tenant: &str, id: &str) -> Result<Option<Link>, String> {
         self.with(|connection| {
             connection
                 .query_row(
@@ -477,13 +475,12 @@ impl Store {
                 )
                 .optional()
         })
-        .expect("store read failed")
     }
 
     /// Looks a link up by id alone, for the public upload protocol: the
     /// 128-bit id is the capability, and senders never know a tenant key.
     /// Administrative reads stay tenant-scoped.
-    pub fn link_by_id(&self, id: &str) -> Option<Link> {
+    pub fn link_by_id(&self, id: &str) -> Result<Option<Link>, String> {
         self.with(|connection| {
             connection
                 .query_row(
@@ -495,7 +492,6 @@ impl Store {
                 )
                 .optional()
         })
-        .expect("store read failed")
     }
 
     pub fn insert_link(&self, link: Link) -> Result<(), InsertLinkError> {
@@ -632,7 +628,7 @@ impl Store {
         })
     }
 
-    pub fn tenants(&self) -> Vec<Tenant> {
+    pub fn tenants(&self) -> Result<Vec<Tenant>, String> {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT key, label, admin_group, max_total_bytes, max_links, max_sessions, created_at
@@ -654,15 +650,14 @@ impl Store {
             })?;
             rows.collect::<Result<Vec<_>, _>>()
         })
-        .expect("store read failed")
     }
 
-    pub fn tenant(&self, key: &str) -> Option<Tenant> {
-        self.tenants().into_iter().find(|tenant| tenant.key == key)
+    pub fn tenant(&self, key: &str) -> Result<Option<Tenant>, String> {
+        Ok(self.tenants()?.into_iter().find(|tenant| tenant.key == key))
     }
 
-    pub fn tenant_link_count(&self, key: &str) -> u64 {
-        u64::try_from(self.links(key).len()).unwrap_or(u64::MAX)
+    pub fn tenant_link_count(&self, key: &str) -> Result<u64, String> {
+        Ok(u64::try_from(self.links(key)?.len()).unwrap_or(u64::MAX))
     }
 
     /// Deletes a tenant row atomically unless links still reference it.
@@ -712,7 +707,7 @@ impl Store {
 
     // ----------------------------------------------------------- principals
 
-    pub fn principal(&self, subject: &str) -> Option<Principal> {
+    pub fn principal(&self, subject: &str) -> Result<Option<Principal>, String> {
         self.with(|connection| {
             connection
                 .query_row(
@@ -724,10 +719,9 @@ impl Store {
                 )
                 .optional()
         })
-        .expect("store read failed")
     }
 
-    pub fn principals(&self) -> Vec<Principal> {
+    pub fn principals(&self) -> Result<Vec<Principal>, String> {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT subject, credential_version, blocked, last_login_at,
@@ -737,7 +731,6 @@ impl Store {
             let rows = statement.query_map([], map_principal)?;
             rows.collect::<Result<Vec<_>, _>>()
         })
-        .expect("store read failed")
     }
 
     /// Inserts or refreshes last-login fields without resetting version or block.
@@ -766,11 +759,19 @@ impl Store {
         })
     }
 
-    /// Missing row accepts cv 1 only. A present row must match version and be unblocked.
+    /// Missing row accepts cv 1 only. A present row must match version and be
+    /// unblocked. A read failure denies: this decides whether a session is
+    /// still valid, and the safe answer to "cannot tell" is no. The local
+    /// break-glass subject never reaches here, so denying cannot lock the
+    /// operator out.
     pub fn principal_allows(&self, subject: &str, credential_version: u64) -> bool {
         match self.principal(subject) {
-            None => credential_version == 1,
-            Some(row) => credential_version == row.credential_version && !row.blocked,
+            Ok(None) => credential_version == 1,
+            Ok(Some(row)) => credential_version == row.credential_version && !row.blocked,
+            Err(error) => {
+                tracing::error!(%error, subject, "principal read failed; refusing the session");
+                false
+            }
         }
     }
 
@@ -816,7 +817,7 @@ impl Store {
 
     /// Every link across every tenant. Internal use only (retention sweeps,
     /// metrics); administrative API reads stay tenant-scoped.
-    pub fn all_links(&self) -> Vec<Link> {
+    pub fn all_links(&self) -> Result<Vec<Link>, String> {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
@@ -826,10 +827,9 @@ impl Store {
             let rows = statement.query_map([], row_to_link)?;
             rows.collect::<Result<Vec<_>, _>>()
         })
-        .expect("store read failed")
     }
 
-    pub fn audit_count(&self) -> u64 {
+    pub fn audit_count(&self) -> Result<u64, String> {
         self.with(|connection| {
             connection
                 .query_row("SELECT count(*) FROM audit_log", [], |row| {
@@ -837,12 +837,11 @@ impl Store {
                 })
                 .map(|value| value.max(0) as u64)
         })
-        .expect("store read failed")
     }
 
     // -------------------------------------------------------------- settings
 
-    pub fn setting(&self, key: &str) -> Option<String> {
+    pub fn setting(&self, key: &str) -> Result<Option<String>, String> {
         self.with(|connection| {
             connection
                 .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
@@ -850,16 +849,14 @@ impl Store {
                 })
                 .optional()
         })
-        .expect("store read failed")
     }
 
-    pub fn settings_map(&self) -> HashMap<String, String> {
+    pub fn settings_map(&self) -> Result<HashMap<String, String>, String> {
         self.with(|connection| {
             let mut statement = connection.prepare("SELECT key, value FROM settings")?;
             let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
             rows.collect::<Result<HashMap<_, _>, _>>()
         })
-        .expect("store read failed")
     }
 
     pub fn put_settings(
@@ -903,30 +900,27 @@ impl Store {
             .map(|_| ())
     }
 
-    pub fn overlay(&self, config: &Config) -> SettingsOverlay {
-        overlay_rows(&self.settings_map(), config)
+    pub fn overlay(&self, config: &Config) -> Result<SettingsOverlay, String> {
+        Ok(overlay_rows(&self.settings_map()?, config))
     }
 
-    pub fn resolved_settings(&self, config: &Config) -> ResolvedSettings {
-        self.overlay(config).resolved
+    pub fn resolved_settings(&self, config: &Config) -> Result<ResolvedSettings, String> {
+        Ok(self.overlay(config)?.resolved)
     }
 
     /// Quotas that apply to `tenant_key`: the tenant row for a named
     /// namespace, or `default_max_*` for the implicit default tenant.
-    pub fn quotas_for(
-        &self,
-        tenant_key: &str,
-        config: &Config,
-    ) -> (Option<u64>, Option<u64>, Option<u64>) {
+    pub fn quotas_for(&self, tenant_key: &str, config: &Config) -> Result<Quotas, String> {
         if tenant_key.is_empty() {
-            let settings = self.resolved_settings(config);
-            (
+            let settings = self.resolved_settings(config)?;
+            Ok((
                 settings.default_max_total_bytes,
                 settings.default_max_links,
                 settings.default_max_sessions,
-            )
+            ))
         } else {
-            self.tenant(tenant_key)
+            Ok(self
+                .tenant(tenant_key)?
                 .map(|tenant| {
                     (
                         tenant.max_total_bytes,
@@ -934,20 +928,21 @@ impl Store {
                         tenant.max_sessions,
                     )
                 })
-                .unwrap_or((None, None, None))
+                .unwrap_or((None, None, None)))
         }
     }
 
     // -------------------------------------------------------------- quotas
 
     /// Bytes received-and-not-deleted across a tenant's links.
-    pub fn tenant_received_bytes(&self, tenant: &str) -> u64 {
-        self.links(tenant)
+    pub fn tenant_received_bytes(&self, tenant: &str) -> Result<u64, String> {
+        Ok(self
+            .links(tenant)?
             .into_iter()
             .flat_map(|link| link.uploads.into_iter().flat_map(|upload| upload.files))
             .filter(|file| !file.deleted)
             .map(|file| file.bytes)
-            .sum()
+            .sum())
     }
 }
 
@@ -1168,6 +1163,10 @@ pub enum TenantRemoval {
     Absent,
     HasLinks,
 }
+
+/// The three caps that apply to a namespace: total bytes, links, concurrent
+/// sessions. None is unlimited.
+pub type Quotas = (Option<u64>, Option<u64>, Option<u64>);
 
 /// Outcome of [`Store::insert_tenant`].
 #[derive(Debug, PartialEq)]
@@ -1427,6 +1426,26 @@ pub fn now_unix() -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_broken_table_is_an_error_not_a_panic() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .with(|connection| connection.execute_batch("DROP TABLE links"))
+            .unwrap();
+        // The point of the Result: a handler answers 500 and logs, instead of
+        // a panicked task dropping the connection with nothing recorded.
+        assert!(store.links("").is_err());
+        assert!(store.link("", "any").is_err());
+        assert!(store.all_links().is_err());
+        // A principal that cannot be read denies the session rather than
+        // admitting it.
+        store
+            .with(|connection| connection.execute_batch("DROP TABLE principals"))
+            .unwrap();
+        assert!(!store.principal_allows("user@example.com", 1));
+    }
+
     pub(crate) fn test_link(id: &str) -> Link {
         Link {
             id: id.to_owned(),
@@ -1497,11 +1516,11 @@ mod tests {
         });
         store.insert_link(link).unwrap();
 
-        let loaded = store.link("", "link-1").unwrap();
+        let loaded = store.link("", "link-1").unwrap().unwrap();
         assert_eq!(loaded.uploads.len(), 1);
         assert!(loaded.uploads[0].files[0].receipt);
         assert_eq!(loaded.events[0].outcome, "cancelled");
-        assert_eq!(store.links("").len(), 1);
+        assert_eq!(store.links("").unwrap().len(), 1);
     }
 
     #[test]
@@ -1513,11 +1532,11 @@ mod tests {
             .update_link("", "link-1", |link| link.active = false)
             .unwrap();
         assert!(found);
-        assert!(!store.link("", "link-1").unwrap().active);
+        assert!(!store.link("", "link-1").unwrap().unwrap().active);
         assert!(!store.update_link("", "missing", |_| {}).unwrap());
         assert!(store.remove_link("", "link-1").unwrap());
         assert!(!store.remove_link("", "link-1").unwrap());
-        assert!(store.link("", "link-1").is_none());
+        assert!(store.link("", "link-1").unwrap().is_none());
     }
 
     #[test]
@@ -1526,7 +1545,12 @@ mod tests {
         let store = Store::open(directory.path()).unwrap();
         store.insert_link(test_link("b")).unwrap();
         store.insert_link(test_link("a")).unwrap();
-        let ids: Vec<String> = store.links("").into_iter().map(|link| link.id).collect();
+        let ids: Vec<String> = store
+            .links("")
+            .unwrap()
+            .into_iter()
+            .map(|link| link.id)
+            .collect();
         assert_eq!(ids, ["b", "a"]);
     }
 
@@ -1534,14 +1558,14 @@ mod tests {
     fn admin_hash_persists_across_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
-        assert!(store.admin_password_hash().is_none());
+        assert!(store.admin_password_hash().unwrap().is_none());
         store
             .set_admin_password_hash("argon2-hash".to_owned())
             .unwrap();
         drop(store);
         let reopened = Store::open(directory.path()).unwrap();
         assert_eq!(
-            reopened.admin_password_hash().as_deref(),
+            reopened.admin_password_hash().unwrap().as_deref(),
             Some("argon2-hash")
         );
     }
@@ -1557,7 +1581,7 @@ mod tests {
         store.insert_link(link).unwrap();
         drop(store);
         let reopened = Store::open(directory.path()).unwrap();
-        let loaded = reopened.link("", "link-1").unwrap();
+        let loaded = reopened.link("", "link-1").unwrap().unwrap();
         assert_eq!(loaded.password_hash.as_deref(), Some("argon2"));
         assert_eq!(loaded.expires_at, Some(12345));
         assert_eq!(loaded.max_bytes, Some(999));
@@ -1565,7 +1589,10 @@ mod tests {
         let mut bare = test_link("link-2");
         bare.expires_at = None;
         reopened.insert_link(bare).unwrap();
-        assert_eq!(reopened.link("", "link-2").unwrap().expires_at, None);
+        assert_eq!(
+            reopened.link("", "link-2").unwrap().unwrap().expires_at,
+            None
+        );
     }
 
     #[test]
@@ -1587,8 +1614,8 @@ mod tests {
         )
         .unwrap();
         let reopened = Store::open(directory.path()).unwrap();
-        assert!(reopened.link("", "old-link-a").is_some());
-        assert!(reopened.link("", "old-link-b").is_some());
+        assert!(reopened.link("", "old-link-a").unwrap().is_some());
+        assert!(reopened.link("", "old-link-b").unwrap().is_some());
         assert!(!directory.path().join("state.json").exists());
     }
 
@@ -1640,14 +1667,17 @@ mod tests {
         )
         .unwrap();
         let store = Store::open(directory.path()).unwrap();
-        assert!(store.link("", "old-link").is_some());
-        assert_eq!(store.admin_password_hash().as_deref(), Some("old-hash"));
+        assert!(store.link("", "old-link").unwrap().is_some());
+        assert_eq!(
+            store.admin_password_hash().unwrap().as_deref(),
+            Some("old-hash")
+        );
         assert!(!directory.path().join("state.json").exists());
         assert!(directory.path().join("state.json.imported").exists());
         // Reopening must not re-import stale state over newer rows.
         drop(store);
         let reopened = Store::open(directory.path()).unwrap();
-        assert!(reopened.link("", "old-link").is_some());
+        assert!(reopened.link("", "old-link").unwrap().is_some());
     }
 }
 
@@ -1674,13 +1704,13 @@ mod tenant_tests {
         store.insert_link(link_in("acme", "secret-link")).unwrap();
         store.insert_link(link_in("", "default-link")).unwrap();
 
-        assert!(store.link("acme", "secret-link").is_some());
+        assert!(store.link("acme", "secret-link").unwrap().is_some());
         // Another tenant (and the default) cannot see or touch it.
-        assert!(store.link("", "secret-link").is_none());
+        assert!(store.link("", "secret-link").unwrap().is_none());
         assert!(!store.update_link("", "secret-link", |_| {}).unwrap());
         assert!(!store.remove_link("", "secret-link").unwrap());
-        assert_eq!(store.links("acme").len(), 1);
-        assert_eq!(store.links("").len(), 1);
+        assert_eq!(store.links("acme").unwrap().len(), 1);
+        assert_eq!(store.links("").unwrap().len(), 1);
     }
 
     #[test]
@@ -1698,22 +1728,22 @@ mod tenant_tests {
                 created_at: 0,
             })
             .unwrap();
-        assert_eq!(store.tenants().len(), 1);
-        assert_eq!(store.tenant("acme").unwrap().max_links, Some(2));
-        assert!(store.tenant("missing").is_none());
+        assert_eq!(store.tenants().unwrap().len(), 1);
+        assert_eq!(store.tenant("acme").unwrap().unwrap().max_links, Some(2));
+        assert!(store.tenant("missing").unwrap().is_none());
 
         store.insert_link(link_in("acme", "blocked")).unwrap();
         // The handler refuses deletion while links remain; the store exposes
         // the count and the raw delete.
-        assert_eq!(store.tenant_link_count("acme"), 1);
+        assert_eq!(store.tenant_link_count("acme").unwrap(), 1);
 
         store.remove_link("acme", "blocked").unwrap();
-        assert_eq!(store.tenant_link_count("acme"), 0);
+        assert_eq!(store.tenant_link_count("acme").unwrap(), 0);
         assert_eq!(store.remove_tenant("acme").unwrap(), TenantRemoval::Deleted);
-        assert!(store.tenant("acme").is_none());
+        assert!(store.tenant("acme").unwrap().is_none());
         let err = store.insert_link(link_in("acme", "orphan")).unwrap_err();
         assert_eq!(err, InsertLinkError::NamedTenantGone);
-        assert!(store.link("acme", "orphan").is_none());
+        assert!(store.link("acme", "orphan").unwrap().is_none());
     }
 
     #[test]
@@ -1742,8 +1772,8 @@ mod tenant_tests {
         });
         store.insert_tenant(test_tenant("acme")).unwrap();
         store.insert_link(link.clone()).unwrap();
-        assert_eq!(store.tenant_received_bytes("acme"), 500);
-        assert_eq!(store.tenant_received_bytes(""), 0);
+        assert_eq!(store.tenant_received_bytes("acme").unwrap(), 500);
+        assert_eq!(store.tenant_received_bytes("").unwrap(), 0);
 
         file.deleted = true;
         link.uploads[0].files[0] = file;
@@ -1752,7 +1782,7 @@ mod tenant_tests {
                 link.uploads[0].files[0].deleted = true
             })
             .unwrap();
-        assert_eq!(store.tenant_received_bytes("acme"), 0);
+        assert_eq!(store.tenant_received_bytes("acme").unwrap(), 0);
     }
 }
 
@@ -1776,7 +1806,7 @@ mod ops_tests {
         let restore = tempfile::tempdir().unwrap();
         std::fs::copy(&snapshot, restore.path().join("votport.db")).unwrap();
         let reopened = Store::open(restore.path()).unwrap();
-        assert!(reopened.link("", "link-1").is_some());
+        assert!(reopened.link("", "link-1").unwrap().is_some());
 
         // A fresh VACUUM INTO needs the destination gone; that is the
         // caller's contract.
@@ -1794,7 +1824,7 @@ mod ops_tests {
         let mut scoped = test_link("scoped-link");
         scoped.tenant = "acme".to_owned();
         store.insert_link(scoped).unwrap();
-        assert_eq!(store.all_links().len(), 2);
+        assert_eq!(store.all_links().unwrap().len(), 2);
     }
 }
 
@@ -1830,8 +1860,8 @@ mod phase4_review_tests {
                 .unwrap();
         }
         let store = Store::open(directory.path()).unwrap();
-        assert!(store.link("", "v1-link").is_some());
-        assert_eq!(store.link("", "v1-link").unwrap().tenant, "");
+        assert!(store.link("", "v1-link").unwrap().is_some());
+        assert_eq!(store.link("", "v1-link").unwrap().unwrap().tenant, "");
     }
 
     #[test]
@@ -1843,8 +1873,8 @@ mod phase4_review_tests {
             .unwrap();
         store.insert_link(link_in("acme", "scoped")).unwrap();
         // Senders never know a tenant key; the id is the capability.
-        assert!(store.link_by_id("scoped").is_some());
-        assert!(store.link_by_id("missing").is_none());
+        assert!(store.link_by_id("scoped").unwrap().is_some());
+        assert!(store.link_by_id("missing").unwrap().is_none());
     }
 
     #[test]
@@ -1938,7 +1968,7 @@ mod settings_tests {
     fn empty_settings_table_follows_env() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
-        let overlay = store.overlay(&test_config());
+        let overlay = store.overlay(&test_config()).unwrap();
         assert_eq!(
             overlay.resolved.notify_webhook.as_deref(),
             Some("https://env.example/hook")
@@ -1968,7 +1998,7 @@ mod settings_tests {
                 )],
             )
             .unwrap();
-        let overlay = store.overlay(&test_config());
+        let overlay = store.overlay(&test_config()).unwrap();
         assert_eq!(
             overlay.resolved.notify_webhook.as_deref(),
             Some("https://db.example/hook")
@@ -1991,7 +2021,7 @@ mod settings_tests {
                 )],
             )
             .unwrap();
-        let overlay = store.overlay(&test_config());
+        let overlay = store.overlay(&test_config()).unwrap();
         assert_eq!(overlay.resolved.notify_webhook, None);
         assert_eq!(overlay.notify_webhook_source, "db");
     }
@@ -2015,13 +2045,13 @@ mod settings_tests {
                 &[("notify_webhook".to_owned(), SettingWrite::Reset)],
             )
             .unwrap();
-        let overlay = store.overlay(&test_config());
+        let overlay = store.overlay(&test_config()).unwrap();
         assert_eq!(
             overlay.resolved.notify_webhook.as_deref(),
             Some("https://env.example/hook")
         );
         assert_eq!(overlay.notify_webhook_source, "env");
-        assert!(store.setting("notify_webhook").is_none());
+        assert!(store.setting("notify_webhook").unwrap().is_none());
     }
 
     #[test]
@@ -2037,7 +2067,7 @@ mod settings_tests {
                 )],
             )
             .unwrap();
-        let overlay = store.overlay(&test_config());
+        let overlay = store.overlay(&test_config()).unwrap();
         assert_eq!(overlay.resolved.audit_retention_days, 400);
         assert_eq!(overlay.audit_retention_days_source, "env");
     }
@@ -2056,7 +2086,10 @@ mod settings_tests {
             )
             .unwrap();
         assert_eq!(
-            store.resolved_settings(&test_config()).audit_retention_days,
+            store
+                .resolved_settings(&test_config())
+                .unwrap()
+                .audit_retention_days,
             7
         );
     }
@@ -2114,8 +2147,8 @@ mod settings_tests {
         }
         let store = Store::open(directory.path()).unwrap();
         assert_eq!(schema_version(directory.path()), "5");
-        assert!(store.principals().is_empty());
-        assert!(store.principal("nobody").is_none());
+        assert!(store.principals().unwrap().is_empty());
+        assert!(store.principal("nobody").unwrap().is_none());
     }
 
     #[test]
@@ -2125,7 +2158,7 @@ mod settings_tests {
         let mut config = test_config();
         config.smtp_from = Some("votport@example.com".to_owned());
         config.smtp_to = Some("ops@example.com".to_owned());
-        assert!(store.resolved_settings(&config).smtp.is_none());
+        assert!(store.resolved_settings(&config).unwrap().smtp.is_none());
     }
 
     #[test]
@@ -2135,7 +2168,7 @@ mod settings_tests {
         let mut config = test_config();
         config.smtp_host = Some("smtp.example.com".to_owned());
         config.smtp_from = Some("votport@example.com".to_owned());
-        assert!(store.resolved_settings(&config).smtp.is_none());
+        assert!(store.resolved_settings(&config).unwrap().smtp.is_none());
     }
 
     #[test]
@@ -2156,6 +2189,7 @@ mod settings_tests {
         config.smtp_to = Some("ops@example.com,  alerts@example.com".to_owned());
         let smtp = store
             .resolved_settings(&config)
+            .unwrap()
             .smtp
             .expect("host from DB plus from/to from env");
         assert_eq!(smtp.host, "db.example.com");
@@ -2176,7 +2210,7 @@ mod settings_tests {
                 &[("smtp_port".to_owned(), SettingWrite::Set("nope".to_owned()))],
             )
             .unwrap();
-        let overlay = store.overlay(&test_config());
+        let overlay = store.overlay(&test_config()).unwrap();
         assert_eq!(overlay.smtp_port, 587);
         assert_eq!(overlay.smtp_port_source, "env");
     }
@@ -2204,14 +2238,14 @@ mod principals_store_tests {
         assert!(!store.principal_allows("missing", 2));
 
         assert!(store.revoke_principal("user@example.com").unwrap());
-        let revoked = store.principal("user@example.com").unwrap();
+        let revoked = store.principal("user@example.com").unwrap().unwrap();
         assert_eq!(revoked.credential_version, 2);
         assert!(revoked.blocked);
         assert!(!store.principal_allows("user@example.com", 1));
         assert!(!store.principal_allows("user@example.com", 2));
 
         assert!(store.unblock_principal("user@example.com").unwrap());
-        let unblocked = store.principal("user@example.com").unwrap();
+        let unblocked = store.principal("user@example.com").unwrap().unwrap();
         assert_eq!(unblocked.credential_version, 2);
         assert!(!unblocked.blocked);
         assert!(store.principal_allows("user@example.com", 2));

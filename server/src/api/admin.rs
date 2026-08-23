@@ -24,10 +24,12 @@ const ADMIN_COOKIE: &str = "votport_admin";
 /// UI has set one, else the stable tag derived from the environment
 /// credential. Either way, rotating the credential evicts sessions and a
 /// plain restart does not.
-fn admin_token_phc(app: &App) -> String {
-    app.store
+fn admin_token_phc(app: &App) -> ApiResult<String> {
+    Ok(app
+        .store
         .admin_password_hash()
-        .unwrap_or_else(|| app.config.admin_token_tag.clone())
+        .map_err(super::store_unavailable)?
+        .unwrap_or_else(|| app.config.admin_token_tag.clone()))
 }
 
 /// Returns the authenticated principal, or unauthorized.
@@ -38,7 +40,7 @@ fn require_admin(app: &App, headers: &HeaderMap) -> ApiResult<auth::AdminIdentit
         .and_then(|cookies| auth::cookie_value(cookies, ADMIN_COOKIE));
     let mut identity = auth::verify_admin_token(
         &app.secret,
-        &admin_token_phc(app),
+        &admin_token_phc(app)?,
         token.unwrap_or_default(),
     )
     .ok_or_else(ApiError::unauthorized)?;
@@ -50,7 +52,7 @@ fn require_admin(app: &App, headers: &HeaderMap) -> ApiResult<auth::AdminIdentit
         return Err(ApiError::unauthorized());
     }
     if identity.subject == "local" {
-        identity.grants = local_admin_grants(app);
+        identity.grants = local_admin_grants(app).map_err(super::store_unavailable)?;
         if !identity
             .grants
             .iter()
@@ -63,21 +65,21 @@ fn require_admin(app: &App, headers: &HeaderMap) -> ApiResult<auth::AdminIdentit
     Ok(identity)
 }
 
-fn local_admin_grants(app: &App) -> Vec<auth::TenantGrant> {
+fn local_admin_grants(app: &App) -> Result<Vec<auth::TenantGrant>, String> {
     let mut grants = vec![auth::TenantGrant {
         tenant: String::new(),
         role: "admin".to_owned(),
     }];
     grants.extend(
         app.store
-            .tenants()
+            .tenants()?
             .into_iter()
             .map(|tenant| auth::TenantGrant {
                 tenant: tenant.key,
                 role: "admin".to_owned(),
             }),
     );
-    grants
+    Ok(grants)
 }
 
 /// Default-tenant admin only. Same gate as database backup: viewers and
@@ -113,19 +115,21 @@ fn require_admin_write(headers: &HeaderMap, identity: &auth::AdminIdentity) -> A
 /// The admin password in force: a hash stored by "change password" wins over
 /// the one derived from the environment at startup, so a restart does not roll
 /// the password back to VOTPORT_ADMIN_PASSWORD.
-fn admin_hash(app: &App) -> String {
-    app.store
+fn admin_hash(app: &App) -> ApiResult<String> {
+    Ok(app
+        .store
         .admin_password_hash()
-        .unwrap_or_else(|| app.config.admin_password_hash.clone())
+        .map_err(super::store_unavailable)?
+        .unwrap_or_else(|| app.config.admin_password_hash.clone()))
 }
 
 /// Builds the signed admin session cookie value for `identity`.
-pub(crate) fn issue_admin_cookie(app: &App, identity: &auth::AdminIdentity) -> String {
-    let token = auth::issue_admin_token(&app.secret, identity, &admin_token_phc(app));
-    format!(
+pub(crate) fn issue_admin_cookie(app: &App, identity: &auth::AdminIdentity) -> ApiResult<String> {
+    let token = auth::issue_admin_token(&app.secret, identity, &admin_token_phc(app)?);
+    Ok(format!(
         "{ADMIN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{}",
         cookie_attributes(app)
-    )
+    ))
 }
 
 /// Cookie attributes for non-admin cookies too (Secure behind https).
@@ -169,7 +173,7 @@ pub async fn admin_login(
         .await
         .map_err(|_| ApiError::internal("login semaphore closed"))?;
     let ok = tokio::task::spawn_blocking({
-        let hash = admin_hash(&app);
+        let hash = admin_hash(&app)?;
         move || {
             let _permit = permit;
             auth::verify_password(&request.password, &hash)
@@ -191,7 +195,7 @@ pub async fn admin_login(
     tracing::info!(target: "audit", event = "admin_login", %ip, "admin signed in");
     app.store
         .audit("", "", "admin_login", &ip, &serde_json::json!({}));
-    let cookie = issue_admin_cookie(&app, &auth::AdminIdentity::local_admin());
+    let cookie = issue_admin_cookie(&app, &auth::AdminIdentity::local_admin())?;
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
 
@@ -347,7 +351,12 @@ pub async fn create_tenant(
     let identity = require_platform_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
     let key = admit_tenant_key(&request.key)?;
-    if app.store.tenant(&key).is_some() {
+    if app
+        .store
+        .tenant(&key)
+        .map_err(super::store_unavailable)?
+        .is_some()
+    {
         return Err(ApiError::new(StatusCode::CONFLICT, "tenant already exists"));
     }
     if app.sessions.tenant_pinned(&key) {
@@ -380,7 +389,10 @@ pub async fn create_tenant(
             "that folder already holds received files; move them aside first",
         ));
     }
-    let defaults = app.store.resolved_settings(&app.config);
+    let defaults = app
+        .store
+        .resolved_settings(&app.config)
+        .map_err(super::store_unavailable)?;
     let tenant = crate::store::Tenant {
         key: key.clone(),
         label: request.label.trim().to_owned(),
@@ -463,8 +475,8 @@ pub async fn list_tenants(
 ) -> ApiResult<Json<serde_json::Value>> {
     let _identity = require_platform_admin(&app, &headers)?;
     Ok(Json(json!({
-        "tenants": app.store.tenants(),
-        "principals": app.store.principals(),
+        "tenants": app.store.tenants().map_err(super::store_unavailable)?,
+        "principals": app.store.principals().map_err(super::store_unavailable)?,
     })))
 }
 
@@ -546,7 +558,10 @@ pub async fn delete_tenant(
             "tenant delete already in progress",
         ));
     }
-    let count = app.store.tenant_link_count(&key);
+    let count = app
+        .store
+        .tenant_link_count(&key)
+        .map_err(super::store_unavailable)?;
     if count > 0 {
         app.sessions.unpin_tenant(&key);
         return Err(ApiError::new(
@@ -582,7 +597,9 @@ pub async fn delete_tenant(
     // removed, so a refusal leaves nothing half done. This stays the backstop
     // for pre-existing rows and for a link created after the create-time
     // checks below have passed.
-    if purge_target.is_some() && default_tenant_dest_collides(&app.store, &key) {
+    if purge_target.is_some()
+        && default_tenant_dest_collides(&app.store, &key).map_err(super::store_unavailable)?
+    {
         app.sessions.unpin_tenant(&key);
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -681,7 +698,7 @@ pub async fn update_tenant(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_platform_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    let Some(mut tenant) = app.store.tenant(&key) else {
+    let Some(mut tenant) = app.store.tenant(&key).map_err(super::store_unavailable)? else {
         return Err(ApiError::not_found());
     };
     if let Some(label) = request.label {
@@ -758,12 +775,12 @@ fn tenant_receive_dir(
     Ok(path)
 }
 
-fn default_tenant_dest_collides(store: &crate::store::Store, key: &str) -> bool {
+fn default_tenant_dest_collides(store: &crate::store::Store, key: &str) -> Result<bool, String> {
     let prefix = format!("{key}/");
-    store
-        .links("")
+    Ok(store
+        .links("")?
         .iter()
-        .any(|link| link.dest == key || link.dest.starts_with(&prefix))
+        .any(|link| link.dest == key || link.dest.starts_with(&prefix)))
 }
 
 /// Streams a consistent SQLite snapshot as a download. Read-only operation:
@@ -836,13 +853,16 @@ pub async fn get_settings(
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     let _identity = require_platform_admin(&app, &headers)?;
-    Ok(Json(settings_json(&app)))
+    Ok(Json(settings_json(&app)?))
 }
 
-fn settings_json(app: &App) -> serde_json::Value {
-    let overlay = app.store.overlay(&app.config);
+fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
+    let overlay = app
+        .store
+        .overlay(&app.config)
+        .map_err(super::store_unavailable)?;
     let resolved = &overlay.resolved;
-    json!({
+    Ok(json!({
         "notify_webhook": resolved.notify_webhook,
         "notify_webhook_source": overlay.notify_webhook_source,
         "notify_ntfy": resolved.notify_ntfy,
@@ -881,7 +901,7 @@ fn settings_json(app: &App) -> serde_json::Value {
         "public_password_login": resolved.public_password_login,
         "public_password_login_source": overlay.public_password_login_source,
         "sso_configured": app.sso_config.is_some(),
-    })
+    }))
 }
 
 fn write_url(key: &str, value: &serde_json::Value) -> ApiResult<crate::store::SettingWrite> {
@@ -1051,7 +1071,7 @@ pub async fn put_settings(
             &json!({ "keys": keys, "reset": reset }),
         );
     }
-    Ok(Json(settings_json(&app)))
+    Ok(Json(settings_json(&app)?))
 }
 
 #[derive(Deserialize)]
@@ -1097,7 +1117,7 @@ pub async fn switch_tenant(
         &switched.tenant,
         &json!({ "from": identity.tenant }),
     );
-    let cookie = issue_admin_cookie(&app, &switched);
+    let cookie = issue_admin_cookie(&app, &switched)?;
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
 
@@ -1156,7 +1176,7 @@ pub async fn admin_change_password(
         .await
         .map_err(|_| ApiError::internal("login semaphore closed"))?;
     let current_ok = tokio::task::spawn_blocking({
-        let hash = admin_hash(&app);
+        let hash = admin_hash(&app)?;
         let current = request.current.clone();
         move || {
             let _permit = permit;
@@ -1191,7 +1211,7 @@ pub async fn admin_change_password(
         "",
         &serde_json::json!({}),
     );
-    let cookie = issue_admin_cookie(&app, &auth::AdminIdentity::local_admin());
+    let cookie = issue_admin_cookie(&app, &auth::AdminIdentity::local_admin())?;
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
 
@@ -1330,6 +1350,7 @@ pub async fn list_links(
     let links: Vec<LinkView> = app
         .store
         .links(&identity.tenant)
+        .map_err(super::store_unavailable)?
         .into_iter()
         .map(|link| link_view(&app, link, &base))
         .collect();
@@ -1376,15 +1397,30 @@ pub async fn create_link(
     let tenant = identity.tenant.clone();
     // A cookie can outlive its tenant's deletion; without this check the
     // link would be created under a namespace nothing manages anymore.
-    if !tenant.is_empty() && app.store.tenant(&tenant).is_none() {
+    if !tenant.is_empty()
+        && app
+            .store
+            .tenant(&tenant)
+            .map_err(super::store_unavailable)?
+            .is_none()
+    {
         return Err(ApiError::new(
             StatusCode::GONE,
             "this session's tenant no longer exists; sign in again",
         ));
     }
-    let (_, max_links, _) = app.store.quotas_for(&tenant, &app.config);
+    let (_, max_links, _) = app
+        .store
+        .quotas_for(&tenant, &app.config)
+        .map_err(super::store_unavailable)?;
     if let Some(max_links) = max_links {
-        let count = u64::try_from(app.store.links(&tenant).len()).unwrap_or(u64::MAX);
+        let count = u64::try_from(
+            app.store
+                .links(&tenant)
+                .map_err(super::store_unavailable)?
+                .len(),
+        )
+        .unwrap_or(u64::MAX);
         if count >= max_links {
             return Err(ApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -1497,6 +1533,7 @@ pub async fn link_qr(
     let link = app
         .store
         .link(&identity.tenant, &id)
+        .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
     let url = format!("{}/r/{}", base_url(&app, &headers), link.id);
     let code = qrcode::QrCode::new(url.as_bytes())
@@ -1551,6 +1588,7 @@ pub async fn delete_received_file(
     let link = app
         .store
         .link(&identity.tenant, &id)
+        .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
     let record = link
         .uploads
@@ -2019,7 +2057,7 @@ mod tenant_authz_tests {
         };
         format!(
             "votport_admin={}; Path=/",
-            auth::issue_admin_token(&app.secret, &identity, &admin_token_phc(app))
+            auth::issue_admin_token(&app.secret, &identity, &admin_token_phc(app).unwrap())
         )
     }
 
@@ -2299,7 +2337,7 @@ mod tenant_offboard_tests {
             .expect("tenant_deleted audit");
         assert_eq!(deleted.detail["purged_receive"], true);
         assert_eq!(deleted.detail["row_deleted"], true);
-        assert!(application.store.tenant("acme").is_none());
+        assert!(application.store.tenant("acme").unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2358,7 +2396,7 @@ mod tenant_offboard_tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         assert!(tenant_dir.join("x.bin").exists());
         assert!(!application.sessions.tenant_pinned("acme"));
-        assert!(application.store.tenant("acme").is_some());
+        assert!(application.store.tenant("acme").unwrap().is_some());
     }
 
     #[tokio::test]
@@ -2414,7 +2452,7 @@ mod tenant_offboard_tests {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
         let tenant_dir = write_dummy(&application.config.receive_dir, "acme");
-        assert!(application.store.tenant("acme").is_none());
+        assert!(application.store.tenant("acme").unwrap().is_none());
 
         let router = app::router(application.clone());
         let cookie = login_cookie(router).await;
@@ -2449,7 +2487,7 @@ mod tenant_offboard_tests {
             tokio::spawn(async move { delete_tenant_req(first_app, &first_cookie, "acme").await });
         entered.await.unwrap();
         assert!(application.sessions.tenant_pinned("acme"));
-        assert!(application.store.tenant("acme").is_none());
+        assert!(application.store.tenant("acme").unwrap().is_none());
 
         let second = delete_tenant_req(application.clone(), &cookie, "acme").await;
         assert_eq!(second.status(), StatusCode::CONFLICT);
@@ -2468,7 +2506,7 @@ mod tenant_offboard_tests {
         let created = create_tenant_req(application.clone(), &cookie, "acme").await;
         assert_eq!(created.status(), StatusCode::CONFLICT);
         assert!(application.sessions.tenant_pinned("acme"));
-        assert!(application.store.tenant("acme").is_none());
+        assert!(application.store.tenant("acme").unwrap().is_none());
 
         release.send(()).unwrap();
         let first_resp = first.await.unwrap();
@@ -2496,7 +2534,7 @@ mod tenant_offboard_tests {
                 .contains("already in progress"),
             "error was {json}"
         );
-        assert!(application.store.tenant("acme").is_none());
+        assert!(application.store.tenant("acme").unwrap().is_none());
         assert!(application.sessions.tenant_pinned("acme"));
     }
 
@@ -2511,7 +2549,7 @@ mod tenant_offboard_tests {
         // component, so uploads into it fail too.
         let response = create_tenant_req(application.clone(), &cookie, "a/b").await;
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(application.store.tenants().is_empty());
+        assert!(application.store.tenants().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2544,7 +2582,7 @@ mod tenant_offboard_tests {
         let cookie = login_cookie(router).await;
         let response = delete_tenant_req(application.clone(), &cookie, "clients%2Facme").await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(application.store.tenants().is_empty());
+        assert!(application.store.tenants().unwrap().is_empty());
         assert!(bystander.join("statement.pdf").exists());
     }
 
@@ -2594,7 +2632,7 @@ mod tenant_offboard_tests {
         let response = delete_tenant_req(application.clone(), &cookie, "acme").await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
         // The refusal comes before remove_tenant, so nothing is half done.
-        assert!(application.store.tenant("acme").is_some());
+        assert!(application.store.tenant("acme").unwrap().is_some());
         assert!(shared.join("invoice.pdf").exists());
         assert!(!application.sessions.tenant_pinned("acme"));
     }
@@ -2631,7 +2669,7 @@ mod tenant_offboard_tests {
         let cookie = login_cookie(router).await;
         let response = create_tenant_req(application.clone(), &cookie, "acme").await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert!(application.store.tenants().is_empty());
+        assert!(application.store.tenants().unwrap().is_empty());
         // Creating the tenant would have put those files inside a namespace
         // whose delete purges the whole folder.
         assert!(occupied.join("invoice.pdf").exists());
@@ -2654,7 +2692,7 @@ mod tenant_offboard_tests {
         });
         entered.await.expect("create reached the recheck");
         assert!(
-            application.store.tenant("acme").is_some(),
+            application.store.tenant("acme").unwrap().is_some(),
             "the row exists at this point, which is what makes the recheck necessary"
         );
         let taken = application.config.receive_dir.join("acme");
@@ -2665,7 +2703,7 @@ mod tenant_offboard_tests {
         let response = create.await.unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
         assert!(
-            application.store.tenant("acme").is_none(),
+            application.store.tenant("acme").unwrap().is_none(),
             "a refused create must leave no tenant row over those bytes"
         );
     }
@@ -2788,7 +2826,7 @@ mod tenant_offboard_tests {
         let cookie = login_cookie(router).await;
         let response = create_tenant_req(application.clone(), &cookie, "acme").await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert!(application.store.tenants().is_empty());
+        assert!(application.store.tenants().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2822,7 +2860,7 @@ mod tenant_offboard_tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::CONFLICT, "dest {dest}");
         }
-        assert!(application.store.links("").is_empty());
+        assert!(application.store.links("").unwrap().is_empty());
     }
 
     #[test]
@@ -3078,7 +3116,7 @@ mod settings_api_tests {
         };
         format!(
             "votport_admin={}; Path=/",
-            auth::issue_admin_token(&app.secret, &identity, &admin_token_phc(app))
+            auth::issue_admin_token(&app.secret, &identity, &admin_token_phc(app).unwrap())
         )
     }
 
@@ -3461,7 +3499,11 @@ mod settings_api_tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["key"], "acme");
-        let tenant = application.store.tenant("acme").expect("tenant stored");
+        let tenant = application
+            .store
+            .tenant("acme")
+            .unwrap()
+            .expect("tenant stored");
         assert_eq!(tenant.max_total_bytes, Some(100));
         assert_eq!(tenant.max_links, None);
         assert_eq!(tenant.max_sessions, None);
@@ -3530,7 +3572,10 @@ mod settings_api_tests {
                 )],
             )
             .unwrap();
-        let resolved = application.store.resolved_settings(&application.config);
+        let resolved = application
+            .store
+            .resolved_settings(&application.config)
+            .unwrap();
         assert_eq!(resolved.audit_retention_days, 400);
     }
 }
@@ -3551,7 +3596,7 @@ mod principals_api_tests {
     fn cookie_for(app: &App, identity: auth::AdminIdentity) -> String {
         format!(
             "votport_admin={}; Path=/",
-            auth::issue_admin_token(&app.secret, &identity, &admin_token_phc(app))
+            auth::issue_admin_token(&app.secret, &identity, &admin_token_phc(app).unwrap())
         )
     }
 
@@ -3578,7 +3623,11 @@ mod principals_api_tests {
         .to_string();
         format!(
             "votport_admin={}; Path=/",
-            auth::issue_admin_token_from_payload(&app.secret, &payload, &admin_token_phc(app))
+            auth::issue_admin_token_from_payload(
+                &app.secret,
+                &payload,
+                &admin_token_phc(app).unwrap()
+            )
         )
     }
 
@@ -3752,6 +3801,7 @@ mod principals_api_tests {
         let live = application
             .store
             .principal("user@example.com")
+            .unwrap()
             .unwrap()
             .credential_version;
         assert_eq!(live, 2);
@@ -3999,7 +4049,11 @@ mod principals_api_tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        let row = application.store.principal("user@example.com").unwrap();
+        let row = application
+            .store
+            .principal("user@example.com")
+            .unwrap()
+            .unwrap();
         assert!(!row.blocked);
         assert_eq!(row.credential_version, 1);
     }

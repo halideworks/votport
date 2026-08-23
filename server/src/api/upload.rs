@@ -49,6 +49,7 @@ pub async fn link_info(
     let link = app
         .store
         .link_by_id(&token)
+        .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
     let usable = link.usable_now();
     Ok(Json(json!({
@@ -173,6 +174,7 @@ pub async fn verify_link_password(
     let link = app
         .store
         .link_by_id(&token)
+        .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
     if !link.usable_now() {
         return Err(ApiError::new(
@@ -219,6 +221,7 @@ pub async fn create_session(
     let link = app
         .store
         .link_by_id(&token)
+        .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
     if !link.usable_now() {
         return Err(ApiError::new(
@@ -243,7 +246,13 @@ pub async fn create_session(
     }
     // Fail closed when a named tenant row has vanished: publishing into the
     // receive root unprefixed and quota-free would cross a tenant boundary.
-    if !link.tenant.is_empty() && app.store.tenant(&link.tenant).is_none() {
+    if !link.tenant.is_empty()
+        && app
+            .store
+            .tenant(&link.tenant)
+            .map_err(super::store_unavailable)?
+            .is_none()
+    {
         audit_session_rejected(&app, &link.tenant, "link tenant missing");
         return Err(ApiError::new(
             StatusCode::GONE,
@@ -272,9 +281,15 @@ pub async fn create_session(
     // Quotas: the tenant's received-but-not-deleted bytes plus this upload
     // must stay under max_total_bytes, and its concurrent sessions under
     // max_sessions.
-    let (max_total, _, max_sessions) = app.store.quotas_for(&link.tenant, &app.config);
+    let (max_total, _, max_sessions) = app
+        .store
+        .quotas_for(&link.tenant, &app.config)
+        .map_err(super::store_unavailable)?;
     if let Some(max_total) = max_total {
-        let received = app.store.tenant_received_bytes(&link.tenant);
+        let received = app
+            .store
+            .tenant_received_bytes(&link.tenant)
+            .map_err(super::store_unavailable)?;
         if received + expected.length > max_total {
             audit_session_rejected(&app, &link.tenant, "byte quota exhausted");
             return Err(ApiError::new(
@@ -301,7 +316,11 @@ pub async fn create_session(
     let mut dest_components = if link.tenant.is_empty() {
         Vec::new()
     } else {
-        match app.store.tenant(&link.tenant) {
+        match app
+            .store
+            .tenant(&link.tenant)
+            .map_err(super::store_unavailable)?
+        {
             Some(tenant) => tenant.path_prefix(),
             None => {
                 audit_session_rejected(&app, &link.tenant, "link tenant missing");
@@ -492,7 +511,7 @@ pub async fn upload_finish(
     );
     let completed_tenant = link_id
         .clone()
-        .and_then(|id| app.store.link_by_id(&id))
+        .and_then(|id| app.store.link_by_id(&id).ok().flatten())
         .map(|link| link.tenant)
         .unwrap_or_default();
     app.store.audit(
@@ -505,7 +524,7 @@ pub async fn upload_finish(
             "bytes": report.files.iter().map(|f| f.bytes).sum::<u64>()
         }),
     );
-    if let Some(link) = link_id.and_then(|id| app.store.link_by_id(&id)) {
+    if let Some(link) = link_id.and_then(|id| app.store.link_by_id(&id).ok().flatten()) {
         tokio::spawn(crate::notify::uploaded(
             Arc::clone(&app),
             link.label,

@@ -351,9 +351,13 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
     // only case where a package path can name a tenant folder.
     let publishes_into_receive_root = setup.tenant.is_empty() && setup.dest_rel.is_empty();
     let reserved: HashSet<String> = if publishes_into_receive_root {
+        // A read failure refuses the package rather than admitting it: this
+        // guard exists to keep a root link out of a tenant's folder, and
+        // guessing "no tenants" is the answer that lets it in.
         setup
             .store
             .tenants()
+            .map_err(|error| SessionError::internal(format!("tenant read failed: {error}")))?
             .into_iter()
             .map(|tenant| tenant.key)
             .collect()
@@ -399,11 +403,16 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
     paths::tighten_dir(&setup.dest_dir);
 
     // Files this link already delivered, for dedupe on identical roots.
-    let prior_uploads = setup
-        .store
-        .link_by_id(&setup.link_id)
-        .map(|link| link.uploads)
-        .unwrap_or_default();
+    // Dedupe is an optimization: a read failure here costs a suffixed copy of
+    // a file already on disk, which is better than failing a transfer whose
+    // bytes are fine.
+    let prior_uploads = match setup.store.link_by_id(&setup.link_id) {
+        Ok(link) => link.map(|link| link.uploads).unwrap_or_default(),
+        Err(error) => {
+            tracing::warn!(%error, "link read failed; skipping dedupe for this package");
+            Vec::new()
+        }
+    };
 
     let mut files = Vec::with_capacity(entries.len());
     for entry in &entries {
@@ -429,6 +438,7 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
         let now_reserved: HashSet<String> = setup
             .store
             .tenants()
+            .map_err(|error| SessionError::internal(format!("tenant read failed: {error}")))?
             .into_iter()
             .map(|tenant| tenant.key)
             .collect();
@@ -672,6 +682,7 @@ fn publish_file(setup: &WorkerSetup, file: &mut FileState) -> Result<(), Session
         let taken = setup
             .store
             .tenants()
+            .map_err(|error| SessionError::internal(format!("tenant read failed: {error}")))?
             .into_iter()
             .any(|tenant| &tenant.key == name);
         if taken {

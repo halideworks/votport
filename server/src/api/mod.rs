@@ -119,6 +119,7 @@ fn proxy_peer(ip: &std::net::IpAddr) -> bool {
     }
 }
 
+#[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     message: String,
@@ -161,6 +162,18 @@ impl IntoResponse for ApiError {
 }
 
 type ApiResult<T> = Result<T, ApiError>;
+
+/// A failed store read becomes a 500 that says only that the database is
+/// unavailable. The rusqlite message goes to the log instead: it can name
+/// file paths, and a caller who cannot read the database can do nothing with
+/// the detail anyway.
+pub(crate) fn store_unavailable(error: String) -> ApiError {
+    tracing::error!(target: "audit", event = "store_read_failed", %error, "store read failed");
+    ApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "database unavailable; try again",
+    )
+}
 
 fn cookie_attributes(app: &App) -> &'static str {
     let secure = app
