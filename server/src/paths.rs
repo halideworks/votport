@@ -20,10 +20,17 @@ pub fn tenant_prefix(key: &str) -> Vec<String> {
 }
 
 pub fn portable_tenant_key(key: &str) -> bool {
-    !key.is_empty()
-        && key.bytes().all(|byte| {
+    if key.is_empty()
+        || !key.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
         })
+    {
+        return false;
+    }
+    !matches!(key, "con" | "prn" | "aux" | "nul")
+        && !(key.len() == 4
+            && matches!(&key[..3], "com" | "lpt")
+            && matches!(key.as_bytes()[3], b'1'..=b'9'))
 }
 
 /// Drops group/other write bits on a directory files are received into. VOT
@@ -233,6 +240,10 @@ mod tests {
         assert!(portable_tenant_key("acme-1_ok"));
         assert!(!portable_tenant_key("Acme"));
         assert!(!portable_tenant_key("café"));
+        for key in ["con", "prn", "aux", "nul", "com1", "com9", "lpt1", "lpt9"] {
+            assert!(!portable_tenant_key(key), "{key}");
+        }
+        assert!(portable_tenant_key("com0"));
     }
 
     #[test]
