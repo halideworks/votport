@@ -448,12 +448,13 @@ async fn dispatch<T>(
     session_id: &str,
     build: impl FnOnce(oneshot::Sender<Result<T, SessionError>>) -> Cmd,
 ) -> ApiResult<T> {
-    let sender = app
+    let command = app
         .sessions
         .touch(session_id)
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "unknown or expired session"))?;
     let (reply, receive) = oneshot::channel();
-    sender
+    command
+        .sender
         .send(build(reply))
         .await
         .map_err(|_| ApiError::new(StatusCode::GONE, "upload session ended"))?;

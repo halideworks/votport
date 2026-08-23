@@ -507,14 +507,8 @@ async fn expire_link_uploads(app: &App, candidate: crate::store::Link, cutoff: u
     if removed.is_empty() {
         return;
     }
-    match app.store.update_link(&link.tenant, &link.id, |link| {
-        for upload in &mut link.uploads {
-            for file in &mut upload.files {
-                if removed.contains(&file.stored_as) {
-                    file.deleted = true;
-                }
-            }
-        }
+    match app.store.tombstone_files(&link.tenant, &link.id, |file| {
+        removed.contains(&file.stored_as)
     }) {
         Ok(true) => {
             tracing::info!(

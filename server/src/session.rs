@@ -653,9 +653,7 @@ fn handle_finish(
     let upload_id = upload.id.clone();
     let recorded = setup
         .store
-        .update_link(&setup.tenant, &setup.link_id, |link| {
-            link.uploads.push(upload)
-        })
+        .append_upload(&setup.tenant, &setup.link_id, upload)
         .map_err(SessionError::internal)?;
     if !recorded {
         return Err(SessionError::conflict("request link no longer exists"));
@@ -774,6 +772,23 @@ pub struct SessionHandle {
     pub reserved_bytes: u64,
     pub sender: mpsc::Sender<Cmd>,
     pub last_active: Instant,
+    pub in_flight: usize,
+}
+
+pub struct SessionCommand<'a> {
+    sessions: &'a Sessions,
+    id: String,
+    pub sender: mpsc::Sender<Cmd>,
+}
+
+impl Drop for SessionCommand<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.sessions.inner.lock().expect("sessions poisoned");
+        if let Some(handle) = inner.map.get_mut(&self.id) {
+            handle.in_flight = handle.in_flight.saturating_sub(1);
+            handle.last_active = Instant::now();
+        }
+    }
 }
 
 pub struct SessionAdmission {
@@ -1015,6 +1030,7 @@ impl Sessions {
                 reserved_bytes,
                 sender,
                 last_active: Instant::now(),
+                in_flight: 0,
             },
         );
         Ok(())
@@ -1065,12 +1081,17 @@ impl Sessions {
             .map(|handle| handle.link_id.clone())
     }
 
-    /// Returns the sender for a session and refreshes its idle clock.
-    pub fn touch(&self, id: &str) -> Option<mpsc::Sender<Cmd>> {
+    /// Keeps the session registered until the returned command guard drops.
+    pub fn touch(&self, id: &str) -> Option<SessionCommand<'_>> {
         let mut inner = self.inner.lock().expect("sessions poisoned");
         let handle = inner.map.get_mut(id)?;
         handle.last_active = Instant::now();
-        Some(handle.sender.clone())
+        handle.in_flight = handle.in_flight.saturating_add(1);
+        Some(SessionCommand {
+            sessions: self,
+            id: id.to_owned(),
+            sender: handle.sender.clone(),
+        })
     }
 
     pub fn remove(&self, id: &str) {
@@ -1098,7 +1119,9 @@ impl Sessions {
             .lock()
             .expect("sessions poisoned")
             .map
-            .retain(|_, handle| handle.last_active.elapsed().as_secs() < idle_secs);
+            .retain(|_, handle| {
+                handle.in_flight > 0 || handle.last_active.elapsed().as_secs() < idle_secs
+            });
     }
 }
 
@@ -1213,6 +1236,12 @@ mod pin_tests {
             sessions.insert_admitted(admission("stale", 60, 100, 1), dummy_sender(), || Ok(60),),
             Err(InsertError::ByteQuota)
         );
+        assert_eq!(
+            sessions.insert_admitted(admission("full", 1, u64::MAX, 1), dummy_sender(), || Ok(
+                u64::MAX
+            ),),
+            Err(InsertError::ByteQuota)
+        );
         sessions
             .insert_admitted(
                 admission("s2", u64::MAX, u64::MAX, 1),
@@ -1220,6 +1249,25 @@ mod pin_tests {
                 || Ok(0),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn sweep_keeps_in_flight_commands_registered() {
+        let sessions = Sessions::new();
+        sessions
+            .insert(
+                "s1".to_owned(),
+                "link".to_owned(),
+                "acme".to_owned(),
+                dummy_sender(),
+            )
+            .unwrap();
+        let command = sessions.touch("s1").unwrap();
+        sessions.sweep(0);
+        assert_eq!(sessions.total(), 1);
+        drop(command);
+        sessions.sweep(0);
+        assert_eq!(sessions.total(), 0);
     }
 
     #[test]
