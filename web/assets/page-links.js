@@ -129,6 +129,12 @@ function renderLink(link) {
     lock.textContent = 'password';
     head.append(lock);
   }
+  if (link.legal_hold) {
+    const hold = document.createElement('span');
+    hold.className = 'badge';
+    hold.textContent = 'legal hold';
+    head.append(hold);
+  }
   card.append(head);
 
   const url = document.createElement('p');
@@ -169,6 +175,22 @@ function renderLink(link) {
       await api(`/api/admin/links/${link.id}`, {
         method: 'POST',
         body: JSON.stringify({ active: !link.active }),
+      });
+      await refreshLinks();
+    }),
+    button(link.legal_hold ? 'Release hold' : 'Legal hold', 'tiny ghost', async () => {
+      if (
+        link.legal_hold &&
+        !(await confirmModal(
+          'Release legal hold',
+          'Release this hold? Automatic retention may delete expired files.',
+          'Release hold',
+        ))
+      )
+        return;
+      await api(`/api/admin/links/${link.id}`, {
+        method: 'POST',
+        body: JSON.stringify({ legal_hold: !link.legal_hold }),
       });
       await refreshLinks();
     }),

@@ -1120,6 +1120,7 @@ struct LinkView {
     expires_at: Option<u64>,
     max_bytes: Option<u64>,
     active: bool,
+    legal_hold: bool,
     usable: bool,
     uploads: Vec<UploadView>,
     events: Vec<crate::store::SessionEvent>,
@@ -1224,6 +1225,7 @@ fn link_view(app: &App, link: Link, base: &str) -> LinkView {
         expires_at: link.expires_at,
         max_bytes: link.max_bytes,
         active: link.active,
+        legal_hold: link.legal_hold,
         uploads,
         events: link.events,
     }
@@ -1328,6 +1330,7 @@ pub async fn create_link(
             .map(|days| now_unix() + u64::from(days) * 86_400),
         max_bytes: request.max_bytes.filter(|&bytes| bytes > 0),
         active: true,
+        legal_hold: false,
         uploads: Vec::new(),
         events: Vec::new(),
     };
@@ -1353,7 +1356,10 @@ pub async fn create_link(
 
 #[derive(Deserialize)]
 pub struct UpdateLinkRequest {
-    active: bool,
+    #[serde(default)]
+    active: Option<bool>,
+    #[serde(default)]
+    legal_hold: Option<bool>,
 }
 
 pub async fn update_link(
@@ -1364,20 +1370,59 @@ pub async fn update_link(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
+    if request.active.is_none() && request.legal_hold.is_none() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "active or legal_hold is required",
+        ));
+    }
+    if request.active.is_some() && request.legal_hold.is_some() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "update one link lifecycle field at a time",
+        ));
+    }
+    if let Some(legal_hold) = request.legal_hold {
+        if app
+            .store
+            .link(&identity.tenant, &id)
+            .map_err(ApiError::internal)?
+            .is_none()
+        {
+            return Err(ApiError::not_found());
+        }
+        let _pin = app.sessions.try_pin_link(&id).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "link lifecycle update in progress; try again",
+            )
+        })?;
+        let found = app
+            .store
+            .set_link_legal_hold(&identity.tenant, &id, legal_hold, &identity.subject)
+            .map_err(ApiError::internal)?;
+        if !found {
+            return Err(ApiError::not_found());
+        }
+        tracing::info!(target: "audit", event = "link_legal_hold_changed", id = %id, legal_hold, "request link legal hold changed");
+        return Ok(Json(json!({ "ok": true })));
+    }
+
+    let active = request.active.expect("validated above");
     let found = app
         .store
-        .update_link(&identity.tenant, &id, |link| link.active = request.active)
+        .update_link(&identity.tenant, &id, |link| link.active = active)
         .map_err(ApiError::internal)?;
     if !found {
         return Err(ApiError::not_found());
     }
-    tracing::info!(target: "audit", event = "link_active_changed", id = %id, active = request.active, "request link toggled");
+    tracing::info!(target: "audit", event = "link_active_changed", id = %id, active, "request link toggled");
     app.store.audit(
         &identity.tenant,
         &identity.subject,
         "link_active_changed",
         &id,
-        &serde_json::json!({ "active": request.active }),
+        &serde_json::json!({ "active": active }),
     );
     Ok(Json(json!({ "ok": true })))
 }
@@ -1389,27 +1434,28 @@ pub async fn delete_link(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    if !app.sessions.pin_link_for_delete(&id) {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "link delete already in progress",
-        ));
+    if app
+        .store
+        .link(&identity.tenant, &id)
+        .map_err(ApiError::internal)?
+        .is_none()
+    {
+        return Err(ApiError::not_found());
     }
+    let _pin = app
+        .sessions
+        .try_pin_link(&id)
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "link delete already in progress"))?;
     if app.sessions.active_for_link(&id) > 0 {
-        app.sessions.unpin_link(&id);
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "uploads are in flight; try again when they finish",
         ));
     }
-    let removed = match app.store.remove_link(&identity.tenant, &id) {
-        Ok(removed) => removed,
-        Err(error) => {
-            app.sessions.unpin_link(&id);
-            return Err(ApiError::internal(error));
-        }
-    };
-    app.sessions.unpin_link(&id);
+    let removed = app
+        .store
+        .remove_link(&identity.tenant, &id)
+        .map_err(ApiError::internal)?;
     if !removed {
         return Err(ApiError::not_found());
     }
@@ -1992,6 +2038,7 @@ mod tenant_authz_tests {
                     expires_at: None,
                     max_bytes: None,
                     active: true,
+                    legal_hold: false,
                     uploads: Vec::new(),
                     events: Vec::new(),
                 }
@@ -2015,6 +2062,35 @@ mod tenant_authz_tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["links"].as_array().unwrap().len(), 0);
+
+        // Foreign IDs are rejected before touching the global lifecycle pin.
+        assert!(application.sessions.pin_link_for_delete("acme-link"));
+        let router = app::router(application.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/admin/links/acme-link")
+            .header("cookie", &outsider)
+            .header("content-type", "application/json")
+            .header("x-votport", "1")
+            .body(Body::from(r#"{"legal_hold":true}"#))
+            .unwrap();
+        assert_eq!(
+            router.oneshot(request).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        let router = app::router(application.clone());
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/api/admin/links/acme-link")
+            .header("cookie", &outsider)
+            .header("x-votport", "1")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.oneshot(request).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        application.sessions.unpin_link("acme-link");
 
         let router = app::router(application.clone());
         let request = Request::builder()
@@ -2057,6 +2133,54 @@ mod tenant_authz_tests {
             .unwrap();
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+
+        let router = app::router(application.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/admin/links/acme-link")
+            .header("cookie", &acme_admin)
+            .header("content-type", "application/json")
+            .header("x-votport", "1")
+            .body(Body::from(r#"{"legal_hold":true}"#))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            application
+                .store
+                .link("acme", "acme-link")
+                .unwrap()
+                .unwrap()
+                .legal_hold
+        );
+        assert!(application
+            .store
+            .audit_export("acme", 0, 0, 100)
+            .unwrap()
+            .iter()
+            .any(|row| row.event == "link_legal_hold_changed"));
+
+        assert!(application.sessions.pin_link_for_delete("acme-link"));
+        let router = app::router(application.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/admin/links/acme-link")
+            .header("cookie", &acme_admin)
+            .header("content-type", "application/json")
+            .header("x-votport", "1")
+            .body(Body::from(r#"{"legal_hold":false}"#))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        application.sessions.unpin_link("acme-link");
+        assert!(
+            application
+                .store
+                .link("acme", "acme-link")
+                .unwrap()
+                .unwrap()
+                .legal_hold
+        );
 
         // A viewer gets read-only access: reads pass, writes are 403.
         let viewer = cookie_for(&application, "acme", "viewer");
@@ -2153,6 +2277,7 @@ mod tenant_offboard_tests {
             expires_at: None,
             max_bytes: None,
             active: true,
+            legal_hold: false,
             uploads: Vec::new(),
             events: Vec::new(),
         }
@@ -3285,6 +3410,7 @@ mod settings_api_tests {
                 expires_at: None,
                 max_bytes: None,
                 active: true,
+                legal_hold: false,
                 uploads: Vec::new(),
                 events: Vec::new(),
             })
@@ -3377,6 +3503,7 @@ mod settings_api_tests {
                 expires_at: None,
                 max_bytes: None,
                 active: true,
+                legal_hold: false,
                 uploads: Vec::new(),
                 events: Vec::new(),
             })

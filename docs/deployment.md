@@ -283,7 +283,9 @@ Set `VOTPORT_UPLOAD_RETENTION_DAYS` to delete received files (and their
 records' live status) older than N days, swept daily with audit events.
 `VOTPORT_AUDIT_RETENTION_DAYS` (default 400) prunes audit rows the same way.
 Upload retention defaults to keeping everything; audit rows default to
-400 days.
+400 days. A link's **Legal hold** action excludes all of that link's uploads
+from the automatic content sweep and records the change in the audit log.
+Explicit file, upload-record, link, and tenant deletion remain available.
 
 ## Performance
 

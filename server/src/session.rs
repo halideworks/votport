@@ -743,6 +743,17 @@ pub struct Sessions {
     inner: Mutex<SessionsInner>,
 }
 
+pub struct LinkPin<'a> {
+    sessions: &'a Sessions,
+    link_id: String,
+}
+
+impl Drop for LinkPin<'_> {
+    fn drop(&mut self) {
+        self.sessions.unpin_link(&self.link_id);
+    }
+}
+
 struct SessionsInner {
     map: HashMap<String, SessionHandle>,
     /// Tenants whose receive subtree is being deleted. Lives on the same
@@ -833,6 +844,14 @@ impl Sessions {
             .expect("sessions poisoned")
             .pinned_links
             .insert(link_id.to_owned())
+    }
+
+    /// Blocks new sessions until the returned guard is dropped.
+    pub fn try_pin_link(&self, link_id: &str) -> Option<LinkPin<'_>> {
+        self.pin_link_for_delete(link_id).then(|| LinkPin {
+            sessions: self,
+            link_id: link_id.to_owned(),
+        })
     }
 
     pub fn unpin_link(&self, link_id: &str) {
@@ -1084,5 +1103,25 @@ mod pin_tests {
                 dummy_sender(),
             )
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_task_releases_link_pin() {
+        let sessions = Arc::new(Sessions::new());
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let task = tokio::spawn({
+            let sessions = Arc::clone(&sessions);
+            async move {
+                let _pin = sessions.try_pin_link("link").unwrap();
+                let _ = entered_tx.send(());
+                std::future::pending::<()>().await;
+            }
+        });
+        entered_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+
+        assert!(sessions.pin_link_for_delete("link"));
+        sessions.unpin_link("link");
     }
 }

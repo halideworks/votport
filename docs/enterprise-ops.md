@@ -8,8 +8,8 @@
 | Continues | `docs/multi-tenancy.md` (phases 1-5 plus multi-page admin #28) |
 | Audience | Senior engineers who already know the votport tree |
 
-The body below is the design that shipped. Remaining follow-ons (not this
-tree): scoped automation tokens; legal hold versus retention. VOT re-pin
+The body below is the design that shipped. Per-link legal hold shipped later
+in schema v6. The remaining follow-on is scoped automation tokens. VOT re-pin
 waits on upstream FEC.
 
 ## Overview
