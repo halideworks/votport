@@ -64,6 +64,11 @@ pub struct Config {
     pub public_password_login: bool,
     /// When set, /metrics requires this bearer token.
     pub metrics_token: Option<String>,
+    /// Peers whose `X-Forwarded-For` is believed, as CIDR blocks. Empty means
+    /// the built-in default: loopback plus the private ranges. Naming the
+    /// reverse proxy explicitly is what stops anything else that can reach
+    /// the port from choosing its own throttle bucket.
+    pub trusted_proxies: Vec<IpCidr>,
     /// OIDC single sign-on for the admin dashboard. None when unset.
     pub oidc: Option<OidcConfig>,
 }
@@ -86,6 +91,88 @@ const DEFAULT_MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024 * 1024; // 50 GiB
 /// credential, which may predate the check.
 pub const MIN_ADMIN_PASSWORD_CHARS: usize = 12;
 
+/// Refuses a break-glass password too short to survive guessing. Throttling
+/// bounds how fast a guess is checked; it cannot make a short password safe,
+/// and this is the credential that still works when the identity provider
+/// does not. `VOTPORT_ADMIN_PASSWORD_HASH` is exempt: a PHC string says
+/// nothing about the length of its input.
+pub fn admit_admin_password(password: &str) -> Result<(), String> {
+    if password.chars().count() < MIN_ADMIN_PASSWORD_CHARS {
+        return Err(format!(
+            "VOTPORT_ADMIN_PASSWORD must be at least {MIN_ADMIN_PASSWORD_CHARS} characters"
+        ));
+    }
+    Ok(())
+}
+
+/// One CIDR block: a network address and how many leading bits are fixed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IpCidr {
+    network: std::net::IpAddr,
+    bits: u8,
+}
+
+impl IpCidr {
+    /// Parses "10.0.0.0/8", "2001:db8::/32", or a bare address (a full-length
+    /// prefix). Rejects a prefix longer than the address family allows.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        let (address, bits) = match text.split_once('/') {
+            Some((address, bits)) => {
+                let bits: u8 = bits
+                    .parse()
+                    .map_err(|_| format!("{text:?}: prefix length is not a number"))?;
+                (address, Some(bits))
+            }
+            None => (text, None),
+        };
+        let network: std::net::IpAddr = address
+            .parse()
+            .map_err(|_| format!("{text:?}: not an IP address"))?;
+        let width = if network.is_ipv4() { 32 } else { 128 };
+        let bits = bits.unwrap_or(width);
+        if bits > width {
+            return Err(format!("{text:?}: prefix longer than the address family"));
+        }
+        Ok(Self { network, bits })
+    }
+
+    /// Whether `ip` falls inside this block. A v4-mapped address is compared
+    /// as v4, matching how the rest of the service reads peers.
+    pub fn contains(&self, ip: &std::net::IpAddr) -> bool {
+        let ip = match ip {
+            std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => std::net::IpAddr::V4(v4),
+                None => *ip,
+            },
+            other => *other,
+        };
+        match (self.network, ip) {
+            (std::net::IpAddr::V4(network), std::net::IpAddr::V4(ip)) => {
+                prefix_matches(&network.octets(), &ip.octets(), self.bits)
+            }
+            (std::net::IpAddr::V6(network), std::net::IpAddr::V6(ip)) => {
+                prefix_matches(&network.octets(), &ip.octets(), self.bits)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Whether two addresses agree on their first `bits` bits.
+fn prefix_matches(network: &[u8], ip: &[u8], bits: u8) -> bool {
+    let whole = usize::from(bits / 8);
+    let remainder = bits % 8;
+    if network[..whole] != ip[..whole] {
+        return false;
+    }
+    if remainder == 0 {
+        return true;
+    }
+    let mask = 0xffu8 << (8 - remainder);
+    network[whole] & mask == ip[whole] & mask
+}
+
 pub fn from_env() -> Result<Config, String> {
     let bind = env_or("VOTPORT_BIND", "0.0.0.0:8080")
         .parse()
@@ -104,16 +191,7 @@ pub fn from_env() -> Result<Config, String> {
         }
         _ => match env::var("VOTPORT_ADMIN_PASSWORD") {
             Ok(password) if !password.is_empty() => {
-                // Warned, not refused: refusing would strand a deployment
-                // whose credential predates this check. admin_change_password
-                // enforces the same minimum on anything set through the UI.
-                if password.chars().count() < MIN_ADMIN_PASSWORD_CHARS {
-                    tracing::warn!(
-                        "VOTPORT_ADMIN_PASSWORD is shorter than {MIN_ADMIN_PASSWORD_CHARS} \
-                         characters; sign-in throttling bounds guessing but a short \
-                         break-glass password is the weakest part of this deployment"
-                    );
-                }
+                admit_admin_password(&password)?;
                 use sha2::Digest as _;
                 let tag = hex::encode(sha2::Sha256::digest(password.as_bytes()));
                 let hash = crate::auth::hash_password(&password)
@@ -152,6 +230,17 @@ pub fn from_env() -> Result<Config, String> {
         Err(_) => 0,
     };
     let metrics_token = optional("VOTPORT_METRICS_TOKEN");
+
+    let trusted_proxies = match optional("VOTPORT_TRUSTED_PROXIES") {
+        Some(list) => list
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(IpCidr::parse)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("VOTPORT_TRUSTED_PROXIES: {error}"))?,
+        None => Vec::new(),
+    };
 
     let audit_retention_days = match env::var("VOTPORT_AUDIT_RETENTION_DAYS") {
         Ok(value) => value
@@ -266,6 +355,7 @@ pub fn from_env() -> Result<Config, String> {
         default_max_sessions,
         public_password_login,
         metrics_token,
+        trusted_proxies,
         oidc,
     })
 }
@@ -319,6 +409,69 @@ fn parse_bytes(value: &str) -> Result<u64, String> {
         return Err(format!("{value:?} must be greater than zero"));
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod password_tests {
+    use super::{admit_admin_password, MIN_ADMIN_PASSWORD_CHARS};
+
+    #[test]
+    fn short_break_glass_passwords_are_refused() {
+        assert!(admit_admin_password("a-long-enough-passphrase").is_ok());
+        // Counted in characters, not bytes. Six two-byte characters is
+        // twelve bytes and six characters, so a byte count would admit it.
+        let six_two_byte_chars = "\u{e9}".repeat(6);
+        assert_eq!(six_two_byte_chars.len(), MIN_ADMIN_PASSWORD_CHARS);
+        assert_eq!(six_two_byte_chars.chars().count(), 6);
+        assert!(admit_admin_password(&six_two_byte_chars).is_err());
+        for short in ["", "short", "elevenchar."] {
+            assert!(
+                admit_admin_password(short).is_err(),
+                "{short:?} was admitted"
+            );
+        }
+        assert_eq!("elevenchar.".chars().count(), MIN_ADMIN_PASSWORD_CHARS - 1);
+    }
+}
+
+#[cfg(test)]
+mod cidr_tests {
+    use super::IpCidr;
+
+    #[test]
+    fn blocks_match_only_their_own_range() {
+        let single = IpCidr::parse("192.0.2.7/32").unwrap();
+        assert!(single.contains(&"192.0.2.7".parse().unwrap()));
+        assert!(!single.contains(&"192.0.2.8".parse().unwrap()));
+        // The same peer arriving v4-mapped is the same peer.
+        assert!(single.contains(&"::ffff:192.0.2.7".parse().unwrap()));
+
+        let private = IpCidr::parse("172.16.0.0/12").unwrap();
+        assert!(private.contains(&"172.16.0.1".parse().unwrap()));
+        assert!(private.contains(&"172.31.255.255".parse().unwrap()));
+        assert!(!private.contains(&"172.32.0.1".parse().unwrap()));
+        assert!(!private.contains(&"203.0.113.9".parse().unwrap()));
+
+        let v6 = IpCidr::parse("2001:db8::/32").unwrap();
+        assert!(v6.contains(&"2001:db8:1:2::3".parse().unwrap()));
+        assert!(!v6.contains(&"2001:db9::1".parse().unwrap()));
+        // Families never match across.
+        assert!(!v6.contains(&"192.0.2.7".parse().unwrap()));
+
+        // A bare address is a full-length prefix.
+        assert!(IpCidr::parse("127.0.0.1")
+            .unwrap()
+            .contains(&"127.0.0.1".parse().unwrap()));
+        for bad in [
+            "",
+            "not-an-ip",
+            "10.0.0.0/33",
+            "2001:db8::/129",
+            "10.0.0.0/x",
+        ] {
+            assert!(IpCidr::parse(bad).is_err(), "{bad} parsed");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -148,7 +148,7 @@ pub async fn admin_login(
     // address that typed it and nobody else. It cannot be the only bound,
     // because the key comes from a header a caller behind a private peer can
     // choose, and because one IPv6 client holds a whole prefix.
-    let ip = super::client_ip(&headers, &peer);
+    let ip = super::client_ip(&headers, &peer, &app.config.trusted_proxies);
     let bucket = super::throttle_key(&ip);
     if app.login_throttle.locked(&bucket) {
         return Err(ApiError::new(
@@ -1536,7 +1536,7 @@ mod handler_tests {
     }
 
     #[tokio::test]
-    async fn a_flood_of_attempts_does_not_queue_the_operator_out() {
+    async fn a_flood_of_attempts_does_not_refuse_the_operator() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
         // Every attempt from a different bucket, so none is refused by the
@@ -1549,8 +1549,10 @@ mod handler_tests {
                 login_attempt(application, [10, 0, 0, index], "wrong").await;
             }));
         }
-        // Bounded: a regression that queues the operator has to fail with a
-        // diagnosis rather than hang the suite.
+        // Bounded so a regression fails with a diagnosis rather than hanging.
+        // This checks that the operator is not refused, not that the wait is
+        // short: queue latency under a flood is an accepted residual, and the
+        // semaphore is FIFO.
         let operator = tokio::time::timeout(
             std::time::Duration::from_secs(60),
             login_attempt(
@@ -1560,7 +1562,7 @@ mod handler_tests {
             ),
         )
         .await
-        .expect("the operator waited behind the flood instead of signing in");
+        .expect("the operator never completed sign-in during a flood");
         assert_eq!(
             operator.status(),
             StatusCode::OK,
@@ -2647,6 +2649,7 @@ mod ops_tests {
             default_max_sessions: None,
             public_password_login: true,
             metrics_token: None,
+            trusted_proxies: Vec::new(),
             oidc: None,
         }
     }

@@ -265,11 +265,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Global, key-independent bound on password guessing. The per-IP throttle is
-/// the precise one, but its key comes from a header a caller can sometimes
-/// choose, so this backstop counts every attempt from every source. Sign-in
-/// treats `locked` as "delay this attempt", never as "refuse it": refusing is
-/// what let anyone deny the break-glass credential.
+/// Global failure counter with a lockout. Its one user is the password-change
+/// endpoint, which is reachable only with a valid session, so a global bound
+/// there cannot be used to deny anyone. Sign-in deliberately has no counter
+/// like this: a global refusal is how the break-glass credential got denied.
 pub struct LoginThrottle {
     state: Mutex<(u32, Option<Instant>)>,
 }

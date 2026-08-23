@@ -197,6 +197,45 @@ overlay environment variables via `GET`/`PUT /api/admin/settings`
 `""` disables a URL or token; JSON `null` ("Use environment") deletes the
 row so env applies again. See [`enterprise-ops.md`](enterprise-ops.md).
 
+## Client addresses
+
+Throttles and audit rows need to know which client made a request. Behind a
+reverse proxy the socket peer is the proxy, so votport reads the rightmost
+`X-Forwarded-For` entry, the one the proxy appended. Earlier entries are
+whatever the client sent and are ignored.
+
+That header is only believed from a peer that could be the proxy. With
+`VOTPORT_TRUSTED_PROXIES` unset the rule is "any loopback or private address",
+which is broad enough to matter: on a shared container network, or with the
+default `0.0.0.0` bind reachable from a LAN, anything else that can open a
+connection can send a different `X-Forwarded-For` per request and give itself
+a fresh throttle bucket every time.
+
+Set the variable to the address your proxy actually connects from:
+
+```yaml
+environment:
+  VOTPORT_TRUSTED_PROXIES: "10.1.2.3/32"      # example only
+```
+
+Do not copy an address out of this document, and do not assume a container
+bridge gateway is stable, because Docker assigns those when it creates the
+network. Determine it for your own deployment: make one request through the
+proxy with a deliberately wrong admin password and read the address votport
+logged.
+
+```sh
+curl -sS -o /dev/null -X POST http://127.0.0.1:8103/api/admin/login \
+  -H 'content-type: application/json' -d '{"password":"wrong"}'
+docker logs --since 30s votport | grep admin_login_failed
+```
+
+The `ip` field in that line is the peer votport saw. If the deployment is
+behind a proxy, that is the value to name. Recheck it after recreating the
+network. Setting the variable to an address the proxy does not use collapses
+every client into one bucket, so confirm sign-in still records distinct
+addresses afterwards.
+
 ## Metrics
 
 `GET /metrics` serves Prometheus-format counters and gauges (tenants, links,

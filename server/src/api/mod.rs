@@ -32,12 +32,17 @@ use crate::session::SessionError;
 /// Client address for per-IP throttling: the rightmost X-Forwarded-For entry
 /// (the one the reverse proxy appended; earlier entries are client-supplied),
 /// else the socket peer.
-fn client_ip(headers: &HeaderMap, peer: &std::net::SocketAddr) -> String {
-    // X-Forwarded-For is honored only from a peer that can be the reverse
-    // proxy (loopback or a private/ULA address). A caller reaching the port
-    // directly from elsewhere would otherwise mint a fresh throttle bucket
-    // per request by spoofing the header.
-    if !proxy_peer(&peer.ip()) {
+fn client_ip(
+    headers: &HeaderMap,
+    peer: &std::net::SocketAddr,
+    trusted: &[crate::config::IpCidr],
+) -> String {
+    let believable = if trusted.is_empty() {
+        proxy_peer(&peer.ip())
+    } else {
+        trusted.iter().any(|block| block.contains(&peer.ip()))
+    };
+    if !believable {
         return peer.ip().to_string();
     }
     headers
@@ -65,10 +70,15 @@ fn parse_forwarded(value: &str) -> Option<String> {
         .map(|socket| socket.ip().to_string())
 }
 
-/// Throttle bucket for a client address. IPv6 clients routinely hold a whole
-/// /64, so the full address would give one guesser as many buckets as it
-/// wants; v4 addresses are their own bucket. Audit rows keep the real address:
-/// this is only the key for rate limiting.
+/// Bucket for a *guessing* throttle: admin sign-in and link passwords. IPv6
+/// clients routinely hold a whole /64, so keying on the full address would
+/// give one guesser as many five-attempt budgets as it wants. The cost is
+/// that neighbors in one prefix share a lockout, which is the right trade
+/// only where the resource being protected is a password.
+///
+/// Quotas (session creation, receipt checks) deliberately key on the full
+/// address instead: sharing an office should not mean sharing an upload
+/// budget. Audit rows always keep the real address.
 pub(crate) fn throttle_key(ip: &str) -> String {
     match ip.parse::<std::net::IpAddr>() {
         // A v4-mapped address is a v4 client: docker bridges and a dual-stack
@@ -204,6 +214,7 @@ pub(crate) mod testing {
             default_max_sessions: None,
             public_password_login: true,
             metrics_token: None,
+            trusted_proxies: Vec::new(),
             oidc: None,
         }
     }
@@ -220,10 +231,29 @@ mod ip_tests {
         let proxy: std::net::SocketAddr = "127.0.0.1:80".parse().unwrap();
         let private: std::net::SocketAddr = "172.18.0.2:80".parse().unwrap();
         let public: std::net::SocketAddr = "203.0.113.9:80".parse().unwrap();
-        assert_eq!(client_ip(&headers, &proxy), "5.6.7.8");
-        assert_eq!(client_ip(&headers, &private), "5.6.7.8");
-        assert_eq!(client_ip(&headers, &public), "203.0.113.9");
-        assert_eq!(client_ip(&HeaderMap::new(), &proxy), "127.0.0.1");
+        assert_eq!(client_ip(&headers, &proxy, &[]), "5.6.7.8");
+        assert_eq!(client_ip(&headers, &private, &[]), "5.6.7.8");
+        assert_eq!(client_ip(&headers, &public, &[]), "203.0.113.9");
+        assert_eq!(client_ip(&HeaderMap::new(), &proxy, &[]), "127.0.0.1");
+    }
+
+    #[test]
+    fn a_configured_allowlist_replaces_the_private_range_guess() {
+        use crate::config::IpCidr;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        let proxy: std::net::SocketAddr = "192.0.2.7:80".parse().unwrap();
+        let other: std::net::SocketAddr = "192.0.2.8:80".parse().unwrap();
+        let trusted = [IpCidr::parse("192.0.2.7/32").unwrap()];
+        // The named proxy is believed.
+        assert_eq!(client_ip(&headers, &proxy, &trusted), "203.0.113.9");
+        // Anything else is not, even though it could reach the port.
+        assert_eq!(client_ip(&headers, &other, &trusted), "192.0.2.8");
+        // A private peer is believed by the default guess and not by a list
+        // that does not name it: naming the proxy is what narrows this.
+        let private: std::net::SocketAddr = "172.19.0.1:80".parse().unwrap();
+        assert_eq!(client_ip(&headers, &private, &[]), "203.0.113.9");
+        assert_eq!(client_ip(&headers, &private, &trusted), "172.19.0.1");
     }
 
     #[test]
@@ -232,7 +262,11 @@ mod ip_tests {
         let proxy: std::net::SocketAddr = "127.0.0.1:80".parse().unwrap();
         for bad in ["not-an-ip", "", "   ", "1.2.3.4.5", "<script>"] {
             headers.insert("x-forwarded-for", bad.parse().unwrap());
-            assert_eq!(client_ip(&headers, &proxy), "127.0.0.1", "value {bad:?}");
+            assert_eq!(
+                client_ip(&headers, &proxy, &[]),
+                "127.0.0.1",
+                "value {bad:?}"
+            );
         }
         // A proxy that appends a port still names a client. Rejecting these
         // would put every client behind that proxy in one bucket.
@@ -241,7 +275,11 @@ mod ip_tests {
             ("[2001:db8::1]:443", "2001:db8::1"),
         ] {
             headers.insert("x-forwarded-for", value.parse().unwrap());
-            assert_eq!(client_ip(&headers, &proxy), expected, "value {value:?}");
+            assert_eq!(
+                client_ip(&headers, &proxy, &[]),
+                expected,
+                "value {value:?}"
+            );
         }
     }
 
@@ -276,11 +314,14 @@ mod ip_tests {
         // A v4-mapped docker bridge address must still count as a proxy peer;
         // treating it as public would put every sender in one throttle bucket.
         let mapped: std::net::SocketAddr = "[::ffff:172.18.0.2]:80".parse().unwrap();
-        assert_eq!(client_ip(&headers, &mapped), "9.9.9.9");
+        assert_eq!(client_ip(&headers, &mapped, &[]), "9.9.9.9");
         let mapped_public: std::net::SocketAddr = "[::ffff:203.0.113.9]:80".parse().unwrap();
         // A public mapped peer is not a proxy: its socket address is used and
         // the forwarded header is ignored.
-        assert_eq!(client_ip(&headers, &mapped_public), "::ffff:203.0.113.9");
+        assert_eq!(
+            client_ip(&headers, &mapped_public, &[]),
+            "::ffff:203.0.113.9"
+        );
     }
 }
 

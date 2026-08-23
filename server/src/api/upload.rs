@@ -176,7 +176,7 @@ pub async fn verify_link_password(
             "this link is no longer accepting uploads",
         ));
     }
-    let ip = client_ip(&headers, &peer);
+    let ip = client_ip(&headers, &peer, &app.config.trusted_proxies);
     check_link_password(&app, &link, request.password.as_deref(), &ip).await?;
     let phc = link.password_hash.as_deref().unwrap_or_default();
     let value = auth::issue_link_token(&app.secret, &link.id, phc);
@@ -225,8 +225,10 @@ pub async fn create_session(
     // Every create-session request consumes rate budget, whatever the
     // outcome: without this, holders of a no-password link could churn
     // sessions into the global cap and evict legitimate senders' uploads.
-    let ip = client_ip(&headers, &peer);
-    if !app.session_rate.allow(&super::throttle_key(&ip)) {
+    let ip = client_ip(&headers, &peer, &app.config.trusted_proxies);
+    // The full address, not the /64 a guessing throttle uses: this is a
+    // per-sender quota, and people in one office share a prefix.
+    if !app.session_rate.allow(&ip) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many uploads started from your address; try again later",

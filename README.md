@@ -82,7 +82,7 @@ so env applies again. Details: [`docs/deployment.md`](docs/deployment.md).
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `VOTPORT_ADMIN_PASSWORD` | — | Admin password (hashed with argon2id at startup). Required unless the hash is set. |
+| `VOTPORT_ADMIN_PASSWORD` | — | Admin password (hashed with argon2id at startup). Required unless the hash is set. At least 12 characters; a shorter one refuses to start, because this is the credential that still works when the identity provider does not. |
 | `VOTPORT_ADMIN_PASSWORD_HASH` | — | Argon2 PHC string; takes precedence over the plain password. |
 | `VOTPORT_PUBLIC_URL` | — | Public https URL; used for generated links and to mark cookies `Secure`. |
 | `VOTPORT_BIND` | `0.0.0.0:8080` | Listen address inside the container. |
@@ -111,6 +111,7 @@ so env applies again. Details: [`docs/deployment.md`](docs/deployment.md).
 | `VOTPORT_DEFAULT_MAX_SESSIONS` | unlimited | Same overlay for max concurrent sessions. |
 | `VOTPORT_PUBLIC_PASSWORD_LOGIN` | on | Set `0` to prefer collapsing the local password form when SSO is offered (login API stays available). |
 | `VOTPORT_METRICS_TOKEN` | — | When set, `GET /metrics` requires this bearer token. Counts only; scrape over an internal interface. |
+| `VOTPORT_TRUSTED_PROXIES` | loopback + private ranges | Comma-separated CIDR blocks (or bare addresses) whose `X-Forwarded-For` is believed. Anything else is keyed on its socket address. The default trusts any loopback or RFC1918/ULA peer, which is broad: on a shared container network or a LAN bind, anything that can reach the port can pick its own throttle bucket. Name your reverse proxy to close that; see [Client addresses](#client-addresses). |
 | `VOTPORT_OIDC_ISSUER` | — | OIDC issuer URL for admin single sign-on. Requires the client id/secret and `VOTPORT_PUBLIC_URL`; see [Single sign-on](#single-sign-on). |
 | `VOTPORT_OIDC_CLIENT_ID` | — | OAuth client id at the identity provider. |
 | `VOTPORT_OIDC_CLIENT_SECRET` | — | OAuth client secret at the identity provider. |
