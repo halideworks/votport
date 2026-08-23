@@ -8,7 +8,7 @@ const $ = (id) => document.getElementById(id);
 
 let payloadFile = null;
 let sidecarFile = null;
-let ignoredCount = 0;
+let checking = false;
 
 function showError(message) {
   $('verify-error').textContent = message;
@@ -19,59 +19,99 @@ function clearError() {
   $('verify-error').hidden = true;
 }
 
-function refreshPickedNote() {
-  const parts = [];
-  if (payloadFile) parts.push(`file: ${payloadFile.name}`);
-  if (sidecarFile) parts.push(`receipt: ${sidecarFile.name}`);
-  if (payloadFile && !sidecarFile) parts.push('pick the .vot-receipt to check');
-  const note = $('picked-note');
-  if (parts.length) {
-    note.textContent = parts.join(' · ');
-    note.hidden = false;
+function renderSlots() {
+  const payloadName = $('payload-name');
+  const sidecarName = $('sidecar-name');
+  if (payloadFile) {
+    payloadName.textContent = `${payloadFile.name} (${formatBytes(payloadFile.size)})`;
+    payloadName.classList.remove('muted');
   } else {
-    note.hidden = true;
+    payloadName.textContent = 'not picked';
+    payloadName.classList.add('muted');
   }
+  if (sidecarFile) {
+    sidecarName.textContent = sidecarFile.name;
+    sidecarName.classList.remove('muted');
+  } else {
+    sidecarName.textContent = 'the .vot-receipt is enough on its own';
+    sidecarName.classList.add('muted');
+  }
+  $('clear-payload').hidden = !payloadFile;
+  $('clear-sidecar').hidden = !sidecarFile;
   // A lone sidecar is enough to check issuance; a lone payload is not.
-  $('check').disabled = !sidecarFile;
+  $('check').disabled = checking || !sidecarFile;
 }
 
 // One payload plus one sidecar per Check; anything else dropped on the zone
 // is named so the sender knows it was not checked.
 function takeFiles(files) {
-  ignoredCount = 0;
+  let ignored = 0;
   for (const file of files) {
     if (!sidecarFile && file.name.endsWith('.vot-receipt')) {
       sidecarFile = file;
     } else if (!payloadFile) {
       payloadFile = file;
     } else {
-      ignoredCount += 1;
+      ignored += 1;
     }
   }
-  if (ignoredCount) {
-    $('ignore-note').textContent =
-      'Only one file and one receipt are checked. Extra files were ignored.';
-    $('ignore-note').hidden = false;
-  }
   clearError();
-  refreshPickedNote();
+  renderSlots();
+  return ignored;
+}
+
+function setChecking(active) {
+  checking = active;
+  $('check').textContent = active ? 'Checking…' : 'Check receipt';
+  renderSlots();
+}
+
+function showResult({ ok, title, file, bytes, next, suite, root }) {
+  const card = $('verify-result');
+  card.classList.toggle('ok', Boolean(ok));
+  card.hidden = false;
+  $('verify-title').textContent = title;
+
+  const list = $('verify-list');
+  list.replaceChildren();
+  appendObjectCard(
+    list,
+    { name: file, suite, root },
+    { tag: 'li', rowClass: 'done', status: `${formatBytes(bytes)} · receipt ✓` },
+  );
+
+  const nextLine = $('verify-next');
+  nextLine.textContent = next || '';
+  nextLine.hidden = !next;
+  $('reset').hidden = false;
+}
+
+function reset() {
+  payloadFile = null;
+  sidecarFile = null;
+  $('payload-input').value = '';
+  $('sidecar-input').value = '';
+  $('verify-result').hidden = true;
+  $('reset').hidden = true;
+  clearError();
+  renderSlots();
 }
 
 // hash-worker.js posts {req, step} per 8 MiB read and only the final message
-// carries done: {suite, root (Uint8Array), length (bigint)}.
+// carries done: {suite, root (Uint8Array), length (bigint)}. Steps drive no
+// UI here beyond the button state; a check is short relative to an upload.
 function hashPayload(file) {
   return new Promise((resolve, reject) => {
     const worker = new Worker('/assets/hash-worker.js', { type: 'module' });
-    worker.onmessage = async ({ data }) => {
+    worker.onmessage = ({ data }) => {
       if (data.step !== undefined) return; // progress tick, not a result
-      if (data.error) {
-        worker.terminate();
-        reject(new Error(data.error));
-        return;
-      }
       // Terminate frees the worker heap including any pinned tree; no drop
       // round-trip needed on a worker we are about to destroy.
       worker.terminate();
+      if (data.error) {
+        reject(new Error(data.error));
+        return;
+      }
       resolve(data.done);
     };
     worker.onerror = () => {
@@ -88,94 +128,96 @@ function toHex(bytes) {
 
 async function check() {
   clearError();
-  $('check').disabled = true;
+  setChecking(true);
   try {
-    let response;
-    try {
-      response = await fetch('/api/verify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: await sidecarFile.arrayBuffer(),
-      });
-    } catch {
-      showError('Could not reach the server. Reload the page to try again.');
-      return;
-    }
-    let result = null;
-    try {
-      result = await response.json();
-    } catch {
-      // A 413 body is empty axum text; treat any non-JSON as not-a-receipt.
-    }
-    if (!response.ok || !result?.ok) {
-      showError(result?.error ?? 'This is not a vot-receipt.');
-      return;
-    }
-
-    const list = $('verify-list');
-    list.replaceChildren();
-    const resultCard = $('verify-result');
-    const next = $('verify-next');
-    next.hidden = true;
-    resultCard.classList.remove('ok');
-
-    if (!payloadFile) {
-      appendObjectCard(
-        list,
-        { name: sidecarFile.name, suite: result.suite, root: result.root },
-        {
-          tag: 'li',
-          rowClass: 'done',
-          status: `${formatBytes(result.length)} · receipt ✓`,
-        },
-      );
-      next.textContent =
-        'Receipt is from this server. Drop the file to check the bytes.';
-      next.hidden = false;
-      resultCard.hidden = false;
-      return;
-    }
-
-    let done;
-    try {
-      done = await hashPayload(payloadFile);
-    } catch {
-      showError('Could not read the file. Pick it again.');
-      resultCard.hidden = false;
-      return;
-    }
-    const root = toHex(done.root);
-    const length = Number(done.length);
-    const match = root === result.root && length === Number(result.length);
-    appendObjectCard(
-      list,
-      { name: payloadFile.name, suite: result.suite, root },
-      { tag: 'li', rowClass: 'done', status: `${formatBytes(length)} · receipt ✓` },
-    );
-    if (match) {
-      resultCard.classList.add('ok');
-    } else {
-      next.textContent = 'This file is not the object in the receipt.';
-      next.hidden = false;
-    }
-    resultCard.hidden = false;
+    await runCheck();
   } finally {
-    $('check').disabled = !sidecarFile;
+    setChecking(false);
   }
+}
+
+async function runCheck() {
+  let response;
+  try {
+    response = await fetch('/api/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: await sidecarFile.arrayBuffer(),
+    });
+  } catch {
+    showError('Could not reach the server. Reload the page to try again.');
+    return;
+  }
+  let result = null;
+  try {
+    result = await response.json();
+  } catch {
+    // A 413 body is empty axum text; treat any non-JSON as not-a-receipt.
+  }
+  if (!response.ok || !result?.ok) {
+    showError(result?.error ?? 'This is not a vot-receipt.');
+    return;
+  }
+
+  if (!payloadFile) {
+    showResult({
+      ok: false,
+      title: 'Genuine receipt',
+      suite: result.suite,
+      root: result.root,
+      file: sidecarFile.name,
+      bytes: Number(result.length),
+      next: 'This receipt was issued by this server. Pick the file too if you also want its bytes checked.',
+    });
+    return;
+  }
+
+  let done;
+  try {
+    done = await hashPayload(payloadFile);
+  } catch {
+    showError('Could not read the file. Pick it again.');
+    return;
+  }
+  const root = toHex(done.root);
+  const length = Number(done.length);
+  const match = root === result.root && length === Number(result.length);
+  showResult({
+    ok: match,
+    title: match ? 'Verified' : 'Does not match',
+    suite: result.suite,
+    root,
+    file: payloadFile.name,
+    bytes: length,
+    next: match
+      ? 'Every byte of this file matches what the server received.'
+      : 'This file is not the object in the receipt. Compare names — a receipt proves one exact file.',
+  });
 }
 
 try {
   const response = await fetch('/api/receipt-key');
   if (!response.ok) throw new Error(response.status);
   const { receipt_key: key } = await response.json();
-  $('receipt-key').textContent = key;
+  $('receipt-key').textContent = key.replace(/(..)(..)(..).*(..)/, '$1 $2 $3 … $4');
 } catch {
-  $('receipt-key').textContent = '';
-  showError('Could not reach the server. Reload the page to try again.');
+  $('receipt-key').textContent = 'unavailable';
 }
 
 $('pick-payload').addEventListener('click', () => $('payload-input').click());
 $('pick-sidecar').addEventListener('click', () => $('sidecar-input').click());
+$('clear-payload').addEventListener('click', () => {
+  payloadFile = null;
+  $('payload-input').value = '';
+  clearError();
+  renderSlots();
+});
+$('clear-sidecar').addEventListener('click', () => {
+  sidecarFile = null;
+  $('sidecar-input').value = '';
+  clearError();
+  renderSlots();
+});
 $('payload-input').addEventListener('change', (e) => takeFiles(e.target.files));
 $('sidecar-input').addEventListener('change', (e) =>
   takeFiles(e.target.files),
@@ -184,11 +226,19 @@ const dropZone = $('verify-drop');
 dropZone.addEventListener('dragover', (e) => e.preventDefault());
 dropZone.addEventListener('drop', (e) => {
   e.preventDefault();
-  takeFiles([...e.dataTransfer.files]);
+  const ignored = takeFiles([...e.dataTransfer.files]);
+  if (ignored) {
+    showError(
+      ignored === 1
+        ? 'One extra file was ignored; only a file and its receipt are checked.'
+        : `${ignored} extra files were ignored; only a file and its receipt are checked.`,
+    );
+  }
 });
 dropZone.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' || e.key === ' ') $('payload-input').click();
 });
+$('reset').addEventListener('click', reset);
 $('verify-form').addEventListener('submit', (e) => {
   e.preventDefault();
   check();

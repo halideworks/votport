@@ -675,6 +675,48 @@ button.danger:hover:not(:disabled) {
  outline: 2px solid var(--progress);
  outline-offset: 2px;
 }
+
+/* Verify page: one labeled row per input, so the pair under check is
+   always visible and each half can be swapped without a reload. */
+.verify-slot {
+ display: flex;
+ align-items: center;
+ gap: 0.5rem;
+ padding: 0.45rem 0.6rem;
+ border: 1px solid var(--border-faint);
+ border-radius: 0.6rem;
+ margin-bottom: 0.5rem;
+ font-size: 0.8rem;
+}
+.slot-label {
+ flex: none;
+ font-size: 0.68rem;
+ font-weight: 600;
+ letter-spacing: 0.08em;
+ text-transform: uppercase;
+ color: var(--muted);
+}
+.slot-name {
+ flex: 1;
+ min-width: 0;
+ overflow-wrap: anywhere;
+}
+.key-box {
+ margin-top: 1rem;
+}
+.key-box summary {
+ font-weight: 600;
+ letter-spacing: 0.08em;
+ text-transform: uppercase;
+ list-style: none;
+ font-size: 0.68rem;
+}
+.key-box summary::-webkit-details-marker {
+ display: none;
+}
+.key-box .mono {
+ overflow-wrap: anywhere;
+}
 .drop:hover,
 .drop.hover {
  border-color: var(--border-active);
