@@ -48,7 +48,7 @@ pub async fn link_info(
 ) -> ApiResult<Json<serde_json::Value>> {
     let link = app
         .store
-        .link_by_id(&token)
+        .upload_link(&token)
         .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
     let usable = link.usable_now();
@@ -173,7 +173,7 @@ pub async fn verify_link_password(
 ) -> ApiResult<Response> {
     let link = app
         .store
-        .link_by_id(&token)
+        .upload_link(&token)
         .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
     if !link.usable_now() {
@@ -220,7 +220,7 @@ pub async fn create_session(
 ) -> ApiResult<Json<serde_json::Value>> {
     let link = app
         .store
-        .link_by_id(&token)
+        .upload_link(&token)
         .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
     if !link.usable_now() {
@@ -409,7 +409,7 @@ pub async fn create_session(
         }
         Ok(()) => {}
     }
-    match app.store.link_by_id(&link.id) {
+    match app.store.upload_link(&link.id) {
         Ok(Some(current)) if current.tenant == link.tenant && current.usable_now() => {}
         Ok(_) => {
             app.sessions.remove(&session_id);
@@ -572,7 +572,7 @@ pub async fn upload_finish(
     );
     let link = link_id.and_then(|id| {
         app.store
-            .link_by_id(&id)
+            .upload_link(&id)
             .inspect_err(|error| tracing::warn!(%error, "link read failed after upload"))
             .ok()
             .flatten()
