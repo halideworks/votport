@@ -349,6 +349,9 @@ impl Store {
                     .execute_batch("ALTER TABLE links ADD COLUMN tenant TEXT NOT NULL DEFAULT ''")
             })
             .ok();
+        store.with(|connection| {
+            connection.execute_batch("CREATE INDEX IF NOT EXISTS links_tenant ON links(tenant)")
+        })?;
         store.migrate()?;
         store.import_legacy(data_dir)?;
         Ok(store)
@@ -797,24 +800,36 @@ impl Store {
         id: &str,
         upload: UploadRecord,
     ) -> Result<bool, String> {
+        let upload_json = serde_json::to_string(&upload).map_err(|error| error.to_string())?;
         let mut connection = self.connection.lock().expect("store poisoned");
         let transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
-        let Some(mut link) = read_link(&transaction, tenant, id)? else {
+        let Some((history_type, upload_index)) = transaction
+            .query_row(
+                "SELECT json_type(uploads_json), json_array_length(uploads_json)
+                 FROM links WHERE tenant = ?1 AND id = ?2",
+                rusqlite::params![tenant, id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+        else {
             return Ok(false);
         };
-        let upload_index = i64::try_from(link.uploads.len()).unwrap_or(i64::MAX);
-        link.uploads.push(upload);
-        write_link_row(&transaction, &link).map_err(|error| error.to_string())?;
-        insert_upload_files(
-            &transaction,
-            &link.id,
-            &link.tenant,
-            upload_index,
-            link.uploads.last().expect("upload was just appended"),
-        )
-        .map_err(|error| error.to_string())?;
+        if history_type != "array" {
+            return Err("links.uploads_json is not an array".to_owned());
+        }
+        transaction
+            .execute(
+                "UPDATE links
+                 SET uploads_json = json_insert(uploads_json, '$[#]', json(?3))
+                 WHERE tenant = ?1 AND id = ?2",
+                rusqlite::params![tenant, id, upload_json],
+            )
+            .map_err(|error| error.to_string())?;
+        insert_upload_files(&transaction, id, tenant, upload_index, &upload)
+            .map_err(|error| error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(true)
     }
@@ -928,27 +943,35 @@ impl Store {
                         CAST(max_links AS TEXT), CAST(max_sessions AS TEXT), created_at
                  FROM tenants ORDER BY rowid",
             )?;
-            let rows = statement.query_map([], |row| -> rusqlite::Result<Tenant> {
-                Ok(Tenant {
-                    key: row.get(0)?,
-                    label: row.get(1)?,
-                    admin_group: row.get(2)?,
-                    max_total_bytes: decode_quota(row.get(3)?, 3)?,
-                    max_links: decode_quota(row.get(4)?, 4)?,
-                    max_sessions: decode_quota(row.get(5)?, 5)?,
-                    created_at: row.get::<_, i64>(6)?.max(0) as u64,
-                })
-            })?;
+            let rows = statement.query_map([], map_tenant)?;
             rows.collect::<Result<Vec<_>, _>>()
         })
     }
 
     pub fn tenant(&self, key: &str) -> Result<Option<Tenant>, String> {
-        Ok(self.tenants()?.into_iter().find(|tenant| tenant.key == key))
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT key, label, admin_group, CAST(max_total_bytes AS TEXT),
+                            CAST(max_links AS TEXT), CAST(max_sessions AS TEXT), created_at
+                     FROM tenants WHERE key = ?1",
+                    [key],
+                    map_tenant,
+                )
+                .optional()
+        })
     }
 
     pub fn tenant_link_count(&self, key: &str) -> Result<u64, String> {
-        Ok(u64::try_from(self.links(key)?.len()).unwrap_or(u64::MAX))
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM links WHERE tenant = ?1",
+                    [key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|count| count.max(0) as u64)
+        })
     }
 
     /// Deletes a tenant row atomically unless links still reference it.
@@ -1498,6 +1521,18 @@ pub struct AuditRow {
     pub event: String,
     pub subject: String,
     pub detail: serde_json::Value,
+}
+
+fn map_tenant(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tenant> {
+    Ok(Tenant {
+        key: row.get(0)?,
+        label: row.get(1)?,
+        admin_group: row.get(2)?,
+        max_total_bytes: decode_quota(row.get(3)?, 3)?,
+        max_links: decode_quota(row.get(4)?, 4)?,
+        max_sessions: decode_quota(row.get(5)?, 5)?,
+        created_at: row.get::<_, i64>(6)?.max(0) as u64,
+    })
 }
 
 fn map_principal(row: &rusqlite::Row<'_>) -> rusqlite::Result<Principal> {
@@ -2580,6 +2615,27 @@ mod tenant_tests {
 
         assert_eq!(store.tenant_received_bytes("acme").unwrap(), u64::MAX);
         assert_eq!(store.tenant_usage().unwrap()[1].received_bytes, u64::MAX);
+        store
+            .append_upload(
+                "acme",
+                "large",
+                UploadRecord {
+                    id: "second".to_owned(),
+                    started_at: u64::MAX,
+                    completed_at: u64::MAX,
+                    replayed_chunks: u64::MAX,
+                    rejected_chunks: u64::MAX,
+                    package_root: "exact".to_owned(),
+                    total_bytes: u64::MAX,
+                    files: Vec::new(),
+                },
+            )
+            .unwrap();
+        let uploads = store.link("acme", "large").unwrap().unwrap().uploads;
+        assert_eq!(uploads.len(), 2);
+        assert_eq!(uploads[0].total_bytes, u64::MAX);
+        assert_eq!(uploads[1].started_at, u64::MAX);
+        assert_eq!(uploads[1].total_bytes, u64::MAX);
         let limbs = store
             .with(|connection| {
                 connection.query_row(
@@ -2590,6 +2646,17 @@ mod tenant_tests {
             })
             .unwrap();
         assert_eq!(limbs, (u32::MAX as i64, u32::MAX as i64));
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE links SET uploads_json = '{}' WHERE id = 'large'",
+                    [],
+                )
+            })
+            .unwrap();
+        assert!(store
+            .append_upload("acme", "large", uploads[1].clone())
+            .is_err());
     }
 
     #[test]
