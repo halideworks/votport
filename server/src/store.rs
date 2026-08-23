@@ -368,11 +368,9 @@ impl Store {
 
         let default_links = self.links("")?;
         let default_owns_prefix = |key: &str| {
-            let key = key.to_lowercase();
-            let prefix = format!("{key}/");
             let uses_prefix = |path: &str| {
-                let path = path.to_lowercase();
-                path == key || path.starts_with(&prefix)
+                let component = path.split('/').next().unwrap_or_default();
+                !component.is_ascii() || component.eq_ignore_ascii_case(key)
             };
             default_links.iter().any(|link| {
                 uses_prefix(&link.dest)
@@ -1753,12 +1751,18 @@ mod tests {
         let data = directory.path().join("data");
         let receive = directory.path().join("receive");
         let store = Store::open(&data).unwrap();
-        store.insert_tenant(test_tenant("acme")).unwrap();
-        std::fs::create_dir_all(receive.join("acme")).unwrap();
+        store.insert_tenant(test_tenant("s")).unwrap();
+        std::fs::create_dir_all(receive.join("s")).unwrap();
         let mut link = test_link("dest");
-        link.dest = "Acme".to_owned();
+        link.dest = "S".to_owned();
         store.insert_link(link).unwrap();
 
+        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        assert!(error.contains("cannot determine ownership"), "{error}");
+
+        store
+            .update_link("", "dest", |link| link.dest = "ſ".to_owned())
+            .unwrap();
         let error = store.migrate_tenant_storage(&receive).unwrap_err();
         assert!(error.contains("cannot determine ownership"), "{error}");
     }

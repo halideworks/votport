@@ -64,6 +64,9 @@ pub fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String
             "hidden file names are not accepted (VOTPORT_ALLOW_HIDDEN=1 to allow)".to_owned(),
         );
     }
+    if component.starts_with('.') && !component.is_ascii() {
+        return Err("non-ASCII hidden names are reserved for portable storage".to_owned());
+    }
     // Reserved even with VOTPORT_ALLOW_HIDDEN: a sender file of this shape
     // would publish fine and then be deleted by the next boot's staging sweep.
     if component.eq_ignore_ascii_case(TENANT_STORAGE_DIR) {
@@ -199,6 +202,7 @@ mod tests {
         assert!(admit_component(".vot-notes.txt", true).is_ok());
         assert!(admit_component(TENANT_STORAGE_DIR, true).is_err());
         assert!(admit_component(".VOT-TENANTS.STAGE", true).is_err());
+        assert!(admit_component(".VOT-TENANTſ.STAGE", true).is_err());
     }
 
     #[test]
