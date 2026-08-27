@@ -296,9 +296,10 @@ create. The sender keeps eight range PUTs in flight. The upload worker
 verifies those ranges one at a time. That serial verify, not SQLite, is
 what leaves the NIC idle on a fast path.
 
-Do not raise `CHUNK_BYTES` in votport until VOT's improved FEC lands and
-this repo re-pins `vot-sdk` / `vot-sdk-file` / `vot-wasm` to the same
-revision in Cargo.toml, the Dockerfile `ARG`, and Cargo.lock. Measure with:
+Do not raise `CHUNK_BYTES` in votport until VOT changes its server verify
+path to support larger ranges; the `069b552` pin does not. Any VOT re-pin
+moves `vot-sdk` / `vot-sdk-file` / `vot-receipt` and the Dockerfile `ARG`
+together, then relocks Cargo.lock. Measure with:
 
 ```sh
 cargo test --test e2e -- --ignored --nocapture throughput_baseline
