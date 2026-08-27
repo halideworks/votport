@@ -672,7 +672,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1769,7 +1769,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2020,7 +2020,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2410,7 +2410,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2763,12 +2763,12 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vot-cbor"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 
 [[package]]
 name = "vot-codec"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "vot-cbor",
  "vot-fec",
@@ -2779,12 +2779,12 @@ dependencies = [
 [[package]]
 name = "vot-commit-model"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 
 [[package]]
 name = "vot-commit-platform"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "vot-platform-fs",
  "vot-receipt",
@@ -2793,7 +2793,7 @@ dependencies = [
 [[package]]
 name = "vot-commit-posix"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "blake3",
  "vot-commit-model",
@@ -2805,7 +2805,7 @@ dependencies = [
 [[package]]
 name = "vot-commit-strict"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "aligned-vec",
  "rustix",
@@ -2816,12 +2816,12 @@ dependencies = [
 [[package]]
 name = "vot-coverage"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 
 [[package]]
 name = "vot-fec"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "fearless_simd",
 ]
@@ -2829,7 +2829,7 @@ dependencies = [
 [[package]]
 name = "vot-journal"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "fs4",
  "vot-platform-fs",
@@ -2838,7 +2838,7 @@ dependencies = [
 [[package]]
 name = "vot-manifest"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "blake3",
  "unicode-normalization",
@@ -2848,7 +2848,7 @@ dependencies = [
 [[package]]
 name = "vot-object"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "vot-manifest",
  "vot-proof-blake3",
@@ -2860,7 +2860,7 @@ dependencies = [
 [[package]]
 name = "vot-package"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "blake3",
  "vot-manifest",
@@ -2870,7 +2870,7 @@ dependencies = [
 [[package]]
 name = "vot-platform-fs"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "rustix",
  "windows-sys 0.61.2",
@@ -2879,7 +2879,7 @@ dependencies = [
 [[package]]
 name = "vot-proof-blake3"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "blake3",
  "vot-proof-store",
@@ -2889,7 +2889,7 @@ dependencies = [
 [[package]]
 name = "vot-proof-catalog"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "vot-codec",
  "vot-object",
@@ -2901,7 +2901,7 @@ dependencies = [
 [[package]]
 name = "vot-proof-sha256"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "sha2 0.11.0",
  "vot-proof-store",
@@ -2911,12 +2911,12 @@ dependencies = [
 [[package]]
 name = "vot-proof-store"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 
 [[package]]
 name = "vot-receipt"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "ed25519-dalek",
  "hmac 0.13.0",
@@ -2928,12 +2928,12 @@ dependencies = [
 [[package]]
 name = "vot-resume-core"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 
 [[package]]
 name = "vot-scheduler"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "blake3",
  "vot-cbor",
@@ -2950,7 +2950,7 @@ dependencies = [
 [[package]]
 name = "vot-sdk"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "ed25519-dalek",
  "vot-codec",
@@ -2967,7 +2967,7 @@ dependencies = [
 [[package]]
 name = "vot-sdk-file"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "vot-commit-model",
  "vot-commit-platform",
@@ -2983,7 +2983,7 @@ dependencies = [
 [[package]]
 name = "vot-session"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "vot-codec",
  "vot-transport-api",
@@ -2992,7 +2992,7 @@ dependencies = [
 [[package]]
 name = "vot-transport-api"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "vot-codec",
 ]
@@ -3000,7 +3000,7 @@ dependencies = [
 [[package]]
 name = "vot-verified-range"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "vot-codec",
  "vot-proof-blake3",
@@ -3011,7 +3011,7 @@ dependencies = [
 [[package]]
 name = "vot-verifier"
 version = "0.0.1"
-source = "git+https://github.com/halideworks/VOT?rev=b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726#b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726"
+source = "git+https://github.com/halideworks/VOT?rev=069b55209cbaf03e04236bcec628cdea0972361c#069b55209cbaf03e04236bcec628cdea0972361c"
 dependencies = [
  "blake3",
  "sha2 0.11.0",

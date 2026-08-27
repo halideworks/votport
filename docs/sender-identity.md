@@ -74,7 +74,7 @@ A drop's result is an object identity. Three surfaces, one story:
 
 ### Non-goals
 
-- Raising `CHUNK_BYTES` (8 MiB). VOT FEC is parked. Do not re-pin VOT.
+- Raising `CHUNK_BYTES` (8 MiB). Do not re-pin VOT inside these PRs.
 - A JS crypto framework (tweetnacl, noble, WebCrypto ed25519 polyfill). The server verifies a tiny CBOR receipt.
 - Uploading the payload file to `/api/verify`. That would make votport a free hashing farm and a privacy problem.
 - Postgres, a new store backend, a dashboard rewrite, a component library.
@@ -264,7 +264,7 @@ Value is `app.signer.public_hex`, the same string `list_links` already returns a
 
 `suite` from existing `session::suite_name(receipt.suite_id)`. `root` is `hex::encode(receipt.subject_digest)` (64 lowercase hex). `length` is `receipt.subject_length`. The verify page maps `bytes: result.length` before `appendObjectCard`; the helper never reads `length`.
 
-`vot-receipt` at pin `b0c82d67` exposes `SubjectKind` / `AssuranceLevel` / `CommitProfile` as `repr(u8)` with no serde aliases and no `Display`. Do not `format!("{:?}", …)` (`Object` / `Published` / `Balanced`). Explicit match, and tests for the strings:
+`vot-receipt` at pin `069b5520` exposes `SubjectKind` / `AssuranceLevel` / `CommitProfile` as `repr(u8)` with no serde aliases and no `Display`. Do not `format!("{:?}", …)` (`Object` / `Published` / `Balanced`). Explicit match, and tests for the strings:
 
 | Rust | JSON |
 | --- | --- |
@@ -623,7 +623,7 @@ iOS pass is a manual gate on PR 3 (lock screen mid-send). Chromium `scripts/brow
 8. **No sender QR.** Admin QR remains the table-handoff.
 9. **Load-bearing ids stay.** New ids only on `verify.html`. Grep before rename.
 10. **Dead `admin.js` is not in the DAG.** Live listing is `page-links.js`.
-11. **Do not raise `CHUNK_BYTES`.** Do not re-pin VOT. FEC stays parked.
+11. **Do not raise `CHUNK_BYTES`.** Do not re-pin VOT inside these PRs.
 12. **Three PRs, card first.** Merge 1 then 2, and 1 then 3. 2 and 3 must not share a PR. 3 may merge without 2. Independently reviewable and rollbackable, not mergeable in any order.
 
 ## Risks
@@ -652,7 +652,7 @@ iOS pass is a manual gate on PR 3 (lock screen mid-send). Chromium `scripts/brow
 - `server/src/store.rs` (`FileRecord`, `UploadRecord`)
 - `server/tests/e2e.rs` `receipts_are_written_and_files_are_manageable`
 - `scripts/browser-e2e.mjs`
-- vot-receipt at pin `b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726`: `decode_authenticated`, `verify_ed25519`, 65_536 byte cap
+- vot-receipt at pin `069b55209cbaf03e04236bcec628cdea0972361c`: `decode_authenticated`, `verify_ed25519`, 65_536 byte cap
 - `docs/enterprise-ops.md`, `docs/deployment.md` (8 MiB ceiling), `README.md` Receipts section
 - `HANDOFF.md` load-bearing ids note: grep before renaming
 

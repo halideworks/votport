@@ -11,9 +11,9 @@ publish = false
 [workspace]
 
 [dependencies]
-vot-sdk = { git = "https://github.com/halideworks/VOT", rev = "b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726" }
-vot-sdk-file = { git = "https://github.com/halideworks/VOT", rev = "b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726" }
-vot-receipt = { git = "https://github.com/halideworks/VOT", rev = "b0c82d67415cf5fdbe1ca55e19aadf64cc5a5726" }
+vot-sdk = { git = "https://github.com/halideworks/VOT", rev = "069b55209cbaf03e04236bcec628cdea0972361c" }
+vot-sdk-file = { git = "https://github.com/halideworks/VOT", rev = "069b55209cbaf03e04236bcec628cdea0972361c" }
+vot-receipt = { git = "https://github.com/halideworks/VOT", rev = "069b55209cbaf03e04236bcec628cdea0972361c" }
 
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs", "io-util"] }
