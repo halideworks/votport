@@ -2988,6 +2988,10 @@ mod ops_tests {
     fn testing_config_public() -> crate::config::Config {
         crate::config::Config {
             bind: "127.0.0.1:0".parse().unwrap(),
+            push_bind: None,
+            push_certificate: None,
+            push_private_key: None,
+            push_advertise: None,
             data_dir: std::path::PathBuf::from("/nonexistent"),
             receive_dir: std::path::PathBuf::from("/nonexistent"),
             web_root: std::path::PathBuf::from("../web"),

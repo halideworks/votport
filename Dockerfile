@@ -10,13 +10,17 @@
 # guards older toolchains, so a floating tag would let production drift.
 FROM rust:1.97 AS build
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends clang cmake \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN rustup target add wasm32-unknown-unknown
 # Must match the wasm-bindgen version pinned by vot-wasm.
 RUN cargo install wasm-bindgen-cli --version 0.2.126 --locked
 
 # Browser-side VOT: hashing, proofs, and package building in WebAssembly.
 ARG VOT_GIT=https://github.com/halideworks/VOT
-ARG VOT_REV=069b55209cbaf03e04236bcec628cdea0972361c
+ARG VOT_REV=b14cc41debc2547c5ef999fee26bb055995284d9
 RUN git clone --filter=blob:none "$VOT_GIT" /vot \
     && git -C /vot checkout "$VOT_REV"
 RUN cd /vot \
@@ -26,7 +30,7 @@ RUN wasm-bindgen --target web --no-typescript --out-dir /wasm-vendor \
 
 # Server.
 COPY server /src/server
-RUN cd /src/server && cargo build --release
+RUN cd /src/server && cargo build --release --locked
 
 FROM debian:stable-slim
 # curl exists only for the healthcheck.

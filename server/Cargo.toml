@@ -10,10 +10,16 @@ publish = false
 # Standalone build: never join a surrounding cargo workspace.
 [workspace]
 
+# VOT's live QUIC transport uses the same three quiche patches as its
+# workspace. Cargo does not inherit a git dependency's workspace patch.
+[patch.crates-io]
+quiche = { git = "https://github.com/halideworks/quiche.git", rev = "ce7e5b71f3198125ab92a1626390bbe3a2c7faa0" }
+
 [dependencies]
-vot-sdk = { git = "https://github.com/halideworks/VOT", rev = "069b55209cbaf03e04236bcec628cdea0972361c" }
-vot-sdk-file = { git = "https://github.com/halideworks/VOT", rev = "069b55209cbaf03e04236bcec628cdea0972361c" }
-vot-receipt = { git = "https://github.com/halideworks/VOT", rev = "069b55209cbaf03e04236bcec628cdea0972361c" }
+vot-sdk = { git = "https://github.com/halideworks/VOT", rev = "b14cc41debc2547c5ef999fee26bb055995284d9" }
+vot-sdk-file = { git = "https://github.com/halideworks/VOT", rev = "b14cc41debc2547c5ef999fee26bb055995284d9" }
+vot-receipt = { git = "https://github.com/halideworks/VOT", rev = "b14cc41debc2547c5ef999fee26bb055995284d9" }
+vot-cli = { git = "https://github.com/halideworks/VOT", rev = "b14cc41debc2547c5ef999fee26bb055995284d9", default-features = false, features = ["wire"] }
 
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs", "io-util"] }
@@ -36,6 +42,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 openidconnect = { version = "4.0.1", features = ["reqwest"] }
+rcgen = { version = "0.14.9", default-features = false, features = ["aws_lc_rs", "pem"] }
 
 [dev-dependencies]
 http-body-util = "0.1"

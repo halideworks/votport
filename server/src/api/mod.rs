@@ -206,6 +206,10 @@ pub(crate) mod testing {
     pub(crate) fn config(directory: &std::path::Path) -> Config {
         Config {
             bind: "127.0.0.1:0".parse().unwrap(),
+            push_bind: None,
+            push_certificate: None,
+            push_private_key: None,
+            push_advertise: None,
             data_dir: directory.join("data"),
             receive_dir: directory.join("received"),
             web_root: std::path::PathBuf::from("../web"),

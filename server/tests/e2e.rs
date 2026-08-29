@@ -34,6 +34,10 @@ async fn start_server_with_cap(max_upload_bytes: u64) -> TestServer {
     let received = tempfile::tempdir().expect("receive dir");
     let config = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
+        push_bind: None,
+        push_certificate: None,
+        push_private_key: None,
+        push_advertise: None,
         data_dir: data.path().to_path_buf(),
         receive_dir: received.path().to_path_buf(),
         web_root: PathBuf::from("./web"),

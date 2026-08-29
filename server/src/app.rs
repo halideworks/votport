@@ -7,7 +7,9 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse as _, Response};
 use axum::routing::{get, post};
+use axum::Json;
 use axum::Router;
+use rand::RngCore as _;
 use std::fmt::Write as _;
 use tower_http::services::ServeDir;
 
@@ -16,6 +18,15 @@ use crate::auth::LoginThrottle;
 use crate::config::Config;
 use crate::session::{self, Sessions};
 use crate::store::Store;
+
+/// Native push transport state retained for the process lifetime.
+pub struct PushState {
+    #[allow(dead_code)]
+    pub(crate) listener: Mutex<vot_cli::Listener>,
+    pub(crate) issuer: ed25519_dalek::SigningKey,
+    pub(crate) address: String,
+    pub(crate) certificate_digest: [u8; 32],
+}
 
 pub struct App {
     pub config: Config,
@@ -57,6 +68,7 @@ pub struct App {
     /// OIDC configuration when SSO is enabled; the client discovers lazily.
     pub sso_config: Option<crate::config::OidcConfig>,
     pub sso_client: SsoSlot,
+    pub push: Option<PushState>,
 }
 
 const SSO_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
@@ -206,6 +218,10 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|error| format!("http client: {error}"))?;
+    let push = config
+        .push_bind
+        .map(|address| build_push_state(&config, address))
+        .transpose()?;
     Ok(Arc::new(App {
         store,
         sessions: Sessions::new(),
@@ -222,8 +238,133 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         http,
         sso_config: config.oidc.clone(),
         sso_client: SsoSlot::new(),
+        push,
         config,
     }))
+}
+
+fn build_push_state(config: &Config, address: std::net::SocketAddr) -> Result<PushState, String> {
+    let (certificate, key) = push_credentials(config)?;
+    let credentials = vot_cli::Credentials::Files { certificate, key };
+    let (listener, certificate_digest) = vot_cli::bind_push_listener(address, &credentials)
+        .map_err(|error| format!("bind native push listener: {error:?}"))?;
+    let issuer = load_push_issuer(&config.data_dir)?;
+    let address = config
+        .push_advertise
+        .clone()
+        .unwrap_or_else(|| listener.local_address().to_string());
+    tracing::info!(
+        address = %listener.local_address(),
+        certificate_digest = %hex::encode(certificate_digest),
+        "native push listener bound"
+    );
+    Ok(PushState {
+        listener: Mutex::new(listener),
+        issuer,
+        address,
+        certificate_digest,
+    })
+}
+
+fn load_push_issuer(data_dir: &std::path::Path) -> Result<ed25519_dalek::SigningKey, String> {
+    let path = data_dir.join("push-issuer.key");
+    let create = || {
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        publish_private(&path, &bytes)
+            .map(|()| bytes.to_vec())
+            .map_err(|error| format!("write {}: {error}", path.display()))
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) if bytes.len() == 32 => bytes,
+        Ok(_) => {
+            std::fs::remove_file(&path)
+                .map_err(|error| format!("remove {}: {error}", path.display()))?;
+            create()?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => create()?,
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let mut bytes32 = [0u8; 32];
+    bytes32.copy_from_slice(&bytes);
+    Ok(ed25519_dalek::SigningKey::from_bytes(&bytes32))
+}
+
+fn push_credentials(config: &Config) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+    let certificate = config
+        .push_certificate
+        .clone()
+        .unwrap_or_else(|| config.data_dir.join("push.crt"));
+    let key = config
+        .push_private_key
+        .clone()
+        .unwrap_or_else(|| config.data_dir.join("push.key"));
+    let managed = config.push_certificate.is_none() && config.push_private_key.is_none();
+    match (certificate.exists(), key.exists()) {
+        (true, true) => return Ok((certificate, key)),
+        (true, false) | (false, true) => {
+            if !managed {
+                return Err(format!(
+                    "native push certificate and key must both exist: {} and {}",
+                    certificate.display(),
+                    key.display()
+                ));
+            }
+            for path in [&certificate, &key] {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!("remove {}: {error}", path.display()));
+                    }
+                }
+            }
+        }
+        (false, false) if !managed => {
+            return Err(format!(
+                "native push certificate and key not found: {} and {}",
+                certificate.display(),
+                key.display()
+            ));
+        }
+        (false, false) => {}
+    }
+
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .map_err(|error| format!("generate native push key: {error}"))?;
+    let mut parameters = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+        .map_err(|error| format!("create native push certificate: {error}"))?;
+    parameters
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "localhost");
+    let certificate_pem = parameters
+        .self_signed(&key_pair)
+        .map_err(|error| format!("create native push certificate: {error}"))?;
+    publish_private(&certificate, certificate_pem.pem().as_bytes())
+        .map_err(|error| format!("write {}: {error}", certificate.display()))?;
+    if let Err(error) = publish_private(&key, key_pair.serialize_pem().as_bytes()) {
+        let _ = std::fs::remove_file(&certificate);
+        return Err(format!("write {}: {error}", key.display()));
+    }
+    Ok((certificate, key))
+}
+
+fn publish_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("key");
+    let mut suffix = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut suffix);
+    let temporary = parent.join(format!(".{name}.tmp-{}", hex::encode(suffix)));
+    let result = crate::auth::write_private(&temporary, bytes)
+        .and_then(|()| std::fs::hard_link(&temporary, path));
+    let cleanup = std::fs::remove_file(&temporary);
+    match result {
+        Ok(()) => cleanup,
+        Err(error) => Err(error),
+    }
 }
 
 pub fn router(app: Arc<App>) -> Router {
@@ -349,6 +490,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/admin/sso/start", get(api::sso_start))
         .route("/api/admin/callback", get(api::sso_callback))
         // Public upload API.
+        .route("/api/push-identity", get(push_identity))
         .route("/api/r/{token}", get(api::link_info))
         .route("/api/receipt-key", get(api::receipt_key))
         .route(
@@ -374,6 +516,164 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/session/{sid}/abort", post(api::upload_abort))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(app)
+}
+
+async fn push_identity(State(app): State<Arc<App>>) -> Response {
+    let Some(push) = app.push.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    Json(serde_json::json!({
+        "address": push.address,
+        "certificate_digest": hex::encode(push.certificate_digest),
+        "issuer_public_key": hex::encode(push.issuer.verifying_key().to_bytes()),
+    }))
+    .into_response()
+}
+
+#[cfg(test)]
+mod push_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+
+    fn push_config(directory: &std::path::Path) -> Config {
+        let mut config = crate::api::testing::config(directory);
+        config.push_bind = Some("127.0.0.1:0".parse().unwrap());
+        config.push_advertise = Some("push.example.test:8322".to_owned());
+        config
+    }
+
+    async fn identity(app: Arc<App>) -> serde_json::Value {
+        let response = router(app)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/push-identity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn push_identity_is_public_and_stable_across_restarts() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = build(push_config(directory.path())).unwrap();
+        let first_identity = identity(first).await;
+        assert_eq!(first_identity["address"], "push.example.test:8322");
+        assert_eq!(
+            first_identity["certificate_digest"].as_str().unwrap().len(),
+            64
+        );
+        assert_eq!(
+            first_identity["issuer_public_key"].as_str().unwrap().len(),
+            64
+        );
+        let certificate = std::fs::read(directory.path().join("data/push.crt")).unwrap();
+        let key = std::fs::read(directory.path().join("data/push.key")).unwrap();
+        let issuer = std::fs::read(directory.path().join("data/push-issuer.key")).unwrap();
+
+        let second = build(push_config(directory.path())).unwrap();
+        assert_eq!(identity(second).await, first_identity);
+        assert_eq!(
+            std::fs::read(directory.path().join("data/push.crt")).unwrap(),
+            certificate
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("data/push.key")).unwrap(),
+            key
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("data/push-issuer.key")).unwrap(),
+            issuer
+        );
+    }
+
+    #[tokio::test]
+    async fn push_identity_is_not_exposed_when_disabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let response = router(crate::api::testing::build(directory.path()))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/push-identity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn managed_credentials_regenerate_when_one_file_is_left_behind() {
+        for lone in ["push.crt", "push.key"] {
+            let directory = tempfile::tempdir().unwrap();
+            let data = directory.path().join("data");
+            std::fs::create_dir_all(&data).unwrap();
+            std::fs::write(data.join(lone), b"interrupted").unwrap();
+
+            let config = push_config(directory.path());
+            push_credentials(&config).unwrap();
+
+            assert!(std::fs::read(data.join("push.crt"))
+                .unwrap()
+                .starts_with(b"-----BEGIN CERTIFICATE-----"));
+            assert!(std::fs::read(data.join("push.key"))
+                .unwrap()
+                .starts_with(b"-----BEGIN"));
+        }
+    }
+
+    #[test]
+    fn invalid_push_issuer_is_regenerated_and_then_stable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("push-issuer.key");
+        std::fs::write(&path, b"interrupted").unwrap();
+
+        let first = load_push_issuer(directory.path()).unwrap();
+        let first_bytes = std::fs::read(&path).unwrap();
+        assert_eq!(first_bytes.len(), 32);
+        let second = load_push_issuer(directory.path()).unwrap();
+        assert_eq!(first.to_bytes(), second.to_bytes());
+        assert_eq!(std::fs::read(path).unwrap(), first_bytes);
+    }
+
+    #[test]
+    fn supplied_credentials_are_strict_and_never_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let certificate = directory.path().join("supplied.crt");
+        let key = directory.path().join("supplied.key");
+        std::fs::write(&certificate, b"keep this file").unwrap();
+        let mut config = crate::api::testing::config(directory.path());
+        config.push_bind = Some("127.0.0.1:0".parse().unwrap());
+        config.push_certificate = Some(certificate.clone());
+        config.push_private_key = Some(key.clone());
+
+        assert!(build(config).is_err());
+        assert_eq!(std::fs::read(certificate).unwrap(), b"keep this file");
+        assert!(!key.exists());
+    }
+
+    #[test]
+    fn private_publication_never_overwrites_and_cleans_temporary_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let existing = directory.path().join("existing.key");
+        std::fs::write(&existing, b"original").unwrap();
+        assert!(publish_private(&existing, b"replacement").is_err());
+        assert_eq!(std::fs::read(&existing).unwrap(), b"original");
+
+        let created = directory.path().join("created.key");
+        publish_private(&created, b"new secret").unwrap();
+        assert_eq!(std::fs::read(&created).unwrap(), b"new secret");
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .flatten()
+            .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp-")));
+    }
 }
 
 /// Prometheus-style plain-text metrics: counts only, no secrets. When
