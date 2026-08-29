@@ -8,6 +8,14 @@ use std::path::PathBuf;
 pub struct Config {
     /// Address the HTTP server binds to.
     pub bind: SocketAddr,
+    /// UDP address for native VOT pushes. None leaves the feature off.
+    pub push_bind: Option<SocketAddr>,
+    /// Certificate and private key presented by the native push listener.
+    /// When absent, a persistent self-signed pair is created in `data_dir`.
+    pub push_certificate: Option<PathBuf>,
+    pub push_private_key: Option<PathBuf>,
+    /// Public host and port native senders dial.
+    pub push_advertise: Option<String>,
     /// Directory holding votport state (votport.db, secret).
     pub data_dir: PathBuf,
     /// Root directory received files are published into.
@@ -224,10 +232,40 @@ pub fn from_env() -> Result<Config, String> {
         },
     };
 
+    let optional = |name: &str| env::var(name).ok().filter(|value| !value.trim().is_empty());
     let public_url = env::var("VOTPORT_PUBLIC_URL")
         .ok()
         .map(|url| url.trim_end_matches('/').to_owned())
         .filter(|url| !url.is_empty());
+
+    let push_bind = optional("VOTPORT_PUSH_BIND")
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|error| format!("VOTPORT_PUSH_BIND is not a socket address: {error}"))
+        })
+        .transpose()?;
+    let (push_certificate, push_private_key) =
+        match (optional("VOTPORT_PUSH_CERT"), optional("VOTPORT_PUSH_KEY")) {
+            (Some(certificate), Some(key)) => {
+                (Some(PathBuf::from(certificate)), Some(PathBuf::from(key)))
+            }
+            (None, None) => (None, None),
+            _ => {
+                return Err(
+                    "set both VOTPORT_PUSH_CERT and VOTPORT_PUSH_KEY, or neither".to_owned(),
+                )
+            }
+        };
+    let push_advertise = push_bind
+        .map(|bind| {
+            push_address(
+                optional("VOTPORT_PUSH_ADVERTISE"),
+                public_url.as_deref(),
+                bind,
+            )
+        })
+        .transpose()?;
 
     let max_upload_bytes = match env::var("VOTPORT_MAX_UPLOAD_BYTES") {
         Ok(value) => {
@@ -238,7 +276,6 @@ pub fn from_env() -> Result<Config, String> {
 
     let allow_hidden = env::var("VOTPORT_ALLOW_HIDDEN").is_ok_and(|value| value == "1");
 
-    let optional = |name: &str| env::var(name).ok().filter(|value| !value.trim().is_empty());
     let upload_retention_days = match env::var("VOTPORT_UPLOAD_RETENTION_DAYS") {
         Ok(value) => value
             .parse()
@@ -361,6 +398,10 @@ pub fn from_env() -> Result<Config, String> {
 
     Ok(Config {
         bind,
+        push_bind,
+        push_certificate,
+        push_private_key,
+        push_advertise,
         data_dir,
         receive_dir,
         web_root,
@@ -391,6 +432,53 @@ pub fn from_env() -> Result<Config, String> {
         trusted_proxies,
         oidc,
     })
+}
+
+fn push_address(
+    explicit: Option<String>,
+    public_url: Option<&str>,
+    bind: SocketAddr,
+) -> Result<String, String> {
+    if bind.port() == 0 {
+        return Err("VOTPORT_PUSH_BIND port must be greater than zero".to_owned());
+    }
+    let address = if let Some(address) = explicit {
+        address
+    } else {
+        let public_url = public_url.ok_or_else(|| {
+            "set VOTPORT_PUSH_ADVERTISE or VOTPORT_PUBLIC_URL when VOTPORT_PUSH_BIND is set"
+                .to_owned()
+        })?;
+        let parsed = reqwest::Url::parse(public_url).map_err(|error| {
+            format!("VOTPORT_PUBLIC_URL cannot supply the push address: {error}")
+        })?;
+        let host = parsed.host_str().ok_or_else(|| {
+            "VOTPORT_PUBLIC_URL has no host; set VOTPORT_PUSH_ADVERTISE".to_owned()
+        })?;
+        if host.starts_with('[') {
+            format!("{host}:{}", bind.port())
+        } else if host.contains(':') {
+            format!("[{host}]:{}", bind.port())
+        } else {
+            format!("{host}:{}", bind.port())
+        }
+    };
+    if address.contains(['/', '\\']) {
+        return Err("VOTPORT_PUSH_ADVERTISE must be host:port".to_owned());
+    }
+    let parsed = reqwest::Url::parse(&format!("vot://{address}"))
+        .map_err(|error| format!("VOTPORT_PUSH_ADVERTISE is not host:port: {error}"))?;
+    if parsed.host_str().is_none()
+        || parsed.port().is_none_or(|port| port == 0)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || !matches!(parsed.path(), "" | "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("VOTPORT_PUSH_ADVERTISE must be host:port".to_owned());
+    }
+    Ok(address)
 }
 
 fn env_or(name: &str, default: &str) -> String {
@@ -464,6 +552,66 @@ mod password_tests {
             );
         }
         assert_eq!("elevenchar.".chars().count(), MIN_ADMIN_PASSWORD_CHARS - 1);
+    }
+}
+
+#[cfg(test)]
+mod push_tests {
+    use super::push_address;
+
+    #[test]
+    fn push_address_uses_the_public_host_and_udp_port() {
+        assert_eq!(
+            push_address(
+                None,
+                Some("https://drop.example.com/base"),
+                "0.0.0.0:8322".parse().unwrap()
+            )
+            .unwrap(),
+            "drop.example.com:8322"
+        );
+        assert_eq!(
+            push_address(
+                None,
+                Some("https://[2001:db8::1]"),
+                "[::]:8322".parse().unwrap()
+            )
+            .unwrap(),
+            "[2001:db8::1]:8322"
+        );
+        assert_eq!(
+            push_address(
+                Some("push.example.net:9443".to_owned()),
+                None,
+                "0.0.0.0:8322".parse().unwrap()
+            )
+            .unwrap(),
+            "push.example.net:9443"
+        );
+        assert!(push_address(None, None, "0.0.0.0:8322".parse().unwrap()).is_err());
+        assert!(push_address(
+            Some("push.example.net:8322".to_owned()),
+            None,
+            "127.0.0.1:0".parse().unwrap()
+        )
+        .is_err());
+        for invalid in [
+            "push.example.net",
+            "push.example.net:0",
+            "push.example.net:8322/",
+            "push.example.net:9/path",
+            "user@host:9",
+        ] {
+            assert!(
+                push_address(
+                    Some(invalid.to_owned()),
+                    None,
+                    "0.0.0.0:8322".parse().unwrap()
+                )
+                .is_err(),
+                "{invalid} was accepted"
+            );
+        }
     }
 }
 

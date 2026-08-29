@@ -1,7 +1,8 @@
 # Native push: VOT QUIC receive path
 
-Status: draft, 2026-08-27. Depends on VOT ADR-0045 (push, the holder dials),
-which is proposed and not yet implemented upstream.
+Status: PR 1 implemented, 2026-08-29. VOT ADR-0045 (push, the holder dials)
+landed upstream in PR #391 at `b14cc41debc2547c5ef999fee26bb055995284d9`.
+Preflight, the accept loop, and the receive worker are not shipped yet.
 
 ## Overview
 
@@ -415,19 +416,23 @@ want one public port, and changes nothing in votport.
 
 ## Rollout Plan
 
-1. Land ADR-0045 and its implementation upstream. Repin.
-2. Ship votport with `VOTPORT_PUSH_BIND` unset by default. Nothing changes
+1. Ship votport PR 1 with `VOTPORT_PUSH_BIND` unset by default. Nothing changes
    for existing deployments.
-3. Enable on the production instance with a self-signed certificate, publish
+2. Implement preflight and admission in PR 2.
+3. Implement the accept loop and push worker in PR 3.
+4. Enable on the production instance with a self-signed certificate, publish
    `<port>/udp` in compose, open the firewall port, verify
    `/api/push-identity`.
-4. First sender is the CLI (`vot push`). Second is VOTDock's server-to-server
+5. First sender is the CLI (`vot push`). Second is VOTDock's server-to-server
    agent. Desktop app follows the same library path.
 
 ## Open Questions
 
 - Cloudflare in front of VOTDock: raw QUIC needs Spectrum UDP or a direct
   address. Decide before VOTDock's topology is fixed.
+- VOT `b14cc41` parses the CLI push address as a numeric `SocketAddr`, while
+  votport advertises a DNS host and port. Resolve hostnames in VOT before the
+  CLI is named as a supported sender in PR 4.
 
 ## Risks
 
@@ -457,9 +462,9 @@ want one public port, and changes nothing in votport.
   `VOTPORT_PUSH_ADVERTISE`.
 - `app.rs`: bind `Listener` when set; issuer and certificate key files;
   `GET /api/push-identity`.
-- `Cargo.toml`: `vot-cli` with `wire`, `vot-transport-quiche`,
-  `vot-capability`, `vot-scheduler`, `vot-proof-blake3`. Dockerfile: cmake,
-  clang.
+- `Cargo.toml`: `vot-cli` with `wire` and `rcgen`; the worker's direct
+  capability, scheduler, proof, and transport dependencies wait for PR 3.
+  Dockerfile: cmake, clang.
 - Tests: identity endpoint, key generation idempotent across restarts,
   digest stable.
 

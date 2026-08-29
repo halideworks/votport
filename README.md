@@ -246,7 +246,7 @@ publishes each file the moment its coverage is complete.
 
 That serial verify is what leaves headroom on a fast NIC. Raising the range
 size or verifying in parallel needs VOT changes on the server verify path;
-the VOT pin at `069b552` does not include them. Do not raise `CHUNK_BYTES`
+the VOT pin at `b14cc41` does not include them. Do not raise `CHUNK_BYTES`
 in votport ahead of that work.
 
 Measure on this box:
@@ -307,12 +307,10 @@ dies halfway still delivers the files that finished.
 
 ## Roadmap
 
-VOT is pinned at `069b55209cbaf03e04236bcec628cdea0972361c`. The upstream
-work since the previous pin (datagram FEC, pacing, congestion window seeding,
-serve identity pins) lives in VOT's QUIC serve and fetch path, which votport
-does not run: uploads travel over HTTP through the reverse proxy, and the
-server uses only `vot-sdk` package and range verification, `vot-sdk-file`
-commit, and `vot-receipt`. None of the new VOT knobs apply here, and nothing
+VOT is pinned at `b14cc41debc2547c5ef999fee26bb055995284d9` (upstream PR #391).
+That pin adds the holder-dialed push engine. votport now has the feature-off
+listener identity from native-push PR 1, but not preflight or a receive worker.
+Browser uploads still travel over HTTP through the reverse proxy, and nothing
 landed that changes `CHUNK_BYTES` or enables parallel verify.
 
 Product next, each as its own design first:
