@@ -56,6 +56,7 @@ http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "cookies"] }
 tempfile = "3"
+vot-transport-api = { git = "https://github.com/halideworks/VOT", rev = "b14cc41debc2547c5ef999fee26bb055995284d9" }
 
 [profile.release]
 lto = "thin"

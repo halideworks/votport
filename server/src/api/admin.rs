@@ -1141,6 +1141,7 @@ struct UploadView {
     id: String,
     started_at: u64,
     completed_at: u64,
+    transport: String,
     replayed_chunks: u64,
     rejected_chunks: u64,
     package_root: String,
@@ -1218,6 +1219,7 @@ fn link_view(app: &App, link: Link, base: &str) -> LinkView {
             id: upload.id,
             started_at: upload.started_at,
             completed_at: upload.completed_at,
+            transport: upload.transport.unwrap_or_else(|| "http".to_owned()),
             replayed_chunks: upload.replayed_chunks,
             rejected_chunks: upload.rejected_chunks,
             package_root: upload.package_root,
@@ -1609,6 +1611,7 @@ mod handler_tests {
 
     use crate::api::testing;
     use crate::app;
+    use crate::store::UploadRecord;
 
     async fn login_attempt(
         application: Arc<App>,
@@ -1885,6 +1888,42 @@ mod handler_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn link_view_maps_legacy_upload_transport_to_http() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let view = link_view(
+            &application,
+            Link {
+                id: "link".to_owned(),
+                label: "link".to_owned(),
+                tenant: String::new(),
+                dest: String::new(),
+                password_hash: None,
+                created_at: 0,
+                expires_at: None,
+                max_bytes: None,
+                active: true,
+                legal_hold: false,
+                uploads: vec![UploadRecord {
+                    id: "upload".to_owned(),
+                    started_at: 0,
+                    completed_at: 1,
+                    replayed_chunks: 0,
+                    rejected_chunks: 0,
+                    transport: None,
+                    package_root: "root".to_owned(),
+                    total_bytes: 0,
+                    files: Vec::new(),
+                }],
+                events: Vec::new(),
+            },
+            "http://localhost",
+        );
+        let json = serde_json::to_value(view).unwrap();
+        assert_eq!(json["uploads"][0]["transport"], "http");
     }
 
     #[tokio::test]

@@ -1,8 +1,7 @@
 # Native push: VOT QUIC receive path
 
-Status: PRs 1-3 implemented, 2026-08-29. VOT ADR-0045 (push, the holder dials)
+Status: Native push and its operator surface are implemented, 2026-08-29. VOT ADR-0045 (push, the holder dials)
 landed upstream in PR #391 at `b14cc41debc2547c5ef999fee26bb055995284d9`.
-The remaining work is PR 4's operator surface.
 
 ## Overview
 
@@ -23,39 +22,29 @@ admission decision, one commit path, and one `UploadRecord` shape.
 
 ### Current state (verified in code)
 
-- `POST /api/r/{token}/session` (`server/src/api/upload.rs:214-414`) checks
-  the link, the password, the per-IP rate, resolves the tenant, computes
-  `effective_cap`, builds `session::WorkerSetup`, and calls
-  `Sessions::insert_admitted` (`server/src/session.rs:1001-1073`), which
-  under one lock checks delete pins, `MAX_SESSIONS`, `MAX_SESSIONS_PER_LINK`,
-  the tenant session cap, and the byte quota, then registers the session
-  before `spawn_worker` starts its thread.
-- The worker is a `Phase` state machine (`session.rs:161-172`):
-  `AwaitSeal`, `Pages`, `Receiving`, `Done`. `handle_begin`
-  (`session.rs:337-423`) finishes `PackageIngest`, refuses packed entries,
-  and runs the dedupe index over prior `FileRecord`s. `handle_chunk`
-  (`session.rs:556-606`) calls `vot_sdk::verify::verify_range` then
-  `NativeFile::accept`; `publish_file` (`session.rs:608-640`) calls
-  `NativeFile::publish` and `ReceiptSigner::write_sidecar`. `handle_finish`
-  (`session.rs:642-692`) appends the `UploadRecord`.
-- votport binds one TCP socket (`server/src/main.rs:43`) and holds no
-  certificate; Caddy terminates TLS. There is no UDP listener, no ACME, no
-  cert path. Persistent keys under `data_dir` are the cookie-signing secret
-  (`auth::load_secret`, `server/src/auth.rs:43-60`) and the receipt key
-  (`ReceiptSigner::load_or_create`, `server/src/receipt.rs:34-52`).
-- Credentials are the link token plus optional password (argon2, throttled
-  per /64) issued as a signed cookie, and admin password or OIDC. There is
-  no token a non-browser sender can present.
-- `server/Cargo.toml` depends on `vot-sdk`, `vot-sdk-file`, `vot-receipt`.
-  No transport crate. The VOT wire engine lives in `vot-cli`'s library
-  behind the `wire` feature (`crates/vot-cli/Cargo.toml:14`), which pulls
-  `vot-transport-quiche` with `live` and builds BoringSSL through cmake.
+- The browser path still uses HTTP through Caddy. It admits sessions through
+  the shared quota and session checks, verifies proven ranges, and publishes
+  files with receipts.
+- When `VOTPORT_PUSH_BIND` is set, votport also binds a QUIC/UDP listener,
+  serves `/api/push-identity`, and accepts the capability returned by
+  `POST /api/r/{token}/push`. The bind is off by default.
+- Native push uses the same tenant/link quotas, session table, upload history,
+  receipts, retention, and admin views as browser uploads. It stages and
+  verifies the complete package before publication, so a failed native
+  transfer does not publish partial destination files.
+- The browser uses the link token plus optional password (argon2, throttled
+  per /64) and a signed cookie. Native senders authenticate the HTTPS
+  preflight with that link authorization, then present its scoped capability
+  and holder proof over QUIC.
+- `server/Cargo.toml` embeds VOT's wire engine behind the `wire` feature,
+  including the live QUIC transport and the proof dependencies used by the
+  native receive seams.
 
-### Pain points
+### What native push addresses
 
-- A CLI or desktop sender today must drive the HTTP chunk protocol by hand
-  and gets nothing from VOT's carrier: no multi-rail, no datagram FEC, no
-  pacing, no resume below the 8 MiB chunk.
+- Without native push, a CLI or desktop sender must drive the HTTP chunk
+  protocol by hand and gets nothing from VOT's carrier: no multi-rail, no
+  datagram FEC, no pacing, no resume below the 8 MiB chunk.
 - The HTTP path verifies ranges serially in one worker thread per session
   (`handle_chunk`). The VOT fetch engine already parallelizes proof workers
   (`VOT_FETCH_PROVERS`) and rails (`VOT_FETCH_RAILS`).
@@ -147,6 +136,7 @@ admission decision, one commit path, and one `UploadRecord` shape.
   votport generates a self-signed pair at first boot into
   `<data_dir>/push.crt` and `<data_dir>/push.key` with `auth::write_private`,
   the pattern `ReceiptSigner::load_or_create` uses, and logs the digest.
+  When both are set, those certificate and key paths are used in place.
 - `VOTPORT_PUSH_ADVERTISE` (default: host of `VOTPORT_PUBLIC_URL` plus the
   bind port) is what the preflight returns to senders. Docker publishes it
   as `<port>/udp`.
@@ -170,6 +160,10 @@ Request:
                "entries": 3 }
 }
 ```
+
+The announced suite, root, and length are bound at admission. The announced
+`entries` value is accepted for the request shape but is not an admission
+check; the received manifest is checked later against `MAX_ENTRIES`.
 
 - Runs the same checks as `create_session` in the same order: link usable,
   per-IP rate, password or link cookie, tenant resolve, `effective_cap`
@@ -344,7 +338,8 @@ New, all under the existing link authorization:
 CLI can discover the path before asking for a password.
 
 The stored `UploadRecord` carries `transport: "push"`; new browser uploads
-record `"http"`. PR 4 exposes it through `list_links` and upload history.
+record `"http"`. The operator surface exposes it through `list_links` and
+upload history.
 There is no schema bump: `UploadRecord` is JSON in `links.uploads_json`, and
 an absent value on an older record means `"http"`.
 
@@ -356,8 +351,9 @@ an absent value on an older record means `"http"`.
 - In-memory `push_tickets: Mutex<HashMap<[u8; 16], PushTicket>>` on `App`,
   swept with sessions. Not persisted: a restart invalidates in-flight
   pushes the same way it invalidates HTTP sessions today.
-- Two key files under `data_dir`: `push-issuer.key`, and `push.key` with
-  `push.crt` unless the operator supplies PEMs.
+- `push-issuer.key` is always under `data_dir`. `push.key` and `push.crt` are
+  generated there unless the operator supplies certificate and key paths,
+  which are used in place.
 
 ## Alternatives Considered
 
@@ -423,34 +419,38 @@ want one public port, and changes nothing in votport.
 
 ## Observability
 
-- Events: `push_admitted`, `push_connected`, `push_refused` with reason
-  (`capability`, `root_mismatch`, `expired`, `spent`), and the existing
-  `uploaded`, `cancelled`, `interrupted`.
+- Events: `push_admitted`, `push_connected`, and `push_refused` with a bounded
+  reason (`rate`, `capability`, `expired`, or `spent`), plus the existing
+  `uploaded`, `cancelled`, and `interrupted`
+  lifecycle events. A package root mismatch is recorded as an interrupted
+  push rather than a `push_refused` reason: VOT b14 checks the package pin
+  before calling votport's manifest hook and exposes no terminal reason hook.
 - Metrics: `votport_push_sessions_active`, `votport_push_bytes_total`,
-  `votport_push_refused_total{reason}`; the engine's fetch statistics
-  (`VOT_FETCH_STATS` shape) logged per session at info.
+  `votport_push_refused_total{reason}`.
+- `VOT_FETCH_STATS` is for VOT's fetch path only, not a native push sender
+  setting. The b14 receiver has no whole-session terminal statistics callback,
+  so votport does not claim to emit that setting's fetch-statistics line; use
+  the metrics and audit events above for receiver-side observability.
 - Link cards show transport and the same duration and rate telemetry the
   HTTP path records.
 
 ## Rollout Plan
 
-1. Ship votport PR 1 with `VOTPORT_PUSH_BIND` unset by default. Nothing changes
-   for existing deployments.
-2. Implement preflight and admission in PR 2.
-3. Implement the accept loop and push worker in PR 3.
-4. Enable on the production instance with a self-signed certificate, publish
-   `<port>/udp` in compose, open the firewall port, verify
-   `/api/push-identity`.
-5. First sender is the CLI (`vot push`). Second is VOTDock's server-to-server
-   agent. Desktop app follows the same library path.
+1. Keep `VOTPORT_PUSH_BIND` unset unless native push is needed.
+2. When enabling it, choose a reachable UDP port, set a numeric
+   `VOTPORT_PUSH_ADVERTISE` for the b14 CLI, map the UDP port, open the
+   firewall, and verify `/api/push-identity`.
+3. Pin the returned certificate digest, perform the HTTPS preflight, decode
+   its capability into the VOT CLI's capability file, and run `vot push`.
+   Library senders may resolve DNS before dialing.
 
-## Open Questions
+## Upstream limitations
 
 - Cloudflare in front of VOTDock: raw QUIC needs Spectrum UDP or a direct
   address. Decide before VOTDock's topology is fixed.
-- VOT `b14cc41` parses the CLI push address as a numeric `SocketAddr`, while
-  votport advertises a DNS host and port. Resolve hostnames in VOT before the
-  CLI is named as a supported sender in PR 4.
+- VOT `b14cc41` parses the CLI push address as a numeric `SocketAddr`. DNS
+  resolution remains the library caller's responsibility until upstream adds
+  hostname resolution to the CLI.
 
 ## Risks
 
@@ -509,7 +509,7 @@ want one public port, and changes nothing in votport.
   abort leave no partial destination file; throughput benchmark variant
   `throughput_push` beside `throughput_baseline`.
 
-### PR 4: Operator surface
+### PR 4: Operator surface (implemented)
 
 - Link cards and upload history show transport; metrics; events; docs
   (`deployment.md` port and certificate, `README.md` sender section).

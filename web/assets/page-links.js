@@ -47,8 +47,12 @@ function renderUpload(link, upload) {
       ` · ${formatDuration(seconds)} · ${formatBytes(Math.round(upload.total_bytes / seconds))}/s`;
   }
   when.textContent += chunkTrouble(upload);
+  const transport = document.createElement('span');
+  transport.className = 'badge';
+  transport.textContent = upload.transport === 'push' ? 'native push' : 'http';
   head.append(
     when,
+    transport,
     button('Clear record', 'tiny ghost', async () => {
       if (
         !(await confirmModal(
