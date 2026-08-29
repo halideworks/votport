@@ -1,8 +1,8 @@
 # Native push: VOT QUIC receive path
 
-Status: PR 1 implemented, 2026-08-29. VOT ADR-0045 (push, the holder dials)
+Status: PRs 1-2 implemented, 2026-08-29. VOT ADR-0045 (push, the holder dials)
 landed upstream in PR #391 at `b14cc41debc2547c5ef999fee26bb055995284d9`.
-Preflight, the accept loop, and the receive worker are not shipped yet.
+The accept loop and receive worker are not shipped yet.
 
 ## Overview
 

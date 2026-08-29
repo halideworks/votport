@@ -797,6 +797,7 @@ pub struct SessionHandle {
     pub tenant: String,
     pub reserved_bytes: u64,
     pub sender: mpsc::Sender<Cmd>,
+    pub kind: SessionKind,
     activity: Arc<SessionActivity>,
 }
 
@@ -834,6 +835,19 @@ pub struct SessionAdmission {
     pub max_tenant_sessions: Option<u64>,
     pub max_link_sessions: usize,
     pub max_sessions: usize,
+    pub kind: SessionKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionKind {
+    Http,
+    Push,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TouchError {
+    NotFound,
+    WrongKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1013,6 +1027,7 @@ impl Sessions {
             max_tenant_sessions,
             max_link_sessions,
             max_sessions,
+            kind,
         } = admission;
         let mut inner = self.inner.lock().expect("sessions poisoned");
         if !tenant.is_empty() && inner.pinned.contains(&tenant) {
@@ -1063,6 +1078,7 @@ impl Sessions {
                 tenant,
                 reserved_bytes,
                 sender,
+                kind,
                 activity: Arc::new(SessionActivity {
                     in_flight: AtomicUsize::new(0),
                     last_active: Mutex::new(Instant::now()),
@@ -1090,6 +1106,7 @@ impl Sessions {
                 max_tenant_sessions: None,
                 max_link_sessions: usize::MAX,
                 max_sessions: usize::MAX,
+                kind: SessionKind::Http,
             },
             sender,
             || Ok(0),
@@ -1118,16 +1135,19 @@ impl Sessions {
     }
 
     /// Keeps the session registered until the returned command guard drops.
-    pub fn touch(&self, id: &str) -> Option<SessionCommand> {
+    pub fn touch(&self, id: &str) -> Result<SessionCommand, TouchError> {
         let inner = self.inner.lock().expect("sessions poisoned");
-        let handle = inner.map.get(id)?;
+        let handle = inner.map.get(id).ok_or(TouchError::NotFound)?;
+        if matches!(&handle.kind, SessionKind::Push) {
+            return Err(TouchError::WrongKind);
+        }
         *handle
             .activity
             .last_active
             .lock()
             .expect("session activity poisoned") = Instant::now();
         handle.activity.in_flight.fetch_add(1, Ordering::AcqRel);
-        Some(SessionCommand {
+        Ok(SessionCommand {
             sender: handle.sender.clone(),
             lease: SessionLease {
                 activity: Arc::clone(&handle.activity),
@@ -1197,6 +1217,7 @@ mod pin_tests {
             max_tenant_sessions: Some(max_tenant_sessions),
             max_link_sessions: usize::MAX,
             max_sessions: usize::MAX,
+            kind: SessionKind::Http,
         }
     }
 
@@ -1297,6 +1318,49 @@ mod pin_tests {
                 dummy_sender(),
                 || Ok(0),
             )
+            .unwrap();
+    }
+
+    #[test]
+    fn push_touch_is_rejected_without_changing_activity() {
+        let sessions = Sessions::new();
+        let mut push = admission("push", 0, 100, 1);
+        push.kind = SessionKind::Push;
+        sessions
+            .insert_admitted(push, dummy_sender(), || Ok(0))
+            .unwrap();
+
+        assert!(matches!(sessions.touch("push"), Err(TouchError::WrongKind)));
+        assert!(matches!(
+            sessions.touch("missing"),
+            Err(TouchError::NotFound)
+        ));
+        assert_eq!(sessions.active_for_link("link"), 1);
+        sessions.sweep(0);
+        assert_eq!(sessions.total(), 0);
+    }
+
+    #[test]
+    fn push_admission_reserves_bytes_until_removal() {
+        let sessions = Sessions::new();
+        let mut first = admission("push-1", 60, 100, 2);
+        first.kind = SessionKind::Push;
+        sessions
+            .insert_admitted(first, dummy_sender(), || Ok(0))
+            .unwrap();
+
+        let mut second = admission("push-2", 50, 100, 2);
+        second.kind = SessionKind::Push;
+        assert_eq!(
+            sessions.insert_admitted(second, dummy_sender(), || Ok(0)),
+            Err(InsertError::ByteQuota)
+        );
+
+        sessions.remove("push-1");
+        let mut admitted = admission("push-2", 50, 100, 2);
+        admitted.kind = SessionKind::Push;
+        sessions
+            .insert_admitted(admitted, dummy_sender(), || Ok(0))
             .unwrap();
     }
 
