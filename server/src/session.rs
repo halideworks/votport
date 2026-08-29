@@ -7,8 +7,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -16,7 +17,7 @@ use axum::body::Bytes;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
-use vot_sdk::object::ObjectId;
+use vot_sdk::object::{InMemoryObjectBuilder, ObjectId, Suite};
 use vot_sdk::package::{EntryStorage, PackageEntry, PackageIngest};
 use vot_sdk::verify::verify_range;
 use vot_sdk_file::{CommitProfile, NativeFile, RangeStatus};
@@ -145,6 +146,68 @@ pub struct WorkerSetup {
     pub session_id: [u8; 16],
     /// When the session was created, for duration/rate feedback.
     pub started_at: u64,
+}
+
+/// Shared control for one native-push admission and its eventual connection.
+#[derive(Clone, Default)]
+pub struct PushControl {
+    cancellation: vot_cli::CancellationHandle,
+    connected: Arc<AtomicBool>,
+    aborted: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for PushControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PushControl")
+            .field("connected", &self.is_connected())
+            .field("aborted", &self.is_aborted())
+            .field("cancelled", &self.cancellation.is_cancelled())
+            .finish()
+    }
+}
+
+impl PushControl {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Claims creation of the shared receive state; later rails join it.
+    pub fn connect(&self) -> bool {
+        self.connected
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    #[must_use]
+    pub fn cancellation(&self) -> vot_cli::CancellationHandle {
+        self.cancellation.clone()
+    }
+
+    pub fn abort(&self) {
+        self.aborted.store(true, Ordering::Release);
+        self.cancel();
+    }
+
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn is_aborted(&self) -> bool {
+        self.aborted.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
 }
 
 struct FileState {
@@ -370,6 +433,7 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
         for component in entry.path() {
             paths::admit_component(component, setup.allow_hidden).map_err(SessionError::bad)?;
         }
+        validate_empty_object(&entry.object_id())?;
         total = total
             .checked_add(entry.object_id().length)
             .ok_or_else(|| SessionError::bad("total upload size overflows"))?;
@@ -508,8 +572,15 @@ fn find_delivered(
 
 fn open_destination(setup: &WorkerSetup, entry: &PackageEntry) -> Result<FileState, SessionError> {
     let components: Vec<String> = entry.path().map(str::to_owned).collect();
+    open_destination_for(setup, components, entry.object_id())
+}
+
+fn open_destination_for(
+    setup: &WorkerSetup,
+    components: Vec<String>,
+    object: ObjectId,
+) -> Result<FileState, SessionError> {
     let display_path = components.join("/");
-    let object = entry.object_id();
     let parent = |stored: &[String]| {
         paths::join_under(&setup.dest_dir, &stored[..stored.len() - 1])
             .map_err(SessionError::internal)
@@ -605,7 +676,140 @@ fn handle_chunk(
     })
 }
 
-fn publish_file(setup: &WorkerSetup, file: &mut FileState) -> Result<(), SessionError> {
+struct Publication {
+    destination: PathBuf,
+    receipt: Option<PathBuf>,
+}
+
+// ponytail: process-wide lock; shard by destination only if publication throughput measures a need.
+static PUBLICATION_NAMESPACE: Mutex<()> = Mutex::new(());
+
+struct PublishedPushFiles {
+    directory: PathBuf,
+    owned: Vec<(PathBuf, PathBuf)>,
+    armed: bool,
+}
+
+impl PublishedPushFiles {
+    fn new(staging: &std::path::Path) -> Result<Self, SessionError> {
+        let directory = staging.join("rollback");
+        fs::create_dir(&directory)
+            .map_err(|error| SessionError::internal(format!("create rollback guards: {error}")))?;
+        paths::tighten_dir(&directory);
+        Ok(Self {
+            directory,
+            owned: Vec::new(),
+            armed: true,
+        })
+    }
+
+    fn capture(&mut self, publication: Publication) -> Result<(), SessionError> {
+        self.capture_path(publication.destination)?;
+        if let Some(path) = publication.receipt {
+            self.capture_path(path)?;
+        }
+        Ok(())
+    }
+
+    fn capture_path(&mut self, destination: PathBuf) -> Result<(), SessionError> {
+        let guard = self.directory.join(self.owned.len().to_string());
+        if let Err(error) = fs::hard_link(&destination, &guard) {
+            // Publication just created this path in a private directory. Hold
+            // its identity before unlinking so even this failure path cannot
+            // remove a replacement.
+            if let Ok(file) = fs::File::open(&destination) {
+                let _ = vot_platform_fs::remove_file_handle(&file, &destination);
+            }
+            return Err(SessionError::internal(format!(
+                "guard published native push file: {error}"
+            )));
+        }
+        self.owned.push((guard, destination));
+        Ok(())
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        if let Err(error) = fs::remove_dir_all(&self.directory) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %self.directory.display(), %error, "remove native push rollback guards");
+            }
+        }
+    }
+}
+
+impl Drop for PublishedPushFiles {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _publication_namespace = PUBLICATION_NAMESPACE
+            .lock()
+            .expect("publication namespace poisoned");
+        for (guard, destination) in self.owned.iter().rev() {
+            match fs::File::open(guard)
+                .and_then(|file| vot_platform_fs::remove_file_handle(&file, destination))
+            {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::error!(path = %destination.display(), %error, "roll back unrecorded native push file");
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+fn publish_push_entries(
+    setup: &WorkerSetup,
+    staging: &std::path::Path,
+    entries: &mut [PushEntry],
+    mut keep_running: impl FnMut() -> bool,
+) -> Result<PublishedPushFiles, SessionError> {
+    let mut publications = PublishedPushFiles::new(staging)?;
+    for entry in entries {
+        if !keep_running() {
+            return Err(SessionError::conflict("native push was cancelled"));
+        }
+        let file = entry
+            .file
+            .as_mut()
+            .ok_or_else(|| SessionError::internal("push file state is incomplete"))?;
+        if !file.published {
+            publish_push_entry(setup, file, &mut publications, || {})?;
+        }
+    }
+    Ok(publications)
+}
+
+fn publish_push_entry(
+    setup: &WorkerSetup,
+    file: &mut FileState,
+    publications: &mut PublishedPushFiles,
+    after_publish: impl FnOnce(),
+) -> Result<(), SessionError> {
+    let _publication_namespace = PUBLICATION_NAMESPACE
+        .lock()
+        .expect("publication namespace poisoned");
+    let publication = publish_file_locked(setup, file)?;
+    after_publish();
+    publications.capture(publication)
+}
+
+fn publish_file(setup: &WorkerSetup, file: &mut FileState) -> Result<Publication, SessionError> {
+    let _publication_namespace = PUBLICATION_NAMESPACE
+        .lock()
+        .expect("publication namespace poisoned");
+    publish_file_locked(setup, file)
+}
+
+fn publish_file_locked(
+    setup: &WorkerSetup,
+    file: &mut FileState,
+) -> Result<Publication, SessionError> {
+    let destination = paths::join_under(&setup.dest_dir, &file.stored_components)
+        .map_err(SessionError::internal)?;
     let native = file
         .native
         .as_mut()
@@ -618,25 +822,29 @@ fn publish_file(setup: &WorkerSetup, file: &mut FileState) -> Result<(), Session
     })?;
     // Best effort: the file is delivered and verified either way, and the
     // record notes whether its receipt exists.
-    if let Some(observation) = native.publish_observation() {
-        let destination = paths::join_under(&setup.dest_dir, &file.stored_components);
-        match destination
-            .map_err(|error| error.to_string())
-            .and_then(|destination| {
-                setup.signer.write_sidecar(
-                    &destination,
-                    &file.object,
-                    setup.session_id,
-                    observation,
-                )
-            }) {
-            Ok(_) => file.receipt = true,
-            Err(error) => tracing::warn!(file = %file.display_path, "receipt: {error}"),
+    let receipt = if let Some(observation) = native.publish_observation() {
+        match setup
+            .signer
+            .write_sidecar(&destination, &file.object, setup.session_id, observation)
+        {
+            Ok(path) => {
+                file.receipt = true;
+                Some(path)
+            }
+            Err(error) => {
+                tracing::warn!(file = %file.display_path, "receipt: {error}");
+                None
+            }
         }
-    }
+    } else {
+        None
+    };
     file.published = true;
     file.native = None;
-    Ok(())
+    Ok(Publication {
+        destination,
+        receipt,
+    })
 }
 
 fn handle_finish(
@@ -654,24 +862,41 @@ fn handle_finish(
             file.display_path
         )));
     }
-    let records: Vec<FileRecord> = files
-        .iter()
-        .map(|file| FileRecord {
-            path: file.display_path.clone(),
-            stored_as: stored_rel(&setup.dest_rel, &file.stored_components),
-            bytes: file.object.length,
-            suite: suite_name(file.object.suite),
-            root: hex::encode(file.object.root),
-            receipt: file.receipt,
-            deleted: false,
-        })
-        .collect();
+    let report = commit_upload(setup, files, replays, rejected, Some("http"))?;
+    *phase = Phase::Done;
+    Ok(report)
+}
+
+fn commit_upload(
+    setup: &WorkerSetup,
+    files: &[FileState],
+    replays: u64,
+    rejected: u64,
+    transport: Option<&str>,
+) -> Result<FinishReport, SessionError> {
+    commit_upload_records(
+        setup,
+        file_records(setup, files),
+        replays,
+        rejected,
+        transport,
+    )
+}
+
+fn commit_upload_records(
+    setup: &WorkerSetup,
+    records: Vec<FileRecord>,
+    replays: u64,
+    rejected: u64,
+    transport: Option<&str>,
+) -> Result<FinishReport, SessionError> {
     let upload = UploadRecord {
         id: crate::auth::random_token(),
         started_at: setup.started_at,
         completed_at: now_unix(),
         replayed_chunks: replays,
         rejected_chunks: rejected,
+        transport: transport.map(str::to_owned),
         package_root: hex::encode(setup.expected_package.root),
         total_bytes: records.iter().map(|record| record.bytes).sum(),
         files: records.clone(),
@@ -684,11 +909,653 @@ fn handle_finish(
     if !recorded {
         return Err(SessionError::conflict("request link no longer exists"));
     }
-    *phase = Phase::Done;
     Ok(FinishReport {
         upload_id,
         files: records,
     })
+}
+
+fn file_records(setup: &WorkerSetup, files: &[FileState]) -> Vec<FileRecord> {
+    files
+        .iter()
+        .map(|file| FileRecord {
+            path: file.display_path.clone(),
+            stored_as: stored_rel(&setup.dest_rel, &file.stored_components),
+            bytes: file.object.length,
+            suite: suite_name(file.object.suite),
+            root: hex::encode(file.object.root),
+            receipt: file.receipt,
+            deleted: false,
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct PushObjectKey {
+    suite: u16,
+    root: [u8; 32],
+    length: u64,
+}
+
+impl From<&vot_cli::ReceiveObject> for PushObjectKey {
+    fn from(object: &vot_cli::ReceiveObject) -> Self {
+        Self {
+            suite: object.object.suite,
+            root: object.object.root,
+            length: object.object.length,
+        }
+    }
+}
+
+struct PushEntry {
+    components: Vec<String>,
+    object: ObjectId,
+    file: Option<FileState>,
+}
+
+struct PushObject {
+    entries: Vec<usize>,
+    complete: bool,
+}
+
+#[derive(Default)]
+struct PushReceiveInner {
+    entries: Vec<PushEntry>,
+    objects: HashMap<PushObjectKey, PushObject>,
+    remaining: usize,
+    manifest_ready: bool,
+    committing: bool,
+    succeeded: bool,
+    last_error: Option<String>,
+}
+
+struct PushReceive {
+    app: Arc<crate::app::App>,
+    setup: WorkerSetup,
+    control: PushControl,
+    runtime: tokio::runtime::Handle,
+    staging: PathBuf,
+    inner: Mutex<PushReceiveInner>,
+    received: AtomicU64,
+    last_active: AtomicU64,
+}
+
+impl PushReceive {
+    fn cli_error(&self, error: SessionError) -> vot_cli::Error {
+        self.inner.lock().expect("push receive poisoned").last_error = Some(error.message.clone());
+        vot_cli::Error::Io(std::io::Error::other(error.message))
+    }
+
+    fn mark_active(&self) {
+        let now = now_unix();
+        let previous = self.last_active.load(Ordering::Acquire);
+        if now > previous
+            && self
+                .last_active
+                .compare_exchange(previous, now, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            let _ = self
+                .app
+                .sessions
+                .mark_active(&hex::encode(self.setup.session_id));
+        }
+    }
+
+    fn prepare_manifest(
+        &self,
+        summary: vot_cli::PackageSummary,
+        records: &[vot_cli::EntryRecord],
+    ) -> Result<(), SessionError> {
+        let validated = validate_push_manifest(&self.setup, summary, records)?;
+        let prior_uploads = self
+            .setup
+            .store
+            .uploads_by_id(&self.setup.link_id)
+            .map_err(|error| SessionError::internal(format!("link read failed: {error}")))?
+            .ok_or_else(|| SessionError::conflict("request link no longer exists"))?;
+        let delivered = delivered_index(&prior_uploads);
+        fs::create_dir_all(self.staging.join("objects"))
+            .map_err(|error| SessionError::internal(format!("create push staging: {error}")))?;
+        paths::tighten_dir(&self.staging);
+        paths::tighten_dir(&self.staging.join("objects"));
+
+        let mut inner = self.inner.lock().expect("push receive poisoned");
+        if inner.manifest_ready {
+            return Err(SessionError::conflict("push manifest was already prepared"));
+        }
+        for (components, object) in validated {
+            let key = PushObjectKey {
+                suite: object.suite,
+                root: object.root,
+                length: object.length,
+            };
+            let file = find_delivered(&self.setup, &delivered, &object).map(|existing| FileState {
+                display_path: components.join("/"),
+                stored_components: existing.stored_components,
+                object: object.clone(),
+                native: None,
+                published: true,
+                receipt: existing.receipt,
+            });
+            let index = inner.entries.len();
+            inner.entries.push(PushEntry {
+                components,
+                object,
+                file,
+            });
+            inner
+                .objects
+                .entry(key)
+                .or_insert_with(|| PushObject {
+                    entries: Vec::new(),
+                    complete: false,
+                })
+                .entries
+                .push(index);
+        }
+        inner.remaining = inner.objects.len();
+        inner.manifest_ready = true;
+        drop(inner);
+        let _ = self
+            .app
+            .sessions
+            .mark_active(&hex::encode(self.setup.session_id));
+        Ok(())
+    }
+
+    fn choose_sink(
+        self: &Arc<Self>,
+        object: &vot_cli::ReceiveObject,
+    ) -> Result<Option<Box<dyn vot_cli::ReceiveSink>>, SessionError> {
+        let key = PushObjectKey::from(object);
+        let all_delivered = {
+            let inner = self.inner.lock().expect("push receive poisoned");
+            let planned = inner
+                .objects
+                .get(&key)
+                .ok_or_else(|| SessionError::bad("push object is absent from the manifest"))?;
+            planned
+                .entries
+                .iter()
+                .all(|index| inner.entries[*index].file.is_some())
+        };
+        if all_delivered {
+            self.finish_object(key, Vec::new())?;
+            return Ok(None);
+        }
+        let path = self.staging.join("objects").join(hex::encode(key.root));
+        let sink = vot_scheduler::FileSink::create_new(&path, key.length)
+            .map_err(|error| SessionError::internal(format!("create push object: {error}")))?;
+        Ok(Some(Box::new(PushFileSink {
+            sink,
+            path,
+            receive: Arc::clone(self),
+        })))
+    }
+
+    fn complete_object(
+        self: &Arc<Self>,
+        object: &vot_cli::ReceiveObject,
+    ) -> Result<(), SessionError> {
+        let key = PushObjectKey::from(object);
+        let pending = {
+            let inner = self.inner.lock().expect("push receive poisoned");
+            inner
+                .objects
+                .get(&key)
+                .ok_or_else(|| SessionError::bad("push object is absent from the manifest"))?
+                .entries
+                .iter()
+                .filter_map(|index| {
+                    let entry = &inner.entries[*index];
+                    entry
+                        .file
+                        .is_none()
+                        .then(|| (*index, entry.components.clone(), entry.object.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut completed = Vec::with_capacity(pending.len());
+        for (index, components, object) in pending {
+            if self.control.is_cancelled() {
+                return Err(SessionError::conflict("native push was cancelled"));
+            }
+            completed.push((
+                index,
+                open_destination_for(&self.setup, components, object)?,
+            ));
+        }
+        let path = self.staging.join("objects").join(hex::encode(key.root));
+        let files = completed
+            .iter_mut()
+            .map(|(_, file)| file)
+            .collect::<Vec<_>>();
+        reprove_staging(&path, &ObjectId::from(key), files, || {
+            self.mark_active();
+            !self.control.is_cancelled()
+        })?;
+        self.finish_object(key, completed)
+    }
+
+    fn finish_object(
+        &self,
+        key: PushObjectKey,
+        completed: Vec<(usize, FileState)>,
+    ) -> Result<(), SessionError> {
+        let (records, mut publications) = {
+            let mut inner = self.inner.lock().expect("push receive poisoned");
+            for (index, file) in completed {
+                inner.entries[index].file = Some(file);
+            }
+            let planned = inner
+                .objects
+                .get_mut(&key)
+                .ok_or_else(|| SessionError::bad("push object is absent from the manifest"))?;
+            if planned.complete {
+                return Ok(());
+            }
+            planned.complete = true;
+            inner.remaining = inner
+                .remaining
+                .checked_sub(1)
+                .ok_or_else(|| SessionError::internal("push object count underflow"))?;
+            if inner.remaining != 0 || inner.committing {
+                return Ok(());
+            }
+            inner.committing = true;
+            if self.control.is_cancelled() {
+                return Err(SessionError::conflict("native push was cancelled"));
+            }
+            let publications =
+                publish_push_entries(&self.setup, &self.staging, &mut inner.entries, || {
+                    !self.control.is_cancelled()
+                })?;
+            let files = inner
+                .entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .file
+                        .as_ref()
+                        .ok_or_else(|| SessionError::internal("push file state is incomplete"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (file_records_from_refs(&self.setup, &files), publications)
+        };
+        if self.control.is_cancelled() {
+            return Err(SessionError::conflict("native push was cancelled"));
+        }
+        let report = commit_upload_records(&self.setup, records, 0, 0, Some("push"))?;
+        publications.disarm();
+        self.inner.lock().expect("push receive poisoned").succeeded = true;
+        let sid = hex::encode(self.setup.session_id);
+        crate::app::upload_completed(
+            &self.app,
+            &sid,
+            Some(self.setup.link_id.clone()),
+            &report,
+            &self.runtime,
+        );
+        Ok(())
+    }
+}
+
+impl Drop for PushReceive {
+    fn drop(&mut self) {
+        let sid = hex::encode(self.setup.session_id);
+        let inner = self.inner.lock().expect("push receive poisoned");
+        if !inner.succeeded {
+            let (outcome, detail) = if self.control.is_aborted() {
+                ("cancelled", "cancelled by the sender".to_owned())
+            } else {
+                (
+                    "interrupted",
+                    inner
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| "native push ended before completion".to_owned()),
+                )
+            };
+            record_event(
+                &self.setup,
+                self.received.load(Ordering::Acquire),
+                now_unix(),
+                outcome,
+                detail,
+                0,
+                0,
+            );
+        }
+        drop(inner);
+        if let Err(error) = fs::remove_dir_all(&self.staging) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %self.staging.display(), %error, "remove push staging");
+            }
+        }
+        self.app.sessions.remove(&sid);
+        crate::app::remove_push_ticket(&self.app, &sid);
+    }
+}
+
+impl From<PushObjectKey> for ObjectId {
+    fn from(object: PushObjectKey) -> Self {
+        Self {
+            suite: object.suite,
+            root: object.root,
+            length: object.length,
+        }
+    }
+}
+
+struct PushFileSink {
+    sink: vot_scheduler::FileSink,
+    path: PathBuf,
+    receive: Arc<PushReceive>,
+}
+
+impl vot_scheduler::RangeSink for PushFileSink {
+    fn write_at(&self, covered_offset: u64, data: &[u8]) -> Result<(), vot_scheduler::SinkError> {
+        vot_scheduler::RangeSink::write_at(&self.sink, covered_offset, data)?;
+        self.receive
+            .received
+            .fetch_add(data.len() as u64, Ordering::AcqRel);
+        self.receive.mark_active();
+        Ok(())
+    }
+}
+
+impl vot_cli::ReceiveSink for PushFileSink {
+    fn flush(&self) -> Result<(), vot_cli::Error> {
+        self.sink.file().sync_all().map_err(Into::into)
+    }
+
+    fn discard_partial(&self) -> Result<(), vot_cli::Error> {
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+/// The staging directory supplied to [`vot_cli::PushAdmission`].
+#[must_use]
+pub fn push_staging_dir(setup: &WorkerSetup) -> PathBuf {
+    setup
+        .dest_dir
+        .join(format!(".vot-push-{}", hex::encode(setup.session_id)))
+}
+
+#[derive(Clone)]
+pub(crate) struct PushSeamHandle(std::sync::Weak<PushReceive>);
+
+impl PushSeamHandle {
+    pub(crate) fn seams(&self) -> Option<vot_cli::ReceiveSeams> {
+        self.0.upgrade().map(receive_seams)
+    }
+}
+
+pub(crate) fn push_seams(
+    app: Arc<crate::app::App>,
+    setup: WorkerSetup,
+    control: PushControl,
+    runtime: tokio::runtime::Handle,
+) -> (vot_cli::ReceiveSeams, PushSeamHandle) {
+    let receive = Arc::new(PushReceive {
+        staging: push_staging_dir(&setup),
+        app,
+        setup,
+        control,
+        runtime,
+        inner: Mutex::new(PushReceiveInner::default()),
+        received: AtomicU64::new(0),
+        last_active: AtomicU64::new(now_unix()),
+    });
+    let handle = PushSeamHandle(Arc::downgrade(&receive));
+    (receive_seams(receive), handle)
+}
+
+fn receive_seams(receive: Arc<PushReceive>) -> vot_cli::ReceiveSeams {
+    let mut seams = vot_cli::ReceiveSeams::new(receive.control.cancellation());
+    seams.manifest = Some(Arc::new({
+        let receive = Arc::clone(&receive);
+        move |_, summary, entries| {
+            receive
+                .prepare_manifest(summary, entries)
+                .map_err(|error| receive.cli_error(error))
+        }
+    }));
+    seams.sink = Some(Arc::new({
+        let receive = Arc::clone(&receive);
+        move |_, object| {
+            receive
+                .choose_sink(object)
+                .map_err(|error| receive.cli_error(error))
+        }
+    }));
+    seams.complete = Some(Arc::new(move |_, object| {
+        receive
+            .complete_object(object)
+            .map_err(|error| receive.cli_error(error))
+    }));
+    seams
+}
+
+fn validate_push_manifest(
+    setup: &WorkerSetup,
+    summary: vot_cli::PackageSummary,
+    entries: &[vot_cli::EntryRecord],
+) -> Result<Vec<(Vec<String>, ObjectId)>, SessionError> {
+    if summary.root != setup.expected_package.root
+        || summary.logical_length != setup.expected_package.length
+    {
+        return Err(SessionError::bad(
+            "push manifest does not match the admitted package",
+        ));
+    }
+    if entries.is_empty() || entries.len() > MAX_ENTRIES || summary.entries != entries.len() as u64
+    {
+        return Err(SessionError::bad(format!(
+            "package entry count is outside 1..={MAX_ENTRIES}"
+        )));
+    }
+    let mut total = 0_u64;
+    let mut validated = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if !matches!(entry.storage, vot_cli::Storage::Direct) {
+            return Err(SessionError::bad(
+                "packed entries are not supported by votport",
+            ));
+        }
+        let components = entry
+            .path
+            .iter()
+            .map(|component| match component {
+                vot_manifest::Component::Text(text) => {
+                    paths::admit_component(text, setup.allow_hidden).map_err(SessionError::bad)?;
+                    Ok(text.clone())
+                }
+                vot_manifest::Component::Bytes(_) => Err(SessionError::bad(
+                    "raw byte paths are not supported by votport",
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let object = ObjectId {
+            suite: entry.suite.identifier(),
+            root: entry.logical_root,
+            length: entry.logical_length,
+        };
+        validate_empty_object(&object)?;
+        total = total
+            .checked_add(object.length)
+            .ok_or_else(|| SessionError::bad("total upload size overflows"))?;
+        validated.push((components, object));
+    }
+    if total != summary.logical_length {
+        return Err(SessionError::bad(
+            "manifest logical length does not match its entries",
+        ));
+    }
+    if total > setup.max_total_bytes {
+        return Err(SessionError::bad(format!(
+            "upload of {total} bytes exceeds the {} byte limit for this link",
+            setup.max_total_bytes
+        )));
+    }
+    Ok(validated)
+}
+
+fn file_records_from_refs(setup: &WorkerSetup, files: &[&FileState]) -> Vec<FileRecord> {
+    files
+        .iter()
+        .map(|file| FileRecord {
+            path: file.display_path.clone(),
+            stored_as: stored_rel(&setup.dest_rel, &file.stored_components),
+            bytes: file.object.length,
+            suite: suite_name(file.object.suite),
+            root: hex::encode(file.object.root),
+            receipt: file.receipt,
+            deleted: false,
+        })
+        .collect()
+}
+
+enum LocalProofs {
+    Blake3(vot_proof_blake3::GroupCvs),
+    Sha256(vot_proof_sha256::PieceHashes),
+}
+
+struct LocalRangeCover {
+    covered_offset: u64,
+    covered_length: u64,
+    proof: Vec<u8>,
+}
+
+impl LocalProofs {
+    fn prove(&self, offset: u64, length: u64) -> Result<LocalRangeCover, SessionError> {
+        match self {
+            Self::Blake3(cvs) => vot_proof_blake3::prove_with(cvs, offset, length)
+                .map(|cover| LocalRangeCover {
+                    covered_offset: cover.covered_offset,
+                    covered_length: cover.covered_length,
+                    proof: cover.proof,
+                })
+                .map_err(|error| SessionError::internal(format!("prove staged object: {error:?}"))),
+            Self::Sha256(pieces) => vot_proof_sha256::prove_with(pieces, offset, length)
+                .map(|cover| LocalRangeCover {
+                    covered_offset: cover.covered_offset,
+                    covered_length: cover.covered_length,
+                    proof: cover.proof,
+                })
+                .map_err(|error| SessionError::internal(format!("prove staged object: {error:?}"))),
+        }
+    }
+}
+
+fn reprove_staging(
+    path: &std::path::Path,
+    object: &ObjectId,
+    mut files: Vec<&mut FileState>,
+    mut keep_running: impl FnMut() -> bool,
+) -> Result<(), SessionError> {
+    validate_empty_object(object)?;
+    if !keep_running() {
+        return Err(SessionError::conflict("native push was cancelled"));
+    }
+    if object.length == 0 {
+        return Ok(());
+    }
+    let mut staged = fs::File::open(path)
+        .map_err(|error| SessionError::internal(format!("open staged object: {error}")))?;
+    let actual = staged
+        .metadata()
+        .map_err(|error| SessionError::internal(format!("stat staged object: {error}")))?
+        .len();
+    if actual != object.length {
+        return Err(SessionError::bad("staged object length changed"));
+    }
+    let mut proofs = match object.suite {
+        1 => LocalProofs::Blake3(vot_proof_blake3::GroupCvs::new()),
+        2 => LocalProofs::Sha256(vot_proof_sha256::PieceHashes::new()),
+        _ => return Err(SessionError::bad("unsupported staged object suite")),
+    };
+    let mut left = object.length;
+    let mut group = vec![0_u8; vot_scheduler::RANGE_UNIT_BYTES as usize];
+    while left != 0 {
+        let length = usize::try_from(left.min(group.len() as u64))
+            .map_err(|_| SessionError::internal("staged group length"))?;
+        staged
+            .read_exact(&mut group[..length])
+            .map_err(|error| SessionError::internal(format!("read staged object: {error}")))?;
+        match &mut proofs {
+            LocalProofs::Blake3(cvs) => cvs.push(&group[..length]).map_err(|error| {
+                SessionError::internal(format!("hash staged object: {error:?}"))
+            })?,
+            LocalProofs::Sha256(pieces) => pieces.push(&group[..length]).map_err(|error| {
+                SessionError::internal(format!("hash staged object: {error:?}"))
+            })?,
+        }
+        left -= length as u64;
+        if !keep_running() {
+            return Err(SessionError::conflict("native push was cancelled"));
+        }
+    }
+    match &mut proofs {
+        LocalProofs::Blake3(cvs) => cvs.seal(),
+        LocalProofs::Sha256(pieces) => pieces.seal(),
+    }
+    let mut offset = 0_u64;
+    while offset < object.length {
+        let requested = (object.length - offset).min(vot_scheduler::MAX_PROOF_RANGE_BYTES);
+        let cover = proofs.prove(offset, requested)?;
+        let length = usize::try_from(cover.covered_length)
+            .map_err(|_| SessionError::internal("verified range length"))?;
+        let mut data = vec![0_u8; length];
+        staged
+            .seek(SeekFrom::Start(cover.covered_offset))
+            .and_then(|_| staged.read_exact(&mut data))
+            .map_err(|error| SessionError::internal(format!("reread staged object: {error}")))?;
+        let verified =
+            verify_range(object, cover.covered_offset, &data, &cover.proof).map_err(|error| {
+                SessionError::bad(format!(
+                    "staged object failed verification: {:?}",
+                    error.code()
+                ))
+            })?;
+        for file in &mut files {
+            file.native
+                .as_mut()
+                .ok_or_else(|| SessionError::internal("push file state lost"))?
+                .accept(&verified)
+                .map_err(|error| SessionError::internal(format!("write failed: {error}")))?;
+        }
+        offset = cover
+            .covered_offset
+            .checked_add(cover.covered_length)
+            .ok_or_else(|| SessionError::internal("verified range offset overflow"))?;
+        if !keep_running() {
+            return Err(SessionError::conflict("native push was cancelled"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_empty_object(object: &ObjectId) -> Result<(), SessionError> {
+    if object.length != 0 {
+        return Ok(());
+    }
+    let suite = Suite::try_from(object.suite)
+        .map_err(|_| SessionError::bad("unsupported empty object suite"))?;
+    let canonical = InMemoryObjectBuilder::new(suite, Some(0), 0)
+        .and_then(InMemoryObjectBuilder::finish)
+        .map_err(|error| {
+            SessionError::internal(format!("build empty object: {:?}", error.code()))
+        })?;
+    if canonical.object_id().root != object.root {
+        return Err(SessionError::bad("empty object root is not canonical"));
+    }
+    Ok(())
 }
 
 /// How many failed/cancelled session events each link keeps, oldest dropped.
@@ -743,6 +1610,16 @@ fn record_event(
                 link.events.drain(..excess);
             }
         });
+}
+
+/// Records a native-push ticket that ended before it opened a VOT session.
+pub(crate) fn record_unconnected_push(setup: WorkerSetup, aborted: bool) {
+    let (outcome, detail) = if aborted {
+        ("cancelled", "cancelled by the sender")
+    } else {
+        ("interrupted", "native push expired before connecting")
+    };
+    record_event(&setup, 0, now_unix(), outcome, detail.to_owned(), 0, 0);
 }
 
 fn stored_rel(dest_rel: &str, components: &[String]) -> String {
@@ -838,10 +1715,10 @@ pub struct SessionAdmission {
     pub kind: SessionKind,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum SessionKind {
     Http,
-    Push,
+    Push(PushControl),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1134,11 +2011,57 @@ impl Sessions {
             .map(|handle| handle.link_id.clone())
     }
 
+    pub fn contains_push(&self, id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("sessions poisoned")
+            .map
+            .get(id)
+            .is_some_and(|handle| matches!(&handle.kind, SessionKind::Push(_)))
+    }
+
+    /// Refreshes an active native push without making it reachable by HTTP.
+    pub fn mark_active(&self, id: &str) -> bool {
+        let inner = self.inner.lock().expect("sessions poisoned");
+        let Some(handle) = inner.map.get(id) else {
+            return false;
+        };
+        if !matches!(&handle.kind, SessionKind::Push(_)) {
+            return false;
+        }
+        *handle
+            .activity
+            .last_active
+            .lock()
+            .expect("session activity poisoned") = Instant::now();
+        true
+    }
+
+    /// Cancels a connected push after releasing the session registry lock.
+    pub fn abort_push(&self, id: &str) -> bool {
+        let control = self
+            .inner
+            .lock()
+            .expect("sessions poisoned")
+            .map
+            .get(id)
+            .and_then(|handle| match &handle.kind {
+                SessionKind::Push(control) => Some(control.clone()),
+                SessionKind::Http => None,
+            });
+        if let Some(control) = control {
+            control.abort();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Keeps the session registered until the returned command guard drops.
     pub fn touch(&self, id: &str) -> Result<SessionCommand, TouchError> {
         let inner = self.inner.lock().expect("sessions poisoned");
         let handle = inner.map.get(id).ok_or(TouchError::NotFound)?;
-        if matches!(&handle.kind, SessionKind::Push) {
+        if matches!(&handle.kind, SessionKind::Push(_)) {
             return Err(TouchError::WrongKind);
         }
         *handle
@@ -1173,15 +2096,16 @@ impl Sessions {
             .count()
     }
 
-    /// Drops sessions idle beyond `idle_secs`; their workers then exit and
-    /// clean up staging files.
+    /// Drops idle HTTP and unconnected push sessions. A connected push keeps
+    /// its reservation until the receive seams observe cancellation and exit.
     pub fn sweep(&self, idle_secs: u64) {
+        let mut cancellations = Vec::new();
         self.inner
             .lock()
             .expect("sessions poisoned")
             .map
             .retain(|_, handle| {
-                handle.activity.in_flight.load(Ordering::Acquire) > 0
+                let active = handle.activity.in_flight.load(Ordering::Acquire) > 0
                     || handle
                         .activity
                         .last_active
@@ -1189,8 +2113,22 @@ impl Sessions {
                         .expect("session activity poisoned")
                         .elapsed()
                         .as_secs()
-                        < idle_secs
+                        < idle_secs;
+                if active {
+                    return true;
+                }
+                match &handle.kind {
+                    SessionKind::Http => false,
+                    SessionKind::Push(control) if !control.is_connected() => false,
+                    SessionKind::Push(control) => {
+                        cancellations.push(control.cancellation());
+                        true
+                    }
+                }
             });
+        for cancellation in cancellations {
+            cancellation.cancel();
+        }
     }
 }
 
@@ -1325,7 +2263,7 @@ mod pin_tests {
     fn push_touch_is_rejected_without_changing_activity() {
         let sessions = Sessions::new();
         let mut push = admission("push", 0, 100, 1);
-        push.kind = SessionKind::Push;
+        push.kind = SessionKind::Push(PushControl::new());
         sessions
             .insert_admitted(push, dummy_sender(), || Ok(0))
             .unwrap();
@@ -1341,16 +2279,45 @@ mod pin_tests {
     }
 
     #[test]
+    fn connected_push_is_cancelled_and_retained_by_idle_sweep() {
+        let sessions = Sessions::new();
+        let control = PushControl::new();
+        let mut push = admission("push", 0, 100, 1);
+        push.kind = SessionKind::Push(control.clone());
+        sessions
+            .insert_admitted(push, dummy_sender(), || Ok(0))
+            .unwrap();
+
+        assert!(sessions.contains_push("push"));
+        assert!(control.connect());
+        assert!(!control.connect());
+        sessions.sweep(0);
+
+        assert!(control.is_cancelled());
+        assert!(!control.is_aborted());
+        assert!(sessions.contains_push("push"));
+        assert_eq!(sessions.total(), 1);
+    }
+
+    #[test]
+    fn abort_marks_push_as_sender_cancelled() {
+        let control = PushControl::new();
+        control.abort();
+        assert!(control.is_cancelled());
+        assert!(control.is_aborted());
+    }
+
+    #[test]
     fn push_admission_reserves_bytes_until_removal() {
         let sessions = Sessions::new();
         let mut first = admission("push-1", 60, 100, 2);
-        first.kind = SessionKind::Push;
+        first.kind = SessionKind::Push(PushControl::new());
         sessions
             .insert_admitted(first, dummy_sender(), || Ok(0))
             .unwrap();
 
         let mut second = admission("push-2", 50, 100, 2);
-        second.kind = SessionKind::Push;
+        second.kind = SessionKind::Push(PushControl::new());
         assert_eq!(
             sessions.insert_admitted(second, dummy_sender(), || Ok(0)),
             Err(InsertError::ByteQuota)
@@ -1358,7 +2325,7 @@ mod pin_tests {
 
         sessions.remove("push-1");
         let mut admitted = admission("push-2", 50, 100, 2);
-        admitted.kind = SessionKind::Push;
+        admitted.kind = SessionKind::Push(PushControl::new());
         sessions
             .insert_admitted(admitted, dummy_sender(), || Ok(0))
             .unwrap();
@@ -1456,5 +2423,331 @@ mod pin_tests {
 
         assert!(sessions.pin_link_for_delete("link"));
         sessions.unpin_link("link");
+    }
+}
+
+#[cfg(test)]
+mod push_tests {
+    use super::*;
+    use vot_sdk::object::{InMemoryObjectBuilder, Suite};
+
+    fn object(suite: Suite, data: &[u8]) -> ObjectId {
+        let mut builder =
+            InMemoryObjectBuilder::new(suite, Some(data.len() as u64), data.len() as u64).unwrap();
+        builder.update(data).unwrap();
+        builder.finish().unwrap().object_id().clone()
+    }
+
+    fn setup(directory: &std::path::Path, expected_package: ObjectId) -> WorkerSetup {
+        let app = crate::api::testing::build(directory);
+        WorkerSetup {
+            store: Arc::clone(&app.store),
+            link_id: "link".to_owned(),
+            tenant: String::new(),
+            dest_dir: directory.join("receive"),
+            dest_rel: String::new(),
+            expected_package,
+            max_total_bytes: u64::MAX,
+            allow_hidden: false,
+            signer: Arc::clone(&app.signer),
+            session_id: [7; 16],
+            started_at: 1,
+        }
+    }
+
+    fn record(path: vot_manifest::PackagePath, object: &ObjectId) -> vot_cli::EntryRecord {
+        vot_cli::EntryRecord {
+            path,
+            suite: Suite::try_from(object.suite).unwrap(),
+            logical_root: object.root,
+            logical_length: object.length,
+            storage: vot_cli::Storage::Direct,
+        }
+    }
+
+    #[test]
+    fn push_manifest_rejects_mismatch_pack_raw_path_and_entry_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let logical = object(Suite::Blake3Bao64, b"payload");
+        let expected = ObjectId {
+            suite: 1,
+            root: [9; 32],
+            length: logical.length,
+        };
+        let setup = setup(directory.path(), expected.clone());
+        let direct = record(
+            vot_manifest::PackagePath::portable(["file"]).unwrap(),
+            &logical,
+        );
+        let summary = vot_cli::PackageSummary {
+            root: expected.root,
+            logical_length: logical.length,
+            entries: 1,
+        };
+        assert!(validate_push_manifest(&setup, summary, std::slice::from_ref(&direct)).is_ok());
+
+        let mut mismatch = summary;
+        mismatch.root[0] ^= 1;
+        assert!(validate_push_manifest(&setup, mismatch, std::slice::from_ref(&direct)).is_err());
+        let mut mismatch = summary;
+        mismatch.logical_length += 1;
+        assert!(validate_push_manifest(&setup, mismatch, std::slice::from_ref(&direct)).is_err());
+
+        let mut packed = direct.clone();
+        packed.storage = vot_cli::Storage::Pack {
+            root: logical.root,
+            length: logical.length,
+            offset: 0,
+        };
+        assert!(validate_push_manifest(&setup, summary, &[packed]).is_err());
+
+        let raw = record(vot_manifest::PackagePath::raw([b"file"]).unwrap(), &logical);
+        assert!(validate_push_manifest(&setup, summary, &[raw]).is_err());
+
+        let too_many = vec![direct; MAX_ENTRIES + 1];
+        let oversized = vot_cli::PackageSummary {
+            entries: too_many.len() as u64,
+            ..summary
+        };
+        assert!(validate_push_manifest(&setup, oversized, &too_many).is_err());
+    }
+
+    #[test]
+    fn local_reproof_accepts_original_and_rejects_tampered_blake3() {
+        reproof_accepts_original_and_rejects_tampered(Suite::Blake3Bao64);
+    }
+
+    #[test]
+    fn local_reproof_accepts_original_and_rejects_tampered_sha256() {
+        reproof_accepts_original_and_rejects_tampered(Suite::Sha256Bep52);
+    }
+
+    fn reproof_accepts_original_and_rejects_tampered(suite: Suite) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("staged");
+        let data = vec![11_u8; vot_scheduler::RANGE_UNIT_BYTES as usize + 17];
+        let object = object(suite, &data);
+        fs::write(&path, &data).unwrap();
+        let setup = setup(directory.path(), object.clone());
+        fs::create_dir_all(&setup.dest_dir).unwrap();
+        let mut destination =
+            open_destination_for(&setup, vec!["received".to_owned()], object.clone()).unwrap();
+        assert!(reprove_staging(&path, &object, vec![&mut destination], || true).is_ok());
+        assert_eq!(
+            destination.native.as_ref().unwrap().progress().prefix_bytes,
+            object.length
+        );
+
+        let mut tampered = data;
+        tampered[3] ^= 1;
+        fs::write(&path, tampered).unwrap();
+        assert!(reprove_staging(&path, &object, Vec::new(), || true).is_err());
+    }
+
+    #[test]
+    fn empty_object_roots_are_canonical_for_both_suites() {
+        for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
+            let empty = object(suite, b"");
+            assert!(validate_empty_object(&empty).is_ok());
+            let mut forged = empty;
+            forged.root[0] ^= 1;
+            assert!(validate_empty_object(&forged).is_err());
+        }
+    }
+
+    #[test]
+    fn cancelled_reproof_stops_during_hashing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("staged");
+        let data = vec![17_u8; 2 * vot_scheduler::RANGE_UNIT_BYTES as usize];
+        fs::write(&path, &data).unwrap();
+        let object = object(Suite::Blake3Bao64, &data);
+        let setup = setup(directory.path(), object.clone());
+        fs::create_dir_all(&setup.dest_dir).unwrap();
+        let mut destination =
+            open_destination_for(&setup, vec!["cancelled".to_owned()], object.clone()).unwrap();
+
+        let mut checks = 0;
+        assert!(reprove_staging(&path, &object, vec![&mut destination], || {
+            checks += 1;
+            checks < 2
+        })
+        .is_err());
+        assert_eq!(
+            destination
+                .native
+                .as_ref()
+                .unwrap()
+                .progress()
+                .covered_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn cancelled_reproof_stops_after_an_accepted_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("staged");
+        let length =
+            (vot_scheduler::MAX_PROOF_RANGE_BYTES + vot_scheduler::RANGE_UNIT_BYTES) as usize;
+        let data = vec![19_u8; length];
+        fs::write(&path, &data).unwrap();
+        let object = object(Suite::Blake3Bao64, &data);
+        let setup = setup(directory.path(), object.clone());
+        fs::create_dir_all(&setup.dest_dir).unwrap();
+        let mut destination =
+            open_destination_for(&setup, vec!["cancelled".to_owned()], object.clone()).unwrap();
+        let hash_checks = length.div_ceil(vot_scheduler::RANGE_UNIT_BYTES as usize);
+        let mut checks = 0;
+
+        assert!(reprove_staging(&path, &object, vec![&mut destination], || {
+            checks += 1;
+            checks <= hash_checks + 1
+        })
+        .is_err());
+        assert!(
+            destination
+                .native
+                .as_ref()
+                .unwrap()
+                .progress()
+                .covered_bytes
+                > 0
+        );
+    }
+
+    #[test]
+    fn unpublished_record_guards_remove_only_held_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        let destination = directory.path().join("published");
+        let receipt = directory.path().join("published.vot-receipt");
+        paths::tighten_dir(directory.path());
+        fs::write(&destination, b"data").unwrap();
+        fs::write(&receipt, b"receipt").unwrap();
+
+        let mut guards = PublishedPushFiles::new(&staging).unwrap();
+        guards
+            .capture(Publication {
+                destination: destination.clone(),
+                receipt: Some(receipt.clone()),
+            })
+            .unwrap();
+        drop(guards);
+
+        assert!(!destination.exists());
+        assert!(!receipt.exists());
+    }
+
+    #[test]
+    fn rollback_guard_preserves_a_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        paths::tighten_dir(directory.path());
+        let destination = directory.path().join("published");
+        fs::write(&destination, b"ours").unwrap();
+        let mut guards = PublishedPushFiles::new(&staging).unwrap();
+        guards
+            .capture(Publication {
+                destination: destination.clone(),
+                receipt: None,
+            })
+            .unwrap();
+        fs::remove_file(&destination).unwrap();
+        fs::write(&destination, b"replacement").unwrap();
+
+        drop(guards);
+
+        assert_eq!(fs::read(destination).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn publication_namespace_serializes_capture_and_replacement_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let staged = directory.path().join("object");
+        let data = vec![29_u8; 1024];
+        fs::write(&staged, &data).unwrap();
+        let object = object(Suite::Blake3Bao64, &data);
+        let setup = setup(directory.path(), object.clone());
+        fs::create_dir_all(&setup.dest_dir).unwrap();
+        paths::tighten_dir(&setup.dest_dir);
+        let mut file =
+            open_destination_for(&setup, vec!["published".to_owned()], object.clone()).unwrap();
+        reprove_staging(&staged, &object, vec![&mut file], || true).unwrap();
+        let staging = directory.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        let mut guards = PublishedPushFiles::new(&staging).unwrap();
+        publish_push_entry(&setup, &mut file, &mut guards, || {
+            assert!(PUBLICATION_NAMESPACE.try_lock().is_err());
+        })
+        .unwrap();
+        let destination = setup.dest_dir.join("published");
+        fs::remove_file(&destination).unwrap();
+        fs::write(&destination, b"replacement").unwrap();
+        drop(guards);
+
+        assert_eq!(fs::read(destination).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn rollback_guard_creation_failure_removes_the_just_published_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        paths::tighten_dir(directory.path());
+        let destination = directory.path().join("published");
+        fs::write(&destination, b"ours").unwrap();
+        let mut guards = PublishedPushFiles::new(&staging).unwrap();
+        fs::write(guards.directory.join("0"), b"collision").unwrap();
+
+        assert!(guards
+            .capture(Publication {
+                destination: destination.clone(),
+                receipt: None,
+            })
+            .is_err());
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn cancellation_between_final_publications_rolls_back_the_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let staged = directory.path().join("object");
+        let data = vec![23_u8; 1024];
+        fs::write(&staged, &data).unwrap();
+        let object = object(Suite::Blake3Bao64, &data);
+        let setup = setup(directory.path(), object.clone());
+        fs::create_dir_all(&setup.dest_dir).unwrap();
+        paths::tighten_dir(&setup.dest_dir);
+        let mut first =
+            open_destination_for(&setup, vec!["first".to_owned()], object.clone()).unwrap();
+        let mut second =
+            open_destination_for(&setup, vec!["second".to_owned()], object.clone()).unwrap();
+        reprove_staging(&staged, &object, vec![&mut first, &mut second], || true).unwrap();
+        let staging = directory.path().join("push-staging");
+        fs::create_dir(&staging).unwrap();
+        let mut entries = [
+            PushEntry {
+                components: vec!["first".to_owned()],
+                object: object.clone(),
+                file: Some(first),
+            },
+            PushEntry {
+                components: vec!["second".to_owned()],
+                object,
+                file: Some(second),
+            },
+        ];
+        let mut checks = 0;
+
+        assert!(publish_push_entries(&setup, &staging, &mut entries, || {
+            checks += 1;
+            checks < 2
+        })
+        .is_err());
+        assert!(!setup.dest_dir.join("first").exists());
+        assert!(!setup.dest_dir.join("second").exists());
     }
 }

@@ -21,6 +21,11 @@ vot-sdk-file = { git = "https://github.com/halideworks/VOT", rev = "b14cc41debc2
 vot-receipt = { git = "https://github.com/halideworks/VOT", rev = "b14cc41debc2547c5ef999fee26bb055995284d9" }
 vot-cli = { git = "https://github.com/halideworks/VOT", rev = "b14cc41debc2547c5ef999fee26bb055995284d9", default-features = false, features = ["wire"] }
 vot-capability = { git = "https://github.com/halideworks/VOT", rev = "b14cc41debc2547c5ef999fee26bb055995284d9" }
+vot-manifest = { git = "https://github.com/halideworks/VOT", rev = "b14cc41debc2547c5ef999fee26bb055995284d9" }
+vot-platform-fs = { git = "https://github.com/halideworks/VOT", rev = "b14cc41debc2547c5ef999fee26bb055995284d9" }
+vot-proof-blake3 = { git = "https://github.com/halideworks/VOT", rev = "b14cc41debc2547c5ef999fee26bb055995284d9" }
+vot-proof-sha256 = { git = "https://github.com/halideworks/VOT", rev = "b14cc41debc2547c5ef999fee26bb055995284d9" }
+vot-scheduler = { git = "https://github.com/halideworks/VOT", rev = "b14cc41debc2547c5ef999fee26bb055995284d9" }
 
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs", "io-util"] }

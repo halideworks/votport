@@ -533,14 +533,31 @@ pub async fn create_push_session(
         .map_err(|_| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid holder_key"))?
         .to_bytes();
     let session_id = auth::random_token();
-    let (sender, receiver) = mpsc::channel(1);
-    drop(receiver);
+    let session_bytes: [u8; 16] = hex::decode(&session_id)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| ApiError::internal("session id shape"))?;
+    let control = session::PushControl::new();
+    let setup = session::WorkerSetup {
+        store: Arc::clone(&app.store),
+        link_id: prepared.link.id.clone(),
+        tenant: prepared.link.tenant.clone(),
+        dest_dir: prepared.dest_dir.clone(),
+        dest_rel: prepared.link.dest.clone(),
+        expected_package: prepared.expected.clone(),
+        max_total_bytes: prepared.cap,
+        allow_hidden: app.config.allow_hidden,
+        signer: Arc::clone(&app.signer),
+        session_id: session_bytes,
+        started_at: now_unix(),
+    };
+    let (sender, _receiver) = mpsc::channel(1);
     register_session(
         &app,
         &prepared,
         &session_id,
         sender,
-        session::SessionKind::Push,
+        session::SessionKind::Push(control.clone()),
     )
     .await?;
 
@@ -576,6 +593,11 @@ pub async fn create_push_session(
     let ticket = PushTicket {
         session_id: session_id.clone(),
         expires_at,
+        expected_package: setup.expected_package.clone(),
+        directory: session::push_staging_dir(&setup),
+        setup: Some(setup),
+        seams: None,
+        control,
     };
     let inserted = match app
         .push_tickets
@@ -747,40 +769,8 @@ pub async fn upload_finish(
     let report = dispatch(&app, &sid, |reply, _lease| Cmd::Finish { reply, _lease }).await?;
     #[cfg(test)]
     app.sessions.wait_finish_stall().await;
-    tracing::info!(
-        target: "audit", event = "upload_completed", session = %sid,
-        files = report.files.len(), bytes = report.files.iter().map(|f| f.bytes).sum::<u64>(),
-        "upload finished and recorded"
-    );
-    let link = link_id.and_then(|id| {
-        app.store
-            .upload_link(&id)
-            .inspect_err(|error| tracing::warn!(%error, "link read failed after upload"))
-            .ok()
-            .flatten()
-    });
-    let completed_tenant = link
-        .as_ref()
-        .map(|link| link.tenant.as_str())
-        .unwrap_or_default();
-    app.store.audit(
-        completed_tenant,
-        "",
-        "upload_completed",
-        &sid[..8.min(sid.len())],
-        &serde_json::json!({
-            "files": report.files.len(),
-            "bytes": report.files.iter().map(|f| f.bytes).sum::<u64>()
-        }),
-    );
-    if let Some(link) = link {
-        tokio::spawn(crate::notify::uploaded(
-            Arc::clone(&app),
-            link.label,
-            report.clone(),
-        ));
-    }
-    app.sessions.remove(&sid);
+    let runtime = tokio::runtime::Handle::current();
+    crate::app::upload_completed(&app, &sid, link_id, &report, &runtime);
     Ok(Json(report))
 }
 
@@ -788,14 +778,44 @@ pub async fn upload_abort(
     State(app): State<Arc<App>>,
     Path(sid): Path<String>,
 ) -> Json<serde_json::Value> {
+    if app.sessions.contains_push(&sid) {
+        let mut ticket_found = false;
+        let setup = {
+            let mut tickets = app.push_tickets.lock().expect("push tickets poisoned");
+            let key = tickets
+                .iter()
+                .find(|(_, ticket)| ticket.session_id == sid)
+                .map(|(key, _)| *key);
+            if let Some(key) = key {
+                ticket_found = true;
+                if let Some(ticket) = tickets.get(&key) {
+                    ticket.control.abort();
+                }
+                if tickets
+                    .get(&key)
+                    .is_some_and(|ticket| ticket.setup.is_some())
+                {
+                    tickets.remove(&key).and_then(|ticket| ticket.setup)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if !ticket_found {
+            app.sessions.abort_push(&sid);
+        }
+        if let Some(setup) = setup {
+            app.sessions.remove(&sid);
+            session::record_unconnected_push(setup, true);
+        }
+        return Json(json!({ "ok": true }));
+    }
     // Best effort: lets the worker record a "cancelled" event; an unknown or
     // already-dead session still answers ok.
     let _ = dispatch(&app, &sid, |reply, _lease| Cmd::Abort { reply, _lease }).await;
     app.sessions.remove(&sid);
-    app.push_tickets
-        .lock()
-        .expect("push tickets poisoned")
-        .retain(|_, ticket| ticket.session_id != sid);
     Json(json!({ "ok": true }))
 }
 
@@ -1364,6 +1384,16 @@ mod push_preflight_tests {
         assert_eq!(abort.status(), StatusCode::OK);
         assert_eq!(application.sessions.total(), 0);
         assert!(application.push_tickets.lock().unwrap().is_empty());
+        assert_eq!(
+            application
+                .store
+                .link_by_id("quota")
+                .unwrap()
+                .unwrap()
+                .events[0]
+                .outcome,
+            "cancelled"
+        );
         assert_eq!(
             post_push(application, "quota", request_body(&holder, 4))
                 .await

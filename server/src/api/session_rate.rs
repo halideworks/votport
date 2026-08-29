@@ -17,6 +17,7 @@ const TABLE_CAP: usize = 4096;
 
 pub struct SessionRate {
     attempts: Mutex<HashMap<String, Vec<Instant>>>,
+    max_per_window: usize,
 }
 
 impl Default for SessionRate {
@@ -27,8 +28,13 @@ impl Default for SessionRate {
 
 impl SessionRate {
     pub fn new() -> Self {
+        Self::with_limit(MAX_PER_WINDOW)
+    }
+
+    pub fn with_limit(max_per_window: usize) -> Self {
         Self {
             attempts: Mutex::new(HashMap::new()),
+            max_per_window,
         }
     }
 
@@ -60,7 +66,7 @@ impl SessionRate {
         }
         let entries = attempts.entry(ip.to_owned()).or_default();
         entries.retain(|at| now.duration_since(*at) < WINDOW);
-        if entries.len() >= MAX_PER_WINDOW {
+        if entries.len() >= self.max_per_window {
             return false;
         }
         entries.push(now);
@@ -74,8 +80,8 @@ mod tests {
 
     #[test]
     fn allows_up_to_the_cap_then_refuses() {
-        let rate = SessionRate::new();
-        for _ in 0..MAX_PER_WINDOW {
+        let rate = SessionRate::with_limit(2);
+        for _ in 0..2 {
             assert!(rate.allow("10.0.0.1"));
         }
         assert!(!rate.allow("10.0.0.1"));

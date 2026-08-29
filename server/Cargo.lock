@@ -3585,7 +3585,12 @@ dependencies = [
  "tracing-subscriber",
  "vot-capability",
  "vot-cli",
+ "vot-manifest",
+ "vot-platform-fs",
+ "vot-proof-blake3",
+ "vot-proof-sha256",
  "vot-receipt",
+ "vot-scheduler",
  "vot-sdk",
  "vot-sdk-file",
 ]

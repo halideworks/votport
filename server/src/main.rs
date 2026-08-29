@@ -38,6 +38,7 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    app::start_push_receiver(application.clone());
     tokio::spawn(app::session_sweeper(application.clone()));
     let router = app::router(application.clone());
     let listener = match tokio::net::TcpListener::bind(bind).await {
