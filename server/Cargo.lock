@@ -3560,6 +3560,7 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "axum",
+ "base64 0.22.1",
  "ed25519-dalek",
  "hex",
  "hmac 0.12.1",
@@ -3582,6 +3583,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "vot-capability",
  "vot-cli",
  "vot-receipt",
  "vot-sdk",

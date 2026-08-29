@@ -1,6 +1,6 @@
 //! Application state and router assembly.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{DefaultBodyLimit, State};
@@ -25,7 +25,14 @@ pub struct PushState {
     pub(crate) listener: Mutex<vot_cli::Listener>,
     pub(crate) issuer: ed25519_dalek::SigningKey,
     pub(crate) address: String,
+    pub(crate) audience: String,
     pub(crate) certificate_digest: [u8; 32],
+}
+
+/// One admitted native-push capability, retained until its session ends.
+pub(crate) struct PushTicket {
+    pub(crate) session_id: String,
+    pub(crate) expires_at: u64,
 }
 
 pub struct App {
@@ -69,6 +76,7 @@ pub struct App {
     pub sso_config: Option<crate::config::OidcConfig>,
     pub sso_client: SsoSlot,
     pub push: Option<PushState>,
+    pub(crate) push_tickets: Mutex<HashMap<[u8; 16], PushTicket>>,
 }
 
 const SSO_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
@@ -197,6 +205,12 @@ async fn discover_sso(
 }
 
 pub fn build(config: Config) -> Result<Arc<App>, String> {
+    if config.push_bind.is_some() && config.session_idle_secs == 0 {
+        return Err(
+            "VOTPORT_SESSION_IDLE_SECS must be greater than zero when native push is enabled"
+                .to_owned(),
+        );
+    }
     // VOT refuses to stage files under a group-writable directory. On hosts
     // with umask 002 (Ubuntu user groups) every directory votport creates
     // would be 0775 and every upload would fail, so pin the umask here.
@@ -239,6 +253,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         sso_config: config.oidc.clone(),
         sso_client: SsoSlot::new(),
         push,
+        push_tickets: Mutex::new(HashMap::new()),
         config,
     }))
 }
@@ -253,6 +268,7 @@ fn build_push_state(config: &Config, address: std::net::SocketAddr) -> Result<Pu
         .push_advertise
         .clone()
         .unwrap_or_else(|| listener.local_address().to_string());
+    let audience = push_audience(config.public_url.as_deref(), &address)?;
     tracing::info!(
         address = %listener.local_address(),
         certificate_digest = %hex::encode(certificate_digest),
@@ -262,8 +278,20 @@ fn build_push_state(config: &Config, address: std::net::SocketAddr) -> Result<Pu
         listener: Mutex::new(listener),
         issuer,
         address,
+        audience,
         certificate_digest,
     })
+}
+
+fn push_audience(public_url: Option<&str>, address: &str) -> Result<String, String> {
+    let audience = format!("votport:{}", public_url.unwrap_or(address));
+    let (low, high) = vot_capability::bounds::IDENTITY;
+    if !(low..=high).contains(&audience.len()) || audience.chars().any(char::is_control) {
+        return Err(format!(
+            "native push capability audience must be {low}..={high} bytes without control characters"
+        ));
+    }
+    Ok(audience)
 }
 
 fn load_push_issuer(data_dir: &std::path::Path) -> Result<ed25519_dalek::SigningKey, String> {
@@ -498,6 +526,7 @@ pub fn router(app: Arc<App>) -> Router {
             post(api::verify_receipt).layer(DefaultBodyLimit::max(64 * 1024)),
         )
         .route("/api/r/{token}/verify", post(api::verify_link_password))
+        .route("/api/r/{token}/push", post(api::create_push_session))
         .route("/api/r/{token}/session", post(api::create_session))
         .route(
             "/api/session/{sid}/seal",
@@ -606,6 +635,70 @@ mod push_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn native_push_requires_a_nonzero_session_lifetime() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = push_config(directory.path());
+        config.session_idle_secs = 0;
+
+        assert_eq!(
+            build(config).err().unwrap(),
+            "VOTPORT_SESSION_IDLE_SECS must be greater than zero when native push is enabled"
+        );
+    }
+
+    #[test]
+    fn native_push_audience_obeys_capability_identity_bounds() {
+        let exact = "x".repeat(vot_capability::bounds::IDENTITY.1 - "votport:".len());
+        assert_eq!(
+            push_audience(Some(&exact), "unused").unwrap().len(),
+            vot_capability::bounds::IDENTITY.1
+        );
+        assert!(push_audience(Some(&format!("{exact}x")), "unused").is_err());
+        assert!(push_audience(Some("drop.example\ninvalid"), "unused").is_err());
+    }
+
+    #[test]
+    fn push_ticket_sweep_keeps_only_live_unexpired_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = build(push_config(directory.path())).unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        application
+            .sessions
+            .insert("live".to_owned(), "link".to_owned(), String::new(), sender)
+            .unwrap();
+        let now = crate::store::now_unix();
+        application.push_tickets.lock().unwrap().extend([
+            (
+                [1; 16],
+                PushTicket {
+                    session_id: "live".to_owned(),
+                    expires_at: now + 60,
+                },
+            ),
+            (
+                [2; 16],
+                PushTicket {
+                    session_id: "missing".to_owned(),
+                    expires_at: now + 60,
+                },
+            ),
+            (
+                [3; 16],
+                PushTicket {
+                    session_id: "live".to_owned(),
+                    expires_at: now,
+                },
+            ),
+        ]);
+
+        sweep_push_tickets(&application);
+
+        let tickets = application.push_tickets.lock().unwrap();
+        assert_eq!(tickets.len(), 1);
+        assert!(tickets.contains_key(&[1; 16]));
     }
 
     #[test]
@@ -840,6 +933,19 @@ async fn expire_link_uploads(app: &App, candidate: crate::store::Link, cutoff: u
 }
 
 /// Discards idle upload sessions and expired audit rows.
+fn sweep_push_tickets(app: &App) {
+    if app.push.is_none() {
+        return;
+    }
+    let now = crate::store::now_unix();
+    app.push_tickets
+        .lock()
+        .expect("push tickets poisoned")
+        .retain(|_, ticket| {
+            ticket.expires_at > now && app.sessions.link_id(&ticket.session_id).is_some()
+        });
+}
+
 pub async fn session_sweeper(app: Arc<App>) {
     let idle = app.config.session_idle_secs;
     let mut day = tokio::time::interval(std::time::Duration::from_secs(86_400));
@@ -847,6 +953,7 @@ pub async fn session_sweeper(app: Arc<App>) {
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                 app.sessions.sweep(idle);
+                sweep_push_tickets(&app);
             }
             _ = day.tick() => {
                 // Skip this tick rather than sweep on guessed settings: a
