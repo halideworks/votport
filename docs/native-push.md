@@ -1,8 +1,8 @@
 # Native push: VOT QUIC receive path
 
-Status: PRs 1-2 implemented, 2026-08-29. VOT ADR-0045 (push, the holder dials)
+Status: PRs 1-3 implemented, 2026-08-29. VOT ADR-0045 (push, the holder dials)
 landed upstream in PR #391 at `b14cc41debc2547c5ef999fee26bb055995284d9`.
-The accept loop and receive worker are not shipped yet.
+The remaining work is PR 4's operator surface.
 
 ## Overview
 
@@ -67,7 +67,7 @@ admission decision, one commit path, and one `UploadRecord` shape.
 ### Goals
 
 1. A sender that embeds VOT can push a package into a link with one HTTPS
-   call and one QUIC connection, authenticated by a capability votport
+   call and one VOT transfer, authenticated by a capability votport
    mints, and the result is indistinguishable in the admin UI, receipts,
    dedupe, quotas, retention, legal hold, and audit from a browser upload.
 2. Admission happens once, before any byte moves, under the same
@@ -111,18 +111,20 @@ admission decision, one commit path, and one `UploadRecord` shape.
    `SessionAdmission` field; `remove` and tenant delete pins work
    unchanged; `sweep` and abort call the cancellation handle for a push
    session instead of dropping or sending on the `Cmd` channel.
-4. **Fetch into staging, then publish per object through `NativeFile`.**
+4. **Fetch into staging, then publish through `NativeFile` after package verification.**
    The VOT engine writes each object to
    `<dest_dir>/.vot-push-<sid>/objects/<root>` through its own `RangeSink`,
    root-verified on arrival. The engine consumes the `PROOF_BUNDLE`s and
    hands the sink bare bytes, and `VerifiedSlice` has no public constructor
    other than `verify_range`, so the worker cannot replay the wire proofs.
-   On object completion it re-proves the staged file locally: one
+   On object completion it re-proves the staged file locally into an
+   unpublished `NativeFile`: one
    streaming pass with `vot_proof_blake3::GroupCvs::push` per 64 KiB group
    and `seal`, then `prove_with(&cvs, offset, length)` per
    `RANGE_UNIT_BYTES`-aligned range of at most `MAX_PROOF_RANGE_BYTES`
-   (8,454,144 bytes), each fed through `verify_range` then
-   `NativeFile::accept`, then `publish` and `write_sidecar`. One hash pass
+   (4,259,840 bytes in the pinned VOT revision), each fed through
+   `NativeFile::accept`. After all unique objects finish, it publishes every
+   destination and writes sidecars. One hash pass
    per object and about 512 KiB of chaining-value state per GiB, next to a
    network transfer. `vot_proof_blake3::prove` is not used: it takes the
    whole object as one slice and rehashes it per range. `NativeFile::publish`,
@@ -200,11 +202,12 @@ Request:
 - `app::build` calls `receive_push_on(listener, policy)` on its own thread;
   the engine owns the accept loop. The policy is votport's: verify the
   capability against the issuer key, check audience and validity, look up
-  `id128` in a `push_tickets` map keyed to the session id, refuse if
-  unknown, used, or the session is gone. A capability is single use: the
-  first accepted `SESSION_OPEN` marks it spent. On grant the policy builds
-  that session's `ReceiveSeams`, stores the cancellation handle on the
-  `SessionHandle`, and returns them.
+  `id128` in a `push_tickets` map keyed to the session id, and refuse if
+  unknown, expired, cancelled, or the session is gone. The first accepted
+  `SESSION_OPEN` builds that transfer's `ReceiveSeams`; concurrent VOT rails
+  presenting the same capability join those seams. Completion removes the
+  ticket, so a later replay is refused. The cancellation handle is shared
+  with the `SessionHandle`.
 - The grant binds the session to the scope root and length. When
   `PACKAGE_DESCRIPTOR` arrives, the engine compares; a mismatch ends the
   session and the worker records an `interrupted` event exactly as the
@@ -259,12 +262,14 @@ the seams:
    `HAVE` is not involved: it carries verified 64 KiB group coverage within
    one object (`spec/object.md` section 10), not a package-level skip, and
    has no implementation outside the codec.
-4. On each object's completion callback, publishes it: `NativeFile::create`
-   for the destination, then the local re-prove loop of Key Decision 4
-   (`GroupCvs`, `prove_with` per aligned range, `verify_range`, `accept`),
-   then `publish`, then `write_sidecar`. `FileRecord` fields are identical
-   to the browser path.
-5. On session complete, the record-building half of `handle_finish`
+4. Each object's completion callback creates its `NativeFile` destinations
+   and runs the local re-prove loop of Key Decision 4 (`GroupCvs`,
+   `prove_with` per aligned range, `verify_range`, `accept`). Publication is
+   deferred until every unique object has completed, so aborting or rejecting
+   a later object cannot leave a partial package in the destination.
+5. On the last unique object, cancellation is checked before publication and
+   again before recording. The worker publishes every `NativeFile`, writes
+   sidecars, and runs the record-building half of `handle_finish`
    (`session.rs:642-692`) runs. Today that function destructures
    `Phase::Receiving { files }` and takes the chunk `replays` and `rejected`
    counters (`session.rs:645-650`); the `UploadRecord` construction and
@@ -275,10 +280,21 @@ the seams:
    for a push they run from the completion path on the engine's thread,
    which has no tokio context, so `App` keeps a `tokio::runtime::Handle`
    for the notify spawn. Audit rows are written the same way for both
-   paths.
-6. On any failure, cancel unpublished `NativeFile`s, remove
+   paths. A process-wide publication namespace lock spans
+   `NativeFile::publish`, sidecar publication, guard capture, and rollback.
+   Same-filesystem hard links guard the identity of newly published files and
+   sidecars until `store.append_upload` succeeds; rollback opens one guard at
+   a time and removes only that exact destination, keeping file descriptor use
+   constant even at the entry cap.
+   The pinned VOT revision has no public whole-session terminal callback.
+   Therefore the last unique per-object completion commits the record; a
+   later transport-level workspace sync or acknowledgement failure cannot
+   revoke an already published upload.
+6. On any failure, cancel unpublished `NativeFile`s, roll back guarded final
+   files, and remove
    `.vot-push-<sid>/`, record the event, `Sessions::remove`.
-   `paths::clean_staging` at boot also learns the `.vot-push-*` prefix.
+   `paths::clean_staging` at boot also removes only the generated
+   `.vot-push-<32 lowercase hex>` shape.
 7. Abort and the `Cmd` routes. Nothing consumes a push session's `Cmd`
    channel, and `dispatch` awaits a oneshot with no timeout
    (`upload.rs:415-434`), so every HTTP session route (`seal`, `page`,
@@ -302,15 +318,17 @@ the seams:
   `vot-capability` for minting, `vot-scheduler` for the `RangeSink` and
   `FileSink` types the seams are typed on (`vot-cli` re-exports neither),
   and `vot-proof-blake3` for the re-prove (`vot-sdk` does not re-export a
-  range prover; `vot_sdk::proof` is the catalog encoder). The
+  range prover; `vot_sdk::proof` is the catalog encoder). Package entries
+  may use either suite 1 (BLAKE3) or suite 2 (SHA-256), so the same loop uses
+  `vot-proof-sha256` for suite 2. The
   Dockerfile build stage gains `cmake` and `clang` for BoringSSL. CI's
   server job builds it once; the cache key already hashes `Cargo.lock`.
 - The pin moves in one PR with the ADR-0045 implementation upstream, the
   same six sites as any repin.
 - Sender-side knobs (`VOT_FETCH_RAILS`, `VOT_DATAGRAM_FEC`, `VOT_INITIAL_CWND`,
-  `VOT_PREFIX_DUP`) are the sender's. Receiver-side, votport sets
-  `VOT_FETCH_PROVERS` from available parallelism and leaves the rest at VOT
-  defaults; nothing in votport re-exposes them until a measurement asks.
+  `VOT_PREFIX_DUP`) are the sender's. Receiver-side, VOT b14 supplies the
+  `VOT_FETCH_PROVERS` default; votport does not set or re-expose it. The
+  remaining receiver settings stay at VOT defaults until a measurement asks.
 
 ## API / Interface Changes
 
@@ -325,15 +343,16 @@ New, all under the existing link authorization:
 `GET /api/r/{token}` gains `"push": true` when `VOTPORT_PUSH_BIND` is set so a
 CLI can discover the path before asking for a password.
 
-Admin listing (`list_links`, upload history) shows `transport: "push"` on
-the `UploadRecord`; the browser path records `"http"`. One field, no schema
-bump: `UploadRecord` is JSON in `links.uploads_json` and absent means
-`"http"`.
+The stored `UploadRecord` carries `transport: "push"`; new browser uploads
+record `"http"`. PR 4 exposes it through `list_links` and upload history.
+There is no schema bump: `UploadRecord` is JSON in `links.uploads_json`, and
+an absent value on an older record means `"http"`.
 
 ## Data Model Changes
 
-- `UploadRecord.transport: Option<String>` (serde default `None`, read as
-  `http`). No migration.
+- `UploadRecord.transport: Option<String>` (`Some("http")` or `Some("push")`
+  for new records; serde default `None`, read as `http`, for legacy rows). No
+  migration.
 - In-memory `push_tickets: Mutex<HashMap<[u8; 16], PushTicket>>` on `App`,
   swept with sessions. Not persisted: a restart invalidates in-flight
   pushes the same way it invalidates HTTP sessions today.
@@ -385,8 +404,8 @@ want one public port, and changes nothing in votport.
 
 - The capability is single use, scoped to one root and length, bound to a
   holder key the sender proves possession of, and expires with the session.
-  Replay after `SESSION_ACCEPT` is refused by the spent flag; replay after
-  expiry by the validity window.
+  Concurrent rails may join one live transfer. Replay after completion and
+  ticket removal is refused; expiry is refused by the validity window.
 - The link password is presented once, over HTTPS, at preflight. It never
   crosses the QUIC connection.
 - The QUIC listener accepts any handshake; authorization is the first
@@ -396,9 +415,8 @@ want one public port, and changes nothing in votport.
 - The issuer key never leaves `data_dir`. The certificate digest is public
   by design.
 - Root and length in the capability are what the sender claimed at
-  preflight. Admission reserves that length; a descriptor that claims less
-  is accepted and the reservation released at finish, one that claims more
-  is refused before any range is requested.
+  preflight. Admission reserves that length; the manifest must match both
+  exactly or it is refused before any range is requested.
 - Staged bytes under `.vot-push-<sid>/` are root-verified on arrival by the
   engine and re-verified before `NativeFile::accept`; nothing unverified
   reaches a destination path.

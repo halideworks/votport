@@ -5,7 +5,9 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
+use base64::Engine as _;
 use serde_json::{json, Value};
 
 use vot_sdk::object::{InMemoryObjectBuilder, InMemoryPreparedObject, Suite};
@@ -21,6 +23,9 @@ const CHUNK: u64 = session::CHUNK_BYTES;
 struct TestServer {
     base: String,
     receive_dir: PathBuf,
+    application: Arc<app::App>,
+    push_address: Option<SocketAddr>,
+    push_certificate_digest: Option<[u8; 32]>,
     _data: tempfile::TempDir,
     _received: tempfile::TempDir,
 }
@@ -30,11 +35,23 @@ async fn start_server() -> TestServer {
 }
 
 async fn start_server_with_cap(max_upload_bytes: u64) -> TestServer {
+    start_server_inner(max_upload_bytes, false).await
+}
+
+async fn start_push_server() -> TestServer {
+    start_server_inner(64 * 1024 * 1024, true).await
+}
+
+async fn start_push_server_with_cap(max_upload_bytes: u64) -> TestServer {
+    start_server_inner(max_upload_bytes, true).await
+}
+
+async fn start_server_inner(max_upload_bytes: u64, enable_push: bool) -> TestServer {
     let data = tempfile::tempdir().expect("data dir");
     let received = tempfile::tempdir().expect("receive dir");
     let config = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
-        push_bind: None,
+        push_bind: enable_push.then(|| "127.0.0.1:0".parse().unwrap()),
         push_certificate: None,
         push_private_key: None,
         push_advertise: None,
@@ -69,6 +86,9 @@ async fn start_server_with_cap(max_upload_bytes: u64) -> TestServer {
         oidc: None,
     };
     let application = app::build(config).expect("app builds");
+    if enable_push {
+        app::start_push_receiver(Arc::clone(&application));
+    }
     let router = app::router(Arc::clone(&application));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
@@ -80,9 +100,40 @@ async fn start_server_with_cap(max_upload_bytes: u64) -> TestServer {
         .await
         .unwrap();
     });
+    let (push_address, push_certificate_digest) = if enable_push {
+        let identity = reqwest::Client::new()
+            .get(format!("http://{addr}/api/push-identity"))
+            .send()
+            .await
+            .expect("push identity request")
+            .error_for_status()
+            .expect("push identity status")
+            .json::<Value>()
+            .await
+            .expect("push identity JSON");
+        let address = identity["address"]
+            .as_str()
+            .expect("numeric push address")
+            .parse()
+            .expect("push address parses");
+        let digest = hex::decode(
+            identity["certificate_digest"]
+                .as_str()
+                .expect("push certificate digest"),
+        )
+        .expect("push certificate digest hex")
+        .try_into()
+        .expect("32-byte push certificate digest");
+        (Some(address), Some(digest))
+    } else {
+        (None, None)
+    };
     TestServer {
         base: format!("http://{addr}"),
         receive_dir: received.path().to_path_buf(),
+        application,
+        push_address,
+        push_certificate_digest,
         _data: data,
         _received: received,
     }
@@ -286,6 +337,133 @@ async fn run_upload(
     response.json::<Value>().await.unwrap()
 }
 
+fn push_fixture(
+    root: &std::path::Path,
+    marker: u8,
+) -> (PathBuf, vot_cli::PackageSummary, Vec<(String, Vec<u8>)>) {
+    let source = root.join(format!("push-source-{marker}"));
+    std::fs::create_dir_all(source.join("nested")).unwrap();
+    let files = vec![
+        ("a.bin".to_owned(), vec![marker; 300_000]),
+        (
+            "nested/b.bin".to_owned(),
+            vec![marker.wrapping_add(1); 300_001],
+        ),
+    ];
+    for (path, bytes) in &files {
+        std::fs::write(source.join(path), bytes).unwrap();
+    }
+    let bundle = root.join(format!("push-bundle-{marker}"));
+    let summary = vot_cli::build_bundle(&source, &bundle).unwrap();
+    assert_eq!(summary.entries, files.len() as u64);
+    (bundle, summary, files)
+}
+
+fn write_push_credentials(
+    root: &std::path::Path,
+    response: &Value,
+    holder: &ed25519_dalek::SigningKey,
+) -> (PathBuf, PathBuf) {
+    let capability = root.join("capability.cbor");
+    let holder_key = root.join("holder.key");
+    let encoded = response["capability"].as_str().unwrap();
+    std::fs::write(
+        &capability,
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &holder_key,
+        format!("ed25519-secret:{}", hex::encode(holder.to_bytes())),
+    )
+    .unwrap();
+    (capability, holder_key)
+}
+
+async fn push_bundle_blocking(
+    server: &TestServer,
+    bundle: &std::path::Path,
+    capability: &std::path::Path,
+    holder_key: &std::path::Path,
+) -> Result<vot_cli::PackageSummary, String> {
+    let address = server.push_address.expect("push address");
+    let identity = server
+        .push_certificate_digest
+        .expect("push certificate digest");
+    let bundle = bundle.to_owned();
+    let capability = capability.to_owned();
+    let holder_key = holder_key.to_str().unwrap().to_owned();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            vot_cli::push_bundle(&bundle, address, &capability, &holder_key, identity)
+                .map_err(|error| format!("{error:?}"))
+        }),
+    )
+    .await
+    .map_err(|_| "push timed out".to_owned())?
+    .map_err(|error| format!("push task failed: {error}"))?
+}
+
+async fn create_open_link(
+    client: &reqwest::Client,
+    base: &str,
+    label: &str,
+    dest: &str,
+    max_bytes: Option<u64>,
+) -> String {
+    let response = client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = match max_bytes {
+        Some(max_bytes) => json!({ "label": label, "dest": dest, "max_bytes": max_bytes }),
+        None => json!({ "label": label, "dest": dest }),
+    };
+    let response = client
+        .post(format!("{base}/api/admin/links"))
+        .header("X-Votport", "1")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    response.json::<Value>().await.unwrap()["link"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+async fn preflight_push(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    holder: &ed25519_dalek::SigningKey,
+    summary: vot_cli::PackageSummary,
+) -> Value {
+    let response = client
+        .post(format!("{base}/api/r/{token}/push"))
+        .json(&json!({
+            "holder_key": hex::encode(holder.verifying_key().to_bytes()),
+            "package": {
+                "suite": 1,
+                "root": hex::encode(summary.root),
+                "length": summary.logical_length,
+                "entries": summary.entries,
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    response.json::<Value>().await.unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn full_protocol_end_to_end() {
     let server = start_server().await;
@@ -478,6 +656,15 @@ async fn full_protocol_end_to_end() {
         .clone();
     assert_eq!(uploads.len(), 3);
     assert_eq!(uploads[0]["files"].as_array().unwrap().len(), 4);
+    assert!(server
+        .application
+        .store
+        .link_by_id(&token)
+        .unwrap()
+        .unwrap()
+        .uploads
+        .iter()
+        .all(|upload| upload.transport.as_deref() == Some("http")));
     let events = links["links"]
         .as_array()
         .unwrap()
@@ -2033,6 +2220,45 @@ async fn throughput_baseline() {
     println!("upload       256 MiB: {uploaded:.3?} ({})", mib(uploaded));
 }
 
+/// Native-push counterpart to `throughput_baseline`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark; run explicitly"]
+async fn throughput_push() {
+    const MIB: usize = 1024 * 1024;
+    let server = start_push_server_with_cap(512 * MIB as u64).await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let source = fixture.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    let mut bytes = vec![0u8; 256 * MIB];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = (index * 7 % 251) as u8;
+    }
+    std::fs::write(source.join("benchmark.bin"), bytes).unwrap();
+
+    let bundle = fixture.path().join("bundle");
+    let started = std::time::Instant::now();
+    let summary = vot_cli::build_bundle(&source, &bundle).unwrap();
+    let packaged = started.elapsed();
+
+    let token = create_open_link(&client, &server.base, "push benchmark", "", None).await;
+    let holder = ed25519_dalek::SigningKey::from_bytes(&[71; 32]);
+    let response = preflight_push(&client, &server.base, &token, &holder, summary).await;
+    let (capability, holder_key) = write_push_credentials(fixture.path(), &response, &holder);
+    let started = std::time::Instant::now();
+    push_bundle_blocking(&server, &bundle, &capability, &holder_key)
+        .await
+        .expect("native push succeeds");
+    let pushed = started.elapsed();
+
+    let mib = |elapsed: std::time::Duration| format!("{:.0} MiB/s", 256.0 / elapsed.as_secs_f64());
+    println!("build bundle 256 MiB: {packaged:.3?} ({})", mib(packaged));
+    println!("native push  256 MiB: {pushed:.3?} ({})", mib(pushed));
+}
+
 #[tokio::test]
 async fn public_verify_checks_sidecars() {
     let server = start_server().await;
@@ -2170,4 +2396,289 @@ async fn public_verify_checks_sidecars() {
         response.json::<Value>().await.unwrap()["error"],
         json!("too many checks from your address; try again later")
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_push_matches_http_storage_and_is_single_use() {
+    let server = start_push_server().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let (bundle, summary, files) = push_fixture(fixture.path(), 31);
+    let token = create_open_link(&client, &server.base, "native push", "inbox", None).await;
+    let holder = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+    let response = preflight_push(&client, &server.base, &token, &holder, summary).await;
+    assert_eq!(
+        response["address"],
+        server.push_address.unwrap().to_string()
+    );
+    assert_eq!(
+        response["certificate_digest"],
+        hex::encode(server.push_certificate_digest.unwrap())
+    );
+    let (capability, holder_key) = write_push_credentials(fixture.path(), &response, &holder);
+
+    let pushed = push_bundle_blocking(&server, &bundle, &capability, &holder_key)
+        .await
+        .unwrap_or_else(|error| {
+            let link = server.application.store.link_by_id(&token).unwrap();
+            panic!(
+                "native push succeeds: {error}; sessions={}; events={:?}",
+                server.application.sessions.total(),
+                link.map(|link| link.events)
+            )
+        });
+    assert_eq!(pushed, summary);
+
+    let link = server
+        .application
+        .store
+        .link_by_id(&token)
+        .unwrap()
+        .unwrap();
+    assert_eq!(link.uploads.len(), 1);
+    let upload = &link.uploads[0];
+    assert_eq!(upload.transport.as_deref(), Some("push"));
+    assert_eq!(upload.package_root, hex::encode(summary.root));
+    assert_eq!(upload.total_bytes, summary.logical_length);
+    assert_eq!(upload.replayed_chunks, 0);
+    assert_eq!(upload.rejected_chunks, 0);
+    assert_eq!(upload.files.len(), files.len());
+    for (path, bytes) in files {
+        let record = upload
+            .files
+            .iter()
+            .find(|record| record.path == path)
+            .expect("file record");
+        assert_eq!(record.stored_as, format!("inbox/{path}"));
+        assert_eq!(record.bytes, bytes.len() as u64);
+        assert!(record.receipt);
+        assert!(!record.deleted);
+
+        let destination = server.receive_dir.join(&record.stored_as);
+        assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+        let sidecar = PathBuf::from(format!("{}.vot-receipt", destination.display()));
+        let receipt = vot_receipt::decode_authenticated(&std::fs::read(sidecar).unwrap())
+            .expect("receipt decodes");
+        let verified =
+            vot_receipt::verify_ed25519(&receipt, &server.application.signer.verifying_key())
+                .expect("receipt verifies");
+        assert_eq!(
+            record.suite,
+            match verified.receipt().suite_id {
+                1 => "blake3",
+                2 => "sha256",
+                suite => panic!("unexpected suite {suite}"),
+            }
+        );
+        assert_eq!(hex::encode(verified.receipt().subject_digest), record.root);
+        assert_eq!(verified.receipt().subject_length, record.bytes);
+    }
+
+    let reused = push_bundle_blocking(&server, &bundle, &capability, &holder_key).await;
+    assert!(reused.is_err(), "a push capability is single use");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_push_root_mismatch_cleans_up_and_releases_quota() {
+    let server = start_push_server().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let (_bundle, summary, files) = push_fixture(fixture.path(), 51);
+    let (wrong_bundle, wrong_summary, _) = push_fixture(fixture.path(), 61);
+    assert_eq!(wrong_summary.logical_length, summary.logical_length);
+    let token = create_open_link(
+        &client,
+        &server.base,
+        "bad native push",
+        "inbox",
+        Some(summary.logical_length),
+    )
+    .await;
+    let holder = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+    let response = preflight_push(&client, &server.base, &token, &holder, summary).await;
+    let session = response["session"].as_str().unwrap().to_owned();
+    let (capability, holder_key) = write_push_credentials(fixture.path(), &response, &holder);
+
+    let failed = push_bundle_blocking(&server, &wrong_bundle, &capability, &holder_key).await;
+    assert!(failed.is_err(), "a bundle with the wrong root is refused");
+
+    let staging = server
+        .receive_dir
+        .join("inbox")
+        .join(format!(".vot-push-{session}"));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let link = server
+                .application
+                .store
+                .link_by_id(&token)
+                .unwrap()
+                .unwrap();
+            if server.application.sessions.total() == 0
+                && link.uploads.is_empty()
+                && !staging.exists()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("push cleanup completes");
+    assert!(server
+        .application
+        .store
+        .link_by_id(&token)
+        .unwrap()
+        .unwrap()
+        .uploads
+        .is_empty());
+    for (path, _) in files {
+        assert!(!server.receive_dir.join("inbox").join(path).exists());
+    }
+    assert!(!staging.exists());
+
+    // The exact link cap was occupied by the failed session. A new preflight
+    // succeeding proves both the session and its reserved bytes were released.
+    let retry = preflight_push(&client, &server.base, &token, &holder, summary).await;
+    let retry_session = retry["session"].as_str().unwrap();
+    let response = client
+        .post(format!("{}/api/session/{retry_session}/abort", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_push_abort_removes_partial_transfer() {
+    let server = start_push_server().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let source = fixture.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("a-first.bin"), vec![83_u8; 1024 * 1024]).unwrap();
+    std::fs::write(source.join("z-later.bin"), vec![84_u8; 32 * 1024 * 1024]).unwrap();
+    let bundle = fixture.path().join("bundle");
+    let summary = vot_cli::build_bundle(&source, &bundle).unwrap();
+    let token = create_open_link(&client, &server.base, "aborted push", "inbox", None).await;
+    let holder = ed25519_dalek::SigningKey::from_bytes(&[43; 32]);
+    let response = preflight_push(&client, &server.base, &token, &holder, summary).await;
+    let session = response["session"].as_str().unwrap().to_owned();
+    let (capability, holder_key) = write_push_credentials(fixture.path(), &response, &holder);
+    let staging = server
+        .receive_dir
+        .join("inbox")
+        .join(format!(".vot-push-{session}"));
+
+    let abort = async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let first_complete = std::fs::read_dir(staging.join("objects"))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .find(|entry| entry.metadata().is_ok_and(|meta| meta.len() == 1024 * 1024))
+                    .and_then(|entry| std::fs::read(entry.path()).ok())
+                    .is_some_and(|bytes| bytes.iter().all(|byte| *byte == 83));
+                if first_complete {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("native push connects");
+        client
+            .post(format!("{}/api/session/{session}/abort", server.base))
+            .send()
+            .await
+            .unwrap()
+    };
+    let (pushed, aborted) = tokio::join!(
+        push_bundle_blocking(&server, &bundle, &capability, &holder_key),
+        abort
+    );
+    assert_eq!(aborted.status(), 200);
+    assert!(pushed.is_err(), "aborted push stops the sender");
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while server.application.sessions.total() != 0 || staging.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("aborted push cleanup completes");
+    let link = server
+        .application
+        .store
+        .link_by_id(&token)
+        .unwrap()
+        .unwrap();
+    assert!(link.uploads.is_empty());
+    assert_eq!(link.events.last().unwrap().outcome, "cancelled");
+    assert!(link.events.last().unwrap().received_bytes > 0);
+    assert!(!server.receive_dir.join("inbox/a-first.bin").exists());
+    assert!(!server.receive_dir.join("inbox/z-later.bin").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_push_store_failure_rolls_back_published_files() {
+    let server = start_push_server().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let (bundle, summary, files) = push_fixture(fixture.path(), 91);
+    let token = create_open_link(&client, &server.base, "failed push commit", "inbox", None).await;
+    let holder = ed25519_dalek::SigningKey::from_bytes(&[44; 32]);
+    let response = preflight_push(&client, &server.base, &token, &holder, summary).await;
+    let session = response["session"].as_str().unwrap().to_owned();
+    let (capability, holder_key) = write_push_credentials(fixture.path(), &response, &holder);
+    rusqlite::Connection::open(server._data.path().join("votport.db"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_push_record
+             BEFORE UPDATE OF uploads_json ON links
+             BEGIN SELECT RAISE(FAIL, 'blocked push record'); END;",
+        )
+        .unwrap();
+
+    let pushed = push_bundle_blocking(&server, &bundle, &capability, &holder_key).await;
+    assert!(pushed.is_err(), "store failure rejects native push");
+
+    let staging = server
+        .receive_dir
+        .join("inbox")
+        .join(format!(".vot-push-{session}"));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while server.application.sessions.total() != 0 || staging.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("failed push cleanup completes");
+    assert!(server
+        .application
+        .store
+        .link_by_id(&token)
+        .unwrap()
+        .unwrap()
+        .uploads
+        .is_empty());
+    for (path, _) in files {
+        let destination = server.receive_dir.join("inbox").join(path);
+        assert!(!destination.exists());
+        assert!(!PathBuf::from(format!("{}.vot-receipt", destination.display())).exists());
+    }
 }

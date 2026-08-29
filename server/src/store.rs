@@ -71,6 +71,9 @@ pub struct UploadRecord {
     pub replayed_chunks: u64,
     #[serde(default)]
     pub rejected_chunks: u64,
+    /// Transport that completed the upload; `None` is the legacy HTTP value.
+    #[serde(default)]
+    pub transport: Option<String>,
     /// Hex root of the verified package manifest.
     pub package_root: String,
     pub total_bytes: u64,
@@ -1978,6 +1981,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_upload_records_default_to_http_transport() {
+        let record: UploadRecord = serde_json::from_str(
+            r#"{"id":"legacy","completed_at":1,"package_root":"root","total_bytes":0,"files":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(record.transport, None);
+    }
+
+    #[test]
     fn a_broken_table_is_an_error_not_a_panic() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -2059,6 +2071,7 @@ mod tests {
             completed_at: 2,
             replayed_chunks: 3,
             rejected_chunks: 4,
+            transport: None,
             package_root: "aa".to_owned(),
             total_bytes: 5,
             files: vec![FileRecord {
@@ -2185,6 +2198,7 @@ mod tests {
             completed_at: 1,
             replayed_chunks: 0,
             rejected_chunks: 0,
+            transport: None,
             package_root: "root".to_owned(),
             total_bytes: 7,
             files: vec![FileRecord {
@@ -2538,6 +2552,7 @@ mod tenant_tests {
             completed_at: 0,
             replayed_chunks: 0,
             rejected_chunks: 0,
+            transport: None,
             package_root: "cc".to_owned(),
             total_bytes: 500,
             files: vec![file.clone()],
@@ -2599,6 +2614,7 @@ mod tenant_tests {
             completed_at: 0,
             replayed_chunks: 0,
             rejected_chunks: 0,
+            transport: None,
             package_root: "root".to_owned(),
             total_bytes: u64::MAX,
             files: vec![
@@ -2636,6 +2652,7 @@ mod tenant_tests {
                     completed_at: u64::MAX,
                     replayed_chunks: u64::MAX,
                     rejected_chunks: u64::MAX,
+                    transport: None,
                     package_root: "exact".to_owned(),
                     total_bytes: u64::MAX,
                     files: Vec::new(),
@@ -2731,6 +2748,7 @@ mod tenant_tests {
             completed_at: 0,
             replayed_chunks: 0,
             rejected_chunks: 0,
+            transport: None,
             package_root: "root".to_owned(),
             total_bytes: 50,
             files: vec![file.clone(); 50],
@@ -2764,6 +2782,7 @@ mod tenant_tests {
                     completed_at: 0,
                     replayed_chunks: 0,
                     rejected_chunks: 0,
+                    transport: None,
                     package_root: "new-root".to_owned(),
                     total_bytes: 1,
                     files: vec![FileRecord {
@@ -3193,6 +3212,7 @@ mod settings_tests {
             completed_at: 1,
             replayed_chunks: 0,
             rejected_chunks: 0,
+            transport: None,
             package_root: "root".to_owned(),
             total_bytes: 9,
             files: vec![FileRecord {

@@ -82,12 +82,23 @@ pub fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String
     if component.eq_ignore_ascii_case(TENANT_STORAGE_DIR) {
         return Err("name is reserved for tenant storage".to_owned());
     }
-    if component.starts_with(".vot-")
-        && (component.ends_with(".stage") || component.ends_with(".journal"))
+    if is_push_staging_name(component)
+        || (component.starts_with(".vot-")
+            && (component.ends_with(".stage") || component.ends_with(".journal")))
     {
         return Err("name is reserved for votport staging files".to_owned());
     }
     Ok(())
+}
+
+fn is_push_staging_name(name: &str) -> bool {
+    let Some(session) = name.strip_prefix(".vot-push-") else {
+        return false;
+    };
+    session.len() == 32
+        && session
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Validates a link destination subdirectory ("" allowed) and returns its
@@ -158,36 +169,43 @@ pub fn with_suffix(name: &str, attempt: u32) -> String {
 /// covers sessions this process created; anything left on disk from a previous
 /// boot would otherwise live forever. vot-sdk-file stages each object as
 /// `<name>.stage` (plus `<name>.journal` under the Balanced profile) next to
-/// its destination, where `<name>` always starts with `.vot-`; nothing else
-/// matches that shape.
+/// its destination, where `<name>` always starts with `.vot-`; push sessions
+/// additionally stage under `.vot-push-<session-id>/`.
 pub fn clean_staging(root: &Path) {
     #[cfg(unix)]
-    fn is_staging(name: &str) -> bool {
+    fn is_staging_file(name: &str) -> bool {
         name.starts_with(".vot-") && (name.ends_with(".stage") || name.ends_with(".journal"))
     }
     #[cfg(not(unix))]
     let _ = root;
     #[cfg(unix)]
-    walk(root, &mut |path, name| {
-        if is_staging(name) {
+    walk(root, &mut |path, name, is_dir| {
+        if is_dir && is_push_staging_name(name) {
+            // `walk` only labels entries as directories using `file_type`, so
+            // symlinks are never handed to `remove_dir_all` and never followed.
+            let _ = std::fs::remove_dir_all(path);
+            return false;
+        }
+        if !is_dir && is_staging_file(name) {
             let _ = std::fs::remove_file(path);
         }
+        true
     });
 }
 
 #[cfg(unix)]
-fn walk(dir: &Path, visit: &mut impl FnMut(&Path, &str)) {
+fn walk(dir: &Path, visit: &mut impl FnMut(&Path, &str, bool) -> bool) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        match entry.file_type() {
-            Ok(file_type) if file_type.is_dir() => {
-                walk(&entry.path(), visit);
-            }
-            Ok(_) => visit(&entry.path(), &name),
-            Err(_) => {}
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if visit(&path, &name, file_type.is_dir()) && file_type.is_dir() {
+            walk(&path, visit);
         }
     }
 }
@@ -263,6 +281,61 @@ mod tests {
         assert!(!journal.exists());
         assert!(kept.exists());
         assert!(foreign.exists());
+    }
+
+    #[test]
+    fn clean_staging_removes_push_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let push_staging = directory
+            .path()
+            .join(".vot-push-0123456789abcdef0123456789abcdef");
+        std::fs::create_dir_all(push_staging.join("objects")).unwrap();
+        std::fs::write(push_staging.join("objects/file.stage"), b"x").unwrap();
+        let foreign = directory.path().join(".vot-push-session");
+        std::fs::create_dir_all(foreign.join("objects")).unwrap();
+
+        clean_staging(directory.path());
+
+        assert!(!push_staging.exists());
+        assert!(foreign.exists());
+    }
+
+    #[test]
+    fn push_staging_names_are_never_admitted() {
+        assert!(admit_component(".vot-push-0123456789abcdef0123456789abcdef", true).is_err());
+        assert!(admit_component(".vot-push-sender", true).is_ok());
+        assert!(admit_component(".vot-push-0123456789abcdef0123456789abcde", true).is_ok());
+        assert!(admit_component(".vot-push-0123456789ABCDEF0123456789abcdef", true).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_staging_does_not_follow_push_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("keep");
+        std::fs::write(&outside_file, b"x").unwrap();
+        symlink(
+            outside.path(),
+            directory
+                .path()
+                .join(".vot-push-0123456789abcdef0123456789abcdef"),
+        )
+        .unwrap();
+
+        clean_staging(directory.path());
+
+        assert!(std::fs::symlink_metadata(
+            directory
+                .path()
+                .join(".vot-push-0123456789abcdef0123456789abcdef"),
+        )
+        .unwrap()
+        .file_type()
+        .is_symlink());
+        assert!(outside_file.exists());
     }
 
     #[test]

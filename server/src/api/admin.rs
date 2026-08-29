@@ -1555,6 +1555,16 @@ pub async fn delete_received_file(
         .ok_or_else(ApiError::not_found)?;
     let path = stored_path(&app, &identity.tenant, &record.stored_as)
         .ok_or_else(|| ApiError::internal("stored path failed the join guard"))?;
+    let _pin = app
+        .sessions
+        .try_pin_link(&id)
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "file deletion already in progress"))?;
+    if app.sessions.active_for_link(&id) > 0 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "uploads are in flight; try again when they finish",
+        ));
+    }
     for target in [path.clone(), {
         let mut sidecar = path.into_os_string();
         sidecar.push(".vot-receipt");
@@ -1989,6 +1999,82 @@ mod handler_tests {
         assert_eq!(json["holdings"][0]["tenant"], "");
         assert_eq!(json["holdings"][0]["links"], 1);
         assert_eq!(json["holdings"][0]["received_bytes"], 0);
+    }
+
+    #[tokio::test]
+    async fn received_file_delete_refuses_an_active_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let path = application.config.receive_dir.join("received.bin");
+        std::fs::write(&path, b"keep").unwrap();
+        application
+            .store
+            .insert_link(crate::store::Link {
+                id: "link".to_owned(),
+                label: "link".to_owned(),
+                tenant: String::new(),
+                dest: String::new(),
+                password_hash: None,
+                created_at: 0,
+                expires_at: None,
+                max_bytes: None,
+                active: true,
+                legal_hold: false,
+                uploads: vec![crate::store::UploadRecord {
+                    id: "upload".to_owned(),
+                    started_at: 0,
+                    completed_at: 1,
+                    replayed_chunks: 0,
+                    rejected_chunks: 0,
+                    transport: Some("http".to_owned()),
+                    package_root: "root".to_owned(),
+                    total_bytes: 4,
+                    files: vec![crate::store::FileRecord {
+                        path: "received.bin".to_owned(),
+                        stored_as: "received.bin".to_owned(),
+                        bytes: 4,
+                        suite: "blake3".to_owned(),
+                        root: "root".to_owned(),
+                        receipt: false,
+                        deleted: false,
+                    }],
+                }],
+                events: Vec::new(),
+            })
+            .unwrap();
+        application
+            .sessions
+            .insert(
+                "session".to_owned(),
+                "link".to_owned(),
+                String::new(),
+                tokio::sync::mpsc::channel(1).0,
+            )
+            .unwrap();
+
+        let cookie = login_cookie(app::router(application.clone())).await;
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/admin/links/link/uploads/upload/files/0")
+                    .header("cookie", cookie)
+                    .header("x-votport", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+        let link = application.store.link("", "link").unwrap().unwrap();
+        assert!(!link.uploads[0].files[0].deleted);
+        let pin = application
+            .sessions
+            .try_pin_link("link")
+            .expect("file delete released its link pin");
+        drop(pin);
     }
 
     #[tokio::test]

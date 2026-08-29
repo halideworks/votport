@@ -16,7 +16,7 @@ use tower_http::services::ServeDir;
 use crate::api;
 use crate::auth::LoginThrottle;
 use crate::config::Config;
-use crate::session::{self, Sessions};
+use crate::session::{self, FinishReport, Sessions};
 use crate::store::Store;
 
 /// Native push transport state retained for the process lifetime.
@@ -33,6 +33,11 @@ pub struct PushState {
 pub(crate) struct PushTicket {
     pub(crate) session_id: String,
     pub(crate) expires_at: u64,
+    pub(crate) expected_package: vot_sdk::object::ObjectId,
+    pub(crate) directory: std::path::PathBuf,
+    pub(crate) setup: Option<session::WorkerSetup>,
+    pub(crate) seams: Option<session::PushSeamHandle>,
+    pub(crate) control: session::PushControl,
 }
 
 pub struct App {
@@ -68,6 +73,8 @@ pub struct App {
     /// Per-IP rate limit on public receipt checks; a separate map so a
     /// verifier cannot starve upload creates and vice versa.
     pub verify_rate: crate::api::session_rate::SessionRate,
+    /// Per-IP native-push rail limit, separate from HTTP session creation.
+    pub push_rate: crate::api::session_rate::SessionRate,
     /// Signs the `.vot-receipt` sidecars written next to received files.
     pub signer: Arc<crate::receipt::ReceiptSigner>,
     /// Outbound client for upload notifications.
@@ -77,6 +84,59 @@ pub struct App {
     pub sso_client: SsoSlot,
     pub push: Option<PushState>,
     pub(crate) push_tickets: Mutex<HashMap<[u8; 16], PushTicket>>,
+}
+
+/// Remove any native-push ticket belonging to a completed or aborted session.
+pub(crate) fn remove_push_ticket(app: &Arc<App>, session_id: &str) {
+    app.push_tickets
+        .lock()
+        .expect("push tickets poisoned")
+        .retain(|_, ticket| ticket.session_id != session_id);
+}
+
+/// Apply the completion side effects shared by HTTP and native push uploads.
+pub(crate) fn upload_completed(
+    app: &Arc<App>,
+    session_id: &str,
+    link_id: Option<String>,
+    report: &FinishReport,
+    runtime: &tokio::runtime::Handle,
+) {
+    tracing::info!(
+        target: "audit", event = "upload_completed", session = %session_id,
+        files = report.files.len(), bytes = report.files.iter().map(|file| file.bytes).sum::<u64>(),
+        "upload finished and recorded"
+    );
+    let link = link_id.and_then(|id| {
+        app.store
+            .upload_link(&id)
+            .inspect_err(|error| tracing::warn!(%error, "link read failed after upload"))
+            .ok()
+            .flatten()
+    });
+    let completed_tenant = link
+        .as_ref()
+        .map(|link| link.tenant.as_str())
+        .unwrap_or_default();
+    app.store.audit(
+        completed_tenant,
+        "",
+        "upload_completed",
+        &session_id[..8.min(session_id.len())],
+        &serde_json::json!({
+            "files": report.files.len(),
+            "bytes": report.files.iter().map(|file| file.bytes).sum::<u64>()
+        }),
+    );
+    if let Some(link) = link {
+        let app = Arc::clone(app);
+        let report = report.clone();
+        runtime.spawn(async move {
+            crate::notify::uploaded(app, link.label, report).await;
+        });
+    }
+    app.sessions.remove(session_id);
+    remove_push_ticket(app, session_id);
 }
 
 const SSO_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
@@ -248,6 +308,9 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         link_throttle: crate::auth::IpThrottle::new(),
         session_rate: crate::api::session_rate::SessionRate::new(),
         verify_rate: crate::api::session_rate::SessionRate::new(),
+        // Twenty admitted sessions can each use VOT's eight default rails;
+        // leave room for refused or retried rails in the same ten-minute window.
+        push_rate: crate::api::session_rate::SessionRate::with_limit(200),
         signer,
         http,
         sso_config: config.oidc.clone(),
@@ -292,6 +355,126 @@ fn push_audience(public_url: Option<&str>, address: &str) -> Result<String, Stri
         ));
     }
     Ok(audience)
+}
+
+/// Starts the process-lifetime VOT receiver when native push is enabled.
+pub fn start_push_receiver(app: Arc<App>) {
+    if app.push.is_none() {
+        return;
+    }
+    let runtime = tokio::runtime::Handle::current();
+    std::thread::Builder::new()
+        .name("votport-push-receiver".to_owned())
+        .spawn(move || {
+            let push = app.push.as_ref().expect("push state disappeared");
+            let verifying_key = push.issuer.verifying_key();
+            let requirement = vot_cli::authz::PushRequirement::new(
+                "votport",
+                vot_cli::authz::key_id_of(&verifying_key),
+                verifying_key,
+                &push.audience,
+            );
+            let listener = push.listener.lock().expect("push listener poisoned");
+            if let Err(error) = vot_cli::receive_push_on(&listener, |presentation| {
+                admit_push(&app, &requirement, presentation, &runtime)
+            }) {
+                tracing::error!(?error, "native push receiver stopped");
+            }
+        })
+        .expect("spawn native push receiver");
+}
+
+fn admit_push(
+    app: &Arc<App>,
+    requirement: &vot_cli::authz::PushRequirement,
+    presentation: vot_cli::PushPresentation<'_>,
+    runtime: &tokio::runtime::Handle,
+) -> Option<vot_cli::PushAdmission> {
+    if !app.push_rate.allow(&presentation.peer.ip().to_string()) {
+        tracing::warn!(target: "audit", event = "push_refused", peer = %presentation.peer, reason = "rate", "native push refused");
+        return None;
+    }
+    let Some(scope) = requirement.decide(
+        presentation.challenge,
+        presentation.open,
+        presentation.channel_binding,
+        presentation.now,
+    ) else {
+        tracing::warn!(target: "audit", event = "push_refused", peer = %presentation.peer, reason = "capability", "native push refused");
+        return None;
+    };
+    let signed = vot_capability::decode(&presentation.open.capability).ok()?;
+    let capability = vot_capability::Capability::from_canonical_bytes(&signed.capability).ok()?;
+    let token_id = capability.token_id;
+    let (session_id, directory, seams, joined) = {
+        let mut tickets = app.push_tickets.lock().expect("push tickets poisoned");
+        let Some(ticket) = tickets.get_mut(&token_id) else {
+            tracing::warn!(target: "audit", event = "push_refused", peer = %presentation.peer, reason = "ticket", "native push refused");
+            return None;
+        };
+        if ticket.expires_at <= presentation.now
+            || capability.expiry != ticket.expires_at
+            || !app.sessions.contains_push(&ticket.session_id)
+            || !scope_matches(&scope, &ticket.expected_package)
+            || ticket.control.is_cancelled()
+        {
+            tracing::warn!(target: "audit", event = "push_refused", peer = %presentation.peer, reason = "ticket", "native push refused");
+            return None;
+        }
+        if let Some(seams) = ticket
+            .seams
+            .as_ref()
+            .and_then(session::PushSeamHandle::seams)
+        {
+            (
+                ticket.session_id.clone(),
+                ticket.directory.clone(),
+                seams,
+                true,
+            )
+        } else {
+            let setup = ticket.setup.as_ref()?;
+            if let Err(error) = std::fs::create_dir_all(&setup.dest_dir) {
+                tracing::error!(path = %setup.dest_dir.display(), %error, "create native push destination");
+                return None;
+            }
+            crate::paths::tighten_dir(&setup.dest_dir);
+            if !ticket.control.connect() {
+                return None;
+            }
+            let setup = ticket.setup.take()?;
+            let (seams, handle) = session::push_seams(
+                Arc::clone(app),
+                setup,
+                ticket.control.clone(),
+                runtime.clone(),
+            );
+            ticket.seams = Some(handle);
+            (
+                ticket.session_id.clone(),
+                ticket.directory.clone(),
+                seams,
+                false,
+            )
+        }
+    };
+    tracing::info!(
+        target: "audit", event = "push_connected", peer = %presentation.peer,
+        session_tag = %session_id.get(..8).unwrap_or(&session_id), joined,
+        "native push rail admitted"
+    );
+    Some(vot_cli::PushAdmission {
+        scope,
+        directory,
+        seams,
+    })
+}
+
+fn scope_matches(scope: &vot_capability::Scope, expected: &vot_sdk::object::ObjectId) -> bool {
+    scope.suite == expected.suite
+        && scope.root == expected.root
+        && scope.length == Some(expected.length)
+        && scope.ranges.is_empty()
 }
 
 fn load_push_issuer(data_dir: &std::path::Path) -> Result<ed25519_dalek::SigningKey, String> {
@@ -661,21 +844,65 @@ mod push_tests {
     }
 
     #[test]
-    fn push_ticket_sweep_keeps_only_live_unexpired_sessions() {
+    fn push_ticket_sweep_removes_expired_unconnected_tickets() {
         let directory = tempfile::tempdir().unwrap();
         let application = build(push_config(directory.path())).unwrap();
         let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let live_control = session::PushControl::new();
         application
             .sessions
-            .insert("live".to_owned(), "link".to_owned(), String::new(), sender)
+            .insert_admitted(
+                session::SessionAdmission {
+                    id: "live".to_owned(),
+                    link_id: "link".to_owned(),
+                    tenant: String::new(),
+                    reserved_bytes: 0,
+                    max_total_bytes: None,
+                    max_tenant_sessions: None,
+                    max_link_sessions: usize::MAX,
+                    max_sessions: usize::MAX,
+                    kind: session::SessionKind::Push(live_control.clone()),
+                },
+                sender,
+                || Ok(0),
+            )
             .unwrap();
         let now = crate::store::now_unix();
+        let expired_control = session::PushControl::new();
+        let (expired_sender, _expired_receiver) = tokio::sync::mpsc::channel(1);
+        application
+            .sessions
+            .insert_admitted(
+                session::SessionAdmission {
+                    id: "expired".to_owned(),
+                    link_id: "link".to_owned(),
+                    tenant: String::new(),
+                    reserved_bytes: 0,
+                    max_total_bytes: None,
+                    max_tenant_sessions: None,
+                    max_link_sessions: usize::MAX,
+                    max_sessions: usize::MAX,
+                    kind: session::SessionKind::Push(expired_control.clone()),
+                },
+                expired_sender,
+                || Ok(0),
+            )
+            .unwrap();
         application.push_tickets.lock().unwrap().extend([
             (
                 [1; 16],
                 PushTicket {
                     session_id: "live".to_owned(),
                     expires_at: now + 60,
+                    expected_package: vot_sdk::object::ObjectId {
+                        suite: 1,
+                        root: [1; 32],
+                        length: 1,
+                    },
+                    directory: directory.path().join("live"),
+                    setup: None,
+                    seams: None,
+                    control: live_control.clone(),
                 },
             ),
             (
@@ -683,13 +910,31 @@ mod push_tests {
                 PushTicket {
                     session_id: "missing".to_owned(),
                     expires_at: now + 60,
+                    expected_package: vot_sdk::object::ObjectId {
+                        suite: 1,
+                        root: [2; 32],
+                        length: 1,
+                    },
+                    directory: directory.path().join("missing"),
+                    setup: None,
+                    seams: None,
+                    control: session::PushControl::new(),
                 },
             ),
             (
                 [3; 16],
                 PushTicket {
-                    session_id: "live".to_owned(),
+                    session_id: "expired".to_owned(),
                     expires_at: now,
+                    expected_package: vot_sdk::object::ObjectId {
+                        suite: 1,
+                        root: [3; 32],
+                        length: 1,
+                    },
+                    directory: directory.path().join("expired"),
+                    setup: None,
+                    seams: None,
+                    control: expired_control.clone(),
                 },
             ),
         ]);
@@ -699,6 +944,59 @@ mod push_tests {
         let tickets = application.push_tickets.lock().unwrap();
         assert_eq!(tickets.len(), 1);
         assert!(tickets.contains_key(&[1; 16]));
+        assert!(!live_control.is_cancelled());
+        assert!(expired_control.is_cancelled());
+        assert_eq!(application.sessions.total(), 1);
+        assert!(application.sessions.contains_push("live"));
+    }
+
+    #[test]
+    fn push_ticket_sweep_keeps_expired_connected_tickets() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = build(push_config(directory.path())).unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let control = session::PushControl::new();
+        assert!(control.connect());
+        application
+            .sessions
+            .insert_admitted(
+                session::SessionAdmission {
+                    id: "connected".to_owned(),
+                    link_id: "link".to_owned(),
+                    tenant: String::new(),
+                    reserved_bytes: 0,
+                    max_total_bytes: None,
+                    max_tenant_sessions: None,
+                    max_link_sessions: usize::MAX,
+                    max_sessions: usize::MAX,
+                    kind: session::SessionKind::Push(control.clone()),
+                },
+                sender,
+                || Ok(0),
+            )
+            .unwrap();
+        application.push_tickets.lock().unwrap().insert(
+            [4; 16],
+            PushTicket {
+                session_id: "connected".to_owned(),
+                expires_at: crate::store::now_unix(),
+                expected_package: vot_sdk::object::ObjectId {
+                    suite: 1,
+                    root: [4; 32],
+                    length: 1,
+                },
+                directory: directory.path().join("connected"),
+                setup: None,
+                seams: None,
+                control: control.clone(),
+            },
+        );
+
+        sweep_push_tickets(&application);
+
+        let tickets = application.push_tickets.lock().unwrap();
+        assert!(tickets.contains_key(&[4; 16]));
+        assert!(!control.is_cancelled());
     }
 
     #[test]
@@ -938,12 +1236,33 @@ fn sweep_push_tickets(app: &App) {
         return;
     }
     let now = crate::store::now_unix();
-    app.push_tickets
-        .lock()
-        .expect("push tickets poisoned")
-        .retain(|_, ticket| {
-            ticket.expires_at > now && app.sessions.link_id(&ticket.session_id).is_some()
+    let mut cancelled = Vec::new();
+    {
+        let mut tickets = app.push_tickets.lock().expect("push tickets poisoned");
+        tickets.retain(|_, ticket| {
+            let connected = ticket.control.is_connected();
+            let keep = app.sessions.contains_push(&ticket.session_id)
+                && (ticket.expires_at > now || connected);
+            if !keep {
+                cancelled.push((
+                    ticket.session_id.clone(),
+                    ticket.control.clone(),
+                    ticket.setup.take(),
+                    connected,
+                ));
+            }
+            keep
         });
+    }
+    for (session_id, control, setup, connected) in cancelled {
+        control.cancel();
+        if !connected {
+            app.sessions.remove(&session_id);
+        }
+        if let Some(setup) = setup {
+            session::record_unconnected_push(setup, false);
+        }
+    }
 }
 
 pub async fn session_sweeper(app: Arc<App>) {
@@ -1066,6 +1385,7 @@ mod retention_tests {
                 completed_at: 1,
                 replayed_chunks: 0,
                 rejected_chunks: 0,
+                transport: None,
                 package_root: "root".to_owned(),
                 total_bytes: 4,
                 files: vec![FileRecord {

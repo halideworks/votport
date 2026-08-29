@@ -7,6 +7,8 @@
 //! public key itself, so a receipt is verifiable against the key the admin
 //! page displays with nothing else.
 
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -94,9 +96,37 @@ impl ReceiptSigner {
         let mut sidecar = destination.as_os_str().to_owned();
         sidecar.push(".vot-receipt");
         let sidecar = PathBuf::from(sidecar);
-        std::fs::write(&sidecar, bytes)
-            .map_err(|error| format!("write {}: {error}", sidecar.display()))?;
+        write_sidecar_file(&sidecar, &bytes, |file, bytes| file.write_all(bytes))
+            .map_err(|error| format!("write or publish {}: {error}", sidecar.display()))?;
         Ok(sidecar)
+    }
+}
+
+fn write_sidecar_file(
+    sidecar: &Path,
+    bytes: &[u8],
+    write: impl FnOnce(&mut File, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let parent = sidecar
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let temporary = parent.join(format!(".vot-{}.stage", crate::auth::random_token()));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    let temporary_guard = TemporaryFile(temporary);
+    write(&mut file, bytes)?;
+    file.sync_all()?;
+    std::fs::hard_link(&temporary_guard.0, sidecar)
+}
+
+struct TemporaryFile(PathBuf);
+
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -179,5 +209,75 @@ mod tests {
         let verified = vot_receipt::verify_ed25519(&decoded, &key).unwrap();
         assert_eq!(verified.receipt().subject_digest, [9; 32]);
         assert_eq!(verified.receipt().sequence, 7);
+    }
+
+    #[test]
+    fn partial_write_removes_final_and_temporary_sidecars() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar = directory.path().join("payload.bin.vot-receipt");
+        assert!(write_sidecar_file(&sidecar, b"complete", |file, bytes| {
+            file.write_all(&bytes[..1])?;
+            Err(std::io::Error::other("injected receipt write failure"))
+        })
+        .is_err());
+        assert!(!sidecar.exists());
+        assert!(!std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(".vot-") && name.ends_with(".stage")
+            }));
+    }
+
+    #[test]
+    fn existing_sidecar_is_preserved() {
+        let directory = tempfile::tempdir().unwrap();
+        let signer = ReceiptSigner::load_or_create(directory.path()).unwrap();
+        let destination = directory.path().join("payload.bin");
+        let sidecar = directory.path().join("payload.bin.vot-receipt");
+        let original = b"existing receipt";
+        std::fs::write(&sidecar, original).unwrap();
+
+        let error = signer
+            .write_sidecar(
+                &destination,
+                &ObjectId {
+                    suite: 1,
+                    root: [9; 32],
+                    length: 4096,
+                },
+                [2; 16],
+                PublishObservation {
+                    incarnation: [3; 16],
+                    sequence: 7,
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.contains("publish"));
+        assert_eq!(std::fs::read(&sidecar).unwrap(), original);
+        assert!(!std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(".vot-") && name.ends_with(".stage")
+            }));
+    }
+
+    #[test]
+    fn receipt_stage_orphan_is_removed_at_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let orphan = directory
+            .path()
+            .join(format!(".vot-{}.stage", crate::auth::random_token()));
+        std::fs::write(&orphan, b"partial receipt").unwrap();
+
+        crate::paths::clean_staging(directory.path());
+
+        assert!(!orphan.exists());
     }
 }
