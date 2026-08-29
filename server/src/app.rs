@@ -1,6 +1,7 @@
 //! Application state and router assembly.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{DefaultBodyLimit, State};
@@ -83,7 +84,72 @@ pub struct App {
     pub sso_config: Option<crate::config::OidcConfig>,
     pub sso_client: SsoSlot,
     pub push: Option<PushState>,
+    pub(crate) push_metrics: PushMetrics,
     pub(crate) push_tickets: Mutex<HashMap<[u8; 16], PushTicket>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PushRefusalReason {
+    Rate,
+    Capability,
+    Expired,
+    Spent,
+}
+
+impl PushRefusalReason {
+    const ALL: [Self; 4] = [Self::Rate, Self::Capability, Self::Expired, Self::Spent];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Rate => "rate",
+            Self::Capability => "capability",
+            Self::Expired => "expired",
+            Self::Spent => "spent",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Rate => 0,
+            Self::Capability => 1,
+            Self::Expired => 2,
+            Self::Spent => 3,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct PushMetrics {
+    bytes_total: AtomicU64,
+    refused: [AtomicU64; 4],
+}
+
+impl PushMetrics {
+    pub(crate) fn add_bytes(&self, bytes: u64) {
+        self.bytes_total.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn refuse(&self, reason: PushRefusalReason) {
+        self.refused[reason.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn bytes(&self) -> u64 {
+        self.bytes_total.load(Ordering::Relaxed)
+    }
+
+    fn refusals(&self, reason: PushRefusalReason) -> u64 {
+        self.refused[reason.index()].load(Ordering::Relaxed)
+    }
+}
+
+fn refuse_push(
+    app: &App,
+    reason: PushRefusalReason,
+    peer: std::net::SocketAddr,
+) -> Option<vot_cli::PushAdmission> {
+    app.push_metrics.refuse(reason);
+    tracing::warn!(target: "audit", event = "push_refused", %peer, reason = reason.label(), "native push refused");
+    None
 }
 
 /// Remove any native-push ticket belonging to a completed or aborted session.
@@ -316,6 +382,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         sso_config: config.oidc.clone(),
         sso_client: SsoSlot::new(),
         push,
+        push_metrics: PushMetrics::default(),
         push_tickets: Mutex::new(HashMap::new()),
         config,
     }))
@@ -391,8 +458,7 @@ fn admit_push(
     runtime: &tokio::runtime::Handle,
 ) -> Option<vot_cli::PushAdmission> {
     if !app.push_rate.allow(&presentation.peer.ip().to_string()) {
-        tracing::warn!(target: "audit", event = "push_refused", peer = %presentation.peer, reason = "rate", "native push refused");
-        return None;
+        return refuse_push(app, PushRefusalReason::Rate, presentation.peer);
     }
     let Some(scope) = requirement.decide(
         presentation.challenge,
@@ -400,32 +466,47 @@ fn admit_push(
         presentation.channel_binding,
         presentation.now,
     ) else {
-        tracing::warn!(target: "audit", event = "push_refused", peer = %presentation.peer, reason = "capability", "native push refused");
-        return None;
+        return refuse_push(
+            app,
+            capability_refusal_reason(requirement, &presentation),
+            presentation.peer,
+        );
     };
-    let signed = vot_capability::decode(&presentation.open.capability).ok()?;
-    let capability = vot_capability::Capability::from_canonical_bytes(&signed.capability).ok()?;
+    // `decide` already decoded and authenticated these exact bytes.
+    let signed = match vot_capability::decode(&presentation.open.capability) {
+        Ok(signed) => signed,
+        Err(_) => return refuse_push(app, PushRefusalReason::Capability, presentation.peer),
+    };
+    let capability = match vot_capability::Capability::from_canonical_bytes(&signed.capability) {
+        Ok(capability) => capability,
+        Err(_) => return refuse_push(app, PushRefusalReason::Capability, presentation.peer),
+    };
+    if capability.expiry <= presentation.now {
+        return refuse_push(app, PushRefusalReason::Expired, presentation.peer);
+    }
     let token_id = capability.token_id;
     let (session_id, directory, seams, joined) = {
         let mut tickets = app.push_tickets.lock().expect("push tickets poisoned");
         let Some(ticket) = tickets.get_mut(&token_id) else {
-            tracing::warn!(target: "audit", event = "push_refused", peer = %presentation.peer, reason = "ticket", "native push refused");
-            return None;
+            return refuse_push(app, PushRefusalReason::Spent, presentation.peer);
         };
-        if ticket.expires_at <= presentation.now
-            || capability.expiry != ticket.expires_at
-            || !app.sessions.contains_push(&ticket.session_id)
-            || !scope_matches(&scope, &ticket.expected_package)
-            || ticket.control.is_cancelled()
-        {
-            tracing::warn!(target: "audit", event = "push_refused", peer = %presentation.peer, reason = "ticket", "native push refused");
-            return None;
+        if ticket.expires_at <= presentation.now {
+            return refuse_push(app, PushRefusalReason::Expired, presentation.peer);
         }
-        if let Some(seams) = ticket
-            .seams
-            .as_ref()
-            .and_then(session::PushSeamHandle::seams)
-        {
+        if capability.expiry != ticket.expires_at {
+            return refuse_push(app, PushRefusalReason::Capability, presentation.peer);
+        }
+        if !scope_matches(&scope, &ticket.expected_package) {
+            return refuse_push(app, PushRefusalReason::Capability, presentation.peer);
+        }
+        if !app.sessions.contains_push(&ticket.session_id) || ticket.control.is_cancelled() {
+            return refuse_push(app, PushRefusalReason::Spent, presentation.peer);
+        }
+        let seams = match live_ticket_seams(ticket) {
+            Ok(seams) => seams,
+            Err(reason) => return refuse_push(app, reason, presentation.peer),
+        };
+        if let Some(seams) = seams {
             (
                 ticket.session_id.clone(),
                 ticket.directory.clone(),
@@ -433,16 +514,22 @@ fn admit_push(
                 true,
             )
         } else {
-            let setup = ticket.setup.as_ref()?;
+            let setup = match ticket_setup(ticket) {
+                Ok(setup) => setup,
+                Err(reason) => return refuse_push(app, reason, presentation.peer),
+            };
             if let Err(error) = std::fs::create_dir_all(&setup.dest_dir) {
                 tracing::error!(path = %setup.dest_dir.display(), %error, "create native push destination");
                 return None;
             }
             crate::paths::tighten_dir(&setup.dest_dir);
             if !ticket.control.connect() {
-                return None;
+                return refuse_push(app, PushRefusalReason::Spent, presentation.peer);
             }
-            let setup = ticket.setup.take()?;
+            let setup = match ticket.setup.take() {
+                Some(setup) => setup,
+                None => return refuse_push(app, PushRefusalReason::Spent, presentation.peer),
+            };
             let (seams, handle) = session::push_seams(
                 Arc::clone(app),
                 setup,
@@ -458,11 +545,28 @@ fn admit_push(
             )
         }
     };
-    tracing::info!(
-        target: "audit", event = "push_connected", peer = %presentation.peer,
-        session_tag = %session_id.get(..8).unwrap_or(&session_id), joined,
-        "native push rail admitted"
-    );
+    if joined {
+        tracing::debug!(peer = %presentation.peer, session = %session_id, "native push rail joined");
+    } else {
+        tracing::info!(
+            target: "audit", event = "push_connected", peer = %presentation.peer,
+            session_tag = %session_id.get(..8).unwrap_or(&session_id),
+            "native push session connected"
+        );
+        let tenant = app
+            .sessions
+            .link_id(&session_id)
+            .and_then(|link_id| app.store.upload_link(&link_id).ok().flatten())
+            .map(|link| link.tenant)
+            .unwrap_or_default();
+        app.store.audit(
+            &tenant,
+            "",
+            "push_connected",
+            &session_id,
+            &serde_json::json!({ "peer": presentation.peer.to_string() }),
+        );
+    }
     Some(vot_cli::PushAdmission {
         scope,
         directory,
@@ -475,6 +579,57 @@ fn scope_matches(scope: &vot_capability::Scope, expected: &vot_sdk::object::Obje
         && scope.root == expected.root
         && scope.length == Some(expected.length)
         && scope.ranges.is_empty()
+}
+
+fn live_ticket_seams(
+    ticket: &PushTicket,
+) -> Result<Option<vot_cli::ReceiveSeams>, PushRefusalReason> {
+    match ticket.seams.as_ref() {
+        Some(handle) => handle.seams().map(Some).ok_or(PushRefusalReason::Spent),
+        None => Ok(None),
+    }
+}
+
+fn ticket_setup(ticket: &PushTicket) -> Result<&session::WorkerSetup, PushRefusalReason> {
+    ticket.setup.as_ref().ok_or(PushRefusalReason::Spent)
+}
+
+fn capability_is_expired(
+    requirement: &vot_cli::authz::PushRequirement,
+    presentation: &vot_cli::PushPresentation<'_>,
+) -> bool {
+    let Ok(signed) = vot_capability::decode(&presentation.open.capability) else {
+        return false;
+    };
+    let Ok(capability) = vot_capability::Capability::from_canonical_bytes(&signed.capability)
+    else {
+        return false;
+    };
+    if capability.expiry == 0 || capability.expiry > presentation.now {
+        return false;
+    }
+    let probe_now = capability
+        .not_before
+        .max(capability.expiry.saturating_sub(1));
+    requirement
+        .decide(
+            presentation.challenge,
+            presentation.open,
+            presentation.channel_binding,
+            probe_now,
+        )
+        .is_some()
+}
+
+fn capability_refusal_reason(
+    requirement: &vot_cli::authz::PushRequirement,
+    presentation: &vot_cli::PushPresentation<'_>,
+) -> PushRefusalReason {
+    if capability_is_expired(requirement, presentation) {
+        PushRefusalReason::Expired
+    } else {
+        PushRefusalReason::Capability
+    }
 }
 
 fn load_push_issuer(data_dir: &std::path::Path) -> Result<ed25519_dalek::SigningKey, String> {
@@ -844,6 +999,162 @@ mod push_tests {
     }
 
     #[test]
+    fn stale_push_setup_and_seams_are_spent() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = crate::api::testing::build(directory.path());
+        let missing_setup = PushTicket {
+            session_id: "stale-setup".to_owned(),
+            expires_at: u64::MAX,
+            expected_package: vot_sdk::object::ObjectId {
+                suite: 1,
+                root: [78; 32],
+                length: 1,
+            },
+            directory: directory.path().to_owned(),
+            setup: None,
+            seams: None,
+            control: session::PushControl::new(),
+        };
+        assert!(matches!(
+            ticket_setup(&missing_setup),
+            Err(PushRefusalReason::Spent)
+        ));
+
+        let setup = session::WorkerSetup {
+            store: Arc::clone(&application.store),
+            link_id: "stale-seams".to_owned(),
+            tenant: String::new(),
+            dest_dir: directory.path().join("destination"),
+            dest_rel: String::new(),
+            expected_package: missing_setup.expected_package.clone(),
+            max_total_bytes: 1,
+            allow_hidden: false,
+            signer: Arc::clone(&application.signer),
+            session_id: [79; 16],
+            started_at: crate::store::now_unix(),
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (seams, stale_handle) = session::push_seams(
+            Arc::clone(&application),
+            setup,
+            session::PushControl::new(),
+            runtime.handle().clone(),
+        );
+        drop(seams);
+        let dead_seams = PushTicket {
+            seams: Some(stale_handle),
+            ..missing_setup
+        };
+        assert!(matches!(
+            live_ticket_seams(&dead_seams),
+            Err(PushRefusalReason::Spent)
+        ));
+    }
+
+    #[test]
+    fn capability_refusal_reason_distinguishes_expiry_from_invalid_proof() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[91; 32]);
+        let foreign_issuer = ed25519_dalek::SigningKey::from_bytes(&[92; 32]);
+        let holder_key = ed25519_dalek::SigningKey::from_bytes(&[93; 32]);
+        let audience = "votport:push.example.test:8322";
+        let requirement = vot_cli::authz::PushRequirement::new(
+            "votport",
+            vot_cli::authz::key_id_of(&issuer.verifying_key()),
+            issuer.verifying_key(),
+            audience,
+        );
+        let challenge = requirement.challenge([94; 32]);
+        let binding = vot_transport_api::ChannelBinding::from_bytes([95; 32]);
+        let now = 1_700_000_000;
+        let root = [96; 32];
+        let signed = vot_cli::authz::issue_push(
+            "votport",
+            audience,
+            &issuer,
+            holder_key.verifying_key().to_bytes(),
+            root,
+            97,
+            now,
+            10,
+        )
+        .unwrap();
+        let holder = vot_cli::authz::Holder::new(signed, holder_key.clone()).unwrap();
+        let open = holder.answer(&challenge, binding).unwrap();
+        let expired_now = now + 10 + 301;
+        let expired = vot_cli::PushPresentation {
+            peer: "127.0.0.1:1".parse().unwrap(),
+            challenge: &challenge,
+            open: &open,
+            channel_binding: binding,
+            now: expired_now,
+        };
+        assert_eq!(
+            capability_refusal_reason(&requirement, &expired),
+            PushRefusalReason::Expired
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let application = crate::api::testing::build(directory.path());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let expired_for_admission = vot_cli::PushPresentation {
+            peer: expired.peer,
+            challenge: expired.challenge,
+            open: expired.open,
+            channel_binding: expired.channel_binding,
+            now: now + 11,
+        };
+        assert!(admit_push(
+            &application,
+            &requirement,
+            expired_for_admission,
+            runtime.handle()
+        )
+        .is_none());
+        assert_eq!(
+            application
+                .push_metrics
+                .refusals(PushRefusalReason::Expired),
+            1
+        );
+        assert_eq!(
+            application.push_metrics.refusals(PushRefusalReason::Spent),
+            0
+        );
+
+        let foreign_signed = vot_cli::authz::issue_push(
+            "votport",
+            audience,
+            &foreign_issuer,
+            holder_key.verifying_key().to_bytes(),
+            root,
+            97,
+            now,
+            10,
+        )
+        .unwrap();
+        let foreign_holder = vot_cli::authz::Holder::new(foreign_signed, holder_key).unwrap();
+        let foreign_open = foreign_holder.answer(&challenge, binding).unwrap();
+        let foreign = vot_cli::PushPresentation {
+            open: &foreign_open,
+            ..expired
+        };
+        assert_eq!(
+            capability_refusal_reason(&requirement, &foreign),
+            PushRefusalReason::Capability
+        );
+
+        let wrong_binding = vot_transport_api::ChannelBinding::from_bytes([98; 32]);
+        let wrong_binding_presentation = vot_cli::PushPresentation {
+            channel_binding: wrong_binding,
+            ..expired
+        };
+        assert_eq!(
+            capability_refusal_reason(&requirement, &wrong_binding_presentation),
+            PushRefusalReason::Capability
+        );
+    }
+
+    #[test]
     fn push_ticket_sweep_removes_expired_unconnected_tickets() {
         let directory = tempfile::tempdir().unwrap();
         let application = build(push_config(directory.path())).unwrap();
@@ -1127,10 +1438,51 @@ fn metrics_text(app: &App) -> Result<String, String> {
     );
     let _ = write!(
         body,
+        "# TYPE votport_push_sessions_active gauge\nvotport_push_sessions_active {}\n",
+        app.sessions.push_total()
+    );
+    let _ = write!(
+        body,
+        "# TYPE votport_push_bytes_total counter\nvotport_push_bytes_total {}\n",
+        app.push_metrics.bytes()
+    );
+    body.push_str("# TYPE votport_push_refused_total counter\n");
+    for reason in PushRefusalReason::ALL {
+        let _ = writeln!(
+            body,
+            "votport_push_refused_total{{reason=\"{}\"}} {}",
+            reason.label(),
+            app.push_metrics.refusals(reason)
+        );
+    }
+    let _ = write!(
+        body,
         "# TYPE votport_audit_rows gauge\nvotport_audit_rows {}\n",
         app.store.audit_count()?
     );
     Ok(body)
+}
+
+#[cfg(test)]
+mod push_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn push_metrics_keep_fixed_refusal_series() {
+        let metrics = PushMetrics::default();
+        metrics.add_bytes(7);
+        for reason in PushRefusalReason::ALL {
+            metrics.refuse(reason);
+        }
+        assert_eq!(metrics.bytes(), 7);
+        assert!(PushRefusalReason::ALL
+            .iter()
+            .all(|reason| metrics.refusals(*reason) == 1));
+        assert_eq!(PushRefusalReason::Rate.label(), "rate");
+        assert_eq!(PushRefusalReason::Capability.label(), "capability");
+        assert_eq!(PushRefusalReason::Expired.label(), "expired");
+        assert_eq!(PushRefusalReason::Spent.label(), "spent");
+    }
 }
 
 async fn expire_link_uploads(app: &App, candidate: crate::store::Link, cutoff: u64) {

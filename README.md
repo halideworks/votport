@@ -87,6 +87,9 @@ so env applies again. Details: [`docs/deployment.md`](docs/deployment.md).
 | `VOTPORT_ADMIN_PASSWORD_HASH` | — | Argon2 PHC string; takes precedence over the plain password. |
 | `VOTPORT_PUBLIC_URL` | — | Public https URL; used for generated links and to mark cookies `Secure`. |
 | `VOTPORT_BIND` | `0.0.0.0:8080` | Listen address inside the container. |
+| `VOTPORT_PUSH_BIND` | off | UDP address for native VOT pushes. Setting it enables the listener; leave unset to keep native push disabled. |
+| `VOTPORT_PUSH_ADVERTISE` | derived | `host:port` that native senders dial. Defaults to the host in `VOTPORT_PUBLIC_URL` and the push bind port. Set it when the public UDP address differs. |
+| `VOTPORT_PUSH_CERT` / `VOTPORT_PUSH_KEY` | generated | PEM certificate and private key for native push. Set both together to use those paths in place, or leave both unset for a persistent self-signed pair under `VOTPORT_DATA_DIR`. |
 | `VOTPORT_DATA_DIR` | `/data` | State: `votport.db` (links, upload records; legacy `state.json` is imported once) and the cookie secret. |
 | `VOTPORT_RECEIVE_DIR` | `/received` | Root folder received files are published into. |
 | `VOTPORT_MAX_UPLOAD_BYTES` | 50 GiB | Hard cap per upload session (per-link caps can be lower). Accepts plain bytes or a `K/KiB/KB`, `M/MiB/MB`, `G/GiB/GB`, `T/TiB/TB` suffix, e.g. `500G`. |
@@ -305,13 +308,49 @@ POST /api/session/{s}/finish   all files verified → recorded
 Each file is published the moment its coverage is complete, so a session that
 dies halfway still delivers the files that finished.
 
+### Native push sender
+
+Native push is optional. It is enabled only when `VOTPORT_PUSH_BIND` is set;
+the UDP port must be reachable from the sender and `VOTPORT_PUSH_ADVERTISE`
+must name the address it can dial. The issuer key is always kept in
+`VOTPORT_DATA_DIR`; an automatically generated listener certificate pair is
+kept there too, while configured certificate and key paths are used in place.
+`/api/push-identity` is public so a sender can obtain and pin the certificate
+digest.
+
+The sender first calls `POST /api/r/{token}/push` over HTTPS with the link
+password (or its existing link cookie), holder public key, and the exact VOT
+package root and length. The receiver checks the manifest entry count later
+against its built-in `MAX_ENTRIES` limit. The response contains a one-session capability,
+the advertised UDP address, certificate digest, and expiry. Pass the
+capability and its holder key to the VOT CLI or equivalent VOT library:
+
+```sh
+CAPABILITY_B64='<capability from the preflight JSON>'
+printf '%s' "$CAPABILITY_B64" | base64 -d > push-token.cbor
+export VOT_PUSH_IDENTITY=<certificate_digest>
+export HOLDER_SECRET='ed25519-secret:<64 hex characters for the holder secret>'
+vot push BUNDLE_DIR <host>:<udp-port> push-token.cbor env:HOLDER_SECRET
+```
+
+The b14 CLI accepts a numeric IPv4 or bracketed IPv6 `SocketAddr`, not a DNS
+hostname. Use a numeric address in `VOTPORT_PUSH_ADVERTISE` for that CLI; VOT
+library callers may resolve names themselves. The link password never crosses
+the UDP connection.
+
+Native and browser uploads share link and tenant quotas, upload history,
+receipts, retention, and the admin UI. Browser uploads continue to use HTTP
+through the reverse proxy. Native push stages the complete package first and
+publishes it as one package after verification; an interrupted native push
+does not publish partial files.
+
 ## Roadmap
 
 VOT is pinned at `b14cc41debc2547c5ef999fee26bb055995284d9` (upstream PR #391).
-That pin adds the holder-dialed push engine. votport now has the feature-off
-listener identity from native-push PR 1, but not preflight or a receive worker.
-Browser uploads still travel over HTTP through the reverse proxy, and nothing
-landed that changes `CHUNK_BYTES` or enables parallel verify.
+That pin adds the holder-dialed push engine, and votport's native push receive
+path is shipped but disabled unless `VOTPORT_PUSH_BIND` is set. Browser uploads
+still travel over HTTP through the reverse proxy. Native push does not change
+`CHUNK_BYTES` or enable parallel HTTP verification.
 
 Product next, each as its own design first:
 

@@ -1260,6 +1260,7 @@ impl vot_scheduler::RangeSink for PushFileSink {
         self.receive
             .received
             .fetch_add(data.len() as u64, Ordering::AcqRel);
+        self.receive.app.push_metrics.add_bytes(data.len() as u64);
         self.receive.mark_active();
         Ok(())
     }
@@ -2084,6 +2085,16 @@ impl Sessions {
 
     pub fn total(&self) -> usize {
         self.inner.lock().expect("sessions poisoned").map.len()
+    }
+
+    pub fn push_total(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("sessions poisoned")
+            .map
+            .values()
+            .filter(|handle| matches!(&handle.kind, SessionKind::Push(_)))
+            .count()
     }
 
     pub fn active_for_link(&self, link_id: &str) -> usize {

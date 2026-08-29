@@ -3593,6 +3593,7 @@ dependencies = [
  "vot-scheduler",
  "vot-sdk",
  "vot-sdk-file",
+ "vot-transport-api",
 ]
 
 [[package]]

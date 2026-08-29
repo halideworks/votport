@@ -12,6 +12,8 @@ data/                       votport state - keep private
   votport.db                SQLite store (links, tenants, audit log)
   secret                    cookie-signing key        (0600)
   receipt.key               ed25519 receipt signer    (0600)
+  push-issuer.key           native-push capability issuer, always here (0600)
+  push.crt / push.key       generated native-push certificate and key (0600)
   backups/                  snapshots written by /api/admin/backup
 /received                   received files, published per tenant/link
 Caddyfile.example           reverse-proxy template
@@ -27,6 +29,54 @@ cp Caddyfile.example /etc/caddy/sites/votport   # adjust host + port
 docker compose up -d --build
 curl -o /dev/null -w '%{http_code}\n' http://127.0.0.1:<debug-port>/r/x   # expect 200
 ```
+
+## Native push
+
+Native push is disabled unless `VOTPORT_PUSH_BIND` is set. It is a QUIC/UDP
+listener separate from the HTTP listener, so keep the browser site behind
+Caddy and expose the push port directly to senders. For a container listening
+on UDP 8322, the deployment-specific compose service needs a mapping such as:
+
+```yaml
+ports:
+  - "127.0.0.1:8103:8080"
+  - "8322:8322/udp"
+environment:
+  VOTPORT_PUSH_BIND: "0.0.0.0:8322"
+  VOTPORT_PUSH_ADVERTISE: "203.0.113.10:8322"
+```
+
+Replace the example address with the numeric public address reachable by the
+sender, and allow that UDP port in the host and cloud firewalls. Do not put
+the UDP mapping behind the normal Caddy `reverse_proxy`: it proxies HTTP/TCP,
+not the VOT QUIC listener. The HTTPS `VOTPORT_PUBLIC_URL` remains the address
+used for the link and native-push preflight.
+
+If `VOTPORT_PUSH_CERT` and `VOTPORT_PUSH_KEY` are both unset, votport creates
+and retains a self-signed certificate in `data/` and exposes its digest from
+`GET /api/push-identity`. Pin that digest in each sender. To supply a
+certificate instead, set both variables to readable PEM paths; votport uses
+those files in place and does not obtain an ACME certificate for the UDP
+listener. Back up the generated `push.crt` and `push.key` with the data
+directory, or back up and rotate configured external files separately. The
+`push-issuer.key` is always in the data directory and must be backed up there.
+Rotating the certificate changes the identity and requires senders to pin the
+new digest.
+
+The sender presents the link password only to the HTTPS preflight,
+`POST /api/r/{token}/push`, which admits the exact package root and length and
+returns a capability, advertised address, certificate digest, and expiry. The
+receiver checks the manifest entry count later against `MAX_ENTRIES`. Native
+pushes then use the UDP listener. They share tenant/link
+quotas, sessions, upload history, receipts, retention, and the admin UI with
+browser uploads. A native package is staged and published after the complete
+package verifies; a failed or cancelled native push does not leave partial
+destination files.
+
+The VOT b14 CLI requires a numeric IPv4 or bracketed IPv6 `SocketAddr` for
+`vot push`; it does not resolve the advertised DNS name. Use a numeric
+`VOTPORT_PUSH_ADVERTISE` when supporting that CLI. Library senders may resolve
+DNS before calling the VOT push API.
 
 ## Backups
 
@@ -274,8 +324,10 @@ values.
 ## Metrics
 
 `GET /metrics` serves Prometheus-format counters and gauges (tenants, links,
-received bytes, active sessions, audit rows). Set `VOTPORT_METRICS_TOKEN` to
-require a bearer token, and scrape it over an internal interface only.
+received bytes, active sessions, audit rows), plus native-push active sessions,
+received bytes, and refusals by bounded reason (`rate`, `capability`, `expired`,
+or `spent`). Set `VOTPORT_METRICS_TOKEN` to require a bearer token, and scrape
+it over an internal interface only.
 Platform admins can fetch the same per-tenant link and live-byte totals as JSON
 from `GET /api/admin/holdings`.
 

@@ -46,7 +46,19 @@ async fn start_push_server_with_cap(max_upload_bytes: u64) -> TestServer {
     start_server_inner(max_upload_bytes, true).await
 }
 
+async fn start_push_server_with_idle(session_idle_secs: u64) -> TestServer {
+    start_server_inner_with_idle(64 * 1024 * 1024, true, session_idle_secs).await
+}
+
 async fn start_server_inner(max_upload_bytes: u64, enable_push: bool) -> TestServer {
+    start_server_inner_with_idle(max_upload_bytes, enable_push, 600).await
+}
+
+async fn start_server_inner_with_idle(
+    max_upload_bytes: u64,
+    enable_push: bool,
+    session_idle_secs: u64,
+) -> TestServer {
     let data = tempfile::tempdir().expect("data dir");
     let received = tempfile::tempdir().expect("receive dir");
     let config = Config {
@@ -74,7 +86,7 @@ async fn start_server_inner(max_upload_bytes: u64, enable_push: bool) -> TestSer
         public_url: None,
         max_upload_bytes,
         allow_hidden: false,
-        session_idle_secs: 600,
+        session_idle_secs,
         audit_retention_days: 400,
         upload_retention_days: 0,
         default_max_total_bytes: None,
@@ -2418,6 +2430,15 @@ async fn native_push_matches_http_storage_and_is_single_use() {
         response["certificate_digest"],
         hex::encode(server.push_certificate_digest.unwrap())
     );
+    let metrics = client
+        .get(format!("{}/metrics", server.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains("votport_push_sessions_active 1\n"));
     let (capability, holder_key) = write_push_credentials(fixture.path(), &response, &holder);
 
     let pushed = push_bundle_blocking(&server, &bundle, &capability, &holder_key)
@@ -2446,6 +2467,20 @@ async fn native_push_matches_http_storage_and_is_single_use() {
     assert_eq!(upload.replayed_chunks, 0);
     assert_eq!(upload.rejected_chunks, 0);
     assert_eq!(upload.files.len(), files.len());
+    let transferred_bytes = files
+        .iter()
+        .map(|(_, bytes)| bytes.len() as u64)
+        .sum::<u64>();
+    let metrics = client
+        .get(format!("{}/metrics", server.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains("votport_push_sessions_active 0\n"));
+    assert!(metrics.contains(&format!("votport_push_bytes_total {transferred_bytes}\n")));
     for (path, bytes) in files {
         let record = upload
             .files
@@ -2479,6 +2514,86 @@ async fn native_push_matches_http_storage_and_is_single_use() {
 
     let reused = push_bundle_blocking(&server, &bundle, &capability, &holder_key).await;
     assert!(reused.is_err(), "a push capability is single use");
+    let metrics = client
+        .get(format!("{}/metrics", server.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains("votport_push_refused_total{reason=\"spent\"} 1\n"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_push_expired_capability_increments_metric() {
+    let server = start_push_server_with_idle(1).await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let (bundle, summary, _) = push_fixture(fixture.path(), 81);
+    let token = create_open_link(&client, &server.base, "expired push", "inbox", None).await;
+    let holder = ed25519_dalek::SigningKey::from_bytes(&[81; 32]);
+    let response = preflight_push(&client, &server.base, &token, &holder, summary).await;
+    let (capability, holder_key) = write_push_credentials(fixture.path(), &response, &holder);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let expired = push_bundle_blocking(&server, &bundle, &capability, &holder_key).await;
+    assert!(expired.is_err(), "an expired push capability is refused");
+
+    let metrics = client
+        .get(format!("{}/metrics", server.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains("votport_push_refused_total{reason=\"expired\"} 1\n"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_push_foreign_capability_increments_metric() {
+    let server = start_push_server().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let (bundle, summary, _) = push_fixture(fixture.path(), 82);
+    let holder = ed25519_dalek::SigningKey::from_bytes(&[82; 32]);
+    let foreign_issuer = ed25519_dalek::SigningKey::from_bytes(&[83; 32]);
+    let foreign = vot_cli::authz::issue_push(
+        "votport",
+        &format!("votport:{}", server.push_address.unwrap()),
+        &foreign_issuer,
+        holder.verifying_key().to_bytes(),
+        summary.root,
+        summary.logical_length,
+        vot_cli::authz::now_seconds().unwrap(),
+        600,
+    )
+    .unwrap();
+    let foreign_response = json!({
+        "capability": base64::engine::general_purpose::STANDARD.encode(foreign),
+    });
+    let (capability, holder_key) =
+        write_push_credentials(fixture.path(), &foreign_response, &holder);
+
+    let refused = push_bundle_blocking(&server, &bundle, &capability, &holder_key).await;
+    assert!(refused.is_err(), "a foreign capability is refused");
+
+    let metrics = client
+        .get(format!("{}/metrics", server.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains("votport_push_refused_total{reason=\"capability\"} 1\n"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
