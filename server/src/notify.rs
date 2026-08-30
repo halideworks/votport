@@ -13,7 +13,7 @@ use serde_json::json;
 
 use crate::app::App;
 use crate::session::FinishReport;
-use crate::store::ResolvedSmtp;
+use crate::store::{OutboundDownloadResult, OutboundGrant, ResolvedSmtp};
 
 /// Sends every configured notification for one completed upload.
 pub async fn uploaded(app: Arc<App>, label: String, report: FinishReport) {
@@ -30,8 +30,71 @@ pub async fn uploaded(app: Arc<App>, label: String, report: FinishReport) {
             .join("\n")
     );
 
+    let payload = json!({
+        "event": "upload_complete",
+        "label": label,
+        "upload_id": report.upload_id,
+        "total_bytes": total,
+        "files": report.files,
+    });
+    send_all(app, title, body, payload).await;
+}
+
+/// Sends the transition notification for an outbound delivery.
+pub async fn outbound_downloaded(
+    app: Arc<App>,
+    grant: OutboundGrant,
+    result: OutboundDownloadResult,
+) {
+    let (event, transition) = if result.completed_delivery {
+        ("outbound_delivery_complete", "delivery complete")
+    } else if result.first_download {
+        ("outbound_download_started", "download started")
+    } else {
+        return;
+    };
+    let (file_count, total_bytes, files) = if grant.files.is_empty() {
+        (
+            1,
+            grant.bytes,
+            vec![json!({ "name": &grant.name, "bytes": grant.bytes })],
+        )
+    } else {
+        let total_bytes = grant
+            .files
+            .iter()
+            .fold(0u64, |total, file| total.saturating_add(file.bytes));
+        (
+            grant.files.len(),
+            total_bytes,
+            grant
+                .files
+                .iter()
+                .map(|file| json!({ "name": &file.name, "bytes": file.bytes }))
+                .collect(),
+        )
+    };
+    let download_starts = grant.downloads.saturating_add(1);
+    let title = format!("votport: outbound {transition} for \"{}\"", grant.label);
+    let body = format!(
+        "{}\n{transition}: {file_count} file(s), {total_bytes} bytes",
+        grant.label
+    );
+    let payload = json!({
+        "event": event,
+        "grant_id": grant.id,
+        "label": grant.label,
+        "download_starts": download_starts,
+        "file_count": file_count,
+        "total_bytes": total_bytes,
+        "files": files,
+    });
+    send_all(app, title, body, payload).await;
+}
+
+async fn send_all(app: Arc<App>, title: String, body: String, payload: serde_json::Value) {
     // Best effort like the rest of this path: a settings read failure logs
-    // and sends nothing, rather than failing an upload that already landed.
+    // and sends nothing, rather than failing a transfer that already landed.
     let settings = match app.store.resolved_settings(&app.config) {
         Ok(settings) => settings,
         Err(error) => {
@@ -41,13 +104,6 @@ pub async fn uploaded(app: Arc<App>, label: String, report: FinishReport) {
     };
 
     if let Some(url) = &settings.notify_webhook {
-        let payload = json!({
-            "event": "upload_complete",
-            "label": label,
-            "upload_id": report.upload_id,
-            "total_bytes": total,
-            "files": report.files,
-        });
         log_failure("webhook", app.http.post(url).json(&payload).send().await);
     }
 
@@ -154,7 +210,158 @@ mod tests {
     use crate::api::testing;
     use crate::app;
     use crate::session::FinishReport;
-    use crate::store::SettingWrite;
+    use crate::store::{OutboundDownloadResult, OutboundGrant, OutboundGrantFile, SettingWrite};
+
+    fn test_grant(files: Vec<OutboundGrantFile>) -> OutboundGrant {
+        OutboundGrant {
+            id: "grant-id".to_owned(),
+            token_hash: "token-hash-secret".to_owned(),
+            password_hash: Some("password-hash-secret".to_owned()),
+            tenant: "tenant-secret".to_owned(),
+            link_id: "link-id".to_owned(),
+            upload_id: "upload-id".to_owned(),
+            package_root: "package-root-secret".to_owned(),
+            name: "legacy-file.txt".to_owned(),
+            suite: "blake3".to_owned(),
+            root: "root-secret".to_owned(),
+            file_index: 0,
+            bytes: 10,
+            label: "delivery-label".to_owned(),
+            created_at: 1,
+            expires_at: 2,
+            revoked_at: None,
+            downloads: 0,
+            max_downloads: None,
+            first_download_at: None,
+            last_download_at: None,
+            files,
+        }
+    }
+
+    fn test_file(name: &str, bytes: u64) -> OutboundGrantFile {
+        OutboundGrantFile {
+            source: "source-secret".to_owned(),
+            name: name.to_owned(),
+            suite: "blake3".to_owned(),
+            root: "file-root-secret".to_owned(),
+            bytes,
+            receipt_b64: "receipt-secret".to_owned(),
+            downloads: 0,
+            first_download_at: None,
+            last_download_at: None,
+        }
+    }
+
+    fn webhook_app() -> (
+        Arc<App>,
+        tempfile::TempDir,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            let _ = std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let application = app::build(testing::config(directory.path())).unwrap();
+        application
+            .store
+            .put_settings(
+                "local",
+                &[(
+                    "notify_webhook".to_owned(),
+                    SettingWrite::Set(format!("http://{addr}/outbound")),
+                )],
+            )
+            .unwrap();
+        (application, directory, rx, thread)
+    }
+
+    fn request_json(request: &str) -> serde_json::Value {
+        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
+    }
+
+    fn assert_no_secrets(request: &str) {
+        for secret in [
+            "token-hash-secret",
+            "password-hash-secret",
+            "tenant-secret",
+            "https://share-secret",
+            "source-secret",
+            "receipt-secret",
+        ] {
+            assert!(!request.contains(secret), "{secret}: {request}");
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_downloaded_sends_started_webhook_without_secrets() {
+        let (application, _directory, rx, thread) = webhook_app();
+        outbound_downloaded(
+            application,
+            test_grant(vec![test_file("one.txt", 10), test_file("two.txt", 20)]),
+            OutboundDownloadResult {
+                first_download: true,
+                completed_delivery: false,
+            },
+        )
+        .await;
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let payload = request_json(&request);
+        assert_eq!(payload["event"], "outbound_download_started");
+        assert_eq!(payload["download_starts"], 1);
+        assert_eq!(payload["file_count"], 2);
+        assert_eq!(payload["total_bytes"], 30);
+        assert_no_secrets(&request);
+        thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn outbound_downloaded_sends_complete_webhook() {
+        let (application, _directory, rx, thread) = webhook_app();
+        let mut grant = test_grant(Vec::new());
+        grant.downloads = u64::MAX;
+        outbound_downloaded(
+            application,
+            grant,
+            OutboundDownloadResult {
+                first_download: true,
+                completed_delivery: true,
+            },
+        )
+        .await;
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let payload = request_json(&request);
+        assert_eq!(payload["event"], "outbound_delivery_complete");
+        assert_eq!(payload["download_starts"], u64::MAX);
+        assert_eq!(payload["file_count"], 1);
+        assert_eq!(payload["total_bytes"], 10);
+        assert_no_secrets(&request);
+        thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn outbound_downloaded_ignores_nontransitions() {
+        let directory = tempfile::tempdir().unwrap();
+        outbound_downloaded(
+            testing::build(directory.path()),
+            test_grant(Vec::new()),
+            OutboundDownloadResult {
+                first_download: false,
+                completed_delivery: false,
+            },
+        )
+        .await;
+    }
 
     #[tokio::test]
     async fn uploaded_hits_the_db_webhook_not_env() {
