@@ -2,7 +2,8 @@
 // uploads files through the real uploader (vot-wasm in Chromium), and
 // verifies the bytes on disk. VOTPORT PROPRIETARY LICENSE.
 //
-// Requires: `npm i playwright` (with its Chromium), a running votport, and:
+// Requires: `npm ci`, `npx --no-install playwright install chromium`, a
+// running votport, and:
 //   BASE_URL        e.g. http://127.0.0.1:8080
 //   ADMIN_PASSWORD  the admin password of that instance
 //   RECEIVE_DIR     the instance's receive root, from this process's view
