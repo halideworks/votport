@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{
     AsyncRead, AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _, ReadBuf, SeekFrom,
 };
+use tokio::sync::Semaphore;
 use tokio_util::io::ReaderStream;
 use vot_receipt::SubjectKind;
 use vot_sdk::object::{InMemoryObjectBuilder, ObjectId, Suite};
@@ -51,9 +52,11 @@ const MAX_LIBRARY_PROJECT_FILES: usize = 10_000;
 const MAX_LIBRARY_SEARCH_CHARS: usize = 100;
 const MAX_LIBRARY_SEARCH_RESULTS: usize = 200;
 const RETAINED_LIBRARY_SEARCH_RESULTS: usize = MAX_LIBRARY_SEARCH_RESULTS + 1;
+const LIBRARY_HASH_CONCURRENCY: usize = 4;
 
 // ponytail: one tiny global critical section; use per-tenant locks only if contention is measured.
 static LIBRARY_MUTATION_LOCK: Mutex<()> = Mutex::new(());
+static LIBRARY_HASH_PERMITS: Semaphore = Semaphore::const_new(LIBRARY_HASH_CONCURRENCY);
 
 #[derive(Deserialize)]
 pub struct OutboundPathQuery {
@@ -1516,15 +1519,24 @@ async fn create_library_grant(
     let max = app.config.max_upload_bytes;
     let revalidation = selections.clone();
     let hash_root = root.clone();
-    let hashed = tokio::task::spawn_blocking(move || {
-        selections
-            .into_iter()
-            .map(|(name, path)| hash_library_file(&hash_root, &name, &path, max))
-            .collect::<Result<Vec<_>, _>>()
-    })
+    let hashed = futures_util::stream::iter(selections.into_iter().map(|(name, path)| {
+        let hash_root = hash_root.clone();
+        async move {
+            let _permit = LIBRARY_HASH_PERMITS
+                .acquire()
+                .await
+                .map_err(|_| ApiError::internal("hash outbound files failed"))?;
+            tokio::task::spawn_blocking(move || hash_library_file(&hash_root, &name, &path, max))
+                .await
+                .map_err(|_| ApiError::internal("hash outbound files failed"))?
+                .map_err(|_| ApiError::not_found())
+        }
+    }))
+    .buffered(LIBRARY_HASH_CONCURRENCY)
+    .collect::<Vec<_>>()
     .await
-    .map_err(|_| ApiError::internal("hash outbound files failed"))?
-    .map_err(|_| ApiError::not_found())?;
+    .into_iter()
+    .collect::<ApiResult<Vec<_>>>()?;
     let files = hashed
         .into_iter()
         .map(|file| {
@@ -4805,10 +4817,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(metadata.status(), StatusCode::OK);
-        assert_eq!(
-            body(metadata).await["files"].as_array().unwrap().len(),
-            1001
-        );
+        let metadata = body(metadata).await;
+        let files = metadata["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1001);
+        assert!(files.windows(2).all(|pair| {
+            pair[0]["name"].as_str().unwrap() <= pair[1]["name"].as_str().unwrap()
+        }));
 
         let history = crate::app::router(app)
             .oneshot(
