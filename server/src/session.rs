@@ -1658,9 +1658,12 @@ impl Drop for LinkPin<'_> {
 
 struct SessionsInner {
     map: HashMap<String, SessionHandle>,
-    /// Tenants whose receive subtree is being deleted. Lives on the same
+    /// Tenants whose storage subtrees are being deleted. Lives on the same
     /// mutex as `map` so [`Sessions::insert_admitted`] cannot race the pin.
     pinned: HashSet<String>,
+    /// Named tenants with an outbound operation in progress. This shares the
+    /// mutex with `pinned` so delete and operation admission are atomic.
+    outbound: HashMap<String, usize>,
     pinned_links: HashSet<String>,
     #[cfg(test)]
     delete_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
@@ -1668,6 +1671,26 @@ struct SessionsInner {
     session_create_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
     #[cfg(test)]
     finish_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+}
+
+pub struct OutboundOperation<'a> {
+    sessions: &'a Sessions,
+    tenant: Option<String>,
+}
+
+impl Drop for OutboundOperation<'_> {
+    fn drop(&mut self) {
+        let Some(tenant) = self.tenant.take() else {
+            return;
+        };
+        let mut inner = self.sessions.inner.lock().expect("sessions poisoned");
+        if let Some(count) = inner.outbound.get_mut(&tenant) {
+            *count -= 1;
+            if *count == 0 {
+                inner.outbound.remove(&tenant);
+            }
+        }
+    }
 }
 
 pub struct SessionHandle {
@@ -1750,6 +1773,7 @@ impl Sessions {
             inner: Mutex::new(SessionsInner {
                 map: HashMap::new(),
                 pinned: HashSet::new(),
+                outbound: HashMap::new(),
                 pinned_links: HashSet::new(),
                 #[cfg(test)]
                 delete_stall: None,
@@ -1792,6 +1816,36 @@ impl Sessions {
             .expect("sessions poisoned")
             .pinned
             .contains(tenant)
+    }
+
+    /// Registers a named-tenant outbound operation unless deletion is pinned.
+    /// The default tenant is not deletable and needs no counter.
+    pub fn try_begin_outbound(&self, tenant: &str) -> Option<OutboundOperation<'_>> {
+        let mut inner = self.inner.lock().expect("sessions poisoned");
+        if tenant.is_empty() {
+            return Some(OutboundOperation {
+                sessions: self,
+                tenant: None,
+            });
+        }
+        if inner.pinned.contains(tenant) {
+            return None;
+        }
+        *inner.outbound.entry(tenant.to_owned()).or_default() += 1;
+        Some(OutboundOperation {
+            sessions: self,
+            tenant: Some(tenant.to_owned()),
+        })
+    }
+
+    pub fn active_outbound_for_tenant(&self, tenant: &str) -> usize {
+        self.inner
+            .lock()
+            .expect("sessions poisoned")
+            .outbound
+            .get(tenant)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Blocks new sessions for `link_id` while its row is being deleted.
@@ -2208,6 +2262,18 @@ mod pin_tests {
         sessions.unpin_tenant("acme");
         assert!(!sessions.tenant_pinned("acme"));
         assert!(sessions.pin_tenant_for_delete("acme"));
+    }
+
+    #[test]
+    fn delete_pin_blocks_new_outbound_operations_while_active_count_remains() {
+        let sessions = Sessions::new();
+        let operation = sessions.try_begin_outbound("acme").unwrap();
+        assert_eq!(sessions.active_outbound_for_tenant("acme"), 1);
+        assert!(sessions.pin_tenant_for_delete("acme"));
+        assert!(sessions.try_begin_outbound("acme").is_none());
+        drop(operation);
+        assert_eq!(sessions.active_outbound_for_tenant("acme"), 0);
+        sessions.unpin_tenant("acme");
     }
 
     #[test]

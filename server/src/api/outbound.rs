@@ -29,6 +29,7 @@ use super::{ApiError, ApiResult};
 use crate::api::admin;
 use crate::app::App;
 use crate::auth;
+use crate::session::OutboundOperation;
 use crate::store::{
     now_unix, AutomationToken, OutboundDownloadResult, OutboundGrant, OutboundGrantFile,
     OUTBOUND_DOWNLOAD_LIMIT_REACHED,
@@ -70,6 +71,7 @@ pub async fn list_outbound_files(
     Query(query): Query<OutboundListQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = admin::require_admin(&app, &headers)?;
+    let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     let root = library_root(&app, &identity.tenant);
     if [
         query.directory.is_some(),
@@ -94,9 +96,10 @@ pub async fn list_outbound_files(
             ));
         }
         let tenant = identity.tenant;
+        let app_for_selection = Arc::clone(&app);
         let result = tokio::task::spawn_blocking(move || {
-            let directory = automation_directory(&app, &tenant, &selection)?;
-            let root = library_root(&app, &tenant);
+            let directory = automation_directory(&app_for_selection, &tenant, &selection)?;
+            let root = library_root(&app_for_selection, &tenant);
             enumerate_library_selection(&root, &directory)
         })
         .await
@@ -183,8 +186,9 @@ pub async fn upload_outbound_file(
 ) -> ApiResult<Response> {
     let identity = admin::require_admin(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
+    let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     if headers.contains_key(header::CONTENT_RANGE) || headers.contains_key(OUTBOUND_UPLOAD_ID) {
-        return upload_outbound_chunk(app, identity, headers, query.path, body).await;
+        return upload_outbound_chunk(Arc::clone(&app), identity, headers, query.path, body).await;
     }
     let path = safe_library_path(&app, &identity.tenant, &query.path)?;
     let parent = path
@@ -520,6 +524,7 @@ pub async fn delete_outbound_file(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = admin::require_admin(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
+    let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     let relative_path = query.path.trim_matches('/').to_owned();
     let path = safe_library_path(&app, &identity.tenant, &relative_path)?;
     let bytes = {
@@ -574,6 +579,23 @@ fn library_root(app: &App, tenant: &str) -> PathBuf {
             .join(crate::paths::TENANT_STORAGE_DIR)
             .join(tenant)
     }
+}
+
+fn begin_outbound_operation<'a>(app: &'a App, tenant: &str) -> ApiResult<OutboundOperation<'a>> {
+    let operation = app
+        .sessions
+        .try_begin_outbound(tenant)
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "tenant deletion in progress"))?;
+    if !tenant.is_empty()
+        && app
+            .store
+            .tenant(tenant)
+            .map_err(super::store_unavailable)?
+            .is_none()
+    {
+        return Err(ApiError::not_found());
+    }
+    Ok(operation)
 }
 
 fn list_library_dir(root: &Path, dir: &Path, files: &mut Vec<serde_json::Value>) {
@@ -949,6 +971,7 @@ pub async fn list_outbound_grants(
     Query(query): Query<OutboundGrantsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = admin::require_admin(&app, &headers)?;
+    let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     let (limit, offset) = outbound_grants_paging(query)?;
     let (grants, total) = app
         .store
@@ -978,6 +1001,7 @@ pub async fn list_automation_tokens(
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_automation_admin(&app, &headers)?;
+    let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     let tokens = app
         .store
         .automation_tokens(&identity.tenant)
@@ -994,6 +1018,7 @@ pub async fn create_automation_token(
 ) -> ApiResult<Response> {
     let identity = require_automation_admin(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
+    let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     let label = request.label.trim().to_owned();
     if label.is_empty() || label.chars().count() > MAX_AUTOMATION_LABEL_CHARS {
         return Err(ApiError::new(
@@ -1046,6 +1071,7 @@ pub async fn delete_automation_token(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_automation_admin(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
+    let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     if !app
         .store
         .revoke_automation_token(&identity.tenant, &id, now_unix())
@@ -1105,6 +1131,7 @@ pub async fn create_outbound_grant(
     let link_id = request
         .link_id
         .ok_or_else(|| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "link_id is required"))?;
+    let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     let upload_id = request
         .upload_id
         .ok_or_else(|| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "upload_id is required"))?;
@@ -1226,6 +1253,7 @@ pub async fn automation_share(
         .authenticate_automation_token(&hash_token(&bearer), now_unix())
         .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::unauthorized)?;
+    let _operation = begin_outbound_operation(&app, &token.tenant)?;
     if !(1..=30).contains(&request.expires_days) {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1364,6 +1392,7 @@ async fn create_library_grant(
     requested: &[String],
     options: GrantOptions,
 ) -> ApiResult<Response> {
+    let _operation = begin_outbound_operation(app, &identity.tenant)?;
     if requested.is_empty() || requested.len() > 64 {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1570,6 +1599,7 @@ pub async fn delete_outbound_grant(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = admin::require_admin(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
+    let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     if !app
         .store
         .revoke_outbound_grant(&identity.tenant, &id, now_unix())
@@ -1605,6 +1635,7 @@ pub async fn update_outbound_grant(
 ) -> ApiResult<Response> {
     let identity = admin::require_admin(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
+    let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     let fields = [
         request.rotate.is_some(),
         request.extend_days.is_some(),
@@ -1684,6 +1715,7 @@ pub async fn outbound_metadata(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let grant = active_grant(&app, &token)?;
+    let _operation = begin_outbound_operation(&app, &grant.tenant)?;
     let authorized = grant_authorized(&app, &grant, &headers);
     if grant.password_hash.is_some() && !authorized {
         return Ok((
@@ -1756,6 +1788,7 @@ pub async fn verify_outbound_password(
     Json(request): Json<VerifyOutboundRequest>,
 ) -> ApiResult<Response> {
     let grant = active_grant(&app, &token)?;
+    let _operation = begin_outbound_operation(&app, &grant.tenant)?;
     let ip = super::client_ip(&headers, &peer, &app.config.trusted_proxies);
     super::upload::check_password(
         &app,
@@ -1789,6 +1822,7 @@ pub async fn outbound_receipt_indexed(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let grant = active_grant(&app, &token)?;
+    let _operation = begin_outbound_operation(&app, &grant.tenant)?;
     require_grant_access(&app, &grant, &headers)?;
     let source = source_info_indexed(&app, &grant, index)?;
     let bytes = if let Some(bytes) = source.receipt.clone() {
@@ -1859,6 +1893,7 @@ async fn outbound_file_inner(
     index: usize,
 ) -> ApiResult<Response> {
     let (grant, leased) = active_download_grant(&app, &token, index, &headers)?;
+    let _operation = begin_outbound_operation(&app, &grant.tenant)?;
     require_grant_access(&app, &grant, &headers)?;
     if !app.outbound_rate.allow(&grant.token_hash) {
         return Err(ApiError::new(
@@ -1913,6 +1948,7 @@ async fn outbound_file_head_inner(
     index: usize,
 ) -> ApiResult<Response> {
     let (grant, _leased) = active_download_grant(&app, &token, index, &headers)?;
+    let _operation = begin_outbound_operation(&app, &grant.tenant)?;
     require_grant_access(&app, &grant, &headers)?;
     if !app.outbound_rate.allow(&grant.token_hash) {
         return Err(ApiError::new(
@@ -2073,6 +2109,7 @@ pub async fn outbound_bundle(
     AxumPath(token): AxumPath<String>,
 ) -> ApiResult<Response> {
     let grant = active_grant(&app, &token)?;
+    let _operation = begin_outbound_operation(&app, &grant.tenant)?;
     require_grant_access(&app, &grant, &headers)?;
     if !app.outbound_rate.allow(&grant.token_hash) {
         return Err(ApiError::new(

@@ -1314,26 +1314,45 @@ impl Store {
     /// Ok(Some(())) = deleted, Ok(None) = absent,
     /// Ok(Some(links)) via Err variant... see [`TenantRemoval`].
     pub fn remove_tenant(&self, key: &str) -> Result<TenantRemoval, String> {
-        self.with(|connection| {
-            let mut statement = connection.prepare(
-                "DELETE FROM tenants WHERE key = ?1
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let removal = {
+            let changed = transaction
+                .execute(
+                    "DELETE FROM tenants WHERE key = ?1
                  AND NOT EXISTS (SELECT 1 FROM links WHERE tenant = ?1)",
-            )?;
-            let changed = statement.execute([key])?;
+                    [key],
+                )
+                .map_err(|error| error.to_string())?;
             if changed > 0 {
-                return Ok(TenantRemoval::Deleted);
-            }
-            let exists: i64 = connection.query_row(
-                "SELECT EXISTS (SELECT 1 FROM tenants WHERE key = ?1)",
-                [key],
-                |row| row.get(0),
-            )?;
-            if exists == 0 {
-                Ok(TenantRemoval::Absent)
+                TenantRemoval::Deleted
             } else {
-                Ok(TenantRemoval::HasLinks)
+                let exists: i64 = transaction
+                    .query_row(
+                        "SELECT EXISTS (SELECT 1 FROM tenants WHERE key = ?1)",
+                        [key],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if exists == 0 {
+                    TenantRemoval::Absent
+                } else {
+                    TenantRemoval::HasLinks
+                }
             }
-        })
+        };
+        if matches!(removal, TenantRemoval::Deleted | TenantRemoval::Absent) {
+            transaction
+                .execute("DELETE FROM outbound_grants WHERE tenant = ?1", [key])
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute("DELETE FROM automation_tokens WHERE tenant = ?1", [key])
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(removal)
     }
 
     pub fn update_tenant(&self, tenant: &Tenant) -> Result<bool, String> {
@@ -3201,6 +3220,31 @@ mod tests {
 
         assert_eq!(store.automation_tokens("acme").unwrap(), vec![token]);
         assert!(store.automation_tokens("missing").unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_tenant_cleans_outbound_credentials_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.insert_tenant(test_tenant("acme")).unwrap();
+        store
+            .insert_outbound_grant(test_outbound_grant("grant", "acme", 0))
+            .unwrap();
+        store
+            .insert_automation_token(test_automation_token("token", "acme"))
+            .unwrap();
+
+        assert_eq!(store.remove_tenant("acme").unwrap(), TenantRemoval::Deleted);
+        assert!(store.outbound_grants("acme").unwrap().is_empty());
+        assert!(store
+            .outbound_grant_by_token_hash("hash-grant")
+            .unwrap()
+            .is_none());
+        assert!(store.automation_tokens("acme").unwrap().is_empty());
+        assert!(store
+            .authenticate_automation_token("hash-token", 15)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
