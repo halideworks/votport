@@ -2219,23 +2219,35 @@ impl Store {
             .transaction()
             .map_err(|error| error.to_string())?;
         let result = (|| {
-            let (downloads, max_downloads, first_download_at, normalized): (
+            let (downloads, max_downloads, first_download_at, normalized, file_count): (
                 i64,
                 Option<i64>,
                 Option<i64>,
                 bool,
+                i64,
             ) = transaction
                 .query_row(
                     "SELECT g.downloads, g.max_downloads, g.first_download_at,
                                 EXISTS (SELECT 1 FROM outbound_grant_files
-                                        WHERE grant_id = g.id)
+                                        WHERE grant_id = g.id),
+                                g.file_count
                          FROM outbound_grants AS g WHERE g.id = ?1",
                     [id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "outbound grant not found".to_owned())?;
+            let file_count = usize::try_from(file_count)
+                .map_err(|_| "outbound grant file count out of range".to_owned())?;
             let downloads = downloads.max(0) as u64;
             let max_downloads = max_downloads.and_then(|max| u64::try_from(max).ok());
             if max_downloads.is_some_and(|max| downloads >= max) {
@@ -2253,44 +2265,83 @@ impl Store {
                 } else {
                     first_download_at
                 };
-                let mut update = transaction
-                    .prepare(
-                        "UPDATE outbound_grant_files
-                         SET downloads = CASE WHEN downloads = 9223372036854775807
-                                              THEN downloads ELSE downloads + 1 END,
-                             first_download_at = COALESCE(first_download_at, ?3),
-                             last_download_at = ?3
-                         WHERE grant_id = ?1 AND file_index = ?2
-                           AND (?4 IS NULL OR downloads < ?4)",
-                    )
-                    .map_err(|error| error.to_string())?;
                 let max_downloads =
                     max_downloads.map(|value| i64::try_from(value).unwrap_or(i64::MAX));
-                for index in &unique_indexes {
-                    let changed = update
-                        .execute(rusqlite::params![
-                            id,
-                            i64::try_from(*index).unwrap_or(i64::MAX),
-                            at,
-                            max_downloads,
-                        ])
+                let full_range = file_count > 0
+                    && indexes.len() == file_count
+                    && indexes.iter().copied().eq(0..file_count);
+                if full_range {
+                    let file_count_i64 = i64::try_from(file_count).unwrap_or(i64::MAX);
+                    let changed = transaction
+                        .execute(
+                            "UPDATE outbound_grant_files
+                             SET downloads = CASE WHEN downloads = 9223372036854775807
+                                                  THEN downloads ELSE downloads + 1 END,
+                                 first_download_at = COALESCE(first_download_at, ?3),
+                                 last_download_at = ?3
+                             WHERE grant_id = ?1
+                               AND (?2 IS NULL OR downloads < ?2)",
+                            rusqlite::params![id, max_downloads, at],
+                        )
                         .map_err(|error| error.to_string())?;
-                    if changed == 0 {
-                        let exists: bool = transaction
-                            .query_row(
-                                "SELECT EXISTS (SELECT 1 FROM outbound_grant_files
-                                                 WHERE grant_id = ?1 AND file_index = ?2)",
-                                rusqlite::params![id, i64::try_from(*index).unwrap_or(i64::MAX)],
-                                |row| row.get(0),
-                            )
-                            .map_err(|error| error.to_string())?;
-                        if exists {
+                    if changed != file_count {
+                        let (child_count, in_range_count, exhausted): (i64, i64, bool) =
+                            transaction
+                                .query_row(
+                                    "SELECT
+                                         (SELECT COUNT(*) FROM outbound_grant_files
+                                          WHERE grant_id = ?1),
+                                         (SELECT COUNT(*) FROM outbound_grant_files
+                                          WHERE grant_id = ?1 AND file_index >= 0
+                                            AND file_index < ?2),
+                                         EXISTS (SELECT 1 FROM outbound_grant_files
+                                          WHERE grant_id = ?1
+                                            AND ?3 IS NOT NULL AND downloads >= ?3)",
+                                    rusqlite::params![id, file_count_i64, max_downloads],
+                                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                                )
+                                .map_err(|error| error.to_string())?;
+                        if child_count == file_count_i64
+                            && in_range_count == file_count_i64
+                            && exhausted
+                        {
                             return Err(OUTBOUND_DOWNLOAD_LIMIT_REACHED.to_owned());
                         }
                         return Err("outbound file index out of range".to_owned());
                     }
+                } else {
+                    let mut update = transaction
+                        .prepare(
+                            "UPDATE outbound_grant_files
+                             SET downloads = CASE WHEN downloads = 9223372036854775807
+                                                  THEN downloads ELSE downloads + 1 END,
+                                 first_download_at = COALESCE(first_download_at, ?3),
+                                 last_download_at = ?3
+                             WHERE grant_id = ?1 AND file_index = ?2
+                               AND (?4 IS NULL OR downloads < ?4)",
+                        )
+                        .map_err(|error| error.to_string())?;
+                    for index in &unique_indexes {
+                        let index = i64::try_from(*index).unwrap_or(i64::MAX);
+                        let changed = update
+                            .execute(rusqlite::params![id, index, at, max_downloads,])
+                            .map_err(|error| error.to_string())?;
+                        if changed == 0 {
+                            let exists: bool = transaction
+                                .query_row(
+                                    "SELECT EXISTS (SELECT 1 FROM outbound_grant_files
+                                                     WHERE grant_id = ?1 AND file_index = ?2)",
+                                    rusqlite::params![id, index],
+                                    |row| row.get(0),
+                                )
+                                .map_err(|error| error.to_string())?;
+                            if exists {
+                                return Err(OUTBOUND_DOWNLOAD_LIMIT_REACHED.to_owned());
+                            }
+                            return Err("outbound file index out of range".to_owned());
+                        }
+                    }
                 }
-                drop(update);
                 let downloads = if unique_indexes.is_empty() {
                     downloads
                 } else {
@@ -4331,6 +4382,32 @@ mod tests {
         assert_eq!(grant.files[1].downloads, 2);
         assert_eq!(grant.files[1].first_download_at, Some(100));
         assert_eq!(grant.files[1].last_download_at, Some(300));
+
+        assert_eq!(
+            store
+                .record_outbound_download("multi", &[0, 1], 400)
+                .unwrap(),
+            OutboundDownloadResult {
+                first_download: false,
+                completed_delivery: false,
+            }
+        );
+        assert_eq!(
+            store
+                .record_outbound_download("multi", &[0, 1], 500)
+                .unwrap(),
+            OutboundDownloadResult {
+                first_download: false,
+                completed_delivery: false,
+            }
+        );
+        let grant = store
+            .outbound_grant_by_token_hash("hash-multi")
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.downloads, 4);
+        assert_eq!(grant.files[0].downloads, 4);
+        assert_eq!(grant.files[1].downloads, 4);
     }
 
     #[test]
@@ -4362,6 +4439,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(grant.downloads, 0);
+        assert_eq!(grant.files[0].downloads, 1);
+        assert_eq!(grant.files[1].downloads, 0);
+
+        assert_eq!(
+            store
+                .record_outbound_download("multi-limit", &[0, 1], 150)
+                .unwrap_err(),
+            OUTBOUND_DOWNLOAD_LIMIT_REACHED
+        );
+        let grant = store
+            .outbound_grant_by_token_hash("hash-multi-limit")
+            .unwrap()
+            .unwrap();
         assert_eq!(grant.files[0].downloads, 1);
         assert_eq!(grant.files[1].downloads, 0);
 
@@ -4418,6 +4508,56 @@ mod tests {
                 .unwrap(),
             grant
         );
+    }
+
+    #[test]
+    fn outbound_full_range_rejects_missing_child_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut grant = test_outbound_grant("missing-child", "acme", 0);
+        grant.files = (0..2)
+            .map(|index| OutboundGrantFile {
+                source: format!("objects/{index}"),
+                name: format!("{index}.txt"),
+                suite: "blake3".to_owned(),
+                root: format!("root-{index}"),
+                bytes: 1,
+                receipt_b64: "receipt".to_owned(),
+                downloads: 0,
+                first_download_at: None,
+                last_download_at: None,
+            })
+            .collect();
+        store.insert_outbound_grant(grant).unwrap();
+        store
+            .with(|connection| {
+                connection.execute(
+                    "DELETE FROM outbound_grant_files
+                     WHERE grant_id = 'missing-child' AND file_index = 1",
+                    [],
+                )
+            })
+            .unwrap();
+
+        assert_eq!(
+            store
+                .record_outbound_download("missing-child", &[0, 1], 100)
+                .unwrap_err(),
+            "outbound file index out of range"
+        );
+        let downloads: Vec<i64> = store
+            .with(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT downloads FROM outbound_grant_files
+                     WHERE grant_id = 'missing-child' ORDER BY file_index",
+                )?;
+                let downloads = statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<Result<Vec<_>, _>>();
+                downloads
+            })
+            .unwrap();
+        assert_eq!(downloads, vec![0]);
     }
 
     #[test]
