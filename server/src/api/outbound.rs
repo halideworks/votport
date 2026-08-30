@@ -326,13 +326,9 @@ pub async fn list_outbound_grants(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = admin::require_admin(&app, &headers)?;
     let (limit, offset) = outbound_grants_paging(query)?;
-    let grants = app
+    let (grants, total) = app
         .store
         .outbound_grants_page(&identity.tenant, limit, offset)
-        .map_err(super::store_unavailable)?;
-    let total = app
-        .store
-        .outbound_grants_count(&identity.tenant)
         .map_err(super::store_unavailable)?;
     let has_more = u64::try_from(offset)
         .unwrap_or(u64::MAX)
@@ -2267,6 +2263,58 @@ mod tests {
                 StatusCode::UNPROCESSABLE_ENTITY
             );
         }
+    }
+
+    #[tokio::test]
+    async fn outbound_grants_handler_returns_default_page_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        for index in 0..51 {
+            app.store
+                .insert_outbound_grant(OutboundGrant {
+                    id: format!("grant-{index}"),
+                    token_hash: format!("hash-{index}"),
+                    password_hash: None,
+                    tenant: String::new(),
+                    link_id: String::new(),
+                    upload_id: String::new(),
+                    package_root: String::new(),
+                    name: "file.bin".to_owned(),
+                    suite: "blake3".to_owned(),
+                    root: String::new(),
+                    file_index: 0,
+                    bytes: 0,
+                    label: format!("grant-{index}"),
+                    created_at: 1,
+                    expires_at: 2,
+                    revoked_at: None,
+                    downloads: 0,
+                    max_downloads: None,
+                    notify_on_download: false,
+                    first_download_at: None,
+                    last_download_at: None,
+                    files: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get("/api/admin/outbound-grants")
+                    .header("cookie", admin_cookie(&app))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed = body(response).await;
+        assert_eq!(listed["limit"], 50);
+        assert_eq!(listed["offset"], 0);
+        assert_eq!(listed["total"], 51);
+        assert_eq!(listed["has_more"], true);
+        assert_eq!(listed["grants"].as_array().unwrap().len(), 50);
+        assert_eq!(listed["grants"][0]["id"], "grant-50");
     }
 
     #[test]
