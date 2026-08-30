@@ -309,7 +309,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-const SCHEMA_VERSION: u64 = 14;
+const SCHEMA_VERSION: u64 = 15;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -374,7 +374,8 @@ CREATE TABLE IF NOT EXISTS outbound_grants (
     max_downloads INTEGER,
     first_download_at INTEGER,
     last_download_at INTEGER,
-    files_json TEXT NOT NULL DEFAULT '[]'
+    files_json TEXT NOT NULL DEFAULT '[]',
+    file_count INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS outbound_grants_tenant_created ON outbound_grants(tenant, created_at);
 CREATE INDEX IF NOT EXISTS outbound_grants_file
@@ -383,6 +384,12 @@ CREATE INDEX IF NOT EXISTS outbound_grants_file
 
 const OUTBOUND_GRANTS_FILES_SCHEMA: &str =
     "ALTER TABLE outbound_grants ADD COLUMN files_json TEXT NOT NULL DEFAULT '[]';";
+
+const OUTBOUND_GRANTS_FILE_COUNT_SCHEMA: &str =
+    "ALTER TABLE outbound_grants ADD COLUMN file_count INTEGER NOT NULL DEFAULT 1;
+     UPDATE outbound_grants
+     SET file_count = CASE WHEN json_array_length(files_json) = 0
+                           THEN 1 ELSE json_array_length(files_json) END;";
 
 const OUTBOUND_GRANTS_PASSWORD_SCHEMA: &str =
     "ALTER TABLE outbound_grants ADD COLUMN password_hash TEXT;";
@@ -724,6 +731,11 @@ impl Store {
         if stored < 14 {
             transaction
                 .execute_batch(NOTIFICATION_POLICY_SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
+        }
+        if (8..15).contains(&stored) {
+            transaction
+                .execute_batch(OUTBOUND_GRANTS_FILE_COUNT_SCHEMA)
                 .map_err(|error| format!("schema: {error}"))?;
         }
         transaction
@@ -1675,13 +1687,15 @@ impl Store {
     pub fn insert_outbound_grant(&self, grant: OutboundGrant) -> Result<(), String> {
         let (bytes_hi, bytes_lo) = split_bytes(grant.bytes);
         let files_json = serde_json::to_string(&grant.files).unwrap_or_else(|_| "[]".to_owned());
+        let file_count = i64::try_from(grant.files.len().max(1)).unwrap_or(i64::MAX);
         self.with(|connection| {
             connection.execute(
                 "INSERT INTO outbound_grants
                  (id, token_hash, password_hash, tenant, link_id, upload_id, package_root, name, suite,
                   root, file_index, bytes_hi, bytes_lo, label, created_at, expires_at, revoked_at,
-                  downloads, max_downloads, notify_on_download, first_download_at, last_download_at, files_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                  downloads, max_downloads, notify_on_download, first_download_at, last_download_at,
+                  files_json, file_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                 rusqlite::params![
                     grant.id,
                     grant.token_hash,
@@ -1712,6 +1726,7 @@ impl Store {
                         .last_download_at
                         .map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
                     files_json,
+                    file_count,
                 ],
             )
             .map(|_| ())
@@ -1752,9 +1767,8 @@ impl Store {
                             name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
                             expires_at, revoked_at, downloads, max_downloads, notify_on_download, first_download_at,
                             last_download_at,
-                            CASE WHEN json_array_length(files_json) = 0
-                                 THEN 1 ELSE json_array_length(files_json) END AS file_count,
-                            CASE WHEN json_array_length(files_json) <= ?4
+                            file_count,
+                            CASE WHEN file_count <= ?4
                                  THEN files_json ELSE '[]' END AS files_json
                      FROM outbound_grants WHERE tenant = ?1
                      ORDER BY created_at DESC, rowid DESC LIMIT ?2 OFFSET ?3",
@@ -3053,7 +3067,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(schema, "14");
+        assert_eq!(schema, "15");
         assert!(store
             .with(|connection| {
                 connection.query_row(
@@ -3102,6 +3116,17 @@ mod tests {
         assert_eq!(
             store.outbound_grant_by_token_hash("hash-library").unwrap(),
             Some(grant)
+        );
+        store.record_outbound_download("library", &[0], 30).unwrap();
+        assert_eq!(
+            store
+                .with(|connection| connection.query_row(
+                    "SELECT file_count FROM outbound_grants WHERE id = 'library'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                ))
+                .unwrap(),
+            2
         );
     }
 
@@ -3287,6 +3312,26 @@ mod tests {
             })
             .collect();
         store.insert_outbound_grant(large).unwrap();
+
+        let counts = store
+            .with(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT id, file_count FROM outbound_grants WHERE tenant = 'acme' ORDER BY id",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap();
+        assert_eq!(
+            counts,
+            [
+                ("large".to_owned(), 3),
+                ("legacy".to_owned(), 1),
+                ("small".to_owned(), 2),
+            ]
+        );
 
         let page = store.outbound_grants_page("acme", 10, 0, 2).unwrap().0;
         let find = |id: &str| page.iter().find(|(grant, _)| grant.id == id).unwrap();
@@ -5089,9 +5134,9 @@ mod settings_tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         drop(store);
-        assert_eq!(schema_version(directory.path()), "14");
+        assert_eq!(schema_version(directory.path()), "15");
         Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "14");
+        assert_eq!(schema_version(directory.path()), "15");
     }
 
     #[test]
@@ -5113,7 +5158,7 @@ mod settings_tests {
                 .unwrap();
         }
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "14");
+        assert_eq!(schema_version(directory.path()), "15");
         assert!(store.principals_page(50, 0, None).unwrap().0.is_empty());
         assert!(store.principal("nobody").unwrap().is_none());
     }
@@ -5135,7 +5180,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "14");
+        assert_eq!(schema_version(directory.path()), "15");
         assert!(!store.link("", "old-link").unwrap().unwrap().legal_hold);
     }
 
@@ -5177,7 +5222,7 @@ mod settings_tests {
         drop(store);
 
         let reopened = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "14");
+        assert_eq!(schema_version(directory.path()), "15");
         assert_eq!(reopened.tenant_received_bytes("").unwrap(), 9);
     }
 
@@ -5219,7 +5264,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "14");
+        assert_eq!(schema_version(directory.path()), "15");
         let grant = store
             .outbound_grant_by_token_hash("hash-g1")
             .unwrap()
@@ -5271,7 +5316,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "14");
+        assert_eq!(schema_version(directory.path()), "15");
         let grant = store
             .outbound_grant_by_token_hash("hash-g1")
             .unwrap()
@@ -5296,6 +5341,7 @@ mod settings_tests {
                      ALTER TABLE outbound_grants DROP COLUMN max_downloads;
                      ALTER TABLE outbound_grants DROP COLUMN first_download_at;
                      ALTER TABLE outbound_grants DROP COLUMN last_download_at;
+                     ALTER TABLE outbound_grants DROP COLUMN file_count;
                      ALTER TABLE links DROP COLUMN notify_on_upload;
                      ALTER TABLE outbound_grants DROP COLUMN notify_on_download;
                      UPDATE meta SET value = '10' WHERE key = 'schema_version';",
@@ -5305,7 +5351,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "14");
+        assert_eq!(schema_version(directory.path()), "15");
         let columns: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('outbound_grants')
@@ -5327,6 +5373,7 @@ mod settings_tests {
                 .execute_batch(
                     "DROP TABLE automation_tokens;
                      ALTER TABLE outbound_grants DROP COLUMN max_downloads;
+                     ALTER TABLE outbound_grants DROP COLUMN file_count;
                      ALTER TABLE links DROP COLUMN notify_on_upload;
                      ALTER TABLE outbound_grants DROP COLUMN notify_on_download;
                      UPDATE meta SET value = '11' WHERE key = 'schema_version';",
@@ -5336,7 +5383,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "14");
+        assert_eq!(schema_version(directory.path()), "15");
         let table_exists: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -5366,6 +5413,7 @@ mod settings_tests {
             connection
                 .execute_batch(
                     "ALTER TABLE outbound_grants DROP COLUMN max_downloads;
+                     ALTER TABLE outbound_grants DROP COLUMN file_count;
                      ALTER TABLE links DROP COLUMN notify_on_upload;
                      ALTER TABLE outbound_grants DROP COLUMN notify_on_download;
                      UPDATE meta SET value = '12' WHERE key = 'schema_version';",
@@ -5375,7 +5423,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "14");
+        assert_eq!(schema_version(directory.path()), "15");
         let default: Option<String> = connection
             .query_row(
                 "SELECT dflt_value FROM pragma_table_info('outbound_grants')
@@ -5399,6 +5447,54 @@ mod settings_tests {
             assert_eq!(default.as_deref(), Some("0"));
             assert_eq!(not_null, 1);
         }
+    }
+
+    #[test]
+    fn v15_database_backfills_outbound_file_counts() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(Store::open(directory.path()).unwrap());
+        {
+            let connection = Connection::open(directory.path().join("votport.db")).unwrap();
+            connection
+                .execute_batch(
+                    "ALTER TABLE outbound_grants DROP COLUMN file_count;
+                     INSERT INTO outbound_grants
+                         (id, token_hash, tenant, link_id, upload_id, package_root, name, suite,
+                          root, file_index, bytes_hi, bytes_lo, label, created_at, expires_at,
+                          files_json)
+                     VALUES
+                         ('empty', 'hash-empty', 'acme', 'link', 'upload', 'package', 'empty.bin',
+                          'blake3', 'root', 0, 0, 1, 'download', 10, 20, '[]'),
+                         ('single', 'hash-single', 'acme', 'link', 'upload', 'package', 'single.bin',
+                          'blake3', 'root', 0, 0, 1, 'download', 10, 20, '[{}]'),
+                         ('multi', 'hash-multi', 'acme', 'link', 'upload', 'package', 'multi.bin',
+                          'blake3', 'root', 0, 0, 1, 'download', 10, 20, '[{}, {}]');
+                     UPDATE meta SET value = '14' WHERE key = 'schema_version';",
+                )
+                .unwrap();
+        }
+
+        drop(Store::open(directory.path()).unwrap());
+        let connection = Connection::open(directory.path().join("votport.db")).unwrap();
+        assert_eq!(schema_version(directory.path()), "15");
+        let counts: Vec<(String, i64)> = {
+            let mut statement = connection
+                .prepare("SELECT id, file_count FROM outbound_grants ORDER BY id")
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            counts,
+            [
+                ("empty".to_owned(), 1),
+                ("multi".to_owned(), 2),
+                ("single".to_owned(), 1),
+            ]
+        );
     }
 
     #[test]
