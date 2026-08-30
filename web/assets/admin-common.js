@@ -32,7 +32,8 @@ export async function requireSession() {
 }
 
 const NAV_ITEMS = [
-  ['links', '/links', 'Links'],
+  ['receive', '/receive', 'Receive'],
+  ['deliver', '/deliver', 'Deliver'],
   ['tenants', '/tenants', 'Tenants'],
   ['audit', '/audit', 'Audit'],
   ['system', '/system', 'System'],
@@ -47,7 +48,9 @@ function buildNav(session) {
     const link = document.createElement('a');
     link.href = href;
     link.textContent = label;
-    if (window.location.pathname === href) link.classList.add('active');
+    if (window.location.pathname === href || (href === '/receive' && window.location.pathname === '/links')) {
+      link.classList.add('active');
+    }
     nav.append(link);
   }
   // Tenant switcher appears only for multi-tenant principals.

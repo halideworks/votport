@@ -41,7 +41,7 @@ await page.goto(base);
 await page.waitForSelector("#login:not([hidden])");
 await page.fill("#login-password", adminPassword);
 await page.click("#login-form button[type=submit]");
-// Signed-in users land on /links; the create form is the first element.
+// Signed-in users land on /receive; the create form is the first element.
 await page.waitForSelector("#create-form:not([hidden])", { timeout: 15000 });
 
 const dest = `e2e-${Date.now().toString(36)}`;

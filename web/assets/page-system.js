@@ -279,7 +279,7 @@ for (const button of document.querySelectorAll('[data-clear]')) {
 
 const session = await requireSession();
 if (!session.pages.includes('system')) {
-  window.location.replace('/links');
+  window.location.replace('/receive');
 }
 try {
   fillSettings(await api('/api/admin/settings'));

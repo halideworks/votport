@@ -871,6 +871,7 @@ mod session_rate_tests {
             max_bytes: None,
             active: true,
             legal_hold: false,
+            notify_on_upload: false,
             uploads: Vec::new(),
             events: Vec::new(),
         }
@@ -1083,6 +1084,7 @@ mod push_preflight_tests {
             max_bytes: None,
             active: true,
             legal_hold: false,
+            notify_on_upload: false,
             uploads: Vec::new(),
             events: Vec::new(),
         }

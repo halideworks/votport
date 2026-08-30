@@ -100,6 +100,7 @@ pub struct OutboundGrant {
     pub revoked_at: Option<u64>,
     pub downloads: u64,
     pub max_downloads: Option<u64>,
+    pub notify_on_download: bool,
     pub first_download_at: Option<u64>,
     pub last_download_at: Option<u64>,
     pub files: Vec<OutboundGrantFile>,
@@ -158,6 +159,8 @@ pub struct Link {
     pub active: bool,
     #[serde(default)]
     pub legal_hold: bool,
+    #[serde(default)]
+    pub notify_on_upload: bool,
     #[serde(default)]
     pub uploads: Vec<UploadRecord>,
     #[serde(default)]
@@ -306,7 +309,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-const SCHEMA_VERSION: u64 = 13;
+const SCHEMA_VERSION: u64 = 14;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -405,6 +408,10 @@ CREATE INDEX IF NOT EXISTS automation_tokens_tenant_created
 
 const OUTBOUND_GRANTS_LIMIT_SCHEMA: &str =
     "ALTER TABLE outbound_grants ADD COLUMN max_downloads INTEGER;";
+
+const NOTIFICATION_POLICY_SCHEMA: &str =
+    "ALTER TABLE links ADD COLUMN notify_on_upload INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE outbound_grants ADD COLUMN notify_on_download INTEGER NOT NULL DEFAULT 0;";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -667,7 +674,7 @@ impl Store {
                 let mut statement = transaction
                     .prepare(
                         "SELECT id, tenant, label, dest, password_hash, created_at, expires_at,
-                                max_bytes, active, legal_hold, uploads_json, events_json
+                                max_bytes, active, legal_hold, 0 AS notify_on_upload, uploads_json, events_json
                          FROM links ORDER BY rowid",
                     )
                     .map_err(|error| error.to_string())?;
@@ -710,6 +717,11 @@ impl Store {
                 .execute_batch(OUTBOUND_GRANTS_LIMIT_SCHEMA)
                 .map_err(|error| format!("schema: {error}"))?;
         }
+        if stored < 14 {
+            transaction
+                .execute_batch(NOTIFICATION_POLICY_SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
+        }
         transaction
             .execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
@@ -746,8 +758,8 @@ impl Store {
                     .execute(
                         "INSERT OR IGNORE INTO links (id, tenant, label, dest, password_hash,
                                                       created_at, expires_at, max_bytes, active,
-                                                      legal_hold, uploads_json, events_json)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                                                      legal_hold, notify_on_upload, uploads_json, events_json)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                         link_params(link),
                     )
                     .map_err(|error| error.to_string())?;
@@ -901,7 +913,7 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                        active, legal_hold, uploads_json, events_json
+                        active, legal_hold, notify_on_upload, uploads_json, events_json
                  FROM links WHERE tenant = ?1 ORDER BY rowid",
             )?;
             let rows = statement.query_map([tenant], row_to_link)?;
@@ -934,7 +946,7 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                        active, legal_hold, uploads_json, events_json
+                        active, legal_hold, notify_on_upload, uploads_json, events_json
                  FROM links
                  WHERE tenant = ?1
                    AND (?2 = '' OR lower(label) LIKE '%' || ?2 || '%' ESCAPE '\\'
@@ -983,7 +995,7 @@ impl Store {
             connection
                 .query_row(
                     "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                            active, legal_hold, uploads_json, events_json
+                            active, legal_hold, notify_on_upload, uploads_json, events_json
                      FROM links WHERE tenant = ?1 AND id = ?2",
                     rusqlite::params![tenant, id],
                     row_to_link,
@@ -1000,7 +1012,7 @@ impl Store {
             connection
                 .query_row(
                     "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                            active, legal_hold, uploads_json, events_json
+                            active, legal_hold, notify_on_upload, uploads_json, events_json
                      FROM links WHERE id = ?1",
                     [id],
                     row_to_link,
@@ -1015,7 +1027,7 @@ impl Store {
             connection
                 .query_row(
                     "SELECT id, tenant, label, dest, password_hash, created_at, expires_at,
-                            max_bytes, active, legal_hold, '[]' AS uploads_json,
+                            max_bytes, active, legal_hold, notify_on_upload, '[]' AS uploads_json,
                             '[]' AS events_json
                      FROM links WHERE id = ?1",
                     [id],
@@ -1455,7 +1467,7 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                        active, legal_hold, uploads_json, events_json
+                        active, legal_hold, notify_on_upload, uploads_json, events_json
                  FROM links ORDER BY rowid",
             )?;
             let rows = statement.query_map([], row_to_link)?;
@@ -1624,8 +1636,8 @@ impl Store {
                 "INSERT INTO outbound_grants
                  (id, token_hash, password_hash, tenant, link_id, upload_id, package_root, name, suite,
                   root, file_index, bytes_hi, bytes_lo, label, created_at, expires_at, revoked_at,
-                  downloads, max_downloads, first_download_at, last_download_at, files_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                  downloads, max_downloads, notify_on_download, first_download_at, last_download_at, files_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
                 rusqlite::params![
                     grant.id,
                     grant.token_hash,
@@ -1648,6 +1660,7 @@ impl Store {
                     grant
                         .max_downloads
                         .map(|count| i64::try_from(count).unwrap_or(i64::MAX)),
+                    grant.notify_on_download,
                     grant
                         .first_download_at
                         .map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
@@ -1666,7 +1679,7 @@ impl Store {
             let mut statement = connection.prepare(
                 "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
                         name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
-                        expires_at, revoked_at, downloads, max_downloads, first_download_at,
+                        expires_at, revoked_at, downloads, max_downloads, notify_on_download, first_download_at,
                         last_download_at,
                         files_json
                  FROM outbound_grants WHERE tenant = ?1 ORDER BY created_at, rowid",
@@ -1685,7 +1698,7 @@ impl Store {
                 .query_row(
                     "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
                             name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
-                            expires_at, revoked_at, downloads, max_downloads, first_download_at,
+                            expires_at, revoked_at, downloads, max_downloads, notify_on_download, first_download_at,
                             last_download_at,
                             files_json
                      FROM outbound_grants WHERE token_hash = ?1",
@@ -1771,6 +1784,23 @@ impl Store {
         .map(|changed| changed > 0)
     }
 
+    pub fn set_outbound_notify_on_download(
+        &self,
+        tenant: &str,
+        id: &str,
+        enabled: bool,
+    ) -> Result<bool, String> {
+        self.with(|connection| {
+            connection
+                .execute(
+                    "UPDATE outbound_grants SET notify_on_download = ?3
+                     WHERE tenant = ?1 AND id = ?2",
+                    rusqlite::params![tenant, id, enabled],
+                )
+                .map(|changed| changed > 0)
+        })
+    }
+
     pub fn record_outbound_download(
         &self,
         id: &str,
@@ -1797,8 +1827,9 @@ impl Store {
                 .optional()
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "outbound grant not found".to_owned())?;
-            let downloads = downloads.max(0);
-            if max_downloads.is_some_and(|max| downloads >= max.max(0)) {
+            let downloads = downloads.max(0) as u64;
+            let max_downloads = max_downloads.and_then(|max| u64::try_from(max).ok());
+            if max_downloads.is_some_and(|max| downloads >= max) {
                 return Err(OUTBOUND_DOWNLOAD_LIMIT_REACHED.to_owned());
             }
             let mut files: Vec<OutboundGrantFile> = serde_json::from_str(&files_json)
@@ -1811,7 +1842,17 @@ impl Store {
             {
                 return Err("outbound file index out of range".to_owned());
             }
-            let first_download = downloads == 0;
+            if let Some(max) = max_downloads {
+                if (!files.is_empty()
+                    && unique_indexes
+                        .iter()
+                        .any(|&index| files[index].downloads >= max))
+                    || (files.is_empty() && downloads >= max)
+                {
+                    return Err(OUTBOUND_DOWNLOAD_LIMIT_REACHED.to_owned());
+                }
+            }
+            let first_download = first_download_at.is_none();
             let was_all_files_downloaded = if files.is_empty() {
                 downloads > 0
             } else {
@@ -1837,6 +1878,11 @@ impl Store {
             } else {
                 !was_all_files_downloaded && files.iter().all(|file| file.downloads > 0)
             };
+            let downloads = if files.is_empty() {
+                downloads.saturating_add(1)
+            } else {
+                files.iter().map(|file| file.downloads).min().unwrap_or(0)
+            };
             let files_json = serde_json::to_string(&files)
                 .map_err(|error| format!("serialize outbound grant files: {error}"))?;
             transaction
@@ -1847,7 +1893,7 @@ impl Store {
                      WHERE id = ?1",
                     rusqlite::params![
                         id,
-                        downloads.saturating_add(1),
+                        i64::try_from(downloads).unwrap_or(i64::MAX),
                         first_download_at,
                         at,
                         files_json,
@@ -1929,8 +1975,8 @@ fn escape_like(value: &str) -> String {
 fn insert_link_row(connection: &Connection, link: &Link) -> rusqlite::Result<()> {
     connection.execute(
         "INSERT INTO links (id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                            active, legal_hold, uploads_json, events_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                            active, legal_hold, notify_on_upload, uploads_json, events_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         link_params(link),
     )?;
     rebuild_link_files(connection, link)?;
@@ -1941,7 +1987,7 @@ fn write_link_row(connection: &Connection, link: &Link) -> rusqlite::Result<()> 
     connection.execute(
         "UPDATE links SET label = ?3, dest = ?4, password_hash = ?5, created_at = ?6,
                           expires_at = ?7, max_bytes = ?8, active = ?9,
-                          legal_hold = ?10, uploads_json = ?11, events_json = ?12
+                          legal_hold = ?10, notify_on_upload = ?11, uploads_json = ?12, events_json = ?13
          WHERE id = ?1 AND tenant = ?2",
         link_params(link),
     )?;
@@ -2081,7 +2127,7 @@ fn decode_quota(value: Option<String>, column: usize) -> rusqlite::Result<Option
         .transpose()
 }
 
-fn link_params(link: &Link) -> [rusqlite::types::Value; 12] {
+fn link_params(link: &Link) -> [rusqlite::types::Value; 13] {
     use rusqlite::types::Value as V;
     let uploads = serde_json::to_string(&link.uploads).unwrap_or_else(|_| "[]".to_owned());
     let events = serde_json::to_string(&link.events).unwrap_or_else(|_| "[]".to_owned());
@@ -2101,6 +2147,7 @@ fn link_params(link: &Link) -> [rusqlite::types::Value; 12] {
             .unwrap_or(V::Null),
         V::from(link.active),
         V::from(link.legal_hold),
+        V::from(link.notify_on_upload),
         V::from(uploads),
         V::from(events),
     ]
@@ -2124,8 +2171,9 @@ fn row_to_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<Link> {
             .and_then(|value| u64::try_from(value).ok()),
         active: row.get::<_, i64>("active")? != 0,
         legal_hold: row.get::<_, i64>("legal_hold")? != 0,
-        uploads: parse_json(&uploads_json, 10)?,
-        events: parse_json(&events_json, 11)?,
+        notify_on_upload: row.get::<_, i64>("notify_on_upload")? != 0,
+        uploads: parse_json(&uploads_json, 11)?,
+        events: parse_json(&events_json, 12)?,
     })
 }
 
@@ -2153,6 +2201,7 @@ fn map_outbound_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboundGrant
         max_downloads: row
             .get::<_, Option<i64>>("max_downloads")?
             .and_then(|value| u64::try_from(value).ok()),
+        notify_on_download: row.get::<_, i64>("notify_on_download")? != 0,
         first_download_at: row
             .get::<_, Option<i64>>("first_download_at")?
             .and_then(|value| u64::try_from(value).ok()),
@@ -2184,7 +2233,7 @@ fn read_link(connection: &Connection, tenant: &str, id: &str) -> Result<Option<L
     connection
         .query_row(
             "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                    active, legal_hold, uploads_json, events_json
+                        active, legal_hold, notify_on_upload, uploads_json, events_json
              FROM links WHERE tenant = ?1 AND id = ?2",
             rusqlite::params![tenant, id],
             row_to_link,
@@ -2722,6 +2771,7 @@ mod tests {
             max_bytes: None,
             active: true,
             legal_hold: false,
+            notify_on_upload: false,
             uploads: Vec::new(),
             events: Vec::new(),
         }
@@ -2766,6 +2816,7 @@ mod tests {
             revoked_at: None,
             downloads: 0,
             max_downloads: None,
+            notify_on_download: false,
             first_download_at: None,
             last_download_at: None,
             files: Vec::new(),
@@ -2798,7 +2849,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(schema, "13");
+        assert_eq!(schema, "14");
         assert!(store
             .with(|connection| {
                 connection.query_row(
@@ -3189,7 +3240,7 @@ mod tests {
             .outbound_grant_by_token_hash("hash-multi")
             .unwrap()
             .unwrap();
-        assert_eq!(grant.downloads, 3);
+        assert_eq!(grant.downloads, 2);
         assert_eq!(grant.first_download_at, Some(100));
         assert_eq!(grant.last_download_at, Some(300));
         assert_eq!(grant.files[0].downloads, 2);
@@ -3198,6 +3249,63 @@ mod tests {
         assert_eq!(grant.files[1].downloads, 2);
         assert_eq!(grant.files[1].first_download_at, Some(100));
         assert_eq!(grant.files[1].last_download_at, Some(300));
+    }
+
+    #[test]
+    fn outbound_multi_file_limit_applies_per_file_and_counts_rounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut grant = test_outbound_grant("multi-limit", "acme", 0);
+        grant.max_downloads = Some(1);
+        grant.files = (0..2)
+            .map(|index| OutboundGrantFile {
+                source: format!("objects/{index}"),
+                name: format!("{index}.txt"),
+                suite: "blake3".to_owned(),
+                root: format!("root-{index}"),
+                bytes: 1,
+                receipt_b64: "receipt".to_owned(),
+                downloads: 0,
+                first_download_at: None,
+                last_download_at: None,
+            })
+            .collect();
+        store.insert_outbound_grant(grant).unwrap();
+
+        store
+            .record_outbound_download("multi-limit", &[0], 100)
+            .unwrap();
+        let grant = store
+            .outbound_grant_by_token_hash("hash-multi-limit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.downloads, 0);
+        assert_eq!(grant.files[0].downloads, 1);
+        assert_eq!(grant.files[1].downloads, 0);
+
+        let completed = store
+            .record_outbound_download("multi-limit", &[1], 200)
+            .unwrap();
+        assert!(completed.completed_delivery);
+        let grant = store
+            .outbound_grant_by_token_hash("hash-multi-limit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.downloads, 1);
+        assert_eq!(grant.files[0].downloads, 1);
+        assert_eq!(grant.files[1].downloads, 1);
+
+        assert_eq!(
+            store
+                .record_outbound_download("multi-limit", &[0], 300)
+                .unwrap_err(),
+            OUTBOUND_DOWNLOAD_LIMIT_REACHED
+        );
+        let grant = store
+            .outbound_grant_by_token_hash("hash-multi-limit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.files[1].downloads, 1);
     }
 
     #[test]
@@ -4426,9 +4534,9 @@ mod settings_tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         drop(store);
-        assert_eq!(schema_version(directory.path()), "13");
+        assert_eq!(schema_version(directory.path()), "14");
         Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "13");
+        assert_eq!(schema_version(directory.path()), "14");
     }
 
     #[test]
@@ -4450,7 +4558,7 @@ mod settings_tests {
                 .unwrap();
         }
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "13");
+        assert_eq!(schema_version(directory.path()), "14");
         assert!(store.principals().unwrap().is_empty());
         assert!(store.principal("nobody").unwrap().is_none());
     }
@@ -4472,7 +4580,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "13");
+        assert_eq!(schema_version(directory.path()), "14");
         assert!(!store.link("", "old-link").unwrap().unwrap().legal_hold);
     }
 
@@ -4506,6 +4614,7 @@ mod settings_tests {
                 connection.execute_batch(
                     "DROP TABLE files;
                      DROP TABLE outbound_grants;
+                     ALTER TABLE links DROP COLUMN notify_on_upload;
                      UPDATE meta SET value = '6' WHERE key = 'schema_version';",
                 )
             })
@@ -4513,7 +4622,7 @@ mod settings_tests {
         drop(store);
 
         let reopened = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "13");
+        assert_eq!(schema_version(directory.path()), "14");
         assert_eq!(reopened.tenant_received_bytes("").unwrap(), 9);
     }
 
@@ -4555,7 +4664,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "13");
+        assert_eq!(schema_version(directory.path()), "14");
         let grant = store
             .outbound_grant_by_token_hash("hash-g1")
             .unwrap()
@@ -4607,7 +4716,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "13");
+        assert_eq!(schema_version(directory.path()), "14");
         let grant = store
             .outbound_grant_by_token_hash("hash-g1")
             .unwrap()
@@ -4632,6 +4741,8 @@ mod settings_tests {
                      ALTER TABLE outbound_grants DROP COLUMN max_downloads;
                      ALTER TABLE outbound_grants DROP COLUMN first_download_at;
                      ALTER TABLE outbound_grants DROP COLUMN last_download_at;
+                     ALTER TABLE links DROP COLUMN notify_on_upload;
+                     ALTER TABLE outbound_grants DROP COLUMN notify_on_download;
                      UPDATE meta SET value = '10' WHERE key = 'schema_version';",
                 )
                 .unwrap();
@@ -4639,7 +4750,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "13");
+        assert_eq!(schema_version(directory.path()), "14");
         let columns: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('outbound_grants')
@@ -4661,6 +4772,8 @@ mod settings_tests {
                 .execute_batch(
                     "DROP TABLE automation_tokens;
                      ALTER TABLE outbound_grants DROP COLUMN max_downloads;
+                     ALTER TABLE links DROP COLUMN notify_on_upload;
+                     ALTER TABLE outbound_grants DROP COLUMN notify_on_download;
                      UPDATE meta SET value = '11' WHERE key = 'schema_version';",
                 )
                 .unwrap();
@@ -4668,7 +4781,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "13");
+        assert_eq!(schema_version(directory.path()), "14");
         let table_exists: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -4698,6 +4811,8 @@ mod settings_tests {
             connection
                 .execute_batch(
                     "ALTER TABLE outbound_grants DROP COLUMN max_downloads;
+                     ALTER TABLE links DROP COLUMN notify_on_upload;
+                     ALTER TABLE outbound_grants DROP COLUMN notify_on_download;
                      UPDATE meta SET value = '12' WHERE key = 'schema_version';",
                 )
                 .unwrap();
@@ -4705,7 +4820,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "13");
+        assert_eq!(schema_version(directory.path()), "14");
         let default: Option<String> = connection
             .query_row(
                 "SELECT dflt_value FROM pragma_table_info('outbound_grants')
@@ -4715,6 +4830,20 @@ mod settings_tests {
             )
             .unwrap();
         assert!(default.is_none());
+        for (table, column) in [
+            ("links", "notify_on_upload"),
+            ("outbound_grants", "notify_on_download"),
+        ] {
+            let (default, not_null): (Option<String>, i64) = connection
+                .query_row(
+                    &format!("SELECT dflt_value, \"notnull\" FROM pragma_table_info('{table}') WHERE name = '{column}'"),
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(default.as_deref(), Some("0"));
+            assert_eq!(not_null, 1);
+        }
     }
 
     #[test]

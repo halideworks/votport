@@ -94,6 +94,6 @@ $('load-more').addEventListener('click', () => {
 
 const session = await requireSession();
 if (!session.pages.includes('audit')) {
-  window.location.replace('/links');
+  window.location.replace('/receive');
 }
 await load(true).catch(showLoadError);
