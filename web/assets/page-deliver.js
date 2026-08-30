@@ -129,9 +129,19 @@ async function refreshAutomationTokens() {
   }
 }
 
-function renderGrants(grants) {
+let grantRows = [];
+let grantTotal = 0;
+let grantHasMore = false;
+let grantLoading = false;
+
+function renderGrants() {
+  const grants = grantRows;
   const container = $('outbound-grants');
   container.replaceChildren();
+  $('outbound-grants-count').textContent = grantTotal
+    ? `Showing ${grants.length} of ${grantTotal} issued downloads.`
+    : '0 issued downloads.';
+  $('outbound-grants-load-more').hidden = !grantHasMore;
   if (!grants.length) {
     const empty = document.createElement('p');
     empty.className = 'muted';
@@ -139,7 +149,7 @@ function renderGrants(grants) {
     container.append(empty);
     return;
   }
-  for (const grant of [...grants].reverse()) {
+  for (const grant of grants) {
     const card = document.createElement('div');
     card.className = 'card link-item';
     const head = document.createElement('div');
@@ -281,17 +291,35 @@ function renderGrants(grants) {
   }
 }
 
-async function refreshGrants() {
+async function refreshGrants(reset = true) {
+  if (grantLoading) return;
+  grantLoading = true;
+  const offset = reset ? 0 : grantRows.length;
+  const loadMore = $('outbound-grants-load-more');
+  loadMore.disabled = true;
   try {
-    const { grants } = await api('/api/admin/outbound-grants');
-    renderGrants(grants || []);
-  } catch {
-    const error = document.createElement('p');
-    error.className = 'muted';
-    error.textContent = 'Issued downloads could not be loaded.';
-    $('outbound-grants').replaceChildren(error);
+    const response = await api(`/api/admin/outbound-grants?limit=50&offset=${offset}`);
+    if (reset) grantRows = [];
+    grantRows.push(...(response.grants || []));
+    grantTotal = response.total ?? grantRows.length;
+    grantHasMore = Boolean(response.has_more);
+    renderGrants();
+  } catch (error) {
+    if (reset || !grantRows.length) {
+      const message = document.createElement('p');
+      message.className = 'muted';
+      message.textContent = 'Issued downloads could not be loaded.';
+      $('outbound-grants').replaceChildren(message);
+    } else {
+      alertModal(error.message);
+    }
+  } finally {
+    grantLoading = false;
+    loadMore.disabled = false;
   }
 }
+
+$('outbound-grants-load-more').addEventListener('click', () => refreshGrants(false));
 
 const MAX_LIBRARY_SELECTION = 64;
 const MAX_LIBRARY_SEARCH_RESULTS = 200;

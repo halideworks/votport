@@ -50,13 +50,18 @@ pub async fn list_outbound_files(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = admin::require_admin(&app, &headers)?;
     let root = library_root(&app, &identity.tenant);
-    let mut files = Vec::new();
-    if let Ok(meta) = std::fs::symlink_metadata(&root) {
-        if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
-            list_library_dir(&root, &root, &mut files);
+    let files = tokio::task::spawn_blocking(move || {
+        let mut files = Vec::new();
+        if let Ok(meta) = std::fs::symlink_metadata(&root) {
+            if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+                list_library_dir(&root, &root, &mut files);
+            }
         }
-    }
-    files.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+        files.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+        files
+    })
+    .await
+    .map_err(|_| ApiError::internal("list outbound files failed"))?;
     Ok(Json(json!({ "files": files })))
 }
 
@@ -268,18 +273,74 @@ const fn default_expiry() -> u64 {
     7
 }
 
+#[derive(Deserialize)]
+pub struct OutboundGrantsQuery {
+    limit: Option<String>,
+    offset: Option<String>,
+}
+
+fn outbound_grants_paging(query: OutboundGrantsQuery) -> ApiResult<(usize, usize)> {
+    let limit = query
+        .limit
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "limit must be an integer between 1 and 100",
+            )
+        })?
+        .unwrap_or(50usize);
+    if !(1..=100).contains(&limit) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "limit must be between 1 and 100",
+        ));
+    }
+    let offset = query
+        .offset
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "offset must be a non-negative integer",
+            )
+        })?
+        .unwrap_or(0usize);
+    if i64::try_from(offset).is_err() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "offset is too large",
+        ));
+    }
+    Ok((limit, offset))
+}
+
 pub async fn list_outbound_grants(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
+    Query(query): Query<OutboundGrantsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = admin::require_admin(&app, &headers)?;
-    let grants = app
+    let (limit, offset) = outbound_grants_paging(query)?;
+    let (grants, total) = app
         .store
-        .outbound_grants(&identity.tenant)
+        .outbound_grants_page(&identity.tenant, limit, offset)
         .map_err(super::store_unavailable)?;
-    Ok(Json(
-        json!({ "grants": grants.into_iter().map(public_grant).collect::<Vec<_>>() }),
-    ))
+    let has_more = u64::try_from(offset)
+        .unwrap_or(u64::MAX)
+        .saturating_add(grants.len() as u64)
+        < total;
+    Ok(Json(json!({
+        "grants": grants.into_iter().map(public_grant).collect::<Vec<_>>(),
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "has_more": has_more,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -550,7 +611,10 @@ pub async fn automation_share(
     validate_max_downloads(request.max_downloads)?;
     let directory_label = request.directory.clone();
     let directory = automation_directory(&app, &token.tenant, &request.directory)?;
-    let paths = enumerate_automation_files(&library_root(&app, &token.tenant), &directory)?;
+    let root = library_root(&app, &token.tenant);
+    let paths = tokio::task::spawn_blocking(move || enumerate_automation_files(&root, &directory))
+        .await
+        .map_err(|_| ApiError::internal("enumerate outbound files failed"))??;
     let identity = auth::AdminIdentity {
         subject: format!("automation:{}", token.id),
         tenant: token.tenant,
@@ -2166,6 +2230,93 @@ mod tests {
         assert!(!app.automation_rate.allow("127.0.0.1"));
         assert!(app.automation_rate.allow("127.0.0.2"));
     }
+
+    #[test]
+    fn outbound_grants_paging_rejects_invalid_bounds_and_overflow() {
+        assert_eq!(
+            outbound_grants_paging(OutboundGrantsQuery {
+                limit: None,
+                offset: None,
+            })
+            .unwrap(),
+            (50, 0)
+        );
+        for limit in ["0", "101", "nope"] {
+            assert_eq!(
+                outbound_grants_paging(OutboundGrantsQuery {
+                    limit: Some(limit.to_owned()),
+                    offset: None,
+                })
+                .unwrap_err()
+                .status,
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
+        for offset in ["-1", "18446744073709551616"] {
+            assert_eq!(
+                outbound_grants_paging(OutboundGrantsQuery {
+                    limit: None,
+                    offset: Some(offset.to_owned()),
+                })
+                .unwrap_err()
+                .status,
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_grants_handler_returns_default_page_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        for index in 0..51 {
+            app.store
+                .insert_outbound_grant(OutboundGrant {
+                    id: format!("grant-{index}"),
+                    token_hash: format!("hash-{index}"),
+                    password_hash: None,
+                    tenant: String::new(),
+                    link_id: String::new(),
+                    upload_id: String::new(),
+                    package_root: String::new(),
+                    name: "file.bin".to_owned(),
+                    suite: "blake3".to_owned(),
+                    root: String::new(),
+                    file_index: 0,
+                    bytes: 0,
+                    label: format!("grant-{index}"),
+                    created_at: 1,
+                    expires_at: 2,
+                    revoked_at: None,
+                    downloads: 0,
+                    max_downloads: None,
+                    notify_on_download: false,
+                    first_download_at: None,
+                    last_download_at: None,
+                    files: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get("/api/admin/outbound-grants")
+                    .header("cookie", admin_cookie(&app))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed = body(response).await;
+        assert_eq!(listed["limit"], 50);
+        assert_eq!(listed["offset"], 0);
+        assert_eq!(listed["total"], 51);
+        assert_eq!(listed["has_more"], true);
+        assert_eq!(listed["grants"].as_array().unwrap().len(), 50);
+        assert_eq!(listed["grants"][0]["id"], "grant-50");
+    }
+
     #[test]
     fn filenames_are_single_safe_components() {
         assert_eq!(safe_filename("../a/b?.txt"), "b_.txt");
