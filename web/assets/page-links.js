@@ -90,24 +90,52 @@ function renderUpload(link, upload) {
   const transport = document.createElement('span');
   transport.className = 'badge';
   transport.textContent = upload.transport === 'push' ? 'native push' : 'http';
-  head.append(
-    when,
-    transport,
-    button('Clear record', 'tiny ghost', async () => {
-      if (
-        !(await confirmModal(
-          'Clear record',
-          'Remove this transfer from the history? Files on disk stay.',
-          'Clear',
-        ))
-      )
-        return;
-      await api(`/api/admin/links/${link.id}/uploads/${upload.id}`, { method: 'DELETE' });
-      await refreshLinks();
-    }),
-  );
+  head.append(when, transport);
+  if (!link.legal_hold) {
+    head.append(
+      button('Clear record', 'tiny ghost', async () => {
+        if (
+          !(await confirmModal(
+            'Clear record',
+            'Remove this transfer from the history? Files on disk stay.',
+            'Clear',
+          ))
+        )
+          return;
+        await api(`/api/admin/links/${link.id}/uploads/${upload.id}`, { method: 'DELETE' });
+        await refreshLinks();
+      }),
+    );
+  }
+  const existingFiles = upload.files.filter((file) => file.exists);
+  if (!link.legal_hold && existingFiles.length) {
+    head.append(
+      button('Delete stored files', 'tiny danger', async () => {
+        if (
+          !(await confirmModal(
+            'Delete stored files',
+            `Delete ${existingFiles.length} stored file${existingFiles.length === 1 ? '' : 's'} from disk? This cannot be undone.`,
+            'Delete',
+          ))
+        )
+          return;
+        try {
+          for (const [index, file] of upload.files.entries()) {
+            if (!file.exists) continue;
+            await api(
+              `/api/admin/links/${link.id}/uploads/${upload.id}/files/${index}`,
+              { method: 'DELETE' },
+            );
+          }
+        } catch (error) {
+          try { await refreshLinks(); } catch { /* keep the deletion error visible */ }
+          throw error;
+        }
+        await refreshLinks();
+      }),
+    );
+  }
   item.append(head);
-
   upload.files.forEach((file, index) => {
     const extras = [];
     if (!file.exists) {
@@ -125,7 +153,7 @@ function renderUpload(link, upload) {
     if (file.exists && file.receipt) {
       extras.push(button('Send', 'tiny', () => issueReceivedGrant(link, upload, index, file)));
     }
-    if (file.exists) {
+    if (file.exists && !link.legal_hold) {
       extras.push(
         button('Delete file', 'tiny danger', async () => {
           if (
@@ -586,6 +614,10 @@ async function refreshLibrary() {
   }
 }
 
+const LINKS_PAGE_SIZE = 50;
+let linksCursor = null;
+let linksFilter = { search: '', status: '' };
+
 function renderLink(link) {
   const card = document.createElement('div');
   card.className = 'card link-item';
@@ -627,6 +659,12 @@ function renderLink(link) {
   if (link.max_bytes) parts.push(`limit ${formatBytes(link.max_bytes)}`);
   meta.textContent = parts.join(' · ');
   card.append(meta);
+  if (link.legal_hold) {
+    const holdNote = document.createElement('p');
+    holdNote.className = 'muted';
+    holdNote.textContent = 'Manual deletion of stored files and transfer history is disabled while this request is under legal hold.';
+    card.append(holdNote);
+  }
 
   // Lazily-loaded QR of the request link, toggled from the actions row.
   const qr = document.createElement('div');
@@ -669,19 +707,23 @@ function renderLink(link) {
       });
       await refreshLinks();
     }),
-    button('Delete', 'tiny danger', async () => {
-      if (
-        !(await confirmModal(
-          'Delete request',
-          `Delete "${link.label}"? Received files stay on disk.`,
-          'Delete',
-        ))
-      )
-        return;
-      await api(`/api/admin/links/${link.id}`, { method: 'DELETE' });
-      await refreshLinks();
-    }),
   );
+  if (!link.legal_hold) {
+    actions.append(
+      button('Delete', 'tiny danger', async () => {
+        if (
+          !(await confirmModal(
+            'Delete request',
+            `Delete "${link.label}"? Received files stay on disk.`,
+            'Delete',
+          ))
+        )
+          return;
+        await api(`/api/admin/links/${link.id}`, { method: 'DELETE' });
+        await refreshLinks();
+      }),
+    );
+  }
   card.append(actions, qr);
 
   if (link.uploads.length) {
@@ -732,22 +774,56 @@ function renderLink(link) {
   return card;
 }
 
-async function refreshLinks() {
-  const { links, receive_dir } = await api('/api/admin/links');
+async function refreshLinks({ append = false } = {}) {
+  if (!append) {
+    linksFilter = {
+      search: $('links-query').value.trim(),
+      status: $('links-status').value,
+    };
+    linksCursor = null;
+    $('links').replaceChildren();
+    $('links-load-more').hidden = true;
+  }
+  const params = new URLSearchParams({ limit: String(LINKS_PAGE_SIZE) });
+  if (linksFilter.search) params.set('search', linksFilter.search);
+  if (linksFilter.status) params.set('status', linksFilter.status);
+  if (append && linksCursor) {
+    params.set('before_created_at', String(linksCursor.created));
+    params.set('before_id', linksCursor.id);
+  }
+  const response = await api(`/api/admin/links?${params}`);
+  const { links, receive_dir } = response;
   $('receive-dir').textContent = `Receive root ${receive_dir}`;
   const container = $('links');
-  container.replaceChildren();
-  if (!links.length) {
+  if (!append && !links.length) {
     const empty = document.createElement('p');
     empty.className = 'muted';
-    empty.textContent = 'No requests issued.';
+    empty.textContent = linksFilter.search || linksFilter.status
+      ? 'No matching requests.'
+      : 'No requests issued.';
     container.append(empty);
   } else {
-    for (const link of [...links].reverse()) {
+    for (const link of links) {
       container.append(renderLink(link));
     }
   }
-  await refreshGrants();
+  const nextCursor = response.next_cursor;
+  linksCursor = nextCursor?.created_at !== undefined
+    && nextCursor.created_at !== null
+    && nextCursor.id
+    ? { created: nextCursor.created_at, id: nextCursor.id }
+    : null;
+  $('links-load-more').hidden = !linksCursor;
+  $('links-error').hidden = true;
+}
+
+async function refreshLinksSafe(options = {}) {
+  try {
+    await refreshLinks(options);
+  } catch (error) {
+    $('links-error').textContent = error.message;
+    $('links-error').hidden = false;
+  }
 }
 
 $('create-form').addEventListener('submit', async (event) => {
@@ -897,5 +973,17 @@ $('deliver-form').addEventListener('submit', async (event) => {
   }
 });
 
+$('links-filter').addEventListener('submit', (event) => {
+  event.preventDefault();
+  refreshLinksSafe();
+});
+$('links-refresh').addEventListener('click', () => refreshLinksSafe());
+$('links-load-more').addEventListener('click', async () => {
+  const loadMore = $('links-load-more');
+  loadMore.disabled = true;
+  await refreshLinksSafe({ append: true });
+  loadMore.disabled = false;
+});
+
 await requireSession();
-await Promise.all([refreshLinks(), refreshLibrary(), refreshAutomationTokens()]);
+await Promise.all([refreshLinks(), refreshGrants(), refreshLibrary(), refreshAutomationTokens()]);

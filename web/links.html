@@ -197,7 +197,27 @@
       <div id="outbound-grants"></div>
 
       <h2>Issued requests</h2>
+      <form id="links-filter" class="card">
+        <div class="grid">
+          <label
+            >Search requests
+            <input id="links-query" type="search" autocomplete="off" placeholder="reference or destination" />
+          </label>
+          <label
+            >Status
+            <select id="links-status">
+              <option value="">All</option>
+              <option value="open">Open</option>
+              <option value="closed">Closed</option>
+            </select>
+          </label>
+        </div>
+        <button type="submit">Filter</button>
+        <button type="button" id="links-refresh" class="ghost">Refresh</button>
+      </form>
       <div id="links"></div>
+      <button id="links-load-more" type="button" class="ghost" hidden>Load more</button>
+      <p id="links-error" class="error" role="alert" hidden></p>
       <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
     </div>
 

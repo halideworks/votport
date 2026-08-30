@@ -31,7 +31,93 @@ function quotaText(tenant) {
   return parts.length ? parts.join(' · ') : 'no quotas';
 }
 
-function renderTenant(tenant) {
+function nullableNumber(value) {
+  if (value.trim() === '') return null;
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 1) {
+    throw new Error('Quota values must be positive whole numbers.');
+  }
+  return number;
+}
+
+function nullableStorageBytes(value) {
+  if (value.trim() === '') return null;
+  const gib = Number(value);
+  const bytes = Math.round(gib * 1024 ** 3);
+  if (!Number.isFinite(gib) || gib <= 0 || !Number.isSafeInteger(bytes) || bytes < 1) {
+    throw new Error('Storage quota must be a finite positive value.');
+  }
+  return bytes;
+}
+
+function editTenantForm(tenant) {
+  const details = document.createElement('details');
+  const summary = document.createElement('summary');
+  summary.textContent = 'Edit namespace';
+  details.append(summary);
+  const form = document.createElement('form');
+  form.className = 'tenant-edit';
+  const fields = [
+    ['Label', 'label', tenant.label || '', 'text'],
+    ['Admin group', 'admin_group', tenant.admin_group || '', 'text'],
+    ['Storage GiB', 'max_total_bytes', tenant.max_total_bytes === null || tenant.max_total_bytes === undefined ? '' : tenant.max_total_bytes / 1024 ** 3, 'number'],
+    ['Link limit', 'max_links', tenant.max_links ?? '', 'number'],
+    ['Concurrent uploads', 'max_sessions', tenant.max_sessions ?? '', 'number'],
+  ];
+  const grid = document.createElement('div');
+  grid.className = 'grid';
+  const inputs = {};
+  for (const [label, key, value, type] of fields) {
+    const wrapper = document.createElement('label');
+    wrapper.textContent = label;
+    const input = document.createElement('input');
+    input.type = type;
+    input.value = value;
+    if (type === 'number') {
+      input.min = key === 'max_total_bytes' ? String(1 / 1024 ** 3) : '1';
+      input.step = key === 'max_total_bytes' ? 'any' : '1';
+    }
+    wrapper.append(input);
+    grid.append(wrapper);
+    inputs[key] = input;
+  }
+  const save = document.createElement('button');
+  save.type = 'submit';
+  save.className = 'tiny';
+  save.textContent = 'Save';
+  const error = document.createElement('p');
+  error.className = 'error';
+  error.hidden = true;
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!form.reportValidity()) return;
+    save.disabled = true;
+    error.hidden = true;
+    try {
+      const storageBytes = nullableStorageBytes(inputs.max_total_bytes.value);
+      await api(`/api/admin/tenants/${encodeURIComponent(tenant.key)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          label: inputs.label.value,
+          admin_group: inputs.admin_group.value.trim() || null,
+          max_total_bytes: storageBytes,
+          max_links: nullableNumber(inputs.max_links.value),
+          max_sessions: nullableNumber(inputs.max_sessions.value),
+        }),
+      });
+      await refreshTenants();
+    } catch (requestError) {
+      error.textContent = requestError.message;
+      error.hidden = false;
+      save.disabled = false;
+    }
+  });
+  form.append(grid, save, error);
+  details.append(form);
+  return details;
+}
+
+function renderTenant(tenant, usage) {
   const card = document.createElement('div');
   card.className = 'card link-item';
 
@@ -47,10 +133,15 @@ function renderTenant(tenant) {
 
   const meta = document.createElement('p');
   meta.className = 'muted';
-  const parts = [`created ${formatWhen(tenant.created_at)}`, quotaText(tenant)];
+  const parts = [
+    `created ${formatWhen(tenant.created_at)}`,
+    `${formatBytes(usage?.received_bytes || 0)} received · ${usage?.links || 0} links`,
+    quotaText(tenant),
+  ];
   if (tenant.admin_group) parts.push(`admins: ${tenant.admin_group}`);
   meta.textContent = parts.join(' · ');
   card.append(meta);
+  if (tenant.key !== '') card.append(editTenantForm(tenant));
 
   if (tenant.key !== '') {
     card.append(
@@ -157,7 +248,11 @@ function renderPrincipal(principal) {
 }
 
 async function refreshTenants() {
-  const { tenants, principals } = await api('/api/admin/tenants');
+  const [{ tenants, principals }, { holdings }] = await Promise.all([
+    api('/api/admin/tenants'),
+    api('/api/admin/holdings'),
+  ]);
+  const usage = new Map((holdings || []).map((item) => [item.tenant, item]));
   const container = $('tenants');
   container.replaceChildren();
   if (!tenants.length) {
@@ -167,7 +262,7 @@ async function refreshTenants() {
     container.append(empty);
   } else {
     for (const tenant of tenants) {
-      container.append(renderTenant(tenant));
+      container.append(renderTenant(tenant, usage.get(tenant.key)));
     }
   }
 

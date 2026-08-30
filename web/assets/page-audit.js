@@ -4,6 +4,11 @@
 import { formatWhen, requireSession } from '/assets/admin-common.js';
 
 const $ = (id) => document.getElementById(id);
+const PAGE_SIZE = 250;
+const INITIAL_CURSOR = '18446744073709551615';
+let beforeRowid = INITIAL_CURSOR;
+let loadedRows = 0;
+let loading = false;
 
 function renderRow(row) {
   const line = document.createElement('div');
@@ -33,40 +38,62 @@ function renderRow(row) {
   return line;
 }
 
-async function load() {
+async function load(reset = false) {
+  if (loading) return;
+  loading = true;
+  $('refresh').disabled = true;
+  $('load-more').disabled = true;
+  if (reset) {
+    beforeRowid = INITIAL_CURSOR;
+    loadedRows = 0;
+    $('audit-log').replaceChildren();
+  }
   // The endpoint streams JSONL; an empty log is an empty body, so parse as
   // text rather than JSON.
-  const response = await fetch('/api/admin/audit?limit=10000', {
-    credentials: 'same-origin',
-  });
-  if (!response.ok) throw new Error(`request failed (${response.status})`);
-  const text = await response.text();
-  const rows = text
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => JSON.parse(line));
-  const container = $('audit-log');
-  container.replaceChildren();
-  $('audit-range').textContent = `${rows.length} rows shown`;
-  if (!rows.length) {
-    container.textContent = 'No audit rows yet.';
-    return;
+  try {
+    const query = new URLSearchParams({ limit: String(PAGE_SIZE) });
+    query.set('before_rowid', beforeRowid);
+    const response = await fetch(`/api/admin/audit?${query}`, {
+      credentials: 'same-origin',
+    });
+    if (!response.ok) throw new Error(`request failed (${response.status})`);
+    const text = await response.text();
+    const rows = text
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const container = $('audit-log');
+    if (!rows.length && loadedRows === 0) container.textContent = 'No audit rows yet.';
+    for (const row of rows) container.append(renderRow(row));
+    loadedRows += rows.length;
+    if (rows.length) beforeRowid = String(rows[rows.length - 1].rowid);
+    $('audit-range').textContent = `${loadedRows} rows loaded`;
+    $('load-more').hidden = rows.length < PAGE_SIZE;
+  } finally {
+    loading = false;
+    $('refresh').disabled = false;
+    $('load-more').disabled = false;
   }
-  for (const row of [...rows].reverse()) {
-    container.append(renderRow(row));
+}
+
+function showLoadError(error) {
+  if (loadedRows > 0) {
+    $('audit-range').textContent = `${loadedRows} rows loaded · ${error.message}`;
+  } else {
+    $('audit-log').textContent = error.message;
   }
 }
 
 $('refresh').addEventListener('click', () => {
-  load().catch((error) => {
-    $('audit-log').textContent = error.message;
-  });
+  load(true).catch(showLoadError);
+});
+
+$('load-more').addEventListener('click', () => {
+  load().catch(showLoadError);
 });
 
 const session = await requireSession();
 if (!session.pages.includes('audit')) {
   window.location.replace('/links');
 }
-await load().catch((error) => {
-  $('audit-log').textContent = error.message;
-});
+await load(true).catch(showLoadError);
