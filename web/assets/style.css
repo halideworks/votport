@@ -279,6 +279,11 @@ h2 {
 section > h2 {
  margin: 2rem 0 0.7rem;
 }
+.settings-group-note {
+ margin: -0.35rem 0 0.7rem;
+ color: var(--muted);
+ font-size: 0.74rem;
+}
 
 .sheet-foot {
  margin-top: auto;
@@ -304,6 +309,51 @@ section > h2 {
 }
 .card > p:last-child {
  margin-bottom: 0;
+}
+.settings-status {
+ display: grid;
+ grid-template-columns: minmax(9rem, 0.7fr) minmax(0, 1.3fr);
+ margin: 0;
+}
+.settings-status > div {
+ display: contents;
+}
+.settings-status dt,
+.settings-status dd {
+ padding: 0.6rem 0;
+ border-top: 1px solid var(--border-faint);
+}
+.settings-status > div:first-child dt,
+.settings-status > div:first-child dd {
+ border-top: 0;
+ padding-top: 0;
+}
+.settings-status dt {
+ color: var(--muted);
+ font-size: 0.68rem;
+ font-weight: 600;
+ letter-spacing: 0.06em;
+ text-transform: uppercase;
+}
+.settings-status dd {
+ margin: 0;
+ color: var(--text-soft);
+ text-align: right;
+ overflow-wrap: anywhere;
+}
+@media (max-width: 520px) {
+ .settings-status {
+  grid-template-columns: 1fr;
+ }
+ .settings-status dt,
+ .settings-status dd {
+  border-top: 0;
+  padding: 0.25rem 0;
+ }
+ .settings-status dd {
+  padding-bottom: 0.7rem;
+  text-align: left;
+ }
 }
 /* A completed transfer earns the one green in the palette. */
 .card.ok {

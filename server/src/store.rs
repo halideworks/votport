@@ -490,7 +490,11 @@ impl Store {
             })
             .ok();
         store.with(|connection| {
-            connection.execute_batch("CREATE INDEX IF NOT EXISTS links_tenant ON links(tenant)")
+            connection.execute_batch(
+                "CREATE INDEX IF NOT EXISTS links_tenant ON links(tenant);
+                 CREATE INDEX IF NOT EXISTS links_tenant_created
+                 ON links(tenant, created_at DESC, id DESC)",
+            )
         })?;
         store.migrate()?;
         store.import_legacy(data_dir)?;
@@ -1943,6 +1947,41 @@ impl Store {
         .map(|exists| exists != 0)
     }
 
+    pub fn active_outbound_file_keys(
+        &self,
+        tenant: &str,
+        link_id: &str,
+        now: u64,
+    ) -> Result<Vec<(String, usize)>, String> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT upload_id, file_index
+                 FROM outbound_grants
+                 WHERE tenant = ?1 AND link_id = ?2
+                   AND revoked_at IS NULL AND expires_at > ?3
+                   AND (max_downloads IS NULL OR downloads < max_downloads)",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![tenant, link_id, i64::try_from(now).unwrap_or(i64::MAX)],
+                |row| {
+                    let upload_id = row.get::<_, String>(0)?;
+                    let file_index = usize::try_from(row.get::<_, i64>(1)?).map_err(|_| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Integer,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "outbound grant file index is outside usize range",
+                            )),
+                        )
+                    })?;
+                    Ok((upload_id, file_index))
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+    }
+
     pub fn link_has_active_outbound_grants(
         &self,
         tenant: &str,
@@ -2796,7 +2835,7 @@ mod tests {
         }
     }
 
-    fn test_outbound_grant(id: &str, tenant: &str, file_index: usize) -> OutboundGrant {
+    pub(crate) fn test_outbound_grant(id: &str, tenant: &str, file_index: usize) -> OutboundGrant {
         OutboundGrant {
             id: id.to_owned(),
             token_hash: format!("hash-{id}"),
@@ -4147,7 +4186,7 @@ mod ops_tests {
 
 #[cfg(test)]
 mod phase4_review_tests {
-    use super::tests::{link_in, test_tenant};
+    use super::tests::{link_in, test_outbound_grant, test_tenant};
     use super::*;
 
     #[test]
@@ -4299,6 +4338,84 @@ mod phase4_review_tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn links_page_unfiltered_query_uses_created_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let plan = store
+            .with(|connection| {
+                let mut statement = connection.prepare(
+                    "EXPLAIN QUERY PLAN
+                     SELECT id FROM links
+                     WHERE tenant = ?1
+                       AND (?2 = '' OR lower(label) LIKE '%' || ?2 || '%' ESCAPE '\\'
+                            OR lower(dest) LIKE '%' || ?2 || '%' ESCAPE '\\')
+                       AND (?3 = 'all'
+                            OR (?3 = 'open' AND active != 0
+                                AND (expires_at IS NULL OR expires_at > ?4))
+                            OR (?3 = 'closed' AND (active = 0
+                                OR (expires_at IS NOT NULL AND expires_at <= ?4))))
+                       AND (?5 = 0 OR created_at < ?6
+                            OR (created_at = ?6 AND id < ?7))
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT ?8",
+                )?;
+                let rows = statement.query_map(
+                    rusqlite::params!["", "", "all", 1000_i64, 0_i64, 0_i64, "", 11_i64],
+                    |row| row.get::<_, String>(3),
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap();
+        assert!(plan
+            .iter()
+            .any(|detail| detail.contains("USING INDEX links_tenant_created")));
+    }
+
+    #[test]
+    fn active_outbound_file_keys_filter_scope_state_and_bad_indexes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+
+        store
+            .insert_outbound_grant(test_outbound_grant("active", "acme", 2))
+            .unwrap();
+        let mut expired = test_outbound_grant("expired", "acme", 3);
+        expired.expires_at = 19;
+        store.insert_outbound_grant(expired).unwrap();
+        let mut revoked = test_outbound_grant("revoked", "acme", 4);
+        revoked.revoked_at = Some(1);
+        store.insert_outbound_grant(revoked).unwrap();
+        let mut spent = test_outbound_grant("spent", "acme", 5);
+        spent.max_downloads = Some(1);
+        spent.downloads = 1;
+        store.insert_outbound_grant(spent).unwrap();
+        let other_tenant = test_outbound_grant("other-tenant", "other", 6);
+        store.insert_outbound_grant(other_tenant).unwrap();
+        let mut other_link = test_outbound_grant("other-link", "acme", 7);
+        other_link.link_id = "other-link".to_owned();
+        store.insert_outbound_grant(other_link).unwrap();
+
+        assert_eq!(
+            store.active_outbound_file_keys("acme", "link", 19).unwrap(),
+            vec![("upload".to_owned(), 2)]
+        );
+        assert!(store
+            .active_outbound_file_keys("acme", "link", 20)
+            .unwrap()
+            .is_empty());
+
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE outbound_grants SET file_index = ?1 WHERE id = ?2",
+                    rusqlite::params![-1_i64, "active"],
+                )
+            })
+            .unwrap();
+        assert!(store.active_outbound_file_keys("acme", "link", 19).is_err());
     }
 
     #[test]

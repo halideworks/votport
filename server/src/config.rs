@@ -1,6 +1,7 @@
 //! Environment-driven configuration.
 
 use std::env;
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -122,6 +123,12 @@ pub fn admit_admin_password(password: &str) -> Result<(), String> {
 pub struct IpCidr {
     network: std::net::IpAddr,
     bits: u8,
+}
+
+impl fmt::Display for IpCidr {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.network, self.bits)
+    }
 }
 
 impl IpCidr {

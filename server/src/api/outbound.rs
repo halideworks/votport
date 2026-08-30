@@ -1160,11 +1160,14 @@ async fn outbound_file_inner(
         .await
         .map_err(|_| ApiError::internal("open staged file failed"))?;
     record_download(&app, &grant, &[index])?;
-    let stream = ReaderStream::new(OutboundReader {
-        file,
-        _stage: stage,
-        _active: active,
-    });
+    let stream = ReaderStream::with_capacity(
+        OutboundReader {
+            file,
+            _stage: stage,
+            _active: active,
+        },
+        CHUNK,
+    );
     let filename = safe_filename(&source.name);
     let mut response = Body::from_stream(stream).into_response();
     response.headers_mut().insert(
@@ -1247,12 +1250,15 @@ pub async fn outbound_bundle(
         .map_err(|_| ApiError::internal("open bundle failed"))?;
     let indexes: Vec<usize> = (0..count).collect();
     record_download(&app, &grant, &indexes)?;
-    let stream = ReaderStream::new(BundleReader {
-        file,
-        _archive: archive,
-        _stages: stages,
-        _active: active,
-    });
+    let stream = ReaderStream::with_capacity(
+        BundleReader {
+            file,
+            _archive: archive,
+            _stages: stages,
+            _active: active,
+        },
+        CHUNK,
+    );
     let mut response = Body::from_stream(stream).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,

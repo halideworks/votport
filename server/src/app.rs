@@ -1756,28 +1756,32 @@ async fn expire_link_uploads(app: &App, candidate: crate::store::Link, cutoff: u
         .filter(|file| !file.deleted)
         .map(|file| file.stored_as.as_str())
         .collect();
-    // ponytail: retention runs infrequently, so one indexed lookup per file
-    // stays simpler than another store projection until link histories grow.
     let now = now_unix();
+    let active_outbound_files =
+        match app
+            .store
+            .active_outbound_file_keys(&link.tenant, &link.id, now)
+        {
+            Ok(keys) => keys,
+            Err(error) => {
+                tracing::error!(%error, "outbound grant read failed; skipping retention for link");
+                return;
+            }
+        };
+    let mut active_outbound_files: HashSet<(&str, usize)> = active_outbound_files
+        .iter()
+        .map(|(upload_id, file_index)| (upload_id.as_str(), *file_index))
+        .collect();
     for upload in &link.uploads {
         for (index, file) in upload.files.iter().enumerate() {
-            match app.store.has_active_outbound_grant(
-                &link.tenant,
-                &link.id,
-                &upload.id,
-                index,
-                now,
-            ) {
-                Ok(true) => {
-                    protected.insert(file.stored_as.as_str());
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    tracing::error!(%error, "outbound grant read failed; skipping retention for link");
-                    return;
-                }
+            if active_outbound_files.remove(&(upload.id.as_str(), index)) {
+                protected.insert(file.stored_as.as_str());
             }
         }
+    }
+    if !active_outbound_files.is_empty() {
+        tracing::error!("outbound grant references a missing file; skipping retention for link");
+        return;
     }
     let candidates: HashSet<&str> = link
         .uploads
@@ -2123,6 +2127,17 @@ mod retention_tests {
 
         let connection =
             rusqlite::Connection::open(app.config.data_dir.join("votport.db")).unwrap();
+        connection
+            .execute(
+                "UPDATE outbound_grants SET file_index = ?1 WHERE id = ?2",
+                rusqlite::params![i64::MAX, "grant"],
+            )
+            .unwrap();
+        let malformed_candidate = app.store.link("", "outbound").unwrap().unwrap();
+        expire_link_uploads(&app, malformed_candidate, cutoff).await;
+        assert!(outbound_path.exists());
+        assert!(!app.store.link("", "outbound").unwrap().unwrap().uploads[0].files[0].deleted);
+
         connection
             .execute_batch(
                 "CREATE TRIGGER fail_link_update BEFORE UPDATE ON links

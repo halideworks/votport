@@ -1,7 +1,7 @@
 // votport system page: credentials, backups, verification key, overlay settings.
 // VOTPORT PROPRIETARY LICENSE.
 
-import { api, requireSession } from '/assets/admin-common.js';
+import { api, formatBytes, requireSession } from '/assets/admin-common.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -16,6 +16,58 @@ function setSource(id, source) {
 function setSecret(id, isSet) {
   $(id).value = '';
   $(id).placeholder = isSet ? 'unchanged' : '';
+}
+
+function deploymentValue(id, value, fallback = 'Not configured') {
+  $(id).textContent = value === null || value === undefined || value === '' ? fallback : value;
+}
+
+function fillDeployment(data) {
+  const deployment = data.deployment;
+  deploymentValue('setting-data-dir', deployment.data_dir);
+  deploymentValue('setting-receive-dir', deployment.receive_dir);
+  deploymentValue('setting-outbound-dir', deployment.outbound_dir);
+  deploymentValue('setting-web-root', deployment.web_root);
+  deploymentValue('setting-max-upload', formatBytes(deployment.max_upload_bytes));
+  deploymentValue('setting-allow-hidden', deployment.allow_hidden ? 'Allowed' : 'Blocked');
+  deploymentValue(
+    'setting-idle-timeout',
+    deployment.session_idle_secs === undefined
+      ? null
+      : `${deployment.session_idle_secs} seconds`,
+  );
+
+  deploymentValue('setting-bind', deployment.bind);
+  deploymentValue('setting-public-url', deployment.public_url);
+  deploymentValue(
+    'setting-trusted-proxies',
+    deployment.trusted_proxies?.length ? deployment.trusted_proxies.join(', ') : null,
+    'Built-in loopback and private ranges',
+  );
+  deploymentValue('setting-metrics', deployment.metrics_configured ? 'Configured' : 'Not configured');
+  deploymentValue('setting-oidc-issuer', deployment.oidc_issuer);
+  deploymentValue('setting-oidc-client-id', deployment.oidc_client_id);
+  deploymentValue(
+    'setting-oidc-admin-group',
+    deployment.oidc_admin_group,
+    deployment.oidc_configured ? 'All authenticated principals' : 'Not configured',
+  );
+  deploymentValue(
+    'setting-oidc-secret',
+    deployment.oidc_client_secret_configured ? 'Configured' : 'Not configured',
+  );
+  deploymentValue('setting-push-bind', deployment.push_bind);
+  deploymentValue('setting-push-advertise', deployment.push_advertise);
+  deploymentValue(
+    'setting-push-certificate',
+    deployment.push_certificate_configured ? deployment.push_certificate : null,
+    deployment.push_configured ? 'Managed by VOTPort' : 'Not configured',
+  );
+  deploymentValue(
+    'setting-push-key',
+    deployment.push_private_key_configured ? 'Configured' : null,
+    deployment.push_configured ? 'Managed by VOTPort' : 'Not configured',
+  );
 }
 
 function gibValue(bytes) {
@@ -60,6 +112,7 @@ function setSmtpActions(enabled) {
 }
 
 function fillSettings(data) {
+  fillDeployment(data);
   $('notify-webhook').value = data.notify_webhook || '';
   setSource('notify-webhook-source', data.notify_webhook_source);
   $('notify-ntfy').value = data.notify_ntfy || '';
@@ -107,6 +160,7 @@ function fillSettings(data) {
   const collapse = $('signin-collapse');
   collapse.checked = data.public_password_login === false;
   collapse.disabled = !data.sso_configured;
+  setSource('signin-source', data.public_password_login_source);
   $('signin-save').disabled = !data.sso_configured;
 }
 

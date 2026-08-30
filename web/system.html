@@ -30,344 +30,543 @@
 
       <h1>System</h1>
 
-      <form id="password-form" class="card">
-        <h2>Administrator password</h2>
-        <div class="grid">
-          <label
-            >Current password
-            <input
-              type="password"
-              id="password-current"
-              autocomplete="current-password"
-              required
-            />
-          </label>
-          <label
-            >New password <span class="muted">12 characters minimum</span>
-            <input
-              type="password"
-              id="password-new"
-              autocomplete="new-password"
-              required
-              minlength="12"
-            />
-          </label>
-        </div>
-        <button type="submit">Update password</button>
-        <span id="password-note" class="muted"></span>
-        <p class="error" id="password-error" hidden></p>
-      </form>
+      <section class="settings-group" data-group="access-security">
+        <h2>Access &amp; security</h2>
+        <p class="settings-group-note">Editable here</p>
 
-      <form id="notify-form" class="card">
-        <h2>Notifications</h2>
-        <div class="grid">
-          <div>
+        <form id="password-form" class="card">
+          <h2>Administrator password</h2>
+          <div class="grid">
             <label
-              >Webhook URL <span class="muted" id="notify-webhook-source"></span>
-              <input id="notify-webhook" placeholder="https://" />
-            </label>
-            <button type="button" class="ghost tiny" data-reset="notify_webhook">
-              Use environment
-            </button>
-          </div>
-          <div>
-            <label
-              >ntfy URL <span class="muted" id="notify-ntfy-source"></span>
-              <input id="notify-ntfy" placeholder="https://" />
-            </label>
-            <button type="button" class="ghost tiny" data-reset="notify_ntfy">
-              Use environment
-            </button>
-          </div>
-          <div>
-            <label
-              >ntfy token <span class="muted" id="notify-ntfy-token-source"></span>
-              <input id="notify-ntfy-token" type="password" autocomplete="off" />
-            </label>
-            <button type="button" class="ghost tiny" data-reset="notify_ntfy_token">
-              Use environment
-            </button>
-            <button
-              type="button"
-              class="ghost tiny"
-              data-clear="notify_ntfy_token"
-              disabled
-            >
-              Clear
-            </button>
-          </div>
-          <div>
-            <label
-              >Pushover token
-              <span class="muted" id="notify-pushover-token-source"></span>
-              <input id="notify-pushover-token" type="password" autocomplete="off" />
-            </label>
-            <button
-              type="button"
-              class="ghost tiny"
-              data-reset="notify_pushover_token"
-            >
-              Use environment
-            </button>
-            <button
-              type="button"
-              class="ghost tiny"
-              data-clear="notify_pushover_token"
-              disabled
-            >
-              Clear
-            </button>
-          </div>
-          <div>
-            <label
-              >Pushover user
-              <span class="muted" id="notify-pushover-user-source"></span>
-              <input id="notify-pushover-user" autocomplete="off" />
-            </label>
-            <button
-              type="button"
-              class="ghost tiny"
-              data-reset="notify_pushover_user"
-            >
-              Use environment
-            </button>
-            <button
-              type="button"
-              class="ghost tiny"
-              data-clear="notify_pushover_user"
-              disabled
-            >
-              Clear
-            </button>
-          </div>
-        </div>
-        <button type="submit" id="notify-save" disabled>Save</button>
-        <button type="button" id="notify-test" class="ghost" disabled>Send test</button>
-        <span id="notify-test-note" class="muted">
-          Tests the currently active notification settings.
-        </span>
-        <p class="error" id="notify-test-error" hidden></p>
-        <span id="notify-note" class="muted"></span>
-        <p class="error" id="notify-error" hidden></p>
-      </form>
-
-      <form id="smtp-form" class="card">
-        <h2>SMTP</h2>
-        <p class="muted">
-          Sent when an upload finishes. Requires host, from, and at least one
-          recipient. Port 465 uses implicit TLS.
-        </p>
-        <div class="grid">
-          <div>
-            <label
-              >Host <span class="muted" id="smtp-host-source"></span>
-              <input id="smtp-host" placeholder="smtp.example.com" autocomplete="off" />
-            </label>
-            <button type="button" class="ghost tiny" data-reset="smtp_host">
-              Use environment
-            </button>
-          </div>
-          <div>
-            <label
-              >Port <span class="muted" id="smtp-port-source"></span>
-              <input id="smtp-port" type="number" min="1" max="65535" step="1" />
-            </label>
-            <button type="button" class="ghost tiny" data-reset="smtp_port">
-              Use environment
-            </button>
-          </div>
-          <div>
-            <label
-              ><input type="checkbox" id="smtp-starttls" />
-              STARTTLS
-              <span class="muted" id="smtp-starttls-source"></span>
-            </label>
-            <button type="button" class="ghost tiny" data-reset="smtp_starttls">
-              Use environment
-            </button>
-          </div>
-          <div>
-            <label
-              >Username <span class="muted" id="smtp-username-source"></span>
-              <input id="smtp-username" autocomplete="off" />
-            </label>
-            <button type="button" class="ghost tiny" data-reset="smtp_username">
-              Use environment
-            </button>
-          </div>
-          <div>
-            <label
-              >Password <span class="muted" id="smtp-password-source"></span>
-              <input id="smtp-password" type="password" autocomplete="off" />
-            </label>
-            <button type="button" class="ghost tiny" data-reset="smtp_password">
-              Use environment
-            </button>
-            <button
-              type="button"
-              class="ghost tiny"
-              data-clear="smtp_password"
-              disabled
-            >
-              Clear
-            </button>
-          </div>
-          <div>
-            <label
-              >From <span class="muted" id="smtp-from-source"></span>
-              <input id="smtp-from" placeholder="votport@example.com" autocomplete="off" />
-            </label>
-            <button type="button" class="ghost tiny" data-reset="smtp_from">
-              Use environment
-            </button>
-          </div>
-          <div>
-            <label
-              >To
-              <span class="muted">comma-separated</span>
-              <span class="muted" id="smtp-to-source"></span>
-              <input id="smtp-to" placeholder="ops@example.com" autocomplete="off" />
-            </label>
-            <button type="button" class="ghost tiny" data-reset="smtp_to">
-              Use environment
-            </button>
-          </div>
-        </div>
-        <button type="submit" id="smtp-save" disabled>Save</button>
-        <span id="smtp-note" class="muted"></span>
-        <p class="error" id="smtp-error" hidden></p>
-      </form>
-
-      <form id="retention-form" class="card">
-        <h2>Retention</h2>
-        <div class="grid">
-          <div>
-            <label
-              >Audit log
-              <span class="muted">days, 0 is off</span>
-              <span class="muted" id="audit-retention-source"></span>
-              <input id="audit-retention-days" type="number" min="0" step="1" />
-            </label>
-            <button
-              type="button"
-              class="ghost tiny"
-              data-reset="audit_retention_days"
-            >
-              Use environment
-            </button>
-          </div>
-          <div>
-            <label
-              >Received files
-              <span class="muted">days, 0 is off</span>
-              <span class="muted" id="upload-retention-source"></span>
-              <input id="upload-retention-days" type="number" min="0" step="1" />
-            </label>
-            <button
-              type="button"
-              class="ghost tiny"
-              data-reset="upload_retention_days"
-            >
-              Use environment
-            </button>
-          </div>
-        </div>
-        <button type="submit">Save</button>
-        <span id="retention-note" class="muted"></span>
-        <p class="error" id="retention-error" hidden></p>
-      </form>
-
-      <form id="quotas-form" class="card">
-        <h2>Default quotas</h2>
-        <div class="grid">
-          <div>
-            <label
-              >Storage quota <span class="muted">GiB</span>
-              <span class="muted" id="default-max-total-source"></span>
-              <input id="default-max-total" type="number" min="1" placeholder="none" />
-            </label>
-            <button
-              type="button"
-              class="ghost tiny"
-              data-reset="default_max_total_bytes"
-            >
-              Use environment
-            </button>
-          </div>
-          <div>
-            <label
-              >Link limit <span class="muted">optional</span>
-              <span class="muted" id="default-max-links-source"></span>
-              <input id="default-max-links" type="number" min="1" placeholder="none" />
-            </label>
-            <button
-              type="button"
-              class="ghost tiny"
-              data-reset="default_max_links"
-            >
-              Use environment
-            </button>
-          </div>
-          <div>
-            <label
-              >Concurrent uploads <span class="muted">optional</span>
-              <span class="muted" id="default-max-sessions-source"></span>
+              >Current password
               <input
-                id="default-max-sessions"
-                type="number"
-                min="1"
-                placeholder="none"
+                type="password"
+                id="password-current"
+                autocomplete="current-password"
+                required
               />
             </label>
-            <button
-              type="button"
-              class="ghost tiny"
-              data-reset="default_max_sessions"
-            >
-              Use environment
-            </button>
+            <label
+              >New password <span class="muted">12 characters minimum</span>
+              <input
+                type="password"
+                id="password-new"
+                autocomplete="new-password"
+                required
+                minlength="12"
+              />
+            </label>
           </div>
+          <button type="submit">Update password</button>
+          <span id="password-note" class="muted"></span>
+          <p class="error" id="password-error" hidden></p>
+        </form>
+
+        <form id="signin-form" class="card">
+          <h2>Sign-in</h2>
+          <p class="muted">
+            The password form stays in the page behind a disclosure. POST
+            /api/admin/login always works. Without SSO the form stays expanded.
+          </p>
+          <label
+            ><input type="checkbox" id="signin-collapse" />
+            Collapse the local password form when SSO is offered
+            <span class="muted" id="signin-source"></span>
+          </label>
+          <button type="submit" id="signin-save" disabled>Save</button>
+          <span id="signin-note" class="muted"></span>
+          <p class="error" id="signin-error" hidden></p>
+        </form>
+      </section>
+
+      <section class="settings-group" data-group="storage-transfer">
+        <h2>Storage &amp; transfer</h2>
+        <p class="settings-group-note">
+          Deployment settings &middot; restart required
+        </p>
+        <div class="card">
+          <h2>Storage and transfer limits</h2>
+          <dl class="settings-status">
+            <div>
+              <dt>Data directory</dt>
+              <dd id="setting-data-dir" class="mono"></dd>
+            </div>
+            <div>
+              <dt>Received files directory</dt>
+              <dd id="setting-receive-dir" class="mono"></dd>
+            </div>
+            <div>
+              <dt>Outbound files directory</dt>
+              <dd id="setting-outbound-dir" class="mono"></dd>
+            </div>
+            <div>
+              <dt>Web assets directory</dt>
+              <dd id="setting-web-root" class="mono"></dd>
+            </div>
+            <div>
+              <dt>Maximum upload</dt>
+              <dd id="setting-max-upload" class="mono"></dd>
+            </div>
+            <div>
+              <dt>Hidden files</dt>
+              <dd id="setting-allow-hidden"></dd>
+            </div>
+            <div>
+              <dt>Idle session timeout</dt>
+              <dd id="setting-idle-timeout" class="mono"></dd>
+            </div>
+          </dl>
         </div>
-        <button type="submit">Save</button>
-        <span id="quotas-note" class="muted"></span>
-        <p class="error" id="quotas-error" hidden></p>
-      </form>
+      </section>
 
-      <form id="signin-form" class="card">
-        <h2>Sign-in</h2>
-        <p class="muted">
-          The password form stays in the page behind a disclosure.
-          POST /api/admin/login always works. Without SSO the form stays
-          expanded.
-        </p>
-        <label
-          ><input type="checkbox" id="signin-collapse" />
-          Collapse the local password form when SSO is offered
-        </label>
-        <button type="submit" id="signin-save" disabled>Save</button>
-        <span id="signin-note" class="muted"></span>
-        <p class="error" id="signin-error" hidden></p>
-      </form>
+      <section class="settings-group" data-group="notifications">
+        <h2>Notifications</h2>
+        <p class="settings-group-note">Editable here</p>
+        <form id="notify-form" class="card">
+          <h2>Notifications</h2>
+          <div class="grid">
+            <div>
+              <label
+                >Webhook URL
+                <span class="muted" id="notify-webhook-source"></span>
+                <input id="notify-webhook" placeholder="https://" />
+              </label>
+              <button
+                type="button"
+                class="ghost tiny"
+                data-reset="notify_webhook"
+              >
+                Use environment
+              </button>
+            </div>
+            <div>
+              <label
+                >ntfy URL <span class="muted" id="notify-ntfy-source"></span>
+                <input id="notify-ntfy" placeholder="https://" />
+              </label>
+              <button type="button" class="ghost tiny" data-reset="notify_ntfy">
+                Use environment
+              </button>
+            </div>
+            <div>
+              <label
+                >ntfy token
+                <span class="muted" id="notify-ntfy-token-source"></span>
+                <input
+                  id="notify-ntfy-token"
+                  type="password"
+                  autocomplete="off"
+                />
+              </label>
+              <button
+                type="button"
+                class="ghost tiny"
+                data-reset="notify_ntfy_token"
+              >
+                Use environment
+              </button>
+              <button
+                type="button"
+                class="ghost tiny"
+                data-clear="notify_ntfy_token"
+                disabled
+              >
+                Clear
+              </button>
+            </div>
+            <div>
+              <label
+                >Pushover token
+                <span class="muted" id="notify-pushover-token-source"></span>
+                <input
+                  id="notify-pushover-token"
+                  type="password"
+                  autocomplete="off"
+                />
+              </label>
+              <button
+                type="button"
+                class="ghost tiny"
+                data-reset="notify_pushover_token"
+              >
+                Use environment
+              </button>
+              <button
+                type="button"
+                class="ghost tiny"
+                data-clear="notify_pushover_token"
+                disabled
+              >
+                Clear
+              </button>
+            </div>
+            <div>
+              <label
+                >Pushover user
+                <span class="muted" id="notify-pushover-user-source"></span>
+                <input id="notify-pushover-user" autocomplete="off" />
+              </label>
+              <button
+                type="button"
+                class="ghost tiny"
+                data-reset="notify_pushover_user"
+              >
+                Use environment
+              </button>
+              <button
+                type="button"
+                class="ghost tiny"
+                data-clear="notify_pushover_user"
+                disabled
+              >
+                Clear
+              </button>
+            </div>
+          </div>
+          <button type="submit" id="notify-save" disabled>Save</button>
+          <button type="button" id="notify-test" class="ghost" disabled>
+            Send test
+          </button>
+          <span id="notify-test-note" class="muted">
+            Tests the currently active notification settings.
+          </span>
+          <p class="error" id="notify-test-error" hidden></p>
+          <span id="notify-note" class="muted"></span>
+          <p class="error" id="notify-error" hidden></p>
+        </form>
+      </section>
 
-      <div class="card">
-        <h2>Backups</h2>
-        <p class="muted">
-          A consistent SQLite snapshot of links, tenants and the audit log.
-          Received files live separately under the receive root.
-        </p>
-        <a id="backup-download" class="ghost" href="/api/admin/backup">Download snapshot</a>
-      </div>
+      <section class="settings-group" data-group="email">
+        <h2>Email</h2>
+        <p class="settings-group-note">Editable here</p>
+        <form id="smtp-form" class="card">
+          <h2>SMTP delivery</h2>
+          <p class="muted">
+            Sent when an upload finishes. Requires host, from, and at least one
+            recipient. Port 465 uses implicit TLS.
+          </p>
+          <div class="grid">
+            <div>
+              <label
+                >Host <span class="muted" id="smtp-host-source"></span>
+                <input
+                  id="smtp-host"
+                  placeholder="smtp.example.com"
+                  autocomplete="off"
+                />
+              </label>
+              <button type="button" class="ghost tiny" data-reset="smtp_host">
+                Use environment
+              </button>
+            </div>
+            <div>
+              <label
+                >Port <span class="muted" id="smtp-port-source"></span>
+                <input
+                  id="smtp-port"
+                  type="number"
+                  min="1"
+                  max="65535"
+                  step="1"
+                />
+              </label>
+              <button type="button" class="ghost tiny" data-reset="smtp_port">
+                Use environment
+              </button>
+            </div>
+            <div>
+              <label
+                ><input type="checkbox" id="smtp-starttls" />
+                STARTTLS
+                <span class="muted" id="smtp-starttls-source"></span>
+              </label>
+              <button
+                type="button"
+                class="ghost tiny"
+                data-reset="smtp_starttls"
+              >
+                Use environment
+              </button>
+            </div>
+            <div>
+              <label
+                >Username <span class="muted" id="smtp-username-source"></span>
+                <input id="smtp-username" autocomplete="off" />
+              </label>
+              <button
+                type="button"
+                class="ghost tiny"
+                data-reset="smtp_username"
+              >
+                Use environment
+              </button>
+            </div>
+            <div>
+              <label
+                >Password <span class="muted" id="smtp-password-source"></span>
+                <input id="smtp-password" type="password" autocomplete="off" />
+              </label>
+              <button
+                type="button"
+                class="ghost tiny"
+                data-reset="smtp_password"
+              >
+                Use environment
+              </button>
+              <button
+                type="button"
+                class="ghost tiny"
+                data-clear="smtp_password"
+                disabled
+              >
+                Clear
+              </button>
+            </div>
+            <div>
+              <label
+                >From <span class="muted" id="smtp-from-source"></span>
+                <input
+                  id="smtp-from"
+                  placeholder="votport@example.com"
+                  autocomplete="off"
+                />
+              </label>
+              <button type="button" class="ghost tiny" data-reset="smtp_from">
+                Use environment
+              </button>
+            </div>
+            <div>
+              <label
+                >To
+                <span class="muted">comma-separated</span>
+                <span class="muted" id="smtp-to-source"></span>
+                <input
+                  id="smtp-to"
+                  placeholder="ops@example.com"
+                  autocomplete="off"
+                />
+              </label>
+              <button type="button" class="ghost tiny" data-reset="smtp_to">
+                Use environment
+              </button>
+            </div>
+          </div>
+          <button type="submit" id="smtp-save" disabled>Save</button>
+          <span id="smtp-note" class="muted"></span>
+          <p class="error" id="smtp-error" hidden></p>
+        </form>
+      </section>
 
-      <div class="card">
-        <h2>Receipt verification</h2>
-        <p class="muted">
-          Every received file carries a signed
-          <code>.vot-receipt</code> sidecar. Verify signatures against this
-          public key.
+      <section class="settings-group" data-group="retention">
+        <h2>Retention</h2>
+        <p class="settings-group-note">Editable here</p>
+        <form id="retention-form" class="card">
+          <h2>Data retention</h2>
+          <div class="grid">
+            <div>
+              <label
+                >Audit log
+                <span class="muted">days, 0 is off</span>
+                <span class="muted" id="audit-retention-source"></span>
+                <input
+                  id="audit-retention-days"
+                  type="number"
+                  min="0"
+                  step="1"
+                />
+              </label>
+              <button
+                type="button"
+                class="ghost tiny"
+                data-reset="audit_retention_days"
+              >
+                Use environment
+              </button>
+            </div>
+            <div>
+              <label
+                >Received files
+                <span class="muted">days, 0 is off</span>
+                <span class="muted" id="upload-retention-source"></span>
+                <input
+                  id="upload-retention-days"
+                  type="number"
+                  min="0"
+                  step="1"
+                />
+              </label>
+              <button
+                type="button"
+                class="ghost tiny"
+                data-reset="upload_retention_days"
+              >
+                Use environment
+              </button>
+            </div>
+          </div>
+          <button type="submit">Save</button>
+          <span id="retention-note" class="muted"></span>
+          <p class="error" id="retention-error" hidden></p>
+        </form>
+      </section>
+
+      <section class="settings-group" data-group="default-tenant-quotas">
+        <h2>Default tenant quotas</h2>
+        <p class="settings-group-note">Editable here</p>
+        <form id="quotas-form" class="card">
+          <h2>Default tenant limits</h2>
+          <div class="grid">
+            <div>
+              <label
+                >Storage quota <span class="muted">GiB</span>
+                <span class="muted" id="default-max-total-source"></span>
+                <input
+                  id="default-max-total"
+                  type="number"
+                  min="1"
+                  placeholder="none"
+                />
+              </label>
+              <button
+                type="button"
+                class="ghost tiny"
+                data-reset="default_max_total_bytes"
+              >
+                Use environment
+              </button>
+            </div>
+            <div>
+              <label
+                >Link limit <span class="muted">optional</span>
+                <span class="muted" id="default-max-links-source"></span>
+                <input
+                  id="default-max-links"
+                  type="number"
+                  min="1"
+                  placeholder="none"
+                />
+              </label>
+              <button
+                type="button"
+                class="ghost tiny"
+                data-reset="default_max_links"
+              >
+                Use environment
+              </button>
+            </div>
+            <div>
+              <label
+                >Concurrent uploads <span class="muted">optional</span>
+                <span class="muted" id="default-max-sessions-source"></span>
+                <input
+                  id="default-max-sessions"
+                  type="number"
+                  min="1"
+                  placeholder="none"
+                />
+              </label>
+              <button
+                type="button"
+                class="ghost tiny"
+                data-reset="default_max_sessions"
+              >
+                Use environment
+              </button>
+            </div>
+          </div>
+          <button type="submit">Save</button>
+          <span id="quotas-note" class="muted"></span>
+          <p class="error" id="quotas-error" hidden></p>
+        </form>
+      </section>
+
+      <section class="settings-group" data-group="network-integrations">
+        <h2>Network &amp; integrations</h2>
+        <p class="settings-group-note">
+          Deployment settings &middot; restart required
         </p>
-        <p class="mono" id="receipt-key"></p>
-        <p class="muted">Anyone can check a sidecar at <a href="/verify">/verify</a>.</p>
-      </div>
+        <div class="card">
+          <h2>Network and sign-on</h2>
+          <dl class="settings-status">
+            <div>
+              <dt>HTTP bind</dt>
+              <dd id="setting-bind" class="mono"></dd>
+            </div>
+            <div>
+              <dt>Public URL</dt>
+              <dd id="setting-public-url" class="mono"></dd>
+            </div>
+            <div>
+              <dt>Trusted proxies</dt>
+              <dd id="setting-trusted-proxies" class="mono"></dd>
+            </div>
+            <div>
+              <dt>Metrics endpoint</dt>
+              <dd id="setting-metrics"></dd>
+            </div>
+            <div>
+              <dt>OIDC issuer</dt>
+              <dd id="setting-oidc-issuer" class="mono"></dd>
+            </div>
+            <div>
+              <dt>OIDC client ID</dt>
+              <dd id="setting-oidc-client-id" class="mono"></dd>
+            </div>
+            <div>
+              <dt>OIDC admin group</dt>
+              <dd id="setting-oidc-admin-group"></dd>
+            </div>
+            <div>
+              <dt>OIDC client secret</dt>
+              <dd id="setting-oidc-secret"></dd>
+            </div>
+            <div>
+              <dt>Native push listener</dt>
+              <dd id="setting-push-bind" class="mono"></dd>
+            </div>
+            <div>
+              <dt>Native push advertise</dt>
+              <dd id="setting-push-advertise" class="mono"></dd>
+            </div>
+            <div>
+              <dt>Native push certificate</dt>
+              <dd id="setting-push-certificate"></dd>
+            </div>
+            <div>
+              <dt>Native push private key</dt>
+              <dd id="setting-push-key"></dd>
+            </div>
+          </dl>
+        </div>
+      </section>
+
+      <section class="settings-group" data-group="maintenance-verification">
+        <h2>Maintenance &amp; verification</h2>
+        <p class="settings-group-note">Operational tools</p>
+        <div class="card">
+          <h2>Backups</h2>
+          <p class="muted">
+            A consistent SQLite snapshot of links, tenants and the audit log.
+            Received files live separately under the receive root.
+          </p>
+          <a id="backup-download" class="ghost" href="/api/admin/backup"
+            >Download snapshot</a
+          >
+        </div>
+
+        <div class="card">
+          <h2>Receipt verification</h2>
+          <p class="muted">
+            Every received file carries a signed
+            <code>.vot-receipt</code> sidecar. Verify signatures against this
+            public key.
+          </p>
+          <p class="mono" id="receipt-key"></p>
+          <p class="muted">
+            Anyone can check a sidecar at <a href="/verify">/verify</a>.
+          </p>
+        </div>
+      </section>
       <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
     </div>
 
@@ -376,7 +575,9 @@
         <h2 id="confirm-title">Confirm</h2>
         <p id="confirm-detail"></p>
         <div class="modal-actions">
-          <button value="cancel" class="ghost" id="confirm-cancel">Cancel</button>
+          <button value="cancel" class="ghost" id="confirm-cancel">
+            Cancel
+          </button>
           <button value="ok" class="danger" id="confirm-ok">Delete</button>
         </div>
       </form>
