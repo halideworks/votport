@@ -20,6 +20,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Root directory received files are published into.
     pub receive_dir: PathBuf,
+    /// Root directory for outbound library files and rendered projects.
+    pub outbound_dir: PathBuf,
     /// Directory holding the static web assets.
     pub web_root: PathBuf,
     /// Argon2 PHC hash of the admin password.
@@ -203,6 +205,7 @@ pub fn from_env() -> Result<Config, String> {
         .map_err(|error| format!("VOTPORT_BIND is not a socket address: {error}"))?;
     let data_dir = PathBuf::from(env_or("VOTPORT_DATA_DIR", "/data"));
     let receive_dir = PathBuf::from(env_or("VOTPORT_RECEIVE_DIR", "/received"));
+    let outbound_dir = PathBuf::from(env_or("VOTPORT_OUTBOUND_DIR", "/outbound"));
     let web_root = PathBuf::from(env_or("VOTPORT_WEB_ROOT", "./web"));
 
     let (admin_password_hash, admin_token_tag) = match env::var("VOTPORT_ADMIN_PASSWORD_HASH") {
@@ -404,6 +407,7 @@ pub fn from_env() -> Result<Config, String> {
         push_advertise,
         data_dir,
         receive_dir,
+        outbound_dir,
         web_root,
         admin_password_hash,
         admin_token_tag,

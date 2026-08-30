@@ -88,6 +88,40 @@
         <span id="new-link-note" class="muted"></span>
       </div>
 
+      <section class="card" aria-labelledby="deliver-title">
+        <h2 id="deliver-title">Deliver files</h2>
+        <form id="deliver-upload-form">
+          <label
+            >Project subdirectory <span class="muted">optional</span>
+            <input id="deliver-project" placeholder="client/alex" autocomplete="off" />
+          </label>
+          <label
+            >Add files
+            <input id="library-input" type="file" multiple />
+          </label>
+          <p id="library-status" class="muted" aria-live="polite"></p>
+        </form>
+        <div class="library-head">
+          <h3>File library</h3>
+          <button id="library-refresh" type="button" class="tiny ghost">Refresh</button>
+        </div>
+        <div id="library-files" class="library-list" aria-live="polite"></div>
+        <form id="deliver-form">
+          <div class="grid">
+            <label
+              >Link label
+              <input id="deliver-label" required maxlength="200" placeholder="Project files" />
+            </label>
+            <label
+              >Expires after <span class="muted">days</span>
+              <input id="deliver-expires" type="number" min="1" max="30" value="7" required />
+            </label>
+          </div>
+          <button type="submit" id="deliver-submit">Issue download link</button>
+          <p id="deliver-error" class="error" hidden></p>
+        </form>
+      </section>
+
       <div id="outbound-result" class="card ok" hidden aria-live="polite">
         <h2>Download link issued</h2>
         <label

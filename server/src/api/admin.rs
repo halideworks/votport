@@ -3162,6 +3162,7 @@ mod ops_tests {
         let mut config = testing_config_public();
         config.data_dir = directory.join("data");
         config.receive_dir = directory.join("received");
+        config.outbound_dir = directory.join("outbound");
         config
     }
 
@@ -3174,6 +3175,7 @@ mod ops_tests {
             push_advertise: None,
             data_dir: std::path::PathBuf::from("/nonexistent"),
             receive_dir: std::path::PathBuf::from("/nonexistent"),
+            outbound_dir: std::path::PathBuf::from("/nonexistent"),
             web_root: std::path::PathBuf::from("../web"),
             admin_password_hash: crate::auth::hash_password(testing::TEST_PASSWORD).unwrap(),
             admin_token_tag: "tag".to_owned(),

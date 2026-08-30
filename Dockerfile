@@ -37,7 +37,7 @@ FROM debian:stable-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /app /data /received
+    && mkdir -p /app /data /received /outbound
 COPY --from=build /src/server/target/release/votport /app/votport
 COPY web /app/web
 COPY --from=build /wasm-vendor/ /app/web/assets/vendor/
@@ -46,13 +46,14 @@ RUN chmod -R a+rX /app/web
 ENV VOTPORT_BIND=0.0.0.0:8080 \
     VOTPORT_DATA_DIR=/data \
     VOTPORT_RECEIVE_DIR=/received \
+    VOTPORT_OUTBOUND_DIR=/outbound \
     VOTPORT_WEB_ROOT=/app/web
 
-# Same uid the deployment's compose file uses; state and received volumes must
-# stay writable by it.
+# Same uid the deployment's compose file uses; state, received, and outbound
+# volumes must stay writable by it.
 USER 1000:1000
 EXPOSE 8080
-VOLUME ["/data", "/received"]
+VOLUME ["/data", "/received", "/outbound"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -sf http://127.0.0.1:8080/ -o /dev/null || exit 1
 CMD ["/app/votport"]

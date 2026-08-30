@@ -98,6 +98,17 @@ pub struct OutboundGrant {
     pub expires_at: u64,
     pub revoked_at: Option<u64>,
     pub downloads: u64,
+    pub files: Vec<OutboundGrantFile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OutboundGrantFile {
+    pub source: String,
+    pub name: String,
+    pub suite: String,
+    pub root: String,
+    pub bytes: u64,
+    pub receipt_b64: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -256,7 +267,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-const SCHEMA_VERSION: u64 = 8;
+const SCHEMA_VERSION: u64 = 9;
 
 const SETTINGS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS settings (
@@ -314,12 +325,16 @@ CREATE TABLE IF NOT EXISTS outbound_grants (
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     revoked_at INTEGER,
-    downloads INTEGER NOT NULL DEFAULT 0
+    downloads INTEGER NOT NULL DEFAULT 0,
+    files_json TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS outbound_grants_tenant_created ON outbound_grants(tenant, created_at);
 CREATE INDEX IF NOT EXISTS outbound_grants_file
     ON outbound_grants(tenant, link_id, upload_id, file_index);
 ";
+
+const OUTBOUND_GRANTS_FILES_SCHEMA: &str =
+    "ALTER TABLE outbound_grants ADD COLUMN files_json TEXT NOT NULL DEFAULT '[]';";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -599,6 +614,10 @@ impl Store {
         if stored < 8 {
             transaction
                 .execute_batch(OUTBOUND_GRANTS_SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
+        } else if stored < 9 {
+            transaction
+                .execute_batch(OUTBOUND_GRANTS_FILES_SCHEMA)
                 .map_err(|error| format!("schema: {error}"))?;
         }
         transaction
@@ -1355,12 +1374,14 @@ impl Store {
 
     pub fn insert_outbound_grant(&self, grant: OutboundGrant) -> Result<(), String> {
         let (bytes_hi, bytes_lo) = split_bytes(grant.bytes);
+        let files_json = serde_json::to_string(&grant.files).unwrap_or_else(|_| "[]".to_owned());
         self.with(|connection| {
             connection.execute(
                 "INSERT INTO outbound_grants
                  (id, token_hash, tenant, link_id, upload_id, package_root, name, suite, root,
-                  file_index, bytes_hi, bytes_lo, label, created_at, expires_at, revoked_at, downloads)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                  file_index, bytes_hi, bytes_lo, label, created_at, expires_at, revoked_at, downloads,
+                  files_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                 rusqlite::params![
                     grant.id,
                     grant.token_hash,
@@ -1379,6 +1400,7 @@ impl Store {
                     i64::try_from(grant.expires_at).unwrap_or(i64::MAX),
                     grant.revoked_at.map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
                     i64::try_from(grant.downloads).unwrap_or(i64::MAX),
+                    files_json,
                 ],
             )
             .map(|_| ())
@@ -1390,7 +1412,7 @@ impl Store {
             let mut statement = connection.prepare(
                 "SELECT id, token_hash, tenant, link_id, upload_id, package_root, name, suite,
                         root, file_index, bytes_hi, bytes_lo, label, created_at, expires_at,
-                        revoked_at, downloads
+                        revoked_at, downloads, files_json
                  FROM outbound_grants WHERE tenant = ?1 ORDER BY created_at, rowid",
             )?;
             let rows = statement.query_map([tenant], map_outbound_grant)?;
@@ -1407,7 +1429,7 @@ impl Store {
                 .query_row(
                     "SELECT id, token_hash, tenant, link_id, upload_id, package_root, name, suite,
                             root, file_index, bytes_hi, bytes_lo, label, created_at, expires_at,
-                            revoked_at, downloads
+                            revoked_at, downloads, files_json
                      FROM outbound_grants WHERE token_hash = ?1",
                     [token_hash],
                     map_outbound_grant,
@@ -1710,6 +1732,7 @@ fn map_outbound_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboundGrant
             .get::<_, Option<i64>>("revoked_at")?
             .and_then(|value| u64::try_from(value).ok()),
         downloads: row.get::<_, i64>("downloads")?.max(0) as u64,
+        files: parse_json(&row.get::<_, String>("files_json")?, 17)?,
     })
 }
 
@@ -2271,6 +2294,7 @@ mod tests {
             expires_at: 20,
             revoked_at: None,
             downloads: 0,
+            files: Vec::new(),
         }
     }
 
@@ -2287,7 +2311,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(schema, "8");
+        assert_eq!(schema, "9");
         assert!(store
             .with(|connection| {
                 connection.query_row(
@@ -2301,6 +2325,36 @@ mod tests {
         let grant = test_outbound_grant("g1", "acme", 3);
         store.insert_outbound_grant(grant.clone()).unwrap();
         assert_eq!(store.outbound_grants("acme").unwrap(), vec![grant]);
+    }
+
+    #[test]
+    fn outbound_grants_round_trip_multiple_library_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut grant = test_outbound_grant("library", "acme", 0);
+        grant.files = vec![
+            OutboundGrantFile {
+                source: "objects/a".to_owned(),
+                name: "a.txt".to_owned(),
+                suite: "blake3".to_owned(),
+                root: "aa".to_owned(),
+                bytes: 3,
+                receipt_b64: "receipt-a".to_owned(),
+            },
+            OutboundGrantFile {
+                source: "objects/b".to_owned(),
+                name: "b.txt".to_owned(),
+                suite: "sha256".to_owned(),
+                root: "bb".to_owned(),
+                bytes: u64::MAX,
+                receipt_b64: "receipt-b".to_owned(),
+            },
+        ];
+        store.insert_outbound_grant(grant.clone()).unwrap();
+        assert_eq!(
+            store.outbound_grant_by_token_hash("hash-library").unwrap(),
+            Some(grant)
+        );
     }
 
     #[test]
@@ -3290,6 +3344,7 @@ mod settings_tests {
             push_advertise: None,
             data_dir: std::path::PathBuf::from("/nonexistent"),
             receive_dir: std::path::PathBuf::from("/nonexistent"),
+            outbound_dir: std::path::PathBuf::from("/nonexistent"),
             web_root: std::path::PathBuf::from("../web"),
             admin_password_hash: "x".to_owned(),
             admin_token_tag: "tag".to_owned(),
@@ -3489,9 +3544,9 @@ mod settings_tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         drop(store);
-        assert_eq!(schema_version(directory.path()), "8");
+        assert_eq!(schema_version(directory.path()), "9");
         Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "8");
+        assert_eq!(schema_version(directory.path()), "9");
     }
 
     #[test]
@@ -3513,7 +3568,7 @@ mod settings_tests {
                 .unwrap();
         }
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "8");
+        assert_eq!(schema_version(directory.path()), "9");
         assert!(store.principals().unwrap().is_empty());
         assert!(store.principal("nobody").unwrap().is_none());
     }
@@ -3535,7 +3590,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "8");
+        assert_eq!(schema_version(directory.path()), "9");
         assert!(!store.link("", "old-link").unwrap().unwrap().legal_hold);
     }
 
@@ -3575,8 +3630,55 @@ mod settings_tests {
         drop(store);
 
         let reopened = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "8");
+        assert_eq!(schema_version(directory.path()), "9");
         assert_eq!(reopened.tenant_received_bytes("").unwrap(), 9);
+    }
+
+    #[test]
+    fn v8_database_adds_empty_outbound_files_json() {
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let connection = Connection::open(directory.path().join("votport.db")).unwrap();
+            connection.execute_batch(SCHEMA).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE outbound_grants (
+                         id TEXT PRIMARY KEY,
+                         token_hash TEXT UNIQUE NOT NULL,
+                         tenant TEXT NOT NULL,
+                         link_id TEXT NOT NULL,
+                         upload_id TEXT NOT NULL,
+                         package_root TEXT NOT NULL,
+                         name TEXT NOT NULL,
+                         suite TEXT NOT NULL,
+                         root TEXT NOT NULL,
+                         file_index INTEGER NOT NULL,
+                         bytes_hi INTEGER NOT NULL,
+                         bytes_lo INTEGER NOT NULL,
+                         label TEXT NOT NULL,
+                         created_at INTEGER NOT NULL,
+                         expires_at INTEGER NOT NULL,
+                         revoked_at INTEGER,
+                         downloads INTEGER NOT NULL DEFAULT 0
+                     );
+                     INSERT INTO outbound_grants
+                         (id, token_hash, tenant, link_id, upload_id, package_root, name, suite,
+                          root, file_index, bytes_hi, bytes_lo, label, created_at, expires_at)
+                     VALUES ('g1', 'hash-g1', 'acme', 'link', 'upload', 'package', 'file.bin',
+                             'blake3', 'root', 0, 0, 1, 'download', 10, 20);
+                     INSERT INTO meta (key, value) VALUES ('schema_version', '8');",
+                )
+                .unwrap();
+        }
+
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(schema_version(directory.path()), "9");
+        assert!(store
+            .outbound_grant_by_token_hash("hash-g1")
+            .unwrap()
+            .unwrap()
+            .files
+            .is_empty());
     }
 
     #[test]

@@ -67,6 +67,22 @@ impl ReceiptSigner {
         session_id: [u8; 16],
         observation: PublishObservation,
     ) -> Result<PathBuf, String> {
+        let bytes = self.encode(object, session_id, observation)?;
+        let mut sidecar = destination.as_os_str().to_owned();
+        sidecar.push(".vot-receipt");
+        let sidecar = PathBuf::from(sidecar);
+        write_sidecar_file(&sidecar, &bytes, |file, bytes| file.write_all(bytes))
+            .map_err(|error| format!("write or publish {}: {error}", sidecar.display()))?;
+        Ok(sidecar)
+    }
+
+    /// Encodes a signed receipt for a newly prepared object.
+    pub fn encode(
+        &self,
+        object: &ObjectId,
+        session_id: [u8; 16],
+        observation: PublishObservation,
+    ) -> Result<Vec<u8>, String> {
         let receipt = Receipt {
             subject_kind: SubjectKind::Object,
             suite_id: object.suite,
@@ -91,14 +107,7 @@ impl ReceiptSigner {
         let key_id = self.key.verifying_key().to_bytes();
         let authenticated = sign_ed25519(receipt, &key_id, &self.key)
             .map_err(|error| format!("sign receipt: {error:?}"))?;
-        let bytes = encode_authenticated(&authenticated)
-            .map_err(|error| format!("encode receipt: {error:?}"))?;
-        let mut sidecar = destination.as_os_str().to_owned();
-        sidecar.push(".vot-receipt");
-        let sidecar = PathBuf::from(sidecar);
-        write_sidecar_file(&sidecar, &bytes, |file, bytes| file.write_all(bytes))
-            .map_err(|error| format!("write or publish {}: {error}", sidecar.display()))?;
-        Ok(sidecar)
+        encode_authenticated(&authenticated).map_err(|error| format!("encode receipt: {error:?}"))
     }
 }
 
