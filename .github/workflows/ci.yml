@@ -92,8 +92,22 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
       - name: Build the image (compiles vot-wasm + server)
-        run: docker build -t votport:ci .
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          load: true
+          tags: votport:ci
+          cache-from: type=gha,scope=votport-ci
+          cache-to: type=gha,mode=max,scope=votport-ci,ignore-error=true
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
       - name: Install Chromium for browser acceptance
         run: |
