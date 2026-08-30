@@ -30,8 +30,15 @@ RUN wasm-bindgen --target web --no-typescript --out-dir /wasm-vendor \
 
 # Server.
 COPY LICENSE /src/LICENSE
-COPY server /src/server
-RUN cd /src/server && cargo build --release --locked
+COPY server/Cargo.toml server/Cargo.lock /src/server/
+RUN mkdir -p /src/server/src \
+    && printf 'fn main() {}\n' > /src/server/src/main.rs \
+    && cd /src/server \
+    && cargo build --release --locked
+COPY server/src /src/server/src
+RUN touch /src/server/src/main.rs /src/server/src/lib.rs \
+    && cd /src/server \
+    && cargo build --release --locked
 
 FROM debian:stable-slim
 # curl exists only for the healthcheck.
