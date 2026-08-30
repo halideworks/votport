@@ -1877,23 +1877,15 @@ async fn outbound_file_inner(
     } else {
         ActiveDownload::claim(Arc::clone(&app), &format!("{}:{index}", grant.token_hash))?
     };
-    let (stage, source, _receipt) = prepare(&app, &grant, index).await?;
-    let mut file = tokio::fs::File::open(&stage.path)
+    let (stage, source, _receipt) = prepare(&app, &grant, index, range).await?;
+    let file = tokio::fs::File::open(&stage.path)
         .await
         .map_err(|_| ApiError::internal("open staged file failed"))?;
-    if let Some((start, _end)) = range {
-        file.seek(SeekFrom::Start(start))
-            .await
-            .map_err(|_| ApiError::internal("seek staged file failed"))?;
-    }
     if !leased {
         record_download(&app, &grant, &[index])?;
     }
     let length = range.map_or(source.object.length, |(start, end)| end - start + 1);
-    let file = match range {
-        Some((start, end)) => file.take(end - start + 1),
-        None => file.take(source.object.length),
-    };
+    let file = file.take(length);
     let stream = ReaderStream::with_capacity(
         OutboundReader {
             file,
@@ -2111,7 +2103,7 @@ pub async fn outbound_bundle(
     let mut files = Vec::with_capacity(count);
     let mut names = std::collections::HashSet::with_capacity(count);
     for index in 0..count {
-        let (stage, source, _receipt) = prepare(&app, &grant, index).await?;
+        let (stage, source, _receipt) = prepare(&app, &grant, index, None).await?;
         let relative = bundle_path(&source.name).ok_or_else(ApiError::not_found)?;
         if !names.insert(bundle_collision_key(&relative)) {
             return Err(ApiError::not_found());
@@ -2474,6 +2466,7 @@ async fn prepare(
     app: &Arc<App>,
     grant: &OutboundGrant,
     index: usize,
+    range: Option<(u64, u64)>,
 ) -> ApiResult<(StagedFile, Source, Vec<u8>)> {
     let _pin = if grant.files.is_empty() {
         let pin = app.sessions.try_pin_link(&grant.link_id).ok_or_else(|| {
@@ -2501,7 +2494,7 @@ async fn prepare(
     let expected = source.object.clone();
     let source_receipt = source.receipt.clone();
     let prepared = tokio::task::spawn_blocking(move || {
-        let receipt = copy_verify(&source_path, &stage.path, expected, source_receipt)?;
+        let receipt = copy_verify(&source_path, &stage.path, expected, source_receipt, range)?;
         Ok::<_, io::Error>((stage, receipt))
     })
     .await
@@ -2522,6 +2515,7 @@ fn copy_verify(
     stage: &Path,
     expected: ObjectId,
     receipt_bytes: Option<Vec<u8>>,
+    range: Option<(u64, u64)>,
 ) -> io::Result<Vec<u8>> {
     use std::io::{Read, Write};
     let mut input = std::fs::File::open(source)?;
@@ -2538,6 +2532,7 @@ fn copy_verify(
         .map_err(|_| io::Error::other("builder"))?;
     let mut buf = vec![0u8; CHUNK];
     let mut receipt = Vec::new();
+    let mut offset = 0u64;
     loop {
         let count = input.read(&mut buf)?;
         if count == 0 {
@@ -2546,7 +2541,26 @@ fn copy_verify(
         builder
             .update(&buf[..count])
             .map_err(|_| io::Error::other("object"))?;
-        output.write_all(&buf[..count])?;
+        if let Some((start, end)) = range {
+            let chunk_end = offset
+                .checked_add(count as u64)
+                .and_then(|end| end.checked_sub(1))
+                .ok_or_else(|| io::Error::other("source too large"))?;
+            let write_start = start.max(offset);
+            let write_end = end.min(chunk_end);
+            if write_start <= write_end {
+                let begin = usize::try_from(write_start - offset)
+                    .map_err(|_| io::Error::other("range offset"))?;
+                let finish = usize::try_from(write_end - offset + 1)
+                    .map_err(|_| io::Error::other("range offset"))?;
+                output.write_all(&buf[begin..finish])?;
+            }
+        } else {
+            output.write_all(&buf[..count])?;
+        }
+        offset = offset
+            .checked_add(count as u64)
+            .ok_or_else(|| io::Error::other("source too large"))?;
     }
     let actual = builder.finish().map_err(|_| io::Error::other("object"))?;
     if actual.object_id() != &expected {
@@ -3082,7 +3096,62 @@ mod tests {
             root: [0; 32],
             length: 7,
         };
-        assert!(copy_verify(&source, &stage, expected, None).is_err());
+        assert!(copy_verify(&source, &stage, expected, None, Some((1, 3))).is_err());
+    }
+
+    #[test]
+    fn copy_verify_stages_exact_range_and_full_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let range_stage = directory.path().join("range-stage");
+        let full_stage = directory.path().join("full-stage");
+        let payload = b"0123456789";
+        std::fs::write(&source, payload).unwrap();
+
+        let mut builder = InMemoryObjectBuilder::new(
+            Suite::try_from(1).unwrap(),
+            Some(payload.len() as u64),
+            payload.len() as u64,
+        )
+        .unwrap();
+        builder.update(payload).unwrap();
+        let expected = builder.finish().unwrap().object_id().clone();
+
+        copy_verify(
+            &source,
+            &range_stage,
+            expected.clone(),
+            Some(Vec::new()),
+            Some((2, 6)),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&range_stage).unwrap(), b"23456");
+
+        copy_verify(&source, &full_stage, expected, Some(Vec::new()), None).unwrap();
+        assert_eq!(std::fs::read(&full_stage).unwrap(), payload);
+
+        let boundary_source = directory.path().join("boundary-source");
+        let boundary_stage = directory.path().join("boundary-stage");
+        let mut boundary_payload = vec![0u8; CHUNK + 3];
+        boundary_payload[CHUNK - 2..].copy_from_slice(b"abcde");
+        std::fs::write(&boundary_source, &boundary_payload).unwrap();
+        let mut boundary_builder = InMemoryObjectBuilder::new(
+            Suite::try_from(1).unwrap(),
+            Some(boundary_payload.len() as u64),
+            boundary_payload.len() as u64,
+        )
+        .unwrap();
+        boundary_builder.update(&boundary_payload).unwrap();
+        let boundary_expected = boundary_builder.finish().unwrap().object_id().clone();
+        copy_verify(
+            &boundary_source,
+            &boundary_stage,
+            boundary_expected,
+            Some(Vec::new()),
+            Some((CHUNK as u64 - 2, CHUNK as u64 + 2)),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&boundary_stage).unwrap(), b"abcde");
     }
     #[test]
     fn drop_guards_remove_stage_and_active_grant() {
@@ -3976,6 +4045,7 @@ mod tests {
         let mutated = crate::app::router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/files/0"))
+                    .header(header::RANGE, "bytes=0-1")
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 4))))
                     .body(Body::empty())
                     .unwrap(),
