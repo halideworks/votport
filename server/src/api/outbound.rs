@@ -2004,7 +2004,7 @@ async fn outbound_file_inner(
     token: String,
     index: usize,
 ) -> ApiResult<Response> {
-    let (grant, leased) = active_download_grant(&app, &token, index, &headers)?;
+    let (grant, leased, file) = active_download_grant(&app, &token, index, &headers)?;
     let _operation = begin_outbound_operation(&app, &grant.tenant)?;
     require_grant_access(&app, &grant, &headers)?;
     if !app.outbound_rate.allow(&grant.token_hash) {
@@ -2013,7 +2013,7 @@ async fn outbound_file_inner(
             "too many downloads; try again later",
         ));
     }
-    let source = source_info_indexed(&app, &grant, index)?;
+    let source = source_info_indexed_with_file(&app, &grant, index, file.as_ref())?;
     let range = requested_range(&headers, &source.object)?;
     let active = if leased {
         ActiveDownload::claim_with_grant(
@@ -2024,7 +2024,7 @@ async fn outbound_file_inner(
     } else {
         ActiveDownload::claim(Arc::clone(&app), &format!("{}:{index}", grant.token_hash))?
     };
-    let (stage, source, _receipt) = prepare(&app, &grant, index, range).await?;
+    let (stage, source, _receipt) = prepare(&app, &grant, index, range, file.as_ref()).await?;
     let file = tokio::fs::File::open(&stage.path)
         .await
         .map_err(|_| ApiError::internal("open staged file failed"))?;
@@ -2059,7 +2059,7 @@ async fn outbound_file_head_inner(
     token: String,
     index: usize,
 ) -> ApiResult<Response> {
-    let (grant, _leased) = active_download_grant(&app, &token, index, &headers)?;
+    let (grant, _leased, file) = active_download_grant(&app, &token, index, &headers)?;
     let _operation = begin_outbound_operation(&app, &grant.tenant)?;
     require_grant_access(&app, &grant, &headers)?;
     if !app.outbound_rate.allow(&grant.token_hash) {
@@ -2068,7 +2068,7 @@ async fn outbound_file_head_inner(
             "too many downloads; try again later",
         ));
     }
-    let source = source_info_indexed(&app, &grant, index)?;
+    let source = source_info_indexed_with_file(&app, &grant, index, file.as_ref())?;
     let mut response = Body::empty().into_response();
     add_file_headers(
         &mut response,
@@ -2252,7 +2252,7 @@ pub async fn outbound_bundle(
     let mut files = Vec::with_capacity(count);
     let mut names = std::collections::HashSet::with_capacity(count);
     for index in 0..count {
-        let (stage, source, _receipt) = prepare(&app, &grant, index, None).await?;
+        let (stage, source, _receipt) = prepare(&app, &grant, index, None, None).await?;
         let relative = bundle_path(&source.name).ok_or_else(ApiError::not_found)?;
         if !names.insert(bundle_collision_key(&relative)) {
             return Err(ApiError::not_found());
@@ -2325,32 +2325,35 @@ fn active_download_grant(
     token: &str,
     index: usize,
     headers: &HeaderMap,
-) -> ApiResult<(OutboundGrant, bool)> {
+) -> ApiResult<(OutboundGrant, bool, Option<OutboundGrantFile>)> {
     if !valid_token(token) {
         return Err(ApiError::not_found());
     }
-    let grant = app
+    let (grant, file) = app
         .store
-        .outbound_grant_by_token_hash(&hash_token(token))
+        .outbound_grant_file_by_token_hash(&hash_token(token), index)
         .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
     if grant.revoked_at.is_some() || grant.expires_at <= now_unix() {
         return Err(ApiError::not_found());
     }
     let leased = download_lease_authorized(app, &grant, index, headers);
-    if !leased && grant_is_exhausted(&grant, index) {
+    if !leased && grant_is_exhausted(&grant, index, file.as_ref()) {
         return Err(ApiError::not_found());
     }
-    Ok((grant, leased))
+    Ok((grant, leased, file))
 }
 
-fn grant_is_exhausted(grant: &OutboundGrant, index: usize) -> bool {
+fn grant_is_exhausted(
+    grant: &OutboundGrant,
+    index: usize,
+    indexed_file: Option<&OutboundGrantFile>,
+) -> bool {
     let Some(max) = grant.max_downloads else {
         return false;
     };
-    grant
-        .files
-        .get(index)
+    indexed_file
+        .or_else(|| grant.files.get(index))
         .map_or(grant.files.is_empty() && grant.downloads >= max, |file| {
             file.downloads >= max
         })
@@ -2367,11 +2370,21 @@ fn record_download(
     {
         Ok(result) => {
             if grant.notify_on_download && (result.first_download || result.completed_delivery) {
-                tokio::spawn(crate::notify::outbound_downloaded(
-                    Arc::clone(app),
-                    grant.clone(),
-                    result,
-                ));
+                match app.store.outbound_grant_by_token_hash(&grant.token_hash) {
+                    Ok(Some(full_grant)) => {
+                        tokio::spawn(crate::notify::outbound_downloaded(
+                            Arc::clone(app),
+                            full_grant,
+                            result,
+                        ));
+                    }
+                    Ok(None) => {
+                        tracing::warn!(grant_id = %grant.id, "download notification grant reload found no grant");
+                    }
+                    Err(error) => {
+                        tracing::warn!(grant_id = %grant.id, %error, "download notification grant reload failed");
+                    }
+                }
             }
             Ok(result)
         }
@@ -2525,8 +2538,16 @@ struct Source {
 }
 
 fn source_info_indexed(app: &App, grant: &OutboundGrant, index: usize) -> ApiResult<Source> {
-    if !grant.files.is_empty() {
-        let file = grant.files.get(index).ok_or_else(ApiError::not_found)?;
+    source_info_indexed_with_file(app, grant, index, None)
+}
+
+fn source_info_indexed_with_file(
+    app: &App,
+    grant: &OutboundGrant,
+    index: usize,
+    indexed_file: Option<&OutboundGrantFile>,
+) -> ApiResult<Source> {
+    if let Some(file) = indexed_file.or_else(|| grant.files.get(index)) {
         let path = safe_library_path(app, &grant.tenant, &file.source)?;
         if !library_components_safe(&library_root(app, &grant.tenant), &path) {
             return Err(ApiError::not_found());
@@ -2616,8 +2637,9 @@ async fn prepare(
     grant: &OutboundGrant,
     index: usize,
     range: Option<(u64, u64)>,
+    indexed_file: Option<&OutboundGrantFile>,
 ) -> ApiResult<(StagedFile, Source, Vec<u8>)> {
-    let _pin = if grant.files.is_empty() {
+    let _pin = if grant.files.is_empty() && indexed_file.is_none() {
         let pin = app.sessions.try_pin_link(&grant.link_id).ok_or_else(|| {
             ApiError::new(StatusCode::CONFLICT, "link lifecycle update in progress")
         })?;
@@ -2628,7 +2650,7 @@ async fn prepare(
     } else {
         None
     };
-    let source = source_info_indexed(app, grant, index)?;
+    let source = source_info_indexed_with_file(app, grant, index, indexed_file)?;
     let stage_dir = app
         .config
         .data_dir
