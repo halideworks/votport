@@ -2,7 +2,8 @@
 // uploads files through the real uploader (vot-wasm in Chromium), and
 // verifies the bytes on disk. VOTPORT PROPRIETARY LICENSE.
 //
-// Requires: `npm i playwright` (with its Chromium), a running votport, and:
+// Requires: `npm ci`, `npx --no-install playwright install chromium`, a
+// running votport, and:
 //   BASE_URL        e.g. http://127.0.0.1:8080
 //   ADMIN_PASSWORD  the admin password of that instance
 //   RECEIVE_DIR     the instance's receive root, from this process's view
@@ -10,6 +11,7 @@
 //   node scripts/browser-e2e.mjs
 
 import { chromium } from "playwright";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -23,7 +25,10 @@ if (!adminPassword || !receiveDir) {
 }
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "votport-e2e-"));
+process.once("exit", () => fs.rmSync(dir, { recursive: true, force: true }));
 fs.writeFileSync(path.join(dir, "Résumé Draft.pdf"), "unicode names travel\n");
+fs.writeFileSync(path.join(dir, "deliver-one.txt"), "first deliverable\n");
+fs.writeFileSync(path.join(dir, "deliver-two.txt"), "second deliverable\n");
 // Multiple server-sized ranges exercise the bounded parallel upload path.
 const big = Buffer.alloc(40 * 1024 * 1024 + 99);
 for (let i = 0; i < big.length; i += 1) big[i] = (i * 7) % 253;
@@ -36,6 +41,36 @@ const browser = await chromium.launch({
 const page = await browser.newPage();
 const errors = [];
 page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
+
+async function collectDownloads(action, count) {
+  const downloads = [];
+  let timer;
+  let resolveDownloads;
+  let rejectDownloads;
+  const complete = new Promise((resolve, reject) => {
+    resolveDownloads = resolve;
+    rejectDownloads = reject;
+  });
+  const onDownload = (download) => {
+    downloads.push(download);
+    if (downloads.length === count) resolveDownloads(downloads);
+  };
+  page.on("download", onDownload);
+  timer = setTimeout(() => rejectDownloads(new Error(`expected ${count} downloads, got ${downloads.length}`)), 30000);
+  try {
+    await action();
+    return await complete;
+  } finally {
+    clearTimeout(timer);
+    page.off("download", onDownload);
+  }
+}
+
+// Headless Chromium does not provide a deterministic folder chooser. Force
+// the supported anchor-download fallback so this path is exercised in CI.
+await page.addInitScript(() => {
+  Object.defineProperty(window, "showDirectoryPicker", { value: undefined });
+});
 
 await page.goto(base);
 await page.waitForSelector("#login:not([hidden])");
@@ -112,6 +147,7 @@ if (`${verdict.suite}:${verdict.root}` !== ids[0]) {
 console.log("verified:", ids[0]);
 
 // The /verify page itself: slot UI, sidecar-only, full match, mismatch.
+const stored = path.join(receiveDir, dest);
 const payloadPath = path.join(stored, "Résumé Draft.pdf");
 const sidecarPath = path.join(stored, sidecarName);
 await page.goto(`${base}/verify`);
@@ -156,9 +192,102 @@ await page.waitForFunction(
   { timeout: 60000 },
 );
 console.log("verify page flow ok");
+
+// Deliver an outbound multi-file link through the admin UI.
+await page.goto(`${base}/deliver`);
+try {
+  await page.waitForSelector("#library-input", { timeout: 15000 });
+} catch (error) {
+  console.error(`deliver page did not load at ${page.url()}: ${await page.locator("body").innerText()}`);
+  throw error;
+}
+await page.setInputFiles("#library-input", [
+  path.join(dir, "deliver-one.txt"),
+  path.join(dir, "deliver-two.txt"),
+]);
+await page.waitForFunction(
+  () => document.getElementById("library-status").textContent.includes("2 files added"),
+  { timeout: 30000 },
+);
+const libraryFiles = page.locator("#library-files input[type=checkbox]");
+const libraryFileCount = await libraryFiles.count();
+if (libraryFileCount !== 2) {
+  throw new Error(`outbound library count: ${libraryFileCount}`);
+}
+for (let index = 0; index < libraryFileCount; index += 1) {
+  await page.locator("#library-files input[type=checkbox]").nth(index).click();
+}
+await page.fill("#deliver-label", "browser outbound e2e");
+await page.click("#deliver-submit");
+await page.waitForSelector("#outbound-result:not([hidden])", { timeout: 30000 });
+const outboundUrl = await page.inputValue("#outbound-url");
+if (!/^https?:\/\//.test(outboundUrl)) {
+  throw new Error(`outbound URL malformed: ${outboundUrl}`);
+}
+console.log("outbound link:", outboundUrl);
+
+await page.goto(outboundUrl);
+await page.waitForSelector("#download-content:not([hidden])", { timeout: 30000 });
+if (await page.$eval("#bundle-download", (el) => el.hidden)) {
+  throw new Error("bundle download action is missing");
+}
+if (await page.$eval("#separate-download", (el) => el.hidden)) {
+  throw new Error("separate download action is missing");
+}
+if ((await page.evaluate(() => typeof window.showDirectoryPicker)) !== "undefined") {
+  throw new Error("browser fallback was not selected");
+}
+if (!(await page.textContent("#separate-download-note")).includes("multiple downloads")) {
+  throw new Error("separate download fallback note is missing");
+}
+
+const [bundleDownload] = await collectDownloads(
+  () => page.click("#bundle-download-button"),
+  1,
+);
+const bundlePath = path.join(dir, "deliverables.zip");
+await bundleDownload.saveAs(bundlePath);
+const bundleNames = execFileSync("unzip", ["-Z1", bundlePath], { encoding: "utf8" })
+  .trim()
+  .split("\n")
+  .filter(Boolean);
+if (
+  bundleNames.length !== 2 ||
+  !bundleNames.includes("deliver-one.txt") ||
+  !bundleNames.includes("deliver-two.txt") ||
+  bundleNames.some((name) => name.endsWith(".vot-receipt"))
+) {
+  throw new Error(`bundle payload names: ${JSON.stringify(bundleNames)}`);
+}
+const bundledOne = execFileSync("unzip", ["-p", bundlePath, "deliver-one.txt"], {
+  encoding: "utf8",
+});
+if (bundledOne !== "first deliverable\n") {
+  throw new Error("bundle payload mismatch");
+}
+console.log("bundle payload-only: ok");
+
+const separateDownloads = await collectDownloads(
+  () => page.click("#separate-download-button"),
+  2,
+);
+const separateNames = separateDownloads.map((download) => download.suggestedFilename());
+if (!separateNames.includes("deliver-one.txt") || !separateNames.includes("deliver-two.txt")) {
+  throw new Error(`separate download names: ${JSON.stringify(separateNames)}`);
+}
+for (const download of separateDownloads) {
+  const downloadedPath = await download.path();
+  if (!downloadedPath) throw new Error("separate download has no path");
+  const expected = download.suggestedFilename() === "deliver-one.txt"
+    ? "first deliverable\n"
+    : "second deliverable\n";
+  if (fs.readFileSync(downloadedPath, "utf8") !== expected) {
+    throw new Error(`separate payload mismatch: ${download.suggestedFilename()}`);
+  }
+}
+console.log("separate fallback downloads: ok");
 await browser.close();
 
-const stored = path.join(receiveDir, dest);
 if (
   fs.readFileSync(path.join(stored, "Résumé Draft.pdf"), "utf8") !==
   "unicode names travel\n"
