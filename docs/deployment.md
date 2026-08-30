@@ -30,6 +30,10 @@ docker compose up -d --build
 curl -o /dev/null -w '%{http_code}\n' http://127.0.0.1:<debug-port>/r/x   # expect 200
 ```
 
+`VOTPORT_PUBLIC_URL` must be an `https://` URL for a deployed site. Plain
+`http://` is accepted only when its host is loopback (`localhost`, `127.0.0.1`,
+or `::1`), and invalid values stop startup.
+
 ## Admin pages and deliveries
 
 The admin UI has separate **Receive** and **Deliver** pages. Receive issues
