@@ -168,7 +168,6 @@ pub(crate) struct RequestMetrics {
     in_flight: AtomicU64,
     status: [AtomicU64; 5],
     latency_buckets: [AtomicU64; 7],
-    latency_count: AtomicU64,
     latency_sum_ns: AtomicU64,
 }
 
@@ -181,7 +180,6 @@ impl RequestMetrics {
     fn observe(&self, status: StatusCode, elapsed: std::time::Duration) {
         self.status[request_status_index(status)].fetch_add(1, Ordering::Relaxed);
         let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
-        self.latency_count.fetch_add(1, Ordering::Relaxed);
         self.latency_sum_ns.fetch_add(nanos, Ordering::Relaxed);
         for (bucket, bound) in self.latency_buckets.iter().zip(REQUEST_LATENCY_BUCKETS_NS) {
             if nanos <= bound {
@@ -194,7 +192,7 @@ impl RequestMetrics {
         let mut body = String::new();
         let _ = writeln!(
             body,
-            "# HELP votport_http_requests_in_flight Current HTTP requests being handled.\n# TYPE votport_http_requests_in_flight gauge\nvotport_http_requests_in_flight {}",
+            "# HELP votport_http_requests_in_flight Current HTTP request handlers producing responses.\n# TYPE votport_http_requests_in_flight gauge\nvotport_http_requests_in_flight {}",
             self.in_flight.load(Ordering::Relaxed)
         );
         body.push_str(
@@ -208,7 +206,7 @@ impl RequestMetrics {
             );
         }
         body.push_str(
-            "# HELP votport_http_request_duration_seconds HTTP request duration in seconds.\n# TYPE votport_http_request_duration_seconds histogram\n",
+            "# HELP votport_http_request_duration_seconds HTTP time to response headers in seconds; streamed body transfer time is excluded.\n# TYPE votport_http_request_duration_seconds histogram\n",
         );
         for (bucket, label) in self
             .latency_buckets
@@ -226,7 +224,7 @@ impl RequestMetrics {
             body,
             "votport_http_request_duration_seconds_bucket{{le=\"+Inf\"}} {}\nvotport_http_request_duration_seconds_count {}\nvotport_http_request_duration_seconds_sum {:.9}",
             self.latency_buckets[6].load(Ordering::Relaxed),
-            self.latency_count.load(Ordering::Relaxed),
+            self.latency_buckets[6].load(Ordering::Relaxed),
             self.latency_sum_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0
         );
         body
