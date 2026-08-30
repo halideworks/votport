@@ -11,6 +11,7 @@ function when(seconds) {
 
 function showError(message) {
   $('download-gate').hidden = true;
+  $('bundle-download').hidden = true;
   $('download-content').hidden = true;
   $('download-error-message').textContent = message;
   $('download-error').hidden = false;
@@ -88,6 +89,11 @@ async function loadMetadata() {
 
   $('download-gate').hidden = true;
   $('object').replaceChildren();
+  const bundle = $('bundle-download');
+  bundle.hidden = !body.bundle_url;
+  if (body.bundle_url) {
+    $('bundle-download-button').onclick = () => window.location.assign(body.bundle_url);
+  }
   $('title').textContent = body.label || 'Verified download';
   $('status').textContent = 'The server verifies the file against this identity before download.';
   for (const file of files) {
