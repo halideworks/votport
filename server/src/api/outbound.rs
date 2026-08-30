@@ -1173,7 +1173,15 @@ async fn outbound_file_inner(
     }
     let source = source_info_indexed(&app, &grant, index)?;
     let range = requested_range(&headers, &source.object)?;
-    let active = ActiveDownload::claim(Arc::clone(&app), &format!("{}:{index}", grant.token_hash))?;
+    let active = if leased {
+        ActiveDownload::claim_with_grant(
+            Arc::clone(&app),
+            &format!("{}:{index}:{}", grant.token_hash, auth::random_token()),
+            &grant.token_hash,
+        )?
+    } else {
+        ActiveDownload::claim(Arc::clone(&app), &format!("{}:{index}", grant.token_hash))?
+    };
     let (stage, source, _receipt) = prepare(&app, &grant, index).await?;
     let mut file = tokio::fs::File::open(&stage.path)
         .await
@@ -1929,11 +1937,15 @@ struct ActiveDownload {
 }
 impl ActiveDownload {
     fn claim(app: Arc<App>, key: &str) -> ApiResult<Self> {
+        let grant = key.rsplit_once(':').map_or(key, |(grant, _)| grant);
+        Self::claim_with_grant(app, key, grant)
+    }
+
+    fn claim_with_grant(app: Arc<App>, key: &str, grant: &str) -> ApiResult<Self> {
         let mut active = app
             .outbound_active
             .lock()
             .expect("outbound active poisoned");
-        let grant = key.rsplit_once(':').map_or(key, |(grant, _)| grant);
         if active.contains(key)
             || active.len() >= MAX_ACTIVE
             || active
@@ -2214,6 +2226,18 @@ mod tests {
         assert!(ActiveDownload::claim(Arc::clone(&app), "grant:0").is_err());
         drop(active);
         assert!(ActiveDownload::claim(Arc::clone(&app), "grant:4").is_ok());
+    }
+
+    #[test]
+    fn leased_ranges_can_run_alongside_one_unleased_file_download() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let first = ActiveDownload::claim(Arc::clone(&app), "grant:0").unwrap();
+        let leased =
+            ActiveDownload::claim_with_grant(Arc::clone(&app), "grant:0:lease-unique", "grant")
+                .unwrap();
+        assert!(ActiveDownload::claim(Arc::clone(&app), "grant:0").is_err());
+        drop((first, leased));
     }
 
     #[tokio::test]
