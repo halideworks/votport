@@ -4,6 +4,9 @@ import { test } from 'node:test';
 
 const receive = await readFile(new URL('../web/receive.html', import.meta.url), 'utf8');
 const deliver = await readFile(new URL('../web/deliver.html', import.meta.url), 'utf8');
+const audit = await readFile(new URL('../web/audit.html', import.meta.url), 'utf8');
+const tenants = await readFile(new URL('../web/tenants.html', import.meta.url), 'utf8');
+const system = await readFile(new URL('../web/system.html', import.meta.url), 'utf8');
 const receiveScript = await readFile(new URL('../web/assets/page-receive.js', import.meta.url), 'utf8');
 const deliverScript = await readFile(new URL('../web/assets/page-deliver.js', import.meta.url), 'utf8');
 const commonScript = await readFile(new URL('../web/assets/admin-common.js', import.meta.url), 'utf8');
@@ -35,4 +38,11 @@ test('issued request status filter uses the shared form control styling', () => 
   assert.match(style, /input,\s*\.card select\s*\{[\s\S]*display: block;[\s\S]*width: 100%;[\s\S]*background: rgba\(255, 255, 255, 0\.03\);/);
   assert.match(style, /input:focus,\s*\.card select:focus\s*\{[\s\S]*border-color: var\(--border-active\);/);
   assert.doesNotMatch(style, /^select\s*\{/m);
+});
+
+test('admin navigation exposes the current page and tenant selector', () => {
+  assert.match(commonScript, /link\.setAttribute\('aria-current', 'page'\)/);
+  for (const page of [receive, deliver, audit, tenants, system]) {
+    assert.match(page, /<select id="tenant-switcher" aria-label="Tenant" hidden>/);
+  }
 });

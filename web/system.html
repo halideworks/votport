@@ -20,7 +20,7 @@
           </div>
           <span class="wordmark">VOTPort</span>
         </div>
-        <select id="tenant-switcher" hidden></select>
+        <select id="tenant-switcher" aria-label="Tenant" hidden></select>
       </header>
 
       <div class="bar">
@@ -59,7 +59,7 @@
           </div>
           <button type="submit">Update password</button>
           <span id="password-note" class="muted"></span>
-          <p class="error" id="password-error" hidden></p>
+          <p class="error" id="password-error" role="alert" hidden></p>
         </form>
 
         <form id="signin-form" class="card">
@@ -75,7 +75,7 @@
           </label>
           <button type="submit" id="signin-save" disabled>Save</button>
           <span id="signin-note" class="muted"></span>
-          <p class="error" id="signin-error" hidden></p>
+          <p class="error" id="signin-error" role="alert" hidden></p>
         </form>
       </section>
 
@@ -230,9 +230,9 @@
           <span id="notify-test-note" class="muted">
             Tests the currently active notification settings.
           </span>
-          <p class="error" id="notify-test-error" hidden></p>
+          <p class="error" id="notify-test-error" role="alert" hidden></p>
           <span id="notify-note" class="muted"></span>
-          <p class="error" id="notify-error" hidden></p>
+          <p class="error" id="notify-error" role="alert" hidden></p>
         </form>
       </section>
 
@@ -353,7 +353,7 @@
           </div>
           <button type="submit" id="smtp-save" disabled>Save</button>
           <span id="smtp-note" class="muted"></span>
-          <p class="error" id="smtp-error" hidden></p>
+          <p class="error" id="smtp-error" role="alert" hidden></p>
         </form>
       </section>
 
@@ -406,7 +406,7 @@
           </div>
           <button type="submit">Save</button>
           <span id="retention-note" class="muted"></span>
-          <p class="error" id="retention-error" hidden></p>
+          <p class="error" id="retention-error" role="alert" hidden></p>
         </form>
       </section>
 
@@ -476,7 +476,7 @@
           </div>
           <button type="submit">Save</button>
           <span id="quotas-note" class="muted"></span>
-          <p class="error" id="quotas-error" hidden></p>
+          <p class="error" id="quotas-error" role="alert" hidden></p>
         </form>
       </section>
 

@@ -117,6 +117,7 @@ async function refreshAutomationTokens() {
   } catch (error) {
     const message = document.createElement('p');
     message.className = 'error';
+    message.setAttribute('role', 'alert');
     message.textContent = error.message;
     $('automation-tokens').replaceChildren(message);
   }
@@ -637,6 +638,7 @@ async function refreshLibrary() {
     if (generation !== libraryRequestGeneration) return;
     const message = document.createElement('p');
     message.className = 'error';
+    message.setAttribute('role', 'alert');
     message.textContent = error.message;
     $('library-files').replaceChildren(message);
   }

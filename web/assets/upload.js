@@ -555,7 +555,9 @@ function renderNote() {
 }
 
 function setMeter(fraction) {
-  $('meter-fill').style.width = `${Math.min(100, Math.round(fraction * 100))}%`;
+  const percent = Math.min(100, Math.round(fraction * 100));
+  $('meter-fill').style.width = `${percent}%`;
+  $('meter').setAttribute('aria-valuenow', String(percent));
 }
 
 

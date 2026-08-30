@@ -48,8 +48,11 @@ function buildNav(session) {
     const link = document.createElement('a');
     link.href = href;
     link.textContent = label;
-    if (window.location.pathname === href || (href === '/receive' && window.location.pathname === '/links')) {
+    const active = window.location.pathname === href
+      || (href === '/receive' && window.location.pathname === '/links');
+    if (active) {
       link.classList.add('active');
+      link.setAttribute('aria-current', 'page');
     }
     nav.append(link);
   }

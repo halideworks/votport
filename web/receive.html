@@ -15,7 +15,7 @@
           <div class="brand-square"><img src="/assets/pommern_ship_white.png" alt="" /></div>
           <span class="wordmark">VOTPort</span>
         </div>
-        <select id="tenant-switcher" hidden></select>
+        <select id="tenant-switcher" aria-label="Tenant" hidden></select>
       </header>
       <div class="bar">
         <nav id="nav" class="nav"></nav>
@@ -46,7 +46,7 @@
         </div>
         <label><input id="create-notify-on-upload" name="notify_on_upload" type="checkbox" /> Notify when an upload completes</label>
         <button type="submit">Issue request</button>
-        <p class="error" id="create-error" hidden></p>
+        <p class="error" id="create-error" role="alert" hidden></p>
       </form>
 
       <div id="new-link" class="card ok" hidden>
