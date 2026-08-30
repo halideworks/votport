@@ -53,7 +53,7 @@ test('one upload batch validates paths and reports per-file progress', () => {
   assert.match(deliverScript, /files complete/);
   assert.match(deliverScript, /if \(completedUploads > 0\) \{\s+await refreshLibrary\(\)/);
   assert.match(deliverScript, /\$\{error\.message\} \$\{completedUploads\} of \$\{uploads\.length\} files added\./);
-  assert.match(deliverScript, /await refreshLibrary\(\)/);
+  assert.match(deliverScript, /await refreshLibrary\(\);\s+\$\('library-status'\)\.textContent = `\$\{uploads\.length\}/);
 });
 
 test('upload batches cap concurrency and wait for running work after failure', async () => {
