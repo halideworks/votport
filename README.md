@@ -265,13 +265,13 @@ newer).
 
 ### Automation shares
 
-Create a tenant-scoped automation token on **Links**. The raw token is shown
+Create a tenant-scoped automation token on **Deliver**. The raw token is shown
 once, so copy it immediately; revoke it and create another if it is lost.
 Use the token to share a server-relative outbound directory from the CLI:
 
 ```sh
 export VOTPORT_URL=https://drop.example.com
-export VOTPORT_AUTOMATION_TOKEN='<token from Links>'
+export VOTPORT_AUTOMATION_TOKEN='<token from Deliver>'
 # Optional password for the outbound link:
 export VOTPORT_SHARE_PASSWORD='use-a-separate-secret'
 votport share project/render --expires 7d --label "Client delivery" --max-downloads 1
