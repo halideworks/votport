@@ -1165,6 +1165,7 @@ pub fn router(app: Arc<App>) -> Router {
             "/api/admin/tenants",
             get(api::list_tenants).post(api::create_tenant),
         )
+        .route("/api/admin/principals", get(api::list_principals))
         .route(
             "/api/admin/settings",
             get(api::get_settings).put(api::put_settings),

@@ -20,6 +20,8 @@ use super::{cookie_attributes, ApiError, ApiResult};
 
 const ADMIN_COOKIE: &str = "votport_admin";
 const MAX_PASSWORD_BYTES: usize = 256;
+const PRINCIPAL_PAGE_DEFAULT: usize = 50;
+const PRINCIPAL_PAGE_MAX: usize = 100;
 
 /// Credential tag bound into admin token MACs: the stored hash when the
 /// UI has set one, else the stable tag derived from the environment
@@ -454,9 +456,90 @@ pub async fn list_tenants(
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     let _identity = require_platform_admin(&app, &headers)?;
+    let (principals, total) = app
+        .store
+        .principals_page(PRINCIPAL_PAGE_DEFAULT, 0, None)
+        .map_err(super::store_unavailable)?;
     Ok(Json(json!({
         "tenants": app.store.tenants().map_err(super::store_unavailable)?,
-        "principals": app.store.principals().map_err(super::store_unavailable)?,
+        "principals": principals,
+        "principals_truncated": total > PRINCIPAL_PAGE_DEFAULT as u64,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct PrincipalsQuery {
+    limit: Option<String>,
+    offset: Option<String>,
+    q: Option<String>,
+}
+
+pub async fn list_principals(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Query(query): Query<PrincipalsQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let _identity = require_platform_admin(&app, &headers)?;
+    let limit = query
+        .limit
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "limit must be an integer between 1 and 100",
+            )
+        })?
+        .unwrap_or(PRINCIPAL_PAGE_DEFAULT);
+    if !(1..=PRINCIPAL_PAGE_MAX).contains(&limit) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "limit must be between 1 and 100",
+        ));
+    }
+    let offset = query
+        .offset
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "offset must be a non-negative integer",
+            )
+        })?
+        .unwrap_or(0usize);
+    if i64::try_from(offset).is_err() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "offset is too large",
+        ));
+    }
+    let query = query.q.filter(|value| !value.is_empty());
+    if query
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > 100)
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "q must be at most 100 characters",
+        ));
+    }
+    let (principals, total) = app
+        .store
+        .principals_page(limit, offset, query.as_deref())
+        .map_err(super::store_unavailable)?;
+    let has_more = u64::try_from(offset)
+        .unwrap_or(u64::MAX)
+        .saturating_add(principals.len() as u64)
+        < total;
+    Ok(Json(json!({
+        "principals": principals,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "has_more": has_more,
     })))
 }
 
@@ -4873,6 +4956,101 @@ mod principals_api_tests {
         assert_eq!(principals[0]["credential_version"], 1);
         assert_eq!(principals[0]["last_groups"][0], "employees");
         assert_eq!(principals[0]["source"], "sso");
+    }
+
+    #[tokio::test]
+    async fn principal_page_is_platform_only_and_validates_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .upsert_sso_principal("Alice%literal", &[], &json!([]))
+            .unwrap();
+        let named = cookie_for(
+            &application,
+            auth::AdminIdentity {
+                subject: "named-admin".to_owned(),
+                tenant: "acme".to_owned(),
+                role: "admin".to_owned(),
+                grants: vec![TenantGrant {
+                    tenant: "acme".to_owned(),
+                    role: "admin".to_owned(),
+                }],
+                credential_version: 1,
+            },
+        );
+        let (status, _, _) = send(
+            application.clone(),
+            Request::get("/api/admin/principals")
+                .header("cookie", &named)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let platform = platform_cookie(&application);
+        let (status, json, _) = send(
+            application.clone(),
+            Request::get("/api/admin/principals?limit=1&q=%25literal")
+                .header("cookie", &platform)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["total"], 1);
+        assert_eq!(json["principals"][0]["subject"], "Alice%literal");
+
+        for uri in [
+            "/api/admin/principals?limit=0",
+            "/api/admin/principals?limit=101",
+            "/api/admin/principals?offset=-1",
+        ] {
+            let (status, _, _) = send(
+                application.clone(),
+                Request::get(uri)
+                    .header("cookie", &platform)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
+        }
+        let long_query = "a".repeat(101);
+        let (status, _, _) = send(
+            application,
+            Request::get(format!("/api/admin/principals?q={long_query}"))
+                .header("cookie", &platform)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn legacy_tenant_principals_are_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        for index in 0..51 {
+            application
+                .store
+                .upsert_sso_principal(&format!("user-{index:02}"), &[], &json!([]))
+                .unwrap();
+        }
+        let platform = platform_cookie(&application);
+        let (status, json, _) = send(
+            application,
+            Request::get("/api/admin/tenants")
+                .header("cookie", &platform)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["principals"].as_array().unwrap().len(), 50);
+        assert_eq!(json["principals_truncated"], true);
     }
 
     #[tokio::test]

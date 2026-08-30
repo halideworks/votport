@@ -1390,15 +1390,36 @@ impl Store {
         })
     }
 
-    pub fn principals(&self) -> Result<Vec<Principal>, String> {
+    pub fn principals_page(
+        &self,
+        limit: usize,
+        offset: usize,
+        query: Option<&str>,
+    ) -> Result<(Vec<Principal>, u64), String> {
+        let limit = i64::try_from(limit).map_err(|_| "principal limit overflow".to_owned())?;
+        let offset = i64::try_from(offset).map_err(|_| "principal offset overflow".to_owned())?;
+        let query = query.map(|value| format!("%{}%", escape_like(value)));
         self.with(|connection| {
+            let total = connection.query_row(
+                "SELECT COUNT(*) FROM principals
+                 WHERE (?1 IS NULL OR subject LIKE ?1 ESCAPE '\\' COLLATE NOCASE)",
+                rusqlite::params![query.as_deref()],
+                |row| row.get::<_, i64>(0),
+            )?;
             let mut statement = connection.prepare(
                 "SELECT subject, credential_version, blocked, last_login_at,
                         last_groups, last_grants, source
-                 FROM principals ORDER BY last_login_at DESC, subject",
+                 FROM principals
+                 WHERE (?1 IS NULL OR subject LIKE ?1 ESCAPE '\\' COLLATE NOCASE)
+                 ORDER BY last_login_at DESC, subject ASC
+                 LIMIT ?2 OFFSET ?3",
             )?;
-            let rows = statement.query_map([], map_principal)?;
-            rows.collect::<Result<Vec<_>, _>>()
+            let rows =
+                statement.query_map(rusqlite::params![query, limit, offset], map_principal)?;
+            Ok((
+                rows.collect::<Result<Vec<_>, _>>()?,
+                u64::try_from(total).unwrap_or(0),
+            ))
         })
     }
 
@@ -5093,7 +5114,7 @@ mod settings_tests {
         }
         let store = Store::open(directory.path()).unwrap();
         assert_eq!(schema_version(directory.path()), "14");
-        assert!(store.principals().unwrap().is_empty());
+        assert!(store.principals_page(50, 0, None).unwrap().0.is_empty());
         assert!(store.principal("nobody").unwrap().is_none());
     }
 
@@ -5503,5 +5524,45 @@ mod principals_store_tests {
             .unwrap();
         assert!(store.principal("user@example.com").is_err());
         assert!(!store.principal_allows("user@example.com", 2));
+    }
+
+    #[test]
+    fn principals_page_searches_literally_and_orders_stably() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        for subject in ["Alice%literal", "alice_literal", "aliceXliteral"] {
+            store
+                .upsert_sso_principal(subject, &[], &serde_json::json!([]))
+                .unwrap();
+        }
+        store
+            .with(|connection| connection.execute("UPDATE principals SET last_login_at = 0", []))
+            .unwrap();
+
+        let (page, total) = store.principals_page(2, 0, Some("%literal")).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].subject, "Alice%literal");
+
+        let (page, total) = store.principals_page(2, 0, Some("_literal")).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(page[0].subject, "alice_literal");
+
+        let (page, total) = store.principals_page(2, 0, Some("ALICEXLITERAL")).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(page[0].subject, "aliceXliteral");
+
+        let (page, total) = store.principals_page(2, 0, None).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(
+            page.iter()
+                .map(|item| item.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["Alice%literal", "aliceXliteral"]
+        );
+        let (page, total) = store.principals_page(2, 2, None).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].subject, "alice_literal");
     }
 }

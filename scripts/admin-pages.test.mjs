@@ -9,6 +9,7 @@ const tenants = await readFile(new URL('../web/tenants.html', import.meta.url), 
 const system = await readFile(new URL('../web/system.html', import.meta.url), 'utf8');
 const receiveScript = await readFile(new URL('../web/assets/page-receive.js', import.meta.url), 'utf8');
 const deliverScript = await readFile(new URL('../web/assets/page-deliver.js', import.meta.url), 'utf8');
+const tenantsScript = await readFile(new URL('../web/assets/page-tenants.js', import.meta.url), 'utf8');
 const commonScript = await readFile(new URL('../web/assets/admin-common.js', import.meta.url), 'utf8');
 const style = await readFile(new URL('../web/assets/style.css', import.meta.url), 'utf8');
 
@@ -45,4 +46,14 @@ test('admin navigation exposes the current page and tenant selector', () => {
   for (const page of [receive, deliver, audit, tenants, system]) {
     assert.match(page, /<select id="tenant-switcher" aria-label="Tenant" hidden>/);
   }
+});
+
+test('tenant principals use a bounded searchable page', () => {
+  assert.match(tenants, /id="principal-search"[^>]+maxlength="100"/);
+  assert.match(tenants, /id="principal-load-more"[^>]+hidden/);
+  assert.match(tenantsScript, /api\(`\/api\/admin\/principals\?\$\{params\}`\)/);
+  assert.match(tenantsScript, /limit: String\(PRINCIPAL_PAGE_SIZE\)/);
+  assert.match(tenantsScript, /setTimeout\([\s\S]*refreshPrincipals\(true\)[\s\S]*200/);
+  assert.match(tenantsScript, /principalRows\.concat\(page\.principals\)/);
+  assert.match(tenantsScript, /refreshPrincipals\(true\)/);
 });

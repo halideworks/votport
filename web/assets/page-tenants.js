@@ -11,6 +11,14 @@ import {
 } from '/assets/admin-common.js';
 
 const $ = (id) => document.getElementById(id);
+const PRINCIPAL_PAGE_SIZE = 50;
+let principalRows = [];
+let principalOffset = 0;
+let principalHasMore = false;
+let principalTotal = 0;
+let principalLoading = false;
+let principalReloadPending = false;
+let principalSearchTimer;
 
 function button(text, classes, onClick) {
   const element = document.createElement('button');
@@ -222,7 +230,7 @@ function renderPrincipal(principal) {
           method: 'POST',
           body: JSON.stringify({ subject: principal.subject }),
         });
-        await refreshTenants();
+        await refreshPrincipals(true);
       }),
     );
   } else {
@@ -240,7 +248,7 @@ function renderPrincipal(principal) {
           method: 'POST',
           body: JSON.stringify({ subject: principal.subject }),
         });
-        await refreshTenants();
+        await refreshPrincipals(true);
       }),
     );
   }
@@ -249,7 +257,7 @@ function renderPrincipal(principal) {
 }
 
 async function refreshTenants() {
-  const [{ tenants, principals }, { holdings }] = await Promise.all([
+  const [{ tenants }, { holdings }] = await Promise.all([
     api('/api/admin/tenants'),
     api('/api/admin/holdings'),
   ]);
@@ -267,17 +275,63 @@ async function refreshTenants() {
     }
   }
 
+}
+
+function renderPrincipals() {
   const list = $('principals');
+  const filtered = $('principal-search').value.trim() !== '';
   list.replaceChildren();
-  if (!principals || !principals.length) {
+  if (!principalRows.length) {
     const empty = document.createElement('p');
     empty.className = 'muted';
-    empty.textContent = 'No SSO principals have signed in yet.';
+    empty.textContent = filtered
+      ? 'No matching principals.'
+      : 'No SSO principals have signed in yet.';
     list.append(empty);
+  } else {
+    for (const principal of principalRows) {
+      list.append(renderPrincipal(principal));
+    }
+  }
+  $('principal-count').textContent = `Showing ${principalRows.length} of ${principalTotal} ${filtered ? 'matches' : 'principals'}`;
+  $('principal-load-more').hidden = !principalHasMore;
+  $('principal-load-more').disabled = principalLoading;
+}
+
+async function refreshPrincipals(reset = false) {
+  if (principalLoading) {
+    principalReloadPending ||= reset;
     return;
   }
-  for (const principal of principals) {
-    list.append(renderPrincipal(principal));
+  if (reset) {
+    principalRows = [];
+    principalOffset = 0;
+    principalTotal = 0;
+    principalHasMore = false;
+    renderPrincipals();
+  }
+  principalLoading = true;
+  $('principal-load-more').disabled = true;
+  try {
+    const params = new URLSearchParams({
+      limit: String(PRINCIPAL_PAGE_SIZE),
+      offset: String(principalOffset),
+    });
+    const search = $('principal-search').value.trim();
+    if (search) params.set('q', search);
+    const page = await api(`/api/admin/principals?${params}`);
+    principalRows = reset ? page.principals : principalRows.concat(page.principals);
+    principalOffset += page.principals.length;
+    principalHasMore = page.has_more;
+    principalTotal = page.total;
+    renderPrincipals();
+  } finally {
+    principalLoading = false;
+    $('principal-load-more').disabled = !principalHasMore;
+    if (principalReloadPending) {
+      principalReloadPending = false;
+      refreshPrincipals(true).catch((error) => alertModal(error.message));
+    }
   }
 }
 
@@ -307,6 +361,16 @@ $('tenant-form').addEventListener('submit', async (event) => {
   }
 });
 
+$('principal-search').addEventListener('input', () => {
+  clearTimeout(principalSearchTimer);
+  principalSearchTimer = setTimeout(
+    () => refreshPrincipals(true).catch((error) => alertModal(error.message)),
+    200,
+  );
+});
+$('principal-load-more').addEventListener('click', () =>
+  refreshPrincipals().catch((error) => alertModal(error.message)),
+);
 const session = await requireSession();
 // The page itself is hidden from non-platform admins by the nav; direct
 // navigation gets bounced to their home.
@@ -314,3 +378,4 @@ if (!session.pages.includes('tenants')) {
   window.location.replace('/receive');
 }
 await refreshTenants();
+await refreshPrincipals(true);
