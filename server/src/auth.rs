@@ -246,6 +246,48 @@ pub fn verify_link_token(secret: &[u8; 32], link_id: &str, phc: &str, token: &st
     )
 }
 
+/// Issues a short-lived cookie proving that one logical download of one file
+/// in the current grant-token generation has already been counted.
+pub fn issue_download_lease(
+    secret: &[u8; 32],
+    grant_id: &str,
+    token_hash: &str,
+    file_index: usize,
+    lifetime_secs: u64,
+) -> String {
+    let index = file_index.to_string();
+    issue_token(
+        secret,
+        &[
+            b"votport-download-lease",
+            grant_id.as_bytes(),
+            token_hash.as_bytes(),
+            index.as_bytes(),
+        ],
+        lifetime_secs,
+    )
+}
+
+pub fn verify_download_lease(
+    secret: &[u8; 32],
+    grant_id: &str,
+    token_hash: &str,
+    file_index: usize,
+    token: &str,
+) -> bool {
+    let index = file_index.to_string();
+    verify_token(
+        secret,
+        &[
+            b"votport-download-lease",
+            grant_id.as_bytes(),
+            token_hash.as_bytes(),
+            index.as_bytes(),
+        ],
+        token,
+    )
+}
+
 pub fn hex_encode(bytes: &[u8]) -> String {
     hex::encode(bytes)
 }

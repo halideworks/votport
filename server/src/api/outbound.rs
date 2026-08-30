@@ -16,7 +16,7 @@ use futures_util::StreamExt as _;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncSeekExt as _, ReadBuf, SeekFrom};
 use tokio_util::io::ReaderStream;
 use vot_receipt::SubjectKind;
 use vot_sdk::object::{InMemoryObjectBuilder, ObjectId, Suite};
@@ -37,6 +37,7 @@ const CHUNK: usize = 1024 * 1024;
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
 const MAX_PASSWORD_BYTES: usize = 256;
 const MAX_AUTOMATION_LABEL_CHARS: usize = 100;
+const DOWNLOAD_LEASE_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Deserialize)]
 pub struct OutboundPathQuery {
@@ -1132,6 +1133,14 @@ pub async fn outbound_file(
     outbound_file_inner(app, headers, token, 0).await
 }
 
+pub async fn outbound_file_head(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    AxumPath(token): AxumPath<String>,
+) -> ApiResult<Response> {
+    outbound_file_head_inner(app, headers, token, 0).await
+}
+
 pub async fn outbound_file_indexed(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -1140,13 +1149,21 @@ pub async fn outbound_file_indexed(
     outbound_file_inner(app, headers, token, index).await
 }
 
+pub async fn outbound_file_indexed_head(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    AxumPath((token, index)): AxumPath<(String, usize)>,
+) -> ApiResult<Response> {
+    outbound_file_head_inner(app, headers, token, index).await
+}
+
 async fn outbound_file_inner(
     app: Arc<App>,
     headers: HeaderMap,
     token: String,
     index: usize,
 ) -> ApiResult<Response> {
-    let grant = active_grant(&app, &token)?;
+    let (grant, leased) = active_download_grant(&app, &token, index, &headers)?;
     require_grant_access(&app, &grant, &headers)?;
     if !app.outbound_rate.allow(&grant.token_hash) {
         return Err(ApiError::new(
@@ -1154,12 +1171,34 @@ async fn outbound_file_inner(
             "too many downloads; try again later",
         ));
     }
-    let active = ActiveDownload::claim(Arc::clone(&app), &format!("{}:{index}", grant.token_hash))?;
+    let source = source_info_indexed(&app, &grant, index)?;
+    let range = requested_range(&headers, &source.object)?;
+    let active = if leased {
+        ActiveDownload::claim_with_grant(
+            Arc::clone(&app),
+            &format!("{}:{index}:{}", grant.token_hash, auth::random_token()),
+            &grant.token_hash,
+        )?
+    } else {
+        ActiveDownload::claim(Arc::clone(&app), &format!("{}:{index}", grant.token_hash))?
+    };
     let (stage, source, _receipt) = prepare(&app, &grant, index).await?;
-    let file = tokio::fs::File::open(&stage.path)
+    let mut file = tokio::fs::File::open(&stage.path)
         .await
         .map_err(|_| ApiError::internal("open staged file failed"))?;
-    record_download(&app, &grant, &[index])?;
+    if let Some((start, _end)) = range {
+        file.seek(SeekFrom::Start(start))
+            .await
+            .map_err(|_| ApiError::internal("seek staged file failed"))?;
+    }
+    if !leased {
+        record_download(&app, &grant, &[index])?;
+    }
+    let length = range.map_or(source.object.length, |(start, end)| end - start + 1);
+    let file = match range {
+        Some((start, end)) => file.take(end - start + 1),
+        None => file.take(source.object.length),
+    };
     let stream = ReaderStream::with_capacity(
         OutboundReader {
             file,
@@ -1170,6 +1209,49 @@ async fn outbound_file_inner(
     );
     let filename = safe_filename(&source.name);
     let mut response = Body::from_stream(stream).into_response();
+    add_file_headers(&mut response, &source, filename, length, range)?;
+    if range.is_some() {
+        *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+    }
+    if !leased {
+        issue_download_lease(&app, &grant, &token, index, &mut response);
+    }
+    Ok(response)
+}
+
+async fn outbound_file_head_inner(
+    app: Arc<App>,
+    headers: HeaderMap,
+    token: String,
+    index: usize,
+) -> ApiResult<Response> {
+    let (grant, _leased) = active_download_grant(&app, &token, index, &headers)?;
+    require_grant_access(&app, &grant, &headers)?;
+    if !app.outbound_rate.allow(&grant.token_hash) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many downloads; try again later",
+        ));
+    }
+    let source = source_info_indexed(&app, &grant, index)?;
+    let mut response = Body::empty().into_response();
+    add_file_headers(
+        &mut response,
+        &source,
+        safe_filename(&source.name),
+        source.object.length,
+        None,
+    )?;
+    Ok(response)
+}
+
+fn add_file_headers(
+    response: &mut Response,
+    source: &Source,
+    filename: String,
+    length: u64,
+    range: Option<(u64, u64)>,
+) -> ApiResult<()> {
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
@@ -1179,18 +1261,123 @@ async fn outbound_file_inner(
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
         .headers_mut()
-        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("none"));
+        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(length));
     response.headers_mut().insert(
-        header::CONTENT_LENGTH,
-        HeaderValue::from(source.object.length),
+        header::ETAG,
+        HeaderValue::try_from(etag(&source.object))
+            .map_err(|_| ApiError::internal("download etag invalid"))?,
     );
+    if let Some((start, end)) = range {
+        response.headers_mut().insert(
+            header::CONTENT_RANGE,
+            HeaderValue::try_from(format!("bytes {start}-{end}/{}", source.object.length))
+                .map_err(|_| ApiError::internal("download range invalid"))?,
+        );
+    }
     let disposition = format!("attachment; filename=\"{filename}\"");
     response.headers_mut().insert(
         header::CONTENT_DISPOSITION,
         HeaderValue::try_from(disposition)
             .map_err(|_| ApiError::internal("download filename invalid"))?,
     );
-    Ok(response)
+    Ok(())
+}
+
+fn requested_range(headers: &HeaderMap, object: &ObjectId) -> ApiResult<Option<(u64, u64)>> {
+    let mut values = headers.get_all(header::RANGE).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(range_not_satisfiable(object.length));
+    }
+    let etag = etag(object);
+    if let Some(value) = headers.get(header::IF_RANGE) {
+        if value.to_str().ok() != Some(etag.as_str()) {
+            return Ok(None);
+        }
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| range_not_satisfiable(object.length))?;
+    let range =
+        parse_range(value, object.length).ok_or_else(|| range_not_satisfiable(object.length))?;
+    Ok(Some(range))
+}
+
+fn parse_range(value: &str, length: u64) -> Option<(u64, u64)> {
+    let (unit, spec) = value.split_once('=')?;
+    if !unit.eq_ignore_ascii_case("bytes") || spec.is_empty() || spec.contains(',') || length == 0 {
+        return None;
+    }
+    let (start, end) = spec.split_once('-')?;
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        let first = length.saturating_sub(suffix);
+        return Some((first, length - 1));
+    }
+    let first = start.parse::<u64>().ok()?;
+    if first >= length {
+        return None;
+    }
+    if end.is_empty() {
+        return Some((first, length - 1));
+    }
+    let last = end.parse::<u64>().ok()?;
+    if last < first {
+        return None;
+    }
+    Some((first, last.min(length - 1)))
+}
+
+fn range_not_satisfiable(length: u64) -> ApiError {
+    let mut error = ApiError::new(
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        format!("bytes */{length}"),
+    );
+    error.content_range = Some(format!("bytes */{length}"));
+    error
+}
+
+fn etag(object: &ObjectId) -> String {
+    format!(
+        "\"votport-{}-{}-{}\"",
+        object.suite,
+        hex::encode(object.root),
+        object.length
+    )
+}
+
+fn issue_download_lease(
+    app: &App,
+    grant: &OutboundGrant,
+    token: &str,
+    index: usize,
+    response: &mut Response,
+) {
+    let lifetime = grant
+        .expires_at
+        .saturating_sub(now_unix())
+        .min(DOWNLOAD_LEASE_SECS);
+    if lifetime == 0 {
+        return;
+    }
+    let value =
+        auth::issue_download_lease(&app.secret, &grant.id, &grant.token_hash, index, lifetime);
+    let cookie = format!(
+        "{}={value}; Path=/api/s/{token}; HttpOnly; SameSite=Lax; Max-Age={lifetime}{}",
+        download_lease_cookie_name(&grant.id, index),
+        super::cookie_attributes(app)
+    );
+    if let Ok(value) = HeaderValue::try_from(cookie) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
 }
 
 pub async fn outbound_bundle(
@@ -1297,6 +1484,42 @@ fn active_grant(app: &App, token: &str) -> ApiResult<OutboundGrant> {
     Ok(grant)
 }
 
+fn active_download_grant(
+    app: &App,
+    token: &str,
+    index: usize,
+    headers: &HeaderMap,
+) -> ApiResult<(OutboundGrant, bool)> {
+    if !valid_token(token) {
+        return Err(ApiError::not_found());
+    }
+    let grant = app
+        .store
+        .outbound_grant_by_token_hash(&hash_token(token))
+        .map_err(super::store_unavailable)?
+        .ok_or_else(ApiError::not_found)?;
+    if grant.revoked_at.is_some() || grant.expires_at <= now_unix() {
+        return Err(ApiError::not_found());
+    }
+    let leased = download_lease_authorized(app, &grant, index, headers);
+    if !leased && grant_is_exhausted(&grant, index) {
+        return Err(ApiError::not_found());
+    }
+    Ok((grant, leased))
+}
+
+fn grant_is_exhausted(grant: &OutboundGrant, index: usize) -> bool {
+    let Some(max) = grant.max_downloads else {
+        return false;
+    };
+    grant
+        .files
+        .get(index)
+        .map_or(grant.files.is_empty() && grant.downloads >= max, |file| {
+            file.downloads >= max
+        })
+}
+
 fn record_download(
     app: &Arc<App>,
     grant: &OutboundGrant,
@@ -1323,6 +1546,27 @@ fn record_download(
 
 fn grant_cookie_name(grant_id: &str) -> String {
     format!("votport_s_{grant_id}")
+}
+
+fn download_lease_cookie_name(grant_id: &str, index: usize) -> String {
+    format!("votport_d_{grant_id}_{index}")
+}
+
+fn download_lease_authorized(
+    app: &App,
+    grant: &OutboundGrant,
+    index: usize,
+    headers: &HeaderMap,
+) -> bool {
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| {
+            auth::cookie_value(cookies, &download_lease_cookie_name(&grant.id, index))
+        })
+        .is_some_and(|value| {
+            auth::verify_download_lease(&app.secret, &grant.id, &grant.token_hash, index, value)
+        })
 }
 
 fn grant_authorized(app: &App, grant: &OutboundGrant, headers: &HeaderMap) -> bool {
@@ -1693,11 +1937,15 @@ struct ActiveDownload {
 }
 impl ActiveDownload {
     fn claim(app: Arc<App>, key: &str) -> ApiResult<Self> {
+        let grant = key.rsplit_once(':').map_or(key, |(grant, _)| grant);
+        Self::claim_with_grant(app, key, grant)
+    }
+
+    fn claim_with_grant(app: Arc<App>, key: &str, grant: &str) -> ApiResult<Self> {
         let mut active = app
             .outbound_active
             .lock()
             .expect("outbound active poisoned");
-        let grant = key.rsplit_once(':').map_or(key, |(grant, _)| grant);
         if active.contains(key)
             || active.len() >= MAX_ACTIVE
             || active
@@ -1745,12 +1993,12 @@ impl Drop for StagedFile {
     }
 }
 
-struct OutboundReader {
-    file: tokio::fs::File,
+struct OutboundReader<R> {
+    file: R,
     _stage: StagedFile,
     _active: ActiveDownload,
 }
-impl AsyncRead for OutboundReader {
+impl<R: AsyncRead + Unpin> AsyncRead for OutboundReader<R> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -1887,6 +2135,28 @@ mod tests {
         assert_ne!(hash_token("a"), "a");
     }
     #[test]
+    fn byte_ranges_support_all_single_range_forms() {
+        assert_eq!(parse_range("bytes=2-4", 10), Some((2, 4)));
+        assert_eq!(parse_range("bytes=2-", 10), Some((2, 9)));
+        assert_eq!(parse_range("bytes=-3", 10), Some((7, 9)));
+        assert_eq!(parse_range("bytes=-99", 10), Some((0, 9)));
+        assert_eq!(parse_range("BYTES=0-99", 10), Some((0, 9)));
+    }
+    #[test]
+    fn byte_ranges_reject_malformed_and_unsatisfiable_values() {
+        for value in [
+            "bytes=",
+            "bytes=1-2,4-5",
+            "bytes=abc-2",
+            "bytes=2-1",
+            "bytes=10-",
+            "bytes=-0",
+        ] {
+            assert_eq!(parse_range(value, 10), None, "{value}");
+        }
+        assert_eq!(parse_range("bytes=0-", 0), None);
+    }
+    #[test]
     fn automation_share_rate_is_bounded_per_ip() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
@@ -1956,6 +2226,18 @@ mod tests {
         assert!(ActiveDownload::claim(Arc::clone(&app), "grant:0").is_err());
         drop(active);
         assert!(ActiveDownload::claim(Arc::clone(&app), "grant:4").is_ok());
+    }
+
+    #[test]
+    fn leased_ranges_can_run_alongside_one_unleased_file_download() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let first = ActiveDownload::claim(Arc::clone(&app), "grant:0").unwrap();
+        let leased =
+            ActiveDownload::claim_with_grant(Arc::clone(&app), "grant:0:lease-unique", "grant")
+                .unwrap();
+        assert!(ActiveDownload::claim(Arc::clone(&app), "grant:0").is_err());
+        drop((first, leased));
     }
 
     #[tokio::test]
@@ -2093,6 +2375,268 @@ mod tests {
                 StatusCode::NOT_FOUND
             );
         }
+    }
+
+    #[tokio::test]
+    async fn resumable_downloads_count_once_and_head_does_not_stage() {
+        let (_directory, app, cookie, expected_bytes) = fixture().await;
+        let created = body(
+            crate::app::router(app.clone())
+                .oneshot(
+                    Request::post("/api/admin/outbound-grants")
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7,"max_downloads":1}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
+        let head = crate::app::router(app.clone())
+            .oneshot(
+                Request::head(format!("/api/s/{token}/file"))
+                    .header(header::RANGE, "bytes=0-6")
+                    .header(header::IF_RANGE, "\"not-the-etag\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(
+            head.headers()[header::CONTENT_LENGTH],
+            expected_bytes.len().to_string()
+        );
+        assert!(head.headers().get(header::SET_COOKIE).is_none());
+        assert!(!app.config.data_dir.join("outbound.stage").exists());
+
+        let first = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/file"))
+                    .header(header::RANGE, "bytes=0-6")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(first.headers()[header::CONTENT_RANGE], "bytes 0-6/16");
+        assert_eq!(first.headers()[header::CONTENT_LENGTH], "7");
+        assert_eq!(first.headers()[header::ACCEPT_RANGES], "bytes");
+        let etag = first.headers()[header::ETAG].to_str().unwrap().to_owned();
+        let lease = first.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        assert!(first.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .contains("HttpOnly"));
+        assert!(first.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .contains("SameSite=Lax"));
+        assert!(first.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .contains("Secure"));
+        assert_eq!(
+            first.into_body().collect().await.unwrap().to_bytes(),
+            &expected_bytes[..7]
+        );
+
+        let second = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/file"))
+                    .header(header::RANGE, "bytes=7-")
+                    .header(header::IF_RANGE, etag)
+                    .header(header::COOKIE, &lease)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(second.headers()[header::CONTENT_RANGE], "bytes 7-15/16");
+        assert_eq!(
+            second.into_body().collect().await.unwrap().to_bytes(),
+            &expected_bytes[7..]
+        );
+
+        let exhausted = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/file"))
+                    .header(header::RANGE, "bytes=7-15")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exhausted.status(), StatusCode::NOT_FOUND);
+        let invalid_lease = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/file"))
+                    .header(header::COOKIE, "votport_d_invalid=forged")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_lease.status(), StatusCode::NOT_FOUND);
+
+        let id = created["grant"]["id"].as_str().unwrap();
+        let rotated = crate::app::router(app.clone())
+            .oneshot(
+                Request::patch(format!("/api/admin/outbound-grants/{id}"))
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"rotate":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rotated.status(), StatusCode::OK);
+        let old_lease_after_rotation = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/file"))
+                    .header(header::COOKIE, &lease)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(old_lease_after_rotation.status(), StatusCode::NOT_FOUND);
+
+        let created = body(
+            crate::app::router(app.clone())
+                .oneshot(
+                    Request::post("/api/admin/outbound-grants")
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let revoke_token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
+        let first = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{revoke_token}/file"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let revoke_lease = first.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let revoke_id = created["grant"]["id"].as_str().unwrap();
+        let revoke = crate::app::router(app.clone())
+            .oneshot(
+                Request::delete(format!("/api/admin/outbound-grants/{revoke_id}"))
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoke.status(), StatusCode::OK);
+        let old_lease_after_revoke = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{revoke_token}/file"))
+                    .header(header::COOKIE, revoke_lease)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(old_lease_after_revoke.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn range_errors_and_if_range_mismatch_are_safe() {
+        let (_directory, app, cookie, expected_bytes) = fixture().await;
+        let created = body(
+            crate::app::router(app.clone())
+                .oneshot(
+                    Request::post("/api/admin/outbound-grants")
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
+        for value in ["bytes=0-1,2-3", "bytes=99-", "bytes=3-2"] {
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::get(format!("/api/s/{token}/file"))
+                        .header(header::RANGE, value)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+            assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes */16");
+        }
+        let mut multiple = Request::get(format!("/api/s/{token}/file"))
+            .body(Body::empty())
+            .unwrap();
+        multiple
+            .headers_mut()
+            .append(header::RANGE, HeaderValue::from_static("bytes=0-1"));
+        multiple
+            .headers_mut()
+            .append(header::RANGE, HeaderValue::from_static("bytes=2-3"));
+        let multiple = crate::app::router(app.clone())
+            .oneshot(multiple)
+            .await
+            .unwrap();
+        assert_eq!(multiple.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(multiple.headers()[header::CONTENT_RANGE], "bytes */16");
+        let full = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/file"))
+                    .header(header::RANGE, "bytes=0-1")
+                    .header(header::IF_RANGE, "\"wrong\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(full.headers()[header::CONTENT_LENGTH], "16");
+        assert!(full.headers().get(header::CONTENT_RANGE).is_none());
+        assert_eq!(
+            full.into_body().collect().await.unwrap().to_bytes(),
+            expected_bytes
+        );
     }
 
     #[tokio::test]
