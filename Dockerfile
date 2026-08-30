@@ -6,9 +6,8 @@
 #   2. compile the votport server
 #   3. slim runtime image
 
-# Pinned to the version CI tests against; rust-version in Cargo.toml only
-# guards older toolchains, so a floating tag would let production drift.
-FROM rust:1.97 AS build
+# Pin the production-resolved toolchain and runtime inputs.
+FROM rust:1.97@sha256:b1b3c9c0d921d7fa0a6d1f9ec7e4eab87f8c8ec97644c3d791450f131dec813f AS build
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends clang cmake \
@@ -40,8 +39,14 @@ RUN touch /src/server/src/main.rs /src/server/src/lib.rs \
     && cd /src/server \
     && cargo build --release --locked
 
-FROM debian:stable-slim
+FROM debian:stable-slim@sha256:04634311a8d5fc442b6eb06d792293c4f3e2268652ca7634e00ce8ef5cc0a28a
 # curl exists only for the healthcheck.
+ARG VOTPORT_VERSION=dev
+ARG VOTPORT_REVISION=unknown
+LABEL org.opencontainers.image.version="$VOTPORT_VERSION" \
+      org.opencontainers.image.revision="$VOTPORT_REVISION" \
+      org.opencontainers.image.source="https://github.com/halideworks/votport" \
+      org.opencontainers.image.licenses="LicenseRef-VOTPort-Proprietary"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/* \
