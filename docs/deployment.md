@@ -341,8 +341,11 @@ values.
 `GET /metrics` serves Prometheus-format counters and gauges (tenants, links,
 received bytes, active sessions, audit rows), plus native-push active sessions,
 received bytes, and refusals by bounded reason (`rate`, `capability`, `expired`,
-or `spent`). Set `VOTPORT_METRICS_TOKEN` to require a bearer token, and scrape
-it over an internal interface only.
+or `spent`). It also exposes fixed-cardinality HTTP request totals by status
+class, in-flight requests, and a duration histogram with 10ms through 5s and
+`+Inf` buckets. Request metrics never include paths, tenants, addresses,
+methods, or tokens. Set `VOTPORT_METRICS_TOKEN` to require a bearer token, and
+scrape it over an internal interface only.
 Platform admins can fetch the same per-tenant link and live-byte totals as JSON
 from `GET /api/admin/holdings`.
 
