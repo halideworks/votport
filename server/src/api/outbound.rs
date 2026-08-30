@@ -16,7 +16,9 @@ use futures_util::StreamExt as _;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncSeekExt as _, ReadBuf, SeekFrom};
+use tokio::io::{
+    AsyncRead, AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _, ReadBuf, SeekFrom,
+};
 use tokio_util::io::ReaderStream;
 use vot_receipt::SubjectKind;
 use vot_sdk::object::{InMemoryObjectBuilder, ObjectId, Suite};
@@ -38,6 +40,8 @@ const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
 const MAX_PASSWORD_BYTES: usize = 256;
 const MAX_AUTOMATION_LABEL_CHARS: usize = 100;
 const DOWNLOAD_LEASE_SECS: u64 = 24 * 60 * 60;
+const OUTBOUND_UPLOAD_ID: &str = "x-votport-upload-id";
+const MAX_OUTBOUND_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Deserialize)]
 pub struct OutboundPathQuery {
@@ -70,9 +74,12 @@ pub async fn upload_outbound_file(
     headers: HeaderMap,
     Query(query): Query<OutboundPathQuery>,
     body: Body,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Response> {
     let identity = admin::require_admin(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
+    if headers.contains_key(header::CONTENT_RANGE) || headers.contains_key(OUTBOUND_UPLOAD_ID) {
+        return upload_outbound_chunk(app, identity, headers, query.path, body).await;
+    }
     let path = safe_library_path(&app, &identity.tenant, &query.path)?;
     let parent = path
         .parent()
@@ -135,7 +142,269 @@ pub async fn upload_outbound_file(
         &relative_path,
         &json!({ "path": relative_path, "bytes": bytes }),
     );
-    Ok(Json(json!({ "path": query.path, "bytes": bytes })))
+    Ok(Json(json!({ "path": query.path, "bytes": bytes })).into_response())
+}
+
+async fn upload_outbound_chunk(
+    app: Arc<App>,
+    identity: auth::AdminIdentity,
+    headers: HeaderMap,
+    requested_path: String,
+    body: Body,
+) -> ApiResult<Response> {
+    let upload_id = headers
+        .get(OUTBOUND_UPLOAD_ID)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| valid_outbound_upload_id(value))
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "X-Votport-Upload-Id must be 64 hexadecimal characters",
+            )
+        })?
+        .to_owned();
+    let (start, end, total) = parse_outbound_content_range(&headers)?;
+    let chunk_len = end
+        .checked_sub(start)
+        .and_then(|length| length.checked_add(1))
+        .ok_or_else(|| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid Content-Range"))?;
+    if chunk_len > MAX_OUTBOUND_CHUNK_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "outbound chunk exceeds 16 MiB",
+        ));
+    }
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Content-Length must match the requested range",
+            )
+        })?;
+    if declared != chunk_len {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Content-Length must match the requested range",
+        ));
+    }
+    if total > app.config.max_upload_bytes {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "file exceeds upload limit",
+        ));
+    }
+    if end >= total {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Content-Range exceeds the declared file size",
+        ));
+    }
+
+    let path = safe_library_path(&app, &identity.tenant, &requested_path)?;
+    let stripe = outbound_upload_stripe(&path);
+    let _lock = app.outbound_upload_locks[stripe].lock().await;
+    let parent = path
+        .parent()
+        .ok_or_else(|| ApiError::internal("outbound path has no parent"))?;
+    create_library_dirs(parent)?;
+    let stage = parent.join(outbound_stage_name(&path, &upload_id));
+    if std::fs::symlink_metadata(&path).is_ok() {
+        let _ = std::fs::remove_file(&stage);
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "outbound file already exists",
+        ));
+    }
+    match std::fs::symlink_metadata(&stage) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_file() => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "outbound staging path is not a regular file",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(ApiError::internal("inspect outbound staging file failed")),
+    }
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&stage)
+        .await
+        .map_err(|_| ApiError::internal("open outbound staging file failed"))?;
+    let stage_len = file
+        .metadata()
+        .await
+        .map_err(|_| ApiError::internal("inspect outbound staging file failed"))?
+        .len();
+    if stage_len != start {
+        return Ok(outbound_upload_conflict(&requested_path, stage_len, total));
+    }
+    file.seek(SeekFrom::Start(start))
+        .await
+        .map_err(|_| ApiError::internal("seek outbound staging file failed"))?;
+    let mut stream = body.into_data_stream();
+    let mut received = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                let _ = file.set_len(start).await;
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid upload body",
+                ));
+            }
+        };
+        let next = received.checked_add(chunk.len() as u64).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "upload body exceeds Content-Length",
+            )
+        });
+        let Ok(next) = next else {
+            let _ = file.set_len(start).await;
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "upload body exceeds Content-Length",
+            ));
+        };
+        if next > chunk_len {
+            let _ = file.set_len(start).await;
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "upload body exceeds Content-Length",
+            ));
+        }
+        if file.write_all(&chunk).await.is_err() {
+            let _ = file.set_len(start).await;
+            return Err(ApiError::internal("write outbound staging file failed"));
+        }
+        received = next;
+    }
+    if received != chunk_len {
+        let _ = file.set_len(start).await;
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "upload body does not match Content-Length",
+        ));
+    }
+    let offset = end + 1;
+    if offset < total {
+        if file.flush().await.is_err() {
+            let _ = file.set_len(start).await;
+            return Err(ApiError::internal("write outbound staging file failed"));
+        }
+        return Ok(Json(json!({
+            "complete": false,
+            "offset": offset,
+            "bytes": total,
+            "path": requested_path,
+        }))
+        .into_response());
+    }
+    if file.flush().await.is_err() {
+        let _ = file.set_len(start).await;
+        return Err(ApiError::internal("write outbound staging file failed"));
+    }
+    if file.sync_all().await.is_err() {
+        let _ = file.set_len(start).await;
+        return Err(ApiError::internal("sync outbound file failed"));
+    }
+    drop(file);
+    if let Err(error) = std::fs::hard_link(&stage, &path) {
+        return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+            let _ = std::fs::remove_file(&stage);
+            ApiError::new(StatusCode::CONFLICT, "outbound file already exists")
+        } else {
+            ApiError::internal("publish outbound file failed")
+        });
+    }
+    let _ = std::fs::remove_file(&stage);
+    let relative_path = requested_path.trim_matches('/').replace('\\', "/");
+    app.store.audit(
+        &identity.tenant,
+        &identity.subject,
+        "outbound_file_uploaded",
+        &relative_path,
+        &json!({ "path": relative_path, "bytes": total }),
+    );
+    Ok(Json(json!({
+        "complete": true,
+        "offset": total,
+        "bytes": total,
+        "path": requested_path,
+    }))
+    .into_response())
+}
+
+fn outbound_upload_stripe(path: &Path) -> usize {
+    let digest = Sha256::digest(path.to_string_lossy().as_bytes());
+    usize::from(u16::from_be_bytes([digest[0], digest[1]])) % 64
+}
+
+fn outbound_stage_name(path: &Path, upload_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(path.to_string_lossy().as_bytes());
+    hasher.update([0]);
+    hasher.update(upload_id.as_bytes());
+    format!(".vot-outbound-{}.stage", hex::encode(hasher.finalize()))
+}
+
+fn valid_outbound_upload_id(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn parse_outbound_content_range(headers: &HeaderMap) -> ApiResult<(u64, u64, u64)> {
+    let value = headers
+        .get(header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Content-Range is required",
+            )
+        })?;
+    let value = value
+        .strip_prefix("bytes ")
+        .ok_or_else(|| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid Content-Range"))?;
+    let (range, total) = value
+        .split_once('/')
+        .ok_or_else(|| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid Content-Range"))?;
+    let (start, end) = range
+        .split_once('-')
+        .ok_or_else(|| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid Content-Range"))?;
+    let start = start
+        .parse::<u64>()
+        .map_err(|_| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid Content-Range"))?;
+    let end = end
+        .parse::<u64>()
+        .map_err(|_| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid Content-Range"))?;
+    let total = total
+        .parse::<u64>()
+        .map_err(|_| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid Content-Range"))?;
+    if end < start || total == 0 {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid Content-Range",
+        ));
+    }
+    Ok((start, end, total))
+}
+
+fn outbound_upload_conflict(path: &str, offset: u64, total: u64) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({ "complete": false, "offset": offset, "bytes": total, "path": path })),
+    )
+        .into_response()
 }
 
 struct UploadTemporary(PathBuf);
@@ -3304,6 +3573,265 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    fn chunk_request(
+        cookie: &str,
+        path: &str,
+        upload_id: &str,
+        start: u64,
+        end: u64,
+        total: u64,
+        bytes: &[u8],
+    ) -> Request<Body> {
+        Request::post(format!("/api/admin/outbound-files?path={path}"))
+            .header("cookie", cookie)
+            .header("x-votport", "1")
+            .header(OUTBOUND_UPLOAD_ID, upload_id)
+            .header(
+                header::CONTENT_RANGE,
+                format!("bytes {start}-{end}/{total}"),
+            )
+            .header(header::CONTENT_LENGTH, bytes.len())
+            .body(Body::from(bytes.to_vec()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn resumable_library_upload_keeps_partial_files_unpublished() {
+        let (_directory, app, cookie, _bytes) = fixture().await;
+        let upload_id = "a".repeat(64);
+        let response = crate::app::router(app.clone())
+            .oneshot(chunk_request(
+                &cookie,
+                "partial.bin",
+                &upload_id,
+                0,
+                2,
+                6,
+                b"abc",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let progress = body(response).await;
+        assert_eq!(progress["complete"], false);
+        assert_eq!(progress["offset"], 3);
+        assert_eq!(progress["bytes"], 6);
+        assert!(!app.config.outbound_dir.join("partial.bin").exists());
+        assert_eq!(
+            std::fs::read(app.config.outbound_dir.join(outbound_stage_name(
+                &app.config.outbound_dir.join("partial.bin"),
+                &upload_id,
+            )))
+            .unwrap(),
+            b"abc"
+        );
+        assert!(app.store.audit_export("", 0, 0, 100).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resumable_library_upload_resynchronizes_and_audits_completion() {
+        let (_directory, app, cookie, _bytes) = fixture().await;
+        let upload_id = "b".repeat(64);
+        let first = crate::app::router(app.clone())
+            .oneshot(chunk_request(
+                &cookie,
+                "resume.bin",
+                &upload_id,
+                0,
+                2,
+                6,
+                b"abc",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let mismatch = crate::app::router(app.clone())
+            .oneshot(chunk_request(
+                &cookie,
+                "resume.bin",
+                &upload_id,
+                0,
+                2,
+                6,
+                b"abc",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(mismatch.status(), StatusCode::CONFLICT);
+        assert_eq!(body(mismatch).await["offset"], 3);
+
+        let complete = crate::app::router(app.clone())
+            .oneshot(chunk_request(
+                &cookie,
+                "resume.bin",
+                &upload_id,
+                3,
+                5,
+                6,
+                b"def",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(complete.status(), StatusCode::OK);
+        let complete = body(complete).await;
+        assert_eq!(complete["complete"], true);
+        assert_eq!(complete["offset"], 6);
+        assert_eq!(
+            std::fs::read(app.config.outbound_dir.join("resume.bin")).unwrap(),
+            b"abcdef"
+        );
+        assert!(!app
+            .config
+            .outbound_dir
+            .join(outbound_stage_name(
+                &app.config.outbound_dir.join("resume.bin"),
+                &upload_id,
+            ))
+            .exists());
+        let audits = app.store.audit_export("", 0, 0, 100).unwrap();
+        assert_eq!(
+            audits
+                .iter()
+                .filter(|row| row.event == "outbound_file_uploaded")
+                .count(),
+            1
+        );
+        assert_eq!(audits[0].detail["bytes"], 6);
+    }
+
+    #[tokio::test]
+    async fn resumable_library_upload_rolls_back_an_invalid_chunk() {
+        let (_directory, app, cookie, _bytes) = fixture().await;
+        let upload_id = "e".repeat(64);
+        let first = crate::app::router(app.clone())
+            .oneshot(chunk_request(
+                &cookie,
+                "rollback.bin",
+                &upload_id,
+                0,
+                2,
+                6,
+                b"abc",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let invalid = Request::post("/api/admin/outbound-files?path=rollback.bin")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header(OUTBOUND_UPLOAD_ID, &upload_id)
+            .header(header::CONTENT_RANGE, "bytes 3-5/6")
+            .header(header::CONTENT_LENGTH, 3)
+            .body(Body::from("defg"))
+            .unwrap();
+        let invalid = crate::app::router(app.clone())
+            .oneshot(invalid)
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert!(!app.config.outbound_dir.join("rollback.bin").exists());
+        let stage = app.config.outbound_dir.join(outbound_stage_name(
+            &app.config.outbound_dir.join("rollback.bin"),
+            &upload_id,
+        ));
+        assert_eq!(std::fs::read(stage).unwrap(), b"abc");
+    }
+
+    #[tokio::test]
+    async fn resumable_library_upload_separates_sibling_stages_with_same_id() {
+        let (_directory, app, cookie, _bytes) = fixture().await;
+        let upload_id = "f".repeat(64);
+        for (path, bytes) in [("sibling-a.bin", b"abc"), ("sibling-b.bin", b"xyz")] {
+            let response = crate::app::router(app.clone())
+                .oneshot(chunk_request(&cookie, path, &upload_id, 0, 2, 6, bytes))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let first = app.config.outbound_dir.join(outbound_stage_name(
+            &app.config.outbound_dir.join("sibling-a.bin"),
+            &upload_id,
+        ));
+        let second = app.config.outbound_dir.join(outbound_stage_name(
+            &app.config.outbound_dir.join("sibling-b.bin"),
+            &upload_id,
+        ));
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(first).unwrap(), b"abc");
+        assert_eq!(std::fs::read(second).unwrap(), b"xyz");
+    }
+
+    #[tokio::test]
+    async fn resumable_library_upload_rejects_limits_before_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::api::testing::build(directory.path());
+        Arc::get_mut(&mut app).unwrap().config.max_upload_bytes = 5;
+        let cookie = admin_cookie(&app);
+        let upload_id = "c".repeat(64);
+        let response = crate::app::router(app.clone())
+            .oneshot(chunk_request(
+                &cookie,
+                "limited.bin",
+                &upload_id,
+                0,
+                5,
+                6,
+                b"abcdef",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!app.config.outbound_dir.join("limited.bin").exists());
+        assert!(!app
+            .config
+            .outbound_dir
+            .join(outbound_stage_name(
+                &app.config.outbound_dir.join("limited.bin"),
+                &upload_id,
+            ))
+            .exists());
+        let mut headers = HeaderMap::new();
+        headers.insert(OUTBOUND_UPLOAD_ID, HeaderValue::from_static("bad"));
+        headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_static("bytes 0-16777216/16777217"),
+        );
+        assert_eq!(
+            parse_outbound_content_range(&headers).unwrap(),
+            (0, 16_777_216, 16_777_217)
+        );
+    }
+
+    #[tokio::test]
+    async fn resumable_library_upload_serializes_duplicate_chunks() {
+        let (_directory, app, cookie, _bytes) = fixture().await;
+        let upload_id = "d".repeat(64);
+        let first = chunk_request(&cookie, "concurrent.bin", &upload_id, 0, 2, 6, b"abc");
+        let second = chunk_request(&cookie, "concurrent.bin", &upload_id, 0, 2, 6, b"xyz");
+        let (first, second) = tokio::join!(
+            crate::app::router(app.clone()).oneshot(first),
+            crate::app::router(app.clone()).oneshot(second),
+        );
+        let statuses = [first.unwrap().status(), second.unwrap().status()];
+        assert!(statuses.contains(&StatusCode::OK));
+        assert!(statuses.contains(&StatusCode::CONFLICT));
+        assert_eq!(
+            std::fs::metadata(app.config.outbound_dir.join(outbound_stage_name(
+                &app.config.outbound_dir.join("concurrent.bin"),
+                &upload_id,
+            )))
+            .unwrap()
+            .len(),
+            3
+        );
+        assert!(app
+            .outbound_upload_locks
+            .iter()
+            .all(|lock| lock.try_lock().is_ok()));
     }
 
     #[tokio::test]
