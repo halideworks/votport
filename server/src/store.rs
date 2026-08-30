@@ -1985,6 +1985,42 @@ impl Store {
         .map(|exists| exists != 0)
     }
 
+    pub fn has_active_library_grant(
+        &self,
+        tenant: &str,
+        source: &str,
+        now: u64,
+    ) -> Result<bool, String> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT files_json
+                 FROM outbound_grants
+                 WHERE tenant = ?1 AND length(trim(files_json)) > 2
+                   AND revoked_at IS NULL AND expires_at > ?2
+                   AND (max_downloads IS NULL OR downloads < max_downloads)",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![tenant, i64::try_from(now).unwrap_or(i64::MAX)],
+                |row| row.get::<_, String>(0),
+            )?;
+            for row in rows {
+                let files: Vec<OutboundGrantFile> =
+                    serde_json::from_str(&row?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                if files.iter().any(|file| file.source == source) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .map_err(|error| error.to_string())
+    }
+
     pub fn active_outbound_file_keys(
         &self,
         tenant: &str,
@@ -3047,6 +3083,73 @@ mod tests {
                 .id,
             "g1"
         );
+    }
+
+    #[test]
+    fn active_library_grants_match_source_with_tenant_and_lifecycle_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut active = test_outbound_grant("active", "acme", 0);
+        active.files = vec![OutboundGrantFile {
+            source: "project/file.bin".to_owned(),
+            name: "file.bin".to_owned(),
+            suite: "blake3".to_owned(),
+            root: "root".to_owned(),
+            bytes: 1,
+            receipt_b64: "receipt".to_owned(),
+            downloads: 0,
+            first_download_at: None,
+            last_download_at: None,
+        }];
+        store.insert_outbound_grant(active).unwrap();
+
+        let mut other = test_outbound_grant("other", "other", 0);
+        other.files = vec![OutboundGrantFile {
+            source: "other/file.bin".to_owned(),
+            name: "file.bin".to_owned(),
+            suite: "blake3".to_owned(),
+            root: "root".to_owned(),
+            bytes: 1,
+            receipt_b64: "receipt".to_owned(),
+            downloads: 0,
+            first_download_at: None,
+            last_download_at: None,
+        }];
+        store.insert_outbound_grant(other).unwrap();
+
+        for (id, revoked_at, expires_at, downloads, max_downloads) in [
+            ("expired", None, Some(14), 0, None),
+            ("revoked", Some(12), Some(20), 0, None),
+            ("spent", None, Some(20), 1, Some(1)),
+        ] {
+            let mut grant = test_outbound_grant(id, "acme", 0);
+            grant.files = vec![OutboundGrantFile {
+                source: "ignored/file.bin".to_owned(),
+                name: "file.bin".to_owned(),
+                suite: "blake3".to_owned(),
+                root: "root".to_owned(),
+                bytes: 1,
+                receipt_b64: "receipt".to_owned(),
+                downloads: 0,
+                first_download_at: None,
+                last_download_at: None,
+            }];
+            grant.revoked_at = revoked_at;
+            grant.expires_at = expires_at.unwrap();
+            grant.downloads = downloads;
+            grant.max_downloads = max_downloads;
+            store.insert_outbound_grant(grant).unwrap();
+        }
+
+        assert!(store
+            .has_active_library_grant("acme", "project/file.bin", 15)
+            .unwrap());
+        assert!(!store
+            .has_active_library_grant("other", "project/file.bin", 15)
+            .unwrap());
+        assert!(!store
+            .has_active_library_grant("acme", "ignored/file.bin", 15)
+            .unwrap());
     }
 
     #[test]
