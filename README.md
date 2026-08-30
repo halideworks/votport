@@ -326,16 +326,18 @@ database RPO; `/received` and `/outbound` are file backups. See [`docs/deploymen
 
 ## Development
 
+Browser tooling requires Node.js 20.19+, 22.13+, or 24+.
+
 ```sh
 # server (needs Rust ≥ 1.97)
-cd server
-cargo test          # unit + full-protocol integration tests
-cargo run           # needs VOTPORT_ADMIN_PASSWORD, VOTPORT_DATA_DIR, etc.
+(cd server && cargo test) # unit + full-protocol integration tests
+(cd server && cargo run)  # needs VOTPORT_ADMIN_PASSWORD, VOTPORT_DATA_DIR, etc.
 
-# browser JS (requires Node.js 20+)
-node --check ../web/assets/*.js
-npx --yes eslint@9.18.0 ../web/assets/*.js
-node --test ../scripts/*.test.mjs
+# browser JS
+npm ci
+for f in web/assets/*.js; do node --check "$f"; done
+npm run lint
+npm test
 
 # browser wasm bundle (needs wasm32 target + wasm-bindgen-cli 0.2.126)
 scripts/build-wasm.sh /path/to/VOT-checkout

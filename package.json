@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": "^20.19.0 || ^22.13.0 || >=24"
   },
   "scripts": {
     "lint": "eslint web/assets/*.js",
@@ -12,7 +12,7 @@
     "browser:e2e": "node scripts/browser-e2e.mjs"
   },
   "devDependencies": {
-    "eslint": "9.18.0",
+    "eslint": "10.9.0",
     "playwright": "1.62.1"
   }
 }
