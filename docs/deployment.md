@@ -228,13 +228,13 @@ curl -b cookies.txt -X PATCH -H 'Content-Type: application/json' \
      -d '{"max_total_bytes":214748364800,"max_links":100}'
 ```
 
-`DELETE /api/admin/tenants/{key}` drops the namespace row and purges
-`<receive>/.vot-tenants.stage/<key>/`. Point-in-time snapshots under
-`data/backups/` (30-day
-sweep in the session sweeper) and Litestream replicas still contain the
-tenant's rows and, for file backups of `/received`, the bytes until those
-backups rotate. GDPR-style erasure of backups is an operator job, not an
-API.
+`DELETE /api/admin/tenants/{key}` drops the namespace row and purges both
+`<receive>/.vot-tenants.stage/<key>/` and
+`<outbound>/.vot-tenants.stage/<key>/`. Point-in-time snapshots under
+`data/backups/` (30-day sweep in the session sweeper) and Litestream replicas
+still contain the tenant's rows until they rotate. File backups of
+`/received` and `/outbound` retain bytes until they rotate. GDPR-style erasure
+of backups is an operator job, not an API.
 
 Retry DELETE if purge fails (the row is already gone; leftover retry removes
 the reserved directory). An unknown key with no leftover directory is 404

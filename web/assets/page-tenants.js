@@ -152,7 +152,7 @@ function renderTenant(tenant, usage) {
             'Delete tenant',
             tenant.key.includes('/')
               ? `Delete "${tenant.key}"? Refused while its links still exist. No files are deleted: nothing was ever stored under a key with a separator.`
-              : `Delete "${tenant.key}"? Refused while its links still exist. Files under the tenant prefix are deleted; if purge fails, retry Delete.`,
+              : `Delete "${tenant.key}"? Refused while its links or operations still exist. Received and outbound files under the tenant prefix are deleted; if purge fails, retry Delete.`,
             'Delete',
           ))
         )

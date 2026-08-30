@@ -553,27 +553,39 @@ pub async fn delete_tenant(
         ));
     }
     let active = app.sessions.active_for_tenant(&key);
-    if active > 0 {
+    let outbound_active = app.sessions.active_outbound_for_tenant(&key);
+    if active > 0 || outbound_active > 0 {
         app.sessions.unpin_tenant(&key);
         return Err(ApiError::new(
             StatusCode::CONFLICT,
-            format!("{active} upload(s) are in flight; try again when they finish"),
+            format!(
+                "{} operation(s) are in flight; try again when they finish",
+                active + outbound_active
+            ),
         ));
     }
-    // The subtree this delete would purge, if there is one. A key with a
-    // separator never had one, and neither does a namespace that never
-    // received anything.
-    let purge_target = if purges_receive_subtree(&key) {
-        match tenant_receive_dir(&app.config.receive_dir, &key) {
+    // The subtrees this delete would purge, if there are any. A key with a
+    // separator was never usable as a namespace, and neither root is valid.
+    let purge_targets = if purges_tenant_subtrees(&key) {
+        let receive = match tenant_receive_dir(&app.config.receive_dir, &key) {
             Ok(path) if path.is_dir() => Some(path),
             Ok(_) => None,
             Err(error) => {
                 app.sessions.unpin_tenant(&key);
                 return Err(ApiError::internal(error));
             }
-        }
+        };
+        let outbound = match tenant_outbound_dir(&app.config.outbound_dir, &key) {
+            Ok(path) if path.is_dir() => Some(path),
+            Ok(_) => None,
+            Err(error) => {
+                app.sessions.unpin_tenant(&key);
+                return Err(ApiError::internal(error));
+            }
+        };
+        (receive, outbound)
     } else {
-        None
+        (None, None)
     };
     use crate::store::TenantRemoval;
     let row_deleted = match app.store.remove_tenant(&key) {
@@ -586,7 +598,7 @@ pub async fn delete_tenant(
             ));
         }
         Ok(TenantRemoval::Absent) => {
-            if purge_target.is_none() {
+            if purge_targets.0.is_none() && purge_targets.1.is_none() {
                 app.sessions.unpin_tenant(&key);
                 return Err(ApiError::not_found());
             }
@@ -597,37 +609,45 @@ pub async fn delete_tenant(
             return Err(ApiError::internal(error));
         }
     };
-    let purged_receive = purge_target.is_some();
-    if let Some(path) = purge_target {
+    let purged_receive = purge_targets.0.is_some();
+    let purged_outbound = purge_targets.1.is_some();
+    for (name, path) in [("receive", purge_targets.0), ("outbound", purge_targets.1)].into_iter() {
+        let Some(path) = path else { continue };
         #[cfg(test)]
-        app.sessions.wait_delete_stall().await;
+        if name == "receive" {
+            app.sessions.wait_delete_stall().await;
+        }
         let purge = tokio::fs::remove_dir_all(&path).await;
-        app.sessions.unpin_tenant(&key);
         match purge {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && row_deleted => {}
             Err(error) => {
                 tracing::error!(
                     key = %key,
+                    subtree = name,
                     error = %error,
-                    "receive subtree purge failed"
+                    "tenant subtree purge failed"
                 );
+                app.sessions.unpin_tenant(&key);
                 return Err(ApiError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "receive subtree purge failed; retry DELETE",
+                    "tenant subtree purge failed; retry DELETE",
                 ));
             }
         }
-    } else {
-        app.sessions.unpin_tenant(&key);
     }
+    app.sessions.unpin_tenant(&key);
     tracing::info!(target: "audit", event = "tenant_deleted", key = %key, "tenant namespace deleted");
     app.store.audit(
         "",
         &identity.subject,
         "tenant_deleted",
         &key,
-        &json!({ "purged_receive": purged_receive, "row_deleted": row_deleted }),
+        &json!({
+            "purged_receive": purged_receive,
+            "purged_outbound": purged_outbound,
+            "row_deleted": row_deleted
+        }),
     );
     Ok(Json(json!({ "ok": true })))
 }
@@ -719,12 +739,12 @@ pub async fn update_tenant(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// Whether deleting `key` may remove a receive subtree. A key with a
+/// Whether deleting `key` may remove tenant subtrees. A key with a
 /// separator was never usable as a namespace: `Tenant::path_prefix` hands the
 /// whole key to `join_under` as one component, so no upload ever published
 /// beneath it, and anything at that path belongs to a default-tenant link
 /// whose dest is that string.
-fn purges_receive_subtree(key: &str) -> bool {
+fn purges_tenant_subtrees(key: &str) -> bool {
     !key.contains('/')
 }
 
@@ -735,6 +755,17 @@ fn tenant_receive_dir(
     let path = paths::join_under(receive_dir, &paths::tenant_prefix(key))?;
     if path == *receive_dir {
         return Err("refusing to purge the receive root".to_owned());
+    }
+    Ok(path)
+}
+
+fn tenant_outbound_dir(
+    outbound_dir: &std::path::Path,
+    key: &str,
+) -> Result<std::path::PathBuf, String> {
+    let path = paths::join_under(outbound_dir, &paths::tenant_prefix(key))?;
+    if path == *outbound_dir {
+        return Err("refusing to purge the outbound root".to_owned());
     }
     Ok(path)
 }
@@ -2991,6 +3022,16 @@ mod tenant_offboard_tests {
         dir
     }
 
+    fn write_outbound_dummy(outbound_dir: &std::path::Path, key: &str) -> std::path::PathBuf {
+        let dir = outbound_dir
+            .join(crate::paths::TENANT_STORAGE_DIR)
+            .join(key);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::paths::tighten_dir(&dir);
+        std::fs::write(dir.join("x.bin"), b"hello").unwrap();
+        dir
+    }
+
     async fn create_tenant_req(
         application: Arc<App>,
         cookie: &str,
@@ -3057,6 +3098,71 @@ mod tenant_offboard_tests {
         assert_eq!(deleted.detail["purged_receive"], true);
         assert_eq!(deleted.detail["row_deleted"], true);
         assert!(application.store.tenant("acme").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_purges_the_outbound_subtree_without_receive_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(named_tenant("acme"))
+            .unwrap();
+        let outbound_dir = write_outbound_dummy(&application.config.outbound_dir, "acme");
+        let default_file = application.config.outbound_dir.join("default.bin");
+        std::fs::write(&default_file, b"keep").unwrap();
+
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let response = delete_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!outbound_dir.exists());
+        assert!(!application
+            .config
+            .receive_dir
+            .join(crate::paths::TENANT_STORAGE_DIR)
+            .join("acme")
+            .exists());
+        assert!(default_file.exists());
+        let rows = application.store.audit_export("", 0, 0, 100).unwrap();
+        let deleted = rows
+            .iter()
+            .find(|row| row.event == "tenant_deleted")
+            .expect("tenant_deleted audit");
+        assert_eq!(deleted.detail["purged_receive"], false);
+        assert_eq!(deleted.detail["purged_outbound"], true);
+    }
+
+    #[tokio::test]
+    async fn absent_tenant_retry_purges_leftover_outbound_subtree() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let outbound_dir = write_outbound_dummy(&application.config.outbound_dir, "acme");
+
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let response = delete_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!outbound_dir.exists());
+        assert!(application.store.tenant("acme").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_an_active_outbound_operation() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(named_tenant("acme"))
+            .unwrap();
+        let operation = application.sessions.try_begin_outbound("acme").unwrap();
+
+        let router = app::router(application.clone());
+        let cookie = login_cookie(router).await;
+        let response = delete_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(application.store.tenant("acme").unwrap().is_some());
+        drop(operation);
     }
 
     #[tokio::test]
