@@ -341,7 +341,8 @@ label .muted:empty {
  display: none;
 }
 
-input {
+input,
+.card select {
  display: block;
  width: 100%;
  margin-top: 0.4rem;
@@ -357,7 +358,8 @@ input {
  letter-spacing: normal;
  text-transform: none;
 }
-input:focus {
+input:focus,
+.card select:focus {
  outline: none;
  border-color: var(--border-active);
  background: rgba(255, 255, 255, 0.05);
