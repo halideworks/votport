@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, Request, StatusCode};
+use axum::middleware::Next;
 use axum::response::{Html, IntoResponse as _, Response};
 use axum::routing::{get, post};
 use axum::Json;
@@ -13,6 +14,7 @@ use axum::Router;
 use rand::RngCore as _;
 use std::fmt::Write as _;
 use tower_http::services::ServeDir;
+use tracing::Instrument as _;
 
 use crate::api;
 use crate::auth::LoginThrottle;
@@ -91,6 +93,7 @@ pub struct App {
     pub sso_client: SsoSlot,
     pub push: Option<PushState>,
     pub(crate) push_metrics: PushMetrics,
+    pub(crate) request_metrics: RequestMetrics,
     pub(crate) push_tickets: Mutex<HashMap<[u8; 16], PushTicket>>,
 }
 
@@ -146,6 +149,138 @@ impl PushMetrics {
     fn refusals(&self, reason: PushRefusalReason) -> u64 {
         self.refused[reason.index()].load(Ordering::Relaxed)
     }
+}
+
+const REQUEST_STATUS_CLASSES: [&str; 5] = ["2xx", "3xx", "4xx", "5xx", "other"];
+const REQUEST_LATENCY_BUCKETS_NS: [u64; 7] = [
+    10_000_000,
+    50_000_000,
+    100_000_000,
+    500_000_000,
+    1_000_000_000,
+    5_000_000_000,
+    u64::MAX,
+];
+const REQUEST_LATENCY_BUCKET_LABELS: [&str; 7] = ["0.01", "0.05", "0.1", "0.5", "1", "5", "+Inf"];
+
+#[derive(Default)]
+pub(crate) struct RequestMetrics {
+    in_flight: AtomicU64,
+    status: [AtomicU64; 5],
+    latency_buckets: [AtomicU64; 7],
+    latency_sum_ns: AtomicU64,
+}
+
+impl RequestMetrics {
+    fn begin(&self) -> RequestInFlight<'_> {
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        RequestInFlight(self)
+    }
+
+    fn observe(&self, status: StatusCode, elapsed: std::time::Duration) {
+        self.status[request_status_index(status)].fetch_add(1, Ordering::Relaxed);
+        let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        self.latency_sum_ns.fetch_add(nanos, Ordering::Relaxed);
+        for (bucket, bound) in self.latency_buckets.iter().zip(REQUEST_LATENCY_BUCKETS_NS) {
+            if nanos <= bound {
+                bucket.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn prometheus(&self) -> String {
+        let mut body = String::new();
+        let _ = writeln!(
+            body,
+            "# HELP votport_http_requests_in_flight Current HTTP request handlers producing responses.\n# TYPE votport_http_requests_in_flight gauge\nvotport_http_requests_in_flight {}",
+            self.in_flight.load(Ordering::Relaxed)
+        );
+        body.push_str(
+            "# HELP votport_http_requests_total Total HTTP requests by fixed response status class.\n# TYPE votport_http_requests_total counter\n",
+        );
+        for (index, class) in REQUEST_STATUS_CLASSES.iter().enumerate() {
+            let _ = writeln!(
+                body,
+                "votport_http_requests_total{{status=\"{class}\"}} {}",
+                self.status[index].load(Ordering::Relaxed)
+            );
+        }
+        body.push_str(
+            "# HELP votport_http_request_duration_seconds HTTP time to response headers in seconds; streamed body transfer time is excluded.\n# TYPE votport_http_request_duration_seconds histogram\n",
+        );
+        for (bucket, label) in self
+            .latency_buckets
+            .iter()
+            .zip(REQUEST_LATENCY_BUCKET_LABELS)
+            .take(REQUEST_LATENCY_BUCKET_LABELS.len() - 1)
+        {
+            let _ = writeln!(
+                body,
+                "votport_http_request_duration_seconds_bucket{{le=\"{label}\"}} {}",
+                bucket.load(Ordering::Relaxed)
+            );
+        }
+        let _ = writeln!(
+            body,
+            "votport_http_request_duration_seconds_bucket{{le=\"+Inf\"}} {}\nvotport_http_request_duration_seconds_count {}\nvotport_http_request_duration_seconds_sum {:.9}",
+            self.latency_buckets[6].load(Ordering::Relaxed),
+            self.latency_buckets[6].load(Ordering::Relaxed),
+            self.latency_sum_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0
+        );
+        body
+    }
+}
+
+struct RequestInFlight<'a>(&'a RequestMetrics);
+
+impl Drop for RequestInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn request_status_index(status: StatusCode) -> usize {
+    match status.as_u16() {
+        200..=299 => 0,
+        300..=399 => 1,
+        400..=499 => 2,
+        500..=599 => 3,
+        _ => 4,
+    }
+}
+
+fn request_id(request: &Request<axum::body::Body>) -> String {
+    request
+        .headers()
+        .get("x-request-id")
+        .map(|value| value.as_bytes())
+        .filter(|value| {
+            (1..=64).contains(&value.len())
+                && value
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
+        .map(|value| String::from_utf8(value.to_vec()).expect("request id is ASCII"))
+        .unwrap_or_else(crate::auth::random_token)
+}
+
+async fn request_observability(
+    State(app): State<Arc<App>>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let id = request_id(&request);
+    let started = std::time::Instant::now();
+    let _in_flight = app.request_metrics.begin();
+    let span = tracing::info_span!("http_request", request_id = %id);
+    let mut response = next.run(request).instrument(span).await;
+    app.request_metrics
+        .observe(response.status(), started.elapsed());
+    response.headers_mut().insert(
+        "x-request-id",
+        axum::http::HeaderValue::from_str(&id).expect("generated request id is valid"),
+    );
+    response
 }
 
 fn refuse_push(
@@ -397,6 +532,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         sso_client: SsoSlot::new(),
         push,
         push_metrics: PushMetrics::default(),
+        request_metrics: RequestMetrics::default(),
         push_tickets: Mutex::new(HashMap::new()),
         config,
     }))
@@ -1152,6 +1288,10 @@ pub fn router(app: Arc<App>) -> Router {
                 axum::http::HeaderValue::from_static("no-referrer"),
             ),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&app),
+            request_observability,
+        ))
         .with_state(app)
 }
 
@@ -1730,6 +1870,7 @@ fn metrics_text(app: &App) -> Result<String, String> {
         "# TYPE votport_audit_rows gauge\nvotport_audit_rows {}\n",
         app.store.audit_count()?
     );
+    body.push_str(&app.request_metrics.prometheus());
     Ok(body)
 }
 
@@ -1752,6 +1893,117 @@ mod push_metrics_tests {
         assert_eq!(PushRefusalReason::Capability.label(), "capability");
         assert_eq!(PushRefusalReason::Expired.label(), "expired");
         assert_eq!(PushRefusalReason::Spent.label(), "spent");
+    }
+}
+
+#[cfg(test)]
+mod request_metrics_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use std::time::Duration;
+
+    #[test]
+    fn request_ids_accept_only_bounded_safe_values() {
+        let valid = Request::get("/")
+            .header("x-request-id", "client.req-1_ok")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(request_id(&valid), "client.req-1_ok");
+        let too_long = "x".repeat(65);
+        for value in ["", "has/slash", "has space", &too_long] {
+            let request = Request::get("/")
+                .header("x-request-id", value)
+                .body(Body::empty())
+                .unwrap();
+            let generated = request_id(&request);
+            assert_eq!(generated.len(), 32);
+            assert!(generated
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')));
+        }
+    }
+
+    #[test]
+    fn request_metrics_keep_fixed_status_series_and_cumulative_buckets() {
+        let metrics = RequestMetrics::default();
+        metrics.observe(StatusCode::OK, Duration::from_millis(5));
+        metrics.observe(StatusCode::MOVED_PERMANENTLY, Duration::from_millis(75));
+        metrics.observe(StatusCode::BAD_REQUEST, Duration::from_millis(200));
+        metrics.observe(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Duration::from_millis(2_000),
+        );
+        metrics.observe(
+            StatusCode::from_u16(199).unwrap(),
+            Duration::from_millis(6_000),
+        );
+        let text = metrics.prometheus();
+        for class in REQUEST_STATUS_CLASSES {
+            assert!(text.contains(&format!(
+                "votport_http_requests_total{{status=\"{class}\"}} 1"
+            )));
+        }
+        assert!(text.contains("votport_http_request_duration_seconds_bucket{le=\"0.01\"} 1"));
+        assert!(text.contains("votport_http_request_duration_seconds_bucket{le=\"0.05\"} 1"));
+        assert!(text.contains("votport_http_request_duration_seconds_bucket{le=\"0.1\"} 2"));
+        assert!(text.contains("votport_http_request_duration_seconds_bucket{le=\"0.5\"} 3"));
+        assert!(text.contains("votport_http_request_duration_seconds_bucket{le=\"1\"} 3"));
+        assert!(text.contains("votport_http_request_duration_seconds_bucket{le=\"5\"} 4"));
+        assert!(text.contains("votport_http_request_duration_seconds_bucket{le=\"+Inf\"} 5"));
+        assert_eq!(
+            text.matches("votport_http_request_duration_seconds_bucket{le=\"+Inf\"}")
+                .count(),
+            1
+        );
+        assert!(text.contains("votport_http_request_duration_seconds_count 5"));
+        assert!(text.contains("votport_http_request_duration_seconds_sum 8.280000000"));
+    }
+
+    #[test]
+    fn request_metrics_in_flight_returns_to_zero() {
+        let metrics = RequestMetrics::default();
+        let in_flight = metrics.begin();
+        assert!(metrics
+            .prometheus()
+            .contains("votport_http_requests_in_flight 1"));
+        drop(in_flight);
+        assert!(metrics
+            .prometheus()
+            .contains("votport_http_requests_in_flight 0"));
+    }
+
+    #[tokio::test]
+    async fn request_middleware_sets_valid_or_generated_request_id() {
+        use tower::ServiceExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let response = router(app.clone())
+            .oneshot(
+                Request::get("/healthz")
+                    .header("x-request-id", "client.req-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.headers()["x-request-id"], "client.req-1");
+
+        let response = router(app)
+            .oneshot(
+                Request::get("/healthz")
+                    .header("x-request-id", "bad/id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let generated = response.headers()["x-request-id"].to_str().unwrap();
+        assert_eq!(generated.len(), 32);
+        assert!(generated
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')));
     }
 }
 
