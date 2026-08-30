@@ -1,6 +1,7 @@
 // votport public verified download page. VOTPORT PROPRIETARY LICENSE.
 
 import { appendObjectCard, formatBytes } from '/assets/object-card.js';
+import { dedupeFilenames, runWorkerPool, summarizeFailures } from '/assets/outbound-download.js';
 
 const $ = (id) => document.getElementById(id);
 const token = window.location.pathname.split('/').filter(Boolean).pop();
@@ -32,6 +33,77 @@ function downloadButton(text, url, classes) {
   button.textContent = text;
   button.addEventListener('click', () => { window.location.assign(url); });
   return button;
+}
+
+async function saveFile(directory, file, name) {
+  const response = await fetch(file.download_url, { credentials: 'same-origin' });
+  if (!response.ok) throw new Error(`server returned ${response.status}`);
+  if (!response.body) throw new Error('browser cannot stream this response');
+  const handle = await directory.getFileHandle(name, { create: true });
+  const writable = await handle.createWritable();
+  try {
+    await response.body.pipeTo(writable);
+  } catch (error) {
+    await writable.abort().catch(() => {});
+    throw error;
+  }
+}
+
+function triggerSeparateDownloads(files, names) {
+  for (const [index, file] of files.entries()) {
+    const link = document.createElement('a');
+    link.href = file.download_url;
+    link.download = names[index];
+    link.hidden = true;
+    document.body.append(link);
+    link.click();
+    link.remove();
+  }
+}
+
+let separateDownloadBusy = false;
+
+async function downloadSeparately(files) {
+  if (separateDownloadBusy) return;
+  separateDownloadBusy = true;
+  const button = $('separate-download-button');
+  const status = $('separate-download-status');
+  const names = dedupeFilenames(files.map((file) => file.name));
+  button.disabled = true;
+  try {
+    if (typeof window.showDirectoryPicker !== 'function') {
+      triggerSeparateDownloads(files, names);
+      status.textContent =
+        `Started ${files.length} downloads. Your browser may ask once to allow multiple downloads.`;
+      return;
+    }
+    const directory = await window.showDirectoryPicker({ mode: 'readwrite' });
+    const failures = [];
+    await runWorkerPool(
+      files,
+      async (file, index) => {
+        try {
+          await saveFile(directory, file, names[index]);
+        } catch (error) {
+          failures.push(`${names[index]}: ${error.message}`);
+        }
+      },
+      4,
+      (_file, _index, completed, total) => {
+        status.textContent = `Downloading files: ${completed}/${total}`;
+      },
+    );
+    status.textContent = failures.length
+      ? `Downloaded ${files.length - failures.length}/${files.length}. Failed: ${summarizeFailures(failures)}`
+      : `Downloaded ${files.length} files.`;
+  } catch (error) {
+    status.textContent = error?.name === 'AbortError'
+      ? 'Download cancelled.'
+      : `Could not download files: ${error.message}`;
+  } finally {
+    separateDownloadBusy = false;
+    button.disabled = false;
+  }
 }
 
 async function loadMetadata() {
@@ -91,8 +163,17 @@ async function loadMetadata() {
   $('object').replaceChildren();
   const bundle = $('bundle-download');
   bundle.hidden = !body.bundle_url;
-  if (body.bundle_url) {
-    $('bundle-download-button').onclick = () => window.location.assign(body.bundle_url);
+  if (body.bundle_url) $('bundle-download-button').onclick = () => window.location.assign(body.bundle_url);
+  const separate = $('separate-download');
+  separate.hidden = files.length < 2;
+  if (files.length > 1) {
+    const separateNote = $('separate-download-note');
+    separateNote.textContent = typeof window.showDirectoryPicker === 'function'
+      ? 'Choose a folder and save each payload file separately.'
+      : 'Your browser may ask once to allow multiple downloads.';
+    $('separate-download-button').onclick = () => downloadSeparately(files);
+    $('separate-download-button').disabled = false;
+    $('separate-download-status').textContent = '';
   }
   $('title').textContent = body.label || 'Verified download';
   $('status').textContent = 'The server verifies the file against this identity before download.';

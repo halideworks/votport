@@ -3,7 +3,8 @@
 A small, self-hosted **file transfer portal** built on
 [VOT (Verified Object Transfer)](https://github.com/halideworks/VOT).
 
-You sign in to the admin UI (`/links`, `/tenants`, `/audit`, `/system`), create
+You sign in to the admin UI (`/receive`, `/deliver`, `/tenants`, `/audit`,
+`/system`), create
 a unique request link (with an optional password), and send it to someone. They
 open it in a browser, drop files on the page, and the files land, cryptographically
 verified, atomically published, never overwriting anything, in a folder you
@@ -27,16 +28,17 @@ you (admin)                    them (any modern browser)
 /your/folder/…      ← files appear here, listed in the admin UI
 ```
 
-Received files still use **Send** beside a file on **Links**. For the outbound
-library, use the **Deliver files** card on **Links** to choose one or more
-files. Server-rendered projects may populate nested project subdirectories
-under the outbound directory, and admin uploads land there too. VOTPort issues
-one expiring bearer URL for the selection, shown once and revocable by an admin.
+Received files use **Send** beside a file on **Receive**. For the outbound
+library, use **Deliver** to choose one or more files. Server-rendered projects
+may populate nested project subdirectories under the outbound directory, and
+admin uploads land there too. VOTPort issues one expiring bearer URL for the
+selection, shown once and revocable by an admin.
 Before a download starts, the server copies each source into private staging,
 verifies its VOT object identity and signed receipt, then serves an immutable
-verified copy. Recipients may download files separately or download one tar
-archive containing every verified file, its signed receipt, and a JSON
-manifest. Optional link passwords gate metadata, files, receipts, and archives.
+verified copy. For multi-file deliveries, recipients may download a payload-only
+ZIP or stream the files separately in bulk; signed receipts remain optional
+individual downloads. Optional link passwords gate metadata, files, receipts,
+and the ZIP.
 
 ## Why VOT instead of a plain upload form?
 
@@ -235,18 +237,21 @@ hashed, verified range by range, independent of every proxy in between.
 ## Admin flow
 
 1. Open the site, sign in (password and, if configured, SSO).
-2. **Links:** issue a request (label, optional destination, password, expiry,
-   size cap). Copy the URL or show a QR code.
-3. When files arrive, each link lists uploads as object cards: stored path,
+2. **Receive:** issue a request (label, optional destination, password, expiry,
+   size cap). Enable its optional notification policy to be notified when a
+   receive completes. Copy the URL or show a QR code.
+3. When files arrive, **Receive** lists uploads as object cards: stored path,
    size, and a click-to-copy identity line (`suite:64-hex root`) per file,
    plus whether the file is still on disk and whether its receipt sidecar
    was written. Delete a file (and its receipt) or clear a
    transfer from history. Deactivate or delete links when done (files stay
    until you delete them or retention sweeps them).
-4. **Links, Deliver files:** browse nested project directories and
-   admin-uploaded files, select one or more files, and issue one expiring,
-   revocable download link. Issued links show aggregate and per-file download
-   starts with first and most recent timestamps.
+4. **Deliver:** browse nested project directories and admin-uploaded files,
+   select one or more files, and issue one expiring, revocable download link.
+   Delivery links have an optional notification policy for the first download
+   and completed delivery. Issued links show aggregate and per-file download
+   starts with first and most recent timestamps. For multi-file links,
+   `max_downloads` applies per file and per full-delivery round.
 5. **Tenants** (platform admin): namespaces, quotas, principals, revoke.
 6. **Audit:** queryable event log and JSONL export.
 7. **System:** password, backup download, receipt public key, notify/SMTP,
@@ -272,8 +277,9 @@ votport share project/render --expires 7d --label "Client delivery" --max-downlo
 
 The command prints the expiring share URL. `VOTPORT_URL` must be the HTTPS
 server URL (HTTP is allowed for loopback); `VOTPORT_SHARE_PASSWORD` is optional.
-`--max-downloads` is optional and limits the number of download starts (1 is
-one-time use).
+`--max-downloads` is optional. For a multi-file delivery it applies per file
+and per full-delivery round; `1` allows one download of each file or one full
+delivery.
 
 ## Performance
 

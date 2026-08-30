@@ -31,7 +31,8 @@ use crate::store::{
     OUTBOUND_DOWNLOAD_LIMIT_REACHED,
 };
 
-const MAX_ACTIVE: usize = 8;
+const MAX_ACTIVE: usize = 32;
+const MAX_ACTIVE_PER_GRANT: usize = 4;
 const CHUNK: usize = 1024 * 1024;
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
 const MAX_PASSWORD_BYTES: usize = 256;
@@ -256,6 +257,8 @@ pub struct CreateOutboundRequest {
     password: Option<String>,
     #[serde(default)]
     max_downloads: Option<u64>,
+    #[serde(default)]
+    notify_on_download: bool,
     #[serde(default = "default_expiry")]
     expires_days: u64,
 }
@@ -408,6 +411,7 @@ pub async fn create_outbound_grant(
                 password_hash,
                 expires_days: request.expires_days,
                 max_downloads: request.max_downloads,
+                notify_on_download: request.notify_on_download,
             },
         )
         .await;
@@ -478,6 +482,7 @@ pub async fn create_outbound_grant(
         created_at,
         expires_at: created_at.saturating_add(request.expires_days * 86_400),
         max_downloads: request.max_downloads,
+        notify_on_download: request.notify_on_download,
         revoked_at: None,
         downloads: 0,
         first_download_at: None,
@@ -492,7 +497,7 @@ pub async fn create_outbound_grant(
         &identity.subject,
         "outbound_grant_created",
         &grant.id,
-        &json!({ "link": grant.link_id, "upload": grant.upload_id, "file_index": grant.file_index }),
+        &json!({ "link": grant.link_id, "upload": grant.upload_id, "file_index": grant.file_index, "notify_on_download": grant.notify_on_download }),
     );
     let base = admin::base_url(&app, &headers);
     Ok((
@@ -511,6 +516,8 @@ pub struct AutomationShareRequest {
     password: Option<String>,
     #[serde(default)]
     max_downloads: Option<u64>,
+    #[serde(default)]
+    notify_on_download: bool,
     expires_days: u64,
 }
 
@@ -560,6 +567,7 @@ pub async fn automation_share(
             password_hash: hash_optional_password(request.password.as_deref())?,
             expires_days: request.expires_days,
             max_downloads: request.max_downloads,
+            notify_on_download: request.notify_on_download,
         },
     )
     .await
@@ -660,6 +668,7 @@ struct GrantOptions {
     password_hash: Option<String>,
     expires_days: u64,
     max_downloads: Option<u64>,
+    notify_on_download: bool,
 }
 
 async fn create_library_grant(
@@ -777,6 +786,7 @@ async fn create_library_grant(
         created_at,
         expires_at: created_at.saturating_add(options.expires_days * 86_400),
         max_downloads: options.max_downloads,
+        notify_on_download: options.notify_on_download,
         revoked_at: None,
         downloads: 0,
         first_download_at: None,
@@ -797,7 +807,7 @@ async fn create_library_grant(
         &identity.subject,
         "outbound_grant_created",
         &grant.id,
-        &json!({ "files": grant.files.len() }),
+        &json!({ "files": grant.files.len(), "notify_on_download": grant.notify_on_download }),
     );
     let base = admin::base_url(app, headers);
     Ok((
@@ -887,6 +897,8 @@ pub struct UpdateOutboundGrantRequest {
     rotate: Option<bool>,
     #[serde(default)]
     extend_days: Option<u64>,
+    #[serde(default)]
+    notify_on_download: Option<bool>,
 }
 
 pub async fn update_outbound_grant(
@@ -897,14 +909,33 @@ pub async fn update_outbound_grant(
 ) -> ApiResult<Response> {
     let identity = admin::require_admin(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
-    if request.rotate.is_some() && request.extend_days.is_some()
-        || request.rotate == Some(false)
-        || request.rotate.is_none() && request.extend_days.is_none()
-    {
+    let fields = [
+        request.rotate.is_some(),
+        request.extend_days.is_some(),
+        request.notify_on_download.is_some(),
+    ];
+    if fields.iter().filter(|field| **field).count() != 1 || request.rotate == Some(false) {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "choose exactly one grant lifecycle action",
+            "choose exactly one grant lifecycle or policy action",
         ));
+    }
+    if let Some(notify_on_download) = request.notify_on_download {
+        if !app
+            .store
+            .set_outbound_notify_on_download(&identity.tenant, &id, notify_on_download)
+            .map_err(ApiError::internal)?
+        {
+            return Err(ApiError::not_found());
+        }
+        app.store.audit(
+            &identity.tenant,
+            &identity.subject,
+            "outbound_grant_notify_on_download_changed",
+            &id,
+            &json!({ "notify_on_download": notify_on_download }),
+        );
+        return Ok(Json(json!({ "ok": true })).into_response());
     }
     if request.rotate == Some(true) {
         let token = auth::random_token();
@@ -1095,39 +1126,35 @@ pub async fn outbound_receipt_indexed(
 
 pub async fn outbound_file(
     State(app): State<Arc<App>>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     AxumPath(token): AxumPath<String>,
 ) -> ApiResult<Response> {
-    outbound_file_inner(app, peer, headers, token, 0).await
+    outbound_file_inner(app, headers, token, 0).await
 }
 
 pub async fn outbound_file_indexed(
     State(app): State<Arc<App>>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     AxumPath((token, index)): AxumPath<(String, usize)>,
 ) -> ApiResult<Response> {
-    outbound_file_inner(app, peer, headers, token, index).await
+    outbound_file_inner(app, headers, token, index).await
 }
 
 async fn outbound_file_inner(
     app: Arc<App>,
-    peer: std::net::SocketAddr,
     headers: HeaderMap,
     token: String,
     index: usize,
 ) -> ApiResult<Response> {
     let grant = active_grant(&app, &token)?;
     require_grant_access(&app, &grant, &headers)?;
-    let ip = super::client_ip(&headers, &peer, &app.config.trusted_proxies);
-    if !app.outbound_rate.allow(&ip) {
+    if !app.outbound_rate.allow(&grant.token_hash) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many downloads; try again later",
         ));
     }
-    let active = ActiveDownload::claim(Arc::clone(&app), &grant.token_hash)?;
+    let active = ActiveDownload::claim(Arc::clone(&app), &format!("{}:{index}", grant.token_hash))?;
     let (stage, source, _receipt) = prepare(&app, &grant, index).await?;
     let file = tokio::fs::File::open(&stage.path)
         .await
@@ -1165,14 +1192,12 @@ async fn outbound_file_inner(
 
 pub async fn outbound_bundle(
     State(app): State<Arc<App>>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     AxumPath(token): AxumPath<String>,
 ) -> ApiResult<Response> {
     let grant = active_grant(&app, &token)?;
     require_grant_access(&app, &grant, &headers)?;
-    let ip = super::client_ip(&headers, &peer, &app.config.trusted_proxies);
-    if !app.outbound_rate.allow(&ip) {
+    if !app.outbound_rate.allow(&grant.token_hash) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many downloads; try again later",
@@ -1197,7 +1222,7 @@ pub async fn outbound_bundle(
             "bundle exceeds total size limit",
         ));
     }
-    let active = ActiveDownload::claim(Arc::clone(&app), &grant.token_hash)?;
+    let active = ActiveDownload::claim(Arc::clone(&app), &format!("{}:bundle", grant.token_hash))?;
     let mut files = Vec::with_capacity(count);
     let mut names = std::collections::HashSet::with_capacity(count);
     for index in 0..count {
@@ -1276,7 +1301,7 @@ fn record_download(
         .record_outbound_download(&grant.id, indexes, now_unix())
     {
         Ok(result) => {
-            if result.first_download || result.completed_delivery {
+            if grant.notify_on_download && (result.first_download || result.completed_delivery) {
                 tokio::spawn(crate::notify::outbound_downloaded(
                     Arc::clone(app),
                     grant.clone(),
@@ -1641,7 +1666,7 @@ fn safe_filename(name: &str) -> String {
     value.chars().take(180).collect()
 }
 fn public_grant(grant: OutboundGrant) -> serde_json::Value {
-    json!({ "id": grant.id, "tenant": grant.tenant, "link_id": grant.link_id, "upload_id": grant.upload_id, "file_index": grant.file_index, "name": grant.name, "label": grant.label, "has_password": grant.password_hash.is_some(), "created_at": grant.created_at, "expires_at": grant.expires_at, "revoked_at": grant.revoked_at, "max_downloads": grant.max_downloads, "downloads": grant.downloads, "first_download_at": grant.first_download_at, "last_download_at": grant.last_download_at, "files": grant.files.iter().map(|file| json!({ "name": file.name, "suite": file.suite, "root": file.root, "bytes": file.bytes, "downloads": file.downloads, "first_download_at": file.first_download_at, "last_download_at": file.last_download_at })).collect::<Vec<_>>() })
+    json!({ "id": grant.id, "tenant": grant.tenant, "link_id": grant.link_id, "upload_id": grant.upload_id, "file_index": grant.file_index, "name": grant.name, "label": grant.label, "has_password": grant.password_hash.is_some(), "created_at": grant.created_at, "expires_at": grant.expires_at, "revoked_at": grant.revoked_at, "max_downloads": grant.max_downloads, "downloads": grant.downloads, "first_download_at": grant.first_download_at, "last_download_at": grant.last_download_at, "notify_on_download": grant.notify_on_download, "files": grant.files.iter().map(|file| json!({ "name": file.name, "suite": file.suite, "root": file.root, "bytes": file.bytes, "downloads": file.downloads, "first_download_at": file.first_download_at, "last_download_at": file.last_download_at })).collect::<Vec<_>>() })
 }
 
 fn public_automation_token(token: &AutomationToken) -> serde_json::Value {
@@ -1666,7 +1691,19 @@ impl ActiveDownload {
             .outbound_active
             .lock()
             .expect("outbound active poisoned");
-        if active.contains(key) || active.len() >= MAX_ACTIVE {
+        let grant = key.rsplit_once(':').map_or(key, |(grant, _)| grant);
+        if active.contains(key)
+            || active.len() >= MAX_ACTIVE
+            || active
+                .iter()
+                .filter(|other| {
+                    other
+                        .strip_prefix(grant)
+                        .is_some_and(|suffix| suffix.starts_with(':'))
+                })
+                .count()
+                >= MAX_ACTIVE_PER_GRANT
+        {
             return Err(ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 "too many downloads in progress",
@@ -1807,6 +1844,7 @@ mod tests {
                 max_bytes: None,
                 active: true,
                 legal_hold: false,
+                notify_on_upload: false,
                 uploads: vec![crate::store::UploadRecord {
                     id: "upload".to_owned(),
                     started_at: 1,
@@ -1898,6 +1936,20 @@ mod tests {
         drop((staged, active));
         assert!(!stage.exists());
         assert!(!app.outbound_active.lock().unwrap().contains("grant"));
+    }
+
+    #[test]
+    fn active_downloads_allow_four_distinct_files_per_grant() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let active: Vec<_> = (0..MAX_ACTIVE_PER_GRANT)
+            .map(|index| ActiveDownload::claim(Arc::clone(&app), &format!("grant:{index}")))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(ActiveDownload::claim(Arc::clone(&app), "grant:4").is_err());
+        assert!(ActiveDownload::claim(Arc::clone(&app), "grant:0").is_err());
+        drop(active);
+        assert!(ActiveDownload::claim(Arc::clone(&app), "grant:4").is_ok());
     }
 
     #[tokio::test]

@@ -285,6 +285,7 @@ mod tests {
             revoked_at: None,
             downloads: 0,
             max_downloads: None,
+            notify_on_download: false,
             first_download_at: None,
             last_download_at: None,
             files,

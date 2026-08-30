@@ -310,6 +310,6 @@ const session = await requireSession();
 // The page itself is hidden from non-platform admins by the nav; direct
 // navigation gets bounced to their home.
 if (!session.pages.includes('tenants')) {
-  window.location.replace('/links');
+  window.location.replace('/receive');
 }
 await refreshTenants();

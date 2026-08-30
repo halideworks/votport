@@ -308,7 +308,7 @@ pub async fn admin_session(
     // Which dashboard pages this principal may open. Named tenants get their
     // own links plus a tenant-filtered audit view; platform administration
     // (tenants, system) is default-tenant admin only.
-    let mut pages = vec!["links", "audit"];
+    let mut pages = vec!["receive", "deliver", "audit"];
     if identity.tenant.is_empty() && identity.role == "admin" {
         pages.push("tenants");
         pages.push("system");
@@ -1199,6 +1199,7 @@ struct LinkView {
     max_bytes: Option<u64>,
     active: bool,
     legal_hold: bool,
+    notify_on_upload: bool,
     usable: bool,
     uploads: Vec<UploadView>,
     events: Vec<crate::store::SessionEvent>,
@@ -1315,6 +1316,7 @@ fn link_view(app: &App, link: Link, base: &str) -> LinkView {
         max_bytes: link.max_bytes,
         active: link.active,
         legal_hold: link.legal_hold,
+        notify_on_upload: link.notify_on_upload,
         uploads,
         events: link.events,
     }
@@ -1409,6 +1411,8 @@ pub struct CreateLinkRequest {
     expires_days: Option<u32>,
     #[serde(default)]
     max_bytes: Option<u64>,
+    #[serde(default)]
+    notify_on_upload: bool,
 }
 
 pub async fn create_link(
@@ -1489,6 +1493,7 @@ pub async fn create_link(
         max_bytes: request.max_bytes,
         active: true,
         legal_hold: false,
+        notify_on_upload: request.notify_on_upload,
         uploads: Vec::new(),
         events: Vec::new(),
     };
@@ -1507,7 +1512,7 @@ pub async fn create_link(
         &identity.subject,
         "link_created",
         &view.id,
-        &serde_json::json!({ "label": view.label, "dest": view.dest, "tenant": identity.tenant }),
+        &serde_json::json!({ "label": view.label, "dest": view.dest, "tenant": identity.tenant, "notify_on_upload": view.notify_on_upload }),
     );
     Ok(Json(json!({ "link": view })))
 }
@@ -1518,6 +1523,8 @@ pub struct UpdateLinkRequest {
     active: Option<bool>,
     #[serde(default)]
     legal_hold: Option<bool>,
+    #[serde(default)]
+    notify_on_upload: Option<bool>,
 }
 
 pub async fn update_link(
@@ -1528,16 +1535,15 @@ pub async fn update_link(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    if request.active.is_none() && request.legal_hold.is_none() {
+    let fields = [
+        request.active.is_some(),
+        request.legal_hold.is_some(),
+        request.notify_on_upload.is_some(),
+    ];
+    if fields.iter().filter(|field| **field).count() != 1 {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "active or legal_hold is required",
-        ));
-    }
-    if request.active.is_some() && request.legal_hold.is_some() {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "update one link lifecycle field at a time",
+            "exactly one link lifecycle or policy field is required",
         ));
     }
     if let Some(legal_hold) = request.legal_hold {
@@ -1563,6 +1569,26 @@ pub async fn update_link(
             return Err(ApiError::not_found());
         }
         tracing::info!(target: "audit", event = "link_legal_hold_changed", id = %id, legal_hold, "request link legal hold changed");
+        return Ok(Json(json!({ "ok": true })));
+    }
+
+    if let Some(notify_on_upload) = request.notify_on_upload {
+        let found = app
+            .store
+            .update_link(&identity.tenant, &id, |link| {
+                link.notify_on_upload = notify_on_upload
+            })
+            .map_err(ApiError::internal)?;
+        if !found {
+            return Err(ApiError::not_found());
+        }
+        app.store.audit(
+            &identity.tenant,
+            &identity.subject,
+            "link_notify_on_upload_changed",
+            &id,
+            &serde_json::json!({ "notify_on_upload": notify_on_upload }),
+        );
         return Ok(Json(json!({ "ok": true })));
     }
 
@@ -2141,6 +2167,7 @@ mod handler_tests {
                 max_bytes: None,
                 active: true,
                 legal_hold: true,
+                notify_on_upload: false,
                 uploads: Vec::new(),
                 events: Vec::new(),
             })
@@ -2186,6 +2213,7 @@ mod handler_tests {
                     max_bytes: None,
                     active: true,
                     legal_hold: false,
+                    notify_on_upload: false,
                     uploads: Vec::new(),
                     events: Vec::new(),
                 })
@@ -2246,6 +2274,7 @@ mod handler_tests {
                 max_bytes: None,
                 active: true,
                 legal_hold: false,
+                notify_on_upload: false,
                 uploads: vec![UploadRecord {
                     id: "upload".to_owned(),
                     started_at: 0,
@@ -2462,6 +2491,7 @@ mod handler_tests {
                 max_bytes: None,
                 active: true,
                 legal_hold: false,
+                notify_on_upload: false,
                 uploads: vec![crate::store::UploadRecord {
                     id: "upload".to_owned(),
                     started_at: 0,
@@ -2608,6 +2638,7 @@ mod tenant_authz_tests {
                     max_bytes: None,
                     active: true,
                     legal_hold: false,
+                    notify_on_upload: false,
                     uploads: Vec::new(),
                     events: Vec::new(),
                 }
@@ -2847,6 +2878,7 @@ mod tenant_offboard_tests {
             max_bytes: None,
             active: true,
             legal_hold: false,
+            notify_on_upload: false,
             uploads: Vec::new(),
             events: Vec::new(),
         }
@@ -3987,6 +4019,7 @@ mod settings_api_tests {
                 max_bytes: None,
                 active: true,
                 legal_hold: false,
+                notify_on_upload: false,
                 uploads: Vec::new(),
                 events: Vec::new(),
             })
@@ -4128,6 +4161,7 @@ mod settings_api_tests {
                 max_bytes: None,
                 active: true,
                 legal_hold: false,
+                notify_on_upload: false,
                 uploads: Vec::new(),
                 events: Vec::new(),
             })

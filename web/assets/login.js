@@ -14,7 +14,7 @@ $('login-form').addEventListener('submit', async (event) => {
       body: JSON.stringify({ password: $('login-password').value }),
     });
     $('login-password').value = '';
-    window.location.replace('/links');
+    window.location.replace('/receive');
   } catch (error) {
     $('login-error').textContent = error.message;
     $('login-error').hidden = false;
@@ -24,7 +24,7 @@ $('login-form').addEventListener('submit', async (event) => {
 // Already-signed-in visitors skip the form entirely.
 try {
   await api('/api/admin/session');
-  window.location.replace('/links');
+  window.location.replace('/receive');
 } catch {
   /* not signed in: stay here */
 }

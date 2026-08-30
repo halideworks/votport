@@ -30,6 +30,17 @@ docker compose up -d --build
 curl -o /dev/null -w '%{http_code}\n' http://127.0.0.1:<debug-port>/r/x   # expect 200
 ```
 
+## Admin pages and deliveries
+
+The admin UI has separate **Receive** and **Deliver** pages. Receive issues
+request links; each link can opt in to notification when a receive completes.
+Deliver issues links for one or more outbound files; each delivery link can opt
+in to notification on its first download and when the delivery completes.
+
+Multi-file deliveries offer a payload-only ZIP or separate-file bulk streaming.
+Receipts remain optional individual downloads. `max_downloads` applies per file
+and per full-delivery round. Separate streaming uses bounded concurrency.
+
 ## Native push
 
 Native push is disabled unless `VOTPORT_PUSH_BIND` is set. It is a QUIC/UDP

@@ -76,7 +76,7 @@ pub struct App {
     pub verify_rate: crate::api::session_rate::SessionRate,
     /// Per-IP native-push rail limit, separate from HTTP session creation.
     pub push_rate: crate::api::session_rate::SessionRate,
-    /// Per-IP rate limit on outbound preparation and downloads.
+    /// Per-grant rate limit on outbound preparation and downloads.
     pub outbound_rate: crate::api::session_rate::SessionRate,
     /// Per-IP rate limit on automation share creation.
     pub automation_rate: crate::api::session_rate::SessionRate,
@@ -200,7 +200,7 @@ pub(crate) fn upload_completed(
             "bytes": report.files.iter().map(|file| file.bytes).sum::<u64>()
         }),
     );
-    if let Some(link) = link {
+    if let Some(link) = link.filter(|link| link.notify_on_upload) {
         let app = Arc::clone(app);
         let report = report.clone();
         runtime.spawn(async move {
@@ -388,7 +388,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         // Twenty admitted sessions can each use VOT's eight default rails;
         // leave room for refused or retried rails in the same ten-minute window.
         push_rate: crate::api::session_rate::SessionRate::with_limit(200),
-        outbound_rate: crate::api::session_rate::SessionRate::with_limit(20),
+        outbound_rate: crate::api::session_rate::SessionRate::with_limit(2000),
         automation_rate: crate::api::session_rate::SessionRate::with_limit(60),
         outbound_active: Mutex::new(HashSet::new()),
         signer,
@@ -1061,7 +1061,9 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route(
             "/api/admin/links/{id}",
-            post(api::update_link).delete(api::delete_link),
+            post(api::update_link)
+                .patch(api::update_link)
+                .delete(api::delete_link),
         )
         .route("/api/admin/links/{id}/qr", get(api::link_qr))
         .route(
@@ -1074,7 +1076,9 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/metrics", axum::routing::get(metrics))
         // Multi-page admin: static shells; authz is enforced per API call.
-        .route("/links", serve_page(page("links")))
+        .route("/receive", serve_page(page("receive")))
+        .route("/deliver", serve_page(page("deliver")))
+        .route("/links", serve_page(page("receive")))
         .route("/tenants", serve_page(page("tenants")))
         .route("/audit", serve_page(page("audit")))
         .route("/system", serve_page(page("system")))
@@ -1997,6 +2001,7 @@ mod retention_tests {
             max_bytes: None,
             active: true,
             legal_hold: true,
+            notify_on_upload: false,
             uploads: vec![UploadRecord {
                 id: "upload".to_owned(),
                 started_at: 0,
@@ -2073,6 +2078,7 @@ mod retention_tests {
                 revoked_at: None,
                 downloads: 0,
                 max_downloads: None,
+                notify_on_download: false,
                 first_download_at: None,
                 last_download_at: None,
                 files: Vec::new(),

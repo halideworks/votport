@@ -2233,6 +2233,81 @@ async fn throughput_baseline() {
     println!("upload       256 MiB: {uploaded:.3?} ({})", mib(uploaded));
 }
 
+/// Outbound throughput baseline, run explicitly. Uploads one 256 MiB library
+/// file, issues a grant, and times the real HTTP download.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark; run explicitly"]
+async fn throughput_outbound() {
+    const MIB: usize = 1024 * 1024;
+    let server = start_server_with_cap(512 * MIB as u64).await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    client
+        .post(format!("{}/api/admin/login", server.base))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let mut bytes = vec![0u8; 256 * MIB];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = (index * 7 % 251) as u8;
+    }
+    let upload_started = std::time::Instant::now();
+    client
+        .post(format!(
+            "{}/api/admin/outbound-files?path=benchmark.bin",
+            server.base
+        ))
+        .header("x-votport", "1")
+        .body(bytes)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let uploaded = upload_started.elapsed();
+    let grant = client
+        .post(format!("{}/api/admin/outbound-grants", server.base))
+        .header("x-votport", "1")
+        .json(&json!({ "paths": ["benchmark.bin"], "expires_days": 1 }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let token = grant["url"]
+        .as_str()
+        .and_then(|url| url.rsplit('/').next())
+        .unwrap();
+    let started = std::time::Instant::now();
+    let response = client
+        .get(format!("{}/api/s/{token}/file", server.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let received = response.bytes().await.unwrap();
+    let downloaded = started.elapsed();
+    let mib = |elapsed: std::time::Duration| format!("{:.0} MiB/s", 256.0 / elapsed.as_secs_f64());
+    assert_eq!(received.len(), 256 * MIB);
+    println!(
+        "outbound upload 256 MiB: {uploaded:.3?} ({})",
+        mib(uploaded)
+    );
+    println!(
+        "outbound download 256 MiB: {downloaded:.3?} ({})",
+        mib(downloaded)
+    );
+}
+
 /// Native-push counterpart to `throughput_baseline`.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "benchmark; run explicitly"]

@@ -397,6 +397,7 @@ mod handler_tests {
             max_bytes: None,
             active: false,
             legal_hold: false,
+            notify_on_upload: false,
             uploads: Vec::new(),
             events: Vec::new(),
         };
