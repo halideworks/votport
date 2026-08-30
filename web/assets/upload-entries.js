@@ -29,3 +29,34 @@ export function entryFiles(entry) {
     }
   });
 }
+
+const UPLOAD_CONCURRENCY = 4;
+
+export async function runUploadBatch(items, upload, onProgress = () => {}, onComplete = () => {}) {
+  let next = 0;
+  let completed = 0;
+  let failed = false;
+  let firstError;
+
+  async function worker() {
+    while (next < items.length && !failed) {
+      const index = next++;
+      const item = items[index];
+      try {
+        await upload(item, (value) => onProgress(item, value, completed, items.length));
+        completed += 1;
+        onComplete(item, completed, items.length);
+      } catch (error) {
+        if (!failed) {
+          failed = true;
+          firstError = error;
+        }
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(UPLOAD_CONCURRENCY, items.length) }, worker),
+  );
+  if (failed) throw firstError;
+}
