@@ -33,6 +33,32 @@ function button(text, classes, onClick) {
   return element;
 }
 
+function showGrantResult(url) {
+  $('outbound-result').hidden = false;
+  $('outbound-url').value = url;
+  $('outbound-url').onclick = () => $('outbound-url').select();
+  $('outbound-copy').onclick = async () => {
+    await navigator.clipboard.writeText(url);
+    $('outbound-copy').textContent = 'Copied';
+  };
+}
+
+async function issueGrant(link, upload, fileIndex) {
+  const response = await api('/api/admin/outbound-grants', {
+    method: 'POST',
+    body: JSON.stringify({
+      link_id: link.id,
+      upload_id: upload.id,
+      file_index: fileIndex,
+      expires_days: 7,
+    }),
+  });
+  const url = response.url;
+  if (!url) throw new Error('server did not return a download URL');
+  showGrantResult(url);
+  await refreshGrants();
+}
+
 function renderUpload(link, upload) {
   const item = document.createElement('li');
 
@@ -82,6 +108,9 @@ function renderUpload(link, upload) {
       receipt.textContent = 'receipt';
       extras.push(receipt);
     }
+    if (file.exists && file.receipt) {
+      extras.push(button('Send', 'tiny', () => issueGrant(link, upload, index)));
+    }
     if (file.exists) {
       extras.push(
         button('Delete file', 'tiny danger', async () => {
@@ -113,6 +142,83 @@ function renderUpload(link, upload) {
   root.textContent = `package ${upload.package_root}`;
   item.append(root);
   return item;
+}
+
+function grantStatus(grant) {
+  if (grant.revoked_at) return 'revoked';
+  if (grant.expires_at && grant.expires_at <= Math.floor(Date.now() / 1000)) return 'expired';
+  return 'active';
+}
+
+function renderGrants(grants) {
+  const container = $('outbound-grants');
+  container.replaceChildren();
+  if (!grants.length) {
+    const empty = document.createElement('p');
+    empty.className = 'muted';
+    empty.textContent = 'No downloads issued.';
+    container.append(empty);
+    return;
+  }
+  for (const grant of [...grants].reverse()) {
+    const card = document.createElement('div');
+    card.className = 'card link-item';
+    const head = document.createElement('div');
+    head.className = 'head';
+    const title = document.createElement('h3');
+    title.textContent = grant.label || 'Outbound download';
+    const status = grantStatus(grant);
+    const badge = document.createElement('span');
+    badge.className = `badge ${status === 'active' ? 'on' : 'off'}`;
+    badge.textContent = status;
+    head.append(title, badge);
+    card.append(head);
+
+    const name = document.createElement('p');
+    name.className = 'mono';
+    name.textContent = grant.name;
+    card.append(name);
+
+    const meta = document.createElement('p');
+    meta.className = 'muted';
+    const expiry = `expires ${formatWhen(grant.expires_at)}`;
+    const downloads = grant.downloads;
+    meta.textContent = `${expiry} · ${downloads} download${downloads === 1 ? '' : 's'}`;
+    card.append(meta);
+
+    if (status === 'active') {
+      const actions = document.createElement('div');
+      actions.className = 'actions';
+      actions.append(
+        button('Revoke', 'tiny danger', async () => {
+          if (
+            !(await confirmModal(
+              'Revoke download',
+              'Revoke this download link? Anyone with it will lose access.',
+              'Revoke',
+            ))
+          )
+            return;
+          await api(`/api/admin/outbound-grants/${grant.id}`, { method: 'DELETE' });
+          await refreshGrants();
+        }),
+      );
+      card.append(actions);
+    }
+    container.append(card);
+  }
+}
+
+async function refreshGrants() {
+  try {
+    const { grants } = await api('/api/admin/outbound-grants');
+    renderGrants(grants || []);
+  } catch {
+    const error = document.createElement('p');
+    error.className = 'muted';
+    error.textContent = 'Issued downloads could not be loaded.';
+    $('outbound-grants').replaceChildren(error);
+  }
 }
 
 function renderLink(link) {
@@ -271,11 +377,12 @@ async function refreshLinks() {
     empty.className = 'muted';
     empty.textContent = 'No requests issued.';
     container.append(empty);
-    return;
+  } else {
+    for (const link of [...links].reverse()) {
+      container.append(renderLink(link));
+    }
   }
-  for (const link of [...links].reverse()) {
-    container.append(renderLink(link));
-  }
+  await refreshGrants();
 }
 
 $('create-form').addEventListener('submit', async (event) => {

@@ -1,6 +1,6 @@
 # votport
 
-A small, self-hosted **file receive portal** built on
+A small, self-hosted **file transfer portal** built on
 [VOT (Verified Object Transfer)](https://github.com/halideworks/VOT).
 
 You sign in to the admin UI (`/links`, `/tenants`, `/audit`, `/system`), create
@@ -26,6 +26,13 @@ you (admin)                    them (any modern browser)
     ▼
 /your/folder/…      ← files appear here, listed in the admin UI
 ```
+
+To send one of those files back out, choose **Send** beside it in the Links
+page. VOTPort issues a 7-day bearer URL that is shown once. Before a download
+starts, the server copies the source into private staging, verifies its VOT
+object identity and signed receipt, then serves that immutable verified copy.
+Revoking the URL blocks new downloads. Active URLs protect their source from
+manual deletion and automatic retention until they expire or are revoked.
 
 ## Why VOT instead of a plain upload form?
 
@@ -355,7 +362,6 @@ still travel over HTTP through the reverse proxy. Native push does not change
 Product next, each as its own design first:
 
 * Content dedup when two entries share an object root
-* Outbound mode: serve files to a recipient with verified download
 * Scoped automation tokens (they bypass human-rate throttles; they need
   grants, expiry, and audit)
 * Legal hold versus upload retention (a do-not-sweep flag)

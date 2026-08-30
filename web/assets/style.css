@@ -845,6 +845,18 @@ button.danger:hover:not(:disabled) {
  margin-top: 1rem;
 }
 
+.outbound-actions {
+ display: flex;
+ align-items: center;
+ gap: 0.5rem;
+ flex-wrap: wrap;
+ margin-bottom: 1rem;
+}
+.outbound-actions a {
+ color: var(--text-soft);
+ font-size: 0.78rem;
+}
+
 /* ---- modal --------------------------------------------------------------- */
 
 .modal {

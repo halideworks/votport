@@ -18,7 +18,7 @@ use crate::api;
 use crate::auth::LoginThrottle;
 use crate::config::Config;
 use crate::session::{self, FinishReport, Sessions};
-use crate::store::Store;
+use crate::store::{now_unix, Store};
 
 /// Native push transport state retained for the process lifetime.
 pub struct PushState {
@@ -76,6 +76,10 @@ pub struct App {
     pub verify_rate: crate::api::session_rate::SessionRate,
     /// Per-IP native-push rail limit, separate from HTTP session creation.
     pub push_rate: crate::api::session_rate::SessionRate,
+    /// Per-IP rate limit on outbound preparation and downloads.
+    pub outbound_rate: crate::api::session_rate::SessionRate,
+    /// Grants currently preparing or streaming, capped globally and per grant.
+    pub outbound_active: Mutex<HashSet<String>>,
     /// Signs the `.vot-receipt` sidecars written next to received files.
     pub signer: Arc<crate::receipt::ReceiptSigner>,
     /// Outbound client for upload notifications.
@@ -346,6 +350,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         .map_err(|error| format!("create {}: {error}", config.receive_dir.display()))?;
     crate::paths::tighten_dir(&config.receive_dir);
     let store = Arc::new(Store::open(&config.data_dir)?);
+    clean_outbound_stage(&config.data_dir);
     store.migrate_tenant_storage(&config.receive_dir)?;
     // Staging files from a previous crash or kill have no live session to
     // sweep them; remove them once at startup.
@@ -377,6 +382,8 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         // Twenty admitted sessions can each use VOT's eight default rails;
         // leave room for refused or retried rails in the same ten-minute window.
         push_rate: crate::api::session_rate::SessionRate::with_limit(200),
+        outbound_rate: crate::api::session_rate::SessionRate::with_limit(20),
+        outbound_active: Mutex::new(HashSet::new()),
         signer,
         http,
         sso_config: config.oidc.clone(),
@@ -386,6 +393,73 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         push_tickets: Mutex::new(HashMap::new()),
         config,
     }))
+}
+
+/// Remove only VOTPORT-owned outbound staging entries. `symlink_metadata` and
+/// per-entry removal keep cleanup from traversing an operator-created link.
+fn clean_outbound_stage(data_dir: &std::path::Path) {
+    let root = data_dir.join("outbound.stage");
+    let Ok(root_meta) = std::fs::symlink_metadata(&root) else {
+        return;
+    };
+    if !root_meta.file_type().is_dir() || root_meta.file_type().is_symlink() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(".vot-outbound-") {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+            let _ = std::fs::remove_file(path);
+            continue;
+        }
+        let Ok(children) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for child in children.flatten() {
+            let child_path = child.path();
+            let Ok(child_meta) = std::fs::symlink_metadata(&child_path) else {
+                continue;
+            };
+            if child_meta.file_type().is_dir() && !child_meta.file_type().is_symlink() {
+                let _ = std::fs::remove_dir(child_path);
+            } else {
+                let _ = std::fs::remove_file(child_path);
+            }
+        }
+        let _ = std::fs::remove_dir(path);
+    }
+}
+
+#[cfg(test)]
+mod outbound_stage_tests {
+    use super::*;
+
+    #[test]
+    fn startup_cleanup_removes_only_outbound_stage_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("outbound.stage");
+        let owned = root.join(".vot-outbound-dead");
+        let unrelated = root.join("keep");
+        std::fs::create_dir_all(&owned).unwrap();
+        std::fs::create_dir_all(&unrelated).unwrap();
+        std::fs::write(owned.join("file"), b"staged").unwrap();
+        std::fs::write(unrelated.join("file"), b"operator").unwrap();
+
+        clean_outbound_stage(directory.path());
+
+        assert!(!owned.exists());
+        assert!(unrelated.join("file").exists());
+    }
 }
 
 fn build_push_state(config: &Config, address: std::net::SocketAddr) -> Result<PushState, String> {
@@ -737,6 +811,7 @@ pub fn router(app: Arc<App>) -> Router {
     let web_root = app.config.web_root.clone();
     let admin_page = web_root.join("index.html");
     let request_page = web_root.join("request.html");
+    let outbound_page = web_root.join("send.html");
     let page = |name: &str| web_root.join(format!("{name}.html"));
 
     // Everything the pages load is same-origin (fonts are self-hosted in
@@ -783,6 +858,7 @@ pub fn router(app: Arc<App>) -> Router {
         // Pages.
         .route("/", serve_page(admin_page))
         .route("/r/{token}", serve_page(request_page))
+        .route("/s/{token}", serve_page(outbound_page))
         .route("/verify", serve_page(page("verify")))
         // no-cache means revalidate, not never-cache: repeat visits answer
         // conditional GETs with 304s instead of re-downloading the wasm and
@@ -827,6 +903,14 @@ pub fn router(app: Arc<App>) -> Router {
             "/api/admin/principals/unblock",
             post(api::unblock_principal),
         )
+        .route(
+            "/api/admin/outbound-grants",
+            get(api::list_outbound_grants).post(api::create_outbound_grant),
+        )
+        .route(
+            "/api/admin/outbound-grants/{id}",
+            axum::routing::delete(api::delete_outbound_grant),
+        )
         .route("/api/admin/password", post(api::admin_change_password))
         .route(
             "/api/admin/links",
@@ -866,6 +950,9 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/r/{token}/verify", post(api::verify_link_password))
         .route("/api/r/{token}/push", post(api::create_push_session))
         .route("/api/r/{token}/session", post(api::create_session))
+        .route("/api/s/{token}", get(api::outbound_metadata))
+        .route("/api/s/{token}/receipt", get(api::outbound_receipt))
+        .route("/api/s/{token}/file", get(api::outbound_file))
         .route(
             "/api/session/{sid}/seal",
             post(api::upload_seal).layer(DefaultBodyLimit::max(session::MAX_SEAL_BYTES + 1024)),
@@ -1503,7 +1590,7 @@ async fn expire_link_uploads(app: &App, candidate: crate::store::Link, cutoff: u
             return;
         }
     };
-    let protected: HashSet<&str> = link
+    let mut protected: HashSet<&str> = link
         .uploads
         .iter()
         .filter(|upload| upload.completed_at == 0 || upload.completed_at >= cutoff)
@@ -1511,6 +1598,29 @@ async fn expire_link_uploads(app: &App, candidate: crate::store::Link, cutoff: u
         .filter(|file| !file.deleted)
         .map(|file| file.stored_as.as_str())
         .collect();
+    // ponytail: retention runs infrequently, so one indexed lookup per file
+    // stays simpler than another store projection until link histories grow.
+    let now = now_unix();
+    for upload in &link.uploads {
+        for (index, file) in upload.files.iter().enumerate() {
+            match app.store.has_active_outbound_grant(
+                &link.tenant,
+                &link.id,
+                &upload.id,
+                index,
+                now,
+            ) {
+                Ok(true) => {
+                    protected.insert(file.stored_as.as_str());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(%error, "outbound grant read failed; skipping retention for link");
+                    return;
+                }
+            }
+        }
+    }
     let candidates: HashSet<&str> = link
         .uploads
         .iter()
@@ -1692,10 +1802,10 @@ pub async fn session_sweeper(app: Arc<App>) {
 #[cfg(test)]
 mod retention_tests {
     use super::*;
-    use crate::store::{FileRecord, Link, SettingWrite, UploadRecord};
+    use crate::store::{FileRecord, Link, OutboundGrant, SettingWrite, UploadRecord};
 
     #[tokio::test]
-    async fn legal_hold_skips_only_automatic_retention() {
+    async fn retention_preserves_protected_files_and_tombstones_expired_files() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
         let cutoff = crate::store::now_unix();
@@ -1713,11 +1823,13 @@ mod retention_tests {
         let expired_path = app.config.receive_dir.join("expired.txt");
         let active_path = app.config.receive_dir.join("active.txt");
         let shared_path = app.config.receive_dir.join("shared.txt");
+        let outbound_path = app.config.receive_dir.join("outbound.txt");
         let failed_path = app.config.receive_dir.join("failed.txt");
         std::fs::write(&held_path, b"held").unwrap();
         std::fs::write(&expired_path, b"expired").unwrap();
         std::fs::write(&active_path, b"active").unwrap();
         std::fs::write(&shared_path, b"shared").unwrap();
+        std::fs::write(&outbound_path, b"outbound").unwrap();
         std::fs::write(&failed_path, b"failed").unwrap();
 
         let held = Link {
@@ -1776,11 +1888,37 @@ mod retention_tests {
         failed.label = "failed".to_owned();
         failed.uploads[0].files[0].path = "failed.txt".to_owned();
         failed.uploads[0].files[0].stored_as = "failed.txt".to_owned();
+        let mut outbound = expired.clone();
+        outbound.id = "outbound".to_owned();
+        outbound.label = "outbound".to_owned();
+        outbound.uploads[0].files[0].path = "outbound.txt".to_owned();
+        outbound.uploads[0].files[0].stored_as = "outbound.txt".to_owned();
         app.store.insert_link(held.clone()).unwrap();
         app.store.insert_link(expired).unwrap();
         app.store.insert_link(active).unwrap();
         app.store.insert_link(shared).unwrap();
+        app.store.insert_link(outbound).unwrap();
         app.store.insert_link(failed).unwrap();
+        app.store
+            .insert_outbound_grant(OutboundGrant {
+                id: "grant".to_owned(),
+                token_hash: "hash".to_owned(),
+                tenant: String::new(),
+                link_id: "outbound".to_owned(),
+                upload_id: "upload".to_owned(),
+                package_root: "root".to_owned(),
+                name: "outbound.txt".to_owned(),
+                suite: "blake3".to_owned(),
+                root: "object".to_owned(),
+                file_index: 0,
+                bytes: 8,
+                label: "outbound".to_owned(),
+                created_at: cutoff,
+                expires_at: cutoff.saturating_add(86_400),
+                revoked_at: None,
+                downloads: 0,
+            })
+            .unwrap();
 
         // The candidate came from the first read before an administrator set
         // the hold. The re-read under the lifecycle pin must still preserve it.
@@ -1812,6 +1950,11 @@ mod retention_tests {
             .uploads
             .iter()
             .all(|upload| !upload.files[0].deleted));
+
+        let outbound_candidate = app.store.link("", "outbound").unwrap().unwrap();
+        expire_link_uploads(&app, outbound_candidate, cutoff).await;
+        assert!(outbound_path.exists());
+        assert!(!app.store.link("", "outbound").unwrap().unwrap().uploads[0].files[0].deleted);
 
         let connection =
             rusqlite::Connection::open(app.config.data_dir.join("votport.db")).unwrap();

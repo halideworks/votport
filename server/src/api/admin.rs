@@ -33,7 +33,7 @@ fn admin_token_phc(app: &App) -> ApiResult<String> {
 }
 
 /// Returns the authenticated principal, or unauthorized.
-fn require_admin(app: &App, headers: &HeaderMap) -> ApiResult<auth::AdminIdentity> {
+pub(crate) fn require_admin(app: &App, headers: &HeaderMap) -> ApiResult<auth::AdminIdentity> {
     let token = headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
@@ -99,7 +99,10 @@ fn require_platform_admin(app: &App, headers: &HeaderMap) -> ApiResult<auth::Adm
 /// cross-site forms cannot set one, which closes CSRF without token
 /// bookkeeping. Viewers (SSO principals outside the admin group) get
 /// read-only access.
-fn require_admin_write(headers: &HeaderMap, identity: &auth::AdminIdentity) -> ApiResult<()> {
+pub(crate) fn require_admin_write(
+    headers: &HeaderMap,
+    identity: &auth::AdminIdentity,
+) -> ApiResult<()> {
     if identity.role != "admin" {
         return Err(ApiError::new(StatusCode::FORBIDDEN, "read-only session"));
     }
@@ -1161,7 +1164,7 @@ struct FileView {
     exists: bool,
 }
 
-fn base_url(app: &App, headers: &HeaderMap) -> String {
+pub(crate) fn base_url(app: &App, headers: &HeaderMap) -> String {
     if let Some(url) = &app.config.public_url {
         return url.clone();
     }
@@ -1179,7 +1182,7 @@ fn base_url(app: &App, headers: &HeaderMap) -> String {
 /// The on-disk path a file record points at, from server-recorded components
 /// only; client input never reaches this. None when a stored record fails the
 /// join guard (a corrupted record), which the display treats as "missing".
-fn stored_path(app: &App, tenant: &str, stored_as: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn stored_path(app: &App, tenant: &str, stored_as: &str) -> Option<std::path::PathBuf> {
     // stored_as is relative to the tenant's own subtree: the session builds
     // it from the link dest, while the tenant prefix is added separately when
     // the destination directory is assembled. Joining it straight under the
@@ -1464,6 +1467,16 @@ pub async fn delete_link(
             "uploads are in flight; try again when they finish",
         ));
     }
+    if app
+        .store
+        .link_has_active_outbound_grants(&identity.tenant, &id, now_unix())
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "active download links must be revoked first",
+        ));
+    }
     let removed = app
         .store
         .remove_link(&identity.tenant, &id)
@@ -1514,6 +1527,38 @@ pub async fn delete_upload_record(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
+    let _pin = app
+        .sessions
+        .try_pin_link(&id)
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "link update already in progress"))?;
+    if app.sessions.active_for_link(&id) > 0 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "uploads are in flight; try again when they finish",
+        ));
+    }
+    let link = app
+        .store
+        .link(&identity.tenant, &id)
+        .map_err(super::store_unavailable)?
+        .ok_or_else(ApiError::not_found)?;
+    let record = link
+        .uploads
+        .iter()
+        .find(|entry| entry.id == upload)
+        .ok_or_else(ApiError::not_found)?;
+    for index in 0..record.files.len() {
+        if app
+            .store
+            .has_active_outbound_grant(&identity.tenant, &id, &upload, index, now_unix())
+            .map_err(ApiError::internal)?
+        {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "active download links must be revoked first",
+            ));
+        }
+    }
     let found = app
         .store
         .update_link_uploads(&identity.tenant, &id, |link| {
@@ -1565,6 +1610,16 @@ pub async fn delete_received_file(
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "uploads are in flight; try again when they finish",
+        ));
+    }
+    if app
+        .store
+        .has_active_outbound_grant(&identity.tenant, &id, &upload, index, now_unix())
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "active download links must be revoked first",
         ));
     }
     for target in [path.clone(), {
