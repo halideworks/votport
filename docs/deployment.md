@@ -37,6 +37,19 @@ curl -o /dev/null -w '%{http_code}\n' http://127.0.0.1:<debug-port>/r/x   # expe
 `http://` is accepted only when its host is loopback (`localhost`, `127.0.0.1`,
 or `::1`), and invalid values stop startup.
 
+For a customer release, use the GHCR image reference and digest recorded in the
+GitHub release notes and workflow summary instead of rebuilding from source:
+
+```yaml
+services:
+  votport:
+    image: ghcr.io/halideworks/votport:vX.Y.Z@sha256:<published-digest>
+    # remove build: .
+```
+
+The workflow also publishes `sha-<commit>` as a diagnostic tag. Do not use a
+floating tag such as `latest` for a deployment.
+
 ## Admin pages and deliveries
 
 The admin UI has separate **Receive** and **Deliver** pages. Receive issues
@@ -152,10 +165,12 @@ database snapshot so records and bytes stay consistent with each other.
    snapshot.
 4. Start. Staging leftovers are removed by `paths::clean_staging` at boot.
 
-For an upgrade or rollback, restore the database and both file volumes from the
-same point-in-time set before starting the selected image. Verify `/healthz`
-and a known Receive and Deliver link; a database-only restore cannot serve
-Deliver files whose source remains absent from `/outbound`.
+For an upgrade or rollback, record the complete image reference, including its
+digest, with the point-in-time backup set. Restore the database and both file
+volumes from that set, set the compose service to the selected digest, and
+start it without rebuilding. Verify `/healthz` and a known Receive and Deliver
+link; a database-only restore cannot serve Deliver files whose source remains
+absent from `/outbound`.
 
 ## Single sign-on
 

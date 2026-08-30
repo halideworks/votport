@@ -89,6 +89,22 @@ Default-tenant files appear under the host folder mounted at `/received`.
 Named tenants use `/received/.vot-tenants.stage/<tenant>/`; per-link
 subfolders are configurable when you create a link.
 
+### Released images
+
+The release workflow publishes semver tags and commit tags to GHCR, never
+`latest`. Pin a customer deployment to the digest recorded in the GitHub
+release notes and workflow summary:
+
+```yaml
+services:
+  votport:
+    image: ghcr.io/halideworks/votport:vX.Y.Z@sha256:<published-digest>
+    # remove build: .
+```
+
+Keep the complete image reference, including its digest, with the matching
+database and `/received` and `/outbound` backup set.
+
 ## Configuration
 
 Environment variables are the boot defaults (see `docker-compose.yml`). A
