@@ -4,6 +4,8 @@ import { appendObjectCard, formatBytes } from '/assets/object-card.js';
 import {
   anchorDownloadsAllowed,
   dedupeFilenames,
+  FILE_RENDER_BATCH_SIZE,
+  nextFileBatch,
   MAX_ANCHOR_DOWNLOADS,
   runWorkerPool,
   summarizeFailures,
@@ -11,6 +13,8 @@ import {
 
 const $ = (id) => document.getElementById(id);
 const token = window.location.pathname.split('/').filter(Boolean).pop();
+let metadataFiles = [];
+let renderedFileCount = 0;
 
 function when(seconds) {
   return new Date(seconds * 1000).toLocaleString();
@@ -39,6 +43,29 @@ function downloadButton(text, url, classes) {
   button.textContent = text;
   button.addEventListener('click', () => { window.location.assign(url); });
   return button;
+}
+
+function renderNextFileBatch() {
+  const batch = nextFileBatch(metadataFiles, renderedFileCount);
+  for (const file of batch) {
+    const extras = [
+      downloadButton('Download file', file.download_url, 'tiny'),
+      downloadButton('Download receipt', file.receipt_url, 'tiny ghost'),
+    ];
+    const row = appendObjectCard(
+      $('object'),
+      { name: file.name, suite: file.suite, root: file.root },
+      { status: formatBytes(file.bytes), extras },
+    );
+    row.setAttribute('aria-label', `Verified ${file.name}`);
+  }
+  renderedFileCount += batch.length;
+  const controls = $('file-list-controls');
+  const more = $('show-more-files');
+  const status = $('file-list-status');
+  controls.hidden = metadataFiles.length <= FILE_RENDER_BATCH_SIZE;
+  more.hidden = renderedFileCount >= metadataFiles.length;
+  status.textContent = `Showing ${renderedFileCount} of ${metadataFiles.length} files`;
 }
 
 async function saveFile(directory, file, name) {
@@ -168,6 +195,9 @@ async function loadMetadata() {
 
   $('download-gate').hidden = true;
   $('object').replaceChildren();
+  metadataFiles = files;
+  renderedFileCount = 0;
+  renderNextFileBatch();
   const bundle = $('bundle-download');
   bundle.hidden = !body.bundle_url;
   if (body.bundle_url) $('bundle-download-button').onclick = () => window.location.assign(body.bundle_url);
@@ -196,24 +226,14 @@ async function loadMetadata() {
   }
   $('title').textContent = body.label || 'Verified download';
   $('status').textContent = 'The server verifies the file against this identity before download.';
-  for (const file of files) {
-    const extras = [
-      downloadButton('Download file', file.download_url, 'tiny'),
-      downloadButton('Download receipt', file.receipt_url, 'tiny ghost'),
-    ];
-    const row = appendObjectCard(
-      $('object'),
-      { name: file.name, suite: file.suite, root: file.root },
-      { status: formatBytes(file.bytes), extras },
-    );
-    row.setAttribute('aria-label', `Verified ${file.name}`);
-  }
   $('expires').textContent = body.expires_at
     ? `Link expires ${when(body.expires_at)}`
     : 'This link does not expire.';
   $('receipt-key').textContent = body.receipt_key;
   $('download-content').hidden = false;
 }
+
+$('show-more-files').addEventListener('click', renderNextFileBatch);
 
 $('download-password-form').addEventListener('submit', async (event) => {
   event.preventDefault();
