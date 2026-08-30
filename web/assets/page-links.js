@@ -193,9 +193,46 @@ function renderGrants(grants) {
     const meta = document.createElement('p');
     meta.className = 'muted';
     const expiry = `expires ${formatWhen(grant.expires_at)}`;
-    const downloads = grant.downloads;
-    meta.textContent = `${expiry} · ${downloads} download${downloads === 1 ? '' : 's'}`;
+    const downloads = grant.downloads ?? 0;
+    const metaParts = [
+      expiry,
+      `${downloads} download start${downloads === 1 ? '' : 's'}`,
+    ];
+    if (Number.isFinite(grant.first_download_at)) {
+      metaParts.push(`first ${formatWhen(grant.first_download_at)}`);
+    }
+    if (Number.isFinite(grant.last_download_at)) {
+      metaParts.push(`last ${formatWhen(grant.last_download_at)}`);
+    }
+    meta.textContent = metaParts.join(' · ');
     card.append(meta);
+
+    if (Array.isArray(grant.files) && grant.files.length > 1) {
+      const files = document.createElement('ul');
+      files.className = 'uploads';
+      for (const file of grant.files) {
+        const item = document.createElement('li');
+        const fileName = document.createElement('div');
+        fileName.className = 'mono';
+        fileName.textContent = file.name;
+        const fileMeta = document.createElement('div');
+        fileMeta.className = 'muted';
+        const fileDownloads = file.downloads ?? 0;
+        const fileParts = [
+          `${fileDownloads} download start${fileDownloads === 1 ? '' : 's'}`,
+        ];
+        if (Number.isFinite(file.first_download_at)) {
+          fileParts.push(`first ${formatWhen(file.first_download_at)}`);
+        }
+        if (Number.isFinite(file.last_download_at)) {
+          fileParts.push(`last ${formatWhen(file.last_download_at)}`);
+        }
+        fileMeta.textContent = fileParts.join(' · ');
+        item.append(fileName, fileMeta);
+        files.append(item);
+      }
+      card.append(files);
+    }
 
     if (status === 'active') {
       const actions = document.createElement('div');

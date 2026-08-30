@@ -972,6 +972,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/r/{token}/session", post(api::create_session))
         .route("/api/s/{token}", get(api::outbound_metadata))
         .route("/api/s/{token}/verify", post(api::verify_outbound_password))
+        .route("/api/s/{token}/bundle", get(api::outbound::outbound_bundle))
         .route("/api/s/{token}/receipt", get(api::outbound_receipt))
         .route("/api/s/{token}/file", get(api::outbound_file))
         .route(
@@ -1947,6 +1948,8 @@ mod retention_tests {
                 expires_at: cutoff.saturating_add(86_400),
                 revoked_at: None,
                 downloads: 0,
+                first_download_at: None,
+                last_download_at: None,
                 files: Vec::new(),
             })
             .unwrap();

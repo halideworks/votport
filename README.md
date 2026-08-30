@@ -34,7 +34,9 @@ under the outbound directory, and admin uploads land there too. VOTPort issues
 one expiring bearer URL for the selection, shown once and revocable by an admin.
 Before a download starts, the server copies each source into private staging,
 verifies its VOT object identity and signed receipt, then serves an immutable
-verified copy.
+verified copy. Recipients may download files separately or download one tar
+archive containing every verified file, its signed receipt, and a JSON
+manifest. Optional link passwords gate metadata, files, receipts, and archives.
 
 ## Why VOT instead of a plain upload form?
 
@@ -243,7 +245,8 @@ hashed, verified range by range, independent of every proxy in between.
    until you delete them or retention sweeps them).
 4. **Links, Deliver files:** browse nested project directories and
    admin-uploaded files, select one or more files, and issue one expiring,
-   revocable download link.
+   revocable download link. Issued links show aggregate and per-file download
+   starts with first and most recent timestamps.
 5. **Tenants** (platform admin): namespaces, quotas, principals, revoke.
 6. **Audit:** queryable event log and JSONL export.
 7. **System:** password, backup download, receipt public key, notify/SMTP,

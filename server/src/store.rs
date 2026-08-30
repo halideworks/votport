@@ -99,7 +99,15 @@ pub struct OutboundGrant {
     pub expires_at: u64,
     pub revoked_at: Option<u64>,
     pub downloads: u64,
+    pub first_download_at: Option<u64>,
+    pub last_download_at: Option<u64>,
     pub files: Vec<OutboundGrantFile>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutboundDownloadResult {
+    pub first_download: bool,
+    pub completed_delivery: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -110,6 +118,12 @@ pub struct OutboundGrantFile {
     pub root: String,
     pub bytes: u64,
     pub receipt_b64: String,
+    #[serde(default)]
+    pub downloads: u64,
+    #[serde(default)]
+    pub first_download_at: Option<u64>,
+    #[serde(default)]
+    pub last_download_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -268,7 +282,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-const SCHEMA_VERSION: u64 = 10;
+const SCHEMA_VERSION: u64 = 11;
 
 const SETTINGS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS settings (
@@ -328,6 +342,8 @@ CREATE TABLE IF NOT EXISTS outbound_grants (
     expires_at INTEGER NOT NULL,
     revoked_at INTEGER,
     downloads INTEGER NOT NULL DEFAULT 0,
+    first_download_at INTEGER,
+    last_download_at INTEGER,
     files_json TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS outbound_grants_tenant_created ON outbound_grants(tenant, created_at);
@@ -340,6 +356,10 @@ const OUTBOUND_GRANTS_FILES_SCHEMA: &str =
 
 const OUTBOUND_GRANTS_PASSWORD_SCHEMA: &str =
     "ALTER TABLE outbound_grants ADD COLUMN password_hash TEXT;";
+
+const OUTBOUND_GRANTS_DELIVERY_SCHEMA: &str =
+    "ALTER TABLE outbound_grants ADD COLUMN first_download_at INTEGER;
+     ALTER TABLE outbound_grants ADD COLUMN last_download_at INTEGER;";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -628,6 +648,11 @@ impl Store {
         if (8..10).contains(&stored) {
             transaction
                 .execute_batch(OUTBOUND_GRANTS_PASSWORD_SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
+        }
+        if (8..11).contains(&stored) {
+            transaction
+                .execute_batch(OUTBOUND_GRANTS_DELIVERY_SCHEMA)
                 .map_err(|error| format!("schema: {error}"))?;
         }
         transaction
@@ -1390,8 +1415,8 @@ impl Store {
                 "INSERT INTO outbound_grants
                  (id, token_hash, password_hash, tenant, link_id, upload_id, package_root, name, suite,
                   root, file_index, bytes_hi, bytes_lo, label, created_at, expires_at, revoked_at,
-                  downloads, files_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                  downloads, first_download_at, last_download_at, files_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                 rusqlite::params![
                     grant.id,
                     grant.token_hash,
@@ -1411,6 +1436,12 @@ impl Store {
                     i64::try_from(grant.expires_at).unwrap_or(i64::MAX),
                     grant.revoked_at.map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
                     i64::try_from(grant.downloads).unwrap_or(i64::MAX),
+                    grant
+                        .first_download_at
+                        .map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
+                    grant
+                        .last_download_at
+                        .map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
                     files_json,
                 ],
             )
@@ -1423,7 +1454,8 @@ impl Store {
             let mut statement = connection.prepare(
                 "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
                         name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
-                        expires_at, revoked_at, downloads, files_json
+                        expires_at, revoked_at, downloads, first_download_at, last_download_at,
+                        files_json
                  FROM outbound_grants WHERE tenant = ?1 ORDER BY created_at, rowid",
             )?;
             let rows = statement.query_map([tenant], map_outbound_grant)?;
@@ -1440,7 +1472,8 @@ impl Store {
                 .query_row(
                     "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
                             name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
-                            expires_at, revoked_at, downloads, files_json
+                            expires_at, revoked_at, downloads, first_download_at, last_download_at,
+                            files_json
                      FROM outbound_grants WHERE token_hash = ?1",
                     [token_hash],
                     map_outbound_grant,
@@ -1460,15 +1493,95 @@ impl Store {
         .map(|changed| changed > 0)
     }
 
-    pub fn record_outbound_download(&self, id: &str) -> Result<bool, String> {
-        self.with(|connection| {
-            connection
+    pub fn record_outbound_download(
+        &self,
+        id: &str,
+        indexes: &[usize],
+        at: u64,
+    ) -> Result<OutboundDownloadResult, String> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let result = (|| {
+            let (downloads, first_download_at, files_json): (i64, Option<i64>, String) =
+                transaction
+                    .query_row(
+                        "SELECT downloads, first_download_at, files_json
+                         FROM outbound_grants WHERE id = ?1",
+                        [id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "outbound grant not found".to_owned())?;
+            let mut files: Vec<OutboundGrantFile> = serde_json::from_str(&files_json)
+                .map_err(|error| format!("parse outbound grant files: {error}"))?;
+            let mut unique_indexes = indexes.to_vec();
+            unique_indexes.sort_unstable();
+            unique_indexes.dedup();
+            if (!files.is_empty() && unique_indexes.iter().any(|&index| index >= files.len()))
+                || (files.is_empty() && unique_indexes.iter().any(|&index| index != 0))
+            {
+                return Err("outbound file index out of range".to_owned());
+            }
+
+            let downloads = downloads.max(0);
+            let first_download = downloads == 0;
+            let was_all_files_downloaded = if files.is_empty() {
+                downloads > 0
+            } else {
+                files.iter().all(|file| file.downloads > 0)
+            };
+            let at = i64::try_from(at).unwrap_or(i64::MAX);
+            let first_download_at = if first_download {
+                Some(at)
+            } else {
+                first_download_at
+            };
+            for index in unique_indexes {
+                if let Some(file) = files.get_mut(index) {
+                    file.downloads = file.downloads.saturating_add(1);
+                    if file.first_download_at.is_none() {
+                        file.first_download_at = Some(u64::try_from(at).unwrap_or(u64::MAX));
+                    }
+                    file.last_download_at = Some(u64::try_from(at).unwrap_or(u64::MAX));
+                }
+            }
+            let completed_delivery = if files.is_empty() {
+                first_download
+            } else {
+                !was_all_files_downloaded && files.iter().all(|file| file.downloads > 0)
+            };
+            let files_json = serde_json::to_string(&files)
+                .map_err(|error| format!("serialize outbound grant files: {error}"))?;
+            transaction
                 .execute(
-                    "UPDATE outbound_grants SET downloads = downloads + 1 WHERE id = ?1",
-                    [id],
+                    "UPDATE outbound_grants
+                     SET downloads = ?2, first_download_at = ?3, last_download_at = ?4,
+                         files_json = ?5
+                     WHERE id = ?1",
+                    rusqlite::params![
+                        id,
+                        downloads.saturating_add(1),
+                        first_download_at,
+                        at,
+                        files_json,
+                    ],
                 )
-                .map(|changed| changed > 0)
-        })
+                .map_err(|error| error.to_string())?;
+            Ok(OutboundDownloadResult {
+                first_download,
+                completed_delivery,
+            })
+        })();
+        match result {
+            Ok(result) => {
+                transaction.commit().map_err(|error| error.to_string())?;
+                Ok(result)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn has_active_outbound_grant(
@@ -1744,7 +1857,13 @@ fn map_outbound_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboundGrant
             .get::<_, Option<i64>>("revoked_at")?
             .and_then(|value| u64::try_from(value).ok()),
         downloads: row.get::<_, i64>("downloads")?.max(0) as u64,
-        files: parse_json(&row.get::<_, String>("files_json")?, 18)?,
+        first_download_at: row
+            .get::<_, Option<i64>>("first_download_at")?
+            .and_then(|value| u64::try_from(value).ok()),
+        last_download_at: row
+            .get::<_, Option<i64>>("last_download_at")?
+            .and_then(|value| u64::try_from(value).ok()),
+        files: parse_json(&row.get::<_, String>("files_json")?, 20)?,
     })
 }
 
@@ -2307,6 +2426,8 @@ mod tests {
             expires_at: 20,
             revoked_at: None,
             downloads: 0,
+            first_download_at: None,
+            last_download_at: None,
             files: Vec::new(),
         }
     }
@@ -2324,7 +2445,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(schema, "10");
+        assert_eq!(schema, "11");
         assert!(store
             .with(|connection| {
                 connection.query_row(
@@ -2353,6 +2474,9 @@ mod tests {
                 root: "aa".to_owned(),
                 bytes: 3,
                 receipt_b64: "receipt-a".to_owned(),
+                downloads: 0,
+                first_download_at: None,
+                last_download_at: None,
             },
             OutboundGrantFile {
                 source: "objects/b".to_owned(),
@@ -2361,6 +2485,9 @@ mod tests {
                 root: "bb".to_owned(),
                 bytes: u64::MAX,
                 receipt_b64: "receipt-b".to_owned(),
+                downloads: 0,
+                first_download_at: None,
+                last_download_at: None,
             },
         ];
         store.insert_outbound_grant(grant.clone()).unwrap();
@@ -2442,17 +2569,30 @@ mod tests {
         other.expires_at = 100;
         store.insert_outbound_grant(other).unwrap();
 
-        assert!(store.record_outbound_download("g1").unwrap());
-        assert!(store.record_outbound_download("g1").unwrap());
         assert_eq!(
-            store
-                .outbound_grant_by_token_hash("hash-g1")
-                .unwrap()
-                .unwrap()
-                .downloads,
-            2
+            store.record_outbound_download("g1", &[0], 100).unwrap(),
+            OutboundDownloadResult {
+                first_download: true,
+                completed_delivery: true,
+            }
         );
-        assert!(!store.record_outbound_download("missing").unwrap());
+        assert_eq!(
+            store.record_outbound_download("g1", &[0], 110).unwrap(),
+            OutboundDownloadResult {
+                first_download: false,
+                completed_delivery: false,
+            }
+        );
+        let grant = store
+            .outbound_grant_by_token_hash("hash-g1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.downloads, 2);
+        assert_eq!(grant.first_download_at, Some(100));
+        assert_eq!(grant.last_download_at, Some(110));
+        assert!(store
+            .record_outbound_download("missing", &[0], 100)
+            .is_err());
         assert!(store
             .link_has_active_outbound_grants("acme", "link", 19)
             .unwrap());
@@ -2465,6 +2605,105 @@ mod tests {
         assert!(!store
             .link_has_active_outbound_grants("acme", "other-link", 100)
             .unwrap());
+    }
+
+    #[test]
+    fn outbound_download_tracking_reports_first_and_completed_transitions() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut grant = test_outbound_grant("multi", "acme", 0);
+        grant.files = vec![
+            OutboundGrantFile {
+                source: "objects/a".to_owned(),
+                name: "a.txt".to_owned(),
+                suite: "blake3".to_owned(),
+                root: "aa".to_owned(),
+                bytes: 3,
+                receipt_b64: "receipt-a".to_owned(),
+                downloads: 0,
+                first_download_at: None,
+                last_download_at: None,
+            },
+            OutboundGrantFile {
+                source: "objects/b".to_owned(),
+                name: "b.txt".to_owned(),
+                suite: "blake3".to_owned(),
+                root: "bb".to_owned(),
+                bytes: 4,
+                receipt_b64: "receipt-b".to_owned(),
+                downloads: 0,
+                first_download_at: None,
+                last_download_at: None,
+            },
+        ];
+        store.insert_outbound_grant(grant).unwrap();
+
+        assert_eq!(
+            store.record_outbound_download("multi", &[1], 100).unwrap(),
+            OutboundDownloadResult {
+                first_download: true,
+                completed_delivery: false,
+            }
+        );
+        assert_eq!(
+            store.record_outbound_download("multi", &[0], 200).unwrap(),
+            OutboundDownloadResult {
+                first_download: false,
+                completed_delivery: true,
+            }
+        );
+        assert_eq!(
+            store
+                .record_outbound_download("multi", &[0, 1, 1], 300)
+                .unwrap(),
+            OutboundDownloadResult {
+                first_download: false,
+                completed_delivery: false,
+            }
+        );
+        let grant = store
+            .outbound_grant_by_token_hash("hash-multi")
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.downloads, 3);
+        assert_eq!(grant.first_download_at, Some(100));
+        assert_eq!(grant.last_download_at, Some(300));
+        assert_eq!(grant.files[0].downloads, 2);
+        assert_eq!(grant.files[0].first_download_at, Some(200));
+        assert_eq!(grant.files[0].last_download_at, Some(300));
+        assert_eq!(grant.files[1].downloads, 2);
+        assert_eq!(grant.files[1].first_download_at, Some(100));
+        assert_eq!(grant.files[1].last_download_at, Some(300));
+    }
+
+    #[test]
+    fn outbound_download_tracking_rejects_invalid_indexes_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut grant = test_outbound_grant("atomic", "acme", 0);
+        grant.files = vec![OutboundGrantFile {
+            source: "objects/a".to_owned(),
+            name: "a.txt".to_owned(),
+            suite: "blake3".to_owned(),
+            root: "aa".to_owned(),
+            bytes: 3,
+            receipt_b64: "receipt-a".to_owned(),
+            downloads: 0,
+            first_download_at: None,
+            last_download_at: None,
+        }];
+        store.insert_outbound_grant(grant.clone()).unwrap();
+
+        assert!(store
+            .record_outbound_download("atomic", &[0, 1], 100)
+            .is_err());
+        assert_eq!(
+            store
+                .outbound_grant_by_token_hash("hash-atomic")
+                .unwrap()
+                .unwrap(),
+            grant
+        );
     }
 
     #[test]
@@ -3574,9 +3813,9 @@ mod settings_tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         drop(store);
-        assert_eq!(schema_version(directory.path()), "10");
+        assert_eq!(schema_version(directory.path()), "11");
         Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "10");
+        assert_eq!(schema_version(directory.path()), "11");
     }
 
     #[test]
@@ -3598,7 +3837,7 @@ mod settings_tests {
                 .unwrap();
         }
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "10");
+        assert_eq!(schema_version(directory.path()), "11");
         assert!(store.principals().unwrap().is_empty());
         assert!(store.principal("nobody").unwrap().is_none());
     }
@@ -3620,7 +3859,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "10");
+        assert_eq!(schema_version(directory.path()), "11");
         assert!(!store.link("", "old-link").unwrap().unwrap().legal_hold);
     }
 
@@ -3660,7 +3899,7 @@ mod settings_tests {
         drop(store);
 
         let reopened = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "10");
+        assert_eq!(schema_version(directory.path()), "11");
         assert_eq!(reopened.tenant_received_bytes("").unwrap(), 9);
     }
 
@@ -3702,13 +3941,15 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "10");
+        assert_eq!(schema_version(directory.path()), "11");
         let grant = store
             .outbound_grant_by_token_hash("hash-g1")
             .unwrap()
             .unwrap();
         assert!(grant.files.is_empty());
         assert!(grant.password_hash.is_none());
+        assert!(grant.first_download_at.is_none());
+        assert!(grant.last_download_at.is_none());
     }
 
     #[test]
@@ -3719,7 +3960,7 @@ mod settings_tests {
             connection.execute_batch(SCHEMA).unwrap();
             connection
                 .execute_batch(
-                    "CREATE TABLE outbound_grants (
+                    r#"CREATE TABLE outbound_grants (
                          id TEXT PRIMARY KEY,
                          token_hash TEXT UNIQUE NOT NULL,
                          tenant TEXT NOT NULL,
@@ -3741,22 +3982,57 @@ mod settings_tests {
                      );
                      INSERT INTO outbound_grants
                          (id, token_hash, tenant, link_id, upload_id, package_root, name, suite,
-                          root, file_index, bytes_hi, bytes_lo, label, created_at, expires_at)
+                         root, file_index, bytes_hi, bytes_lo, label, created_at, expires_at,
+                         files_json)
                      VALUES ('g1', 'hash-g1', 'acme', 'link', 'upload', 'package', 'file.bin',
-                             'blake3', 'root', 0, 0, 1, 'download', 10, 20);
-                     INSERT INTO meta (key, value) VALUES ('schema_version', '9');",
+                             'blake3', 'root', 0, 0, 1, 'download', 10, 20,
+                             '[{"source":"objects/a","name":"a.txt","suite":"blake3","root":"aa","bytes":3,"receipt_b64":"receipt-a"}]');
+                     INSERT INTO meta (key, value) VALUES ('schema_version', '9');"#,
                 )
                 .unwrap();
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "10");
-        assert!(store
+        assert_eq!(schema_version(directory.path()), "11");
+        let grant = store
             .outbound_grant_by_token_hash("hash-g1")
             .unwrap()
-            .unwrap()
-            .password_hash
-            .is_none());
+            .unwrap();
+        assert!(grant.password_hash.is_none());
+        assert!(grant.first_download_at.is_none());
+        assert!(grant.last_download_at.is_none());
+        assert_eq!(grant.files[0].downloads, 0);
+        assert!(grant.files[0].first_download_at.is_none());
+        assert!(grant.files[0].last_download_at.is_none());
+    }
+
+    #[test]
+    fn v10_database_adds_outbound_delivery_timestamps() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(Store::open(directory.path()).unwrap());
+        {
+            let connection = Connection::open(directory.path().join("votport.db")).unwrap();
+            connection
+                .execute_batch(
+                    "ALTER TABLE outbound_grants DROP COLUMN first_download_at;
+                     ALTER TABLE outbound_grants DROP COLUMN last_download_at;
+                     UPDATE meta SET value = '10' WHERE key = 'schema_version';",
+                )
+                .unwrap();
+        }
+
+        drop(Store::open(directory.path()).unwrap());
+        let connection = Connection::open(directory.path().join("votport.db")).unwrap();
+        assert_eq!(schema_version(directory.path()), "11");
+        let columns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('outbound_grants')
+                 WHERE name IN ('first_download_at', 'last_download_at')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 2);
     }
 
     #[test]

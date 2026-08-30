@@ -364,6 +364,8 @@ pub async fn create_outbound_grant(
         expires_at: created_at.saturating_add(request.expires_days * 86_400),
         revoked_at: None,
         downloads: 0,
+        first_download_at: None,
+        last_download_at: None,
         files: Vec::new(),
     };
     app.store
@@ -401,6 +403,8 @@ async fn create_library_grant(
     }
     let root = library_root(app, &identity.tenant);
     let mut selections = Vec::with_capacity(requested.len());
+    let mut selected = std::collections::HashSet::with_capacity(requested.len());
+    let mut total_bytes = 0u64;
     for name in requested {
         let path = safe_library_path(app, &identity.tenant, name)?;
         if !library_components_safe(&root, &path) {
@@ -410,7 +414,23 @@ async fn create_library_grant(
         if !meta.file_type().is_file() || meta.file_type().is_symlink() {
             return Err(ApiError::not_found());
         }
-        selections.push((name.trim_matches('/').to_owned(), path));
+        let name = name.trim_matches('/').to_owned();
+        if !selected.insert(name.clone()) {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "paths must not contain duplicates",
+            ));
+        }
+        total_bytes = total_bytes
+            .checked_add(meta.len())
+            .filter(|total| *total <= app.config.max_upload_bytes)
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "selected files exceed total size limit",
+                )
+            })?;
+        selections.push((name, path));
     }
     let max = app.config.max_upload_bytes;
     let hashed = tokio::task::spawn_blocking(move || {
@@ -483,6 +503,8 @@ async fn create_library_grant(
         expires_at: created_at.saturating_add(expires_days * 86_400),
         revoked_at: None,
         downloads: 0,
+        first_download_at: None,
+        last_download_at: None,
         files,
     };
     if grant.label.trim().is_empty() || grant.label.len() > 200 {
@@ -553,6 +575,9 @@ fn hash_library_file(
         root: hex::encode(object.root),
         bytes,
         receipt_b64: String::new(),
+        downloads: 0,
+        first_download_at: None,
+        last_download_at: None,
     })
 }
 
@@ -636,8 +661,9 @@ pub async fn outbound_metadata(
             "downloads": grant.downloads,
             "receipt_key": app.signer.public_hex,
             "receipt_url": format!("/api/s/{token}/receipt"),
-            "download_url": format!("/api/s/{token}/file")
-            ,"files": files
+            "download_url": format!("/api/s/{token}/file"),
+            "bundle_url": format!("/api/s/{token}/bundle"),
+            "files": files,
         })),
     )
         .into_response())
@@ -754,12 +780,16 @@ async fn outbound_file_inner(
             "too many downloads; try again later",
         ));
     }
-    let active = ActiveDownload::claim(Arc::clone(&app), &format!("{}:{index}", grant.token_hash))?;
-    let (stage, source) = prepare(&app, &grant, index).await?;
+    let active = ActiveDownload::claim(Arc::clone(&app), &grant.token_hash)?;
+    let (stage, source, _receipt) = prepare(&app, &grant, index).await?;
     let file = tokio::fs::File::open(&stage.path)
         .await
         .map_err(|_| ApiError::internal("open staged file failed"))?;
-    if app.store.record_outbound_download(&grant.id).is_err() {
+    if app
+        .store
+        .record_outbound_download(&grant.id, &[index], now_unix())
+        .is_err()
+    {
         return Err(ApiError::internal("record download failed"));
     }
     let stream = ReaderStream::new(OutboundReader {
@@ -788,6 +818,100 @@ async fn outbound_file_inner(
         header::CONTENT_DISPOSITION,
         HeaderValue::try_from(disposition)
             .map_err(|_| ApiError::internal("download filename invalid"))?,
+    );
+    Ok(response)
+}
+
+pub async fn outbound_bundle(
+    State(app): State<Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    AxumPath(token): AxumPath<String>,
+) -> ApiResult<Response> {
+    let grant = active_grant(&app, &token)?;
+    require_grant_access(&app, &grant, &headers)?;
+    let ip = super::client_ip(&headers, &peer, &app.config.trusted_proxies);
+    if !app.outbound_rate.allow(&ip) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many downloads; try again later",
+        ));
+    }
+    let count = if grant.files.is_empty() {
+        1
+    } else {
+        grant.files.len()
+    };
+    let total_bytes = if grant.files.is_empty() {
+        Some(grant.bytes)
+    } else {
+        grant
+            .files
+            .iter()
+            .try_fold(0u64, |total, file| total.checked_add(file.bytes))
+    };
+    if total_bytes.is_none_or(|bytes| bytes > app.config.max_upload_bytes) {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "bundle exceeds total size limit",
+        ));
+    }
+    let active = ActiveDownload::claim(Arc::clone(&app), &grant.token_hash)?;
+    let mut files = Vec::with_capacity(count);
+    let mut names = std::collections::HashSet::with_capacity(count * 2);
+    for index in 0..count {
+        let (stage, source, receipt) = prepare(&app, &grant, index).await?;
+        let relative = bundle_path(&source.name).ok_or_else(ApiError::not_found)?;
+        let name = format!("files/{relative}");
+        let receipt_name = format!("receipts/{relative}.vot-receipt");
+        if !names.insert(name.clone()) || !names.insert(receipt_name.clone()) {
+            return Err(ApiError::not_found());
+        }
+        files.push(PreparedBundleFile {
+            stage,
+            name,
+            receipt_name,
+            source,
+            receipt,
+        });
+    }
+    let manifest = bundle_manifest(&app, &grant, &files)?;
+    let (archive, stages) = build_bundle(&app, files, manifest).await?;
+    let length = tokio::fs::metadata(&archive.path)
+        .await
+        .map_err(|_| ApiError::internal("inspect bundle failed"))?
+        .len();
+    let file = tokio::fs::File::open(&archive.path)
+        .await
+        .map_err(|_| ApiError::internal("open bundle failed"))?;
+    let indexes: Vec<usize> = (0..count).collect();
+    if app
+        .store
+        .record_outbound_download(&grant.id, &indexes, now_unix())
+        .is_err()
+    {
+        return Err(ApiError::internal("record download failed"));
+    }
+    let stream = ReaderStream::new(BundleReader {
+        file,
+        _archive: archive,
+        _stages: stages,
+        _active: active,
+    });
+    let mut response = Body::from_stream(stream).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-tar"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(length));
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"bundle.tar\""),
     );
     Ok(response)
 }
@@ -831,6 +955,127 @@ fn require_grant_access(app: &App, grant: &OutboundGrant, headers: &HeaderMap) -
             "outbound grant password required",
         ))
     }
+}
+
+struct PreparedBundleFile {
+    stage: StagedFile,
+    name: String,
+    receipt_name: String,
+    source: Source,
+    receipt: Vec<u8>,
+}
+
+fn bundle_path(name: &str) -> Option<String> {
+    let normalized = name.replace('\\', "/");
+    let mut components = Vec::new();
+    for component in Path::new(&normalized).components() {
+        let std::path::Component::Normal(component) = component else {
+            return None;
+        };
+        components.push(component.to_str()?.to_owned());
+    }
+    (!components.is_empty()).then(|| components.join("/"))
+}
+
+fn bundle_manifest(
+    app: &App,
+    grant: &OutboundGrant,
+    files: &[PreparedBundleFile],
+) -> ApiResult<Vec<u8>> {
+    serde_json::to_vec(&json!({
+        "label": grant.label,
+        "receipt_key": app.signer.public_hex,
+        "files": files.iter().map(|file| json!({
+            "path": file.name,
+            "receipt_path": file.receipt_name,
+            "suite": object_suite_name(file.source.object.suite),
+            "suite_id": file.source.object.suite,
+            "root": hex::encode(file.source.object.root),
+            "bytes": file.source.object.length,
+        })).collect::<Vec<_>>(),
+    }))
+    .map_err(|_| ApiError::internal("encode bundle manifest failed"))
+}
+
+fn object_suite_name(suite: u16) -> &'static str {
+    match suite {
+        1 => "blake3",
+        2 => "sha256",
+        _ => "unknown",
+    }
+}
+
+async fn build_bundle(
+    app: &App,
+    files: Vec<PreparedBundleFile>,
+    manifest: Vec<u8>,
+) -> ApiResult<(StagedFile, Vec<StagedFile>)> {
+    let stage_dir = app
+        .config
+        .data_dir
+        .join("outbound.stage")
+        .join(format!(".vot-outbound-{}", auth::random_token()));
+    std::fs::create_dir_all(&stage_dir)
+        .map_err(|_| ApiError::internal("create bundle stage failed"))?;
+    let archive_path = stage_dir.join(format!("{}.tar", auth::random_token()));
+    let archive = StagedFile {
+        path: archive_path.clone(),
+    };
+    let prepared = tokio::task::spawn_blocking(move || {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let output = options.open(&archive_path)?;
+        let mut builder = tar::Builder::new(output);
+        for file in &files {
+            let mut input = std::fs::File::open(&file.stage.path)?;
+            append_tar_file(
+                &mut builder,
+                &file.name,
+                file.source.object.length,
+                &mut input,
+            )?;
+            let mut receipt = std::io::Cursor::new(&file.receipt);
+            append_tar_file(
+                &mut builder,
+                &file.receipt_name,
+                file.receipt.len() as u64,
+                &mut receipt,
+            )?;
+        }
+        let mut manifest_input = std::io::Cursor::new(manifest);
+        append_tar_file(
+            &mut builder,
+            "manifest.json",
+            manifest_input.get_ref().len() as u64,
+            &mut manifest_input,
+        )?;
+        builder.finish()?;
+        let output = builder.into_inner()?;
+        output.sync_all()?;
+        Ok::<_, io::Error>(files.into_iter().map(|file| file.stage).collect())
+    })
+    .await
+    .map_err(|_| ApiError::internal("bundle preparation failed"))?
+    .map_err(|_| ApiError::internal("build bundle failed"))?;
+    Ok((archive, prepared))
+}
+
+fn append_tar_file<R: std::io::Read>(
+    builder: &mut tar::Builder<std::fs::File>,
+    name: &str,
+    size: u64,
+    input: &mut R,
+) -> io::Result<()> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(size);
+    header.set_mode(0o600);
+    header.set_cksum();
+    builder.append_data(&mut header, name, input)
 }
 
 fn hash_optional_password(password: Option<&str>) -> ApiResult<Option<String>> {
@@ -946,7 +1191,7 @@ async fn prepare(
     app: &Arc<App>,
     grant: &OutboundGrant,
     index: usize,
-) -> ApiResult<(StagedFile, Source)> {
+) -> ApiResult<(StagedFile, Source, Vec<u8>)> {
     let _pin = if grant.files.is_empty() {
         let pin = app.sessions.try_pin_link(&grant.link_id).ok_or_else(|| {
             ApiError::new(StatusCode::CONFLICT, "link lifecycle update in progress")
@@ -986,7 +1231,7 @@ async fn prepare(
     if verify_receipt(app, &receipt, &source.object).is_err() {
         return Err(ApiError::not_found());
     }
-    Ok((stage, source))
+    Ok((stage, source, receipt))
 }
 
 fn copy_verify(
@@ -1083,7 +1328,7 @@ fn safe_filename(name: &str) -> String {
     value.chars().take(180).collect()
 }
 fn public_grant(grant: OutboundGrant) -> serde_json::Value {
-    json!({ "id": grant.id, "tenant": grant.tenant, "link_id": grant.link_id, "upload_id": grant.upload_id, "file_index": grant.file_index, "name": grant.name, "label": grant.label, "has_password": grant.password_hash.is_some(), "created_at": grant.created_at, "expires_at": grant.expires_at, "revoked_at": grant.revoked_at, "downloads": grant.downloads, "files": grant.files.iter().map(|file| json!({ "name": file.name, "suite": file.suite, "root": file.root, "bytes": file.bytes })).collect::<Vec<_>>() })
+    json!({ "id": grant.id, "tenant": grant.tenant, "link_id": grant.link_id, "upload_id": grant.upload_id, "file_index": grant.file_index, "name": grant.name, "label": grant.label, "has_password": grant.password_hash.is_some(), "created_at": grant.created_at, "expires_at": grant.expires_at, "revoked_at": grant.revoked_at, "downloads": grant.downloads, "first_download_at": grant.first_download_at, "last_download_at": grant.last_download_at, "files": grant.files.iter().map(|file| json!({ "name": file.name, "suite": file.suite, "root": file.root, "bytes": file.bytes, "downloads": file.downloads, "first_download_at": file.first_download_at, "last_download_at": file.last_download_at })).collect::<Vec<_>>() })
 }
 
 struct ActiveDownload {
@@ -1138,6 +1383,23 @@ struct OutboundReader {
     _active: ActiveDownload,
 }
 impl AsyncRead for OutboundReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.file).poll_read(cx, buf)
+    }
+}
+
+struct BundleReader {
+    file: tokio::fs::File,
+    _archive: StagedFile,
+    _stages: Vec<StagedFile>,
+    _active: ActiveDownload,
+}
+
+impl AsyncRead for BundleReader {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -1247,6 +1509,17 @@ mod tests {
         assert_eq!(safe_filename("../a/b?.txt"), "b_.txt");
     }
     #[test]
+    fn bundle_paths_are_relative_and_normalized() {
+        assert_eq!(
+            bundle_path("project/file.bin").as_deref(),
+            Some("project/file.bin")
+        );
+        assert!(bundle_path("../file.bin").is_none());
+        assert!(bundle_path("/file.bin").is_none());
+        assert!(bundle_path("project/../file.bin").is_none());
+        assert!(bundle_path("").is_none());
+    }
+    #[test]
     fn source_identity_mismatch_is_rejected() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source");
@@ -1319,6 +1592,7 @@ mod tests {
         assert_eq!(metadata["receipt_key"], app.signer.public_hex);
         assert_eq!(metadata["receipt_url"], format!("/api/s/{token}/receipt"));
         assert_eq!(metadata["download_url"], format!("/api/s/{token}/file"));
+        assert_eq!(metadata["bundle_url"], format!("/api/s/{token}/bundle"));
 
         let receipt = crate::app::router(app.clone())
             .oneshot(
@@ -1449,11 +1723,11 @@ mod tests {
             json!({ "has_password": true, "authorized": false })
         );
 
-        let peer = ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1)));
-        for suffix in ["/file", "/receipt"] {
+        for suffix in ["/file", "/receipt", "/bundle"] {
             let mut request = Request::get(format!("/api/s/{token}{suffix}"));
-            if suffix == "/file" {
-                request = request.extension(peer);
+            if matches!(suffix, "/file" | "/bundle") {
+                request =
+                    request.extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))));
             }
             assert_eq!(
                 crate::app::router(app.clone())
@@ -1523,6 +1797,51 @@ mod tests {
             file.into_body().collect().await.unwrap().to_bytes(),
             expected_bytes
         );
+
+        let bundle = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/bundle"))
+                    .header("cookie", &grant_cookie)
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 3))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bundle.status(), StatusCode::OK);
+        assert_eq!(bundle.headers()[header::CONTENT_TYPE], "application/x-tar");
+        assert!(bundle.headers().get(header::ACCEPT_RANGES).is_none());
+        let bundle = bundle.into_body().collect().await.unwrap().to_bytes();
+        let mut archive = tar::Archive::new(std::io::Cursor::new(bundle));
+        let mut entries = std::collections::HashMap::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let name = entry.path().unwrap().to_string_lossy().into_owned();
+            let mut contents = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut contents).unwrap();
+            entries.insert(name, contents);
+        }
+        assert_eq!(
+            entries
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::HashSet<_>>(),
+            [
+                "manifest.json",
+                "files/received.bin",
+                "receipts/received.bin.vot-receipt",
+            ]
+            .into_iter()
+            .collect()
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&entries["manifest.json"]).unwrap();
+        assert_eq!(manifest["label"], "received.bin");
+        assert_eq!(manifest["receipt_key"], app.signer.public_hex);
+        assert_eq!(manifest["files"].as_array().unwrap().len(), 1);
+        assert_eq!(manifest["files"][0]["path"], "files/received.bin");
+        assert_eq!(entries["files/received.bin"], expected_bytes);
+        assert!(app.outbound_active.lock().unwrap().is_empty());
 
         let receipt = crate::app::router(app)
             .oneshot(
@@ -1610,6 +1929,21 @@ mod tests {
             StatusCode::CONFLICT
         );
 
+        let duplicate = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"paths":["project/one.bin","project/one.bin"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
         let create = Request::post("/api/admin/outbound-grants")
             .header("cookie", &cookie)
             .header("x-votport", "1")
@@ -1641,6 +1975,37 @@ mod tests {
             .unwrap();
         let metadata = body(metadata).await;
         assert_eq!(metadata["files"].as_array().unwrap().len(), 2);
+        let bundle = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/bundle"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bundle.status(), StatusCode::OK);
+        let bundle = bundle.into_body().collect().await.unwrap().to_bytes();
+        let mut archive = tar::Archive::new(std::io::Cursor::new(bundle));
+        let mut entries = std::collections::HashMap::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let name = entry.path().unwrap().to_string_lossy().into_owned();
+            let mut contents = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut contents).unwrap();
+            entries.insert(name, contents);
+        }
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries["files/project/one.bin"], first);
+        assert_eq!(entries["files/project/two.bin"], b"second file");
+        assert!(entries.contains_key("receipts/project/one.bin.vot-receipt"));
+        assert!(entries.contains_key("receipts/project/two.bin.vot-receipt"));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&entries["manifest.json"]).unwrap();
+        assert_eq!(manifest["label"], "project");
+        assert_eq!(manifest["receipt_key"], app.signer.public_hex);
+        assert_eq!(manifest["files"].as_array().unwrap().len(), 2);
+        assert!(app.outbound_active.lock().unwrap().is_empty());
         for (index, expected) in [first, b"second file".to_vec()].into_iter().enumerate() {
             let file = crate::app::router(app.clone())
                 .oneshot(
@@ -1676,7 +2041,7 @@ mod tests {
             assert_eq!(verified.receipt().subject_length, expected.len() as u64);
         }
         std::fs::write(app.config.outbound_dir.join("project/one.bin"), b"mutated").unwrap();
-        let mutated = crate::app::router(app)
+        let mutated = crate::app::router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/files/0"))
                     .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 4))))
@@ -1686,6 +2051,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mutated.status(), StatusCode::NOT_FOUND);
+        let bundle = crate::app::router(app)
+            .oneshot(
+                Request::get(format!("/api/s/{token}/bundle"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 6))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bundle.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1711,6 +2086,27 @@ mod tests {
                 .flatten()
                 .all(|entry| !entry.file_name().to_string_lossy().ends_with(".stage")))
             .unwrap_or(true));
+    }
+
+    #[tokio::test]
+    async fn library_grant_caps_the_aggregate_selection_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::api::testing::build(directory.path());
+        Arc::get_mut(&mut app).unwrap().config.max_upload_bytes = 5;
+        std::fs::write(app.config.outbound_dir.join("one.bin"), b"one").unwrap();
+        std::fs::write(app.config.outbound_dir.join("two.bin"), b"two").unwrap();
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", admin_cookie(&app))
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"paths":["one.bin","two.bin"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
