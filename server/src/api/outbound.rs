@@ -60,6 +60,7 @@ pub struct OutboundPathQuery {
 pub struct OutboundListQuery {
     directory: Option<String>,
     q: Option<String>,
+    selection: Option<String>,
 }
 
 pub async fn list_outbound_files(
@@ -69,11 +70,37 @@ pub async fn list_outbound_files(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = admin::require_admin(&app, &headers)?;
     let root = library_root(&app, &identity.tenant);
-    if query.directory.is_some() && query.q.is_some() {
+    if [
+        query.directory.is_some(),
+        query.q.is_some(),
+        query.selection.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count()
+        > 1
+    {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "directory and q cannot be combined",
+            "library listing modes cannot be combined",
         ));
+    }
+    if let Some(selection) = query.selection {
+        if selection.len() > MAX_LIBRARY_DIRECTORY_INPUT_BYTES {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "selection is too long",
+            ));
+        }
+        let tenant = identity.tenant;
+        let result = tokio::task::spawn_blocking(move || {
+            let directory = automation_directory(&app, &tenant, &selection)?;
+            let root = library_root(&app, &tenant);
+            enumerate_library_selection(&root, &directory)
+        })
+        .await
+        .map_err(|_| ApiError::internal("list outbound files failed"))??;
+        return Ok(Json(json!({ "files": result })));
     }
     if let Some(query) = query.q {
         let query = query.trim();
@@ -761,6 +788,17 @@ fn list_library_search(root: &Path, query: &str) -> (Vec<serde_json::Value>, boo
     )
 }
 
+fn enumerate_library_selection(root: &Path, directory: &Path) -> ApiResult<Vec<serde_json::Value>> {
+    enumerate_automation_files(root, directory)?
+        .into_iter()
+        .map(|relative| {
+            let path = root.join(&relative);
+            let metadata = std::fs::symlink_metadata(path).map_err(|_| ApiError::not_found())?;
+            Ok(json!({ "path": relative, "bytes": metadata.len() }))
+        })
+        .collect()
+}
+
 fn library_components_safe(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
@@ -1264,12 +1302,9 @@ fn automation_directory(app: &App, tenant: &str, directory: &str) -> ApiResult<P
 
 fn enumerate_automation_files(root: &Path, directory: &Path) -> ApiResult<Vec<String>> {
     fn visit(root: &Path, directory: &Path, paths: &mut Vec<String>) -> ApiResult<()> {
-        let mut entries = std::fs::read_dir(directory)
-            .map_err(|_| ApiError::not_found())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| ApiError::not_found())?;
-        entries.sort_by_key(|entry| entry.file_name());
+        let entries = std::fs::read_dir(directory).map_err(|_| ApiError::not_found())?;
         for entry in entries {
+            let entry = entry.map_err(|_| ApiError::not_found())?;
             let path = entry.path();
             let metadata = std::fs::symlink_metadata(&path).map_err(|_| ApiError::not_found())?;
             if metadata.file_type().is_symlink() {
@@ -4374,6 +4409,51 @@ mod tests {
         assert_eq!(listed["directory"], "adir");
         assert_eq!(listed["directories"], json!([]));
         assert_eq!(listed["files"][0]["path"], "adir/nested.bin");
+
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get("/api/admin/outbound-files?selection=adir")
+                    .header("cookie", admin_cookie(&app))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let selected = body(response).await;
+        assert_eq!(
+            selected["files"],
+            json!([{ "path": "adir/nested.bin", "bytes": 6 }])
+        );
+
+        std::fs::create_dir_all(root.join("large")).unwrap();
+        for index in 0..65 {
+            std::fs::write(root.join(format!("large/file-{index:02}.bin")), b"x").unwrap();
+        }
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get("/api/admin/outbound-files?selection=large")
+                    .header("cookie", admin_cookie(&app))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        #[cfg(unix)]
+        {
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::get("/api/admin/outbound-files?selection=link")
+                        .header("cookie", admin_cookie(&app))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
     }
 
     #[test]
@@ -4436,6 +4516,8 @@ mod tests {
         let app = crate::api::testing::build(directory.path());
         for uri in [
             "/api/admin/outbound-files?directory=one&q=two".to_owned(),
+            "/api/admin/outbound-files?directory=one&selection=two".to_owned(),
+            "/api/admin/outbound-files?selection=".to_owned(),
             "/api/admin/outbound-files?q=".to_owned(),
             format!("/api/admin/outbound-files?q={}", "x".repeat(101)),
             format!("/api/admin/outbound-files?directory={}", "x".repeat(1025)),

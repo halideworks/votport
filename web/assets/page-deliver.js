@@ -325,6 +325,7 @@ let libraryRequestGeneration = 0;
 let librarySearchTimer;
 const libraryProjectSuggestions = new Set();
 let librarySuggestionsInitialized = false;
+const libraryFolderSelections = new Map();
 
 function libraryPath(file) {
   const relative = file.webkitRelativePath || file.name;
@@ -440,6 +441,59 @@ function selectionCheckbox(file) {
   return checkbox;
 }
 
+function updateLibraryFolderCheckbox(directory, checkbox) {
+  const known = libraryFolderSelections.get(directory);
+  const selected = known && [...known.keys()].filter((path) => selectedLibraryPaths.has(path)).length;
+  checkbox.checked = Boolean(known && selected === known.size);
+  checkbox.indeterminate = Boolean(known && selected > 0 && selected < known.size);
+}
+
+async function toggleLibraryFolder(directory, checkbox) {
+  const known = libraryFolderSelections.get(directory);
+  if (!checkbox.checked) {
+    if (!known) return;
+    for (const path of known.keys()) selectedLibraryPaths.delete(path);
+    libraryFolderSelections.delete(directory);
+    updateLibrarySelectionStatus();
+    return;
+  }
+  if (known) {
+    const additions = [...known.keys()].filter((path) => !selectedLibraryPaths.has(path));
+    if (selectedLibraryPaths.size + additions.length > MAX_LIBRARY_SELECTION) {
+      updateLibraryFolderCheckbox(directory, checkbox);
+      showLibrarySelectionError();
+      return;
+    }
+    for (const [path, bytes] of known) selectedLibraryPaths.set(path, bytes);
+    $('library-selection-error').hidden = true;
+    updateLibrarySelectionStatus();
+    return;
+  }
+  checkbox.disabled = true;
+  try {
+    const response = await api(`/api/admin/outbound-files?selection=${encodeURIComponent(directory)}`);
+    const files = (response.files || []).filter((file) => parseLibraryPath(file.path));
+    const additions = files.filter((file) => !selectedLibraryPaths.has(file.path));
+    if (selectedLibraryPaths.size + additions.length > MAX_LIBRARY_SELECTION) {
+      throw new Error(`Select at most ${MAX_LIBRARY_SELECTION} files.`);
+    }
+    libraryFolderSelections.set(
+      directory,
+      new Map(files.map((file) => [file.path, Number(file.bytes) || 0])),
+    );
+    for (const file of files) selectedLibraryPaths.set(file.path, Number(file.bytes) || 0);
+    $('library-selection-error').hidden = true;
+    updateLibrarySelectionStatus();
+  } catch (error) {
+    checkbox.checked = false;
+    $('library-selection-error').textContent = error.message;
+    $('library-selection-error').hidden = false;
+    updateLibrarySelectionStatus();
+  } finally {
+    checkbox.disabled = false;
+  }
+}
+
 function renderLibraryBreadcrumbs() {
   const breadcrumbs = $('library-breadcrumbs');
   breadcrumbs.replaceChildren();
@@ -484,6 +538,10 @@ function renderLibraryFile(file, container, showPath = false) {
     try {
       await api(`/api/admin/outbound-files?path=${encodeURIComponent(file.path)}`, { method: 'DELETE' });
       selectedLibraryPaths.delete(file.path);
+      for (const [directory, paths] of libraryFolderSelections) {
+        paths.delete(file.path);
+        if (!paths.size) libraryFolderSelections.delete(directory);
+      }
       await refreshLibrary();
     } finally {
       remove.disabled = false;
@@ -500,13 +558,19 @@ function renderLibraryFile(file, container, showPath = false) {
 
 function renderLibraryDirectory(directory, container) {
   const name = directory.slice(directory.lastIndexOf('/') + 1);
+  const select = document.createElement('input');
+  select.type = 'checkbox';
+  updateLibraryFolderCheckbox(directory, select);
+  select.setAttribute('aria-label', `Select folder ${directory}`);
+  select.title = 'Select all files in this folder';
+  select.addEventListener('change', () => toggleLibraryFolder(directory, select));
   const open = button(name, 'tiny ghost', async () => {
     await browseLibrary(directory);
   });
   open.setAttribute('aria-label', `Open folder ${name}`);
   const row = document.createElement('div');
   row.className = 'library-file library-folder';
-  row.append(open);
+  row.append(select, open);
   container.append(row);
 }
 
