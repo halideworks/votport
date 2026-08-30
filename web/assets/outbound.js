@@ -3,10 +3,13 @@
 import { appendObjectCard, formatBytes } from '/assets/object-card.js';
 import {
   anchorDownloadsAllowed,
+  appendMetadataPage,
   dedupeFilenames,
   FILE_RENDER_BATCH_SIZE,
+  metadataMoreAvailable,
   nextFileBatch,
   MAX_ANCHOR_DOWNLOADS,
+  publicMetadataPageUrl,
   runWorkerPool,
   summarizeFailures,
 } from '/assets/outbound-download.js';
@@ -15,6 +18,9 @@ const $ = (id) => document.getElementById(id);
 const token = window.location.pathname.split('/').filter(Boolean).pop();
 let metadataFiles = [];
 let renderedFileCount = 0;
+let metadataTotal = 0;
+let metadataHasMore = false;
+let metadataLoading = false;
 
 function when(seconds) {
   return new Date(seconds * 1000).toLocaleString();
@@ -63,9 +69,32 @@ function renderNextFileBatch() {
   const controls = $('file-list-controls');
   const more = $('show-more-files');
   const status = $('file-list-status');
-  controls.hidden = metadataFiles.length <= FILE_RENDER_BATCH_SIZE;
-  more.hidden = renderedFileCount >= metadataFiles.length;
-  status.textContent = `Showing ${renderedFileCount} of ${metadataFiles.length} files`;
+  controls.hidden = metadataTotal <= FILE_RENDER_BATCH_SIZE;
+  more.hidden = !metadataMoreAvailable(renderedFileCount, metadataFiles.length, metadataHasMore);
+  status.textContent = `Showing ${renderedFileCount} of ${metadataTotal} files`;
+}
+
+function showMetadataProgress() {
+  $('file-list-controls').hidden = metadataTotal <= FILE_RENDER_BATCH_SIZE;
+  $('show-more-files').hidden = !metadataMoreAvailable(
+    renderedFileCount,
+    metadataFiles.length,
+    metadataHasMore,
+  );
+  $('file-list-status').textContent = `Showing ${renderedFileCount} of ${metadataTotal} files`;
+}
+
+function validateMetadataFiles(files) {
+  if (files.some((file) =>
+    !file.download_url ||
+    !file.receipt_url ||
+    !file.name ||
+    !file.suite ||
+    !file.root ||
+    typeof file.bytes !== 'number'
+  )) {
+    throw new Error('The server returned incomplete download metadata.');
+  }
 }
 
 async function saveFile(directory, file, name) {
@@ -96,22 +125,111 @@ function triggerSeparateDownloads(files, names) {
 
 let separateDownloadBusy = false;
 
-async function downloadSeparately(files) {
-  if (typeof window.showDirectoryPicker !== 'function' && !anchorDownloadsAllowed(files.length)) return;
+async function fetchMetadataPage(offset, limit = FILE_RENDER_BATCH_SIZE) {
+  let response;
+  try {
+    response = await fetch(publicMetadataPageUrl(token, offset, limit), {
+      credentials: 'same-origin',
+    });
+  } catch {
+    throw new Error('The download could not be loaded. Check your connection and try again.');
+  }
+  let body = null;
+  try { body = await response.json(); } catch { /* non-JSON error page */ }
+  if ((body?.needs_password || body?.has_password) && !body.authorized) {
+    if (offset === 0) showPasswordGate();
+    throw new Error('outbound grant password required');
+  }
+  if (!response.ok) {
+    throw new Error(
+      response.status === 404
+        ? 'This download link was not found or has expired.'
+        : body?.error || `The download could not be loaded (${response.status}).`,
+    );
+  }
+  if (body?.expires_at && body.expires_at <= Math.floor(Date.now() / 1000)) {
+    throw new Error('This download link has expired.');
+  }
+  const files = Array.isArray(body?.files) && body.files.length
+    ? body.files
+    : body?.download_url && body.receipt_url
+      ? [{
+          name: body.name,
+          suite: body.suite,
+          root: body.root,
+          bytes: body.bytes ?? body.length,
+          download_url: body.download_url,
+          receipt_url: body.receipt_url,
+        }]
+      : [];
+  if (!files.length) throw new Error('The server returned incomplete download metadata.');
+  validateMetadataFiles(files);
+  const pagingFields = ['files_total', 'offset', 'limit', 'has_more'];
+  const hasPagingFields = pagingFields.some((field) => Object.hasOwn(body ?? {}, field));
+  if (!hasPagingFields) {
+    return {
+      ...body,
+      files,
+      files_total: files.length,
+      offset: 0,
+      limit: files.length,
+      has_more: false,
+    };
+  }
+  if (!Number.isSafeInteger(body.files_total) || !Number.isSafeInteger(body.offset) ||
+      !Number.isSafeInteger(body.limit) || typeof body.has_more !== 'boolean') {
+    throw new Error('The server returned incomplete download metadata.');
+  }
+  return { ...body, files };
+}
+
+async function appendMetadataPageAt(offset, limit = FILE_RENDER_BATCH_SIZE) {
+  const page = await fetchMetadataPage(offset, limit);
+  const next = appendMetadataPage(
+    { files: metadataFiles, total: metadataFiles.length ? metadataTotal : null },
+    page,
+  );
+  metadataFiles = next.files;
+  metadataTotal = next.total;
+  metadataHasMore = next.hasMore;
+  return page;
+}
+
+async function loadRemainingMetadata() {
+  if (metadataLoading) throw new Error('File metadata is already loading.');
+  metadataLoading = true;
+  try {
+    while (metadataHasMore) {
+      $('file-list-status').textContent = `Loading file metadata: ${metadataFiles.length} of ${metadataTotal}`;
+      await appendMetadataPageAt(metadataFiles.length, 500);
+    }
+    showMetadataProgress();
+    return metadataFiles;
+  } finally {
+    metadataLoading = false;
+  }
+}
+
+async function downloadSeparately() {
+  if (typeof window.showDirectoryPicker !== 'function' && !anchorDownloadsAllowed(metadataTotal)) return;
   if (separateDownloadBusy) return;
   separateDownloadBusy = true;
   const button = $('separate-download-button');
   const status = $('separate-download-status');
-  const names = dedupeFilenames(files.map((file) => file.name));
   button.disabled = true;
   try {
+    let directory;
+    if (typeof window.showDirectoryPicker === 'function') {
+      directory = await window.showDirectoryPicker({ mode: 'readwrite' });
+    }
+    const files = metadataHasMore ? await loadRemainingMetadata() : metadataFiles;
+    const names = dedupeFilenames(files.map((file) => file.name));
     if (typeof window.showDirectoryPicker !== 'function') {
       triggerSeparateDownloads(files, names);
       status.textContent =
         `Requested ${files.length} downloads. Your browser may ask once to allow multiple downloads.`;
       return;
     }
-    const directory = await window.showDirectoryPicker({ mode: 'readwrite' });
     const failures = [];
     await runWorkerPool(
       files,
@@ -141,80 +259,53 @@ async function downloadSeparately(files) {
 }
 
 async function loadMetadata() {
-  let response;
+  let body;
   try {
-    response = await fetch(`/api/s/${encodeURIComponent(token)}`, {
-      credentials: 'same-origin',
-    });
-  } catch {
-    showError('The download could not be loaded. Check your connection and try again.');
+    body = await fetchMetadataPage(0);
+  } catch (error) {
+    if (error.message === 'outbound grant password required') return;
+    showError(error.message);
     return;
   }
-
-  let body = null;
-  try { body = await response.json(); } catch { /* non-JSON error page */ }
-  if ((body?.needs_password || body?.has_password) && !body.authorized) {
-    showPasswordGate();
-    return;
-  }
-  if (!response.ok) {
-    showError(
-      response.status === 404
-        ? 'This download link was not found or has expired.'
-        : body?.error || `The download could not be loaded (${response.status}).`,
-    );
-    return;
-  }
-  if (body.expires_at && body.expires_at <= Math.floor(Date.now() / 1000)) {
-    showError('This download link has expired.');
-    return;
-  }
-  const files = Array.isArray(body.files) && body.files.length
-    ? body.files
-    : body.download_url && body.receipt_url
-      ? [{
-          name: body.name,
-          suite: body.suite,
-          root: body.root,
-          bytes: body.bytes ?? body.length,
-          download_url: body.download_url,
-          receipt_url: body.receipt_url,
-        }]
-      : [];
-  if (!body.receipt_key || !files.length || files.some((file) =>
-    !file.download_url ||
-    !file.receipt_url ||
-    !file.name ||
-    !file.suite ||
-    !file.root ||
-    typeof file.bytes !== 'number'
-  )) {
+  if (!body.receipt_key) {
     showError('The server returned incomplete download metadata.');
     return;
   }
 
   $('download-gate').hidden = true;
   $('object').replaceChildren();
-  metadataFiles = files;
+  metadataFiles = [];
+  metadataTotal = 0;
+  metadataHasMore = false;
   renderedFileCount = 0;
+  let next;
+  try {
+    next = appendMetadataPage({ files: [], total: null }, body);
+  } catch (error) {
+    showError(error.message);
+    return;
+  }
+  metadataFiles = next.files;
+  metadataTotal = next.total;
+  metadataHasMore = next.hasMore;
   renderNextFileBatch();
   const bundle = $('bundle-download');
   bundle.hidden = !body.bundle_url;
   if (body.bundle_url) $('bundle-download-button').onclick = () => window.location.assign(body.bundle_url);
   const separate = $('separate-download');
-  separate.hidden = files.length < 2;
-  if (files.length > 1) {
+  separate.hidden = metadataTotal < 2;
+  if (metadataTotal > 1) {
     const separateNote = $('separate-download-note');
     const separateButton = $('separate-download-button');
     const pickerAvailable = typeof window.showDirectoryPicker === 'function';
     if (pickerAvailable) {
       separateNote.textContent = 'Choose a folder and save each payload file separately.';
-      separateButton.onclick = () => downloadSeparately(files);
+      separateButton.onclick = () => downloadSeparately();
       separateButton.disabled = false;
       $('separate-download-status').textContent = '';
-    } else if (anchorDownloadsAllowed(files.length)) {
+    } else if (anchorDownloadsAllowed(metadataTotal)) {
       separateNote.textContent = 'Your browser may ask once to allow multiple downloads.';
-      separateButton.onclick = () => downloadSeparately(files);
+      separateButton.onclick = () => downloadSeparately();
       separateButton.disabled = false;
       $('separate-download-status').textContent = '';
     } else {
@@ -233,7 +324,22 @@ async function loadMetadata() {
   $('download-content').hidden = false;
 }
 
-$('show-more-files').addEventListener('click', renderNextFileBatch);
+$('show-more-files').addEventListener('click', async () => {
+  if (metadataLoading || !metadataMoreAvailable(renderedFileCount, metadataFiles.length, metadataHasMore)) return;
+  metadataLoading = true;
+  $('show-more-files').disabled = true;
+  try {
+    if (renderedFileCount >= metadataFiles.length && metadataHasMore) {
+      await appendMetadataPageAt(metadataFiles.length);
+    }
+    renderNextFileBatch();
+  } catch (error) {
+    $('file-list-status').textContent = error.message;
+  } finally {
+    metadataLoading = false;
+    $('show-more-files').disabled = false;
+  }
+});
 
 $('download-password-form').addEventListener('submit', async (event) => {
   event.preventDefault();

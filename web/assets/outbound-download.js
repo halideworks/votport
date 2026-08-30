@@ -8,6 +8,58 @@ export function nextFileBatch(files, offset = 0) {
   return files.slice(start, start + FILE_RENDER_BATCH_SIZE);
 }
 
+export function metadataMoreAvailable(renderedCount, loadedCount, hasMore) {
+  return renderedCount < loadedCount || hasMore;
+}
+
+export function appendMetadataPage(state, page) {
+  if (!Number.isSafeInteger(page?.files_total) || page.files_total < 1) {
+    throw new Error('invalid file metadata total');
+  }
+  if (!Number.isSafeInteger(page.offset) || page.offset !== state.files.length) {
+    throw new Error('file metadata page offset changed');
+  }
+  if (!Number.isSafeInteger(page.limit) || page.limit < 1 ||
+      !Array.isArray(page.files) ||
+      page.files.length > page.limit) {
+    throw new Error('invalid file metadata page');
+  }
+  if (state.total !== null && page.files_total !== state.total) {
+    throw new Error('file metadata total changed');
+  }
+  if (page.offset + page.files.length > page.files_total) {
+    throw new Error('invalid file metadata page');
+  }
+  const files = [...state.files, ...page.files];
+  const urls = new Set(state.files.map((file) => file.download_url));
+  for (const [index, file] of page.files.entries()) {
+    const globalIndex = page.offset + index;
+    const indexedUrls = typeof file?.download_url === 'string' &&
+      typeof file?.receipt_url === 'string' &&
+      file.download_url.endsWith(`/files/${globalIndex}`) &&
+      file.receipt_url.endsWith(`/receipts/${globalIndex}`);
+    const legacyUrl = globalIndex === 0 && typeof file?.download_url === 'string' &&
+      typeof file?.receipt_url === 'string' && file.download_url.endsWith('/file') &&
+      file.receipt_url.endsWith('/receipt');
+    if (!file || typeof file.download_url !== 'string' || typeof file.receipt_url !== 'string' ||
+        urls.has(file.download_url) ||
+        (!indexedUrls && !legacyUrl)) {
+      throw new Error('invalid or duplicate file metadata');
+    }
+    urls.add(file.download_url);
+  }
+  const hasMore = page.offset + page.files.length < page.files_total;
+  if (page.has_more !== hasMore || (hasMore && page.files.length !== page.limit)) {
+    throw new Error('file metadata page is incomplete');
+  }
+  return { files, total: page.files_total, hasMore };
+}
+
+export function publicMetadataPageUrl(token, offset = 0, limit = FILE_RENDER_BATCH_SIZE) {
+  const query = new URLSearchParams({ offset: String(offset), limit: String(limit) });
+  return `/api/s/${encodeURIComponent(token)}?${query}`;
+}
+
 export function anchorDownloadsAllowed(count) {
   return count <= MAX_ANCHOR_DOWNLOADS;
 }

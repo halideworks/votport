@@ -106,6 +106,12 @@ pub struct OutboundGrant {
     pub files: Vec<OutboundGrantFile>,
 }
 
+pub struct OutboundGrantFilesPage {
+    pub grant: OutboundGrant,
+    pub file_count: usize,
+    pub files: Vec<(usize, OutboundGrantFile)>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AutomationToken {
     pub id: String,
@@ -1962,7 +1968,14 @@ impl Store {
                     [token_hash],
                     |row| {
                         let file_count = row.get::<_, i64>("file_count")?;
-                        Ok((map_outbound_grant_base(row)?, file_count.max(0) as usize))
+                        let file_count = usize::try_from(file_count.max(0)).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Integer,
+                                Box::new(error),
+                            )
+                        })?;
+                        Ok((map_outbound_grant_base(row)?, file_count))
                     },
                 )
                 .optional()?;
@@ -2003,6 +2016,103 @@ impl Store {
                 }
             }
             Ok(Some((grant, row)))
+        })
+    }
+
+    /// Looks up one page of outbound files without parsing the full manifest.
+    pub fn outbound_grant_files_page_by_token_hash(
+        &self,
+        token_hash: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<OutboundGrantFilesPage>, String> {
+        let offset =
+            i64::try_from(offset).map_err(|_| "outbound file offset overflow".to_owned())?;
+        let limit = i64::try_from(limit).map_err(|_| "outbound file limit overflow".to_owned())?;
+        self.with(|connection| {
+            let parent = connection
+                .query_row(
+                    "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
+                            name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
+                            expires_at, revoked_at, downloads, max_downloads, notify_on_download,
+                            first_download_at, last_download_at, file_count
+                     FROM outbound_grants WHERE token_hash = ?1",
+                    [token_hash],
+                    |row| {
+                        let file_count = row.get::<_, i64>("file_count")?;
+                        let file_count = usize::try_from(file_count.max(0)).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Integer,
+                                Box::new(error),
+                            )
+                        })?;
+                        Ok((map_outbound_grant_base(row)?, file_count))
+                    },
+                )
+                .optional()?;
+            let Some((grant, file_count)) = parent else {
+                return Ok(None);
+            };
+            let mut statement = connection.prepare(
+                "SELECT file_index, source, name, suite, root, bytes_hi, bytes_lo, receipt_b64,
+                        downloads, first_download_at, last_download_at
+                 FROM outbound_grant_files
+                 WHERE grant_id = ?1 AND file_index >= ?2
+                 ORDER BY file_index
+                 LIMIT ?3",
+            )?;
+            let rows = statement.query_map(rusqlite::params![grant.id, offset, limit], |row| {
+                Ok((
+                    usize::try_from(row.get::<_, i64>("file_index")?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })?,
+                    map_outbound_grant_file(row)?,
+                ))
+            })?;
+            let mut files = rows.collect::<Result<Vec<_>, _>>()?;
+            if files.is_empty() && offset == 0 && file_count == 1 {
+                let has_children: bool = connection.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM outbound_grant_files WHERE grant_id = ?1)",
+                    [&grant.id],
+                    |row| row.get(0),
+                )?;
+                if !has_children {
+                    let files_json: String = connection.query_row(
+                        "SELECT files_json FROM outbound_grants WHERE id = ?1",
+                        [&grant.id],
+                        |row| row.get(0),
+                    )?;
+                    if serde_json::from_str::<Vec<OutboundGrantFile>>(&files_json)
+                        .map(|files| files.is_empty())
+                        .unwrap_or(false)
+                    {
+                        files.push((
+                            0,
+                            OutboundGrantFile {
+                                source: String::new(),
+                                name: grant.name.clone(),
+                                suite: grant.suite.clone(),
+                                root: grant.root.clone(),
+                                bytes: grant.bytes,
+                                receipt_b64: String::new(),
+                                downloads: grant.downloads,
+                                first_download_at: grant.first_download_at,
+                                last_download_at: grant.last_download_at,
+                            },
+                        ));
+                    }
+                }
+            }
+            Ok(Some(OutboundGrantFilesPage {
+                grant,
+                file_count,
+                files,
+            }))
         })
     }
 
@@ -3574,6 +3684,11 @@ mod tests {
             .outbound_grant_file_by_token_hash("hash-missing-child", 0)
             .unwrap()
             .is_none());
+        let page = store
+            .outbound_grant_files_page_by_token_hash("hash-missing-child", 0, 100)
+            .unwrap()
+            .unwrap();
+        assert!(page.files.is_empty());
     }
 
     #[test]
