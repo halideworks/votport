@@ -20,6 +20,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
 use vot_receipt::SubjectKind;
 use vot_sdk::object::{InMemoryObjectBuilder, ObjectId, Suite};
+use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 use super::{ApiError, ApiResult};
 use crate::api::admin;
@@ -1110,25 +1111,20 @@ pub async fn outbound_bundle(
     }
     let active = ActiveDownload::claim(Arc::clone(&app), &grant.token_hash)?;
     let mut files = Vec::with_capacity(count);
-    let mut names = std::collections::HashSet::with_capacity(count * 2);
+    let mut names = std::collections::HashSet::with_capacity(count);
     for index in 0..count {
-        let (stage, source, receipt) = prepare(&app, &grant, index).await?;
+        let (stage, source, _receipt) = prepare(&app, &grant, index).await?;
         let relative = bundle_path(&source.name).ok_or_else(ApiError::not_found)?;
-        let name = format!("files/{relative}");
-        let receipt_name = format!("receipts/{relative}.vot-receipt");
-        if !names.insert(name.clone()) || !names.insert(receipt_name.clone()) {
+        if !names.insert(bundle_collision_key(&relative)) {
             return Err(ApiError::not_found());
         }
         files.push(PreparedBundleFile {
             stage,
-            name,
-            receipt_name,
-            source,
-            receipt,
+            name: relative,
+            bytes: source.object.length,
         });
     }
-    let manifest = bundle_manifest(&app, &grant, &files)?;
-    let (archive, stages) = build_bundle(&app, files, manifest).await?;
+    let (archive, stages) = build_bundle(&app, files).await?;
     let length = tokio::fs::metadata(&archive.path)
         .await
         .map_err(|_| ApiError::internal("inspect bundle failed"))?
@@ -1153,7 +1149,7 @@ pub async fn outbound_bundle(
     let mut response = Body::from_stream(stream).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static("application/x-tar"),
+        HeaderValue::from_static("application/zip"),
     );
     response
         .headers_mut()
@@ -1163,7 +1159,7 @@ pub async fn outbound_bundle(
         .insert(header::CONTENT_LENGTH, HeaderValue::from(length));
     response.headers_mut().insert(
         header::CONTENT_DISPOSITION,
-        HeaderValue::from_static("attachment; filename=\"bundle.tar\""),
+        HeaderValue::from_static("attachment; filename=\"deliverables.zip\""),
     );
     Ok(response)
 }
@@ -1212,9 +1208,7 @@ fn require_grant_access(app: &App, grant: &OutboundGrant, headers: &HeaderMap) -
 struct PreparedBundleFile {
     stage: StagedFile,
     name: String,
-    receipt_name: String,
-    source: Source,
-    receipt: Vec<u8>,
+    bytes: u64,
 }
 
 fn bundle_path(name: &str) -> Option<String> {
@@ -1229,38 +1223,13 @@ fn bundle_path(name: &str) -> Option<String> {
     (!components.is_empty()).then(|| components.join("/"))
 }
 
-fn bundle_manifest(
-    app: &App,
-    grant: &OutboundGrant,
-    files: &[PreparedBundleFile],
-) -> ApiResult<Vec<u8>> {
-    serde_json::to_vec(&json!({
-        "label": grant.label,
-        "receipt_key": app.signer.public_hex,
-        "files": files.iter().map(|file| json!({
-            "path": file.name,
-            "receipt_path": file.receipt_name,
-            "suite": object_suite_name(file.source.object.suite),
-            "suite_id": file.source.object.suite,
-            "root": hex::encode(file.source.object.root),
-            "bytes": file.source.object.length,
-        })).collect::<Vec<_>>(),
-    }))
-    .map_err(|_| ApiError::internal("encode bundle manifest failed"))
-}
-
-fn object_suite_name(suite: u16) -> &'static str {
-    match suite {
-        1 => "blake3",
-        2 => "sha256",
-        _ => "unknown",
-    }
+fn bundle_collision_key(name: &str) -> String {
+    name.to_lowercase()
 }
 
 async fn build_bundle(
     app: &App,
     files: Vec<PreparedBundleFile>,
-    manifest: Vec<u8>,
 ) -> ApiResult<(StagedFile, Vec<StagedFile>)> {
     let stage_dir = app
         .config
@@ -1269,7 +1238,7 @@ async fn build_bundle(
         .join(format!(".vot-outbound-{}", auth::random_token()));
     std::fs::create_dir_all(&stage_dir)
         .map_err(|_| ApiError::internal("create bundle stage failed"))?;
-    let archive_path = stage_dir.join(format!("{}.tar", auth::random_token()));
+    let archive_path = stage_dir.join(format!("{}.zip", auth::random_token()));
     let archive = StagedFile {
         path: archive_path.clone(),
     };
@@ -1282,32 +1251,16 @@ async fn build_bundle(
             options.mode(0o600);
         }
         let output = options.open(&archive_path)?;
-        let mut builder = tar::Builder::new(output);
+        let mut builder = ZipWriter::new(output);
         for file in &files {
             let mut input = std::fs::File::open(&file.stage.path)?;
-            append_tar_file(
-                &mut builder,
-                &file.name,
-                file.source.object.length,
-                &mut input,
-            )?;
-            let mut receipt = std::io::Cursor::new(&file.receipt);
-            append_tar_file(
-                &mut builder,
-                &file.receipt_name,
-                file.receipt.len() as u64,
-                &mut receipt,
-            )?;
+            let options = SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Stored)
+                .large_file(file.bytes >= u32::MAX as u64);
+            builder.start_file(&file.name, options)?;
+            io::copy(&mut input, &mut builder)?;
         }
-        let mut manifest_input = std::io::Cursor::new(manifest);
-        append_tar_file(
-            &mut builder,
-            "manifest.json",
-            manifest_input.get_ref().len() as u64,
-            &mut manifest_input,
-        )?;
-        builder.finish()?;
-        let output = builder.into_inner()?;
+        let output = builder.finish()?;
         output.sync_all()?;
         Ok::<_, io::Error>(files.into_iter().map(|file| file.stage).collect())
     })
@@ -1315,19 +1268,6 @@ async fn build_bundle(
     .map_err(|_| ApiError::internal("bundle preparation failed"))?
     .map_err(|_| ApiError::internal("build bundle failed"))?;
     Ok((archive, prepared))
-}
-
-fn append_tar_file<R: std::io::Read>(
-    builder: &mut tar::Builder<std::fs::File>,
-    name: &str,
-    size: u64,
-    input: &mut R,
-) -> io::Result<()> {
-    let mut header = tar::Header::new_gnu();
-    header.set_size(size);
-    header.set_mode(0o600);
-    header.set_cksum();
-    builder.append_data(&mut header, name, input)
 }
 
 fn hash_optional_password(password: Option<&str>) -> ApiResult<Option<String>> {
@@ -1696,6 +1636,19 @@ mod tests {
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
     }
 
+    fn zip_entries(bytes: &[u8]) -> std::collections::HashMap<String, Vec<u8>> {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut entries = std::collections::HashMap::new();
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let name = entry.name().to_owned();
+            let mut contents = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut contents).unwrap();
+            entries.insert(name, contents);
+        }
+        entries
+    }
+
     async fn fixture() -> (tempfile::TempDir, Arc<App>, String, Vec<u8>) {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
@@ -1792,6 +1745,10 @@ mod tests {
         assert!(bundle_path("/file.bin").is_none());
         assert!(bundle_path("project/../file.bin").is_none());
         assert!(bundle_path("").is_none());
+        assert_eq!(
+            bundle_collision_key("Project/FINAL.MOV"),
+            bundle_collision_key("project/final.mov")
+        );
     }
     #[test]
     fn source_identity_mismatch_is_rejected() {
@@ -2083,38 +2040,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bundle.status(), StatusCode::OK);
-        assert_eq!(bundle.headers()[header::CONTENT_TYPE], "application/x-tar");
+        assert_eq!(bundle.headers()[header::CONTENT_TYPE], "application/zip");
+        assert_eq!(
+            bundle.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"deliverables.zip\""
+        );
         assert!(bundle.headers().get(header::ACCEPT_RANGES).is_none());
         let bundle = bundle.into_body().collect().await.unwrap().to_bytes();
-        let mut archive = tar::Archive::new(std::io::Cursor::new(bundle));
-        let mut entries = std::collections::HashMap::new();
-        for entry in archive.entries().unwrap() {
-            let mut entry = entry.unwrap();
-            let name = entry.path().unwrap().to_string_lossy().into_owned();
-            let mut contents = Vec::new();
-            std::io::Read::read_to_end(&mut entry, &mut contents).unwrap();
-            entries.insert(name, contents);
-        }
+        let entries = zip_entries(&bundle);
         assert_eq!(
             entries
                 .keys()
                 .map(String::as_str)
                 .collect::<std::collections::HashSet<_>>(),
-            [
-                "manifest.json",
-                "files/received.bin",
-                "receipts/received.bin.vot-receipt",
-            ]
-            .into_iter()
-            .collect()
+            ["received.bin"].into_iter().collect()
         );
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&entries["manifest.json"]).unwrap();
-        assert_eq!(manifest["label"], "received.bin");
-        assert_eq!(manifest["receipt_key"], app.signer.public_hex);
-        assert_eq!(manifest["files"].as_array().unwrap().len(), 1);
-        assert_eq!(manifest["files"][0]["path"], "files/received.bin");
-        assert_eq!(entries["files/received.bin"], expected_bytes);
+        assert_eq!(entries["received.bin"], expected_bytes);
+        assert!(!entries.keys().any(|name| name.contains("receipt")));
+        assert!(!entries.contains_key("manifest.json"));
         assert!(app.outbound_active.lock().unwrap().is_empty());
 
         let receipt = crate::app::router(app)
@@ -2260,25 +2203,12 @@ mod tests {
             .unwrap();
         assert_eq!(bundle.status(), StatusCode::OK);
         let bundle = bundle.into_body().collect().await.unwrap().to_bytes();
-        let mut archive = tar::Archive::new(std::io::Cursor::new(bundle));
-        let mut entries = std::collections::HashMap::new();
-        for entry in archive.entries().unwrap() {
-            let mut entry = entry.unwrap();
-            let name = entry.path().unwrap().to_string_lossy().into_owned();
-            let mut contents = Vec::new();
-            std::io::Read::read_to_end(&mut entry, &mut contents).unwrap();
-            entries.insert(name, contents);
-        }
-        assert_eq!(entries.len(), 5);
-        assert_eq!(entries["files/project/one.bin"], first);
-        assert_eq!(entries["files/project/two.bin"], b"second file");
-        assert!(entries.contains_key("receipts/project/one.bin.vot-receipt"));
-        assert!(entries.contains_key("receipts/project/two.bin.vot-receipt"));
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&entries["manifest.json"]).unwrap();
-        assert_eq!(manifest["label"], "project");
-        assert_eq!(manifest["receipt_key"], app.signer.public_hex);
-        assert_eq!(manifest["files"].as_array().unwrap().len(), 2);
+        let entries = zip_entries(&bundle);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries["project/one.bin"], first);
+        assert_eq!(entries["project/two.bin"], b"second file");
+        assert!(!entries.keys().any(|name| name.contains("receipt")));
+        assert!(!entries.contains_key("manifest.json"));
         assert!(app.outbound_active.lock().unwrap().is_empty());
         for (index, expected) in [first, b"second file".to_vec()].into_iter().enumerate() {
             let file = crate::app::router(app.clone())
