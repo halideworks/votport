@@ -56,11 +56,14 @@ jobs:
         run: |
           for f in web/assets/*.js; do node --check "$f"; done
 
+      - name: Install pinned JavaScript tooling
+        run: npm ci
+
       - name: Lint browser JavaScript
-        run: npx --yes eslint@9.18.0 web/assets/*.js
+        run: npm run lint
 
       - name: Browser JavaScript unit tests
-        run: node --test scripts/*.test.mjs
+        run: npm test
 
   advisories:
     runs-on: ubuntu-24.04
@@ -88,3 +91,59 @@ jobs:
 
       - name: Build the image (compiles vot-wasm + server)
         run: docker build -t votport:ci .
+
+      - name: Install Chromium for browser acceptance
+        run: |
+          npm ci
+          npx --no-install playwright install --with-deps chromium
+          unzip -v >/dev/null
+
+      - name: Run browser critical paths
+        env:
+          ADMIN_PASSWORD: votport-browser-e2e-password
+        run: |
+          set -Eeuo pipefail
+          e2e_root="$(mktemp -d)"
+          data_dir="$e2e_root/data"
+          receive_dir="$e2e_root/receive"
+          outbound_dir="$e2e_root/outbound"
+          mkdir -p "$data_dir" "$receive_dir" "$outbound_dir"
+          cleanup() {
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              docker logs votport-browser-e2e || true
+            fi
+            docker rm -f votport-browser-e2e >/dev/null 2>&1 || true
+            rm -rf "$e2e_root"
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          docker run -d --name votport-browser-e2e \
+            -p 127.0.0.1:8080:8080 \
+            --user "$(id -u):$(id -g)" \
+            -e VOTPORT_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+            -e VOTPORT_PUBLIC_URL=http://127.0.0.1:8080 \
+            -e VOTPORT_DATA_DIR=/data \
+            -e VOTPORT_RECEIVE_DIR=/received \
+            -e VOTPORT_OUTBOUND_DIR=/outbound \
+            -v "$data_dir:/data" \
+            -v "$receive_dir:/received" \
+            -v "$outbound_dir:/outbound" \
+            votport:ci
+
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:8080/healthz >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              echo "votport did not become ready" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+
+          BASE_URL=http://127.0.0.1:8080 \
+            ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+            RECEIVE_DIR="$receive_dir" \
+            npm run browser:e2e
