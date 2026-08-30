@@ -7,15 +7,17 @@ set -eu
 cd "$(dirname "$0")/.."
 
 FAMILIES='family=Instrument+Serif:ital@0;1&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500'
+FONT_CSS="$(mktemp)"
+trap 'rm -f "$FONT_CSS"' EXIT
 
 # -f makes an HTTP error page fail the script instead of feeding the parser.
 curl -sf --fail -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36" \
-    "https://fonts.googleapis.com/css2?${FAMILIES}&display=swap" -o /tmp/votport-gf.css
+    "https://fonts.googleapis.com/css2?${FAMILIES}&display=swap" -o "$FONT_CSS"
 
-python3 - <<'EOF'
-import re, urllib.request
+python3 - "$FONT_CSS" <<'EOF'
+import re, sys, urllib.request
 
-css = open('/tmp/votport-gf.css').read()
+css = open(sys.argv[1]).read()
 blocks = re.findall(r'/\* ([\w-]+) \*/\s*(@font-face \{[^}]+\})', css)
 out = []
 for subset, block in blocks:
