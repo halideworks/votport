@@ -3,6 +3,7 @@
 //! Licensed under the GNU Affero General Public License, version 3 only.
 
 pub mod admin;
+pub mod outbound;
 pub mod session_rate;
 pub mod sso;
 pub mod upload;
@@ -13,6 +14,10 @@ pub use admin::{
     backup_database, create_link, create_tenant, delete_link, delete_received_file, delete_tenant,
     delete_upload_record, get_settings, holdings, link_qr, list_links, list_tenants, put_settings,
     revoke_principal, switch_tenant, unblock_principal, update_link, update_tenant,
+};
+pub use outbound::{
+    create_outbound_grant, delete_outbound_grant, list_outbound_grants, outbound_file,
+    outbound_metadata, outbound_receipt,
 };
 pub use sso::{sso_available, sso_callback, sso_start};
 pub use upload::{

@@ -80,6 +80,26 @@ pub struct UploadRecord {
     pub files: Vec<FileRecord>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutboundGrant {
+    pub id: String,
+    pub token_hash: String,
+    pub tenant: String,
+    pub link_id: String,
+    pub upload_id: String,
+    pub package_root: String,
+    pub name: String,
+    pub suite: String,
+    pub root: String,
+    pub file_index: usize,
+    pub bytes: u64,
+    pub label: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub revoked_at: Option<u64>,
+    pub downloads: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Link {
     pub id: String,
@@ -236,7 +256,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-const SCHEMA_VERSION: u64 = 7;
+const SCHEMA_VERSION: u64 = 8;
 
 const SETTINGS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS settings (
@@ -274,6 +294,31 @@ CREATE TABLE IF NOT EXISTS files (
     PRIMARY KEY (link_id, upload_index, file_index)
 );
 CREATE INDEX IF NOT EXISTS files_tenant_live ON files(tenant, deleted, bytes_hi, bytes_lo);
+";
+
+const OUTBOUND_GRANTS_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS outbound_grants (
+    id TEXT PRIMARY KEY,
+    token_hash TEXT UNIQUE NOT NULL,
+    tenant TEXT NOT NULL,
+    link_id TEXT NOT NULL,
+    upload_id TEXT NOT NULL,
+    package_root TEXT NOT NULL,
+    name TEXT NOT NULL,
+    suite TEXT NOT NULL,
+    root TEXT NOT NULL,
+    file_index INTEGER NOT NULL,
+    bytes_hi INTEGER NOT NULL,
+    bytes_lo INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    revoked_at INTEGER,
+    downloads INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS outbound_grants_tenant_created ON outbound_grants(tenant, created_at);
+CREATE INDEX IF NOT EXISTS outbound_grants_file
+    ON outbound_grants(tenant, link_id, upload_id, file_index);
 ";
 
 const SCHEMA: &str = "
@@ -550,6 +595,11 @@ impl Store {
             for link in &links {
                 rebuild_link_files(&transaction, link).map_err(|error| error.to_string())?;
             }
+        }
+        if stored < 8 {
+            transaction
+                .execute_batch(OUTBOUND_GRANTS_SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
         }
         transaction
             .execute(
@@ -1300,6 +1350,141 @@ impl Store {
             rows.collect::<Result<Vec<_>, _>>()
         })
     }
+
+    // ------------------------------------------------------ outbound grants
+
+    pub fn insert_outbound_grant(&self, grant: OutboundGrant) -> Result<(), String> {
+        let (bytes_hi, bytes_lo) = split_bytes(grant.bytes);
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO outbound_grants
+                 (id, token_hash, tenant, link_id, upload_id, package_root, name, suite, root,
+                  file_index, bytes_hi, bytes_lo, label, created_at, expires_at, revoked_at, downloads)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                rusqlite::params![
+                    grant.id,
+                    grant.token_hash,
+                    grant.tenant,
+                    grant.link_id,
+                    grant.upload_id,
+                    grant.package_root,
+                    grant.name,
+                    grant.suite,
+                    grant.root,
+                    i64::try_from(grant.file_index).unwrap_or(i64::MAX),
+                    bytes_hi,
+                    bytes_lo,
+                    grant.label,
+                    i64::try_from(grant.created_at).unwrap_or(i64::MAX),
+                    i64::try_from(grant.expires_at).unwrap_or(i64::MAX),
+                    grant.revoked_at.map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
+                    i64::try_from(grant.downloads).unwrap_or(i64::MAX),
+                ],
+            )
+            .map(|_| ())
+        })
+    }
+
+    pub fn outbound_grants(&self, tenant: &str) -> Result<Vec<OutboundGrant>, String> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, token_hash, tenant, link_id, upload_id, package_root, name, suite,
+                        root, file_index, bytes_hi, bytes_lo, label, created_at, expires_at,
+                        revoked_at, downloads
+                 FROM outbound_grants WHERE tenant = ?1 ORDER BY created_at, rowid",
+            )?;
+            let rows = statement.query_map([tenant], map_outbound_grant)?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    pub fn outbound_grant_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<OutboundGrant>, String> {
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT id, token_hash, tenant, link_id, upload_id, package_root, name, suite,
+                            root, file_index, bytes_hi, bytes_lo, label, created_at, expires_at,
+                            revoked_at, downloads
+                     FROM outbound_grants WHERE token_hash = ?1",
+                    [token_hash],
+                    map_outbound_grant,
+                )
+                .optional()
+        })
+    }
+
+    pub fn revoke_outbound_grant(&self, tenant: &str, id: &str, at: u64) -> Result<bool, String> {
+        self.with(|connection| {
+            connection.execute(
+                "UPDATE outbound_grants SET revoked_at = ?3
+                 WHERE tenant = ?1 AND id = ?2 AND revoked_at IS NULL",
+                rusqlite::params![tenant, id, i64::try_from(at).unwrap_or(i64::MAX)],
+            )
+        })
+        .map(|changed| changed > 0)
+    }
+
+    pub fn record_outbound_download(&self, id: &str) -> Result<bool, String> {
+        self.with(|connection| {
+            connection
+                .execute(
+                    "UPDATE outbound_grants SET downloads = downloads + 1 WHERE id = ?1",
+                    [id],
+                )
+                .map(|changed| changed > 0)
+        })
+    }
+
+    pub fn has_active_outbound_grant(
+        &self,
+        tenant: &str,
+        link_id: &str,
+        upload_id: &str,
+        file_index: usize,
+        now: u64,
+    ) -> Result<bool, String> {
+        self.with(|connection| {
+            connection.query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM outbound_grants
+                     WHERE tenant = ?1 AND link_id = ?2 AND upload_id = ?3 AND file_index = ?4
+                       AND revoked_at IS NULL AND expires_at > ?5
+                 )",
+                rusqlite::params![
+                    tenant,
+                    link_id,
+                    upload_id,
+                    i64::try_from(file_index).unwrap_or(i64::MAX),
+                    i64::try_from(now).unwrap_or(i64::MAX),
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+        })
+        .map(|exists| exists != 0)
+    }
+
+    pub fn link_has_active_outbound_grants(
+        &self,
+        tenant: &str,
+        link_id: &str,
+        now: u64,
+    ) -> Result<bool, String> {
+        self.with(|connection| {
+            connection.query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM outbound_grants
+                     WHERE tenant = ?1 AND link_id = ?2
+                       AND revoked_at IS NULL AND expires_at > ?3
+                 )",
+                rusqlite::params![tenant, link_id, i64::try_from(now).unwrap_or(i64::MAX),],
+                |row| row.get::<_, i64>(0),
+            )
+        })
+        .map(|exists| exists != 0)
+    }
 }
 
 fn insert_link_row(connection: &Connection, link: &Link) -> rusqlite::Result<()> {
@@ -1502,6 +1687,29 @@ fn row_to_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<Link> {
         legal_hold: row.get::<_, i64>("legal_hold")? != 0,
         uploads: parse_json(&uploads_json, 10)?,
         events: parse_json(&events_json, 11)?,
+    })
+}
+
+fn map_outbound_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboundGrant> {
+    Ok(OutboundGrant {
+        id: row.get("id")?,
+        token_hash: row.get("token_hash")?,
+        tenant: row.get("tenant")?,
+        link_id: row.get("link_id")?,
+        upload_id: row.get("upload_id")?,
+        package_root: row.get("package_root")?,
+        name: row.get("name")?,
+        suite: row.get("suite")?,
+        root: row.get("root")?,
+        file_index: usize::try_from(row.get::<_, i64>("file_index")?.max(0)).unwrap_or(usize::MAX),
+        bytes: combine_byte_sums(row.get("bytes_hi")?, row.get("bytes_lo")?),
+        label: row.get("label")?,
+        created_at: row.get::<_, i64>("created_at")?.max(0) as u64,
+        expires_at: row.get::<_, i64>("expires_at")?.max(0) as u64,
+        revoked_at: row
+            .get::<_, Option<i64>>("revoked_at")?
+            .and_then(|value| u64::try_from(value).ok()),
+        downloads: row.get::<_, i64>("downloads")?.max(0) as u64,
     })
 }
 
@@ -2043,6 +2251,136 @@ mod tests {
             max_sessions: None,
             created_at: 0,
         }
+    }
+
+    fn test_outbound_grant(id: &str, tenant: &str, file_index: usize) -> OutboundGrant {
+        OutboundGrant {
+            id: id.to_owned(),
+            token_hash: format!("hash-{id}"),
+            tenant: tenant.to_owned(),
+            link_id: "link".to_owned(),
+            upload_id: "upload".to_owned(),
+            package_root: "package".to_owned(),
+            name: "file.bin".to_owned(),
+            suite: "blake3".to_owned(),
+            root: format!("root-{id}"),
+            file_index,
+            bytes: u64::MAX,
+            label: "download".to_owned(),
+            created_at: 10,
+            expires_at: 20,
+            revoked_at: None,
+            downloads: 0,
+        }
+    }
+
+    #[test]
+    fn outbound_grants_migrate_and_round_trip_full_byte_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let schema = store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT value FROM meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(schema, "8");
+        assert!(store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'outbound_grants'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap() > 0);
+
+        let grant = test_outbound_grant("g1", "acme", 3);
+        store.insert_outbound_grant(grant.clone()).unwrap();
+        assert_eq!(store.outbound_grants("acme").unwrap(), vec![grant]);
+    }
+
+    #[test]
+    fn outbound_grants_are_tenant_scoped_and_hash_lookup_is_global() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .insert_outbound_grant(test_outbound_grant("g1", "acme", 0))
+            .unwrap();
+        store
+            .insert_outbound_grant(test_outbound_grant("g2", "other", 1))
+            .unwrap();
+
+        assert_eq!(store.outbound_grants("acme").unwrap().len(), 1);
+        assert_eq!(
+            store
+                .outbound_grant_by_token_hash("hash-g1")
+                .unwrap()
+                .unwrap()
+                .id,
+            "g1"
+        );
+    }
+
+    #[test]
+    fn outbound_grant_expiry_and_revoke_control_active_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .insert_outbound_grant(test_outbound_grant("g1", "acme", 0))
+            .unwrap();
+
+        assert!(store
+            .has_active_outbound_grant("acme", "link", "upload", 0, 19)
+            .unwrap());
+        assert!(!store
+            .has_active_outbound_grant("acme", "link", "upload", 0, 20)
+            .unwrap());
+        assert!(store.revoke_outbound_grant("acme", "g1", 12).unwrap());
+        assert!(!store.revoke_outbound_grant("acme", "g1", 13).unwrap());
+        assert!(!store
+            .has_active_outbound_grant("acme", "link", "upload", 0, 11)
+            .unwrap());
+    }
+
+    #[test]
+    fn outbound_download_count_and_active_link_query_round_trip() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .insert_outbound_grant(test_outbound_grant("g1", "acme", 0))
+            .unwrap();
+        let mut other = test_outbound_grant("g2", "acme", 1);
+        other.link_id = "other-link".to_owned();
+        other.expires_at = 100;
+        store.insert_outbound_grant(other).unwrap();
+
+        assert!(store.record_outbound_download("g1").unwrap());
+        assert!(store.record_outbound_download("g1").unwrap());
+        assert_eq!(
+            store
+                .outbound_grant_by_token_hash("hash-g1")
+                .unwrap()
+                .unwrap()
+                .downloads,
+            2
+        );
+        assert!(!store.record_outbound_download("missing").unwrap());
+        assert!(store
+            .link_has_active_outbound_grants("acme", "link", 19)
+            .unwrap());
+        assert!(!store
+            .link_has_active_outbound_grants("other", "link", 19)
+            .unwrap());
+        assert!(store
+            .link_has_active_outbound_grants("acme", "other-link", 99)
+            .unwrap());
+        assert!(!store
+            .link_has_active_outbound_grants("acme", "other-link", 100)
+            .unwrap());
     }
 
     #[test]
@@ -3151,13 +3489,13 @@ mod settings_tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         drop(store);
-        assert_eq!(schema_version(directory.path()), "7");
+        assert_eq!(schema_version(directory.path()), "8");
         Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "7");
+        assert_eq!(schema_version(directory.path()), "8");
     }
 
     #[test]
-    fn v4_database_gains_principals_and_stamps_7() {
+    fn v4_database_migrates_to_current_schema() {
         let directory = tempfile::tempdir().unwrap();
         {
             let connection = Connection::open(directory.path().join("votport.db")).unwrap();
@@ -3175,13 +3513,13 @@ mod settings_tests {
                 .unwrap();
         }
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "7");
+        assert_eq!(schema_version(directory.path()), "8");
         assert!(store.principals().unwrap().is_empty());
         assert!(store.principal("nobody").unwrap().is_none());
     }
 
     #[test]
-    fn v5_database_gains_legal_hold_and_stamps_7() {
+    fn v5_database_migrates_to_current_schema() {
         let directory = tempfile::tempdir().unwrap();
         {
             let connection = Connection::open(directory.path().join("votport.db")).unwrap();
@@ -3197,12 +3535,12 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "7");
+        assert_eq!(schema_version(directory.path()), "8");
         assert!(!store.link("", "old-link").unwrap().unwrap().legal_hold);
     }
 
     #[test]
-    fn v6_database_backfills_files_and_stamps_7() {
+    fn v6_database_migrates_to_current_schema() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         let mut link = test_link("old-link");
@@ -3237,7 +3575,7 @@ mod settings_tests {
         drop(store);
 
         let reopened = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "7");
+        assert_eq!(schema_version(directory.path()), "8");
         assert_eq!(reopened.tenant_received_bytes("").unwrap(), 9);
     }
 

@@ -88,6 +88,19 @@
         <span id="new-link-note" class="muted"></span>
       </div>
 
+      <div id="outbound-result" class="card ok" hidden aria-live="polite">
+        <h2>Download link issued</h2>
+        <label
+          >One-time address
+          <input id="outbound-url" class="mono" type="text" readonly aria-describedby="outbound-note" />
+        </label>
+        <button id="outbound-copy" type="button">Copy address</button>
+        <p id="outbound-note" class="muted">Shown once. Copy it now; this URL cannot be retrieved later.</p>
+      </div>
+
+      <h2>Issued downloads</h2>
+      <div id="outbound-grants"></div>
+
       <h2>Issued requests</h2>
       <div id="links"></div>
       <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
