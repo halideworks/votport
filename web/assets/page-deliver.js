@@ -4,6 +4,7 @@
 import {
   parseLibraryPath,
 } from '/assets/library-paths.js';
+import { entryFiles } from '/assets/upload-entries.js';
 import {
   alertModal,
   api,
@@ -207,7 +208,12 @@ function renderGrants() {
     notify.append(notifyInput, document.createTextNode(' Notify on first download and delivery completion'));
     card.append(notify);
 
-    if (Array.isArray(grant.files) && grant.files.length > 1) {
+    if (grant.files_truncated) {
+      const summary = document.createElement('p');
+      summary.className = 'muted';
+      summary.textContent = `${Number(grant.file_count).toLocaleString()} files in this delivery.`;
+      card.append(summary);
+    } else if (Array.isArray(grant.files) && grant.files.length > 1) {
       const files = document.createElement('ul');
       files.className = 'uploads';
       for (const file of grant.files) {
@@ -318,17 +324,18 @@ $('outbound-grants-load-more').addEventListener('click', () => refreshGrants(fal
 const MAX_LIBRARY_SELECTION = 64;
 const MAX_LIBRARY_SEARCH_RESULTS = 200;
 const selectedLibraryPaths = new Map();
+let deliverGrantBusy = false;
 let libraryFiles = [];
 let libraryDirectories = [];
 let libraryDirectory = '';
 let libraryTruncated = false;
 let libraryRequestGeneration = 0;
 let librarySearchTimer;
+let libraryUploading = false;
 const libraryProjectSuggestions = new Set();
 const libraryFolderSelections = new Map();
 
-function libraryPath(file) {
-  const relative = file.webkitRelativePath || file.name;
+function libraryPath(relative) {
   const project = $('deliver-project').value.trim().replace(/^\/+|\/+$/g, '');
   return project ? `${project}/${relative}` : relative;
 }
@@ -386,6 +393,53 @@ async function uploadLibraryFile(file, path, progress = () => {}) {
         await new Promise((resolve) => setTimeout(resolve, 200 * retries));
       }
     }
+  }
+}
+
+function libraryFilePairs(files) {
+  return [...files].map((file) => ({
+    path: file.webkitRelativePath || file.name,
+    file,
+  }));
+}
+
+async function uploadLibraryFiles(pairs) {
+  if (!pairs.length || libraryUploading) return;
+  let uploads;
+  try {
+    uploads = pairs.map(({ path, file }) => ({ path: libraryPath(path), file }));
+    for (const { path } of uploads) {
+      if (!parseLibraryPath(path)) throw new Error(`"${path}" is not a valid library path.`);
+    }
+  } catch (error) {
+    $('library-status').textContent = error.message;
+    return;
+  }
+  libraryUploading = true;
+  const controls = [$('library-add-files'), $('library-add-folder'), $('library-input'), $('library-folder-input')];
+  controls.forEach((control) => { control.disabled = true; });
+  libraryDrop.setAttribute('aria-busy', 'true');
+  $('library-status').textContent = `Uploading 0 of ${uploads.length} files…`;
+  try {
+    for (const [index, { file, path }] of uploads.entries()) {
+      await uploadLibraryFile(file, path, (offset) => {
+        const percent = file.size ? Math.floor((offset / file.size) * 100) : 100;
+        $('library-status').textContent =
+          `Uploading ${file.name}: ${percent}% (${index + 1} of ${uploads.length} files)`;
+      });
+      $('library-status').textContent =
+        `Uploading ${file.name}: 100% (${index + 1} of ${uploads.length} files)`;
+    }
+    $('library-status').textContent = `${uploads.length} file${uploads.length === 1 ? '' : 's'} added.`;
+    await refreshLibrary();
+  } catch (error) {
+    $('library-status').textContent = error.message;
+  } finally {
+    libraryUploading = false;
+    libraryDrop.removeAttribute('aria-busy');
+    controls.forEach((control) => { control.disabled = false; });
+    $('library-input').value = '';
+    $('library-folder-input').value = '';
   }
 }
 
@@ -568,9 +622,14 @@ function renderLibraryDirectory(directory, container) {
     await browseLibrary(directory);
   });
   open.setAttribute('aria-label', `Open folder ${name}`);
+  const share = button('Share folder', 'tiny', async () => {
+    await submitDeliverGrant({ directory }, share);
+  });
+  share.dataset.libraryFolderShare = 'true';
+  share.setAttribute('aria-label', `Share folder ${directory}`);
   const row = document.createElement('div');
   row.className = 'library-file library-folder';
-  row.append(select, open);
+  row.append(select, open, share);
   container.append(row);
 }
 
@@ -693,83 +752,120 @@ $('library-search').addEventListener('input', () => {
 });
 
 $('deliver-upload-form').addEventListener('submit', (event) => event.preventDefault());
-$('library-input').addEventListener('change', async (event) => {
-  const input = event.currentTarget;
-  const files = [...input.files];
-  if (!files.length) return;
-  input.disabled = true;
-  $('library-status').textContent = `Uploading 0 of ${files.length} files…`;
+$('library-add-files').addEventListener('click', () => $('library-input').click());
+$('library-add-folder').addEventListener('click', () => $('library-folder-input').click());
+$('library-input').addEventListener('change', (event) => uploadLibraryFiles(libraryFilePairs(event.currentTarget.files)));
+$('library-folder-input').addEventListener('change', (event) => uploadLibraryFiles(libraryFilePairs(event.currentTarget.files)));
+
+const libraryDrop = $('library-drop');
+for (const eventName of ['dragenter', 'dragover']) {
+  libraryDrop.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    libraryDrop.classList.add('hover');
+  });
+}
+for (const eventName of ['dragleave', 'drop']) {
+  libraryDrop.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    libraryDrop.classList.remove('hover');
+  });
+}
+libraryDrop.addEventListener('drop', async (event) => {
+  if (libraryUploading) {
+    $('library-status').textContent = 'An upload is already in progress.';
+    return;
+  }
+  const items = event.dataTransfer.items;
+  const entries = items
+    ? [...items].map((item) => item.webkitGetAsEntry?.()).filter(Boolean)
+    : [];
+  if (!entries.length) {
+    await uploadLibraryFiles(libraryFilePairs(event.dataTransfer.files));
+    return;
+  }
   try {
-    for (const [index, file] of files.entries()) {
-      const path = libraryPath(file);
-      await uploadLibraryFile(file, path, (offset) => {
-        const percent = file.size ? Math.floor((offset / file.size) * 100) : 100;
-        $('library-status').textContent =
-          `Uploading ${file.name}: ${percent}% (${index + 1} of ${files.length} files)`;
-      });
-      $('library-status').textContent =
-        `Uploading ${file.name}: 100% (${index + 1} of ${files.length} files)`;
-    }
-    $('library-status').textContent = `${files.length} file${files.length === 1 ? '' : 's'} added.`;
-    await refreshLibrary();
-  } catch (error) {
-    $('library-status').textContent = error.message;
-  } finally {
-    input.disabled = false;
-    input.value = '';
+    await uploadLibraryFiles((await Promise.all(entries.map(entryFiles))).flat());
+  } catch {
+    $('library-status').textContent = 'Could not read a dropped folder; use the folder picker instead.';
   }
 });
 
-$('deliver-form').addEventListener('submit', async (event) => {
-  event.preventDefault();
+function deliverFormValues(selection) {
   $('deliver-error').hidden = true;
-  const paths = [...selectedLibraryPaths.keys()];
-  if (paths.length > MAX_LIBRARY_SELECTION) {
-    $('deliver-error').textContent = `Select at most ${MAX_LIBRARY_SELECTION} files.`;
-    $('deliver-error').hidden = false;
-    return;
+  const paths = selection.directory === undefined
+    ? [...selectedLibraryPaths.keys()]
+    : [];
+  if (selection.directory === undefined && paths.length > MAX_LIBRARY_SELECTION) {
+    throw new Error(`Select at most ${MAX_LIBRARY_SELECTION} files.`);
   }
   const expires = Number($('deliver-expires').value);
   const maxDownloadsValue = $('deliver-max-downloads').value.trim();
   const maxDownloads = maxDownloadsValue ? Number(maxDownloadsValue) : null;
-  if (!paths.length) {
-    $('deliver-error').textContent = 'Select at least one file.';
-    $('deliver-error').hidden = false;
-    return;
+  if (selection.directory === undefined && !paths.length) {
+    throw new Error('Select at least one file.');
   }
   if (!Number.isInteger(expires) || expires < 1 || expires > 30) {
-    $('deliver-error').textContent = 'Expiry must be between 1 and 30 days.';
-    $('deliver-error').hidden = false;
-    return;
+    throw new Error('Expiry must be between 1 and 30 days.');
   }
   if (maxDownloads !== null && (!Number.isInteger(maxDownloads) || maxDownloads < 1 || maxDownloads > 10000)) {
-    $('deliver-error').textContent = 'Max downloads must be between 1 and 10000.';
-    $('deliver-error').hidden = false;
+    throw new Error('Max downloads must be between 1 and 10000.');
+  }
+  const label = $('deliver-label').value;
+  const directoryLabel = selection.directory?.split('/').filter(Boolean).pop();
+  return {
+    ...(selection.directory === undefined ? { paths } : { directory: selection.directory }),
+    label: selection.directory !== undefined && !label.trim() ? directoryLabel : label,
+    expires_days: expires,
+    password: $('deliver-password').value || null,
+    max_downloads: maxDownloads,
+    notify_on_download: $('deliver-notify-on-download').checked,
+  };
+}
+
+async function submitDeliverGrant(selection, control) {
+  if (deliverGrantBusy) return;
+  const error = $('deliver-error');
+  error.hidden = true;
+  let request;
+  try {
+    request = deliverFormValues(selection);
+  } catch (validationError) {
+    error.textContent = validationError.message;
+    error.hidden = false;
     return;
   }
-  $('deliver-submit').disabled = true;
+  deliverGrantBusy = true;
+  const submit = $('deliver-submit');
+  submit.disabled = true;
+  document.querySelectorAll('[data-library-folder-share]').forEach((button) => {
+    button.disabled = true;
+  });
+  control.disabled = true;
   try {
     const response = await api('/api/admin/outbound-grants', {
       method: 'POST',
-      body: JSON.stringify({
-        paths,
-        label: $('deliver-label').value,
-        expires_days: expires,
-        password: $('deliver-password').value || null,
-        max_downloads: maxDownloads,
-        notify_on_download: $('deliver-notify-on-download').checked,
-      }),
+      body: JSON.stringify(request),
     });
     if (!response.url) throw new Error('server did not return a download URL');
     showGrantResult(response.url, response.grant?.has_password);
     $('deliver-password').value = '';
     await refreshGrants();
-  } catch (error) {
-    $('deliver-error').textContent = error.message;
+  } catch (requestError) {
+    $('deliver-error').textContent = requestError.message;
     $('deliver-error').hidden = false;
   } finally {
-    $('deliver-submit').disabled = false;
+    deliverGrantBusy = false;
+    submit.disabled = false;
+    document.querySelectorAll('[data-library-folder-share]').forEach((button) => {
+      button.disabled = false;
+    });
+    control.disabled = false;
   }
+}
+
+$('deliver-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  await submitDeliverGrant({}, $('deliver-submit'));
 });
 
 await requireSession();

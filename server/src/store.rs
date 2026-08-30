@@ -1717,10 +1717,13 @@ impl Store {
         tenant: &str,
         limit: usize,
         offset: usize,
-    ) -> Result<(Vec<OutboundGrant>, u64), String> {
+        file_preview_limit: usize,
+    ) -> Result<(Vec<(OutboundGrant, usize)>, u64), String> {
         let limit = i64::try_from(limit).map_err(|_| "outbound grant limit overflow".to_owned())?;
         let offset =
             i64::try_from(offset).map_err(|_| "outbound grant offset overflow".to_owned())?;
+        let file_preview_limit = i64::try_from(file_preview_limit)
+            .map_err(|_| "outbound grant file preview limit overflow".to_owned())?;
         self.with(|connection| {
             let grants = {
                 let mut statement = connection.prepare(
@@ -1728,13 +1731,16 @@ impl Store {
                             name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
                             expires_at, revoked_at, downloads, max_downloads, notify_on_download, first_download_at,
                             last_download_at,
-                            files_json
+                            CASE WHEN json_array_length(files_json) = 0
+                                 THEN 1 ELSE json_array_length(files_json) END AS file_count,
+                            CASE WHEN json_array_length(files_json) <= ?4
+                                 THEN files_json ELSE '[]' END AS files_json
                      FROM outbound_grants WHERE tenant = ?1
                      ORDER BY created_at DESC, rowid DESC LIMIT ?2 OFFSET ?3",
                 )?;
                 let rows = statement.query_map(
-                    rusqlite::params![tenant, limit, offset],
-                    map_outbound_grant,
+                    rusqlite::params![tenant, limit, offset, file_preview_limit],
+                    map_outbound_grant_page,
                 )?;
                 rows.collect::<Result<Vec<_>, _>>()?
             };
@@ -2342,6 +2348,19 @@ fn map_outbound_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboundGrant
             .and_then(|value| u64::try_from(value).ok()),
         files: parse_json(&row.get::<_, String>("files_json")?, 20)?,
     })
+}
+
+fn map_outbound_grant_page(row: &rusqlite::Row<'_>) -> rusqlite::Result<(OutboundGrant, usize)> {
+    let grant = map_outbound_grant(row)?;
+    let file_count = row.get::<_, i64>("file_count")?;
+    let file_count = usize::try_from(file_count).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })?;
+    Ok((grant, file_count))
 }
 
 fn map_automation_token(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationToken> {
@@ -3184,28 +3203,81 @@ mod tests {
             .insert_outbound_grant(test_outbound_grant("other", "other", 0))
             .unwrap();
 
-        let page = store.outbound_grants_page("acme", 2, 0).unwrap();
+        let page = store.outbound_grants_page("acme", 2, 0, 64).unwrap();
         assert_eq!(page.1, 3);
         assert_eq!(
-            page.0.into_iter().map(|grant| grant.id).collect::<Vec<_>>(),
+            page.0
+                .into_iter()
+                .map(|(grant, _)| grant.id)
+                .collect::<Vec<_>>(),
             ["g3", "g2"]
         );
         assert_eq!(
             store
-                .outbound_grants_page("acme", 2, 2)
+                .outbound_grants_page("acme", 2, 2, 64)
                 .unwrap()
                 .0
                 .into_iter()
-                .map(|grant| grant.id)
+                .map(|(grant, _)| grant.id)
                 .collect::<Vec<_>>(),
             ["g1"]
         );
         assert!(store
-            .outbound_grants_page("acme", 2, 3)
+            .outbound_grants_page("acme", 2, 3, 64)
             .unwrap()
             .0
             .is_empty());
-        assert_eq!(store.outbound_grants_page("other", 2, 0).unwrap().1, 1);
+        assert_eq!(store.outbound_grants_page("other", 2, 0, 64).unwrap().1, 1);
+    }
+
+    #[test]
+    fn outbound_grants_page_reports_counts_and_bounds_file_previews() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let legacy = test_outbound_grant("legacy", "acme", 0);
+        store.insert_outbound_grant(legacy).unwrap();
+        let mut small = test_outbound_grant("small", "acme", 0);
+        small.files = (0..2)
+            .map(|index| OutboundGrantFile {
+                source: format!("small-{index}"),
+                name: format!("small-{index}.txt"),
+                suite: "blake3".to_owned(),
+                root: format!("small-root-{index}"),
+                bytes: index + 1,
+                receipt_b64: "receipt".to_owned(),
+                downloads: 0,
+                first_download_at: None,
+                last_download_at: None,
+            })
+            .collect();
+        store.insert_outbound_grant(small).unwrap();
+        let mut large = test_outbound_grant("large", "acme", 0);
+        large.files = (0..3)
+            .map(|index| OutboundGrantFile {
+                source: format!("large-{index}"),
+                name: format!("large-{index}.txt"),
+                suite: "blake3".to_owned(),
+                root: format!("large-root-{index}"),
+                bytes: index + 1,
+                receipt_b64: "receipt".to_owned(),
+                downloads: 0,
+                first_download_at: None,
+                last_download_at: None,
+            })
+            .collect();
+        store.insert_outbound_grant(large).unwrap();
+
+        let page = store.outbound_grants_page("acme", 10, 0, 2).unwrap().0;
+        let find = |id: &str| page.iter().find(|(grant, _)| grant.id == id).unwrap();
+        let (legacy, legacy_count) = find("legacy");
+        assert_eq!(*legacy_count, 1);
+        assert!(legacy.files.is_empty());
+        let (small, small_count) = find("small");
+        assert_eq!(*small_count, 2);
+        assert_eq!(small.files.len(), 2);
+        let (large, large_count) = find("large");
+        assert_eq!(*large_count, 3);
+        assert!(large.files.is_empty());
     }
 
     #[test]

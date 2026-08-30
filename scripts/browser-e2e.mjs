@@ -29,6 +29,9 @@ process.once("exit", () => fs.rmSync(dir, { recursive: true, force: true }));
 fs.writeFileSync(path.join(dir, "Résumé Draft.pdf"), "unicode names travel\n");
 fs.writeFileSync(path.join(dir, "deliver-one.txt"), "first deliverable\n");
 fs.writeFileSync(path.join(dir, "deliver-two.txt"), "second deliverable\n");
+const folder = path.join(dir, "folder-pick");
+fs.mkdirSync(path.join(folder, "nested"), { recursive: true });
+fs.writeFileSync(path.join(folder, "nested", "folder-nested.txt"), "nested folder deliverable\n");
 // Multiple server-sized ranges exercise the bounded parallel upload path.
 const big = Buffer.alloc(40 * 1024 * 1024 + 99);
 for (let i = 0; i < big.length; i += 1) big[i] = (i * 7) % 253;
@@ -196,7 +199,7 @@ console.log("verify page flow ok");
 // Deliver an outbound multi-file link through the admin UI.
 await page.goto(`${base}/deliver`);
 try {
-  await page.waitForSelector("#library-input", { timeout: 15000 });
+  await page.waitForSelector("#library-input", { state: "attached", timeout: 15000 });
 } catch (error) {
   console.error(`deliver page did not load at ${page.url()}: ${await page.locator("body").innerText()}`);
   throw error;
@@ -271,6 +274,30 @@ if (!(await selectedFolder.isChecked())) {
 if (!(await page.textContent("#library-selection-status")).startsWith("2 files selected")) {
   throw new Error("scoped library root selection status changed");
 }
+
+await page.fill("#deliver-project", "browser-folder-project");
+await page.setInputFiles("#library-folder-input", folder);
+await page.waitForFunction(
+  () => document.getElementById("library-status").textContent.includes("1 file added"),
+  { timeout: 30000 },
+);
+await page.getByRole("button", { name: "Library", exact: true }).click();
+await page.waitForSelector(
+  '#library-files button[aria-label="Share folder browser-folder-project"]',
+  { state: "visible", timeout: 15000 },
+);
+await page.fill("#library-search", "folder-nested.txt");
+await page.waitForFunction(
+  () => [...document.querySelectorAll("#library-files .mono")]
+    .some((el) => el.textContent === "browser-folder-project/folder-pick/nested/folder-nested.txt"),
+  { timeout: 15000 },
+);
+await page.fill("#library-search", "");
+await page.waitForFunction(
+  () => document.querySelector('#library-breadcrumbs [aria-current="page"]')?.textContent === "Library",
+  { timeout: 15000 },
+);
+
 await page.fill("#deliver-label", "browser outbound e2e");
 await page.click("#deliver-submit");
 await page.waitForSelector("#outbound-result:not([hidden])", { timeout: 30000 });
