@@ -93,7 +93,13 @@
         <form id="deliver-upload-form">
           <label
             >Project subdirectory <span class="muted">optional</span>
-            <input id="deliver-project" placeholder="client/alex" autocomplete="off" />
+            <input
+              id="deliver-project"
+              placeholder="client/alex"
+              autocomplete="off"
+              list="deliver-project-options"
+            />
+            <datalist id="deliver-project-options"></datalist>
           </label>
           <label
             >Add files
@@ -115,6 +121,10 @@
             <label
               >Expires after <span class="muted">days</span>
               <input id="deliver-expires" type="number" min="1" max="30" value="7" required />
+            </label>
+            <label
+              >Access password <span class="muted">optional</span>
+              <input id="deliver-password" type="password" autocomplete="new-password" placeholder="none" />
             </label>
           </div>
           <button type="submit" id="deliver-submit">Issue download link</button>

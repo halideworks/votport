@@ -367,6 +367,30 @@ input::placeholder {
  opacity: 0.6;
 }
 
+#library-input {
+ padding: 0.35rem;
+}
+#library-input::file-selector-button {
+ margin-right: 0.65rem;
+ padding: 0.45rem 0.7rem;
+ border: 1px solid var(--border);
+ border-radius: 0.55rem;
+ background: transparent;
+ color: var(--text-soft);
+ font: inherit;
+ font-size: 0.72rem;
+ font-weight: 600;
+ cursor: pointer;
+}
+#library-input::file-selector-button:hover {
+ border-color: var(--border-active);
+ color: var(--text);
+}
+#library-input:focus-visible {
+ outline: 2px solid var(--progress);
+ outline-offset: 2px;
+}
+
 button {
  padding: 0.8rem 1.25rem;
  border-radius: 0.75rem;

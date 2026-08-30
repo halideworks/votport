@@ -971,6 +971,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/r/{token}/push", post(api::create_push_session))
         .route("/api/r/{token}/session", post(api::create_session))
         .route("/api/s/{token}", get(api::outbound_metadata))
+        .route("/api/s/{token}/verify", post(api::verify_outbound_password))
         .route("/api/s/{token}/receipt", get(api::outbound_receipt))
         .route("/api/s/{token}/file", get(api::outbound_file))
         .route(
@@ -1931,6 +1932,7 @@ mod retention_tests {
             .insert_outbound_grant(OutboundGrant {
                 id: "grant".to_owned(),
                 token_hash: "hash".to_owned(),
+                password_hash: None,
                 tenant: String::new(),
                 link_id: "outbound".to_owned(),
                 upload_id: "upload".to_owned(),

@@ -2,6 +2,7 @@
 // AGPL-3.0-only.
 
 import { appendObjectCard } from '/assets/object-card.js';
+import { projectDirectoryPrefixes } from '/assets/library-paths.js';
 import {
   alertModal,
   api,
@@ -33,10 +34,13 @@ function button(text, classes, onClick) {
   return element;
 }
 
-function showGrantResult(url) {
+function showGrantResult(url, protectedGrant = false) {
   $('outbound-result').hidden = false;
   $('outbound-url').value = url;
   $('outbound-url').onclick = () => $('outbound-url').select();
+  $('outbound-note').textContent =
+    `Shown once. Copy it now; this URL cannot be retrieved later.`
+    + (protectedGrant ? ' This download is password-protected. Send the password by a separate channel.' : '');
   $('outbound-copy').onclick = async () => {
     await navigator.clipboard.writeText(url);
     $('outbound-copy').textContent = 'Copied';
@@ -56,7 +60,7 @@ async function issueReceivedGrant(link, upload, fileIndex, file) {
   });
   const url = response.url;
   if (!url) throw new Error('server did not return a download URL');
-  showGrantResult(url);
+  showGrantResult(url, response.grant?.has_password);
   await refreshGrants();
 }
 
@@ -173,6 +177,12 @@ function renderGrants(grants) {
     badge.className = `badge ${status === 'active' ? 'on' : 'off'}`;
     badge.textContent = status;
     head.append(title, badge);
+    if (grant.has_password) {
+      const protectedBadge = document.createElement('span');
+      protectedBadge.className = 'badge';
+      protectedBadge.textContent = 'protected';
+      head.append(protectedBadge);
+    }
     card.append(head);
 
     const name = document.createElement('p');
@@ -240,7 +250,19 @@ async function uploadLibraryFile(file, path) {
   if (!response.ok) throw new Error(body?.error || `upload failed (${response.status})`);
 }
 
+function updateProjectSuggestions(files) {
+  const options = projectDirectoryPrefixes(files);
+  $('deliver-project-options').replaceChildren(
+    ...options.map((value) => {
+      const option = document.createElement('option');
+      option.value = value;
+      return option;
+    }),
+  );
+}
+
 function renderLibrary(files) {
+  updateProjectSuggestions(files);
   const container = $('library-files');
   container.replaceChildren();
   if (!files.length) {
@@ -517,10 +539,16 @@ $('deliver-form').addEventListener('submit', async (event) => {
   try {
     const response = await api('/api/admin/outbound-grants', {
       method: 'POST',
-      body: JSON.stringify({ paths, label: $('deliver-label').value, expires_days: expires }),
+      body: JSON.stringify({
+        paths,
+        label: $('deliver-label').value,
+        expires_days: expires,
+        password: $('deliver-password').value || null,
+      }),
     });
     if (!response.url) throw new Error('server did not return a download URL');
-    showGrantResult(response.url);
+    showGrantResult(response.url, response.grant?.has_password);
+    $('deliver-password').value = '';
     await refreshGrants();
   } catch (error) {
     $('deliver-error').textContent = error.message;

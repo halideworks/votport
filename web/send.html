@@ -28,6 +28,24 @@
     <p id="download-error-message"></p>
   </section>
 
+  <section id="download-gate" class="card" hidden aria-labelledby="download-gate-title">
+    <h2 id="download-gate-title">Access required</h2>
+    <form id="download-password-form">
+      <label
+        >Password
+        <input
+          id="download-password"
+          type="password"
+          autocomplete="current-password"
+          aria-describedby="download-password-error"
+          required
+        />
+      </label>
+      <button type="submit" id="download-password-submit">Continue</button>
+      <p id="download-password-error" class="error" role="alert" hidden></p>
+    </form>
+  </section>
+
   <section id="download-content" hidden aria-live="polite">
     <div class="card ok">
       <h2>Expected object identities</h2>

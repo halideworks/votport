@@ -29,17 +29,33 @@ const MAX_SESSIONS: usize = 32;
 const MAX_SESSIONS_PER_LINK: usize = 8;
 
 /// Cookie carrying proof that this link's password was verified once.
-fn link_cookie_name(link_id: &str) -> String {
+pub(crate) fn link_cookie_name(link_id: &str) -> String {
     format!("votport_r_{link_id}")
 }
 
-fn link_authorized(app: &App, link: &Link, headers: &HeaderMap) -> bool {
-    let phc = link.password_hash.as_deref().unwrap_or_default();
+pub(crate) fn cookie_authorized(
+    app: &App,
+    id: &str,
+    password_hash: Option<&str>,
+    cookie_name: &str,
+    headers: &HeaderMap,
+) -> bool {
+    let phc = password_hash.unwrap_or_default();
     headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
-        .and_then(|cookies| auth::cookie_value(cookies, &link_cookie_name(&link.id)))
-        .is_some_and(|token| auth::verify_link_token(&app.secret, &link.id, phc, token))
+        .and_then(|cookies| auth::cookie_value(cookies, cookie_name))
+        .is_some_and(|token| auth::verify_link_token(&app.secret, id, phc, token))
+}
+
+fn link_authorized(app: &App, link: &Link, headers: &HeaderMap) -> bool {
+    cookie_authorized(
+        app,
+        &link.id,
+        link.password_hash.as_deref(),
+        &link_cookie_name(&link.id),
+        headers,
+    )
 }
 
 pub async fn link_info(
@@ -147,17 +163,18 @@ fn parse_push_object(package: &PushPackageAnnouncement) -> ApiResult<ObjectId> {
     })
 }
 
-/// Verifies a link password, throttled per client IP: this is the only
-/// unauthenticated password check in the service, so without a throttle it
-/// would be an oracle, and with a global one anyone holding a link URL could
-/// lock the admin out. A link with no password accepts anything.
-async fn check_link_password(
+/// Verifies a public-resource password, throttled per client IP. These are
+/// unauthenticated password checks, so without a throttle they would be an
+/// oracle, and with a global one anyone holding a URL could lock the admin
+/// out. A resource with no password accepts anything.
+pub(crate) async fn check_password(
     app: &Arc<App>,
-    link: &crate::store::Link,
+    password_hash: Option<&str>,
     password: Option<&str>,
     ip: &str,
+    error_message: &'static str,
 ) -> ApiResult<()> {
-    let Some(hash) = &link.password_hash else {
+    let Some(hash) = password_hash else {
         return Ok(());
     };
     // One bucket per v4 address and per IPv6 /64: a client holding a routed
@@ -172,7 +189,7 @@ async fn check_link_password(
         ));
     }
     let password = password.unwrap_or_default().to_owned();
-    let hash = hash.clone();
+    let hash = hash.to_owned();
     // This path's own argon2 budget, separate from sign-in so a flood of
     // link guesses cannot queue ahead of the operator. The permit moves into
     // the blocking task so a disconnect cannot release it early.
@@ -190,10 +207,7 @@ async fn check_link_password(
         app.link_throttle.succeeded(&bucket);
     }
     if !ok {
-        return Err(ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "wrong link password",
-        ));
+        return Err(ApiError::new(StatusCode::UNAUTHORIZED, error_message));
     }
     Ok(())
 }
@@ -221,7 +235,14 @@ pub async fn verify_link_password(
         ));
     }
     let ip = client_ip(&headers, &peer, &app.config.trusted_proxies);
-    check_link_password(&app, &link, request.password.as_deref(), &ip).await?;
+    check_password(
+        &app,
+        link.password_hash.as_deref(),
+        request.password.as_deref(),
+        &ip,
+        "wrong link password",
+    )
+    .await?;
     let phc = link.password_hash.as_deref().unwrap_or_default();
     let value = auth::issue_link_token(&app.secret, &link.id, phc);
     let cookie = format!(
@@ -287,7 +308,14 @@ async fn prepare_session(
         ));
     }
     if !link_authorized(app, &link, headers) {
-        check_link_password(app, &link, password, &ip).await?;
+        check_password(
+            app,
+            link.password_hash.as_deref(),
+            password,
+            &ip,
+            "wrong link password",
+        )
+        .await?;
     }
     let tenant = if link.tenant.is_empty() {
         None

@@ -59,8 +59,8 @@ jobs:
       - name: Lint browser JavaScript
         run: npx --yes eslint@9.18.0 web/assets/*.js
 
-      - name: Login disclosure unit tests
-        run: node --test scripts/login-disclosure.test.mjs
+      - name: Browser JavaScript unit tests
+        run: node --test scripts/*.test.mjs
 
   advisories:
     runs-on: ubuntu-24.04
