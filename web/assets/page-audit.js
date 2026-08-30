@@ -56,7 +56,7 @@ function renderRow(row) {
 
   const actor = document.createElement('span');
   actor.className = 'muted';
-  actor.textContent = row.actor ? ` ${row.actor}` : '';
+  actor.textContent = row.actor ? ` · actor ${row.actor}` : '';
 
   const keys = Object.keys(row.detail ?? {});
   let details;
