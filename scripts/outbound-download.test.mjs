@@ -1,11 +1,27 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import {
+  anchorDownloadsAllowed,
   dedupeFilenames,
+  MAX_ANCHOR_DOWNLOADS,
   runWorkerPool,
   sanitizeFilename,
   summarizeFailures,
 } from '../web/assets/outbound-download.js';
+
+const outboundScript = await readFile(new URL('../web/assets/outbound.js', import.meta.url), 'utf8');
+
+test('anchor download fallback is capped at the supported browser threshold', () => {
+  assert.equal(MAX_ANCHOR_DOWNLOADS, 10);
+  assert.equal(anchorDownloadsAllowed(MAX_ANCHOR_DOWNLOADS), true);
+  assert.equal(anchorDownloadsAllowed(MAX_ANCHOR_DOWNLOADS + 1), false);
+});
+
+test('anchor fallback copy explains the large-link limit', () => {
+  assert.match(outboundScript, /Requested \$\{files\.length\} downloads/);
+  assert.match(outboundScript, /Use Download everything or Chrome\/Edge folder selection/);
+});
 
 test('sanitizes flattened unsafe and reserved filenames', () => {
   assert.equal(sanitizeFilename('nested\\report?.txt'), 'report_.txt');

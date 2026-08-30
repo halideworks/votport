@@ -1,5 +1,11 @@
 // Pure helpers for the public separate-download flow.
 
+export const MAX_ANCHOR_DOWNLOADS = 10;
+
+export function anchorDownloadsAllowed(count) {
+  return count <= MAX_ANCHOR_DOWNLOADS;
+}
+
 export function sanitizeFilename(name) {
   let value = String(name ?? '').split(/[\\/]/).pop();
   value = value.replace(/[<>:"|?*\u0000-\u001f\u007f]/g, '_').trim();

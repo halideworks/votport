@@ -30,7 +30,12 @@
             <input id="deliver-project" placeholder="client/alex" autocomplete="off" list="deliver-project-options" />
             <datalist id="deliver-project-options"></datalist>
           </label>
-          <label>Add files <input id="library-input" type="file" multiple /></label>
+          <div id="library-drop" class="drop" role="group" aria-label="Add files or a folder to the library">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M12 12v9"/><path d="m16 16-4-4-4 4"/></svg>
+            <p><strong>Drop files or folders here, or add</strong> <button type="button" id="library-add-files" class="ghost">files</button> <strong>/</strong> <button type="button" id="library-add-folder" class="ghost">a folder</button></p>
+            <input id="library-input" type="file" multiple hidden />
+            <input id="library-folder-input" type="file" webkitdirectory multiple hidden />
+          </div>
           <p id="library-status" class="muted" aria-live="polite"></p>
         </form>
         <div class="library-head">

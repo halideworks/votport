@@ -46,6 +46,8 @@ const OUTBOUND_UPLOAD_ID: &str = "x-votport-upload-id";
 const MAX_OUTBOUND_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_LIBRARY_DIRECTORY_INPUT_BYTES: usize = 1024;
 const MAX_LIBRARY_DIRECTORY_ENTRIES: usize = 1000;
+const MAX_LIBRARY_SELECTION_FILES: usize = 64;
+const MAX_LIBRARY_PROJECT_FILES: usize = 10_000;
 const MAX_LIBRARY_SEARCH_CHARS: usize = 100;
 const MAX_LIBRARY_SEARCH_RESULTS: usize = 200;
 const RETAINED_LIBRARY_SEARCH_RESULTS: usize = MAX_LIBRARY_SEARCH_RESULTS + 1;
@@ -802,7 +804,7 @@ fn list_library_search(root: &Path, query: &str) -> (Vec<serde_json::Value>, boo
 }
 
 fn enumerate_library_selection(root: &Path, directory: &Path) -> ApiResult<Vec<serde_json::Value>> {
-    enumerate_automation_files(root, directory)?
+    enumerate_automation_files(root, directory, MAX_LIBRARY_SELECTION_FILES)?
         .into_iter()
         .map(|relative| {
             let path = root.join(&relative);
@@ -896,6 +898,8 @@ fn library_sources_match(
 #[derive(Deserialize)]
 pub struct CreateOutboundRequest {
     #[serde(default)]
+    directory: Option<String>,
+    #[serde(default)]
     link_id: Option<String>,
     #[serde(default)]
     upload_id: Option<String>,
@@ -975,14 +979,17 @@ pub async fn list_outbound_grants(
     let (limit, offset) = outbound_grants_paging(query)?;
     let (grants, total) = app
         .store
-        .outbound_grants_page(&identity.tenant, limit, offset)
+        .outbound_grants_page(&identity.tenant, limit, offset, MAX_LIBRARY_SELECTION_FILES)
         .map_err(super::store_unavailable)?;
     let has_more = u64::try_from(offset)
         .unwrap_or(u64::MAX)
         .saturating_add(grants.len() as u64)
         < total;
     Ok(Json(json!({
-        "grants": grants.into_iter().map(public_grant).collect::<Vec<_>>(),
+        "grants": grants
+            .into_iter()
+            .map(|(grant, file_count)| public_grant_with_file_count(grant, file_count))
+            .collect::<Vec<_>>(),
         "total": total,
         "offset": offset,
         "limit": limit,
@@ -1112,12 +1119,55 @@ pub async fn create_outbound_grant(
     }
     validate_max_downloads(request.max_downloads)?;
     let password_hash = hash_optional_password(request.password.as_deref())?;
+    let has_legacy_fields =
+        request.link_id.is_some() || request.upload_id.is_some() || request.file_index.is_some();
+    if let Some(directory_name) = request.directory {
+        if request.paths.is_some() || has_legacy_fields {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "directory cannot be combined with paths, link_id, upload_id, or file_index",
+            ));
+        }
+        let directory_label = library_directory_label(&directory_name);
+        let directory = automation_directory(&app, &identity.tenant, &directory_name)?;
+        let root = library_root(&app, &identity.tenant);
+        let paths = tokio::task::spawn_blocking(move || {
+            enumerate_automation_files(&root, &directory, MAX_LIBRARY_PROJECT_FILES)
+        })
+        .await
+        .map_err(|_| ApiError::internal("enumerate outbound files failed"))??;
+        return create_library_grant(
+            &app,
+            &headers,
+            &identity,
+            &paths,
+            MAX_LIBRARY_PROJECT_FILES,
+            GrantOptions {
+                label: request
+                    .label
+                    .filter(|label| !label.trim().is_empty())
+                    .or(Some(directory_label)),
+                password_hash,
+                expires_days: request.expires_days,
+                max_downloads: request.max_downloads,
+                notify_on_download: request.notify_on_download,
+            },
+        )
+        .await;
+    }
     if let Some(paths) = request.paths.as_deref() {
+        if has_legacy_fields {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "paths cannot be combined with link_id, upload_id, or file_index",
+            ));
+        }
         return create_library_grant(
             &app,
             &headers,
             &identity,
             paths,
+            MAX_LIBRARY_SELECTION_FILES,
             GrantOptions {
                 label: request.label,
                 password_hash,
@@ -1127,6 +1177,12 @@ pub async fn create_outbound_grant(
             },
         )
         .await;
+    }
+    if !has_legacy_fields {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "paths, directory, or link_id, upload_id, and file_index are required",
+        ));
     }
     let link_id = request
         .link_id
@@ -1261,12 +1317,14 @@ pub async fn automation_share(
         ));
     }
     validate_max_downloads(request.max_downloads)?;
-    let directory_label = request.directory.clone();
+    let directory_label = library_directory_label(&request.directory);
     let directory = automation_directory(&app, &token.tenant, &request.directory)?;
     let root = library_root(&app, &token.tenant);
-    let paths = tokio::task::spawn_blocking(move || enumerate_automation_files(&root, &directory))
-        .await
-        .map_err(|_| ApiError::internal("enumerate outbound files failed"))??;
+    let paths = tokio::task::spawn_blocking(move || {
+        enumerate_automation_files(&root, &directory, MAX_LIBRARY_PROJECT_FILES)
+    })
+    .await
+    .map_err(|_| ApiError::internal("enumerate outbound files failed"))??;
     let identity = auth::AdminIdentity {
         subject: format!("automation:{}", token.id),
         tenant: token.tenant,
@@ -1279,8 +1337,12 @@ pub async fn automation_share(
         &headers,
         &identity,
         &paths,
+        MAX_LIBRARY_PROJECT_FILES,
         GrantOptions {
-            label: request.label.or(Some(directory_label)),
+            label: request
+                .label
+                .filter(|label| !label.trim().is_empty())
+                .or(Some(directory_label)),
             password_hash: hash_optional_password(request.password.as_deref())?,
             expires_days: request.expires_days,
             max_downloads: request.max_downloads,
@@ -1301,6 +1363,12 @@ fn automation_bearer(headers: &HeaderMap) -> ApiResult<String> {
 }
 
 fn automation_directory(app: &App, tenant: &str, directory: &str) -> ApiResult<PathBuf> {
+    if directory.len() > MAX_LIBRARY_DIRECTORY_INPUT_BYTES {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "directory is too long",
+        ));
+    }
     if directory.is_empty() || Path::new(directory).is_absolute() || directory.contains('\\') {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1319,8 +1387,26 @@ fn automation_directory(app: &App, tenant: &str, directory: &str) -> ApiResult<P
     Ok(path)
 }
 
-fn enumerate_automation_files(root: &Path, directory: &Path) -> ApiResult<Vec<String>> {
-    fn visit(root: &Path, directory: &Path, paths: &mut Vec<String>) -> ApiResult<()> {
+fn library_directory_label(directory: &str) -> String {
+    directory
+        .trim_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(directory)
+        .to_owned()
+}
+
+fn enumerate_automation_files(
+    root: &Path,
+    directory: &Path,
+    max_files: usize,
+) -> ApiResult<Vec<String>> {
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        paths: &mut Vec<String>,
+        max_files: usize,
+    ) -> ApiResult<()> {
         let entries = std::fs::read_dir(directory).map_err(|_| ApiError::not_found())?;
         for entry in entries {
             let entry = entry.map_err(|_| ApiError::not_found())?;
@@ -1334,17 +1420,13 @@ fn enumerate_automation_files(root: &Path, directory: &Path) -> ApiResult<Vec<St
             }
             if metadata.file_type().is_dir() {
                 let name = entry.file_name();
-                if name.to_string_lossy().starts_with(".vot-")
-                    && name.to_string_lossy().ends_with(".stage")
-                {
+                if is_library_stage_name(&name) {
                     continue;
                 }
-                visit(root, &path, paths)?;
+                visit(root, &path, paths, max_files)?;
             } else if metadata.file_type().is_file() {
                 let name = entry.file_name();
-                if name.to_string_lossy().starts_with(".vot-")
-                    && name.to_string_lossy().ends_with(".stage")
-                {
+                if is_library_stage_name(&name) {
                     continue;
                 }
                 let relative = path
@@ -1354,10 +1436,10 @@ fn enumerate_automation_files(root: &Path, directory: &Path) -> ApiResult<Vec<St
                     .ok_or_else(ApiError::not_found)?
                     .replace('\\', "/");
                 paths.push(relative);
-                if paths.len() > 64 {
+                if paths.len() > max_files {
                     return Err(ApiError::new(
                         StatusCode::UNPROCESSABLE_ENTITY,
-                        "directory contains too many files",
+                        format!("directory contains too many files (maximum {max_files})"),
                     ));
                 }
             }
@@ -1366,7 +1448,7 @@ fn enumerate_automation_files(root: &Path, directory: &Path) -> ApiResult<Vec<St
     }
 
     let mut paths = Vec::new();
-    visit(root, directory, &mut paths)?;
+    visit(root, directory, &mut paths, max_files)?;
     paths.sort();
     if paths.is_empty() {
         return Err(ApiError::new(
@@ -1390,13 +1472,14 @@ async fn create_library_grant(
     headers: &HeaderMap,
     identity: &auth::AdminIdentity,
     requested: &[String],
+    max_files: usize,
     options: GrantOptions,
 ) -> ApiResult<Response> {
     let _operation = begin_outbound_operation(app, &identity.tenant)?;
-    if requested.is_empty() || requested.len() > 64 {
+    if requested.is_empty() || requested.len() > max_files {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "paths must contain 1..=64 files",
+            format!("paths must contain 1..={max_files} files"),
         ));
     }
     let root = library_root(app, &identity.tenant);
@@ -2662,7 +2745,28 @@ fn safe_filename(name: &str) -> String {
     value.chars().take(180).collect()
 }
 fn public_grant(grant: OutboundGrant) -> serde_json::Value {
-    json!({ "id": grant.id, "tenant": grant.tenant, "link_id": grant.link_id, "upload_id": grant.upload_id, "file_index": grant.file_index, "name": grant.name, "label": grant.label, "has_password": grant.password_hash.is_some(), "created_at": grant.created_at, "expires_at": grant.expires_at, "revoked_at": grant.revoked_at, "max_downloads": grant.max_downloads, "downloads": grant.downloads, "first_download_at": grant.first_download_at, "last_download_at": grant.last_download_at, "notify_on_download": grant.notify_on_download, "files": grant.files.iter().map(|file| json!({ "name": file.name, "suite": file.suite, "root": file.root, "bytes": file.bytes, "downloads": file.downloads, "first_download_at": file.first_download_at, "last_download_at": file.last_download_at })).collect::<Vec<_>>() })
+    let file_count = if grant.files.is_empty() {
+        1
+    } else {
+        grant.files.len()
+    };
+    public_grant_with_file_count(grant, file_count)
+}
+
+fn public_grant_with_file_count(grant: OutboundGrant, file_count: usize) -> serde_json::Value {
+    let files_truncated = file_count > MAX_LIBRARY_SELECTION_FILES;
+    let files = if files_truncated {
+        Vec::new()
+    } else {
+        grant
+            .files
+            .iter()
+            .map(|file| {
+                json!({ "name": file.name, "suite": file.suite, "root": file.root, "bytes": file.bytes, "downloads": file.downloads, "first_download_at": file.first_download_at, "last_download_at": file.last_download_at })
+            })
+            .collect()
+    };
+    json!({ "id": grant.id, "tenant": grant.tenant, "link_id": grant.link_id, "upload_id": grant.upload_id, "file_index": grant.file_index, "name": grant.name, "label": grant.label, "has_password": grant.password_hash.is_some(), "created_at": grant.created_at, "expires_at": grant.expires_at, "revoked_at": grant.revoked_at, "max_downloads": grant.max_downloads, "downloads": grant.downloads, "first_download_at": grant.first_download_at, "last_download_at": grant.last_download_at, "notify_on_download": grant.notify_on_download, "file_count": file_count, "files_truncated": files_truncated, "files": files })
 }
 
 fn public_automation_token(token: &AutomationToken) -> serde_json::Value {
@@ -2996,6 +3100,9 @@ mod tests {
         assert_eq!(listed["total"], 51);
         assert_eq!(listed["has_more"], true);
         assert_eq!(listed["grants"].as_array().unwrap().len(), 50);
+        assert_eq!(listed["grants"][0]["file_count"], 1);
+        assert_eq!(listed["grants"][0]["files_truncated"], false);
+        assert_eq!(listed["grants"][0]["files"], json!([]));
         assert_eq!(listed["grants"][0]["id"], "grant-50");
     }
 
@@ -4009,6 +4116,9 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let created = body(response).await;
+        assert_eq!(created["grant"]["file_count"], 2);
+        assert_eq!(created["grant"]["files_truncated"], false);
+        assert_eq!(created["grant"]["files"].as_array().unwrap().len(), 2);
         let token = created["url"]
             .as_str()
             .unwrap()
@@ -4640,6 +4750,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_directory_grant_supports_large_projects_and_public_metadata() {
+        let (_directory, app, cookie, _bytes) = fixture().await;
+        let project = app.config.outbound_dir.join("project");
+        std::fs::create_dir(&project).unwrap();
+        for index in 0..=1000 {
+            std::fs::write(project.join(format!("file-{index:02}.bin")), b"x").unwrap();
+        }
+        for payload in [
+            json!({ "directory": "project", "paths": ["project/file-00.bin"] }),
+            json!({ "directory": "x".repeat(MAX_LIBRARY_DIRECTORY_INPUT_BYTES + 1) }),
+        ] {
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::post("/api/admin/outbound-grants")
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({ "expires_days": 1, "directory": payload["directory"], "paths": payload["paths"] }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "directory": "project", "expires_days": 1 }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = body(response).await;
+        assert_eq!(created["grant"]["file_count"], 1001);
+        assert_eq!(created["grant"]["files_truncated"], true);
+        assert_eq!(created["grant"]["files"], json!([]));
+        let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
+
+        let metadata = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metadata.status(), StatusCode::OK);
+        assert_eq!(
+            body(metadata).await["files"].as_array().unwrap().len(),
+            1001
+        );
+
+        let history = crate::app::router(app)
+            .oneshot(
+                Request::get("/api/admin/outbound-grants")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history.status(), StatusCode::OK);
+        let history = body(history).await;
+        assert_eq!(history["grants"][0]["file_count"], 1001);
+        assert_eq!(history["grants"][0]["files_truncated"], true);
+        assert_eq!(history["grants"][0]["files"], json!([]));
+    }
+
+    #[test]
+    fn recursive_library_enumerator_rejects_more_than_project_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_LIBRARY_PROJECT_FILES {
+            std::fs::write(directory.path().join(format!("file-{index:04}.bin")), b"x").unwrap();
+        }
+        let error = enumerate_automation_files(
+            directory.path(),
+            directory.path(),
+            MAX_LIBRARY_PROJECT_FILES,
+        )
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error.message.contains("maximum 10000"));
+    }
+
+    #[tokio::test]
     async fn scoped_library_search_is_literal_case_insensitive_and_capped() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
@@ -4821,6 +5024,33 @@ mod tests {
         assert_eq!(share["grant"]["files"][0]["name"], "project/a.txt");
         assert_eq!(share["grant"]["files"][1]["name"], "project/sub/b.txt");
         assert_eq!(share["grant"]["has_password"], false);
+
+        let large = app.config.outbound_dir.join("automation-large");
+        std::fs::create_dir(&large).unwrap();
+        for index in 0..=1000 {
+            std::fs::write(large.join(format!("file-{index:02}.bin")), b"x").unwrap();
+        }
+        let large_share = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/automation/share")
+                    .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        15,
+                    ))))
+                    .body(Body::from(
+                        r#"{"directory":"automation-large","expires_days":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(large_share.status(), StatusCode::OK);
+        let large_share = body(large_share).await;
+        assert_eq!(large_share["grant"]["file_count"], 1001);
+        assert_eq!(large_share["grant"]["files_truncated"], true);
+        assert_eq!(large_share["grant"]["label"], "automation-large");
 
         for directory in ["/project", "../project", "project/../project"] {
             let response = crate::app::router(app.clone())

@@ -265,7 +265,10 @@ hashed, verified range by range, independent of every proxy in between.
    transfer from history. Deactivate or delete links when done (files stay
    until you delete them or retention sweeps them).
 4. **Deliver:** browse nested project directories and admin-uploaded files,
-   select one or more files, and issue one expiring, revocable download link.
+   select one or more files and issue one expiring, revocable download link,
+   or share a project folder directly and issue one expiring, revocable
+   download link. Manual mixed selection is limited to 64 files; direct folder
+   shares can include up to 10,000 files.
    Delivery links have an optional notification policy for the first download
    and completed delivery. Issued links show aggregate and per-file download
    starts with first and most recent timestamps. For multi-file links,
@@ -283,7 +286,8 @@ newer).
 
 Create a tenant-scoped automation token on **Deliver**. The raw token is shown
 once, so copy it immediately; revoke it and create another if it is lost.
-Use the token to share a server-relative outbound directory from the CLI:
+Use the token to share a server-relative outbound directory from the CLI (up
+to 10,000 files per share):
 
 ```sh
 export VOTPORT_URL=https://drop.example.com

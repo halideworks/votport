@@ -1,7 +1,13 @@
 // votport public verified download page. VOTPORT PROPRIETARY LICENSE.
 
 import { appendObjectCard, formatBytes } from '/assets/object-card.js';
-import { dedupeFilenames, runWorkerPool, summarizeFailures } from '/assets/outbound-download.js';
+import {
+  anchorDownloadsAllowed,
+  dedupeFilenames,
+  MAX_ANCHOR_DOWNLOADS,
+  runWorkerPool,
+  summarizeFailures,
+} from '/assets/outbound-download.js';
 
 const $ = (id) => document.getElementById(id);
 const token = window.location.pathname.split('/').filter(Boolean).pop();
@@ -64,6 +70,7 @@ function triggerSeparateDownloads(files, names) {
 let separateDownloadBusy = false;
 
 async function downloadSeparately(files) {
+  if (typeof window.showDirectoryPicker !== 'function' && !anchorDownloadsAllowed(files.length)) return;
   if (separateDownloadBusy) return;
   separateDownloadBusy = true;
   const button = $('separate-download-button');
@@ -74,7 +81,7 @@ async function downloadSeparately(files) {
     if (typeof window.showDirectoryPicker !== 'function') {
       triggerSeparateDownloads(files, names);
       status.textContent =
-        `Started ${files.length} downloads. Your browser may ask once to allow multiple downloads.`;
+        `Requested ${files.length} downloads. Your browser may ask once to allow multiple downloads.`;
       return;
     }
     const directory = await window.showDirectoryPicker({ mode: 'readwrite' });
@@ -168,12 +175,24 @@ async function loadMetadata() {
   separate.hidden = files.length < 2;
   if (files.length > 1) {
     const separateNote = $('separate-download-note');
-    separateNote.textContent = typeof window.showDirectoryPicker === 'function'
-      ? 'Choose a folder and save each payload file separately.'
-      : 'Your browser may ask once to allow multiple downloads.';
-    $('separate-download-button').onclick = () => downloadSeparately(files);
-    $('separate-download-button').disabled = false;
-    $('separate-download-status').textContent = '';
+    const separateButton = $('separate-download-button');
+    const pickerAvailable = typeof window.showDirectoryPicker === 'function';
+    if (pickerAvailable) {
+      separateNote.textContent = 'Choose a folder and save each payload file separately.';
+      separateButton.onclick = () => downloadSeparately(files);
+      separateButton.disabled = false;
+      $('separate-download-status').textContent = '';
+    } else if (anchorDownloadsAllowed(files.length)) {
+      separateNote.textContent = 'Your browser may ask once to allow multiple downloads.';
+      separateButton.onclick = () => downloadSeparately(files);
+      separateButton.disabled = false;
+      $('separate-download-status').textContent = '';
+    } else {
+      separateNote.textContent =
+        `This browser cannot request more than ${MAX_ANCHOR_DOWNLOADS} separate downloads. Use Download everything or Chrome/Edge folder selection.`;
+      separateButton.disabled = true;
+      $('separate-download-status').textContent = 'Separate downloads are unavailable for this link in this browser.';
+    }
   }
   $('title').textContent = body.label || 'Verified download';
   $('status').textContent = 'The server verifies the file against this identity before download.';
