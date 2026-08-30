@@ -1,6 +1,6 @@
 // votport public receipt check: POST the sidecar bytes to /api/verify and,
 // when a payload file is present, hash it locally with the same worker the
-// sender uses. The payload never leaves the tab. AGPL-3.0-only.
+// sender uses. The payload never leaves the tab. VOTPORT PROPRIETARY LICENSE.
 
 import { appendObjectCard, formatBytes } from '/assets/object-card.js';
 

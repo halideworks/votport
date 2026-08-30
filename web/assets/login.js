@@ -1,4 +1,4 @@
-// votport sign-in page. AGPL-3.0-only.
+// votport sign-in page. VOTPORT PROPRIETARY LICENSE.
 
 import { api } from '/assets/admin-common.js';
 import { collapseLocalPassword } from '/assets/login-disclosure.js';

@@ -1,5 +1,5 @@
 // votport tenants page: namespace lifecycle for platform admins.
-// AGPL-3.0-only.
+// VOTPORT PROPRIETARY LICENSE.
 
 import {
   alertModal,

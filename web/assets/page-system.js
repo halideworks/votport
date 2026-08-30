@@ -1,5 +1,5 @@
 // votport system page: credentials, backups, verification key, overlay settings.
-// AGPL-3.0-only.
+// VOTPORT PROPRIETARY LICENSE.
 
 import { api, requireSession } from '/assets/admin-common.js';
 

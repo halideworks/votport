@@ -1,5 +1,5 @@
 # votport — password-protected file receive portal built on VOT.
-# AGPL-3.0-only.
+# VOTPORT PROPRIETARY LICENSE.
 #
 # Multi-stage build:
 #   1. compile vot-wasm to WebAssembly for the browser uploader
@@ -29,6 +29,7 @@ RUN wasm-bindgen --target web --no-typescript --out-dir /wasm-vendor \
     /vot/target/wasm32-unknown-unknown/release/vot_wasm.wasm
 
 # Server.
+COPY LICENSE /src/LICENSE
 COPY server /src/server
 RUN cd /src/server && cargo build --release --locked
 
@@ -39,6 +40,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /app /data /received /outbound
 COPY --from=build /src/server/target/release/votport /app/votport
+COPY LICENSE /app/LICENSE
 COPY web /app/web
 COPY --from=build /wasm-vendor/ /app/web/assets/vendor/
 RUN chmod -R a+rX /app/web

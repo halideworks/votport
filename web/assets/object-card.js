@@ -1,6 +1,6 @@
 // Shared object card: one row per delivered file on the sender done list,
 // the operator listing, and the verify page. The identity line carries the
-// full suite:root; clicking it copies the pasteable form. AGPL-3.0-only.
+// full suite:root; clicking it copies the pasteable form. VOTPORT PROPRIETARY LICENSE.
 
 // Byte size for status lines; shared home so public pages (verify) do not
 // import the admin module for one helper.

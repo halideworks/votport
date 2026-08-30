@@ -1,5 +1,5 @@
 // votport audit page: queryable event log viewer + JSONL export.
-// AGPL-3.0-only.
+// VOTPORT PROPRIETARY LICENSE.
 
 import { formatWhen, requireSession } from '/assets/admin-common.js';
 

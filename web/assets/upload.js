@@ -1,5 +1,5 @@
 // votport uploader: hashes files with vot-wasm, builds a VOT package, and
-// streams proven ranges to the server. AGPL-3.0-only.
+// streams proven ranges to the server. VOTPORT PROPRIETARY LICENSE.
 
 import { appendObjectCard, formatBytes } from '/assets/object-card.js';
 import init, {

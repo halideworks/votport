@@ -1,16 +1,9 @@
 //! votport: a password-protected file receive portal built on VOT.
 //!
-//! Copyright (C) 2026  votport contributors
+//! Copyright (c) 2026 David Torcivia. All rights reserved.
 //!
-//! This program is free software: you can redistribute it and/or modify it
-//! under the terms of the GNU Affero General Public License as published by
-//! the Free Software Foundation, version 3.
-//!
-//! This program is distributed in the hope that it will be useful, but
-//! WITHOUT ANY WARRANTY; without even the implied warranty of
-//! MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero
-//! General Public License for more details:
-//! <https://www.gnu.org/licenses/agpl-3.0.html>.
+//! This program is proprietary commercial software. See the VOTPORT
+//! PROPRIETARY LICENSE for the applicable terms and lack of warranty.
 
 use votport::{app, config};
 

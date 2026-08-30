@@ -1,6 +1,6 @@
 //! HTTP API: shared error type plus the admin and upload halves.
 //!
-//! Licensed under the GNU Affero General Public License, version 3 only.
+//! Licensed under the VOTPORT PROPRIETARY LICENSE.
 
 pub mod admin;
 pub mod outbound;

@@ -1,4 +1,4 @@
-// votport public verified download page. AGPL-3.0-only.
+// votport public verified download page. VOTPORT PROPRIETARY LICENSE.
 
 import { appendObjectCard, formatBytes } from '/assets/object-card.js';
 
