@@ -23,6 +23,7 @@ pub struct NotificationReport {
 
 /// Sends every configured notification for one completed upload.
 pub async fn uploaded(app: Arc<App>, label: String, report: FinishReport) {
+    let transfer_id = report.upload_id.clone();
     let total: u64 = report.files.iter().map(|file| file.bytes).sum();
     let count = report.files.len();
     let title = format!("votport: files received for \"{label}\"");
@@ -43,7 +44,15 @@ pub async fn uploaded(app: Arc<App>, label: String, report: FinishReport) {
         "total_bytes": total,
         "files": report.files,
     });
-    send_all(app, title, body, payload).await;
+    send_all(
+        app,
+        title,
+        body,
+        payload,
+        "upload_complete",
+        Some(&transfer_id),
+    )
+    .await;
 }
 
 /// Sends the transition notification for an outbound delivery.
@@ -59,6 +68,7 @@ pub async fn outbound_downloaded(
     } else {
         return;
     };
+    let transfer_id = grant.id.clone();
     let (file_count, total_bytes, files) = if grant.files.is_empty() {
         (
             1,
@@ -95,7 +105,7 @@ pub async fn outbound_downloaded(
         "total_bytes": total_bytes,
         "files": files,
     });
-    send_all(app, title, body, payload).await;
+    send_all(app, title, body, payload, event, Some(&transfer_id)).await;
 }
 
 /// Sends a safe test message using the currently resolved (saved plus
@@ -111,22 +121,38 @@ pub async fn test_saved(app: Arc<App>) -> Result<NotificationReport, String> {
             "event": "notification_test",
             "message": "This is a VOTPort notification test."
         }),
+        "notification_test",
+        None,
     )
     .await)
 }
 
-async fn send_all(app: Arc<App>, title: String, body: String, payload: serde_json::Value) {
+async fn send_all(
+    app: Arc<App>,
+    title: String,
+    body: String,
+    payload: serde_json::Value,
+    event: &str,
+    transfer_id: Option<&str>,
+) {
     // Best effort like the rest of this path: a settings read failure logs
     // and sends nothing, rather than failing a transfer that already landed.
     let settings = match app.store.resolved_settings(&app.config) {
         Ok(settings) => settings,
         Err(error) => {
-            tracing::error!(%error, "settings read failed; skipping notifications");
+            tracing::error!(
+                channel = "settings",
+                event,
+                transfer_id = transfer_id.unwrap_or("none"),
+                outcome = "failed",
+                %error,
+                "settings read failed; skipping notifications"
+            );
             return;
         }
     };
 
-    let _ = send_resolved(&app, &settings, title, body, payload).await;
+    let _ = send_resolved(&app, &settings, title, body, payload, event, transfer_id).await;
 }
 
 async fn send_resolved(
@@ -135,11 +161,18 @@ async fn send_resolved(
     title: String,
     body: String,
     payload: serde_json::Value,
+    event: &str,
+    transfer_id: Option<&str>,
 ) -> NotificationReport {
     let mut report = NotificationReport::default();
     if let Some(url) = &settings.notify_webhook {
         report.configured += 1;
-        if log_failure("webhook", app.http.post(url).json(&payload).send().await) {
+        if log_failure(
+            "webhook",
+            event,
+            transfer_id,
+            app.http.post(url).json(&payload).send().await,
+        ) {
             report.delivered += 1;
         }
     }
@@ -153,7 +186,7 @@ async fn send_resolved(
         if let Some(token) = &settings.notify_ntfy_token {
             request = request.bearer_auth(token);
         }
-        if log_failure("ntfy", request.send().await) {
+        if log_failure("ntfy", event, transfer_id, request.send().await) {
             report.delivered += 1;
         }
     }
@@ -169,37 +202,81 @@ async fn send_resolved(
                 ("title", title.as_str()),
                 ("message", body.as_str()),
             ]);
-        if log_failure("pushover", request.send().await) {
+        if log_failure("pushover", event, transfer_id, request.send().await) {
             report.delivered += 1;
         }
     }
 
     if let Some(smtp) = &settings.smtp {
         report.configured += 1;
-        if log_smtp_failure(send_smtp(smtp, &title, &body).await) {
+        if log_smtp_failure(event, transfer_id, send_smtp(smtp, &title, &body).await) {
             report.delivered += 1;
         }
+    }
+    if report.delivered < report.configured {
+        let outcome = if report.delivered == 0 {
+            "failed"
+        } else {
+            "partial"
+        };
+        tracing::warn!(
+            event,
+            transfer_id = transfer_id.unwrap_or("none"),
+            configured = report.configured,
+            delivered = report.delivered,
+            outcome,
+            "notification delivery incomplete"
+        );
     }
     report
 }
 
-fn log_failure(target: &str, result: Result<reqwest::Response, reqwest::Error>) -> bool {
+fn log_failure(
+    channel: &str,
+    event: &str,
+    transfer_id: Option<&str>,
+    result: Result<reqwest::Response, reqwest::Error>,
+) -> bool {
     match result {
         Ok(response) if !response.status().is_success() => {
-            tracing::warn!(target, status = %response.status(), "notification failed");
+            tracing::warn!(
+                channel,
+                event,
+                transfer_id = transfer_id.unwrap_or("none"),
+                status = %response.status(),
+                outcome = "failed",
+                "notification failed"
+            );
             false
         }
         Err(error) => {
-            tracing::warn!(target, "notification failed: {error}");
+            let error = error.without_url();
+            tracing::warn!(
+                channel,
+                event,
+                transfer_id = transfer_id.unwrap_or("none"),
+                outcome = "failed",
+                "notification failed: {error}"
+            );
             false
         }
         Ok(_) => true,
     }
 }
 
-fn log_smtp_failure<E: std::fmt::Display>(result: Result<(), E>) -> bool {
+fn log_smtp_failure<E: std::fmt::Display>(
+    event: &str,
+    transfer_id: Option<&str>,
+    result: Result<(), E>,
+) -> bool {
     if let Err(error) = result {
-        tracing::warn!(target = "smtp", "notification failed: {error}");
+        tracing::warn!(
+            channel = "smtp",
+            event,
+            transfer_id = transfer_id.unwrap_or("none"),
+            outcome = "failed",
+            "notification failed: {error}"
+        );
         false
     } else {
         true
@@ -340,6 +417,20 @@ mod tests {
         (application, directory, rx, thread)
     }
 
+    fn http_stub(status: &'static str) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let response =
+                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+        });
+        (addr, thread)
+    }
+
     fn request_json(request: &str) -> serde_json::Value {
         serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
     }
@@ -391,6 +482,92 @@ mod tests {
         assert_eq!(payload["message"], "This is a VOTPort notification test.");
         assert_no_secrets(&request);
         thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_success_webhook_is_reported_as_undelivered() {
+        let (addr, thread) = http_stub("500 Internal Server Error");
+        let directory = tempfile::tempdir().unwrap();
+        let application = app::build(testing::config(directory.path())).unwrap();
+        application
+            .store
+            .put_settings(
+                "local",
+                &[(
+                    "notify_webhook".to_owned(),
+                    SettingWrite::Set(format!("http://{addr}/failure")),
+                )],
+            )
+            .unwrap();
+        let settings = application
+            .store
+            .resolved_settings(&application.config)
+            .unwrap();
+        let report = send_resolved(
+            &application,
+            &settings,
+            "title".to_owned(),
+            "body".to_owned(),
+            json!({ "event": "upload_complete" }),
+            "upload_complete",
+            Some("upload-1"),
+        )
+        .await;
+        assert_eq!(
+            report,
+            NotificationReport {
+                configured: 1,
+                delivered: 0
+            }
+        );
+        thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_channel_delivery_reports_one_failure() {
+        let (webhook_addr, webhook_thread) = http_stub("200 OK");
+        let (ntfy_addr, ntfy_thread) = http_stub("503 Service Unavailable");
+        let directory = tempfile::tempdir().unwrap();
+        let application = app::build(testing::config(directory.path())).unwrap();
+        application
+            .store
+            .put_settings(
+                "local",
+                &[
+                    (
+                        "notify_webhook".to_owned(),
+                        SettingWrite::Set(format!("http://{webhook_addr}/ok")),
+                    ),
+                    (
+                        "notify_ntfy".to_owned(),
+                        SettingWrite::Set(format!("http://{ntfy_addr}/partial")),
+                    ),
+                ],
+            )
+            .unwrap();
+        let settings = application
+            .store
+            .resolved_settings(&application.config)
+            .unwrap();
+        let report = send_resolved(
+            &application,
+            &settings,
+            "title".to_owned(),
+            "body".to_owned(),
+            json!({ "event": "upload_complete" }),
+            "upload_complete",
+            Some("upload-2"),
+        )
+        .await;
+        assert_eq!(
+            report,
+            NotificationReport {
+                configured: 2,
+                delivered: 1
+            }
+        );
+        webhook_thread.join().unwrap();
+        ntfy_thread.join().unwrap();
     }
 
     #[tokio::test]
@@ -520,8 +697,8 @@ mod tests {
 
     #[test]
     fn log_smtp_failure_does_not_panic() {
-        log_smtp_failure(Ok::<(), &str>(()));
-        log_smtp_failure(Err("smtp boom"));
+        log_smtp_failure("notification_test", None, Ok::<(), &str>(()));
+        log_smtp_failure("notification_test", None, Err("smtp boom"));
     }
 
     async fn smtp_stub(listener: tokio::net::TcpListener) -> std::io::Result<String> {
