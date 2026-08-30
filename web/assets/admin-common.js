@@ -1,4 +1,4 @@
-// Shared helpers for the multi-page admin. AGPL-3.0-only.
+// Shared helpers for the multi-page admin. VOTPORT PROPRIETARY LICENSE.
 
 export async function api(path, options = {}) {
   const response = await fetch(path, {

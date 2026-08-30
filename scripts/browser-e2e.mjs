@@ -1,6 +1,6 @@
 // Browser end-to-end check: signs in to the admin UI, creates a link,
 // uploads files through the real uploader (vot-wasm in Chromium), and
-// verifies the bytes on disk. AGPL-3.0-only.
+// verifies the bytes on disk. VOTPORT PROPRIETARY LICENSE.
 //
 // Requires: `npm i playwright` (with its Chromium), a running votport, and:
 //   BASE_URL        e.g. http://127.0.0.1:8080

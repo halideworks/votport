@@ -1,6 +1,6 @@
 //! votport library surface: everything the binary and integration tests use.
 //!
-//! Licensed under the GNU Affero General Public License, version 3 only.
+//! Licensed under the VOTPORT PROPRIETARY LICENSE.
 
 pub mod api;
 pub mod app;

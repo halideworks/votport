@@ -1,6 +1,6 @@
 // votport hash worker: owns the vot-wasm hash trees so the UI thread never
 // blocks on hashing, and serves range proofs from them during upload.
-// AGPL-3.0-only.
+// VOTPORT PROPRIETARY LICENSE.
 
 import init, { ObjectBuilder, Suite } from '/assets/vendor/vot_wasm.js';
 

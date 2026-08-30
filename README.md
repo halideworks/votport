@@ -414,6 +414,10 @@ Nothing in the project references its location inside the VOT tree.
 
 ## License
 
-votport is free software, licensed under the
-**GNU Affero General Public License, version 3 only** (same as VOT).
-See [LICENSE](LICENSE).
+Votport is proprietary commercial software. Use requires a separate paid
+written agreement from the repository owner. See [LICENSE](LICENSE) and
+contact the repository owner for commercial terms.
+
+VOT remains separately available under its own license, but bundled VOT use
+with Votport follows the Votport commercial agreement. Third-party component
+licenses and notices are unaffected.

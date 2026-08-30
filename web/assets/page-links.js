@@ -1,5 +1,5 @@
 // votport links page: issue transfer requests and manage received files.
-// AGPL-3.0-only.
+// VOTPORT PROPRIETARY LICENSE.
 
 import { appendObjectCard } from '/assets/object-card.js';
 import {
