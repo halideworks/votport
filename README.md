@@ -267,11 +267,13 @@ export VOTPORT_URL=https://drop.example.com
 export VOTPORT_AUTOMATION_TOKEN='<token from Links>'
 # Optional password for the outbound link:
 export VOTPORT_SHARE_PASSWORD='use-a-separate-secret'
-votport share project/render --expires 7d --label "Client delivery"
+votport share project/render --expires 7d --label "Client delivery" --max-downloads 1
 ```
 
 The command prints the expiring share URL. `VOTPORT_URL` must be the HTTPS
 server URL (HTTP is allowed for loopback); `VOTPORT_SHARE_PASSWORD` is optional.
+`--max-downloads` is optional and limits the number of download starts (1 is
+one-time use).
 
 ## Performance
 

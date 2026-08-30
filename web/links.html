@@ -173,6 +173,10 @@
               >Access password <span class="muted">optional</span>
               <input id="deliver-password" type="password" autocomplete="new-password" placeholder="none" />
             </label>
+            <label
+              >Max downloads <span class="muted">optional; 1 = one-time</span>
+              <input id="deliver-max-downloads" type="number" min="1" max="10000" placeholder="unlimited" />
+            </label>
           </div>
           <button type="submit" id="deliver-submit">Issue download link</button>
           <p id="deliver-error" class="error" hidden></p>

@@ -78,12 +78,14 @@ struct ShareArgs {
     directory: String,
     expires_days: u64,
     label: Option<String>,
+    max_downloads: Option<u64>,
 }
 
 fn parse_share_args(arguments: Vec<String>) -> Result<ShareArgs, String> {
     let mut directory = None;
     let mut expires_days = 7;
     let mut label = None;
+    let mut max_downloads = None;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -108,6 +110,18 @@ fn parse_share_args(arguments: Vec<String>) -> Result<ShareArgs, String> {
                 }
                 label = Some(value);
             }
+            "--max-downloads" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--max-downloads requires a value".to_owned())?;
+                let value = value
+                    .parse::<u64>()
+                    .map_err(|_| "--max-downloads must be 1 through 10000".to_owned())?;
+                if !(1..=10_000).contains(&value) {
+                    return Err("--max-downloads must be 1 through 10000".to_owned());
+                }
+                max_downloads = Some(value);
+            }
             value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
             value if directory.is_none() => {
                 if std::path::Path::new(value).is_absolute() {
@@ -119,7 +133,7 @@ fn parse_share_args(arguments: Vec<String>) -> Result<ShareArgs, String> {
         }
     }
     let directory = directory.filter(|value| !value.is_empty()).ok_or_else(|| {
-        "usage: votport share <server-relative-directory> [--expires 7d] [--label LABEL]".to_owned()
+        "usage: votport share <server-relative-directory> [--expires 7d] [--label LABEL] [--max-downloads N]".to_owned()
     })?;
     if std::path::Path::new(&directory)
         .components()
@@ -131,6 +145,7 @@ fn parse_share_args(arguments: Vec<String>) -> Result<ShareArgs, String> {
         directory,
         expires_days,
         label,
+        max_downloads,
     })
 }
 
@@ -184,6 +199,7 @@ async fn share(arguments: Vec<String>) -> Result<(), String> {
             "expires_days": request.expires_days,
             "label": request.label,
             "password": password,
+            "max_downloads": request.max_downloads,
         }))
         .send()
         .await
@@ -248,6 +264,7 @@ mod cli_tests {
                 directory: "project/render".to_owned(),
                 expires_days: 14,
                 label: Some("Client delivery".to_owned()),
+                max_downloads: None,
             }
         );
     }
@@ -260,6 +277,22 @@ mod cli_tests {
             "project".to_owned(),
             "--expires".to_owned(),
             "31d".to_owned(),
+        ])
+        .is_err());
+        assert_eq!(
+            parse_share_args(vec![
+                "project".to_owned(),
+                "--max-downloads".to_owned(),
+                "1".to_owned(),
+            ])
+            .unwrap()
+            .max_downloads,
+            Some(1)
+        );
+        assert!(parse_share_args(vec![
+            "project".to_owned(),
+            "--max-downloads".to_owned(),
+            "10001".to_owned(),
         ])
         .is_err());
     }

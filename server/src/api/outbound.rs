@@ -26,7 +26,9 @@ use super::{ApiError, ApiResult};
 use crate::api::admin;
 use crate::app::App;
 use crate::auth;
-use crate::store::{now_unix, AutomationToken, OutboundGrant, OutboundGrantFile};
+use crate::store::{
+    now_unix, AutomationToken, OutboundGrant, OutboundGrantFile, OUTBOUND_DOWNLOAD_LIMIT_REACHED,
+};
 
 const MAX_ACTIVE: usize = 8;
 const CHUNK: usize = 1024 * 1024;
@@ -251,6 +253,8 @@ pub struct CreateOutboundRequest {
     label: Option<String>,
     #[serde(default)]
     password: Option<String>,
+    #[serde(default)]
+    max_downloads: Option<u64>,
     #[serde(default = "default_expiry")]
     expires_days: u64,
 }
@@ -390,6 +394,7 @@ pub async fn create_outbound_grant(
             "expires_days must be 1..=30",
         ));
     }
+    validate_max_downloads(request.max_downloads)?;
     let password_hash = hash_optional_password(request.password.as_deref())?;
     if let Some(paths) = request.paths.as_deref() {
         return create_library_grant(
@@ -397,9 +402,12 @@ pub async fn create_outbound_grant(
             &headers,
             &identity,
             paths,
-            request.label,
-            password_hash,
-            request.expires_days,
+            GrantOptions {
+                label: request.label,
+                password_hash,
+                expires_days: request.expires_days,
+                max_downloads: request.max_downloads,
+            },
         )
         .await;
     }
@@ -468,6 +476,7 @@ pub async fn create_outbound_grant(
         token_hash,
         created_at,
         expires_at: created_at.saturating_add(request.expires_days * 86_400),
+        max_downloads: request.max_downloads,
         revoked_at: None,
         downloads: 0,
         first_download_at: None,
@@ -499,6 +508,8 @@ pub struct AutomationShareRequest {
     label: Option<String>,
     #[serde(default)]
     password: Option<String>,
+    #[serde(default)]
+    max_downloads: Option<u64>,
     expires_days: u64,
 }
 
@@ -527,6 +538,7 @@ pub async fn automation_share(
             "expires_days must be 1..=30",
         ));
     }
+    validate_max_downloads(request.max_downloads)?;
     let directory_label = request.directory.clone();
     let directory = automation_directory(&app, &token.tenant, &request.directory)?;
     let paths = enumerate_automation_files(&library_root(&app, &token.tenant), &directory)?;
@@ -542,9 +554,12 @@ pub async fn automation_share(
         &headers,
         &identity,
         &paths,
-        request.label.or(Some(directory_label)),
-        hash_optional_password(request.password.as_deref())?,
-        request.expires_days,
+        GrantOptions {
+            label: request.label.or(Some(directory_label)),
+            password_hash: hash_optional_password(request.password.as_deref())?,
+            expires_days: request.expires_days,
+            max_downloads: request.max_downloads,
+        },
     )
     .await
 }
@@ -639,14 +654,19 @@ fn enumerate_automation_files(root: &Path, directory: &Path) -> ApiResult<Vec<St
     Ok(paths)
 }
 
+struct GrantOptions {
+    label: Option<String>,
+    password_hash: Option<String>,
+    expires_days: u64,
+    max_downloads: Option<u64>,
+}
+
 async fn create_library_grant(
     app: &Arc<App>,
     headers: &HeaderMap,
     identity: &auth::AdminIdentity,
     requested: &[String],
-    label: Option<String>,
-    password_hash: Option<String>,
-    expires_days: u64,
+    options: GrantOptions,
 ) -> ApiResult<Response> {
     if requested.is_empty() || requested.len() > 64 {
         return Err(ApiError::new(
@@ -734,7 +754,8 @@ async fn create_library_grant(
     let first = files.first().cloned().ok_or_else(ApiError::not_found)?;
     let created_at = now_unix();
     let token = auth::random_token();
-    let label = label
+    let label = options
+        .label
         .unwrap_or_else(|| first.name.clone())
         .trim()
         .to_owned();
@@ -751,9 +772,10 @@ async fn create_library_grant(
         file_index: 0,
         bytes: first.bytes,
         label,
-        password_hash,
+        password_hash: options.password_hash,
         created_at,
-        expires_at: created_at.saturating_add(expires_days * 86_400),
+        expires_at: created_at.saturating_add(options.expires_days * 86_400),
+        max_downloads: options.max_downloads,
         revoked_at: None,
         downloads: 0,
         first_download_at: None,
@@ -858,6 +880,76 @@ pub async fn delete_outbound_grant(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[derive(Deserialize)]
+pub struct UpdateOutboundGrantRequest {
+    #[serde(default)]
+    rotate: Option<bool>,
+    #[serde(default)]
+    extend_days: Option<u64>,
+}
+
+pub async fn update_outbound_grant(
+    State(app): State<Arc<App>>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateOutboundGrantRequest>,
+) -> ApiResult<Response> {
+    let identity = admin::require_admin(&app, &headers)?;
+    admin::require_admin_write(&headers, &identity)?;
+    if request.rotate.is_some() && request.extend_days.is_some()
+        || request.rotate == Some(false)
+        || request.rotate.is_none() && request.extend_days.is_none()
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "choose exactly one grant lifecycle action",
+        ));
+    }
+    if request.rotate == Some(true) {
+        let token = auth::random_token();
+        if !app
+            .store
+            .rotate_outbound_grant_token(&identity.tenant, &id, &hash_token(&token))
+            .map_err(ApiError::internal)?
+        {
+            return Err(ApiError::not_found());
+        }
+        app.store.audit(
+            &identity.tenant,
+            &identity.subject,
+            "outbound_grant_token_rotated",
+            &id,
+            &json!({}),
+        );
+        let base = admin::base_url(&app, &headers);
+        return Ok((
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({ "url": format!("{base}/s/{token}") })),
+        )
+            .into_response());
+    }
+    let days = request.extend_days.expect("validated extend_days");
+    if !(1..=30).contains(&days) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "extend_days must be 1..=30",
+        ));
+    }
+    let expires_at = app
+        .store
+        .extend_outbound_grant(&identity.tenant, &id, days * 86_400, now_unix())
+        .map_err(ApiError::internal)?
+        .ok_or_else(ApiError::not_found)?;
+    app.store.audit(
+        &identity.tenant,
+        &identity.subject,
+        "outbound_grant_extended",
+        &id,
+        &json!({ "expires_at": expires_at, "days": days }),
+    );
+    Ok(Json(json!({ "expires_at": expires_at })).into_response())
+}
+
 pub async fn outbound_metadata(
     State(app): State<Arc<App>>,
     AxumPath(token): AxumPath<String>,
@@ -912,6 +1004,7 @@ pub async fn outbound_metadata(
             "package_root": grant.package_root,
             "expires_at": grant.expires_at,
             "downloads": grant.downloads,
+            "max_downloads": grant.max_downloads,
             "receipt_key": app.signer.public_hex,
             "receipt_url": format!("/api/s/{token}/receipt"),
             "download_url": format!("/api/s/{token}/file"),
@@ -1038,13 +1131,7 @@ async fn outbound_file_inner(
     let file = tokio::fs::File::open(&stage.path)
         .await
         .map_err(|_| ApiError::internal("open staged file failed"))?;
-    if app
-        .store
-        .record_outbound_download(&grant.id, &[index], now_unix())
-        .is_err()
-    {
-        return Err(ApiError::internal("record download failed"));
-    }
+    record_download(&app, &grant.id, &[index])?;
     let stream = ReaderStream::new(OutboundReader {
         file,
         _stage: stage,
@@ -1133,13 +1220,7 @@ pub async fn outbound_bundle(
         .await
         .map_err(|_| ApiError::internal("open bundle failed"))?;
     let indexes: Vec<usize> = (0..count).collect();
-    if app
-        .store
-        .record_outbound_download(&grant.id, &indexes, now_unix())
-        .is_err()
-    {
-        return Err(ApiError::internal("record download failed"));
-    }
+    record_download(&app, &grant.id, &indexes)?;
     let stream = ReaderStream::new(BundleReader {
         file,
         _archive: archive,
@@ -1173,10 +1254,23 @@ fn active_grant(app: &App, token: &str) -> ApiResult<OutboundGrant> {
         .outbound_grant_by_token_hash(&hash_token(token))
         .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
-    if grant.revoked_at.is_some() || grant.expires_at <= now_unix() {
+    if grant.revoked_at.is_some()
+        || grant.expires_at <= now_unix()
+        || grant
+            .max_downloads
+            .is_some_and(|max| grant.downloads >= max)
+    {
         return Err(ApiError::not_found());
     }
     Ok(grant)
+}
+
+fn record_download(app: &App, id: &str, indexes: &[usize]) -> ApiResult<()> {
+    match app.store.record_outbound_download(id, indexes, now_unix()) {
+        Ok(_) => Ok(()),
+        Err(error) if error == OUTBOUND_DOWNLOAD_LIMIT_REACHED => Err(ApiError::not_found()),
+        Err(_) => Err(ApiError::internal("record download failed")),
+    }
 }
 
 fn grant_cookie_name(grant_id: &str) -> String {
@@ -1283,6 +1377,16 @@ fn hash_optional_password(password: Option<&str>) -> ApiResult<Option<String>> {
     auth::hash_password(password)
         .map(Some)
         .map_err(ApiError::internal)
+}
+
+fn validate_max_downloads(max_downloads: Option<u64>) -> ApiResult<()> {
+    if max_downloads.is_some_and(|max| !(1..=10_000).contains(&max)) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "max_downloads must be 1..=10000",
+        ));
+    }
+    Ok(())
 }
 
 struct Source {
@@ -1520,7 +1624,7 @@ fn safe_filename(name: &str) -> String {
     value.chars().take(180).collect()
 }
 fn public_grant(grant: OutboundGrant) -> serde_json::Value {
-    json!({ "id": grant.id, "tenant": grant.tenant, "link_id": grant.link_id, "upload_id": grant.upload_id, "file_index": grant.file_index, "name": grant.name, "label": grant.label, "has_password": grant.password_hash.is_some(), "created_at": grant.created_at, "expires_at": grant.expires_at, "revoked_at": grant.revoked_at, "downloads": grant.downloads, "first_download_at": grant.first_download_at, "last_download_at": grant.last_download_at, "files": grant.files.iter().map(|file| json!({ "name": file.name, "suite": file.suite, "root": file.root, "bytes": file.bytes, "downloads": file.downloads, "first_download_at": file.first_download_at, "last_download_at": file.last_download_at })).collect::<Vec<_>>() })
+    json!({ "id": grant.id, "tenant": grant.tenant, "link_id": grant.link_id, "upload_id": grant.upload_id, "file_index": grant.file_index, "name": grant.name, "label": grant.label, "has_password": grant.password_hash.is_some(), "created_at": grant.created_at, "expires_at": grant.expires_at, "revoked_at": grant.revoked_at, "max_downloads": grant.max_downloads, "downloads": grant.downloads, "first_download_at": grant.first_download_at, "last_download_at": grant.last_download_at, "files": grant.files.iter().map(|file| json!({ "name": file.name, "suite": file.suite, "root": file.root, "bytes": file.bytes, "downloads": file.downloads, "first_download_at": file.first_download_at, "last_download_at": file.last_download_at })).collect::<Vec<_>>() })
 }
 
 fn public_automation_token(token: &AutomationToken) -> serde_json::Value {
@@ -1857,7 +1961,6 @@ mod tests {
             file.into_body().collect().await.unwrap().to_bytes(),
             expected_bytes
         );
-
         std::fs::write(
             app.config.receive_dir.join("received.bin"),
             b"tampered fixture",
@@ -1915,6 +2018,126 @@ mod tests {
                 StatusCode::NOT_FOUND
             );
         }
+    }
+
+    #[tokio::test]
+    async fn grant_lifecycle_rotation_and_extension_are_scoped() {
+        let (_directory, app, cookie, _expected_bytes) = fixture().await;
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let created = body(response).await;
+        let old_url = created["url"].as_str().unwrap().to_owned();
+        let old_token = old_url.rsplit('/').next().unwrap().to_owned();
+        let id = created["grant"]["id"].as_str().unwrap();
+        let invalid = crate::app::router(app.clone())
+            .oneshot(
+                Request::patch(format!("/api/admin/outbound-grants/{id}"))
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"rotate":true,"extend_days":7}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let rotated = crate::app::router(app.clone())
+            .oneshot(
+                Request::patch(format!("/api/admin/outbound-grants/{id}"))
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"rotate":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rotated.status(), StatusCode::OK);
+        let rotated = body(rotated).await;
+        let new_url = rotated["url"].as_str().unwrap();
+        assert_ne!(new_url, old_url);
+        assert_eq!(
+            crate::app::router(app.clone())
+                .oneshot(
+                    Request::get(format!("/api/s/{old_token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let extended = crate::app::router(app.clone())
+            .oneshot(
+                Request::patch(format!("/api/admin/outbound-grants/{id}"))
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"extend_days":7}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(extended.status(), StatusCode::OK);
+        assert!(body(extended).await["expires_at"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn exhausted_grant_is_not_available_for_a_second_download() {
+        let (_directory, app, cookie, expected_bytes) = fixture().await;
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7,"max_downloads":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let created = body(response).await;
+        assert_eq!(created["grant"]["max_downloads"], 1);
+        let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
+        let first = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/file"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            first.into_body().collect().await.unwrap().to_bytes(),
+            expected_bytes
+        );
+        let second = crate::app::router(app)
+            .oneshot(
+                Request::get(format!("/api/s/{token}/file"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 2))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

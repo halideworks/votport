@@ -99,6 +99,7 @@ pub struct OutboundGrant {
     pub expires_at: u64,
     pub revoked_at: Option<u64>,
     pub downloads: u64,
+    pub max_downloads: Option<u64>,
     pub first_download_at: Option<u64>,
     pub last_download_at: Option<u64>,
     pub files: Vec<OutboundGrantFile>,
@@ -294,7 +295,9 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-const SCHEMA_VERSION: u64 = 12;
+const SCHEMA_VERSION: u64 = 13;
+
+pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
 const SETTINGS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS settings (
@@ -354,6 +357,7 @@ CREATE TABLE IF NOT EXISTS outbound_grants (
     expires_at INTEGER NOT NULL,
     revoked_at INTEGER,
     downloads INTEGER NOT NULL DEFAULT 0,
+    max_downloads INTEGER,
     first_download_at INTEGER,
     last_download_at INTEGER,
     files_json TEXT NOT NULL DEFAULT '[]'
@@ -387,6 +391,9 @@ CREATE TABLE IF NOT EXISTS automation_tokens (
 CREATE INDEX IF NOT EXISTS automation_tokens_tenant_created
     ON automation_tokens(tenant, created_at);
 ";
+
+const OUTBOUND_GRANTS_LIMIT_SCHEMA: &str =
+    "ALTER TABLE outbound_grants ADD COLUMN max_downloads INTEGER;";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -685,6 +692,11 @@ impl Store {
         if stored < 12 {
             transaction
                 .execute_batch(AUTOMATION_TOKENS_SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
+        }
+        if (8..13).contains(&stored) {
+            transaction
+                .execute_batch(OUTBOUND_GRANTS_LIMIT_SCHEMA)
                 .map_err(|error| format!("schema: {error}"))?;
         }
         transaction
@@ -1520,8 +1532,8 @@ impl Store {
                 "INSERT INTO outbound_grants
                  (id, token_hash, password_hash, tenant, link_id, upload_id, package_root, name, suite,
                   root, file_index, bytes_hi, bytes_lo, label, created_at, expires_at, revoked_at,
-                  downloads, first_download_at, last_download_at, files_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                  downloads, max_downloads, first_download_at, last_download_at, files_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
                 rusqlite::params![
                     grant.id,
                     grant.token_hash,
@@ -1542,6 +1554,9 @@ impl Store {
                     grant.revoked_at.map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
                     i64::try_from(grant.downloads).unwrap_or(i64::MAX),
                     grant
+                        .max_downloads
+                        .map(|count| i64::try_from(count).unwrap_or(i64::MAX)),
+                    grant
                         .first_download_at
                         .map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
                     grant
@@ -1559,7 +1574,8 @@ impl Store {
             let mut statement = connection.prepare(
                 "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
                         name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
-                        expires_at, revoked_at, downloads, first_download_at, last_download_at,
+                        expires_at, revoked_at, downloads, max_downloads, first_download_at,
+                        last_download_at,
                         files_json
                  FROM outbound_grants WHERE tenant = ?1 ORDER BY created_at, rowid",
             )?;
@@ -1577,7 +1593,8 @@ impl Store {
                 .query_row(
                     "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
                             name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
-                            expires_at, revoked_at, downloads, first_download_at, last_download_at,
+                            expires_at, revoked_at, downloads, max_downloads, first_download_at,
+                            last_download_at,
                             files_json
                      FROM outbound_grants WHERE token_hash = ?1",
                     [token_hash],
@@ -1585,6 +1602,70 @@ impl Store {
                 )
                 .optional()
         })
+    }
+
+    pub fn rotate_outbound_grant_token(
+        &self,
+        tenant: &str,
+        id: &str,
+        token_hash: &str,
+    ) -> Result<bool, String> {
+        self.with(|connection| {
+            connection
+                .execute(
+                    "UPDATE outbound_grants SET token_hash = ?3
+                     WHERE tenant = ?1 AND id = ?2 AND revoked_at IS NULL",
+                    rusqlite::params![tenant, id, token_hash],
+                )
+                .map(|changed| changed > 0)
+        })
+    }
+
+    pub fn extend_outbound_grant(
+        &self,
+        tenant: &str,
+        id: &str,
+        seconds: u64,
+        now: u64,
+    ) -> Result<Option<u64>, String> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let result = (|| {
+            let existing: Option<i64> = transaction
+                .query_row(
+                    "SELECT expires_at FROM outbound_grants
+                     WHERE tenant = ?1 AND id = ?2 AND revoked_at IS NULL",
+                    rusqlite::params![tenant, id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let Some(existing) = existing else {
+                return Ok(None);
+            };
+            let base = (existing.max(0) as u64).max(now.min(i64::MAX as u64));
+            let new_expiry = base.saturating_add(seconds).min(i64::MAX as u64);
+            let changed = transaction
+                .execute(
+                    "UPDATE outbound_grants SET expires_at = ?3
+                     WHERE tenant = ?1 AND id = ?2 AND revoked_at IS NULL",
+                    rusqlite::params![tenant, id, new_expiry as i64],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            Ok(Some(new_expiry))
+        })();
+        match result {
+            Ok(result) => {
+                transaction.commit().map_err(|error| error.to_string())?;
+                Ok(result)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn revoke_outbound_grant(&self, tenant: &str, id: &str, at: u64) -> Result<bool, String> {
@@ -1609,17 +1690,25 @@ impl Store {
             .transaction()
             .map_err(|error| error.to_string())?;
         let result = (|| {
-            let (downloads, first_download_at, files_json): (i64, Option<i64>, String) =
-                transaction
-                    .query_row(
-                        "SELECT downloads, first_download_at, files_json
+            let (downloads, max_downloads, first_download_at, files_json): (
+                i64,
+                Option<i64>,
+                Option<i64>,
+                String,
+            ) = transaction
+                .query_row(
+                    "SELECT downloads, max_downloads, first_download_at, files_json
                          FROM outbound_grants WHERE id = ?1",
-                        [id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )
-                    .optional()
-                    .map_err(|error| error.to_string())?
-                    .ok_or_else(|| "outbound grant not found".to_owned())?;
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "outbound grant not found".to_owned())?;
+            let downloads = downloads.max(0);
+            if max_downloads.is_some_and(|max| downloads >= max.max(0)) {
+                return Err(OUTBOUND_DOWNLOAD_LIMIT_REACHED.to_owned());
+            }
             let mut files: Vec<OutboundGrantFile> = serde_json::from_str(&files_json)
                 .map_err(|error| format!("parse outbound grant files: {error}"))?;
             let mut unique_indexes = indexes.to_vec();
@@ -1630,8 +1719,6 @@ impl Store {
             {
                 return Err("outbound file index out of range".to_owned());
             }
-
-            let downloads = downloads.max(0);
             let first_download = downloads == 0;
             let was_all_files_downloaded = if files.is_empty() {
                 downloads > 0
@@ -1703,6 +1790,7 @@ impl Store {
                      SELECT 1 FROM outbound_grants
                      WHERE tenant = ?1 AND link_id = ?2 AND upload_id = ?3 AND file_index = ?4
                        AND revoked_at IS NULL AND expires_at > ?5
+                       AND (max_downloads IS NULL OR downloads < max_downloads)
                  )",
                 rusqlite::params![
                     tenant,
@@ -1729,6 +1817,7 @@ impl Store {
                      SELECT 1 FROM outbound_grants
                      WHERE tenant = ?1 AND link_id = ?2
                        AND revoked_at IS NULL AND expires_at > ?3
+                       AND (max_downloads IS NULL OR downloads < max_downloads)
                  )",
                 rusqlite::params![tenant, link_id, i64::try_from(now).unwrap_or(i64::MAX),],
                 |row| row.get::<_, i64>(0),
@@ -1962,6 +2051,9 @@ fn map_outbound_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboundGrant
             .get::<_, Option<i64>>("revoked_at")?
             .and_then(|value| u64::try_from(value).ok()),
         downloads: row.get::<_, i64>("downloads")?.max(0) as u64,
+        max_downloads: row
+            .get::<_, Option<i64>>("max_downloads")?
+            .and_then(|value| u64::try_from(value).ok()),
         first_download_at: row
             .get::<_, Option<i64>>("first_download_at")?
             .and_then(|value| u64::try_from(value).ok()),
@@ -2548,6 +2640,7 @@ mod tests {
             expires_at: 20,
             revoked_at: None,
             downloads: 0,
+            max_downloads: None,
             first_download_at: None,
             last_download_at: None,
             files: Vec::new(),
@@ -2580,7 +2673,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(schema, "12");
+        assert_eq!(schema, "13");
         assert!(store
             .with(|connection| {
                 connection.query_row(
@@ -2799,6 +2892,118 @@ mod tests {
         assert!(!store
             .link_has_active_outbound_grants("acme", "other-link", 100)
             .unwrap());
+    }
+
+    #[test]
+    fn outbound_download_limit_refuses_after_one_download() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut grant = test_outbound_grant("limited", "acme", 0);
+        grant.max_downloads = Some(1);
+        store.insert_outbound_grant(grant).unwrap();
+
+        assert!(store
+            .has_active_outbound_grant("acme", "link", "upload", 0, 19)
+            .unwrap());
+        store.record_outbound_download("limited", &[0], 15).unwrap();
+        let downloaded = store
+            .outbound_grant_by_token_hash("hash-limited")
+            .unwrap()
+            .unwrap();
+        let error = store
+            .record_outbound_download("limited", &[0], 16)
+            .unwrap_err();
+        assert_eq!(error, OUTBOUND_DOWNLOAD_LIMIT_REACHED);
+        assert_eq!(
+            store
+                .outbound_grant_by_token_hash("hash-limited")
+                .unwrap()
+                .unwrap(),
+            downloaded
+        );
+        assert!(!store
+            .has_active_outbound_grant("acme", "link", "upload", 0, 19)
+            .unwrap());
+        assert!(!store
+            .link_has_active_outbound_grants("acme", "link", 19)
+            .unwrap());
+    }
+
+    #[test]
+    fn outbound_grant_token_rotation_is_tenant_scoped() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .insert_outbound_grant(test_outbound_grant("rotate", "acme", 0))
+            .unwrap();
+
+        assert!(!store
+            .rotate_outbound_grant_token("other", "rotate", "new-hash")
+            .unwrap());
+        assert!(store
+            .rotate_outbound_grant_token("acme", "rotate", "new-hash")
+            .unwrap());
+        assert!(store
+            .outbound_grant_by_token_hash("hash-rotate")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .outbound_grant_by_token_hash("new-hash")
+                .unwrap()
+                .unwrap()
+                .id,
+            "rotate"
+        );
+        store.revoke_outbound_grant("acme", "rotate", 12).unwrap();
+        assert!(!store
+            .rotate_outbound_grant_token("acme", "rotate", "other-hash")
+            .unwrap());
+    }
+
+    #[test]
+    fn outbound_grant_extension_handles_live_expired_and_scoped_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut expired = test_outbound_grant("expired", "acme", 0);
+        expired.expires_at = 10;
+        store.insert_outbound_grant(expired).unwrap();
+        store
+            .insert_outbound_grant(test_outbound_grant("live", "acme", 1))
+            .unwrap();
+        store
+            .insert_outbound_grant(test_outbound_grant("revoked", "acme", 2))
+            .unwrap();
+        store.revoke_outbound_grant("acme", "revoked", 12).unwrap();
+
+        assert_eq!(
+            store.extend_outbound_grant("acme", "live", 5, 15).unwrap(),
+            Some(25)
+        );
+        assert_eq!(
+            store
+                .extend_outbound_grant("acme", "expired", 5, 20)
+                .unwrap(),
+            Some(25)
+        );
+        assert_eq!(
+            store.extend_outbound_grant("other", "live", 5, 20).unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .extend_outbound_grant("acme", "revoked", 5, 20)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .outbound_grant_by_token_hash("hash-expired")
+                .unwrap()
+                .unwrap()
+                .expires_at,
+            25
+        );
     }
 
     #[test]
@@ -4007,9 +4212,9 @@ mod settings_tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         drop(store);
-        assert_eq!(schema_version(directory.path()), "12");
+        assert_eq!(schema_version(directory.path()), "13");
         Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "12");
+        assert_eq!(schema_version(directory.path()), "13");
     }
 
     #[test]
@@ -4031,7 +4236,7 @@ mod settings_tests {
                 .unwrap();
         }
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "12");
+        assert_eq!(schema_version(directory.path()), "13");
         assert!(store.principals().unwrap().is_empty());
         assert!(store.principal("nobody").unwrap().is_none());
     }
@@ -4053,7 +4258,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "12");
+        assert_eq!(schema_version(directory.path()), "13");
         assert!(!store.link("", "old-link").unwrap().unwrap().legal_hold);
     }
 
@@ -4086,6 +4291,7 @@ mod settings_tests {
             .with(|connection| {
                 connection.execute_batch(
                     "DROP TABLE files;
+                     DROP TABLE outbound_grants;
                      UPDATE meta SET value = '6' WHERE key = 'schema_version';",
                 )
             })
@@ -4093,7 +4299,7 @@ mod settings_tests {
         drop(store);
 
         let reopened = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "12");
+        assert_eq!(schema_version(directory.path()), "13");
         assert_eq!(reopened.tenant_received_bytes("").unwrap(), 9);
     }
 
@@ -4135,7 +4341,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "12");
+        assert_eq!(schema_version(directory.path()), "13");
         let grant = store
             .outbound_grant_by_token_hash("hash-g1")
             .unwrap()
@@ -4187,7 +4393,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "12");
+        assert_eq!(schema_version(directory.path()), "13");
         let grant = store
             .outbound_grant_by_token_hash("hash-g1")
             .unwrap()
@@ -4208,7 +4414,9 @@ mod settings_tests {
             let connection = Connection::open(directory.path().join("votport.db")).unwrap();
             connection
                 .execute_batch(
-                    "ALTER TABLE outbound_grants DROP COLUMN first_download_at;
+                    "DROP TABLE automation_tokens;
+                     ALTER TABLE outbound_grants DROP COLUMN max_downloads;
+                     ALTER TABLE outbound_grants DROP COLUMN first_download_at;
                      ALTER TABLE outbound_grants DROP COLUMN last_download_at;
                      UPDATE meta SET value = '10' WHERE key = 'schema_version';",
                 )
@@ -4217,7 +4425,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "12");
+        assert_eq!(schema_version(directory.path()), "13");
         let columns: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('outbound_grants')
@@ -4238,6 +4446,7 @@ mod settings_tests {
             connection
                 .execute_batch(
                     "DROP TABLE automation_tokens;
+                     ALTER TABLE outbound_grants DROP COLUMN max_downloads;
                      UPDATE meta SET value = '11' WHERE key = 'schema_version';",
                 )
                 .unwrap();
@@ -4245,7 +4454,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "12");
+        assert_eq!(schema_version(directory.path()), "13");
         let table_exists: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -4264,6 +4473,34 @@ mod settings_tests {
             )
             .unwrap();
         assert_eq!(index_exists, 1);
+    }
+
+    #[test]
+    fn v12_database_adds_nullable_outbound_download_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(Store::open(directory.path()).unwrap());
+        {
+            let connection = Connection::open(directory.path().join("votport.db")).unwrap();
+            connection
+                .execute_batch(
+                    "ALTER TABLE outbound_grants DROP COLUMN max_downloads;
+                     UPDATE meta SET value = '12' WHERE key = 'schema_version';",
+                )
+                .unwrap();
+        }
+
+        drop(Store::open(directory.path()).unwrap());
+        let connection = Connection::open(directory.path().join("votport.db")).unwrap();
+        assert_eq!(schema_version(directory.path()), "13");
+        let default: Option<String> = connection
+            .query_row(
+                "SELECT dflt_value FROM pragma_table_info('outbound_grants')
+                 WHERE name = 'max_downloads'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(default.is_none());
     }
 
     #[test]
