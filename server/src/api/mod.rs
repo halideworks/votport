@@ -13,7 +13,8 @@ pub use admin::{
     admin_audit_export, admin_change_password, admin_login, admin_logout, admin_session,
     backup_database, create_link, create_tenant, delete_link, delete_received_file, delete_tenant,
     delete_upload_record, get_settings, holdings, link_qr, list_links, list_tenants, put_settings,
-    revoke_principal, switch_tenant, unblock_principal, update_link, update_tenant,
+    revoke_principal, switch_tenant, test_notifications, unblock_principal, update_link,
+    update_tenant,
 };
 pub use outbound::{
     automation_share, create_automation_token, create_outbound_grant, delete_automation_token,

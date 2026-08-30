@@ -13,7 +13,13 @@ use serde_json::json;
 
 use crate::app::App;
 use crate::session::FinishReport;
-use crate::store::{OutboundDownloadResult, OutboundGrant, ResolvedSmtp};
+use crate::store::{OutboundDownloadResult, OutboundGrant, ResolvedSettings, ResolvedSmtp};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NotificationReport {
+    pub configured: u32,
+    pub delivered: u32,
+}
 
 /// Sends every configured notification for one completed upload.
 pub async fn uploaded(app: Arc<App>, label: String, report: FinishReport) {
@@ -92,6 +98,23 @@ pub async fn outbound_downloaded(
     send_all(app, title, body, payload).await;
 }
 
+/// Sends a safe test message using the currently resolved (saved plus
+/// environment) notification settings and reports channel outcomes.
+pub async fn test_saved(app: Arc<App>) -> Result<NotificationReport, String> {
+    let settings = app.store.resolved_settings(&app.config)?;
+    Ok(send_resolved(
+        &app,
+        &settings,
+        "votport: notification test".to_owned(),
+        "This is a VOTPort notification test.".to_owned(),
+        json!({
+            "event": "notification_test",
+            "message": "This is a VOTPort notification test."
+        }),
+    )
+    .await)
+}
+
 async fn send_all(app: Arc<App>, title: String, body: String, payload: serde_json::Value) {
     // Best effort like the rest of this path: a settings read failure logs
     // and sends nothing, rather than failing a transfer that already landed.
@@ -103,11 +126,25 @@ async fn send_all(app: Arc<App>, title: String, body: String, payload: serde_jso
         }
     };
 
-    if let Some(url) = &settings.notify_webhook {
-        log_failure("webhook", app.http.post(url).json(&payload).send().await);
-    }
+    let _ = send_resolved(&app, &settings, title, body, payload).await;
+}
 
+async fn send_resolved(
+    app: &App,
+    settings: &ResolvedSettings,
+    title: String,
+    body: String,
+    payload: serde_json::Value,
+) -> NotificationReport {
+    let mut report = NotificationReport::default();
+    if let Some(url) = &settings.notify_webhook {
+        report.configured += 1;
+        if log_failure("webhook", app.http.post(url).json(&payload).send().await) {
+            report.delivered += 1;
+        }
+    }
     if let Some(url) = &settings.notify_ntfy {
+        report.configured += 1;
         let mut request = app
             .http
             .post(url)
@@ -116,10 +153,13 @@ async fn send_all(app: Arc<App>, title: String, body: String, payload: serde_jso
         if let Some(token) = &settings.notify_ntfy_token {
             request = request.bearer_auth(token);
         }
-        log_failure("ntfy", request.send().await);
+        if log_failure("ntfy", request.send().await) {
+            report.delivered += 1;
+        }
     }
 
     if let Some((token, user)) = &settings.notify_pushover {
+        report.configured += 1;
         let request = app
             .http
             .post("https://api.pushover.net/1/messages.json")
@@ -129,27 +169,40 @@ async fn send_all(app: Arc<App>, title: String, body: String, payload: serde_jso
                 ("title", title.as_str()),
                 ("message", body.as_str()),
             ]);
-        log_failure("pushover", request.send().await);
+        if log_failure("pushover", request.send().await) {
+            report.delivered += 1;
+        }
     }
 
     if let Some(smtp) = &settings.smtp {
-        log_smtp_failure(send_smtp(smtp, &title, &body).await);
+        report.configured += 1;
+        if log_smtp_failure(send_smtp(smtp, &title, &body).await) {
+            report.delivered += 1;
+        }
     }
+    report
 }
 
-fn log_failure(target: &str, result: Result<reqwest::Response, reqwest::Error>) {
+fn log_failure(target: &str, result: Result<reqwest::Response, reqwest::Error>) -> bool {
     match result {
         Ok(response) if !response.status().is_success() => {
             tracing::warn!(target, status = %response.status(), "notification failed");
+            false
         }
-        Err(error) => tracing::warn!(target, "notification failed: {error}"),
-        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(target, "notification failed: {error}");
+            false
+        }
+        Ok(_) => true,
     }
 }
 
-fn log_smtp_failure<E: std::fmt::Display>(result: Result<(), E>) {
+fn log_smtp_failure<E: std::fmt::Display>(result: Result<(), E>) -> bool {
     if let Err(error) = result {
         tracing::warn!(target = "smtp", "notification failed: {error}");
+        false
+    } else {
+        true
     }
 }
 
@@ -321,6 +374,20 @@ mod tests {
         assert_eq!(payload["download_starts"], 1);
         assert_eq!(payload["file_count"], 2);
         assert_eq!(payload["total_bytes"], 30);
+        assert_no_secrets(&request);
+        thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn saved_notification_test_reports_delivery_without_secrets() {
+        let (application, _directory, rx, thread) = webhook_app();
+        let report = test_saved(application).await.unwrap();
+        assert_eq!(report.configured, 1);
+        assert_eq!(report.delivered, 1);
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let payload = request_json(&request);
+        assert_eq!(payload["event"], "notification_test");
+        assert_eq!(payload["message"], "This is a VOTPort notification test.");
         assert_no_secrets(&request);
         thread.join().unwrap();
     }

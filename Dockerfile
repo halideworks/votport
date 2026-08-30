@@ -55,5 +55,5 @@ USER 1000:1000
 EXPOSE 8080
 VOLUME ["/data", "/received", "/outbound"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -sf http://127.0.0.1:8080/ -o /dev/null || exit 1
+    CMD curl -sf http://127.0.0.1:8080/healthz -o /dev/null || exit 1
 CMD ["/app/votport"]

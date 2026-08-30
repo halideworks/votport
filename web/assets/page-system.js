@@ -25,8 +25,30 @@ function gibValue(bytes) {
 
 function setNotifyActions(enabled) {
   $('notify-save').disabled = !enabled;
+  $('notify-test').disabled = !enabled;
   for (const button of $('notify-form').querySelectorAll('[data-clear]')) {
     button.disabled = !enabled;
+  }
+}
+
+async function testNotifications() {
+  const button = $('notify-test');
+  const note = $('notify-test-note');
+  const error = $('notify-test-error');
+  button.disabled = true;
+  button.textContent = 'Sending…';
+  note.textContent = 'Testing currently active notification settings…';
+  error.hidden = true;
+  try {
+    const report = await api('/api/admin/notifications/test', { method: 'POST' });
+    note.textContent = `Delivered ${report.delivered} of ${report.configured} configured notification channels.`;
+  } catch (requestError) {
+    note.textContent = 'Currently active notification test failed.';
+    error.textContent = requestError.message;
+    error.hidden = false;
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Send test';
   }
 }
 
@@ -165,6 +187,8 @@ $('notify-form').addEventListener('submit', async (event) => {
   }
   await saveSettings(event.currentTarget, body);
 });
+
+$('notify-test').addEventListener('click', () => testNotifications());
 
 $('smtp-form').addEventListener('submit', async (event) => {
   event.preventDefault();

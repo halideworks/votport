@@ -761,6 +761,51 @@ pub async fn get_settings(
     Ok(Json(settings_json(&app)?))
 }
 
+pub async fn test_notifications(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let identity = require_platform_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
+    let report = crate::notify::test_saved(Arc::clone(&app))
+        .await
+        .map_err(ApiError::internal)?;
+    app.store.audit(
+        &identity.tenant,
+        &identity.subject,
+        "notification_test",
+        "",
+        &json!({ "configured": report.configured, "delivered": report.delivered }),
+    );
+    if report.configured == 0 {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "no notification channels are configured",
+        ));
+    }
+    let status = if report.delivered == report.configured {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    let error = (status != StatusCode::OK).then(|| {
+        format!(
+            "Delivered {} of {} configured notification channels",
+            report.delivered, report.configured
+        )
+    });
+    Ok((
+        status,
+        Json(json!({
+            "error": error,
+            "configured": report.configured,
+            "delivered": report.delivered,
+            "failed": report.configured.saturating_sub(report.delivered),
+        })),
+    )
+        .into_response())
+}
+
 fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
     let overlay = app
         .store
@@ -1295,6 +1340,17 @@ pub async fn create_link(
     }
     let dest = paths::admit_dest(&request.dest)
         .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    if let Some(max_bytes) = request.max_bytes {
+        if max_bytes == 0 || max_bytes > app.config.max_upload_bytes {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "max_bytes must be between 1 and {} bytes",
+                    app.config.max_upload_bytes
+                ),
+            ));
+        }
+    }
     let password_hash = match request.password.as_deref().filter(|p| !p.is_empty()) {
         Some(password) => Some(auth::hash_password(password).map_err(ApiError::internal)?),
         None => None,
@@ -1343,7 +1399,7 @@ pub async fn create_link(
         expires_at: request
             .expires_days
             .map(|days| now_unix() + u64::from(days) * 86_400),
-        max_bytes: request.max_bytes.filter(|&bytes| bytes > 0),
+        max_bytes: request.max_bytes,
         active: true,
         legal_hold: false,
         uploads: Vec::new(),
@@ -4311,5 +4367,122 @@ mod principals_api_tests {
             .unwrap();
         assert!(!row.blocked);
         assert_eq!(row.credential_version, 1);
+    }
+}
+
+#[cfg(test)]
+mod notification_and_limit_tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+
+    use crate::api::testing;
+    use crate::app;
+
+    fn admin_cookie(application: &App) -> String {
+        let token = auth::issue_admin_token(
+            &application.secret,
+            &auth::AdminIdentity::local_admin(),
+            &application.config.admin_token_tag,
+        );
+        format!("votport_admin={token}")
+    }
+
+    async fn create_link(application: Arc<App>, max_bytes: Option<u64>) -> StatusCode {
+        let cookie = admin_cookie(&application);
+        app::router(application)
+            .oneshot(
+                Request::post("/api/admin/links")
+                    .header("cookie", cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "label": "test", "max_bytes": max_bytes }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn explicit_link_max_bytes_must_be_within_configured_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        assert_eq!(
+            create_link(application.clone(), Some(0)).await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            create_link(
+                application.clone(),
+                Some(application.config.max_upload_bytes.saturating_add(1)),
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(create_link(application.clone(), None).await, StatusCode::OK);
+        assert_eq!(
+            create_link(application.clone(), Some(123)).await,
+            StatusCode::OK
+        );
+        assert!(application
+            .store
+            .links("")
+            .unwrap()
+            .iter()
+            .any(|link| link.max_bytes == Some(123)));
+        assert_eq!(application.store.links("").unwrap()[0].max_bytes, None);
+    }
+
+    #[tokio::test]
+    async fn notification_test_requires_a_saved_channel() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::post("/api/admin/notifications/test")
+                    .header("cookie", admin_cookie(&application))
+                    .header("x-votport", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn notification_test_reports_saved_channel_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut application = testing::build(directory.path());
+        Arc::get_mut(&mut application)
+            .unwrap()
+            .config
+            .notify_webhook = Some("http://127.0.0.1:9/notification-test".to_owned());
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::post("/api/admin/notifications/test")
+                    .header("cookie", admin_cookie(&application))
+                    .header("x-votport", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["configured"], 1);
+        assert_eq!(body["delivered"], 0);
+        assert_eq!(
+            body["error"],
+            "Delivered 0 of 1 configured notification channels"
+        );
     }
 }
