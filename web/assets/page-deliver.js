@@ -2,14 +2,7 @@
 // VOTPORT PROPRIETARY LICENSE.
 
 import {
-  buildLibraryTree,
-  filterLibraryFiles,
-  libraryFilesIn,
-  libraryTreeNode,
   parseLibraryPath,
-  projectDirectoryPrefixes,
-  selectedLibraryStats,
-  toggleFolderSelection,
 } from '/assets/library-paths.js';
 import {
   alertModal,
@@ -323,10 +316,13 @@ $('outbound-grants-load-more').addEventListener('click', () => refreshGrants(fal
 
 const MAX_LIBRARY_SELECTION = 64;
 const MAX_LIBRARY_SEARCH_RESULTS = 200;
-const selectedLibraryPaths = new Set();
+const selectedLibraryPaths = new Map();
 let libraryFiles = [];
-let libraryTree = buildLibraryTree([]);
+let libraryDirectories = [];
 let libraryDirectory = '';
+let libraryTruncated = false;
+let libraryRequestGeneration = 0;
+let librarySearchTimer;
 
 function libraryPath(file) {
   const relative = file.webkitRelativePath || file.name;
@@ -390,8 +386,8 @@ async function uploadLibraryFile(file, path, progress = () => {}) {
   }
 }
 
-function updateProjectSuggestions(files) {
-  const options = projectDirectoryPrefixes(files);
+function updateProjectSuggestions(directories) {
+  const options = [...new Set(directories)].sort();
   $('deliver-project-options').replaceChildren(
     ...options.map((value) => {
       const option = document.createElement('option');
@@ -402,39 +398,35 @@ function updateProjectSuggestions(files) {
 }
 
 function updateLibrarySelectionStatus() {
-  const { count, bytes } = selectedLibraryStats(libraryFiles, selectedLibraryPaths);
+  const count = selectedLibraryPaths.size;
+  const bytes = [...selectedLibraryPaths.values()].reduce((total, value) => total + value, 0);
   $('library-selection-status').textContent = `${count} file${count === 1 ? '' : 's'} selected · ${formatBytes(bytes)}`;
 }
 
 function showLibrarySelectionError() {
   $('library-selection-error').textContent =
-    `Select at most ${MAX_LIBRARY_SELECTION} files. Deselect some files before selecting this folder.`;
+    `Select at most ${MAX_LIBRARY_SELECTION} files.`;
   $('library-selection-error').hidden = false;
   updateLibrarySelectionStatus();
 }
 
-function applyLibrarySelection(next) {
-  selectedLibraryPaths.clear();
-  for (const path of next) selectedLibraryPaths.add(path);
-  $('library-selection-error').hidden = true;
-  updateLibrarySelectionStatus();
-}
-
-function selectionCheckbox(paths) {
+function selectionCheckbox(file) {
   const checkbox = document.createElement('input');
   checkbox.type = 'checkbox';
-  const selected = paths.filter((path) => selectedLibraryPaths.has(path)).length;
-  checkbox.checked = paths.length > 0 && selected === paths.length;
-  checkbox.indeterminate = selected > 0 && selected < paths.length;
+  checkbox.checked = selectedLibraryPaths.has(file.path);
   checkbox.addEventListener('change', () => {
-    const next = toggleFolderSelection(selectedLibraryPaths, paths, MAX_LIBRARY_SELECTION);
-    if (!next) {
-      renderLibraryView();
-      showLibrarySelectionError();
-      return;
+    if (checkbox.checked) {
+      if (selectedLibraryPaths.size >= MAX_LIBRARY_SELECTION) {
+        checkbox.checked = false;
+        showLibrarySelectionError();
+        return;
+      }
+      selectedLibraryPaths.set(file.path, Number(file.bytes) || 0);
+    } else {
+      selectedLibraryPaths.delete(file.path);
     }
-    applyLibrarySelection(next);
-    renderLibraryView();
+    $('library-selection-error').hidden = true;
+    updateLibrarySelectionStatus();
   });
   return checkbox;
 }
@@ -444,7 +436,7 @@ function renderLibraryBreadcrumbs() {
   breadcrumbs.replaceChildren();
   const root = button('Library', 'tiny ghost', async () => {
     libraryDirectory = '';
-    renderLibraryView();
+    await refreshLibrary();
   });
   if (!libraryDirectory) root.setAttribute('aria-current', 'page');
   breadcrumbs.append(root);
@@ -457,7 +449,7 @@ function renderLibraryBreadcrumbs() {
     const crumbPath = path;
     const crumb = button(part, 'tiny ghost', async () => {
       libraryDirectory = crumbPath;
-      renderLibraryView();
+      await refreshLibrary();
     });
     if (crumbPath === libraryDirectory) crumb.setAttribute('aria-current', 'page');
     breadcrumbs.append(crumb);
@@ -467,7 +459,7 @@ function renderLibraryBreadcrumbs() {
 function renderLibraryFile(file, container, showPath = false) {
   const label = document.createElement('label');
   label.className = 'library-file';
-  const checkbox = selectionCheckbox([file.path]);
+  const checkbox = selectionCheckbox(file);
   checkbox.value = file.path;
   const name = document.createElement('span');
   name.className = 'mono';
@@ -499,20 +491,16 @@ function renderLibraryFile(file, container, showPath = false) {
   container.append(label);
 }
 
-function renderLibraryFolder(folder, container) {
-  const files = libraryFilesIn(folder);
+function renderLibraryDirectory(directory, container) {
+  const name = directory.slice(directory.lastIndexOf('/') + 1);
+  const open = button(name, 'tiny ghost', async () => {
+    libraryDirectory = directory;
+    await refreshLibrary();
+  });
+  open.setAttribute('aria-label', `Open folder ${name}`);
   const row = document.createElement('div');
   row.className = 'library-file library-folder';
-  const checkbox = selectionCheckbox(files.map((file) => file.path));
-  const open = button(folder.name, 'tiny ghost', async () => {
-    libraryDirectory = folder.path;
-    renderLibraryView();
-  });
-  open.setAttribute('aria-label', `Open folder ${folder.name}`);
-  const count = document.createElement('span');
-  count.className = 'muted';
-  count.textContent = `${files.length} file${files.length === 1 ? '' : 's'}`;
-  row.append(checkbox, open, count);
+  row.append(open);
   container.append(row);
 }
 
@@ -520,42 +508,32 @@ function renderLibraryView() {
   renderLibraryBreadcrumbs();
   const container = $('library-files');
   container.replaceChildren();
-  const query = $('library-search').value;
-  if (query.trim()) {
-    const matches = filterLibraryFiles(libraryFiles, query).sort((left, right) =>
-      left.path.localeCompare(right.path),
-    );
-    if (!matches.length) {
-      const empty = document.createElement('p');
-      empty.className = 'muted';
-      empty.textContent = 'No matching library files.';
-      container.append(empty);
-      return;
-    }
-    for (const file of matches.slice(0, MAX_LIBRARY_SEARCH_RESULTS)) {
-      renderLibraryFile(file, container, true);
-    }
-    if (matches.length > MAX_LIBRARY_SEARCH_RESULTS) {
+  const query = $('library-search').value.trim();
+  if (query) {
+    for (const file of libraryFiles) renderLibraryFile(file, container, true);
+    if (libraryTruncated) {
       const note = document.createElement('p');
       note.className = 'muted';
       note.textContent = `Showing first ${MAX_LIBRARY_SEARCH_RESULTS}; refine search.`;
       container.append(note);
     }
+    if (!libraryFiles.length) {
+      const empty = document.createElement('p');
+      empty.className = 'muted';
+      empty.textContent = 'No matching library files.';
+      container.append(empty);
+    }
     return;
   }
-  const folder = libraryTreeNode(libraryTree, libraryDirectory);
-  if (!folder) {
-    libraryDirectory = '';
-    renderLibraryView();
-    return;
+  for (const directory of libraryDirectories) renderLibraryDirectory(directory, container);
+  for (const file of libraryFiles) renderLibraryFile(file, container);
+  if (libraryTruncated) {
+    const note = document.createElement('p');
+    note.className = 'muted';
+    note.textContent = 'Showing the first 1000 entries; refine with search.';
+    container.append(note);
   }
-  const folders = [...folder.children.values()].sort((left, right) =>
-    left.name.localeCompare(right.name),
-  );
-  const files = [...folder.files].sort((left, right) => left.path.localeCompare(right.path));
-  for (const child of folders) renderLibraryFolder(child, container);
-  for (const file of files) renderLibraryFile(file, container);
-  if (!folders.length && !files.length) {
+  if (!libraryDirectories.length && !libraryFiles.length) {
     const empty = document.createElement('p');
     empty.className = 'muted';
     empty.textContent = 'No library files.';
@@ -563,24 +541,29 @@ function renderLibraryView() {
   }
 }
 
-function renderLibrary(files) {
-  const safeFiles = files.filter((file) => parseLibraryPath(file.path));
-  libraryFiles = safeFiles;
-  libraryTree = buildLibraryTree(safeFiles);
-  const available = new Set(safeFiles.map((file) => file.path));
-  for (const path of selectedLibraryPaths) {
-    if (!available.has(path)) selectedLibraryPaths.delete(path);
+function renderLibrary(response) {
+  libraryFiles = (response.files || []).filter((file) => parseLibraryPath(file.path));
+  libraryDirectories = (response.directories || []).filter((path) => parseLibraryPath(path));
+  libraryTruncated = Boolean(response.truncated);
+  if (!libraryDirectory && !$('library-search').value.trim()) {
+    updateProjectSuggestions(libraryDirectories);
   }
-  updateProjectSuggestions(safeFiles);
   updateLibrarySelectionStatus();
   renderLibraryView();
 }
 
 async function refreshLibrary() {
+  const generation = ++libraryRequestGeneration;
+  const query = $('library-search').value.trim();
+  const params = query
+    ? `q=${encodeURIComponent(query)}`
+    : `directory=${encodeURIComponent(libraryDirectory)}`;
   try {
-    const { files } = await api('/api/admin/outbound-files');
-    renderLibrary(files || []);
+    const response = await api(`/api/admin/outbound-files?${params}`);
+    if (generation !== libraryRequestGeneration) return;
+    renderLibrary(response);
   } catch (error) {
+    if (generation !== libraryRequestGeneration) return;
     const message = document.createElement('p');
     message.className = 'error';
     message.textContent = error.message;
@@ -630,7 +613,11 @@ $('automation-token-form').addEventListener('submit', async (event) => {
 });
 
 $('library-refresh').addEventListener('click', () => refreshLibrary());
-$('library-search').addEventListener('input', () => renderLibraryView());
+$('library-search').addEventListener('input', () => {
+  libraryRequestGeneration += 1;
+  clearTimeout(librarySearchTimer);
+  librarySearchTimer = setTimeout(() => refreshLibrary(), 200);
+});
 
 $('deliver-upload-form').addEventListener('submit', (event) => event.preventDefault());
 $('library-input').addEventListener('change', async (event) => {
@@ -663,7 +650,7 @@ $('library-input').addEventListener('change', async (event) => {
 $('deliver-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   $('deliver-error').hidden = true;
-  const paths = [...selectedLibraryPaths];
+  const paths = [...selectedLibraryPaths.keys()];
   if (paths.length > MAX_LIBRARY_SELECTION) {
     $('deliver-error').textContent = `Select at most ${MAX_LIBRARY_SELECTION} files.`;
     $('deliver-error').hidden = false;
