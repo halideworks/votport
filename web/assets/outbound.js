@@ -10,10 +10,18 @@ function when(seconds) {
 }
 
 function showError(message) {
+  $('download-gate').hidden = true;
   $('download-content').hidden = true;
   $('download-error-message').textContent = message;
   $('download-error').hidden = false;
   $('status').textContent = 'Download unavailable';
+}
+
+function showPasswordGate() {
+  $('download-content').hidden = true;
+  $('download-gate').hidden = false;
+  $('status').textContent = 'Password required';
+  $('download-password').focus();
 }
 
 function downloadButton(text, url, classes) {
@@ -38,6 +46,10 @@ async function loadMetadata() {
 
   let body = null;
   try { body = await response.json(); } catch { /* non-JSON error page */ }
+  if ((body?.needs_password || body?.has_password) && !body.authorized) {
+    showPasswordGate();
+    return;
+  }
   if (!response.ok) {
     showError(
       response.status === 404
@@ -74,6 +86,8 @@ async function loadMetadata() {
     return;
   }
 
+  $('download-gate').hidden = true;
+  $('object').replaceChildren();
   $('title').textContent = body.label || 'Verified download';
   $('status').textContent = 'The server verifies the file against this identity before download.';
   for (const file of files) {
@@ -94,5 +108,32 @@ async function loadMetadata() {
   $('receipt-key').textContent = body.receipt_key;
   $('download-content').hidden = false;
 }
+
+$('download-password-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const error = $('download-password-error');
+  const submit = $('download-password-submit');
+  error.hidden = true;
+  submit.disabled = true;
+  try {
+    const response = await fetch(`/api/s/${encodeURIComponent(token)}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ password: $('download-password').value }),
+    });
+    let body = null;
+    try { body = await response.json(); } catch { /* non-JSON error page */ }
+    if (!response.ok) throw new Error(body?.error || `verification failed (${response.status})`);
+    $('download-password').value = '';
+    await loadMetadata();
+  } catch (verificationError) {
+    error.textContent = verificationError.message;
+    error.hidden = false;
+    $('download-password').focus();
+  } finally {
+    submit.disabled = false;
+  }
+});
 
 loadMetadata();

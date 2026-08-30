@@ -30,6 +30,7 @@ use crate::store::{now_unix, OutboundGrant, OutboundGrantFile};
 const MAX_ACTIVE: usize = 8;
 const CHUNK: usize = 1024 * 1024;
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
+const MAX_PASSWORD_BYTES: usize = 256;
 
 #[derive(Deserialize)]
 pub struct OutboundPathQuery {
@@ -246,6 +247,8 @@ pub struct CreateOutboundRequest {
     paths: Option<Vec<String>>,
     #[serde(default)]
     label: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
     #[serde(default = "default_expiry")]
     expires_days: u64,
 }
@@ -281,6 +284,7 @@ pub async fn create_outbound_grant(
             "expires_days must be 1..=30",
         ));
     }
+    let password_hash = hash_optional_password(request.password.as_deref())?;
     if let Some(paths) = request.paths.as_deref() {
         return create_library_grant(
             &app,
@@ -288,6 +292,7 @@ pub async fn create_outbound_grant(
             &identity,
             paths,
             request.label,
+            password_hash,
             request.expires_days,
         )
         .await;
@@ -353,6 +358,7 @@ pub async fn create_outbound_grant(
         file_index,
         bytes: file.bytes,
         label,
+        password_hash,
         token_hash,
         created_at,
         expires_at: created_at.saturating_add(request.expires_days * 86_400),
@@ -384,6 +390,7 @@ async fn create_library_grant(
     identity: &auth::AdminIdentity,
     requested: &[String],
     label: Option<String>,
+    password_hash: Option<String>,
     expires_days: u64,
 ) -> ApiResult<Response> {
     if requested.is_empty() || requested.len() > 64 {
@@ -471,6 +478,7 @@ async fn create_library_grant(
         file_index: 0,
         bytes: first.bytes,
         label,
+        password_hash,
         created_at,
         expires_at: created_at.saturating_add(expires_days * 86_400),
         revoked_at: None,
@@ -575,8 +583,17 @@ pub async fn delete_outbound_grant(
 pub async fn outbound_metadata(
     State(app): State<Arc<App>>,
     AxumPath(token): AxumPath<String>,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
     let grant = active_grant(&app, &token)?;
+    let authorized = grant_authorized(&app, &grant, &headers);
+    if grant.password_hash.is_some() && !authorized {
+        return Ok((
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({ "has_password": true, "authorized": false })),
+        )
+            .into_response());
+    }
     let files = if grant.files.is_empty() {
         vec![json!({
             "name": grant.name,
@@ -606,6 +623,8 @@ pub async fn outbound_metadata(
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(json!({
+            "has_password": grant.password_hash.is_some(),
+            "authorized": authorized,
             "label": grant.label,
             "name": grant.name,
             "suite": grant.suite,
@@ -624,18 +643,53 @@ pub async fn outbound_metadata(
         .into_response())
 }
 
+#[derive(Deserialize)]
+pub struct VerifyOutboundRequest {
+    password: Option<String>,
+}
+
+pub async fn verify_outbound_password(
+    State(app): State<Arc<App>>,
+    AxumPath(token): AxumPath<String>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<VerifyOutboundRequest>,
+) -> ApiResult<Response> {
+    let grant = active_grant(&app, &token)?;
+    let ip = super::client_ip(&headers, &peer, &app.config.trusted_proxies);
+    super::upload::check_password(
+        &app,
+        grant.password_hash.as_deref(),
+        request.password.as_deref(),
+        &ip,
+        "wrong outbound grant password",
+    )
+    .await?;
+    let phc = grant.password_hash.as_deref().unwrap_or_default();
+    let value = auth::issue_link_token(&app.secret, &grant.id, phc);
+    let cookie = format!(
+        "{}={value}; Path=/api/s/{token}; HttpOnly; SameSite=Lax; Max-Age=2592000{}",
+        grant_cookie_name(&grant.id),
+        super::cookie_attributes(&app)
+    );
+    Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
+}
+
 pub async fn outbound_receipt(
     State(app): State<Arc<App>>,
     AxumPath(token): AxumPath<String>,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
-    outbound_receipt_indexed(State(app), AxumPath((token, 0))).await
+    outbound_receipt_indexed(State(app), AxumPath((token, 0)), headers).await
 }
 
 pub async fn outbound_receipt_indexed(
     State(app): State<Arc<App>>,
     AxumPath((token, index)): AxumPath<(String, usize)>,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
     let grant = active_grant(&app, &token)?;
+    require_grant_access(&app, &grant, &headers)?;
     let source = source_info_indexed(&app, &grant, index)?;
     let bytes = if let Some(bytes) = source.receipt.clone() {
         bytes
@@ -692,6 +746,7 @@ async fn outbound_file_inner(
     index: usize,
 ) -> ApiResult<Response> {
     let grant = active_grant(&app, &token)?;
+    require_grant_access(&app, &grant, &headers)?;
     let ip = super::client_ip(&headers, &peer, &app.config.trusted_proxies);
     if !app.outbound_rate.allow(&ip) {
         return Err(ApiError::new(
@@ -750,6 +805,47 @@ fn active_grant(app: &App, token: &str) -> ApiResult<OutboundGrant> {
         return Err(ApiError::not_found());
     }
     Ok(grant)
+}
+
+fn grant_cookie_name(grant_id: &str) -> String {
+    format!("votport_s_{grant_id}")
+}
+
+fn grant_authorized(app: &App, grant: &OutboundGrant, headers: &HeaderMap) -> bool {
+    grant.password_hash.is_none()
+        || super::upload::cookie_authorized(
+            app,
+            &grant.id,
+            grant.password_hash.as_deref(),
+            &grant_cookie_name(&grant.id),
+            headers,
+        )
+}
+
+fn require_grant_access(app: &App, grant: &OutboundGrant, headers: &HeaderMap) -> ApiResult<()> {
+    if grant_authorized(app, grant, headers) {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "outbound grant password required",
+        ))
+    }
+}
+
+fn hash_optional_password(password: Option<&str>) -> ApiResult<Option<String>> {
+    let Some(password) = password.filter(|password| !password.is_empty()) else {
+        return Ok(None);
+    };
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "password must be at most 256 bytes",
+        ));
+    }
+    auth::hash_password(password)
+        .map(Some)
+        .map_err(ApiError::internal)
 }
 
 struct Source {
@@ -987,7 +1083,7 @@ fn safe_filename(name: &str) -> String {
     value.chars().take(180).collect()
 }
 fn public_grant(grant: OutboundGrant) -> serde_json::Value {
-    json!({ "id": grant.id, "tenant": grant.tenant, "link_id": grant.link_id, "upload_id": grant.upload_id, "file_index": grant.file_index, "name": grant.name, "label": grant.label, "created_at": grant.created_at, "expires_at": grant.expires_at, "revoked_at": grant.revoked_at, "downloads": grant.downloads, "files": grant.files.iter().map(|file| json!({ "name": file.name, "suite": file.suite, "root": file.root, "bytes": file.bytes })).collect::<Vec<_>>() })
+    json!({ "id": grant.id, "tenant": grant.tenant, "link_id": grant.link_id, "upload_id": grant.upload_id, "file_index": grant.file_index, "name": grant.name, "label": grant.label, "has_password": grant.password_hash.is_some(), "created_at": grant.created_at, "expires_at": grant.expires_at, "revoked_at": grant.revoked_at, "downloads": grant.downloads, "files": grant.files.iter().map(|file| json!({ "name": file.name, "suite": file.suite, "root": file.root, "bytes": file.bytes })).collect::<Vec<_>>() })
 }
 
 struct ActiveDownload {
@@ -1314,6 +1410,130 @@ mod tests {
                 StatusCode::NOT_FOUND
             );
         }
+    }
+
+    #[tokio::test]
+    async fn password_grant_gates_metadata_file_and_receipt() {
+        let (_directory, app, cookie, expected_bytes) = fixture().await;
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"link_id":"link","upload_id":"upload","file_index":0,"password":"correct horse","expires_days":7}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = body(response).await;
+        assert_eq!(created["grant"]["has_password"], true);
+        assert!(created["grant"].get("password_hash").is_none());
+        let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
+
+        let metadata = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metadata.status(), StatusCode::OK);
+        let metadata = body(metadata).await;
+        assert_eq!(
+            metadata,
+            json!({ "has_password": true, "authorized": false })
+        );
+
+        let peer = ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1)));
+        for suffix in ["/file", "/receipt"] {
+            let mut request = Request::get(format!("/api/s/{token}{suffix}"));
+            if suffix == "/file" {
+                request = request.extension(peer);
+            }
+            assert_eq!(
+                crate::app::router(app.clone())
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        let wrong = crate::app::router(app.clone())
+            .oneshot(
+                Request::post(format!("/api/s/{token}/verify"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 2))))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"password":"wrong"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+        let verified = crate::app::router(app.clone())
+            .oneshot(
+                Request::post(format!("/api/s/{token}/verify"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 2))))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"password":"correct horse"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(verified.status(), StatusCode::OK);
+        let set_cookie = verified.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(set_cookie.starts_with("votport_s_"));
+        assert!(set_cookie.contains(&format!("; Path=/api/s/{token}; HttpOnly; SameSite=Lax;")));
+        let grant_cookie = set_cookie.split(';').next().unwrap().to_owned();
+
+        let metadata = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}"))
+                    .header("cookie", &grant_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metadata.status(), StatusCode::OK);
+        assert_eq!(body(metadata).await["label"], "received.bin");
+
+        let file = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/file"))
+                    .header("cookie", &grant_cookie)
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 3))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(file.status(), StatusCode::OK);
+        assert_eq!(
+            file.into_body().collect().await.unwrap().to_bytes(),
+            expected_bytes
+        );
+
+        let receipt = crate::app::router(app)
+            .oneshot(
+                Request::get(format!("/api/s/{token}/receipt"))
+                    .header("cookie", &grant_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.status(), StatusCode::OK);
     }
 
     #[tokio::test]

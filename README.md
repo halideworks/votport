@@ -289,7 +289,7 @@ cargo run           # needs VOTPORT_ADMIN_PASSWORD, VOTPORT_DATA_DIR, etc.
 # browser JS
 node --check ../web/assets/*.js
 npx --yes eslint@9.18.0 ../web/assets/*.js
-node --test ../scripts/login-disclosure.test.mjs
+node --test ../scripts/*.test.mjs
 
 # browser wasm bundle (needs wasm32 target + wasm-bindgen-cli 0.2.126)
 scripts/build-wasm.sh /path/to/VOT-checkout
