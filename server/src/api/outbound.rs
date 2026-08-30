@@ -1825,7 +1825,71 @@ pub async fn outbound_metadata(
     State(app): State<Arc<App>>,
     AxumPath(token): AxumPath<String>,
     headers: HeaderMap,
+    Query(query): Query<OutboundMetadataQuery>,
 ) -> ApiResult<Response> {
+    let paging = outbound_metadata_paging(query)?;
+    if let Some((offset, limit)) = paging {
+        if !valid_token(&token) {
+            return Err(ApiError::not_found());
+        }
+        let page = app
+            .store
+            .outbound_grant_files_page_by_token_hash(&hash_token(&token), offset, limit)
+            .map_err(super::store_unavailable)?
+            .ok_or_else(ApiError::not_found)?;
+        let grant = page.grant;
+        let files_total = page.file_count;
+        if grant.revoked_at.is_some()
+            || grant.expires_at <= now_unix()
+            || grant
+                .max_downloads
+                .is_some_and(|max| grant.downloads >= max)
+        {
+            return Err(ApiError::not_found());
+        }
+        let _operation = begin_outbound_operation(&app, &grant.tenant)?;
+        let authorized = grant_authorized(&app, &grant, &headers);
+        if grant.password_hash.is_some() && !authorized {
+            return Ok((
+                [(header::CACHE_CONTROL, "no-store")],
+                Json(json!({ "has_password": true, "authorized": false })),
+            )
+                .into_response());
+        }
+        let files = page
+            .files
+            .into_iter()
+            .map(|(index, file)| outbound_metadata_file(&token, index, &file))
+            .collect::<Vec<_>>();
+        let has_more = offset.saturating_add(files.len()) < files_total;
+        return Ok((
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({
+                "has_password": grant.password_hash.is_some(),
+                "authorized": authorized,
+                "label": grant.label,
+                "name": grant.name,
+                "suite": grant.suite,
+                "root": grant.root,
+                "bytes": grant.bytes,
+                "length": grant.bytes,
+                "package_root": grant.package_root,
+                "expires_at": grant.expires_at,
+                "downloads": grant.downloads,
+                "max_downloads": grant.max_downloads,
+                "receipt_key": app.signer.public_hex,
+                "receipt_url": format!("/api/s/{token}/receipt"),
+                "download_url": format!("/api/s/{token}/file"),
+                "bundle_url": format!("/api/s/{token}/bundle"),
+                "files": files,
+                "files_total": files_total,
+                "offset": offset,
+                "limit": limit,
+                "has_more": has_more,
+            })),
+        )
+            .into_response());
+    }
     let grant = active_grant(&app, &token)?;
     let _operation = begin_outbound_operation(&app, &grant.tenant)?;
     let authorized = grant_authorized(&app, &grant, &headers);
@@ -1885,6 +1949,70 @@ pub async fn outbound_metadata(
         })),
     )
         .into_response())
+}
+
+#[derive(Deserialize)]
+pub struct OutboundMetadataQuery {
+    offset: Option<String>,
+    limit: Option<String>,
+}
+
+fn outbound_metadata_paging(query: OutboundMetadataQuery) -> ApiResult<Option<(usize, usize)>> {
+    if query.offset.is_none() && query.limit.is_none() {
+        return Ok(None);
+    }
+    let limit = query
+        .limit
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "limit must be an integer between 1 and 500",
+            )
+        })?
+        .unwrap_or(100usize);
+    if !(1..=500).contains(&limit) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "limit must be between 1 and 500",
+        ));
+    }
+    let offset = query
+        .offset
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "offset must be a non-negative integer",
+            )
+        })?
+        .unwrap_or(0usize);
+    if i64::try_from(offset).is_err() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "offset is too large",
+        ));
+    }
+    Ok(Some((offset, limit)))
+}
+
+fn outbound_metadata_file(
+    token: &str,
+    index: usize,
+    file: &OutboundGrantFile,
+) -> serde_json::Value {
+    json!({
+        "name": file.name,
+        "suite": file.suite,
+        "root": file.root,
+        "bytes": file.bytes,
+        "receipt_url": format!("/api/s/{token}/receipts/{index}"),
+        "download_url": format!("/api/s/{token}/files/{index}"),
+    })
 }
 
 #[derive(Deserialize)]
@@ -3126,6 +3254,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn outbound_metadata_paging_defaults_and_rejects_invalid_bounds() {
+        assert_eq!(
+            outbound_metadata_paging(OutboundMetadataQuery {
+                limit: None,
+                offset: None,
+            })
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            outbound_metadata_paging(OutboundMetadataQuery {
+                limit: None,
+                offset: Some("4".to_owned()),
+            })
+            .unwrap(),
+            Some((4, 100))
+        );
+        for limit in ["0", "501", "nope"] {
+            assert_eq!(
+                outbound_metadata_paging(OutboundMetadataQuery {
+                    limit: Some(limit.to_owned()),
+                    offset: None,
+                })
+                .unwrap_err()
+                .status,
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
+        for offset in ["-1", "18446744073709551616"] {
+            assert_eq!(
+                outbound_metadata_paging(OutboundMetadataQuery {
+                    limit: None,
+                    offset: Some(offset.to_owned()),
+                })
+                .unwrap_err()
+                .status,
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
+    }
+
     #[tokio::test]
     async fn outbound_grants_handler_returns_default_page_metadata() {
         let directory = tempfile::tempdir().unwrap();
@@ -3459,6 +3629,26 @@ mod tests {
         assert_eq!(metadata["receipt_url"], format!("/api/s/{token}/receipt"));
         assert_eq!(metadata["download_url"], format!("/api/s/{token}/file"));
         assert_eq!(metadata["bundle_url"], format!("/api/s/{token}/bundle"));
+
+        let paged = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}?limit=1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(paged.status(), StatusCode::OK);
+        let paged = body(paged).await;
+        assert_eq!(paged["files_total"], 1);
+        assert_eq!(paged["offset"], 0);
+        assert_eq!(paged["limit"], 1);
+        assert_eq!(paged["has_more"], false);
+        assert_eq!(paged["files"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            paged["files"][0]["download_url"],
+            format!("/api/s/{token}/files/0")
+        );
 
         let receipt = crate::app::router(app.clone())
             .oneshot(
@@ -3969,6 +4159,19 @@ mod tests {
             metadata,
             json!({ "has_password": true, "authorized": false })
         );
+        let paged = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}?offset=0&limit=1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(paged.status(), StatusCode::OK);
+        assert_eq!(
+            body(paged).await,
+            json!({ "has_password": true, "authorized": false })
+        );
 
         for suffix in ["/file", "/receipt", "/bundle"] {
             let mut request = Request::get(format!("/api/s/{token}{suffix}"));
@@ -4028,6 +4231,17 @@ mod tests {
             .unwrap();
         assert_eq!(metadata.status(), StatusCode::OK);
         assert_eq!(body(metadata).await["label"], "received.bin");
+        let paged = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}?offset=0&limit=1"))
+                    .header("cookie", &grant_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(paged.status(), StatusCode::OK);
+        assert_eq!(body(paged).await["files_total"], 1);
 
         let file = crate::app::router(app.clone())
             .oneshot(
@@ -4211,6 +4425,53 @@ mod tests {
             .unwrap();
         let metadata = body(metadata).await;
         assert_eq!(metadata["files"].as_array().unwrap().len(), 2);
+        for (offset, expected_name, expected_url, has_more) in [
+            (
+                0,
+                "project/one.bin",
+                format!("/api/s/{token}/files/0"),
+                true,
+            ),
+            (
+                1,
+                "project/two.bin",
+                format!("/api/s/{token}/files/1"),
+                false,
+            ),
+        ] {
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::get(format!("/api/s/{token}?offset={offset}&limit=1"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let page = body(response).await;
+            assert_eq!(page["files_total"], 2);
+            assert_eq!(page["offset"], offset);
+            assert_eq!(page["limit"], 1);
+            assert_eq!(page["has_more"], has_more);
+            assert_eq!(page["files"].as_array().unwrap().len(), 1);
+            assert_eq!(page["files"][0]["name"], expected_name);
+            assert_eq!(page["files"][0]["download_url"], expected_url);
+        }
+        let end = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}?offset=2&limit=1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(end.status(), StatusCode::OK);
+        let end = body(end).await;
+        assert_eq!(end["files_total"], 2);
+        assert_eq!(end["offset"], 2);
+        assert_eq!(end["files"], json!([]));
+        assert_eq!(end["has_more"], false);
         let bundle = crate::app::router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/bundle"))
