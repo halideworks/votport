@@ -324,7 +324,6 @@ let libraryTruncated = false;
 let libraryRequestGeneration = 0;
 let librarySearchTimer;
 const libraryProjectSuggestions = new Set();
-let librarySuggestionsInitialized = false;
 const libraryFolderSelections = new Map();
 
 function libraryPath(file) {
@@ -390,7 +389,7 @@ async function uploadLibraryFile(file, path, progress = () => {}) {
 }
 
 function updateProjectSuggestions(directories) {
-  const options = [...new Set(directories)].sort();
+  const options = [...directories].sort();
   $('deliver-project-options').replaceChildren(
     ...options.map((value) => {
       const option = document.createElement('option');
@@ -616,10 +615,6 @@ function renderLibrary(response) {
   libraryDirectories = (response.directories || []).filter((path) => parseLibraryPath(path));
   libraryTruncated = Boolean(response.truncated);
   if (!$('library-search').value.trim()) {
-    if (!librarySuggestionsInitialized && !libraryDirectory) {
-      libraryProjectSuggestions.clear();
-      librarySuggestionsInitialized = true;
-    }
     if (libraryDirectory) libraryProjectSuggestions.add(libraryDirectory);
     for (const directory of libraryDirectories) libraryProjectSuggestions.add(directory);
     updateProjectSuggestions(libraryProjectSuggestions);

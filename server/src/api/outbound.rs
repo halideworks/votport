@@ -1,5 +1,6 @@
 //! Verified, administrator-selected outbound files.
 
+use std::collections::BinaryHeap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -604,33 +605,9 @@ fn list_library_dir(root: &Path, dir: &Path, files: &mut Vec<serde_json::Value>)
     }
 }
 
-fn library_file(path: &Path, root: &Path, bytes: u64) -> Option<LibraryFile> {
-    let relative = path
-        .strip_prefix(root)
-        .ok()?
-        .to_string_lossy()
-        .replace('\\', "/");
-    Some(LibraryFile {
-        path: relative,
-        bytes,
-    })
-}
-
-struct LibraryFile {
-    path: String,
-    bytes: u64,
-}
-
 fn is_library_stage_name(name: &std::ffi::OsStr) -> bool {
     name.to_str()
         .is_some_and(|name| name.starts_with(".vot-") && name.ends_with(".stage"))
-}
-
-fn library_file_cmp(left: &LibraryFile, right: &LibraryFile) -> std::cmp::Ordering {
-    left.path
-        .to_lowercase()
-        .cmp(&right.path.to_lowercase())
-        .then_with(|| left.path.cmp(&right.path))
 }
 
 fn library_root_safe(root: &Path) -> bool {
@@ -667,7 +644,7 @@ fn direct_library_entries(
     root: &Path,
     directory: &Path,
 ) -> (Vec<String>, Vec<serde_json::Value>, bool) {
-    let mut entries = Vec::new();
+    let mut entries = BinaryHeap::new();
     let Ok(read_dir) = std::fs::read_dir(directory) else {
         return (Vec::new(), Vec::new(), false);
     };
@@ -690,17 +667,24 @@ fn direct_library_entries(
         if is_library_stage_name(&name) {
             continue;
         }
-        let Some(file) = library_file(&path, root, meta.len()) else {
+        let Some(relative) = path.strip_prefix(root).ok() else {
             continue;
         };
         let is_directory = meta.file_type().is_dir();
         if !is_directory && !meta.file_type().is_file() {
             continue;
         }
-        entries.push((file.path, is_directory, file.bytes));
+        entries.push((
+            relative.to_string_lossy().replace('\\', "/"),
+            is_directory,
+            meta.len(),
+        ));
+        if entries.len() > MAX_LIBRARY_DIRECTORY_ENTRIES + 1 {
+            entries.pop();
+        }
     }
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
     let truncated = entries.len() > MAX_LIBRARY_DIRECTORY_ENTRIES;
+    let mut entries = entries.into_sorted_vec();
     entries.truncate(MAX_LIBRARY_DIRECTORY_ENTRIES);
     let mut directories = Vec::new();
     let mut files = Vec::new();
@@ -730,7 +714,12 @@ fn list_library_directory(
     Ok(direct_library_entries(root, directory))
 }
 
-fn search_library_dir(root: &Path, directory: &Path, query: &str, matches: &mut Vec<LibraryFile>) {
+fn search_library_dir(
+    root: &Path,
+    directory: &Path,
+    query: &str,
+    matches: &mut BinaryHeap<(String, String, u64)>,
+) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
@@ -756,14 +745,15 @@ fn search_library_dir(root: &Path, directory: &Path, query: &str, matches: &mut 
         if meta.file_type().is_dir() {
             search_library_dir(root, &path, query, matches);
         } else if meta.file_type().is_file() {
-            let Some(file) = library_file(&path, root, meta.len()) else {
+            let Some(relative) = path.strip_prefix(root).ok() else {
                 continue;
             };
-            if !file.path.to_lowercase().contains(query) {
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let lowercase = relative.to_lowercase();
+            if !lowercase.contains(query) {
                 continue;
             }
-            matches.push(file);
-            matches.sort_by(library_file_cmp);
+            matches.push((lowercase, relative, meta.len()));
             if matches.len() > RETAINED_LIBRARY_SEARCH_RESULTS {
                 matches.pop();
             }
@@ -775,14 +765,15 @@ fn list_library_search(root: &Path, query: &str) -> (Vec<serde_json::Value>, boo
     if !library_root_safe(root) {
         return (Vec::new(), false);
     }
-    let mut matches = Vec::new();
+    let mut matches = BinaryHeap::new();
     search_library_dir(root, root, query, &mut matches);
     let truncated = matches.len() > MAX_LIBRARY_SEARCH_RESULTS;
+    let mut matches = matches.into_sorted_vec();
     matches.truncate(MAX_LIBRARY_SEARCH_RESULTS);
     (
         matches
             .into_iter()
-            .map(|file| json!({ "path": file.path, "bytes": file.bytes }))
+            .map(|(_, path, bytes)| json!({ "path": path, "bytes": bytes }))
             .collect(),
         truncated,
     )
@@ -4489,6 +4480,32 @@ mod tests {
         }
         std::fs::create_dir_all(app.config.outbound_dir.join("nested")).unwrap();
         std::fs::write(app.config.outbound_dir.join("nested/noise.bin"), b"match").unwrap();
+        std::fs::create_dir_all(
+            app.config
+                .outbound_dir
+                .join(crate::paths::TENANT_STORAGE_DIR)
+                .join("named"),
+        )
+        .unwrap();
+        std::fs::write(
+            app.config
+                .outbound_dir
+                .join(crate::paths::TENANT_STORAGE_DIR)
+                .join("named/match-reserved.bin"),
+            b"x",
+        )
+        .unwrap();
+        std::fs::write(app.config.outbound_dir.join(".vot-match.stage"), b"x").unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(directory.path().join("outside")).unwrap();
+            std::fs::write(directory.path().join("outside/match-outside.bin"), b"x").unwrap();
+            std::os::unix::fs::symlink(
+                directory.path().join("outside"),
+                app.config.outbound_dir.join("000-match-link"),
+            )
+            .unwrap();
+        }
 
         let response = crate::app::router(app.clone())
             .oneshot(
@@ -4508,6 +4525,15 @@ mod tests {
         assert_eq!(listed["files"][0]["path"], "match-000.bin");
         assert_eq!(listed["files"][199]["path"], "match-199.bin");
         assert_eq!(listed["truncated"], true);
+        let paths = listed["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["path"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!paths.iter().any(|path| path.contains("reserved")));
+        assert!(!paths.iter().any(|path| path.ends_with(".stage")));
+        assert!(!paths.iter().any(|path| path.contains("outside")));
     }
 
     #[tokio::test]
