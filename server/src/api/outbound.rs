@@ -210,7 +210,7 @@ async fn upload_outbound_chunk(
         .parent()
         .ok_or_else(|| ApiError::internal("outbound path has no parent"))?;
     create_library_dirs(parent)?;
-    let stage = parent.join(format!(".vot-outbound-{upload_id}.stage"));
+    let stage = parent.join(outbound_stage_name(&path, &upload_id));
     if std::fs::symlink_metadata(&path).is_ok() {
         let _ = std::fs::remove_file(&stage);
         return Err(ApiError::new(
@@ -298,6 +298,10 @@ async fn upload_outbound_chunk(
     }
     let offset = end + 1;
     if offset < total {
+        if file.flush().await.is_err() {
+            let _ = file.set_len(start).await;
+            return Err(ApiError::internal("write outbound staging file failed"));
+        }
         return Ok(Json(json!({
             "complete": false,
             "offset": offset,
@@ -344,6 +348,14 @@ async fn upload_outbound_chunk(
 fn outbound_upload_stripe(path: &Path) -> usize {
     let digest = Sha256::digest(path.to_string_lossy().as_bytes());
     usize::from(u16::from_be_bytes([digest[0], digest[1]])) % 64
+}
+
+fn outbound_stage_name(path: &Path, upload_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(path.to_string_lossy().as_bytes());
+    hasher.update([0]);
+    hasher.update(upload_id.as_bytes());
+    format!(".vot-outbound-{}.stage", hex::encode(hasher.finalize()))
 }
 
 fn valid_outbound_upload_id(value: &str) -> bool {
@@ -3608,11 +3620,10 @@ mod tests {
         assert_eq!(progress["bytes"], 6);
         assert!(!app.config.outbound_dir.join("partial.bin").exists());
         assert_eq!(
-            std::fs::read(
-                app.config
-                    .outbound_dir
-                    .join(format!(".vot-outbound-{upload_id}.stage"))
-            )
+            std::fs::read(app.config.outbound_dir.join(outbound_stage_name(
+                &app.config.outbound_dir.join("partial.bin"),
+                &upload_id,
+            )))
             .unwrap(),
             b"abc"
         );
@@ -3675,7 +3686,10 @@ mod tests {
         assert!(!app
             .config
             .outbound_dir
-            .join(format!(".vot-outbound-{upload_id}.stage"))
+            .join(outbound_stage_name(
+                &app.config.outbound_dir.join("resume.bin"),
+                &upload_id,
+            ))
             .exists());
         let audits = app.store.audit_export("", 0, 0, 100).unwrap();
         assert_eq!(
@@ -3720,11 +3734,35 @@ mod tests {
             .unwrap();
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
         assert!(!app.config.outbound_dir.join("rollback.bin").exists());
-        let stage = app
-            .config
-            .outbound_dir
-            .join(format!(".vot-outbound-{upload_id}.stage"));
+        let stage = app.config.outbound_dir.join(outbound_stage_name(
+            &app.config.outbound_dir.join("rollback.bin"),
+            &upload_id,
+        ));
         assert_eq!(std::fs::read(stage).unwrap(), b"abc");
+    }
+
+    #[tokio::test]
+    async fn resumable_library_upload_separates_sibling_stages_with_same_id() {
+        let (_directory, app, cookie, _bytes) = fixture().await;
+        let upload_id = "f".repeat(64);
+        for (path, bytes) in [("sibling-a.bin", b"abc"), ("sibling-b.bin", b"xyz")] {
+            let response = crate::app::router(app.clone())
+                .oneshot(chunk_request(&cookie, path, &upload_id, 0, 2, 6, bytes))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let first = app.config.outbound_dir.join(outbound_stage_name(
+            &app.config.outbound_dir.join("sibling-a.bin"),
+            &upload_id,
+        ));
+        let second = app.config.outbound_dir.join(outbound_stage_name(
+            &app.config.outbound_dir.join("sibling-b.bin"),
+            &upload_id,
+        ));
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(first).unwrap(), b"abc");
+        assert_eq!(std::fs::read(second).unwrap(), b"xyz");
     }
 
     #[tokio::test]
@@ -3751,7 +3789,10 @@ mod tests {
         assert!(!app
             .config
             .outbound_dir
-            .join(format!(".vot-outbound-{upload_id}.stage"))
+            .join(outbound_stage_name(
+                &app.config.outbound_dir.join("limited.bin"),
+                &upload_id,
+            ))
             .exists());
         let mut headers = HeaderMap::new();
         headers.insert(OUTBOUND_UPLOAD_ID, HeaderValue::from_static("bad"));
@@ -3779,11 +3820,10 @@ mod tests {
         assert!(statuses.contains(&StatusCode::OK));
         assert!(statuses.contains(&StatusCode::CONFLICT));
         assert_eq!(
-            std::fs::metadata(
-                app.config
-                    .outbound_dir
-                    .join(format!(".vot-outbound-{upload_id}.stage"))
-            )
+            std::fs::metadata(app.config.outbound_dir.join(outbound_stage_name(
+                &app.config.outbound_dir.join("concurrent.bin"),
+                &upload_id,
+            )))
             .unwrap()
             .len(),
             3
