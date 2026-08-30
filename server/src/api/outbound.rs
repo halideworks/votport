@@ -870,8 +870,25 @@ fn create_library_dirs(path: &Path) -> ApiResult<()> {
                 ))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&current)
-                    .map_err(|_| ApiError::internal("create outbound directory failed"))?;
+                match std::fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        match std::fs::symlink_metadata(&current) {
+                            Ok(meta)
+                                if meta.file_type().is_dir() && !meta.file_type().is_symlink() => {}
+                            Ok(_) => {
+                                return Err(ApiError::new(
+                                    StatusCode::CONFLICT,
+                                    "outbound path component is not a directory",
+                                ))
+                            }
+                            Err(_) => {
+                                return Err(ApiError::internal("inspect outbound directory failed"))
+                            }
+                        }
+                    }
+                    Err(_) => return Err(ApiError::internal("create outbound directory failed")),
+                }
             }
             Err(_) => return Err(ApiError::internal("inspect outbound directory failed")),
         }
@@ -2992,6 +3009,30 @@ mod tests {
         assert!(!valid_token("x"));
         assert!(!valid_token(&"g".repeat(32)));
     }
+
+    #[test]
+    fn concurrent_library_dir_creation_accepts_same_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|index| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let path = directory
+                    .path()
+                    .join("shared")
+                    .join(format!("nested-{index}"));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    create_library_dirs(&path)
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        assert!(directory.path().join("shared").is_dir());
+    }
+
     #[test]
     fn hashes_are_not_raw_tokens() {
         assert_ne!(hash_token("a"), "a");

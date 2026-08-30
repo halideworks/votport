@@ -4,7 +4,7 @@
 import {
   parseLibraryPath,
 } from '/assets/library-paths.js';
-import { entryFiles } from '/assets/upload-entries.js';
+import { entryFiles, runUploadBatch } from '/assets/upload-entries.js';
 import {
   alertModal,
   api,
@@ -420,20 +420,32 @@ async function uploadLibraryFiles(pairs) {
   controls.forEach((control) => { control.disabled = true; });
   libraryDrop.setAttribute('aria-busy', 'true');
   $('library-status').textContent = `Uploading 0 of ${uploads.length} files…`;
+  let completedUploads = 0;
   try {
-    for (const [index, { file, path }] of uploads.entries()) {
-      await uploadLibraryFile(file, path, (offset) => {
+    await runUploadBatch(
+      uploads,
+      ({ file, path }, progress) => uploadLibraryFile(file, path, progress),
+      ({ file }, offset, completed, total) => {
         const percent = file.size ? Math.floor((offset / file.size) * 100) : 100;
         $('library-status').textContent =
-          `Uploading ${file.name}: ${percent}% (${index + 1} of ${uploads.length} files)`;
-      });
-      $('library-status').textContent =
-        `Uploading ${file.name}: 100% (${index + 1} of ${uploads.length} files)`;
-    }
+          `Uploading ${file.name}: ${percent}% (${completed} of ${total} files complete)`;
+      },
+      ({ file }, completed, total) => {
+        completedUploads = completed;
+        $('library-status').textContent =
+          `Uploading ${file.name}: 100% (${completed} of ${total} files complete)`;
+      },
+    );
     $('library-status').textContent = `${uploads.length} file${uploads.length === 1 ? '' : 's'} added.`;
     await refreshLibrary();
   } catch (error) {
-    $('library-status').textContent = error.message;
+    if (completedUploads > 0) {
+      await refreshLibrary();
+      $('library-status').textContent =
+        `${error.message} ${completedUploads} of ${uploads.length} files added.`;
+    } else {
+      $('library-status').textContent = error.message;
+    }
   } finally {
     libraryUploading = false;
     libraryDrop.removeAttribute('aria-busy');
