@@ -2,7 +2,16 @@
 // AGPL-3.0-only.
 
 import { appendObjectCard } from '/assets/object-card.js';
-import { projectDirectoryPrefixes } from '/assets/library-paths.js';
+import {
+  buildLibraryTree,
+  filterLibraryFiles,
+  libraryFilesIn,
+  libraryTreeNode,
+  parseLibraryPath,
+  projectDirectoryPrefixes,
+  selectedLibraryStats,
+  toggleFolderSelection,
+} from '/assets/library-paths.js';
 import {
   alertModal,
   api,
@@ -345,6 +354,13 @@ async function refreshGrants() {
   }
 }
 
+const MAX_LIBRARY_SELECTION = 64;
+const MAX_LIBRARY_SEARCH_RESULTS = 200;
+const selectedLibraryPaths = new Set();
+let libraryFiles = [];
+let libraryTree = buildLibraryTree([]);
+let libraryDirectory = '';
+
 function libraryPath(file) {
   const relative = file.webkitRelativePath || file.name;
   const project = $('deliver-project').value.trim().replace(/^\/+|\/+$/g, '');
@@ -374,32 +390,159 @@ function updateProjectSuggestions(files) {
   );
 }
 
-function renderLibrary(files) {
-  updateProjectSuggestions(files);
+function updateLibrarySelectionStatus() {
+  const { count, bytes } = selectedLibraryStats(libraryFiles, selectedLibraryPaths);
+  $('library-selection-status').textContent = `${count} file${count === 1 ? '' : 's'} selected · ${formatBytes(bytes)}`;
+}
+
+function showLibrarySelectionError() {
+  $('library-selection-error').textContent =
+    `Select at most ${MAX_LIBRARY_SELECTION} files. Deselect some files before selecting this folder.`;
+  $('library-selection-error').hidden = false;
+  updateLibrarySelectionStatus();
+}
+
+function applyLibrarySelection(next) {
+  selectedLibraryPaths.clear();
+  for (const path of next) selectedLibraryPaths.add(path);
+  $('library-selection-error').hidden = true;
+  updateLibrarySelectionStatus();
+}
+
+function selectionCheckbox(paths) {
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  const selected = paths.filter((path) => selectedLibraryPaths.has(path)).length;
+  checkbox.checked = paths.length > 0 && selected === paths.length;
+  checkbox.indeterminate = selected > 0 && selected < paths.length;
+  checkbox.addEventListener('change', () => {
+    const next = toggleFolderSelection(selectedLibraryPaths, paths, MAX_LIBRARY_SELECTION);
+    if (!next) {
+      renderLibraryView();
+      showLibrarySelectionError();
+      return;
+    }
+    applyLibrarySelection(next);
+    renderLibraryView();
+  });
+  return checkbox;
+}
+
+function renderLibraryBreadcrumbs() {
+  const breadcrumbs = $('library-breadcrumbs');
+  breadcrumbs.replaceChildren();
+  const root = button('Library', 'tiny ghost', async () => {
+    libraryDirectory = '';
+    renderLibraryView();
+  });
+  if (!libraryDirectory) root.setAttribute('aria-current', 'page');
+  breadcrumbs.append(root);
+  const parts = libraryDirectory ? parseLibraryPath(libraryDirectory) : [];
+  if (!parts) return;
+  let path = '';
+  for (const part of parts) {
+    path = path ? `${path}/${part}` : part;
+    breadcrumbs.append(document.createTextNode(' / '));
+    const crumbPath = path;
+    const crumb = button(part, 'tiny ghost', async () => {
+      libraryDirectory = crumbPath;
+      renderLibraryView();
+    });
+    if (crumbPath === libraryDirectory) crumb.setAttribute('aria-current', 'page');
+    breadcrumbs.append(crumb);
+  }
+}
+
+function renderLibraryFile(file, container, showPath = false) {
+  const label = document.createElement('label');
+  label.className = 'library-file';
+  const checkbox = selectionCheckbox([file.path]);
+  checkbox.value = file.path;
+  const name = document.createElement('span');
+  name.className = 'mono';
+  name.textContent = showPath ? file.path : file.path.slice(file.path.lastIndexOf('/') + 1);
+  const size = document.createElement('span');
+  size.className = 'muted';
+  size.textContent = formatBytes(file.bytes);
+  label.append(checkbox, name, size);
+  container.append(label);
+}
+
+function renderLibraryFolder(folder, container) {
+  const files = libraryFilesIn(folder);
+  const row = document.createElement('div');
+  row.className = 'library-file library-folder';
+  const checkbox = selectionCheckbox(files.map((file) => file.path));
+  const open = button(folder.name, 'tiny ghost', async () => {
+    libraryDirectory = folder.path;
+    renderLibraryView();
+  });
+  open.setAttribute('aria-label', `Open folder ${folder.name}`);
+  const count = document.createElement('span');
+  count.className = 'muted';
+  count.textContent = `${files.length} file${files.length === 1 ? '' : 's'}`;
+  row.append(checkbox, open, count);
+  container.append(row);
+}
+
+function renderLibraryView() {
+  renderLibraryBreadcrumbs();
   const container = $('library-files');
   container.replaceChildren();
-  if (!files.length) {
+  const query = $('library-search').value;
+  if (query.trim()) {
+    const matches = filterLibraryFiles(libraryFiles, query).sort((left, right) =>
+      left.path.localeCompare(right.path),
+    );
+    if (!matches.length) {
+      const empty = document.createElement('p');
+      empty.className = 'muted';
+      empty.textContent = 'No matching library files.';
+      container.append(empty);
+      return;
+    }
+    for (const file of matches.slice(0, MAX_LIBRARY_SEARCH_RESULTS)) {
+      renderLibraryFile(file, container, true);
+    }
+    if (matches.length > MAX_LIBRARY_SEARCH_RESULTS) {
+      const note = document.createElement('p');
+      note.className = 'muted';
+      note.textContent = `Showing first ${MAX_LIBRARY_SEARCH_RESULTS}; refine search.`;
+      container.append(note);
+    }
+    return;
+  }
+  const folder = libraryTreeNode(libraryTree, libraryDirectory);
+  if (!folder) {
+    libraryDirectory = '';
+    renderLibraryView();
+    return;
+  }
+  const folders = [...folder.children.values()].sort((left, right) =>
+    left.name.localeCompare(right.name),
+  );
+  const files = [...folder.files].sort((left, right) => left.path.localeCompare(right.path));
+  for (const child of folders) renderLibraryFolder(child, container);
+  for (const file of files) renderLibraryFile(file, container);
+  if (!folders.length && !files.length) {
     const empty = document.createElement('p');
     empty.className = 'muted';
     empty.textContent = 'No library files.';
     container.append(empty);
-    return;
   }
-  for (const file of files) {
-    const label = document.createElement('label');
-    label.className = 'library-file';
-    const checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    checkbox.value = file.path;
-    const name = document.createElement('span');
-    name.className = 'mono';
-    name.textContent = file.path;
-    const size = document.createElement('span');
-    size.className = 'muted';
-    size.textContent = formatBytes(file.bytes);
-    label.append(checkbox, name, size);
-    container.append(label);
+}
+
+function renderLibrary(files) {
+  const safeFiles = files.filter((file) => parseLibraryPath(file.path));
+  libraryFiles = safeFiles;
+  libraryTree = buildLibraryTree(safeFiles);
+  const available = new Set(safeFiles.map((file) => file.path));
+  for (const path of selectedLibraryPaths) {
+    if (!available.has(path)) selectedLibraryPaths.delete(path);
   }
+  updateProjectSuggestions(safeFiles);
+  updateLibrarySelectionStatus();
+  renderLibraryView();
 }
 
 async function refreshLibrary() {
@@ -650,6 +793,7 @@ $('automation-token-form').addEventListener('submit', async (event) => {
 });
 
 $('library-refresh').addEventListener('click', () => refreshLibrary());
+$('library-search').addEventListener('input', () => renderLibraryView());
 
 $('deliver-upload-form').addEventListener('submit', (event) => event.preventDefault());
 $('library-input').addEventListener('change', async (event) => {
@@ -676,8 +820,12 @@ $('library-input').addEventListener('change', async (event) => {
 $('deliver-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   $('deliver-error').hidden = true;
-  const paths = [...$('library-files').querySelectorAll('input[type="checkbox"]:checked')]
-    .map((checkbox) => checkbox.value);
+  const paths = [...selectedLibraryPaths];
+  if (paths.length > MAX_LIBRARY_SELECTION) {
+    $('deliver-error').textContent = `Select at most ${MAX_LIBRARY_SELECTION} files.`;
+    $('deliver-error').hidden = false;
+    return;
+  }
   const expires = Number($('deliver-expires').value);
   if (!paths.length) {
     $('deliver-error').textContent = 'Select at least one file.';
