@@ -256,6 +256,23 @@ Senders can drop folders as well as files; browser support requires
 WebAssembly SIMD and module workers (Safari 16.4, Chrome 91, Firefox 114 or
 newer).
 
+### Automation shares
+
+Create a tenant-scoped automation token on **Links**. The raw token is shown
+once, so copy it immediately; revoke it and create another if it is lost.
+Use the token to share a server-relative outbound directory from the CLI:
+
+```sh
+export VOTPORT_URL=https://drop.example.com
+export VOTPORT_AUTOMATION_TOKEN='<token from Links>'
+# Optional password for the outbound link:
+export VOTPORT_SHARE_PASSWORD='use-a-separate-secret'
+votport share project/render --expires 7d --label "Client delivery"
+```
+
+The command prints the expiring share URL. `VOTPORT_URL` must be the HTTPS
+server URL (HTTP is allowed for loopback); `VOTPORT_SHARE_PASSWORD` is optional.
+
 ## Performance
 
 The wire unit is an 8 MiB proven range (`CHUNK_BYTES` in `session.rs`). That

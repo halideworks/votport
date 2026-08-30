@@ -16,7 +16,8 @@ pub use admin::{
     revoke_principal, switch_tenant, unblock_principal, update_link, update_tenant,
 };
 pub use outbound::{
-    create_outbound_grant, delete_outbound_grant, list_outbound_files, list_outbound_grants,
+    automation_share, create_automation_token, create_outbound_grant, delete_automation_token,
+    delete_outbound_grant, list_automation_tokens, list_outbound_files, list_outbound_grants,
     outbound_file, outbound_file_indexed, outbound_metadata, outbound_receipt,
     outbound_receipt_indexed, upload_outbound_file, verify_outbound_password,
 };

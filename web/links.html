@@ -88,6 +88,46 @@
         <span id="new-link-note" class="muted"></span>
       </div>
 
+      <section class="card" aria-labelledby="automation-token-create-title">
+        <h2 id="automation-token-create-title">Create automation token</h2>
+        <p class="muted">This token can create transfer links for this tenant only.</p>
+        <form id="automation-token-form">
+          <div class="grid">
+            <label
+              >Label
+              <input id="automation-token-label" required maxlength="100" placeholder="Nightly backup" />
+            </label>
+            <label
+              >Expires after <span class="muted">days</span>
+              <input id="automation-token-expires" type="number" min="1" max="365" value="30" required />
+            </label>
+          </div>
+          <button type="submit" id="automation-token-submit">Issue token</button>
+          <p id="automation-token-error" class="error" role="alert" hidden></p>
+        </form>
+      </section>
+
+      <div id="automation-token-result" class="card ok" hidden aria-live="polite">
+        <h2>Automation token issued</h2>
+        <label
+          >Token
+          <input
+            id="automation-token-value"
+            class="mono"
+            type="text"
+            readonly
+            aria-describedby="automation-token-note"
+          />
+        </label>
+        <button id="automation-token-copy" type="button">Copy token</button>
+        <p id="automation-token-note" class="muted">
+          Copy it now. This raw token is shown once and cannot be retrieved later.
+        </p>
+      </div>
+
+      <h2>Automation tokens</h2>
+      <div id="automation-tokens" aria-live="polite"></div>
+
       <section class="card" aria-labelledby="deliver-title">
         <h2 id="deliver-title">Deliver files</h2>
         <form id="deliver-upload-form">

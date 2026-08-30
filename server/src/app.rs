@@ -78,6 +78,8 @@ pub struct App {
     pub push_rate: crate::api::session_rate::SessionRate,
     /// Per-IP rate limit on outbound preparation and downloads.
     pub outbound_rate: crate::api::session_rate::SessionRate,
+    /// Per-IP rate limit on automation share creation.
+    pub automation_rate: crate::api::session_rate::SessionRate,
     /// Grants currently preparing or streaming, capped globally and per grant.
     pub outbound_active: Mutex<HashSet<String>>,
     /// Signs the `.vot-receipt` sidecars written next to received files.
@@ -387,6 +389,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         // leave room for refused or retried rails in the same ten-minute window.
         push_rate: crate::api::session_rate::SessionRate::with_limit(200),
         outbound_rate: crate::api::session_rate::SessionRate::with_limit(20),
+        automation_rate: crate::api::session_rate::SessionRate::with_limit(60),
         outbound_active: Mutex::new(HashSet::new()),
         signer,
         http,
@@ -928,6 +931,14 @@ pub fn router(app: Arc<App>) -> Router {
             axum::routing::delete(api::delete_outbound_grant),
         )
         .route(
+            "/api/admin/automation-tokens",
+            get(api::list_automation_tokens).post(api::create_automation_token),
+        )
+        .route(
+            "/api/admin/automation-tokens/{id}",
+            axum::routing::delete(api::delete_automation_token),
+        )
+        .route(
             "/api/admin/outbound-files",
             get(api::list_outbound_files).post(api::upload_outbound_file),
         )
@@ -973,6 +984,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/s/{token}", get(api::outbound_metadata))
         .route("/api/s/{token}/verify", post(api::verify_outbound_password))
         .route("/api/s/{token}/bundle", get(api::outbound::outbound_bundle))
+        .route("/api/automation/share", post(api::automation_share))
         .route("/api/s/{token}/receipt", get(api::outbound_receipt))
         .route("/api/s/{token}/file", get(api::outbound_file))
         .route(
