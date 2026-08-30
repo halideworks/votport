@@ -7,6 +7,7 @@ const deliver = await readFile(new URL('../web/deliver.html', import.meta.url), 
 const receiveScript = await readFile(new URL('../web/assets/page-receive.js', import.meta.url), 'utf8');
 const deliverScript = await readFile(new URL('../web/assets/page-deliver.js', import.meta.url), 'utf8');
 const commonScript = await readFile(new URL('../web/assets/admin-common.js', import.meta.url), 'utf8');
+const style = await readFile(new URL('../web/assets/style.css', import.meta.url), 'utf8');
 
 test('receive and deliver pages keep transfer concerns separate', () => {
   assert.match(receive, /page-receive\.js/);
@@ -27,4 +28,11 @@ test('receive and deliver pages keep transfer concerns separate', () => {
   assert.match(deliverScript, /notify_on_download: \$\('deliver-notify-on-download'\)\.checked/);
   assert.match(deliverScript, /method: 'PATCH'[\s\S]+notify_on_download/);
   assert.match(deliverScript, /notifyInput\.disabled = true/);
+});
+
+test('issued request status filter uses the shared form control styling', () => {
+  assert.match(receive, /<div class="grid">[\s\S]*id="links-status"/);
+  assert.match(style, /input,\s*\.card select\s*\{[\s\S]*display: block;[\s\S]*width: 100%;[\s\S]*background: rgba\(255, 255, 255, 0\.03\);/);
+  assert.match(style, /input:focus,\s*\.card select:focus\s*\{[\s\S]*border-color: var\(--border-active\);/);
+  assert.doesNotMatch(style, /^select\s*\{/m);
 });
