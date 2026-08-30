@@ -15,6 +15,8 @@ use crate::app::App;
 use crate::session::FinishReport;
 use crate::store::{OutboundDownloadResult, OutboundGrant, ResolvedSettings, ResolvedSmtp};
 
+const MAX_NOTIFICATION_FILES: usize = 100;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NotificationReport {
     pub configured: u32,
@@ -26,23 +28,33 @@ pub async fn uploaded(app: Arc<App>, label: String, report: FinishReport) {
     let transfer_id = report.upload_id.clone();
     let total: u64 = report.files.iter().map(|file| file.bytes).sum();
     let count = report.files.len();
+    let files_truncated = count > MAX_NOTIFICATION_FILES;
+    let files = report
+        .files
+        .iter()
+        .take(MAX_NOTIFICATION_FILES)
+        .collect::<Vec<_>>();
     let title = format!("votport: files received for \"{label}\"");
-    let body = format!(
+    let mut body = format!(
         "{count} file(s), {total} bytes\n{}",
-        report
-            .files
+        files
             .iter()
             .map(|file| format!("{} ({} bytes)", file.stored_as, file.bytes))
             .collect::<Vec<_>>()
             .join("\n")
     );
+    if files_truncated {
+        body.push_str(&format!("\nand {} more", count - files.len()));
+    }
 
     let payload = json!({
         "event": "upload_complete",
         "label": label,
         "upload_id": report.upload_id,
         "total_bytes": total,
-        "files": report.files,
+        "file_count": count,
+        "files_truncated": files_truncated,
+        "files": files,
     });
     send_all(
         app,
@@ -69,25 +81,29 @@ pub async fn outbound_downloaded(
         return;
     };
     let transfer_id = grant.id.clone();
-    let (file_count, total_bytes, files) = if grant.files.is_empty() {
+    let (file_count, total_bytes, files, files_truncated) = if grant.files.is_empty() {
         (
             1,
             grant.bytes,
             vec![json!({ "name": &grant.name, "bytes": grant.bytes })],
+            false,
         )
     } else {
         let total_bytes = grant
             .files
             .iter()
             .fold(0u64, |total, file| total.saturating_add(file.bytes));
+        let file_count = grant.files.len();
         (
-            grant.files.len(),
+            file_count,
             total_bytes,
             grant
                 .files
                 .iter()
+                .take(MAX_NOTIFICATION_FILES)
                 .map(|file| json!({ "name": &file.name, "bytes": file.bytes }))
                 .collect(),
+            file_count > MAX_NOTIFICATION_FILES,
         )
     };
     let download_starts = grant.downloads.saturating_add(1);
@@ -102,6 +118,7 @@ pub async fn outbound_downloaded(
         "label": grant.label,
         "download_starts": download_starts,
         "file_count": file_count,
+        "files_truncated": files_truncated,
         "total_bytes": total_bytes,
         "files": files,
     });
@@ -340,7 +357,9 @@ mod tests {
     use crate::api::testing;
     use crate::app;
     use crate::session::FinishReport;
-    use crate::store::{OutboundDownloadResult, OutboundGrant, OutboundGrantFile, SettingWrite};
+    use crate::store::{
+        FileRecord, OutboundDownloadResult, OutboundGrant, OutboundGrantFile, SettingWrite,
+    };
 
     fn test_grant(files: Vec<OutboundGrantFile>) -> OutboundGrant {
         OutboundGrant {
@@ -394,7 +413,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         let thread = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = vec![0u8; 8192];
+            let mut buf = vec![0u8; 64 * 1024];
             let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
             let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
             let _ = std::io::Write::write_all(
@@ -466,6 +485,41 @@ mod tests {
         assert_eq!(payload["download_starts"], 1);
         assert_eq!(payload["file_count"], 2);
         assert_eq!(payload["total_bytes"], 30);
+        assert_eq!(payload["files_truncated"], false);
+        assert_no_secrets(&request);
+        thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn uploaded_notification_bounds_large_file_payload() {
+        let (application, _directory, rx, thread) = webhook_app();
+        let files = (0..101)
+            .map(|index| FileRecord {
+                path: format!("file-{index}.txt"),
+                stored_as: format!("file-{index}.txt"),
+                bytes: (index + 1) as u64,
+                suite: "blake3".to_owned(),
+                root: format!("root-{index}"),
+                receipt: false,
+                deleted: false,
+            })
+            .collect();
+        uploaded(
+            application,
+            "upload-label".to_owned(),
+            FinishReport {
+                upload_id: "upload-id".to_owned(),
+                files,
+            },
+        )
+        .await;
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let payload = request_json(&request);
+        assert_eq!(payload["file_count"], 101);
+        assert_eq!(payload["total_bytes"], 5151);
+        assert_eq!(payload["files"].as_array().unwrap().len(), 100);
+        assert_eq!(payload["files_truncated"], true);
+        assert!(!request.contains("file-100.txt"), "{request}");
         assert_no_secrets(&request);
         thread.join().unwrap();
     }
@@ -590,6 +644,32 @@ mod tests {
         assert_eq!(payload["download_starts"], u64::MAX);
         assert_eq!(payload["file_count"], 1);
         assert_eq!(payload["total_bytes"], 10);
+        assert_eq!(payload["files_truncated"], false);
+        assert_no_secrets(&request);
+        thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn outbound_downloaded_bounds_large_file_payload() {
+        let (application, _directory, rx, thread) = webhook_app();
+        let files = (0..101)
+            .map(|index| test_file(&format!("file-{index}.txt"), (index + 1) as u64))
+            .collect();
+        outbound_downloaded(
+            application,
+            test_grant(files),
+            OutboundDownloadResult {
+                first_download: true,
+                completed_delivery: false,
+            },
+        )
+        .await;
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let payload = request_json(&request);
+        assert_eq!(payload["file_count"], 101);
+        assert_eq!(payload["total_bytes"], 5151);
+        assert_eq!(payload["files"].as_array().unwrap().len(), 100);
+        assert_eq!(payload["files_truncated"], true);
         assert_no_secrets(&request);
         thread.join().unwrap();
     }
