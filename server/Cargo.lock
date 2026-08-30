@@ -3616,7 +3616,7 @@ dependencies = [
  "lettre",
  "openidconnect",
  "qrcode",
- "rand 0.8.8",
+ "rand 0.10.2",
  "rcgen",
  "reqwest",
  "rusqlite",
