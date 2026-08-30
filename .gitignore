@@ -1,6 +1,7 @@
 server/target/
 web/assets/vendor/
 data/
+node_modules/
 .env
 HANDOFF.md
 .pi/
