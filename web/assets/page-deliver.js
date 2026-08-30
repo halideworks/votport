@@ -323,6 +323,8 @@ let libraryDirectory = '';
 let libraryTruncated = false;
 let libraryRequestGeneration = 0;
 let librarySearchTimer;
+const libraryProjectSuggestions = new Set();
+let librarySuggestionsInitialized = false;
 
 function libraryPath(file) {
   const relative = file.webkitRelativePath || file.name;
@@ -397,6 +399,13 @@ function updateProjectSuggestions(directories) {
   );
 }
 
+async function browseLibrary(directory) {
+  clearTimeout(librarySearchTimer);
+  $('library-search').value = '';
+  libraryDirectory = directory;
+  await refreshLibrary();
+}
+
 function updateLibrarySelectionStatus() {
   const count = selectedLibraryPaths.size;
   const bytes = [...selectedLibraryPaths.values()].reduce((total, value) => total + value, 0);
@@ -435,8 +444,7 @@ function renderLibraryBreadcrumbs() {
   const breadcrumbs = $('library-breadcrumbs');
   breadcrumbs.replaceChildren();
   const root = button('Library', 'tiny ghost', async () => {
-    libraryDirectory = '';
-    await refreshLibrary();
+    await browseLibrary('');
   });
   if (!libraryDirectory) root.setAttribute('aria-current', 'page');
   breadcrumbs.append(root);
@@ -448,8 +456,7 @@ function renderLibraryBreadcrumbs() {
     breadcrumbs.append(document.createTextNode(' / '));
     const crumbPath = path;
     const crumb = button(part, 'tiny ghost', async () => {
-      libraryDirectory = crumbPath;
-      await refreshLibrary();
+      await browseLibrary(crumbPath);
     });
     if (crumbPath === libraryDirectory) crumb.setAttribute('aria-current', 'page');
     breadcrumbs.append(crumb);
@@ -494,8 +501,7 @@ function renderLibraryFile(file, container, showPath = false) {
 function renderLibraryDirectory(directory, container) {
   const name = directory.slice(directory.lastIndexOf('/') + 1);
   const open = button(name, 'tiny ghost', async () => {
-    libraryDirectory = directory;
-    await refreshLibrary();
+    await browseLibrary(directory);
   });
   open.setAttribute('aria-label', `Open folder ${name}`);
   const row = document.createElement('div');
@@ -545,8 +551,14 @@ function renderLibrary(response) {
   libraryFiles = (response.files || []).filter((file) => parseLibraryPath(file.path));
   libraryDirectories = (response.directories || []).filter((path) => parseLibraryPath(path));
   libraryTruncated = Boolean(response.truncated);
-  if (!libraryDirectory && !$('library-search').value.trim()) {
-    updateProjectSuggestions(libraryDirectories);
+  if (!$('library-search').value.trim()) {
+    if (!librarySuggestionsInitialized && !libraryDirectory) {
+      libraryProjectSuggestions.clear();
+      librarySuggestionsInitialized = true;
+    }
+    if (libraryDirectory) libraryProjectSuggestions.add(libraryDirectory);
+    for (const directory of libraryDirectories) libraryProjectSuggestions.add(directory);
+    updateProjectSuggestions(libraryProjectSuggestions);
   }
   updateLibrarySelectionStatus();
   renderLibraryView();

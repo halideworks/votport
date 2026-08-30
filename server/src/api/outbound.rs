@@ -4376,6 +4376,24 @@ mod tests {
         assert_eq!(listed["files"][0]["path"], "adir/nested.bin");
     }
 
+    #[test]
+    fn scoped_library_directory_caps_direct_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_LIBRARY_DIRECTORY_ENTRIES {
+            std::fs::write(directory.path().join(format!("file-{index:04}.bin")), b"x").unwrap();
+        }
+        let (directories, files, truncated) =
+            direct_library_entries(directory.path(), directory.path());
+        assert!(directories.is_empty());
+        assert_eq!(files.len(), MAX_LIBRARY_DIRECTORY_ENTRIES);
+        assert!(truncated);
+        assert_eq!(files[0]["path"], "file-0000.bin");
+        assert_eq!(
+            files[MAX_LIBRARY_DIRECTORY_ENTRIES - 1]["path"],
+            "file-0999.bin"
+        );
+    }
+
     #[tokio::test]
     async fn scoped_library_search_is_literal_case_insensitive_and_capped() {
         let directory = tempfile::tempdir().unwrap();
