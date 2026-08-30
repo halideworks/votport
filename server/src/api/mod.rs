@@ -19,7 +19,8 @@ pub use outbound::{
     automation_share, create_automation_token, create_outbound_grant, delete_automation_token,
     delete_outbound_grant, list_automation_tokens, list_outbound_files, list_outbound_grants,
     outbound_file, outbound_file_indexed, outbound_metadata, outbound_receipt,
-    outbound_receipt_indexed, upload_outbound_file, verify_outbound_password,
+    outbound_receipt_indexed, update_outbound_grant, upload_outbound_file,
+    verify_outbound_password,
 };
 pub use sso::{sso_available, sso_callback, sso_start};
 pub use upload::{

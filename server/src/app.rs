@@ -928,7 +928,7 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route(
             "/api/admin/outbound-grants/{id}",
-            axum::routing::delete(api::delete_outbound_grant),
+            axum::routing::patch(api::update_outbound_grant).delete(api::delete_outbound_grant),
         )
         .route(
             "/api/admin/automation-tokens",
@@ -1960,6 +1960,7 @@ mod retention_tests {
                 expires_at: cutoff.saturating_add(86_400),
                 revoked_at: None,
                 downloads: 0,
+                max_downloads: None,
                 first_download_at: None,
                 last_download_at: None,
                 files: Vec::new(),

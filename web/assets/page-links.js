@@ -160,6 +160,7 @@ function renderUpload(link, upload) {
 
 function grantStatus(grant) {
   if (grant.revoked_at) return 'revoked';
+  if (Number.isFinite(grant.max_downloads) && (grant.downloads ?? 0) >= grant.max_downloads) return 'used';
   if (grant.expires_at && grant.expires_at <= Math.floor(Date.now() / 1000)) return 'expired';
   return 'active';
 }
@@ -279,10 +280,10 @@ function renderGrants(grants) {
     meta.className = 'muted';
     const expiry = `expires ${formatWhen(grant.expires_at)}`;
     const downloads = grant.downloads ?? 0;
-    const metaParts = [
-      expiry,
-      `${downloads} download start${downloads === 1 ? '' : 's'}`,
-    ];
+    const downloadSummary = Number.isFinite(grant.max_downloads)
+      ? `${downloads} / ${grant.max_downloads} download starts`
+      : `${downloads} download start${downloads === 1 ? '' : 's'} · unlimited`;
+    const metaParts = [expiry, downloadSummary];
     if (Number.isFinite(grant.first_download_at)) {
       metaParts.push(`first ${formatWhen(grant.first_download_at)}`);
     }
@@ -319,10 +320,38 @@ function renderGrants(grants) {
       card.append(files);
     }
 
-    if (status === 'active') {
+    if (status !== 'revoked') {
       const actions = document.createElement('div');
       actions.className = 'actions';
+      if (status === 'active') {
+        actions.append(
+          button('New address', 'tiny', async () => {
+            if (
+              !(await confirmModal(
+                'Rotate download address',
+                'Create a new address? The old address will stop working immediately.',
+                'Create',
+              ))
+            )
+              return;
+            const response = await api(`/api/admin/outbound-grants/${grant.id}`, {
+              method: 'PATCH',
+              body: JSON.stringify({ rotate: true }),
+            });
+            if (!response.url) throw new Error('server did not return a download URL');
+            showGrantResult(response.url, grant.has_password);
+            await refreshGrants();
+          }),
+        );
+      }
       actions.append(
+        button('Extend 7 days', 'tiny', async () => {
+          await api(`/api/admin/outbound-grants/${grant.id}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ extend_days: 7 }),
+          });
+          await refreshGrants();
+        }),
         button('Revoke', 'tiny danger', async () => {
           if (
             !(await confirmModal(
@@ -827,6 +856,8 @@ $('deliver-form').addEventListener('submit', async (event) => {
     return;
   }
   const expires = Number($('deliver-expires').value);
+  const maxDownloadsValue = $('deliver-max-downloads').value.trim();
+  const maxDownloads = maxDownloadsValue ? Number(maxDownloadsValue) : null;
   if (!paths.length) {
     $('deliver-error').textContent = 'Select at least one file.';
     $('deliver-error').hidden = false;
@@ -834,6 +865,11 @@ $('deliver-form').addEventListener('submit', async (event) => {
   }
   if (!Number.isInteger(expires) || expires < 1 || expires > 30) {
     $('deliver-error').textContent = 'Expiry must be between 1 and 30 days.';
+    $('deliver-error').hidden = false;
+    return;
+  }
+  if (maxDownloads !== null && (!Number.isInteger(maxDownloads) || maxDownloads < 1 || maxDownloads > 10000)) {
+    $('deliver-error').textContent = 'Max downloads must be between 1 and 10000.';
     $('deliver-error').hidden = false;
     return;
   }
@@ -846,6 +882,7 @@ $('deliver-form').addEventListener('submit', async (event) => {
         label: $('deliver-label').value,
         expires_days: expires,
         password: $('deliver-password').value || null,
+        max_downloads: maxDownloads,
       }),
     });
     if (!response.url) throw new Error('server did not return a download URL');
