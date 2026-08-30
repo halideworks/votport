@@ -155,6 +155,82 @@ function grantStatus(grant) {
   return 'active';
 }
 
+function automationTokenStatus(token) {
+  if (token.revoked_at) return 'revoked';
+  if (token.expires_at && token.expires_at <= Math.floor(Date.now() / 1000)) return 'expired';
+  return 'active';
+}
+
+function renderAutomationTokens(tokens) {
+  const container = $('automation-tokens');
+  container.replaceChildren();
+  if (!tokens.length) {
+    const empty = document.createElement('p');
+    empty.className = 'muted';
+    empty.textContent = 'No automation tokens issued.';
+    container.append(empty);
+    return;
+  }
+  for (const token of [...tokens].reverse()) {
+    const card = document.createElement('div');
+    card.className = 'card link-item';
+    const head = document.createElement('div');
+    head.className = 'head';
+    const title = document.createElement('h3');
+    title.textContent = token.label || 'Automation token';
+    const status = automationTokenStatus(token);
+    const badge = document.createElement('span');
+    badge.className = `badge ${status === 'active' ? 'on' : 'off'}`;
+    badge.textContent = status;
+    head.append(title, badge);
+    card.append(head);
+
+    const meta = document.createElement('p');
+    meta.className = 'muted';
+    const parts = [
+      `created ${formatWhen(token.created_at)}`,
+      `expires ${formatWhen(token.expires_at)}`,
+      Number.isFinite(token.last_used_at)
+        ? `last used ${formatWhen(token.last_used_at)}`
+        : 'never used',
+    ];
+    meta.textContent = parts.join(' · ');
+    card.append(meta);
+
+    if (status === 'active') {
+      card.append(
+        button('Revoke', 'tiny danger', async () => {
+          if (
+            !(await confirmModal(
+              'Revoke automation token',
+              `Revoke "${token.label || 'this token'}"? Automation using it will stop working.`,
+              'Revoke',
+            ))
+          )
+            return;
+          await api(`/api/admin/automation-tokens/${encodeURIComponent(token.id)}`, {
+            method: 'DELETE',
+          });
+          await refreshAutomationTokens();
+        }),
+      );
+    }
+    container.append(card);
+  }
+}
+
+async function refreshAutomationTokens() {
+  try {
+    const { tokens } = await api('/api/admin/automation-tokens');
+    renderAutomationTokens(tokens || []);
+  } catch (error) {
+    const message = document.createElement('p');
+    message.className = 'error';
+    message.textContent = error.message;
+    $('automation-tokens').replaceChildren(message);
+  }
+}
+
 function renderGrants(grants) {
   const container = $('outbound-grants');
   container.replaceChildren();
@@ -532,6 +608,47 @@ $('create-form').addEventListener('submit', async (event) => {
   }
 });
 
+$('automation-token-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const error = $('automation-token-error');
+  error.hidden = true;
+  const label = $('automation-token-label').value.trim();
+  const expires = Number($('automation-token-expires').value);
+  if (!label || label.length > 100) {
+    error.textContent = 'Label must be 1 to 100 characters.';
+    error.hidden = false;
+    return;
+  }
+  if (!Number.isInteger(expires) || expires < 1 || expires > 365) {
+    error.textContent = 'Expiry must be between 1 and 365 days.';
+    error.hidden = false;
+    return;
+  }
+  const submit = $('automation-token-submit');
+  submit.disabled = true;
+  try {
+    const response = await api('/api/admin/automation-tokens', {
+      method: 'POST',
+      body: JSON.stringify({ label, expires_days: expires }),
+    });
+    if (!response.token) throw new Error('server did not return the automation token');
+    $('automation-token-form').reset();
+    $('automation-token-value').value = response.token;
+    $('automation-token-result').hidden = false;
+    $('automation-token-copy').textContent = 'Copy token';
+    $('automation-token-copy').onclick = async () => {
+      await navigator.clipboard.writeText(response.token);
+      $('automation-token-copy').textContent = 'Copied';
+    };
+    await refreshAutomationTokens();
+  } catch (requestError) {
+    error.textContent = requestError.message;
+    error.hidden = false;
+  } finally {
+    submit.disabled = false;
+  }
+});
+
 $('library-refresh').addEventListener('click', () => refreshLibrary());
 
 $('deliver-upload-form').addEventListener('submit', (event) => event.preventDefault());
@@ -596,4 +713,4 @@ $('deliver-form').addEventListener('submit', async (event) => {
 });
 
 await requireSession();
-await Promise.all([refreshLinks(), refreshLibrary()]);
+await Promise.all([refreshLinks(), refreshLibrary(), refreshAutomationTokens()]);

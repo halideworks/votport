@@ -16,6 +16,14 @@ use votport::{app, config};
 
 #[tokio::main]
 async fn main() {
+    let mut arguments = std::env::args().skip(1);
+    if arguments.next().as_deref() == Some("share") {
+        if let Err(error) = share(arguments.collect()).await {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+        return;
+    }
     tracing_subscriber::fmt()
         // RUST_LOG wins; info is the right default for a deployed server.
         .with_env_filter(
@@ -65,6 +73,139 @@ async fn main() {
     }
 }
 
+#[derive(Debug, PartialEq)]
+struct ShareArgs {
+    directory: String,
+    expires_days: u64,
+    label: Option<String>,
+}
+
+fn parse_share_args(arguments: Vec<String>) -> Result<ShareArgs, String> {
+    let mut directory = None;
+    let mut expires_days = 7;
+    let mut label = None;
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--expires" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--expires requires a value such as 7d".to_owned())?;
+                let value = value.strip_suffix('d').unwrap_or(&value);
+                expires_days = value
+                    .parse::<u64>()
+                    .map_err(|_| "--expires must be 1d through 30d".to_owned())?;
+                if !(1..=30).contains(&expires_days) {
+                    return Err("--expires must be 1d through 30d".to_owned());
+                }
+            }
+            "--label" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--label requires a value".to_owned())?;
+                if value.trim().is_empty() || value.len() > 200 {
+                    return Err("--label must be 1 through 200 characters".to_owned());
+                }
+                label = Some(value);
+            }
+            value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
+            value if directory.is_none() => {
+                if std::path::Path::new(value).is_absolute() {
+                    return Err("share directory must be relative and cannot contain ..".to_owned());
+                }
+                directory = Some(value.trim_end_matches('/').to_owned());
+            }
+            _ => return Err("share accepts one server-relative directory".to_owned()),
+        }
+    }
+    let directory = directory.filter(|value| !value.is_empty()).ok_or_else(|| {
+        "usage: votport share <server-relative-directory> [--expires 7d] [--label LABEL]".to_owned()
+    })?;
+    if std::path::Path::new(&directory)
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("share directory must be relative and cannot contain ..".to_owned());
+    }
+    Ok(ShareArgs {
+        directory,
+        expires_days,
+        label,
+    })
+}
+
+fn automation_url() -> Result<reqwest::Url, String> {
+    let base = std::env::var("VOTPORT_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned());
+    automation_url_from(&base)
+}
+
+fn automation_url_from(base: &str) -> Result<reqwest::Url, String> {
+    let base =
+        reqwest::Url::parse(base).map_err(|_| "VOTPORT_URL is not a valid URL".to_owned())?;
+    let loopback_http = base.scheme() == "http"
+        && base.host_str().is_some_and(|host| {
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        });
+    if (base.scheme() != "https" && !loopback_http)
+        || !base.username().is_empty()
+        || base.password().is_some()
+    {
+        return Err(
+            "VOTPORT_URL must have no credentials and use HTTPS unless it is loopback".to_owned(),
+        );
+    }
+    base.join("/api/automation/share")
+        .map_err(|_| "VOTPORT_URL cannot form the share endpoint".to_owned())
+}
+
+async fn share(arguments: Vec<String>) -> Result<(), String> {
+    let request = parse_share_args(arguments)?;
+    let token = std::env::var("VOTPORT_AUTOMATION_TOKEN")
+        .map_err(|_| "VOTPORT_AUTOMATION_TOKEN is required".to_owned())?;
+    if token.len() != 32 || !token.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return Err("VOTPORT_AUTOMATION_TOKEN is invalid".to_owned());
+    }
+    let password = std::env::var("VOTPORT_SHARE_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30 * 60))
+        .build()
+        .map_err(|error| format!("create HTTP client: {error}"))?;
+    let response = client
+        .post(automation_url()?)
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "directory": request.directory,
+            "expires_days": request.expires_days,
+            "label": request.label,
+            "password": password,
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("share request failed: {error}"))?;
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("share response was not JSON: {error}"))?;
+    if !status.is_success() {
+        return Err(body["error"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("share request failed ({status})")));
+    }
+    let url = body["url"]
+        .as_str()
+        .ok_or_else(|| "share response did not include a URL".to_owned())?;
+    println!("{url}");
+    Ok(())
+}
+
 async fn shutdown_signal() {
     // Docker and systemd stop the process with SIGTERM; ctrl_c is SIGINT
     // only. Without this a container stop skips graceful shutdown entirely.
@@ -86,4 +227,49 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     tracing::info!("shutting down");
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn share_arguments_parse_the_documented_command() {
+        assert_eq!(
+            parse_share_args(vec![
+                "project/render".to_owned(),
+                "--expires".to_owned(),
+                "14d".to_owned(),
+                "--label".to_owned(),
+                "Client delivery".to_owned(),
+            ])
+            .unwrap(),
+            ShareArgs {
+                directory: "project/render".to_owned(),
+                expires_days: 14,
+                label: Some("Client delivery".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn share_arguments_reject_escape_and_bad_expiry() {
+        assert!(parse_share_args(vec!["../project".to_owned()]).is_err());
+        assert!(parse_share_args(vec!["/project".to_owned()]).is_err());
+        assert!(parse_share_args(vec![
+            "project".to_owned(),
+            "--expires".to_owned(),
+            "31d".to_owned(),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn automation_url_requires_https_except_on_loopback() {
+        assert!(automation_url_from("https://files.example.com").is_ok());
+        assert!(automation_url_from("http://127.0.0.1:8080").is_ok());
+        assert!(automation_url_from("http://[::1]:8080").is_ok());
+        assert!(automation_url_from("http://files.example.com").is_err());
+        assert!(automation_url_from("https://user@files.example.com").is_err());
+    }
 }

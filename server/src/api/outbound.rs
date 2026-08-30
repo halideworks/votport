@@ -25,12 +25,13 @@ use super::{ApiError, ApiResult};
 use crate::api::admin;
 use crate::app::App;
 use crate::auth;
-use crate::store::{now_unix, OutboundGrant, OutboundGrantFile};
+use crate::store::{now_unix, AutomationToken, OutboundGrant, OutboundGrantFile};
 
 const MAX_ACTIVE: usize = 8;
 const CHUNK: usize = 1024 * 1024;
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
 const MAX_PASSWORD_BYTES: usize = 256;
+const MAX_AUTOMATION_LABEL_CHARS: usize = 100;
 
 #[derive(Deserialize)]
 pub struct OutboundPathQuery {
@@ -271,6 +272,110 @@ pub async fn list_outbound_grants(
     ))
 }
 
+#[derive(Deserialize)]
+pub struct AutomationTokenRequest {
+    label: String,
+    expires_days: u64,
+}
+
+pub async fn list_automation_tokens(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_automation_admin(&app, &headers)?;
+    let tokens = app
+        .store
+        .automation_tokens(&identity.tenant)
+        .map_err(super::store_unavailable)?;
+    Ok(Json(json!({
+        "tokens": tokens.iter().map(public_automation_token).collect::<Vec<_>>()
+    })))
+}
+
+pub async fn create_automation_token(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(request): Json<AutomationTokenRequest>,
+) -> ApiResult<Response> {
+    let identity = require_automation_admin(&app, &headers)?;
+    admin::require_admin_write(&headers, &identity)?;
+    let label = request.label.trim().to_owned();
+    if label.is_empty() || label.chars().count() > MAX_AUTOMATION_LABEL_CHARS {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "label must be 1..=100 characters",
+        ));
+    }
+    if !(1..=365).contains(&request.expires_days) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "expires_days must be 1..=365",
+        ));
+    }
+    let raw = auth::random_token();
+    let created_at = now_unix();
+    let token = AutomationToken {
+        id: auth::random_token(),
+        token_hash: hash_token(&raw),
+        tenant: identity.tenant.clone(),
+        label,
+        created_at,
+        expires_at: created_at.saturating_add(request.expires_days * 86_400),
+        revoked_at: None,
+        last_used_at: None,
+    };
+    app.store
+        .insert_automation_token(token.clone())
+        .map_err(ApiError::internal)?;
+    app.store.audit(
+        &identity.tenant,
+        &identity.subject,
+        "automation_token_created",
+        &token.id,
+        &json!({ "label": token.label, "expires_at": token.expires_at }),
+    );
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "token": raw,
+            "automation_token": public_automation_token(&token),
+        })),
+    )
+        .into_response())
+}
+
+pub async fn delete_automation_token(
+    State(app): State<Arc<App>>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_automation_admin(&app, &headers)?;
+    admin::require_admin_write(&headers, &identity)?;
+    if !app
+        .store
+        .revoke_automation_token(&identity.tenant, &id, now_unix())
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::not_found());
+    }
+    app.store.audit(
+        &identity.tenant,
+        &identity.subject,
+        "automation_token_revoked",
+        &id,
+        &json!({}),
+    );
+    Ok(Json(json!({ "ok": true })))
+}
+
+fn require_automation_admin(app: &App, headers: &HeaderMap) -> ApiResult<auth::AdminIdentity> {
+    let identity = admin::require_admin(app, headers)?;
+    if identity.role != "admin" {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "admin role required"));
+    }
+    Ok(identity)
+}
+
 pub async fn create_outbound_grant(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -384,6 +489,153 @@ pub async fn create_outbound_grant(
         Json(json!({ "grant": public_grant(grant), "url": format!("{base}/s/{token}") })),
     )
         .into_response())
+}
+
+#[derive(Deserialize)]
+pub struct AutomationShareRequest {
+    directory: String,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    expires_days: u64,
+}
+
+pub async fn automation_share(
+    State(app): State<Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<AutomationShareRequest>,
+) -> ApiResult<Response> {
+    let ip = super::client_ip(&headers, &peer, &app.config.trusted_proxies);
+    if !app.automation_rate.allow(&ip) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many automation shares; try again later",
+        ));
+    }
+    let bearer = automation_bearer(&headers)?;
+    let token = app
+        .store
+        .authenticate_automation_token(&hash_token(&bearer), now_unix())
+        .map_err(super::store_unavailable)?
+        .ok_or_else(ApiError::unauthorized)?;
+    if !(1..=30).contains(&request.expires_days) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "expires_days must be 1..=30",
+        ));
+    }
+    let directory_label = request.directory.clone();
+    let directory = automation_directory(&app, &token.tenant, &request.directory)?;
+    let paths = enumerate_automation_files(&library_root(&app, &token.tenant), &directory)?;
+    let identity = auth::AdminIdentity {
+        subject: format!("automation:{}", token.id),
+        tenant: token.tenant,
+        role: "admin".to_owned(),
+        grants: Vec::new(),
+        credential_version: 1,
+    };
+    create_library_grant(
+        &app,
+        &headers,
+        &identity,
+        &paths,
+        request.label.or(Some(directory_label)),
+        hash_optional_password(request.password.as_deref())?,
+        request.expires_days,
+    )
+    .await
+}
+
+fn automation_bearer(headers: &HeaderMap) -> ApiResult<String> {
+    let value = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|token| valid_token(token))
+        .ok_or_else(ApiError::unauthorized)?;
+    Ok(value.to_owned())
+}
+
+fn automation_directory(app: &App, tenant: &str, directory: &str) -> ApiResult<PathBuf> {
+    if directory.is_empty() || Path::new(directory).is_absolute() || directory.contains('\\') {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "directory must be a relative path",
+        ));
+    }
+    let root = library_root(app, tenant);
+    let path = safe_library_path(app, tenant, directory)?;
+    if !library_components_safe(&root, &path) {
+        return Err(ApiError::not_found());
+    }
+    let metadata = std::fs::symlink_metadata(&path).map_err(|_| ApiError::not_found())?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(ApiError::not_found());
+    }
+    Ok(path)
+}
+
+fn enumerate_automation_files(root: &Path, directory: &Path) -> ApiResult<Vec<String>> {
+    fn visit(root: &Path, directory: &Path, paths: &mut Vec<String>) -> ApiResult<()> {
+        let mut entries = std::fs::read_dir(directory)
+            .map_err(|_| ApiError::not_found())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ApiError::not_found())?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|_| ApiError::not_found())?;
+            if metadata.file_type().is_symlink() {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "directory contains a symlink",
+                ));
+            }
+            if metadata.file_type().is_dir() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with(".vot-")
+                    && name.to_string_lossy().ends_with(".stage")
+                {
+                    continue;
+                }
+                visit(root, &path, paths)?;
+            } else if metadata.file_type().is_file() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with(".vot-")
+                    && name.to_string_lossy().ends_with(".stage")
+                {
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|_| ApiError::not_found())?
+                    .to_str()
+                    .ok_or_else(ApiError::not_found)?
+                    .replace('\\', "/");
+                paths.push(relative);
+                if paths.len() > 64 {
+                    return Err(ApiError::new(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "directory contains too many files",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let mut paths = Vec::new();
+    visit(root, directory, &mut paths)?;
+    paths.sort();
+    if paths.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "directory contains no files",
+        ));
+    }
+    Ok(paths)
 }
 
 async fn create_library_grant(
@@ -1331,6 +1583,18 @@ fn public_grant(grant: OutboundGrant) -> serde_json::Value {
     json!({ "id": grant.id, "tenant": grant.tenant, "link_id": grant.link_id, "upload_id": grant.upload_id, "file_index": grant.file_index, "name": grant.name, "label": grant.label, "has_password": grant.password_hash.is_some(), "created_at": grant.created_at, "expires_at": grant.expires_at, "revoked_at": grant.revoked_at, "downloads": grant.downloads, "first_download_at": grant.first_download_at, "last_download_at": grant.last_download_at, "files": grant.files.iter().map(|file| json!({ "name": file.name, "suite": file.suite, "root": file.root, "bytes": file.bytes, "downloads": file.downloads, "first_download_at": file.first_download_at, "last_download_at": file.last_download_at })).collect::<Vec<_>>() })
 }
 
+fn public_automation_token(token: &AutomationToken) -> serde_json::Value {
+    json!({
+        "id": token.id,
+        "tenant": token.tenant,
+        "label": token.label,
+        "created_at": token.created_at,
+        "expires_at": token.expires_at,
+        "revoked_at": token.revoked_at,
+        "last_used_at": token.last_used_at,
+    })
+}
+
 struct ActiveDownload {
     app: Arc<App>,
     key: String,
@@ -1503,6 +1767,16 @@ mod tests {
     #[test]
     fn hashes_are_not_raw_tokens() {
         assert_ne!(hash_token("a"), "a");
+    }
+    #[test]
+    fn automation_share_rate_is_bounded_per_ip() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        for _ in 0..60 {
+            assert!(app.automation_rate.allow("127.0.0.1"));
+        }
+        assert!(!app.automation_rate.allow("127.0.0.1"));
+        assert!(app.automation_rate.allow("127.0.0.2"));
     }
     #[test]
     fn filenames_are_single_safe_components() {
@@ -2146,5 +2420,165 @@ mod tests {
         assert_eq!(listed["files"][0]["path"], "a.bin");
         assert_eq!(listed["files"][1]["path"], "z.bin");
         assert_eq!(listed["files"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn automation_token_shares_recursive_library_without_leaking_token() {
+        let (_directory, app, cookie, _bytes) = fixture().await;
+        std::fs::create_dir_all(app.config.outbound_dir.join("project/sub")).unwrap();
+        std::fs::write(app.config.outbound_dir.join("project/a.txt"), b"a").unwrap();
+        std::fs::write(app.config.outbound_dir.join("project/sub/b.txt"), b"b").unwrap();
+        let create = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/automation-tokens")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"label":"CI","expires_days":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::OK);
+        assert_eq!(
+            create.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let created = body(create).await;
+        let raw = created["token"].as_str().unwrap().to_owned();
+        assert!(valid_token(&raw));
+        assert!(created["automation_token"].get("token_hash").is_none());
+
+        let listed = crate::app::router(app.clone())
+            .oneshot(
+                Request::get("/api/admin/automation-tokens")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let listed = body(listed).await;
+        assert!(listed["tokens"][0].get("token_hash").is_none());
+        assert!(listed["tokens"][0].get("token").is_none());
+
+        for authorization in [None, Some("Bearer nope")] {
+            let mut request = Request::post("/api/automation/share")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"directory":"project","expires_days":1}"#))
+                .unwrap();
+            if let Some(value) = authorization {
+                request
+                    .headers_mut()
+                    .insert(header::AUTHORIZATION, HeaderValue::from_static(value));
+            }
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    10,
+                ))));
+            assert_eq!(
+                crate::app::router(app.clone())
+                    .oneshot(request)
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        let share = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/automation/share")
+                    .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        11,
+                    ))))
+                    .body(Body::from(r#"{"directory":"project","expires_days":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(share.status(), StatusCode::OK);
+        let share = body(share).await;
+        assert_eq!(share["grant"]["label"], "project");
+        assert_eq!(share["grant"]["files"][0]["name"], "project/a.txt");
+        assert_eq!(share["grant"]["files"][1]["name"], "project/sub/b.txt");
+        assert_eq!(share["grant"]["has_password"], false);
+
+        for directory in ["/project", "../project", "project/../project"] {
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::post("/api/automation/share")
+                        .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                        .header("content-type", "application/json")
+                        .extension(ConnectInfo(std::net::SocketAddr::from((
+                            [127, 0, 0, 1],
+                            12,
+                        ))))
+                        .body(Body::from(format!(
+                            r#"{{"directory":"{directory}","expires_days":1}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                app.config.outbound_dir.join("project/a.txt"),
+                app.config.outbound_dir.join("project/link"),
+            )
+            .unwrap();
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::post("/api/automation/share")
+                        .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                        .header("content-type", "application/json")
+                        .extension(ConnectInfo(std::net::SocketAddr::from((
+                            [127, 0, 0, 1],
+                            13,
+                        ))))
+                        .body(Body::from(r#"{"directory":"project","expires_days":1}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+
+        let id = created["automation_token"]["id"].as_str().unwrap();
+        let revoke = crate::app::router(app.clone())
+            .oneshot(
+                Request::delete(format!("/api/admin/automation-tokens/{id}"))
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoke.status(), StatusCode::OK);
+        let denied = crate::app::router(app)
+            .oneshot(
+                Request::post("/api/automation/share")
+                    .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        14,
+                    ))))
+                    .body(Body::from(r#"{"directory":"project","expires_days":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
     }
 }

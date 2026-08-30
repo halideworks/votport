@@ -104,6 +104,18 @@ pub struct OutboundGrant {
     pub files: Vec<OutboundGrantFile>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutomationToken {
+    pub id: String,
+    pub token_hash: String,
+    pub tenant: String,
+    pub label: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub revoked_at: Option<u64>,
+    pub last_used_at: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutboundDownloadResult {
     pub first_download: bool,
@@ -282,7 +294,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-const SCHEMA_VERSION: u64 = 11;
+const SCHEMA_VERSION: u64 = 12;
 
 const SETTINGS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS settings (
@@ -360,6 +372,21 @@ const OUTBOUND_GRANTS_PASSWORD_SCHEMA: &str =
 const OUTBOUND_GRANTS_DELIVERY_SCHEMA: &str =
     "ALTER TABLE outbound_grants ADD COLUMN first_download_at INTEGER;
      ALTER TABLE outbound_grants ADD COLUMN last_download_at INTEGER;";
+
+const AUTOMATION_TOKENS_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS automation_tokens (
+    id TEXT PRIMARY KEY,
+    token_hash TEXT UNIQUE NOT NULL,
+    tenant TEXT NOT NULL,
+    label TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    revoked_at INTEGER,
+    last_used_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS automation_tokens_tenant_created
+    ON automation_tokens(tenant, created_at);
+";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -655,6 +682,11 @@ impl Store {
                 .execute_batch(OUTBOUND_GRANTS_DELIVERY_SCHEMA)
                 .map_err(|error| format!("schema: {error}"))?;
         }
+        if stored < 12 {
+            transaction
+                .execute_batch(AUTOMATION_TOKENS_SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
+        }
         transaction
             .execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
@@ -754,6 +786,79 @@ impl Store {
                     [hash],
                 )
                 .map(|_| ())
+        })
+    }
+
+    pub fn insert_automation_token(&self, token: AutomationToken) -> Result<(), String> {
+        self.with(|connection| {
+            connection
+                .execute(
+                    "INSERT INTO automation_tokens
+                         (id, token_hash, tenant, label, created_at, expires_at, revoked_at,
+                          last_used_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![
+                        token.id,
+                        token.token_hash,
+                        token.tenant,
+                        token.label,
+                        i64::try_from(token.created_at).unwrap_or(i64::MAX),
+                        i64::try_from(token.expires_at).unwrap_or(i64::MAX),
+                        token
+                            .revoked_at
+                            .map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
+                        token
+                            .last_used_at
+                            .map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
+                    ],
+                )
+                .map(|_| ())
+        })
+    }
+
+    pub fn automation_tokens(&self, tenant: &str) -> Result<Vec<AutomationToken>, String> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, token_hash, tenant, label, created_at, expires_at, revoked_at,
+                        last_used_at
+                 FROM automation_tokens
+                 WHERE tenant = ?1 ORDER BY created_at, rowid",
+            )?;
+            let rows = statement.query_map([tenant], map_automation_token)?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    pub fn authenticate_automation_token(
+        &self,
+        token_hash: &str,
+        at: u64,
+    ) -> Result<Option<AutomationToken>, String> {
+        let at = i64::try_from(at).unwrap_or(i64::MAX);
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "UPDATE automation_tokens
+                     SET last_used_at = ?2
+                     WHERE token_hash = ?1 AND revoked_at IS NULL AND expires_at > ?2
+                     RETURNING id, token_hash, tenant, label, created_at, expires_at,
+                               revoked_at, last_used_at",
+                    rusqlite::params![token_hash, at],
+                    map_automation_token,
+                )
+                .optional()
+        })
+    }
+
+    pub fn revoke_automation_token(&self, tenant: &str, id: &str, at: u64) -> Result<bool, String> {
+        self.with(|connection| {
+            connection
+                .execute(
+                    "UPDATE automation_tokens SET revoked_at = ?3
+                     WHERE tenant = ?1 AND id = ?2 AND revoked_at IS NULL",
+                    rusqlite::params![tenant, id, i64::try_from(at).unwrap_or(i64::MAX)],
+                )
+                .map(|changed| changed > 0)
         })
     }
 
@@ -1867,6 +1972,23 @@ fn map_outbound_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboundGrant
     })
 }
 
+fn map_automation_token(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationToken> {
+    Ok(AutomationToken {
+        id: row.get("id")?,
+        token_hash: row.get("token_hash")?,
+        tenant: row.get("tenant")?,
+        label: row.get("label")?,
+        created_at: row.get::<_, i64>("created_at")?.max(0) as u64,
+        expires_at: row.get::<_, i64>("expires_at")?.max(0) as u64,
+        revoked_at: row
+            .get::<_, Option<i64>>("revoked_at")?
+            .and_then(|value| u64::try_from(value).ok()),
+        last_used_at: row
+            .get::<_, Option<i64>>("last_used_at")?
+            .and_then(|value| u64::try_from(value).ok()),
+    })
+}
+
 fn read_link(connection: &Connection, tenant: &str, id: &str) -> Result<Option<Link>, String> {
     connection
         .query_row(
@@ -2432,6 +2554,19 @@ mod tests {
         }
     }
 
+    fn test_automation_token(id: &str, tenant: &str) -> AutomationToken {
+        AutomationToken {
+            id: id.to_owned(),
+            token_hash: format!("hash-{id}"),
+            tenant: tenant.to_owned(),
+            label: format!("Token {id}"),
+            created_at: 10,
+            expires_at: 20,
+            revoked_at: None,
+            last_used_at: None,
+        }
+    }
+
     #[test]
     fn outbound_grants_migrate_and_round_trip_full_byte_range() {
         let directory = tempfile::tempdir().unwrap();
@@ -2445,7 +2580,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(schema, "11");
+        assert_eq!(schema, "12");
         assert!(store
             .with(|connection| {
                 connection.query_row(
@@ -2534,6 +2669,65 @@ mod tests {
                 .id,
             "g1"
         );
+    }
+
+    #[test]
+    fn automation_tokens_round_trip_and_list_by_tenant() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let token = test_automation_token("t1", "acme");
+        store.insert_automation_token(token.clone()).unwrap();
+        store
+            .insert_automation_token(test_automation_token("t2", "other"))
+            .unwrap();
+
+        assert_eq!(store.automation_tokens("acme").unwrap(), vec![token]);
+        assert!(store.automation_tokens("missing").unwrap().is_empty());
+    }
+
+    #[test]
+    fn automation_token_authentication_updates_last_used_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .insert_automation_token(test_automation_token("t1", "acme"))
+            .unwrap();
+
+        let authenticated = store
+            .authenticate_automation_token("hash-t1", 15)
+            .unwrap()
+            .unwrap();
+        assert_eq!(authenticated.last_used_at, Some(15));
+        assert_eq!(store.automation_tokens("acme").unwrap()[0], authenticated);
+        assert!(store
+            .authenticate_automation_token("hash-t1", 20)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn automation_token_revocation_is_tenant_scoped_and_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .insert_automation_token(test_automation_token("t1", "acme"))
+            .unwrap();
+
+        assert!(!store.revoke_automation_token("other", "t1", 12).unwrap());
+        assert!(store
+            .authenticate_automation_token("hash-t1", 15)
+            .unwrap()
+            .is_some());
+        assert!(store.revoke_automation_token("acme", "t1", 16).unwrap());
+        assert!(!store.revoke_automation_token("acme", "t1", 17).unwrap());
+        assert_eq!(
+            store.automation_tokens("acme").unwrap()[0].revoked_at,
+            Some(16)
+        );
+        assert!(store
+            .authenticate_automation_token("hash-t1", 18)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -3813,9 +4007,9 @@ mod settings_tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         drop(store);
-        assert_eq!(schema_version(directory.path()), "11");
+        assert_eq!(schema_version(directory.path()), "12");
         Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "11");
+        assert_eq!(schema_version(directory.path()), "12");
     }
 
     #[test]
@@ -3837,7 +4031,7 @@ mod settings_tests {
                 .unwrap();
         }
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "11");
+        assert_eq!(schema_version(directory.path()), "12");
         assert!(store.principals().unwrap().is_empty());
         assert!(store.principal("nobody").unwrap().is_none());
     }
@@ -3859,7 +4053,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "11");
+        assert_eq!(schema_version(directory.path()), "12");
         assert!(!store.link("", "old-link").unwrap().unwrap().legal_hold);
     }
 
@@ -3899,7 +4093,7 @@ mod settings_tests {
         drop(store);
 
         let reopened = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "11");
+        assert_eq!(schema_version(directory.path()), "12");
         assert_eq!(reopened.tenant_received_bytes("").unwrap(), 9);
     }
 
@@ -3941,7 +4135,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "11");
+        assert_eq!(schema_version(directory.path()), "12");
         let grant = store
             .outbound_grant_by_token_hash("hash-g1")
             .unwrap()
@@ -3993,7 +4187,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "11");
+        assert_eq!(schema_version(directory.path()), "12");
         let grant = store
             .outbound_grant_by_token_hash("hash-g1")
             .unwrap()
@@ -4023,7 +4217,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "11");
+        assert_eq!(schema_version(directory.path()), "12");
         let columns: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('outbound_grants')
@@ -4033,6 +4227,43 @@ mod settings_tests {
             )
             .unwrap();
         assert_eq!(columns, 2);
+    }
+
+    #[test]
+    fn v11_database_adds_automation_tokens() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(Store::open(directory.path()).unwrap());
+        {
+            let connection = Connection::open(directory.path().join("votport.db")).unwrap();
+            connection
+                .execute_batch(
+                    "DROP TABLE automation_tokens;
+                     UPDATE meta SET value = '11' WHERE key = 'schema_version';",
+                )
+                .unwrap();
+        }
+
+        drop(Store::open(directory.path()).unwrap());
+        let connection = Connection::open(directory.path().join("votport.db")).unwrap();
+        assert_eq!(schema_version(directory.path()), "12");
+        let table_exists: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'automation_tokens'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_exists, 1);
+        let index_exists: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'automation_tokens_tenant_created'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_exists, 1);
     }
 
     #[test]
