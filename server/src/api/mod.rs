@@ -16,8 +16,9 @@ pub use admin::{
     revoke_principal, switch_tenant, unblock_principal, update_link, update_tenant,
 };
 pub use outbound::{
-    create_outbound_grant, delete_outbound_grant, list_outbound_grants, outbound_file,
-    outbound_metadata, outbound_receipt,
+    create_outbound_grant, delete_outbound_grant, list_outbound_files, list_outbound_grants,
+    outbound_file, outbound_file_indexed, outbound_metadata, outbound_receipt,
+    outbound_receipt_indexed, upload_outbound_file,
 };
 pub use sso::{sso_available, sso_callback, sso_start};
 pub use upload::{
@@ -217,6 +218,7 @@ pub(crate) mod testing {
             push_advertise: None,
             data_dir: directory.join("data"),
             receive_dir: directory.join("received"),
+            outbound_dir: directory.join("outbound"),
             web_root: std::path::PathBuf::from("../web"),
             admin_password_hash: crate::auth::hash_password(TEST_PASSWORD).unwrap(),
             admin_token_tag: "test-tag".to_owned(),

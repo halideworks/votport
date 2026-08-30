@@ -349,6 +349,10 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     std::fs::create_dir_all(&config.receive_dir)
         .map_err(|error| format!("create {}: {error}", config.receive_dir.display()))?;
     crate::paths::tighten_dir(&config.receive_dir);
+    std::fs::create_dir_all(&config.outbound_dir)
+        .map_err(|error| format!("create {}: {error}", config.outbound_dir.display()))?;
+    crate::paths::tighten_dir(&config.outbound_dir);
+    crate::paths::clean_staging(&config.outbound_dir);
     let store = Arc::new(Store::open(&config.data_dir)?);
     clean_outbound_stage(&config.data_dir);
     store.migrate_tenant_storage(&config.receive_dir)?;
@@ -459,6 +463,18 @@ mod outbound_stage_tests {
 
         assert!(!owned.exists());
         assert!(unrelated.join("file").exists());
+    }
+
+    #[test]
+    fn startup_cleanup_removes_orphaned_outbound_library_stages() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let stage = app.config.outbound_dir.join(".vot-crash.stage");
+        std::fs::write(&stage, b"staged").unwrap();
+        drop(app);
+
+        let _app = crate::api::testing::build(directory.path());
+        assert!(!stage.exists());
     }
 }
 
@@ -911,6 +927,10 @@ pub fn router(app: Arc<App>) -> Router {
             "/api/admin/outbound-grants/{id}",
             axum::routing::delete(api::delete_outbound_grant),
         )
+        .route(
+            "/api/admin/outbound-files",
+            get(api::list_outbound_files).post(api::upload_outbound_file),
+        )
         .route("/api/admin/password", post(api::admin_change_password))
         .route(
             "/api/admin/links",
@@ -953,6 +973,14 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/s/{token}", get(api::outbound_metadata))
         .route("/api/s/{token}/receipt", get(api::outbound_receipt))
         .route("/api/s/{token}/file", get(api::outbound_file))
+        .route(
+            "/api/s/{token}/files/{index}",
+            get(api::outbound_file_indexed),
+        )
+        .route(
+            "/api/s/{token}/receipts/{index}",
+            get(api::outbound_receipt_indexed),
+        )
         .route(
             "/api/session/{sid}/seal",
             post(api::upload_seal).layer(DefaultBodyLimit::max(session::MAX_SEAL_BYTES + 1024)),
@@ -1917,6 +1945,7 @@ mod retention_tests {
                 expires_at: cutoff.saturating_add(86_400),
                 revoked_at: None,
                 downloads: 0,
+                files: Vec::new(),
             })
             .unwrap();
 

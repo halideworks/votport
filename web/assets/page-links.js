@@ -43,13 +43,14 @@ function showGrantResult(url) {
   };
 }
 
-async function issueGrant(link, upload, fileIndex) {
+async function issueReceivedGrant(link, upload, fileIndex, file) {
   const response = await api('/api/admin/outbound-grants', {
     method: 'POST',
     body: JSON.stringify({
       link_id: link.id,
       upload_id: upload.id,
       file_index: fileIndex,
+      label: file.path,
       expires_days: 7,
     }),
   });
@@ -109,7 +110,7 @@ function renderUpload(link, upload) {
       extras.push(receipt);
     }
     if (file.exists && file.receipt) {
-      extras.push(button('Send', 'tiny', () => issueGrant(link, upload, index)));
+      extras.push(button('Send', 'tiny', () => issueReceivedGrant(link, upload, index, file)));
     }
     if (file.exists) {
       extras.push(
@@ -218,6 +219,63 @@ async function refreshGrants() {
     error.className = 'muted';
     error.textContent = 'Issued downloads could not be loaded.';
     $('outbound-grants').replaceChildren(error);
+  }
+}
+
+function libraryPath(file) {
+  const relative = file.webkitRelativePath || file.name;
+  const project = $('deliver-project').value.trim().replace(/^\/+|\/+$/g, '');
+  return project ? `${project}/${relative}` : relative;
+}
+
+async function uploadLibraryFile(file, path) {
+  const response = await fetch(`/api/admin/outbound-files?path=${encodeURIComponent(path)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': file.type || 'application/octet-stream', 'X-Votport': '1' },
+    credentials: 'same-origin',
+    body: file,
+  });
+  let body = null;
+  try { body = await response.json(); } catch { /* empty success response */ }
+  if (!response.ok) throw new Error(body?.error || `upload failed (${response.status})`);
+}
+
+function renderLibrary(files) {
+  const container = $('library-files');
+  container.replaceChildren();
+  if (!files.length) {
+    const empty = document.createElement('p');
+    empty.className = 'muted';
+    empty.textContent = 'No library files.';
+    container.append(empty);
+    return;
+  }
+  for (const file of files) {
+    const label = document.createElement('label');
+    label.className = 'library-file';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.value = file.path;
+    const name = document.createElement('span');
+    name.className = 'mono';
+    name.textContent = file.path;
+    const size = document.createElement('span');
+    size.className = 'muted';
+    size.textContent = formatBytes(file.bytes);
+    label.append(checkbox, name, size);
+    container.append(label);
+  }
+}
+
+async function refreshLibrary() {
+  try {
+    const { files } = await api('/api/admin/outbound-files');
+    renderLibrary(files || []);
+  } catch (error) {
+    const message = document.createElement('p');
+    message.className = 'error';
+    message.textContent = error.message;
+    $('library-files').replaceChildren(message);
   }
 }
 
@@ -415,5 +473,62 @@ $('create-form').addEventListener('submit', async (event) => {
   }
 });
 
+$('library-refresh').addEventListener('click', () => refreshLibrary());
+
+$('deliver-upload-form').addEventListener('submit', (event) => event.preventDefault());
+$('library-input').addEventListener('change', async (event) => {
+  const input = event.currentTarget;
+  const files = [...input.files];
+  if (!files.length) return;
+  input.disabled = true;
+  $('library-status').textContent = `Uploading 0 of ${files.length} files…`;
+  try {
+    for (const [index, file] of files.entries()) {
+      await uploadLibraryFile(file, libraryPath(file));
+      $('library-status').textContent = `Uploading ${index + 1} of ${files.length} files…`;
+    }
+    $('library-status').textContent = `${files.length} file${files.length === 1 ? '' : 's'} added.`;
+    await refreshLibrary();
+  } catch (error) {
+    $('library-status').textContent = error.message;
+  } finally {
+    input.disabled = false;
+    input.value = '';
+  }
+});
+
+$('deliver-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  $('deliver-error').hidden = true;
+  const paths = [...$('library-files').querySelectorAll('input[type="checkbox"]:checked')]
+    .map((checkbox) => checkbox.value);
+  const expires = Number($('deliver-expires').value);
+  if (!paths.length) {
+    $('deliver-error').textContent = 'Select at least one file.';
+    $('deliver-error').hidden = false;
+    return;
+  }
+  if (!Number.isInteger(expires) || expires < 1 || expires > 30) {
+    $('deliver-error').textContent = 'Expiry must be between 1 and 30 days.';
+    $('deliver-error').hidden = false;
+    return;
+  }
+  $('deliver-submit').disabled = true;
+  try {
+    const response = await api('/api/admin/outbound-grants', {
+      method: 'POST',
+      body: JSON.stringify({ paths, label: $('deliver-label').value, expires_days: expires }),
+    });
+    if (!response.url) throw new Error('server did not return a download URL');
+    showGrantResult(response.url);
+    await refreshGrants();
+  } catch (error) {
+    $('deliver-error').textContent = error.message;
+    $('deliver-error').hidden = false;
+  } finally {
+    $('deliver-submit').disabled = false;
+  }
+});
+
 await requireSession();
-await refreshLinks();
+await Promise.all([refreshLinks(), refreshLibrary()]);

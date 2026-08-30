@@ -16,6 +16,15 @@ function showError(message) {
   $('status').textContent = 'Download unavailable';
 }
 
+function downloadButton(text, url, classes) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = classes;
+  button.textContent = text;
+  button.addEventListener('click', () => { window.location.assign(url); });
+  return button;
+}
+
 async function loadMetadata() {
   let response;
   try {
@@ -41,32 +50,48 @@ async function loadMetadata() {
     showError('This download link has expired.');
     return;
   }
-  if (
-    !body.download_url ||
-    !body.receipt_url ||
-    !body.receipt_key ||
-    !body.name ||
-    !body.suite ||
-    !body.root ||
-    typeof body.bytes !== 'number'
-  ) {
+  const files = Array.isArray(body.files) && body.files.length
+    ? body.files
+    : body.download_url && body.receipt_url
+      ? [{
+          name: body.name,
+          suite: body.suite,
+          root: body.root,
+          bytes: body.bytes ?? body.length,
+          download_url: body.download_url,
+          receipt_url: body.receipt_url,
+        }]
+      : [];
+  if (!body.receipt_key || !files.length || files.some((file) =>
+    !file.download_url ||
+    !file.receipt_url ||
+    !file.name ||
+    !file.suite ||
+    !file.root ||
+    typeof file.bytes !== 'number'
+  )) {
     showError('The server returned incomplete download metadata.');
     return;
   }
 
   $('title').textContent = body.label || 'Verified download';
   $('status').textContent = 'The server verifies the file against this identity before download.';
-  appendObjectCard(
-    $('object'),
-    { name: body.name, suite: body.suite, root: body.root },
-    { status: formatBytes(body.bytes) },
-  );
+  for (const file of files) {
+    const extras = [
+      downloadButton('Download file', file.download_url, 'tiny'),
+      downloadButton('Download receipt', file.receipt_url, 'tiny ghost'),
+    ];
+    const row = appendObjectCard(
+      $('object'),
+      { name: file.name, suite: file.suite, root: file.root },
+      { status: formatBytes(file.bytes), extras },
+    );
+    row.setAttribute('aria-label', `Verified ${file.name}`);
+  }
   $('expires').textContent = body.expires_at
     ? `Link expires ${when(body.expires_at)}`
     : 'This link does not expire.';
   $('receipt-key').textContent = body.receipt_key;
-  $('download-file').addEventListener('click', () => { window.location.assign(body.download_url); });
-  $('download-receipt').addEventListener('click', () => { window.location.assign(body.receipt_url); });
   $('download-content').hidden = false;
 }
 

@@ -27,6 +27,7 @@ services:
       # votport state (links, secrets) — keep this private.
       - ./data:/data
       - /mediastorage-pool/vot-in:/received
+      - /mediastorage-pool/vot-out:/outbound
 
 networks:
   media-server_default:

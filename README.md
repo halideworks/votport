@@ -27,12 +27,14 @@ you (admin)                    them (any modern browser)
 /your/folder/…      ← files appear here, listed in the admin UI
 ```
 
-To send one of those files back out, choose **Send** beside it in the Links
-page. VOTPort issues a 7-day bearer URL that is shown once. Before a download
-starts, the server copies the source into private staging, verifies its VOT
-object identity and signed receipt, then serves that immutable verified copy.
-Revoking the URL blocks new downloads. Active URLs protect their source from
-manual deletion and automatic retention until they expire or are revoked.
+Received files still use **Send** beside a file on **Links**. For the outbound
+library, use the **Deliver files** card on **Links** to choose one or more
+files. Server-rendered projects may populate nested project subdirectories
+under the outbound directory, and admin uploads land there too. VOTPort issues
+one expiring bearer URL for the selection, shown once and revocable by an admin.
+Before a download starts, the server copies each source into private staging,
+verifies its VOT object identity and signed receipt, then serves an immutable
+verified copy.
 
 ## Why VOT instead of a plain upload form?
 
@@ -60,6 +62,7 @@ cd votport
 #   - set VOTPORT_ADMIN_PASSWORD
 #   - set VOTPORT_PUBLIC_URL to the https URL Caddy will serve
 #   - point the /received volume at the folder that should receive files
+#   - point the /outbound volume at the folder for outbound library files
 docker compose up -d --build
 ```
 
@@ -99,6 +102,7 @@ so env applies again. Details: [`docs/deployment.md`](docs/deployment.md).
 | `VOTPORT_PUSH_CERT` / `VOTPORT_PUSH_KEY` | generated | PEM certificate and private key for native push. Set both together to use those paths in place, or leave both unset for a persistent self-signed pair under `VOTPORT_DATA_DIR`. |
 | `VOTPORT_DATA_DIR` | `/data` | State: `votport.db` (links, upload records; legacy `state.json` is imported once) and the cookie secret. |
 | `VOTPORT_RECEIVE_DIR` | `/received` | Root folder received files are published into. |
+| `VOTPORT_OUTBOUND_DIR` | `/outbound` | Root folder for server-rendered projects and files uploaded by admins for outbound links. Nested project subdirectories are allowed. |
 | `VOTPORT_MAX_UPLOAD_BYTES` | 50 GiB | Hard cap per upload session (per-link caps can be lower). Accepts plain bytes or a `K/KiB/KB`, `M/MiB/MB`, `G/GiB/GB`, `T/TiB/TB` suffix, e.g. `500G`. |
 | `VOTPORT_ALLOW_HIDDEN` | off | Set `1` to accept dot-file names from uploaders. |
 | `VOTPORT_SESSION_IDLE_SECS` | `1800` | Idle time before an unfinished upload session is discarded. |
@@ -237,9 +241,12 @@ hashed, verified range by range, independent of every proxy in between.
    was written. Delete a file (and its receipt) or clear a
    transfer from history. Deactivate or delete links when done (files stay
    until you delete them or retention sweeps them).
-4. **Tenants** (platform admin): namespaces, quotas, principals, revoke.
-5. **Audit:** queryable event log and JSONL export.
-6. **System:** password, backup download, receipt public key, notify/SMTP,
+4. **Links, Deliver files:** browse nested project directories and
+   admin-uploaded files, select one or more files, and issue one expiring,
+   revocable download link.
+5. **Tenants** (platform admin): namespaces, quotas, principals, revoke.
+6. **Audit:** queryable event log and JSONL export.
+7. **System:** password, backup download, receipt public key, notify/SMTP,
    retention, default quotas.
 
 Senders can drop folders as well as files; browser support requires

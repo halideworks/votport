@@ -69,6 +69,7 @@ async fn start_server_inner_with_idle(
         push_advertise: None,
         data_dir: data.path().to_path_buf(),
         receive_dir: received.path().to_path_buf(),
+        outbound_dir: data.path().join("outbound"),
         web_root: PathBuf::from("./web"),
         admin_password_hash: auth::hash_password(ADMIN_PASSWORD).unwrap(),
         admin_token_tag: String::new(),
