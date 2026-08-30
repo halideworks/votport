@@ -1,6 +1,12 @@
 // Pure helpers for the public separate-download flow.
 
 export const MAX_ANCHOR_DOWNLOADS = 10;
+export const FILE_RENDER_BATCH_SIZE = 100;
+
+export function nextFileBatch(files, offset = 0) {
+  const start = Math.max(0, Math.min(offset, files.length));
+  return files.slice(start, start + FILE_RENDER_BATCH_SIZE);
+}
 
 export function anchorDownloadsAllowed(count) {
   return count <= MAX_ANCHOR_DOWNLOADS;

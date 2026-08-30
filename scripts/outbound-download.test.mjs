@@ -4,13 +4,16 @@ import { test } from 'node:test';
 import {
   anchorDownloadsAllowed,
   dedupeFilenames,
+  FILE_RENDER_BATCH_SIZE,
   MAX_ANCHOR_DOWNLOADS,
   runWorkerPool,
   sanitizeFilename,
   summarizeFailures,
+  nextFileBatch,
 } from '../web/assets/outbound-download.js';
 
 const outboundScript = await readFile(new URL('../web/assets/outbound.js', import.meta.url), 'utf8');
+const sendPage = await readFile(new URL('../web/send.html', import.meta.url), 'utf8');
 
 test('anchor download fallback is capped at the supported browser threshold', () => {
   assert.equal(MAX_ANCHOR_DOWNLOADS, 10);
@@ -21,6 +24,22 @@ test('anchor download fallback is capped at the supported browser threshold', ()
 test('anchor fallback copy explains the large-link limit', () => {
   assert.match(outboundScript, /Requested \$\{files\.length\} downloads/);
   assert.match(outboundScript, /Use Download everything or Chrome\/Edge folder selection/);
+});
+
+test('file batches are fixed and bounded at both ends', () => {
+  const files = Array.from({ length: 205 }, (_, index) => index);
+  assert.equal(FILE_RENDER_BATCH_SIZE, 100);
+  assert.deepEqual(nextFileBatch(files, 0), files.slice(0, 100));
+  assert.deepEqual(nextFileBatch(files, 100), files.slice(100, 200));
+  assert.deepEqual(nextFileBatch(files, 200), files.slice(200));
+  assert.deepEqual(nextFileBatch(files, 300), []);
+});
+
+test('public page wires an accessible bounded file list', () => {
+  assert.match(sendPage, /id="file-list-controls" hidden/);
+  assert.match(sendPage, /<button type="button" id="show-more-files" class="tiny ghost">Show more files<\/button>/);
+  assert.match(sendPage, /id="file-list-status" class="muted" aria-live="polite"/);
+  assert.match(outboundScript, /nextFileBatch\(metadataFiles, renderedFileCount\)/);
 });
 
 test('sanitizes flattened unsafe and reserved filenames', () => {
