@@ -4066,6 +4066,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn library_grant_restore_requires_outbound_volume() {
+        let (directory, app, cookie, expected) = fixture().await;
+        let source = app.config.outbound_dir.join("restore.bin");
+        std::fs::write(&source, &expected).unwrap();
+        let created = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"paths":["restore.bin"],"label":"restore"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let token = body(created).await["url"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let snapshot = directory.path().join("backup.db");
+        app.store.backup_into(&snapshot).unwrap();
+        let restored_directory = tempfile::tempdir().unwrap();
+        let restored_data = restored_directory.path().join("data");
+        std::fs::create_dir_all(&restored_data).unwrap();
+        std::fs::copy(&snapshot, restored_data.join("votport.db")).unwrap();
+        std::fs::copy(
+            directory.path().join("data/receipt.key"),
+            restored_data.join("receipt.key"),
+        )
+        .unwrap();
+        let restored = crate::api::testing::build(restored_directory.path());
+
+        let unavailable = crate::app::router(restored.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/files/0"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unavailable.status(), StatusCode::NOT_FOUND);
+
+        std::fs::create_dir_all(&restored.config.outbound_dir).unwrap();
+        std::fs::copy(&source, restored.config.outbound_dir.join("restore.bin")).unwrap();
+        let available = crate::app::router(restored)
+            .oneshot(
+                Request::get(format!("/api/s/{token}/files/0"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 2))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(available.status(), StatusCode::OK);
+        assert_eq!(
+            available.into_body().collect().await.unwrap().to_bytes(),
+            expected
+        );
+    }
+
+    #[tokio::test]
     async fn library_upload_limit_cleans_temporary_file() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = crate::api::testing::build(directory.path());
