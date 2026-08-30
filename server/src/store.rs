@@ -2466,7 +2466,7 @@ impl Store {
                  FROM audit_log
                  WHERE (?1 = '' OR tenant = ?1)
                    AND (?2 = '' OR event = ?2)
-                   AND (?3 = '' OR instr(lower(tenant), lower(?3)) > 0
+                   AND (?3 = '' OR instr(lower(CASE WHEN tenant = '' THEN 'default' ELSE tenant END), lower(?3)) > 0
                         OR instr(lower(actor), lower(?3)) > 0
                         OR instr(lower(event), lower(?3)) > 0
                         OR instr(lower(subject), lower(?3)) > 0)
@@ -2503,7 +2503,7 @@ impl Store {
              FROM audit_log
              WHERE (at > ?1 OR (at = ?1 AND rowid > ?2))
                AND (?3 = '' OR event = ?3)
-               AND (?4 = '' OR instr(lower(tenant), lower(?4)) > 0
+               AND (?4 = '' OR instr(lower(CASE WHEN tenant = '' THEN 'default' ELSE tenant END), lower(?4)) > 0
                     OR instr(lower(actor), lower(?4)) > 0
                     OR instr(lower(event), lower(?4)) > 0
                     OR instr(lower(subject), lower(?4)) > 0)
@@ -4493,6 +4493,7 @@ mod phase4_review_tests {
             "request-3",
             &serde_json::json!({}),
         );
+        store.audit("", "", "default_event", "request-4", &serde_json::json!({}));
 
         let filters = AuditFilters {
             event: Some("link_created"),
@@ -4516,6 +4517,20 @@ mod phase4_review_tests {
             )
             .unwrap();
         assert!(detail_only.is_empty());
+
+        let display_tenant = store
+            .audit_recent_filtered(
+                "",
+                0,
+                100,
+                AuditFilters {
+                    event: None,
+                    query: Some("DEFAULT"),
+                },
+            )
+            .unwrap();
+        assert_eq!(display_tenant.len(), 1);
+        assert_eq!(display_tenant[0].event, "default_event");
 
         let legacy = store
             .audit_export_filtered("acme", 0, 0, 100, filters)

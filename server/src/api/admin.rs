@@ -262,7 +262,7 @@ pub async fn admin_audit_export(
         }
     })
     .await
-    .map_err(|error| ApiError::internal(error.to_string()))?
+    .map_err(|_| ApiError::internal("audit query worker failed"))?
     .map_err(ApiError::internal)?;
     use std::fmt::Write as _;
     let mut body = String::new();
@@ -323,7 +323,8 @@ fn validate_audit_filter(value: Option<String>, name: &str) -> ApiResult<Option<
             format!("{name} must be at most 100 characters"),
         ));
     }
-    if value.trim().is_empty() {
+    let value = value.trim().to_owned();
+    if value.is_empty() {
         Ok(None)
     } else {
         Ok(Some(value))
@@ -1945,6 +1946,10 @@ mod audit_filter_tests {
         );
         assert!(validate_audit_filter(Some("🙂".repeat(100)), "q").is_ok());
         assert!(validate_audit_filter(Some("🙂".repeat(101)), "q").is_err());
+        assert_eq!(
+            validate_audit_filter(Some("  actor  ".to_owned()), "q").unwrap(),
+            Some("actor".to_owned())
+        );
     }
 }
 

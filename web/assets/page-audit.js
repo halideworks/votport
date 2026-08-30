@@ -54,6 +54,10 @@ function renderRow(row) {
   const subject = document.createElement('span');
   subject.textContent = row.subject ? ` ${row.subject}` : '';
 
+  const actor = document.createElement('span');
+  actor.className = 'muted';
+  actor.textContent = row.actor ? ` ${row.actor}` : '';
+
   const keys = Object.keys(row.detail ?? {});
   let details;
   if (keys.length) {
@@ -68,7 +72,7 @@ function renderRow(row) {
     details.append(summary, detail);
   }
 
-  line.append(when, event, subject);
+  line.append(when, event, subject, actor);
   if (details) line.append(details);
   return line;
 }
@@ -76,6 +80,7 @@ function renderRow(row) {
 async function load(reset = false) {
   if (loading) return;
   loading = true;
+  for (const control of $('audit-filters').elements) control.disabled = true;
   $('refresh').disabled = true;
   $('load-more').disabled = true;
   if (reset) {
@@ -108,6 +113,7 @@ async function load(reset = false) {
     $('load-more').hidden = rows.length < PAGE_SIZE;
   } finally {
     loading = false;
+    for (const control of $('audit-filters').elements) control.disabled = false;
     $('refresh').disabled = false;
     $('load-more').disabled = false;
   }
