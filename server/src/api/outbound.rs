@@ -27,7 +27,8 @@ use crate::api::admin;
 use crate::app::App;
 use crate::auth;
 use crate::store::{
-    now_unix, AutomationToken, OutboundGrant, OutboundGrantFile, OUTBOUND_DOWNLOAD_LIMIT_REACHED,
+    now_unix, AutomationToken, OutboundDownloadResult, OutboundGrant, OutboundGrantFile,
+    OUTBOUND_DOWNLOAD_LIMIT_REACHED,
 };
 
 const MAX_ACTIVE: usize = 8;
@@ -1131,7 +1132,7 @@ async fn outbound_file_inner(
     let file = tokio::fs::File::open(&stage.path)
         .await
         .map_err(|_| ApiError::internal("open staged file failed"))?;
-    record_download(&app, &grant.id, &[index])?;
+    record_download(&app, &grant, &[index])?;
     let stream = ReaderStream::new(OutboundReader {
         file,
         _stage: stage,
@@ -1220,7 +1221,7 @@ pub async fn outbound_bundle(
         .await
         .map_err(|_| ApiError::internal("open bundle failed"))?;
     let indexes: Vec<usize> = (0..count).collect();
-    record_download(&app, &grant.id, &indexes)?;
+    record_download(&app, &grant, &indexes)?;
     let stream = ReaderStream::new(BundleReader {
         file,
         _archive: archive,
@@ -1265,9 +1266,25 @@ fn active_grant(app: &App, token: &str) -> ApiResult<OutboundGrant> {
     Ok(grant)
 }
 
-fn record_download(app: &App, id: &str, indexes: &[usize]) -> ApiResult<()> {
-    match app.store.record_outbound_download(id, indexes, now_unix()) {
-        Ok(_) => Ok(()),
+fn record_download(
+    app: &Arc<App>,
+    grant: &OutboundGrant,
+    indexes: &[usize],
+) -> ApiResult<OutboundDownloadResult> {
+    match app
+        .store
+        .record_outbound_download(&grant.id, indexes, now_unix())
+    {
+        Ok(result) => {
+            if result.first_download || result.completed_delivery {
+                tokio::spawn(crate::notify::outbound_downloaded(
+                    Arc::clone(app),
+                    grant.clone(),
+                    result,
+                ));
+            }
+            Ok(result)
+        }
         Err(error) if error == OUTBOUND_DOWNLOAD_LIMIT_REACHED => Err(ApiError::not_found()),
         Err(_) => Err(ApiError::internal("record download failed")),
     }
