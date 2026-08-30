@@ -19,6 +19,7 @@ use crate::store::{now_unix, Link, LinkCursor};
 use super::{cookie_attributes, ApiError, ApiResult};
 
 const ADMIN_COOKIE: &str = "votport_admin";
+const MAX_PASSWORD_BYTES: usize = 256;
 
 /// Credential tag bound into admin token MACs: the stored hash when the
 /// UI has set one, else the stable tag derived from the environment
@@ -1086,6 +1087,7 @@ pub async fn switch_tenant(
     Json(request): Json<SwitchTenantRequest>,
 ) -> ApiResult<Response> {
     let identity = require_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
     let Some(grant) = identity
         .grants
         .iter()
@@ -1471,7 +1473,15 @@ pub async fn create_link(
         }
     }
     let password_hash = match request.password.as_deref().filter(|p| !p.is_empty()) {
-        Some(password) => Some(auth::hash_password(password).map_err(ApiError::internal)?),
+        Some(password) if password.len() <= MAX_PASSWORD_BYTES => {
+            Some(auth::hash_password(password).map_err(ApiError::internal)?)
+        }
+        Some(_) => {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "password must be at most 256 bytes",
+            ));
+        }
         None => None,
     };
     let tenant = identity.tenant.clone();
@@ -4905,6 +4915,62 @@ mod notification_and_limit_tests {
             .iter()
             .any(|link| link.max_bytes == Some(123)));
         assert_eq!(application.store.links("").unwrap()[0].max_bytes, None);
+    }
+
+    #[tokio::test]
+    async fn receive_link_passwords_are_limited_to_256_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = admin_cookie(&application);
+        let create = |password: String| {
+            let application = application.clone();
+            let cookie = cookie.clone();
+            async move {
+                app::router(application.clone())
+                    .oneshot(
+                        Request::post("/api/admin/links")
+                            .header("cookie", &cookie)
+                            .header("x-votport", "1")
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                json!({ "label": "test", "password": password }).to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+
+        assert_eq!(create("a".repeat(256)).await, StatusCode::OK);
+        assert_eq!(create("é".repeat(128)).await, StatusCode::OK);
+        assert_eq!(
+            create("a".repeat(257)).await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            create("é".repeat(129)).await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_tenant_requires_csrf_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = admin_cookie(&application);
+        let response = app::router(application)
+            .oneshot(
+                Request::post("/api/admin/tenant")
+                    .header("cookie", cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"tenant":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

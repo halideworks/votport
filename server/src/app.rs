@@ -884,6 +884,11 @@ mod health_tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
         assert!(std::fs::read_dir(receive)
             .unwrap()
             .flatten()
@@ -914,6 +919,11 @@ mod health_tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
     }
 
     #[tokio::test]
@@ -1127,6 +1137,18 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/session/{sid}/finish", post(api::upload_finish))
         .route("/api/session/{sid}/abort", post(api::upload_abort))
         .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(
+            tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+                axum::http::header::X_CONTENT_TYPE_OPTIONS,
+                axum::http::HeaderValue::from_static("nosniff"),
+            ),
+        )
+        .layer(
+            tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+                axum::http::header::REFERRER_POLICY,
+                axum::http::HeaderValue::from_static("no-referrer"),
+            ),
+        )
         .with_state(app)
 }
 

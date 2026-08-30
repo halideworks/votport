@@ -206,6 +206,13 @@ pub async fn sso_available(State(app): State<std::sync::Arc<App>>) -> Response {
 const STATE_COOKIE: &str = "votport_sso_x";
 const STATE_SECS: u64 = 600;
 
+fn clear_state_cookie(app: &App) -> String {
+    format!(
+        "{STATE_COOKIE}=; Path=/api/admin; HttpOnly; SameSite=Lax; Max-Age=0{}",
+        super::admin::sso_cookie_attributes(app)
+    )
+}
+
 fn sign_payload(secret: &[u8; 32], expires: u64, payload: &str) -> String {
     type HmacSha256 = hmac::Hmac<sha2::Sha256>;
     let mut mac = <HmacSha256 as hmac::digest::KeyInit>::new_from_slice(secret)
@@ -316,8 +323,7 @@ pub async fn sso_callback(
                 .store
                 .audit("", "", "sso_failed", "", &json!({ "reason": message }));
         }
-        let clear_state =
-            format!("{STATE_COOKIE}=; Path=/api/admin; HttpOnly; SameSite=Lax; Max-Age=0");
+        let clear_state = clear_state_cookie(&app_for_home);
         let target = if message.is_empty() {
             "/".to_owned()
         } else {
@@ -493,8 +499,7 @@ pub async fn sso_callback(
         Ok(cookie) => cookie,
         Err(_) => return home("could not complete sign-in"),
     };
-    let clear_state =
-        format!("{STATE_COOKIE}=; Path=/api/admin; HttpOnly; SameSite=Lax; Max-Age=0");
+    let clear_state = clear_state_cookie(&app);
     (
         [
             (header::SET_COOKIE, admin_cookie),
@@ -517,6 +522,21 @@ mod tests {
         assert!(azp_ok(Some("votport"), "votport"));
         assert!(!azp_ok(Some("other-client"), "votport"));
         assert!(!azp_ok(Some(""), "votport"));
+    }
+
+    #[test]
+    fn state_cookie_clearing_matches_the_configured_transport() {
+        let directory = tempfile::tempdir().unwrap();
+        let https = crate::api::testing::build(directory.path());
+        assert!(clear_state_cookie(&https).ends_with("; Secure"));
+
+        let mut config = crate::api::testing::config(directory.path());
+        config.data_dir = directory.path().join("http-data");
+        config.receive_dir = directory.path().join("http-received");
+        config.outbound_dir = directory.path().join("http-outbound");
+        config.public_url = Some("http://127.0.0.1:8080".to_owned());
+        let http = crate::app::build(config).unwrap();
+        assert!(!clear_state_cookie(&http).ends_with("; Secure"));
     }
 
     #[tokio::test]

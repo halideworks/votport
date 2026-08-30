@@ -247,6 +247,9 @@ pub fn from_env() -> Result<Config, String> {
         .ok()
         .map(|url| url.trim_end_matches('/').to_owned())
         .filter(|url| !url.is_empty());
+    if let Some(url) = public_url.as_deref() {
+        validate_public_url(url)?;
+    }
 
     let push_bind = optional("VOTPORT_PUSH_BIND")
         .map(|value| {
@@ -445,6 +448,34 @@ pub fn from_env() -> Result<Config, String> {
     })
 }
 
+fn validate_public_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|error| format!("VOTPORT_PUBLIC_URL is not a valid URL: {error}"))?;
+    if !matches!(parsed.scheme(), "https" | "http") {
+        return Err("VOTPORT_PUBLIC_URL must use https (or http for loopback)".to_owned());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("VOTPORT_PUBLIC_URL must not contain credentials".to_owned());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("VOTPORT_PUBLIC_URL must not contain a query or fragment".to_owned());
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "VOTPORT_PUBLIC_URL must include a host".to_owned())?;
+    if parsed.scheme() == "http" {
+        let ip_host = host.trim_matches(['[', ']']);
+        let loopback = host.eq_ignore_ascii_case("localhost")
+            || ip_host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback());
+        if !loopback {
+            return Err("VOTPORT_PUBLIC_URL may use http only for a loopback host".to_owned());
+        }
+    }
+    Ok(())
+}
+
 fn push_address(
     explicit: Option<String>,
     public_url: Option<&str>,
@@ -563,6 +594,38 @@ mod password_tests {
             );
         }
         assert_eq!("elevenchar.".chars().count(), MIN_ADMIN_PASSWORD_CHARS - 1);
+    }
+}
+
+#[cfg(test)]
+mod public_url_tests {
+    use super::validate_public_url;
+
+    #[test]
+    fn public_url_requires_https_except_loopback_http() {
+        for valid in [
+            "https://drop.example.com",
+            "https://drop.example.com/base",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ] {
+            assert!(validate_public_url(valid).is_ok(), "{valid} was refused");
+        }
+        for invalid in [
+            "http://drop.example.com",
+            "ftp://drop.example.com",
+            "https://user:pass@drop.example.com",
+            "https://drop.example.com/base?tenant=acme",
+            "https://drop.example.com/base#fragment",
+            "https://",
+            "http://192.0.2.1",
+        ] {
+            assert!(
+                validate_public_url(invalid).is_err(),
+                "{invalid} was accepted"
+            );
+        }
     }
 }
 
