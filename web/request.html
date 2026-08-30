@@ -36,13 +36,13 @@
         <input type="password" id="link-password" autocomplete="off" required>
       </label>
       <button type="submit" id="gate-continue">Continue</button>
-      <p class="error" id="gate-error" hidden></p>
+      <p class="error" id="gate-error" role="alert" hidden></p>
     </form>
   </section>
 
   <section id="uploader" hidden>
     <form id="upload-form">
-      <div id="drop" class="drop" tabindex="0">
+      <div id="drop" class="drop">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M12 12v9"/><path d="m16 16-4-4-4 4"/></svg>
         <p><strong>Drop files or folders here, or browse</strong> <button type="button" id="pick" class="ghost">files</button> <strong>/</strong> <button type="button" id="pick-folder" class="ghost">a folder</button></p>
         <input type="file" id="file-input" multiple hidden>
@@ -55,13 +55,13 @@
       <p class="muted" id="resume-note" hidden></p>
 
       <button type="submit" id="send" disabled>Ship</button>
-      <p class="error" id="upload-error" hidden></p>
+      <p class="error" id="upload-error" role="alert" hidden></p>
     </form>
 
     <div id="progress-card" class="card" hidden>
       <h2>Transfer in progress</h2>
-      <p id="phase">Preparing&hellip;</p>
-      <div class="meter"><div id="meter-fill"></div></div>
+      <p id="phase" role="status">Preparing&hellip;</p>
+      <div id="meter" class="meter" role="progressbar" aria-label="Transfer progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="meter-fill"></div></div>
       <p class="muted" id="progress-note"></p>
       <div class="progress-actions">
         <button type="button" id="cancel" class="ghost">Cancel transfer</button>

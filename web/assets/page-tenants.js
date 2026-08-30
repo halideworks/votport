@@ -87,6 +87,7 @@ function editTenantForm(tenant) {
   save.textContent = 'Save';
   const error = document.createElement('p');
   error.className = 'error';
+  error.setAttribute('role', 'alert');
   error.hidden = true;
   form.addEventListener('submit', async (event) => {
     event.preventDefault();

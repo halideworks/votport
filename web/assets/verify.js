@@ -238,7 +238,10 @@ dropZone.addEventListener('drop', (e) => {
   if (ignored) reportIgnored(ignored);
 });
 dropZone.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' || e.key === ' ') $('payload-input').click();
+  if (e.key === 'Enter' || e.key === ' ') {
+    e.preventDefault();
+    $('payload-input').click();
+  }
 });
 $('reset').addEventListener('click', reset);
 $('verify-form').addEventListener('submit', (e) => {
