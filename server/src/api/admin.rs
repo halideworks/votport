@@ -832,6 +832,33 @@ fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
         .overlay(&app.config)
         .map_err(super::store_unavailable)?;
     let resolved = &overlay.resolved;
+    let oidc = app.config.oidc.as_ref();
+    let deployment = json!({
+        // Deployment values are intentionally read-only. Secret-bearing
+        // values are represented by a configured flag, never their contents.
+        "bind": app.config.bind.to_string(),
+        "public_url": app.config.public_url,
+        "data_dir": app.config.data_dir,
+        "receive_dir": app.config.receive_dir,
+        "outbound_dir": app.config.outbound_dir,
+        "web_root": app.config.web_root,
+        "max_upload_bytes": app.config.max_upload_bytes,
+        "allow_hidden": app.config.allow_hidden,
+        "session_idle_secs": app.config.session_idle_secs,
+        "trusted_proxies": app.config.trusted_proxies.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "metrics_configured": app.config.metrics_token.is_some(),
+        "push_bind": app.config.push_bind.map(|value| value.to_string()),
+        "push_advertise": app.config.push_advertise,
+        "push_certificate": app.config.push_certificate,
+        "push_certificate_configured": app.config.push_certificate.is_some(),
+        "push_private_key_configured": app.config.push_private_key.is_some(),
+        "push_configured": app.config.push_bind.is_some(),
+        "oidc_issuer": oidc.map(|value| value.issuer.clone()),
+        "oidc_client_id": oidc.map(|value| value.client_id.clone()),
+        "oidc_admin_group": oidc.and_then(|value| value.admin_group.clone()),
+        "oidc_client_secret_configured": oidc.is_some_and(|value| !value.client_secret.is_empty()),
+        "oidc_configured": oidc.is_some(),
+    });
     Ok(json!({
         "notify_webhook": resolved.notify_webhook,
         "notify_webhook_source": overlay.notify_webhook_source,
@@ -871,6 +898,7 @@ fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
         "public_password_login": resolved.public_password_login,
         "public_password_login_source": overlay.public_password_login_source,
         "sso_configured": app.sso_config.is_some(),
+        "deployment": deployment,
     }))
 }
 
@@ -3746,6 +3774,120 @@ mod settings_api_tests {
         assert_eq!(json["smtp_password_set"], false);
         assert_eq!(json["smtp_password_source"], "env");
         assert!(json.get("smtp_password").is_none());
+        let deployment = &json["deployment"];
+        assert_eq!(deployment["bind"], "127.0.0.1:0");
+        assert_eq!(deployment["public_url"], "https://drop.example.com");
+        assert_eq!(
+            deployment["data_dir"],
+            directory.path().join("data").to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            deployment["receive_dir"],
+            directory.path().join("received").to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            deployment["outbound_dir"],
+            directory.path().join("outbound").to_string_lossy().as_ref()
+        );
+        assert_eq!(deployment["max_upload_bytes"], 1024 * 1024);
+        assert_eq!(deployment["allow_hidden"], false);
+        assert_eq!(deployment["session_idle_secs"], 60);
+        assert_eq!(deployment["trusted_proxies"], json!([]));
+        assert_eq!(deployment["metrics_configured"], false);
+        assert_eq!(deployment["push_configured"], false);
+        assert_eq!(deployment["push_private_key_configured"], false);
+        assert_eq!(deployment["oidc_configured"], false);
+        assert_eq!(deployment["oidc_client_secret_configured"], false);
+        // Config::admin_password_hash is represented by the existing
+        // password form. Config::admin_token_tag is internal session state,
+        // so neither belongs in this API payload.
+        for field in [
+            "notify_webhook",
+            "notify_webhook_source",
+            "notify_ntfy",
+            "notify_ntfy_source",
+            "notify_ntfy_token_set",
+            "notify_ntfy_token_source",
+            "notify_pushover_set",
+            "notify_pushover_token_set",
+            "notify_pushover_token_source",
+            "notify_pushover_user_set",
+            "notify_pushover_user_source",
+            "smtp_host",
+            "smtp_host_source",
+            "smtp_port",
+            "smtp_port_source",
+            "smtp_starttls",
+            "smtp_starttls_source",
+            "smtp_username",
+            "smtp_username_source",
+            "smtp_password_set",
+            "smtp_password_source",
+            "smtp_from",
+            "smtp_from_source",
+            "smtp_to",
+            "smtp_to_source",
+            "audit_retention_days",
+            "audit_retention_days_source",
+            "upload_retention_days",
+            "upload_retention_days_source",
+            "default_max_total_bytes",
+            "default_max_total_bytes_source",
+            "default_max_links",
+            "default_max_links_source",
+            "default_max_sessions",
+            "default_max_sessions_source",
+            "public_password_login",
+            "public_password_login_source",
+            "sso_configured",
+        ] {
+            assert!(json.get(field).is_some(), "missing settings field {field}");
+        }
+        for field in [
+            "bind",
+            "public_url",
+            "data_dir",
+            "receive_dir",
+            "outbound_dir",
+            "web_root",
+            "max_upload_bytes",
+            "allow_hidden",
+            "session_idle_secs",
+            "trusted_proxies",
+            "metrics_configured",
+            "push_bind",
+            "push_advertise",
+            "push_certificate",
+            "push_certificate_configured",
+            "push_private_key_configured",
+            "push_configured",
+            "oidc_issuer",
+            "oidc_client_id",
+            "oidc_admin_group",
+            "oidc_client_secret_configured",
+            "oidc_configured",
+        ] {
+            assert!(
+                deployment.get(field).is_some(),
+                "missing deployment field {field}"
+            );
+        }
+        for secret in [
+            "admin_password_hash",
+            "admin_token_tag",
+            "metrics_token",
+            "push_private_key",
+            "oidc_client_secret",
+            "notify_ntfy_token",
+            "notify_pushover_token",
+            "notify_pushover_user",
+            "smtp_password",
+        ] {
+            assert!(
+                json.get(secret).is_none() && deployment.get(secret).is_none(),
+                "secret leaked as {secret}"
+            );
+        }
     }
 
     #[tokio::test]
