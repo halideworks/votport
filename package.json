@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "lint": "eslint web/assets/*.js",
     "test": "node --test scripts/*.test.mjs",
@@ -10,6 +13,6 @@
   },
   "devDependencies": {
     "eslint": "9.18.0",
-    "playwright": "1.59.1"
+    "playwright": "1.62.1"
   }
 }

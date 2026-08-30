@@ -332,7 +332,7 @@ cd server
 cargo test          # unit + full-protocol integration tests
 cargo run           # needs VOTPORT_ADMIN_PASSWORD, VOTPORT_DATA_DIR, etc.
 
-# browser JS
+# browser JS (requires Node.js 20+)
 node --check ../web/assets/*.js
 npx --yes eslint@9.18.0 ../web/assets/*.js
 node --test ../scripts/*.test.mjs
