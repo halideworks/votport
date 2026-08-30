@@ -826,6 +826,113 @@ fn publish_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> 
     }
 }
 
+fn health_probe(root: &std::path::Path, label: &str) -> Result<(), String> {
+    let path = root.join(format!(
+        ".votport-health-{label}-{}",
+        crate::auth::random_token()
+    ));
+    let mut created = false;
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| format!("create {}: {error}", path.display()))
+        .map(|_| {
+            created = true;
+        });
+    let cleanup = if created {
+        std::fs::remove_file(&path).map_err(|error| format!("remove {}: {error}", path.display()))
+    } else {
+        Ok(())
+    };
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+    }
+}
+
+async fn healthz(State(app): State<Arc<App>>) -> Response {
+    let result = app
+        .store
+        .health_check()
+        .and_then(|()| health_probe(&app.config.receive_dir, "receive"))
+        .and_then(|()| health_probe(&app.config.outbound_dir, "outbound"));
+    if let Err(error) = result {
+        tracing::error!(%error, "health check failed");
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    StatusCode::OK.into_response()
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn healthz_is_public_and_probes_database_and_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let receive = app.config.receive_dir.clone();
+        let outbound = app.config.outbound_dir.clone();
+        let response = router(app)
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(std::fs::read_dir(receive)
+            .unwrap()
+            .flatten()
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".votport-health-")));
+        assert!(std::fs::read_dir(outbound)
+            .unwrap()
+            .flatten()
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".votport-health-")));
+    }
+
+    #[tokio::test]
+    async fn healthz_returns_generic_unavailable_when_storage_cannot_be_probed() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let outbound = app.config.outbound_dir.clone();
+        std::fs::remove_dir_all(&outbound).unwrap();
+        std::fs::write(&outbound, b"not a directory").unwrap();
+
+        let response = router(app)
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn healthz_returns_unavailable_when_database_schema_cannot_be_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let connection =
+            rusqlite::Connection::open(app.config.data_dir.join("votport.db")).unwrap();
+        connection.execute_batch("DROP TABLE meta").unwrap();
+
+        let response = router(app)
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
+
 pub fn router(app: Arc<App>) -> Router {
     let web_root = app.config.web_root.clone();
     let admin_page = web_root.join("index.html");
@@ -874,6 +981,7 @@ pub fn router(app: Arc<App>) -> Router {
     };
 
     Router::new()
+        .route("/healthz", get(healthz))
         // Pages.
         .route("/", serve_page(admin_page))
         .route("/r/{token}", serve_page(request_page))
@@ -911,6 +1019,10 @@ pub fn router(app: Arc<App>) -> Router {
         .route(
             "/api/admin/settings",
             get(api::get_settings).put(api::put_settings),
+        )
+        .route(
+            "/api/admin/notifications/test",
+            post(api::test_notifications),
         )
         .route(
             "/api/admin/tenants/{key}",

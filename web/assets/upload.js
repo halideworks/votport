@@ -15,6 +15,7 @@ const token = window.location.pathname.split('/').filter(Boolean).pop();
 
 const UPLOADS_IN_FLIGHT = 8;
 let chunkBytes = 2 * 1024 * 1024;
+let maxBytes = null;
 const picked = new Map(); // relative path -> File
 let uploading = false;
 let cancelled = false;
@@ -389,6 +390,12 @@ function addNamed(pairs) {
 
 // path -> its list row, so per-chunk status updates skip the O(files) scan.
 let rows = new Map();
+let sizeLimitError = false;
+
+function sizeLimitMessage(total) {
+  if (maxBytes === null || total <= maxBytes) return null;
+  return `Selected files total ${formatBytes(total)} exceeds this link's ${formatBytes(maxBytes)} limit. Clear the selection and choose fewer files.`;
+}
 
 function renderPicked() {
   const list = $('file-list');
@@ -408,9 +415,18 @@ function renderPicked() {
     list.append(item);
     rows.set(path, item);
   }
+  const limitError = sizeLimitMessage(total);
   $('totals').hidden = picked.size === 0;
-  $('totals').textContent = `${picked.size} file(s), ${formatBytes(total)} total`;
-  $('send').disabled = picked.size === 0;
+  $('totals').textContent = `${picked.size} file(s), ${formatBytes(total)} total${maxBytes === null ? '' : ` · limit ${formatBytes(maxBytes)}`}`;
+  $('clear-files').hidden = picked.size === 0;
+  if (limitError) {
+    fail(limitError);
+    sizeLimitError = true;
+  } else if (sizeLimitError) {
+    $('upload-error').hidden = true;
+    sizeLimitError = false;
+  }
+  $('send').disabled = picked.size === 0 || Boolean(limitError);
 }
 
 function setStatus(path, text, done = false) {
@@ -921,6 +937,13 @@ $('pick').addEventListener('click', () => $('file-input').click());
 $('pick-folder').addEventListener('click', () => $('folder-input').click());
 $('folder-input').addEventListener('change', (event) => addFiles(event.target.files));
 $('file-input').addEventListener('change', (event) => addFiles(event.target.files));
+$('clear-files').addEventListener('click', () => {
+  if (uploading) return;
+  picked.clear();
+  $('file-input').value = '';
+  $('folder-input').value = '';
+  renderPicked();
+});
 
 const drop = $('drop');
 // The whole zone is clickable; #pick has its own handler, so skip it here.
@@ -987,12 +1010,20 @@ $('gate-form').addEventListener('submit', async (event) => {
 $('upload-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   if (uploading || picked.size === 0) return;
+  const total = [...picked.values()].reduce((sum, file) => sum + file.size, 0);
+  const limitError = sizeLimitMessage(total);
+  if (limitError) {
+    fail(limitError);
+    sizeLimitError = true;
+    return;
+  }
   uploading = true;
   cancelled = false;
   controller = new AbortController();
   startWorkers();
   keepAwake();
   $('send').disabled = true;
+  $('clear-files').disabled = true;
   $('upload-error').hidden = true;
   try {
     await runUpload();
@@ -1015,6 +1046,7 @@ $('upload-form').addEventListener('submit', async (event) => {
           : `${error.message}. Reselect the same files to resume where this stopped.`);
     $('progress-card').hidden = true;
     $('send').disabled = false;
+    $('clear-files').disabled = false;
     showResumeNote();
   } finally {
     uploading = false;
@@ -1074,6 +1106,7 @@ function showResumeNote() {
   $('title').textContent = info.label;
   $('subtitle').textContent = 'Files are verified on receipt.';
   chunkBytes = info.chunk_bytes || chunkBytes;
+  maxBytes = Number.isFinite(info.max_bytes) ? info.max_bytes : null;
   try {
     await init();
   } catch {

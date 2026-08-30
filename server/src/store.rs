@@ -777,6 +777,18 @@ impl Store {
         f(&connection).map_err(|error| error.to_string())
     }
 
+    pub fn health_check(&self) -> Result<(), String> {
+        self.with(|connection| {
+            connection
+                .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                .and_then(|_| {
+                    connection
+                        .query_row("SELECT 1 FROM meta LIMIT 1", [], |row| row.get::<_, i64>(0))
+                })
+                .map(|_| ())
+        })
+    }
+
     pub fn admin_password_hash(&self) -> Result<Option<String>, String> {
         self.with(|connection| {
             connection
