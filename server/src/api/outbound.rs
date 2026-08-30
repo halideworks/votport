@@ -204,18 +204,20 @@ async fn upload_outbound_chunk(
     }
 
     let path = safe_library_path(&app, &identity.tenant, &requested_path)?;
-    let _active = ActiveUpload::acquire(&app, &upload_id).await;
-    if std::fs::symlink_metadata(&path).is_ok() {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "outbound file already exists",
-        ));
-    }
+    let stripe = outbound_upload_stripe(&path);
+    let _lock = app.outbound_upload_locks[stripe].lock().await;
     let parent = path
         .parent()
         .ok_or_else(|| ApiError::internal("outbound path has no parent"))?;
     create_library_dirs(parent)?;
     let stage = parent.join(format!(".vot-outbound-{upload_id}.stage"));
+    if std::fs::symlink_metadata(&path).is_ok() {
+        let _ = std::fs::remove_file(&stage);
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "outbound file already exists",
+        ));
+    }
     match std::fs::symlink_metadata(&stage) {
         Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_file() => {
             return Err(ApiError::new(
@@ -315,6 +317,7 @@ async fn upload_outbound_chunk(
     drop(file);
     if let Err(error) = std::fs::hard_link(&stage, &path) {
         return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+            let _ = std::fs::remove_file(&stage);
             ApiError::new(StatusCode::CONFLICT, "outbound file already exists")
         } else {
             ApiError::internal("publish outbound file failed")
@@ -336,6 +339,11 @@ async fn upload_outbound_chunk(
         "path": requested_path,
     }))
     .into_response())
+}
+
+fn outbound_upload_stripe(path: &Path) -> usize {
+    let digest = Sha256::digest(path.to_string_lossy().as_bytes());
+    usize::from(u16::from_be_bytes([digest[0], digest[1]])) % 64
 }
 
 fn valid_outbound_upload_id(value: &str) -> bool {
@@ -385,42 +393,6 @@ fn outbound_upload_conflict(path: &str, offset: u64, total: u64) -> Response {
         Json(json!({ "complete": false, "offset": offset, "bytes": total, "path": path })),
     )
         .into_response()
-}
-
-struct ActiveUpload<'a> {
-    app: &'a App,
-    upload_id: String,
-}
-
-impl<'a> ActiveUpload<'a> {
-    async fn acquire(app: &'a App, upload_id: &str) -> Self {
-        loop {
-            let notified = app.outbound_upload_notify.notified();
-            if app
-                .outbound_upload_active
-                .lock()
-                .expect("outbound upload lock poisoned")
-                .insert(upload_id.to_owned())
-            {
-                return Self {
-                    app,
-                    upload_id: upload_id.to_owned(),
-                };
-            }
-            notified.await;
-        }
-    }
-}
-
-impl Drop for ActiveUpload<'_> {
-    fn drop(&mut self) {
-        self.app
-            .outbound_upload_active
-            .lock()
-            .expect("outbound upload lock poisoned")
-            .remove(&self.upload_id);
-        self.app.outbound_upload_notify.notify_one();
-    }
 }
 
 struct UploadTemporary(PathBuf);
@@ -3717,6 +3689,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resumable_library_upload_rolls_back_an_invalid_chunk() {
+        let (_directory, app, cookie, _bytes) = fixture().await;
+        let upload_id = "e".repeat(64);
+        let first = crate::app::router(app.clone())
+            .oneshot(chunk_request(
+                &cookie,
+                "rollback.bin",
+                &upload_id,
+                0,
+                2,
+                6,
+                b"abc",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let invalid = Request::post("/api/admin/outbound-files?path=rollback.bin")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header(OUTBOUND_UPLOAD_ID, &upload_id)
+            .header(header::CONTENT_RANGE, "bytes 3-5/6")
+            .header(header::CONTENT_LENGTH, 3)
+            .body(Body::from("defg"))
+            .unwrap();
+        let invalid = crate::app::router(app.clone())
+            .oneshot(invalid)
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert!(!app.config.outbound_dir.join("rollback.bin").exists());
+        let stage = app
+            .config
+            .outbound_dir
+            .join(format!(".vot-outbound-{upload_id}.stage"));
+        assert_eq!(std::fs::read(stage).unwrap(), b"abc");
+    }
+
+    #[tokio::test]
     async fn resumable_library_upload_rejects_limits_before_staging() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = crate::api::testing::build(directory.path());
@@ -3777,7 +3788,10 @@ mod tests {
             .len(),
             3
         );
-        assert!(app.outbound_upload_active.lock().unwrap().is_empty());
+        assert!(app
+            .outbound_upload_locks
+            .iter()
+            .all(|lock| lock.try_lock().is_ok()));
     }
 
     #[tokio::test]

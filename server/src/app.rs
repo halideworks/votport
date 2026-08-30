@@ -84,9 +84,8 @@ pub struct App {
     pub automation_rate: crate::api::session_rate::SessionRate,
     /// Grants currently preparing or streaming, capped globally and per grant.
     pub outbound_active: Mutex<HashSet<String>>,
-    /// Outbound library upload IDs currently writing a staging file.
-    pub outbound_upload_active: Mutex<HashSet<String>>,
-    pub outbound_upload_notify: tokio::sync::Notify,
+    /// Bounded locks for serializing outbound library publication paths.
+    pub outbound_upload_locks: [tokio::sync::Mutex<()>; 64],
     /// Signs the `.vot-receipt` sidecars written next to received files.
     pub signer: Arc<crate::receipt::ReceiptSigner>,
     /// Outbound client for upload notifications.
@@ -529,8 +528,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         outbound_rate: crate::api::session_rate::SessionRate::with_limit(2000),
         automation_rate: crate::api::session_rate::SessionRate::with_limit(60),
         outbound_active: Mutex::new(HashSet::new()),
-        outbound_upload_active: Mutex::new(HashSet::new()),
-        outbound_upload_notify: tokio::sync::Notify::new(),
+        outbound_upload_locks: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
         signer,
         http,
         sso_config: config.oidc.clone(),
