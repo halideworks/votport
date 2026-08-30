@@ -546,8 +546,9 @@
         <div class="card">
           <h2>Backups</h2>
           <p class="muted">
-            A consistent SQLite snapshot of links, tenants and the audit log.
-            Received files live separately under the receive root.
+            A consistent SQLite snapshot of links, tenants and the audit log;
+            it excludes received and outbound files. Those files live
+            separately under their receive and outbound storage roots.
           </p>
           <a id="backup-download" class="ghost" href="/api/admin/backup"
             >Download snapshot</a

@@ -16,10 +16,13 @@ data/                       votport state - keep private
   push.crt / push.key       generated native-push certificate and key (0600)
   backups/                  snapshots written by /api/admin/backup
 /received                   received files, published per tenant/link
+/outbound                   Deliver library files and rendered projects
+  .vot-tenants.stage/<tenant> tenant-scoped library subtree
 Caddyfile.example           reverse-proxy template
 ```
 
-The container runs as uid 1000; both mounted volumes must be writable by it.
+The container runs as uid 1000; all three mounted volumes must be writable by
+it.
 
 ## Quick start
 
@@ -95,8 +98,8 @@ DNS before calling the VOT push API.
 
 ## Backups
 
-Two stores, two clocks. Litestream (or an equivalent WAL replica) is the
-database RPO. `/received` stays on the existing file backup. `GET
+Three stores, two clocks. Litestream (or an equivalent WAL replica) is the
+database RPO. `/received` and `/outbound` stay on existing file backups. `GET
 /api/admin/backup` is a consistent copy-home button, not the HA story.
 
 | Store | Mechanism | RPO | RTO |
@@ -104,6 +107,7 @@ database RPO. `/received` stays on the existing file backup. `GET
 | `data/votport.db` | Litestream (or equivalent WAL replica) continuous | seconds (Litestream's default interval is about 1s of WAL) | minutes: stop container, `litestream restore`, start |
 | `data/votport.db` | `GET /api/admin/backup` (`VACUUM INTO`) | last time someone clicked Download (not the DR clock) | same stop-replace-start |
 | `/received` | existing file backup (restic, borg, zfs send, rsync) | that job's interval | restore files, start |
+| `/outbound` (including `.vot-tenants.stage/<tenant>`) | existing file backup (restic, borg, zfs send, rsync) | that job's interval | restore files, start |
 
 ### Database copy-home
 
@@ -132,19 +136,26 @@ dbs:
 
 Postgres is not on the table.
 
-### Received files
+### Persistent files
 
-Plain files under `/received`. Any file-level backup tool works (restic, borg,
-zfs send, rsync). Back them up together with a database snapshot so records
-and bytes stay consistent with each other.
+Plain files under `/received` and `/outbound`. Any file-level backup tool works
+(restic, borg, zfs send, rsync); include the named-tenant subtree
+`/outbound/.vot-tenants.stage/<tenant>`. Back both volumes up together with a
+database snapshot so records and bytes stay consistent with each other.
 
 ### Restore
 
 1. Stop the container.
 2. Replace `data/votport.db` with the Litestream restore or a `VACUUM INTO`
    snapshot. Do not copy a live `-wal` over a restored file.
-3. Restore `/received` from the file backup taken nearest that snapshot.
+3. Restore `/received` and `/outbound` from the file backups taken nearest that
+   snapshot.
 4. Start. Staging leftovers are removed by `paths::clean_staging` at boot.
+
+For an upgrade or rollback, restore the database and both file volumes from the
+same point-in-time set before starting the selected image. Verify `/healthz`
+and a known Receive and Deliver link; a database-only restore cannot serve
+Deliver files whose source remains absent from `/outbound`.
 
 ## Single sign-on
 

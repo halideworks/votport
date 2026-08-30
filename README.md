@@ -306,7 +306,7 @@ Latest run (2026-08-23, this host, 256 MiB single file): hashing and
 packaging 3012 MiB/s, loopback upload 1203 MiB/s.
 
 SQLite is one writer. That is the scale story. Litestream is the documented
-database RPO; `/received` is a file backup. See [`docs/deployment.md`](docs/deployment.md).
+database RPO; `/received` and `/outbound` are file backups. See [`docs/deployment.md`](docs/deployment.md).
 
 ## Development
 
