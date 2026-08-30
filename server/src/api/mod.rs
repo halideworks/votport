@@ -19,9 +19,9 @@ pub use admin::{
 pub use outbound::{
     automation_share, create_automation_token, create_outbound_grant, delete_automation_token,
     delete_outbound_grant, list_automation_tokens, list_outbound_files, list_outbound_grants,
-    outbound_file, outbound_file_indexed, outbound_metadata, outbound_receipt,
-    outbound_receipt_indexed, update_outbound_grant, upload_outbound_file,
-    verify_outbound_password,
+    outbound_file, outbound_file_head, outbound_file_indexed, outbound_file_indexed_head,
+    outbound_metadata, outbound_receipt, outbound_receipt_indexed, update_outbound_grant,
+    upload_outbound_file, verify_outbound_password,
 };
 pub use sso::{sso_available, sso_callback, sso_start};
 pub use upload::{
@@ -30,7 +30,7 @@ pub use upload::{
 };
 pub use verify::{receipt_key, verify_receipt};
 
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
@@ -132,6 +132,7 @@ fn proxy_peer(ip: &std::net::IpAddr) -> bool {
 pub struct ApiError {
     status: StatusCode,
     message: String,
+    content_range: Option<String>,
 }
 
 impl ApiError {
@@ -139,6 +140,7 @@ impl ApiError {
         Self {
             status,
             message: message.into(),
+            content_range: None,
         }
     }
 
@@ -166,7 +168,20 @@ impl From<SessionError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        let range = self.content_range;
+        let mut response = (self.status, Json(json!({ "error": self.message }))).into_response();
+        if let Some(range) = range {
+            if let Ok(value) = HeaderValue::try_from(range) {
+                response.headers_mut().insert(header::CONTENT_RANGE, value);
+            }
+            response
+                .headers_mut()
+                .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        }
+        response
     }
 }
 

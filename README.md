@@ -35,7 +35,9 @@ admin uploads land there too. VOTPort issues one expiring bearer URL for the
 selection, shown once and revocable by an admin.
 Before a download starts, the server copies each source into private staging,
 verifies its VOT object identity and signed receipt, then serves an immutable
-verified copy. For multi-file deliveries, recipients may download a payload-only
+verified copy. Individual files support RFC 9110 single-byte-range requests for
+resumable downloads; each logical file download is counted once and a short-lived
+secure lease permits subsequent ranges. For multi-file deliveries, recipients may download a payload-only
 ZIP or stream the files separately in bulk; signed receipts remain optional
 individual downloads. Optional link passwords gate metadata, files, receipts,
 and the ZIP.

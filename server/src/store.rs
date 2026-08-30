@@ -1693,6 +1693,44 @@ impl Store {
         })
     }
 
+    pub fn outbound_grants_page(
+        &self,
+        tenant: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<OutboundGrant>, u64), String> {
+        let limit = i64::try_from(limit).map_err(|_| "outbound grant limit overflow".to_owned())?;
+        let offset =
+            i64::try_from(offset).map_err(|_| "outbound grant offset overflow".to_owned())?;
+        self.with(|connection| {
+            let grants = {
+                let mut statement = connection.prepare(
+                    "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
+                            name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
+                            expires_at, revoked_at, downloads, max_downloads, notify_on_download, first_download_at,
+                            last_download_at,
+                            files_json
+                     FROM outbound_grants WHERE tenant = ?1
+                     ORDER BY created_at DESC, rowid DESC LIMIT ?2 OFFSET ?3",
+                )?;
+                let rows = statement.query_map(
+                    rusqlite::params![tenant, limit, offset],
+                    map_outbound_grant,
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let total =
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM outbound_grants WHERE tenant = ?1",
+                        [tenant],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map(|count| count.max(0) as u64)?;
+            Ok((grants, total))
+        })
+    }
+
     pub fn outbound_grant_by_token_hash(
         &self,
         token_hash: &str,
@@ -3009,6 +3047,43 @@ mod tests {
                 .id,
             "g1"
         );
+    }
+
+    #[test]
+    fn outbound_grants_page_is_newest_first_bounded_and_tenant_scoped() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        for id in ["g1", "g2", "g3"] {
+            store
+                .insert_outbound_grant(test_outbound_grant(id, "acme", 0))
+                .unwrap();
+        }
+        store
+            .insert_outbound_grant(test_outbound_grant("other", "other", 0))
+            .unwrap();
+
+        let page = store.outbound_grants_page("acme", 2, 0).unwrap();
+        assert_eq!(page.1, 3);
+        assert_eq!(
+            page.0.into_iter().map(|grant| grant.id).collect::<Vec<_>>(),
+            ["g3", "g2"]
+        );
+        assert_eq!(
+            store
+                .outbound_grants_page("acme", 2, 2)
+                .unwrap()
+                .0
+                .into_iter()
+                .map(|grant| grant.id)
+                .collect::<Vec<_>>(),
+            ["g1"]
+        );
+        assert!(store
+            .outbound_grants_page("acme", 2, 3)
+            .unwrap()
+            .0
+            .is_empty());
+        assert_eq!(store.outbound_grants_page("other", 2, 0).unwrap().1, 1);
     }
 
     #[test]
