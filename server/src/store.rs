@@ -2293,6 +2293,12 @@ pub struct AuditRow {
     pub detail: serde_json::Value,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AuditFilters<'a> {
+    pub event: Option<&'a str>,
+    pub query: Option<&'a str>,
+}
+
 fn map_tenant(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tenant> {
     Ok(Tenant {
         key: row.get(0)?,
@@ -2422,12 +2428,19 @@ impl Store {
         after_rowid: u64,
         limit: u64,
     ) -> Result<Vec<AuditRow>, String> {
+        self.audit_export_filtered(tenant, since, after_rowid, limit, AuditFilters::default())
+    }
+
+    pub fn audit_export_filtered(
+        &self,
+        tenant: &str,
+        since: u64,
+        after_rowid: u64,
+        limit: u64,
+        filters: AuditFilters<'_>,
+    ) -> Result<Vec<AuditRow>, String> {
         self.with(|connection| {
-            if tenant.is_empty() {
-                Self::audit_export_query(connection, "", since, after_rowid, limit)
-            } else {
-                Self::audit_export_query(connection, tenant, since, after_rowid, limit)
-            }
+            Self::audit_export_query(connection, tenant, since, after_rowid, limit, filters)
         })
     }
 
@@ -2437,17 +2450,34 @@ impl Store {
         before_rowid: u64,
         limit: u64,
     ) -> Result<Vec<AuditRow>, String> {
+        self.audit_recent_filtered(tenant, before_rowid, limit, AuditFilters::default())
+    }
+
+    pub fn audit_recent_filtered(
+        &self,
+        tenant: &str,
+        before_rowid: u64,
+        limit: u64,
+        filters: AuditFilters<'_>,
+    ) -> Result<Vec<AuditRow>, String> {
         self.with(|connection| {
             let mut statement = connection.prepare_cached(
                 "SELECT rowid, at, tenant, actor, event, subject, detail
                  FROM audit_log
                  WHERE (?1 = '' OR tenant = ?1)
-                   AND (?2 = 0 OR rowid < ?2)
-                 ORDER BY rowid DESC LIMIT ?3",
+                   AND (?2 = '' OR event = ?2)
+                   AND (?3 = '' OR instr(lower(tenant), lower(?3)) > 0
+                        OR instr(lower(actor), lower(?3)) > 0
+                        OR instr(lower(event), lower(?3)) > 0
+                        OR instr(lower(subject), lower(?3)) > 0)
+                   AND (?4 = 0 OR rowid < ?4)
+                 ORDER BY rowid DESC LIMIT ?5",
             )?;
             let rows = statement.query_map(
                 rusqlite::params![
                     tenant,
+                    filters.event.unwrap_or(""),
+                    filters.query.unwrap_or(""),
                     i64::try_from(before_rowid).unwrap_or(i64::MAX),
                     i64::try_from(limit).unwrap_or(i64::MAX),
                 ],
@@ -2463,33 +2493,35 @@ impl Store {
         since: u64,
         after_rowid: u64,
         limit: u64,
+        filters: AuditFilters<'_>,
     ) -> rusqlite::Result<Vec<AuditRow>> {
         let since = i64::try_from(since).unwrap_or(0);
         let after_rowid = i64::try_from(after_rowid).unwrap_or(0);
         let limit = i64::try_from(limit).unwrap_or(1000);
-        if tenant.is_empty() {
-            let mut statement = connection.prepare_cached(
-                "SELECT rowid, at, tenant, actor, event, subject, detail
-                 FROM audit_log
-                 WHERE at > ?1 OR (at = ?1 AND rowid > ?2)
-                 ORDER BY at, rowid LIMIT ?3",
-            )?;
-            let rows =
-                statement.query_map(rusqlite::params![since, after_rowid, limit], map_audit_row)?;
-            rows.collect()
-        } else {
-            let mut statement = connection.prepare_cached(
-                "SELECT rowid, at, tenant, actor, event, subject, detail
-                 FROM audit_log
-                 WHERE tenant = ?4 AND (at > ?1 OR (at = ?1 AND rowid > ?2))
-                 ORDER BY at, rowid LIMIT ?3",
-            )?;
-            let rows = statement.query_map(
-                rusqlite::params![since, after_rowid, limit, tenant],
-                map_audit_row,
-            )?;
-            rows.collect()
-        }
+        let mut statement = connection.prepare_cached(
+            "SELECT rowid, at, tenant, actor, event, subject, detail
+             FROM audit_log
+             WHERE (at > ?1 OR (at = ?1 AND rowid > ?2))
+               AND (?3 = '' OR event = ?3)
+               AND (?4 = '' OR instr(lower(tenant), lower(?4)) > 0
+                    OR instr(lower(actor), lower(?4)) > 0
+                    OR instr(lower(event), lower(?4)) > 0
+                    OR instr(lower(subject), lower(?4)) > 0)
+               AND (?5 = '' OR tenant = ?5)
+             ORDER BY at, rowid LIMIT ?6",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![
+                since,
+                after_rowid,
+                filters.event.unwrap_or(""),
+                filters.query.unwrap_or(""),
+                tenant,
+                limit,
+            ],
+            map_audit_row,
+        )?;
+        rows.collect()
     }
 
     /// Deletes audit rows older than `before`; returns how many.
@@ -4434,6 +4466,82 @@ mod phase4_review_tests {
             .unwrap();
         assert_eq!(older.len(), 1);
         assert_eq!(older[0].event, "first");
+    }
+
+    #[test]
+    fn audit_filters_match_fields_without_searching_detail() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.audit(
+            "acme",
+            "Alice",
+            "link_created",
+            "request-1",
+            &serde_json::json!({"secret_marker": "needle"}),
+        );
+        store.audit(
+            "acme",
+            "Bob",
+            "link_deleted",
+            "request-2",
+            &serde_json::json!({}),
+        );
+        store.audit(
+            "other",
+            "Alice",
+            "link_created",
+            "request-3",
+            &serde_json::json!({}),
+        );
+
+        let filters = AuditFilters {
+            event: Some("link_created"),
+            query: Some("ALICE"),
+        };
+        let recent = store
+            .audit_recent_filtered("acme", 0, 100, filters)
+            .unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].subject, "request-1");
+
+        let detail_only = store
+            .audit_recent_filtered(
+                "acme",
+                0,
+                100,
+                AuditFilters {
+                    event: None,
+                    query: Some("needle"),
+                },
+            )
+            .unwrap();
+        assert!(detail_only.is_empty());
+
+        let legacy = store
+            .audit_export_filtered("acme", 0, 0, 100, filters)
+            .unwrap();
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].subject, "request-1");
+    }
+
+    #[test]
+    fn filtered_audit_cursor_paginates_recent_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        for subject in ["first", "second", "third"] {
+            store.audit("acme", "", "match", subject, &serde_json::json!({}));
+        }
+        let filters = AuditFilters {
+            event: Some("match"),
+            query: None,
+        };
+        let first = store.audit_recent_filtered("acme", 0, 2, filters).unwrap();
+        assert_eq!(first.len(), 2);
+        let second = store
+            .audit_recent_filtered("acme", first[1].rowid as u64, 2, filters)
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].subject, "first");
     }
 }
 

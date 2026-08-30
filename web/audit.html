@@ -30,6 +30,19 @@
 
       <h1>Audit log</h1>
 
+      <form id="audit-filters" class="card">
+        <div class="grid">
+          <label>Search
+            <input id="audit-query" type="search" maxlength="100" autocomplete="off" placeholder="tenant, actor, event, or subject" />
+          </label>
+          <label>Event
+            <input id="audit-event" maxlength="100" autocomplete="off" list="audit-event-options" placeholder="exact event" />
+            <datalist id="audit-event-options"></datalist>
+          </label>
+        </div>
+        <button type="submit">Apply</button>
+        <button type="button" id="audit-clear" class="ghost">Clear</button>
+      </form>
       <div class="bar">
         <button id="refresh" class="ghost">Refresh</button>
         <button id="load-more" class="ghost" hidden>Load more</button>

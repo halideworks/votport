@@ -14,7 +14,7 @@ use tokio_util::io::ReaderStream;
 use crate::app::App;
 use crate::auth;
 use crate::paths;
-use crate::store::{now_unix, Link, LinkCursor};
+use crate::store::{now_unix, AuditFilters, Link, LinkCursor};
 
 use super::{cookie_attributes, ApiError, ApiResult};
 
@@ -238,20 +238,32 @@ pub async fn admin_audit_export(
     // tenant (platform admin) sees everything.
     let tenant_filter = identity.tenant.clone();
     let limit = query.limit.unwrap_or(1000).min(10_000);
-    let rows = if let Some(before_rowid) = query.before_rowid {
-        app.store
-            .audit_recent(&tenant_filter, before_rowid, limit)
-            .map_err(ApiError::internal)?
-    } else {
-        app.store
-            .audit_export(
+    let event = validate_audit_filter(query.event, "event")?;
+    let search = validate_audit_filter(query.q, "q")?;
+    let since = query.since;
+    let after_rowid = query.after_rowid;
+    let before_rowid = query.before_rowid;
+    let store = Arc::clone(&app.store);
+    let rows = tokio::task::spawn_blocking(move || {
+        let filters = AuditFilters {
+            event: event.as_deref(),
+            query: search.as_deref(),
+        };
+        if let Some(before_rowid) = before_rowid {
+            store.audit_recent_filtered(&tenant_filter, before_rowid, limit, filters)
+        } else {
+            store.audit_export_filtered(
                 &tenant_filter,
-                query.since.unwrap_or(0),
-                query.after_rowid.unwrap_or(0),
+                since.unwrap_or(0),
+                after_rowid.unwrap_or(0),
                 limit,
+                filters,
             )
-            .map_err(ApiError::internal)?
-    };
+        }
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?
+    .map_err(ApiError::internal)?;
     use std::fmt::Write as _;
     let mut body = String::new();
     for row in rows {
@@ -299,6 +311,23 @@ pub struct AuditQuery {
     after_rowid: Option<u64>,
     before_rowid: Option<u64>,
     limit: Option<u64>,
+    event: Option<String>,
+    q: Option<String>,
+}
+
+fn validate_audit_filter(value: Option<String>, name: &str) -> ApiResult<Option<String>> {
+    let Some(value) = value else { return Ok(None) };
+    if value.chars().count() > 100 {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{name} must be at most 100 characters"),
+        ));
+    }
+    if value.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
 }
 
 pub async fn admin_session(
@@ -1897,6 +1926,26 @@ pub async fn delete_received_file(
         &serde_json::json!({ "stored_as": stored_as }),
     );
     Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod audit_filter_tests {
+    use super::*;
+
+    #[test]
+    fn audit_filters_are_bounded_and_blank_values_are_absent() {
+        assert_eq!(validate_audit_filter(None, "q").unwrap(), None);
+        assert_eq!(
+            validate_audit_filter(Some(String::new()), "q").unwrap(),
+            None
+        );
+        assert_eq!(
+            validate_audit_filter(Some(" \t".to_owned()), "q").unwrap(),
+            None
+        );
+        assert!(validate_audit_filter(Some("🙂".repeat(100)), "q").is_ok());
+        assert!(validate_audit_filter(Some("🙂".repeat(101)), "q").is_err());
+    }
 }
 
 #[cfg(test)]
