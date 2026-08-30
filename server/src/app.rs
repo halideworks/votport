@@ -1201,7 +1201,9 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route(
             "/api/admin/outbound-files",
-            get(api::list_outbound_files).post(api::upload_outbound_file),
+            get(api::list_outbound_files)
+                .post(api::upload_outbound_file)
+                .delete(api::delete_outbound_file),
         )
         .route("/api/admin/password", post(api::admin_change_password))
         .route(

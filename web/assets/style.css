@@ -960,7 +960,7 @@ button.danger:hover:not(:disabled) {
 }
 .library-file {
  display: grid;
- grid-template-columns: auto minmax(0, 1fr) auto;
+ grid-template-columns: auto minmax(0, 1fr) auto auto;
  align-items: center;
  gap: 0.5rem;
  padding: 0.5rem 0.6rem;

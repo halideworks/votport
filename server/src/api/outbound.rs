@@ -3,7 +3,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use axum::body::Body;
@@ -42,6 +42,9 @@ const MAX_AUTOMATION_LABEL_CHARS: usize = 100;
 const DOWNLOAD_LEASE_SECS: u64 = 24 * 60 * 60;
 const OUTBOUND_UPLOAD_ID: &str = "x-votport-upload-id";
 const MAX_OUTBOUND_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+
+// ponytail: one tiny global critical section; use per-tenant locks only if contention is measured.
+static LIBRARY_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Deserialize)]
 pub struct OutboundPathQuery {
@@ -407,6 +410,51 @@ fn outbound_upload_conflict(path: &str, offset: u64, total: u64) -> Response {
         .into_response()
 }
 
+pub async fn delete_outbound_file(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Query(query): Query<OutboundPathQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = admin::require_admin(&app, &headers)?;
+    admin::require_admin_write(&headers, &identity)?;
+    let relative_path = query.path.trim_matches('/').to_owned();
+    let path = safe_library_path(&app, &identity.tenant, &relative_path)?;
+    let bytes = {
+        let _lock = LIBRARY_MUTATION_LOCK
+            .lock()
+            .expect("library mutation lock poisoned");
+        let root = library_root(&app, &identity.tenant);
+        if !library_components_safe(&root, &path) {
+            return Err(ApiError::not_found());
+        }
+        let metadata = std::fs::symlink_metadata(&path).map_err(|_| ApiError::not_found())?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(ApiError::not_found());
+        }
+        if app
+            .store
+            .has_active_library_grant(&identity.tenant, &relative_path, now_unix())
+            .map_err(super::store_unavailable)?
+        {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "outbound file is referenced by an active grant",
+            ));
+        }
+        std::fs::remove_file(&path)
+            .map_err(|_| ApiError::internal("delete outbound file failed"))?;
+        metadata.len()
+    };
+    app.store.audit(
+        &identity.tenant,
+        &identity.subject,
+        "outbound_file_deleted",
+        &relative_path,
+        &json!({ "path": relative_path, "bytes": bytes }),
+    );
+    Ok(Json(json!({ "path": query.path, "bytes": bytes })))
+}
+
 struct UploadTemporary(PathBuf);
 impl Drop for UploadTemporary {
     fn drop(&mut self) {
@@ -514,6 +562,25 @@ fn create_library_dirs(path: &Path) -> ApiResult<()> {
         }
     }
     Ok(())
+}
+
+fn library_sources_match(
+    root: &Path,
+    selections: &[(String, PathBuf)],
+    files: &[OutboundGrantFile],
+) -> bool {
+    selections.len() == files.len()
+        && selections.iter().zip(files).all(|((_, path), file)| {
+            if !library_components_safe(root, path) {
+                return false;
+            }
+            let Ok(metadata) = std::fs::symlink_metadata(path) else {
+                return false;
+            };
+            !metadata.file_type().is_symlink()
+                && metadata.file_type().is_file()
+                && metadata.len() == file.bytes
+        })
 }
 
 #[derive(Deserialize)]
@@ -1050,10 +1117,12 @@ async fn create_library_grant(
         selections.push((name, path));
     }
     let max = app.config.max_upload_bytes;
+    let revalidation = selections.clone();
+    let hash_root = root.clone();
     let hashed = tokio::task::spawn_blocking(move || {
         selections
             .into_iter()
-            .map(|(name, path)| hash_library_file(&root, &name, &path, max))
+            .map(|(name, path)| hash_library_file(&hash_root, &name, &path, max))
             .collect::<Result<Vec<_>, _>>()
     })
     .await
@@ -1133,9 +1202,17 @@ async fn create_library_grant(
             "label must be 1..=200 characters",
         ));
     }
-    app.store
-        .insert_outbound_grant(grant.clone())
-        .map_err(ApiError::internal)?;
+    {
+        let _lock = LIBRARY_MUTATION_LOCK
+            .lock()
+            .expect("library mutation lock poisoned");
+        if !library_sources_match(&root, &revalidation, &grant.files) {
+            return Err(ApiError::not_found());
+        }
+        app.store
+            .insert_outbound_grant(grant.clone())
+            .map_err(ApiError::internal)?;
+    }
     app.store.audit(
         &identity.tenant,
         &identity.subject,
@@ -2584,6 +2661,110 @@ mod tests {
         assert_eq!(listed["has_more"], true);
         assert_eq!(listed["grants"].as_array().unwrap().len(), 50);
         assert_eq!(listed["grants"][0]["id"], "grant-50");
+    }
+
+    #[tokio::test]
+    async fn deleting_library_files_checks_safety_and_active_grants() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        std::fs::create_dir_all(&app.config.outbound_dir).unwrap();
+        let path = app.config.outbound_dir.join("delete.bin");
+        std::fs::write(&path, b"payload").unwrap();
+        let request_app = app.clone();
+        let request = |path: &str| {
+            Request::delete(format!("/api/admin/outbound-files?path={path}"))
+                .header("cookie", admin_cookie(&request_app))
+                .header("x-votport", "1")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let response = crate::app::router(app.clone())
+            .oneshot(request("../outside"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let mut grant = OutboundGrant {
+            id: "active".to_owned(),
+            token_hash: "active-hash".to_owned(),
+            password_hash: None,
+            tenant: String::new(),
+            link_id: String::new(),
+            upload_id: String::new(),
+            package_root: String::new(),
+            name: "delete.bin".to_owned(),
+            suite: "blake3".to_owned(),
+            root: String::new(),
+            file_index: 0,
+            bytes: 7,
+            label: "delete.bin".to_owned(),
+            created_at: now_unix(),
+            expires_at: now_unix().saturating_add(60),
+            revoked_at: None,
+            downloads: 0,
+            max_downloads: Some(1),
+            notify_on_download: false,
+            first_download_at: None,
+            last_download_at: None,
+            files: Vec::new(),
+        };
+        grant.files = vec![OutboundGrantFile {
+            source: "delete.bin".to_owned(),
+            name: "delete.bin".to_owned(),
+            suite: "blake3".to_owned(),
+            root: "root".to_owned(),
+            bytes: 7,
+            receipt_b64: "receipt".to_owned(),
+            downloads: 0,
+            first_download_at: None,
+            last_download_at: None,
+        }];
+        app.store.insert_outbound_grant(grant).unwrap();
+        let response = crate::app::router(app.clone())
+            .oneshot(request("delete.bin"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(path.exists());
+
+        app.store
+            .revoke_outbound_grant("", "active", now_unix())
+            .unwrap();
+        let response = crate::app::router(app)
+            .oneshot(request("delete.bin"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn library_grant_revalidation_rejects_changed_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("outbound");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("file.bin");
+        std::fs::write(&path, b"payload").unwrap();
+        let selections = vec![("file.bin".to_owned(), path.clone())];
+        let file = OutboundGrantFile {
+            source: "file.bin".to_owned(),
+            name: "file.bin".to_owned(),
+            suite: "blake3".to_owned(),
+            root: "root".to_owned(),
+            bytes: 7,
+            receipt_b64: "receipt".to_owned(),
+            downloads: 0,
+            first_download_at: None,
+            last_download_at: None,
+        };
+        assert!(library_sources_match(
+            &root,
+            &selections,
+            std::slice::from_ref(&file)
+        ));
+        std::fs::write(&path, b"changed length").unwrap();
+        assert!(!library_sources_match(&root, &selections, &[file]));
     }
 
     #[test]

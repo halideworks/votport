@@ -475,7 +475,27 @@ function renderLibraryFile(file, container, showPath = false) {
   const size = document.createElement('span');
   size.className = 'muted';
   size.textContent = formatBytes(file.bytes);
-  label.append(checkbox, name, size);
+  const remove = button('Delete', 'tiny danger', async () => {
+    if (!(await confirmModal(
+      'Delete outbound file',
+      `Delete "${file.path}"? Active download grants will block this if they still reference it.`,
+      'Delete',
+    ))) return;
+    remove.disabled = true;
+    try {
+      await api(`/api/admin/outbound-files?path=${encodeURIComponent(file.path)}`, { method: 'DELETE' });
+      selectedLibraryPaths.delete(file.path);
+      await refreshLibrary();
+    } finally {
+      remove.disabled = false;
+    }
+  });
+  remove.setAttribute('aria-label', `Delete ${file.path}`);
+  remove.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+  }, { capture: true });
+  label.append(checkbox, name, size, remove);
   container.append(label);
 }
 
