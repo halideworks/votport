@@ -894,6 +894,13 @@ button.danger:hover:not(:disabled) {
  font-weight: 600;
  color: var(--text-soft);
 }
+.library-breadcrumbs {
+ display: flex;
+ align-items: center;
+ gap: 0.15rem;
+ flex-wrap: wrap;
+ margin: 0 0 0.65rem;
+}
 .library-list {
  max-height: 14rem;
  overflow-y: auto;

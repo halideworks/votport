@@ -151,6 +151,13 @@
           <h3>File library</h3>
           <button id="library-refresh" type="button" class="tiny ghost">Refresh</button>
         </div>
+        <nav id="library-breadcrumbs" class="library-breadcrumbs" aria-label="Library navigation"></nav>
+        <label
+          >Search files
+          <input id="library-search" type="search" autocomplete="off" placeholder="name or path" />
+        </label>
+        <p id="library-selection-status" class="muted" aria-live="polite">0 files selected · 0 B</p>
+        <p id="library-selection-error" class="error" role="alert" hidden></p>
         <div id="library-files" class="library-list" aria-live="polite"></div>
         <form id="deliver-form">
           <div class="grid">
