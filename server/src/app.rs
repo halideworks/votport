@@ -1112,10 +1112,13 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/s/{token}/bundle", get(api::outbound::outbound_bundle))
         .route("/api/automation/share", post(api::automation_share))
         .route("/api/s/{token}/receipt", get(api::outbound_receipt))
-        .route("/api/s/{token}/file", get(api::outbound_file))
+        .route(
+            "/api/s/{token}/file",
+            get(api::outbound_file).head(api::outbound_file_head),
+        )
         .route(
             "/api/s/{token}/files/{index}",
-            get(api::outbound_file_indexed),
+            get(api::outbound_file_indexed).head(api::outbound_file_indexed_head),
         )
         .route(
             "/api/s/{token}/receipts/{index}",
