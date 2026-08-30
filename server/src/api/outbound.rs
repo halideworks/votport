@@ -1,5 +1,6 @@
 //! Verified, administrator-selected outbound files.
 
+use std::collections::BinaryHeap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -42,6 +43,11 @@ const MAX_AUTOMATION_LABEL_CHARS: usize = 100;
 const DOWNLOAD_LEASE_SECS: u64 = 24 * 60 * 60;
 const OUTBOUND_UPLOAD_ID: &str = "x-votport-upload-id";
 const MAX_OUTBOUND_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_LIBRARY_DIRECTORY_INPUT_BYTES: usize = 1024;
+const MAX_LIBRARY_DIRECTORY_ENTRIES: usize = 1000;
+const MAX_LIBRARY_SEARCH_CHARS: usize = 100;
+const MAX_LIBRARY_SEARCH_RESULTS: usize = 200;
+const RETAINED_LIBRARY_SEARCH_RESULTS: usize = MAX_LIBRARY_SEARCH_RESULTS + 1;
 
 // ponytail: one tiny global critical section; use per-tenant locks only if contention is measured.
 static LIBRARY_MUTATION_LOCK: Mutex<()> = Mutex::new(());
@@ -51,12 +57,109 @@ pub struct OutboundPathQuery {
     path: String,
 }
 
+#[derive(Deserialize)]
+pub struct OutboundListQuery {
+    directory: Option<String>,
+    q: Option<String>,
+    selection: Option<String>,
+}
+
 pub async fn list_outbound_files(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
+    Query(query): Query<OutboundListQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = admin::require_admin(&app, &headers)?;
     let root = library_root(&app, &identity.tenant);
+    if [
+        query.directory.is_some(),
+        query.q.is_some(),
+        query.selection.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count()
+        > 1
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "library listing modes cannot be combined",
+        ));
+    }
+    if let Some(selection) = query.selection {
+        if selection.len() > MAX_LIBRARY_DIRECTORY_INPUT_BYTES {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "selection is too long",
+            ));
+        }
+        let tenant = identity.tenant;
+        let result = tokio::task::spawn_blocking(move || {
+            let directory = automation_directory(&app, &tenant, &selection)?;
+            let root = library_root(&app, &tenant);
+            enumerate_library_selection(&root, &directory)
+        })
+        .await
+        .map_err(|_| ApiError::internal("list outbound files failed"))??;
+        return Ok(Json(json!({ "files": result })));
+    }
+    if let Some(query) = query.q {
+        let query = query.trim();
+        if query.chars().count() > MAX_LIBRARY_SEARCH_CHARS || query.is_empty() {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "q must be between 1 and 100 characters",
+            ));
+        }
+        let query = query.to_lowercase();
+        let result = tokio::task::spawn_blocking(move || list_library_search(&root, &query))
+            .await
+            .map_err(|_| ApiError::internal("list outbound files failed"))?;
+        return Ok(Json(json!({
+            "files": result.0,
+            "truncated": result.1,
+        })));
+    }
+    if let Some(directory) = query.directory {
+        if directory.len() > MAX_LIBRARY_DIRECTORY_INPUT_BYTES {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "directory is too long",
+            ));
+        }
+        let directory = directory.trim_matches('/').to_owned();
+        if identity.tenant.is_empty()
+            && directory
+                .split('/')
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case(crate::paths::TENANT_STORAGE_DIR))
+        {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "directory is reserved",
+            ));
+        }
+        let path = if directory.is_empty() {
+            root.clone()
+        } else {
+            safe_library_path(&app, &identity.tenant, &directory)?
+        };
+        let result = tokio::task::spawn_blocking(move || list_library_directory(&root, &path))
+            .await
+            .map_err(|_| ApiError::internal("list outbound files failed"))?
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "directory must contain only directories",
+                )
+            })?;
+        return Ok(Json(json!({
+            "directory": directory,
+            "directories": result.0,
+            "files": result.1,
+            "truncated": result.2,
+        })));
+    }
     let files = tokio::task::spawn_blocking(move || {
         let mut files = Vec::new();
         if let Ok(meta) = std::fs::symlink_metadata(&root) {
@@ -500,6 +603,191 @@ fn list_library_dir(root: &Path, dir: &Path, files: &mut Vec<serde_json::Value>)
             }
         }
     }
+}
+
+fn is_library_stage_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.starts_with(".vot-") && name.ends_with(".stage"))
+}
+
+fn library_root_safe(root: &Path) -> bool {
+    std::fs::symlink_metadata(root)
+        .is_ok_and(|meta| meta.file_type().is_dir() && !meta.file_type().is_symlink())
+}
+
+fn library_directory_safe(root: &Path, directory: &Path) -> bool {
+    if !library_root_safe(root) || !library_directory_components_safe(root, directory) {
+        return false;
+    }
+    std::fs::symlink_metadata(directory)
+        .is_ok_and(|meta| meta.file_type().is_dir() && !meta.file_type().is_symlink())
+}
+
+fn library_directory_components_safe(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut current = root.to_owned();
+    for component in relative.components() {
+        current.push(component);
+        let Ok(meta) = std::fs::symlink_metadata(&current) else {
+            return true;
+        };
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+            return false;
+        }
+    }
+    true
+}
+
+fn direct_library_entries(
+    root: &Path,
+    directory: &Path,
+) -> (Vec<String>, Vec<serde_json::Value>, bool) {
+    let mut entries = BinaryHeap::new();
+    let Ok(read_dir) = std::fs::read_dir(directory) else {
+        return (Vec::new(), Vec::new(), false);
+    };
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        let name = entry.file_name();
+        if directory == root
+            && name
+                .to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case(crate::paths::TENANT_STORAGE_DIR))
+        {
+            continue;
+        }
+        if is_library_stage_name(&name) {
+            continue;
+        }
+        let Some(relative) = path.strip_prefix(root).ok() else {
+            continue;
+        };
+        let is_directory = meta.file_type().is_dir();
+        if !is_directory && !meta.file_type().is_file() {
+            continue;
+        }
+        entries.push((
+            relative.to_string_lossy().replace('\\', "/"),
+            is_directory,
+            meta.len(),
+        ));
+        if entries.len() > MAX_LIBRARY_DIRECTORY_ENTRIES + 1 {
+            entries.pop();
+        }
+    }
+    let truncated = entries.len() > MAX_LIBRARY_DIRECTORY_ENTRIES;
+    let mut entries = entries.into_sorted_vec();
+    entries.truncate(MAX_LIBRARY_DIRECTORY_ENTRIES);
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+    for (path, is_directory, bytes) in entries {
+        if is_directory {
+            directories.push(path);
+        } else {
+            files.push(json!({ "path": path, "bytes": bytes }));
+        }
+    }
+    (directories, files, truncated)
+}
+
+fn list_library_directory(
+    root: &Path,
+    directory: &Path,
+) -> Result<(Vec<String>, Vec<serde_json::Value>, bool), ()> {
+    if !library_root_safe(root) {
+        return Ok((Vec::new(), Vec::new(), false));
+    }
+    if !library_directory_safe(root, directory) {
+        if std::fs::symlink_metadata(directory).is_err() {
+            return Ok((Vec::new(), Vec::new(), false));
+        }
+        return Err(());
+    }
+    Ok(direct_library_entries(root, directory))
+}
+
+fn search_library_dir(
+    root: &Path,
+    directory: &Path,
+    query: &str,
+    matches: &mut BinaryHeap<(String, String, u64)>,
+) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        let name = entry.file_name();
+        if directory == root
+            && name
+                .to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case(crate::paths::TENANT_STORAGE_DIR))
+        {
+            continue;
+        }
+        if is_library_stage_name(&name) {
+            continue;
+        }
+        if meta.file_type().is_dir() {
+            search_library_dir(root, &path, query, matches);
+        } else if meta.file_type().is_file() {
+            let Some(relative) = path.strip_prefix(root).ok() else {
+                continue;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let lowercase = relative.to_lowercase();
+            if !lowercase.contains(query) {
+                continue;
+            }
+            matches.push((lowercase, relative, meta.len()));
+            if matches.len() > RETAINED_LIBRARY_SEARCH_RESULTS {
+                matches.pop();
+            }
+        }
+    }
+}
+
+fn list_library_search(root: &Path, query: &str) -> (Vec<serde_json::Value>, bool) {
+    if !library_root_safe(root) {
+        return (Vec::new(), false);
+    }
+    let mut matches = BinaryHeap::new();
+    search_library_dir(root, root, query, &mut matches);
+    let truncated = matches.len() > MAX_LIBRARY_SEARCH_RESULTS;
+    let mut matches = matches.into_sorted_vec();
+    matches.truncate(MAX_LIBRARY_SEARCH_RESULTS);
+    (
+        matches
+            .into_iter()
+            .map(|(_, path, bytes)| json!({ "path": path, "bytes": bytes }))
+            .collect(),
+        truncated,
+    )
+}
+
+fn enumerate_library_selection(root: &Path, directory: &Path) -> ApiResult<Vec<serde_json::Value>> {
+    enumerate_automation_files(root, directory)?
+        .into_iter()
+        .map(|relative| {
+            let path = root.join(&relative);
+            let metadata = std::fs::symlink_metadata(path).map_err(|_| ApiError::not_found())?;
+            Ok(json!({ "path": relative, "bytes": metadata.len() }))
+        })
+        .collect()
 }
 
 fn library_components_safe(root: &Path, path: &Path) -> bool {
@@ -1005,12 +1293,9 @@ fn automation_directory(app: &App, tenant: &str, directory: &str) -> ApiResult<P
 
 fn enumerate_automation_files(root: &Path, directory: &Path) -> ApiResult<Vec<String>> {
     fn visit(root: &Path, directory: &Path, paths: &mut Vec<String>) -> ApiResult<()> {
-        let mut entries = std::fs::read_dir(directory)
-            .map_err(|_| ApiError::not_found())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| ApiError::not_found())?;
-        entries.sort_by_key(|entry| entry.file_name());
+        let entries = std::fs::read_dir(directory).map_err(|_| ApiError::not_found())?;
         for entry in entries {
+            let entry = entry.map_err(|_| ApiError::not_found())?;
             let path = entry.path();
             let metadata = std::fs::symlink_metadata(&path).map_err(|_| ApiError::not_found())?;
             if metadata.file_type().is_symlink() {
@@ -4052,6 +4337,228 @@ mod tests {
         assert_eq!(listed["files"][0]["path"], "a.bin");
         assert_eq!(listed["files"][1]["path"], "z.bin");
         assert_eq!(listed["files"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn scoped_library_directory_lists_sorted_direct_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let root = &app.config.outbound_dir;
+        std::fs::write(root.join("z.bin"), b"z").unwrap();
+        std::fs::write(root.join("a.bin"), b"a").unwrap();
+        std::fs::create_dir_all(root.join("zdir/nested")).unwrap();
+        std::fs::create_dir_all(root.join("adir")).unwrap();
+        std::fs::create_dir_all(root.join(".vot-dir.stage")).unwrap();
+        std::fs::write(root.join("adir/nested.bin"), b"nested").unwrap();
+        std::fs::write(root.join(".vot-upload.stage"), b"stage").unwrap();
+        std::fs::create_dir_all(root.join(crate::paths::TENANT_STORAGE_DIR).join("named")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("adir"), root.join("link")).unwrap();
+
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get("/api/admin/outbound-files?directory=")
+                    .header("cookie", admin_cookie(&app))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed = body(response).await;
+        assert_eq!(listed["directory"], "");
+        assert_eq!(listed["directories"], json!(["adir", "zdir"]));
+        assert_eq!(listed["files"][0]["path"], "a.bin");
+        assert_eq!(listed["files"][1]["path"], "z.bin");
+        assert_eq!(listed["truncated"], false);
+
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!(
+                    "/api/admin/outbound-files?directory={}",
+                    crate::paths::TENANT_STORAGE_DIR
+                ))
+                .header("cookie", admin_cookie(&app))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get("/api/admin/outbound-files?directory=adir")
+                    .header("cookie", admin_cookie(&app))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed = body(response).await;
+        assert_eq!(listed["directory"], "adir");
+        assert_eq!(listed["directories"], json!([]));
+        assert_eq!(listed["files"][0]["path"], "adir/nested.bin");
+
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get("/api/admin/outbound-files?selection=adir")
+                    .header("cookie", admin_cookie(&app))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let selected = body(response).await;
+        assert_eq!(
+            selected["files"],
+            json!([{ "path": "adir/nested.bin", "bytes": 6 }])
+        );
+
+        std::fs::create_dir_all(root.join("large")).unwrap();
+        for index in 0..65 {
+            std::fs::write(root.join(format!("large/file-{index:02}.bin")), b"x").unwrap();
+        }
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get("/api/admin/outbound-files?selection=large")
+                    .header("cookie", admin_cookie(&app))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        #[cfg(unix)]
+        {
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::get("/api/admin/outbound-files?selection=link")
+                        .header("cookie", admin_cookie(&app))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[test]
+    fn scoped_library_directory_caps_direct_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_LIBRARY_DIRECTORY_ENTRIES {
+            std::fs::write(directory.path().join(format!("file-{index:04}.bin")), b"x").unwrap();
+        }
+        let (directories, files, truncated) =
+            direct_library_entries(directory.path(), directory.path());
+        assert!(directories.is_empty());
+        assert_eq!(files.len(), MAX_LIBRARY_DIRECTORY_ENTRIES);
+        assert!(truncated);
+        assert_eq!(files[0]["path"], "file-0000.bin");
+        assert_eq!(
+            files[MAX_LIBRARY_DIRECTORY_ENTRIES - 1]["path"],
+            "file-0999.bin"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_library_search_is_literal_case_insensitive_and_capped() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        for index in 0..205 {
+            std::fs::write(
+                app.config
+                    .outbound_dir
+                    .join(format!("match-{index:03}.bin")),
+                b"x",
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(app.config.outbound_dir.join("nested")).unwrap();
+        std::fs::write(app.config.outbound_dir.join("nested/noise.bin"), b"match").unwrap();
+        std::fs::create_dir_all(
+            app.config
+                .outbound_dir
+                .join(crate::paths::TENANT_STORAGE_DIR)
+                .join("named"),
+        )
+        .unwrap();
+        std::fs::write(
+            app.config
+                .outbound_dir
+                .join(crate::paths::TENANT_STORAGE_DIR)
+                .join("named/match-reserved.bin"),
+            b"x",
+        )
+        .unwrap();
+        std::fs::write(app.config.outbound_dir.join(".vot-match.stage"), b"x").unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(directory.path().join("outside")).unwrap();
+            std::fs::write(directory.path().join("outside/match-outside.bin"), b"x").unwrap();
+            std::os::unix::fs::symlink(
+                directory.path().join("outside"),
+                app.config.outbound_dir.join("000-match-link"),
+            )
+            .unwrap();
+        }
+
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get("/api/admin/outbound-files?q=MaTcH")
+                    .header("cookie", admin_cookie(&app))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed = body(response).await;
+        assert_eq!(
+            listed["files"].as_array().unwrap().len(),
+            MAX_LIBRARY_SEARCH_RESULTS
+        );
+        assert_eq!(listed["files"][0]["path"], "match-000.bin");
+        assert_eq!(listed["files"][199]["path"], "match-199.bin");
+        assert_eq!(listed["truncated"], true);
+        let paths = listed["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["path"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!paths.iter().any(|path| path.contains("reserved")));
+        assert!(!paths.iter().any(|path| path.ends_with(".stage")));
+        assert!(!paths.iter().any(|path| path.contains("outside")));
+    }
+
+    #[tokio::test]
+    async fn scoped_library_listing_rejects_invalid_queries() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        for uri in [
+            "/api/admin/outbound-files?directory=one&q=two".to_owned(),
+            "/api/admin/outbound-files?directory=one&selection=two".to_owned(),
+            "/api/admin/outbound-files?selection=".to_owned(),
+            "/api/admin/outbound-files?q=".to_owned(),
+            format!("/api/admin/outbound-files?q={}", "x".repeat(101)),
+            format!("/api/admin/outbound-files?directory={}", "x".repeat(1025)),
+        ] {
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::get(uri)
+                        .header("cookie", admin_cookie(&app))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
     }
 
     #[tokio::test]

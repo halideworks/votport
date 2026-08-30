@@ -201,6 +201,7 @@ try {
   console.error(`deliver page did not load at ${page.url()}: ${await page.locator("body").innerText()}`);
   throw error;
 }
+await page.fill("#deliver-project", "browser-project");
 await page.setInputFiles("#library-input", [
   path.join(dir, "deliver-one.txt"),
   path.join(dir, "deliver-two.txt"),
@@ -209,13 +210,66 @@ await page.waitForFunction(
   () => document.getElementById("library-status").textContent.includes("2 files added"),
   { timeout: 30000 },
 );
-const libraryFiles = page.locator("#library-files input[type=checkbox]");
-const libraryFileCount = await libraryFiles.count();
-if (libraryFileCount !== 2) {
-  throw new Error(`outbound library count: ${libraryFileCount}`);
+const rootFolder = page.locator(
+  '#library-files input[aria-label="Select folder browser-project"]',
+);
+if (await rootFolder.count() !== 1 || await page.locator("#library-files .library-folder").count() !== 1) {
+  throw new Error("scoped library root did not show browser-project");
 }
-for (let index = 0; index < libraryFileCount; index += 1) {
-  await page.locator("#library-files input[type=checkbox]").nth(index).click();
+await page.getByRole("button", { name: "Open folder browser-project" }).click();
+await page.waitForFunction(
+  () => document.querySelector('#library-breadcrumbs [aria-current="page"]')?.textContent === "browser-project" &&
+    document.querySelectorAll("#library-files input[type=checkbox]").length === 2,
+  { timeout: 15000 },
+);
+const currentDirectory = await page.textContent('#library-breadcrumbs [aria-current="page"]');
+if (currentDirectory !== "browser-project") {
+  throw new Error(`scoped library breadcrumb: ${currentDirectory}`);
+}
+const projectFiles = await page.$$eval("#library-files .library-file:not(.library-folder) .mono", (els) =>
+  els.map((el) => el.textContent).sort(),
+);
+if (JSON.stringify(projectFiles) !== JSON.stringify(["deliver-one.txt", "deliver-two.txt"])) {
+  throw new Error(`scoped library files: ${JSON.stringify(projectFiles)}`);
+}
+await page.getByRole("button", { name: "Library", exact: true }).click();
+await page.waitForSelector('#library-files input[aria-label="Select folder browser-project"]', {
+  state: "visible",
+  timeout: 15000,
+});
+await page.locator('#library-files input[aria-label="Select folder browser-project"]').click();
+await page.waitForFunction(
+  () => document.getElementById("library-selection-status").textContent.startsWith("2 files selected"),
+  { timeout: 15000 },
+);
+await page.getByRole("button", { name: "Open folder browser-project" }).click();
+await page.waitForFunction(
+  () => document.querySelector('#library-breadcrumbs [aria-current="page"]')?.textContent === "browser-project" &&
+    document.querySelectorAll("#library-files input[type=checkbox]").length === 2 &&
+    [...document.querySelectorAll("#library-files input[type=checkbox]")].every((checkbox) => checkbox.checked) &&
+    document.getElementById("library-selection-status").textContent.startsWith("2 files selected"),
+  { timeout: 15000 },
+);
+const selectedProjectFiles = await page.$$eval(
+  "#library-files input[type=checkbox]",
+  (checkboxes) => checkboxes.map((checkbox) => checkbox.checked),
+);
+if (selectedProjectFiles.length !== 2 || !selectedProjectFiles.every(Boolean)) {
+  throw new Error(`scoped library selection: ${JSON.stringify(selectedProjectFiles)}`);
+}
+if (!(await page.textContent("#library-selection-status")).startsWith("2 files selected")) {
+  throw new Error("scoped library selection status changed");
+}
+await page.getByRole("button", { name: "Library", exact: true }).click();
+const selectedFolder = page.locator(
+  '#library-files input[aria-label="Select folder browser-project"]',
+);
+await selectedFolder.waitFor({ state: "visible", timeout: 15000 });
+if (!(await selectedFolder.isChecked())) {
+  throw new Error("scoped library folder selection was lost");
+}
+if (!(await page.textContent("#library-selection-status")).startsWith("2 files selected")) {
+  throw new Error("scoped library root selection status changed");
 }
 await page.fill("#deliver-label", "browser outbound e2e");
 await page.click("#deliver-submit");
@@ -253,13 +307,13 @@ const bundleNames = execFileSync("unzip", ["-Z1", bundlePath], { encoding: "utf8
   .filter(Boolean);
 if (
   bundleNames.length !== 2 ||
-  !bundleNames.includes("deliver-one.txt") ||
-  !bundleNames.includes("deliver-two.txt") ||
+  !bundleNames.includes("browser-project/deliver-one.txt") ||
+  !bundleNames.includes("browser-project/deliver-two.txt") ||
   bundleNames.some((name) => name.endsWith(".vot-receipt"))
 ) {
   throw new Error(`bundle payload names: ${JSON.stringify(bundleNames)}`);
 }
-const bundledOne = execFileSync("unzip", ["-p", bundlePath, "deliver-one.txt"], {
+const bundledOne = execFileSync("unzip", ["-p", bundlePath, "browser-project/deliver-one.txt"], {
   encoding: "utf8",
 });
 if (bundledOne !== "first deliverable\n") {
