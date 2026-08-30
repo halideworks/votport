@@ -48,7 +48,7 @@ const MAX_OUTBOUND_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_LIBRARY_DIRECTORY_INPUT_BYTES: usize = 1024;
 const MAX_LIBRARY_DIRECTORY_ENTRIES: usize = 1000;
 const MAX_LIBRARY_SELECTION_FILES: usize = 64;
-const MAX_LIBRARY_PROJECT_FILES: usize = 10_000;
+const MAX_LIBRARY_PROJECT_FILES: usize = 50_000;
 const MAX_LIBRARY_SEARCH_CHARS: usize = 100;
 const MAX_LIBRARY_SEARCH_RESULTS: usize = 200;
 const RETAINED_LIBRARY_SEARCH_RESULTS: usize = MAX_LIBRARY_SEARCH_RESULTS + 1;
@@ -5211,17 +5211,14 @@ mod tests {
     #[test]
     fn recursive_library_enumerator_rejects_more_than_project_limit() {
         let directory = tempfile::tempdir().unwrap();
-        for index in 0..=MAX_LIBRARY_PROJECT_FILES {
+        let limit = 3;
+        for index in 0..=limit {
             std::fs::write(directory.path().join(format!("file-{index:04}.bin")), b"x").unwrap();
         }
-        let error = enumerate_automation_files(
-            directory.path(),
-            directory.path(),
-            MAX_LIBRARY_PROJECT_FILES,
-        )
-        .unwrap_err();
+        let error =
+            enumerate_automation_files(directory.path(), directory.path(), limit).unwrap_err();
         assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(error.message.contains("maximum 10000"));
+        assert!(error.message.contains(&format!("maximum {limit}")));
     }
 
     #[tokio::test]
