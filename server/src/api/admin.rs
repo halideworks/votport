@@ -14,7 +14,7 @@ use tokio_util::io::ReaderStream;
 use crate::app::App;
 use crate::auth;
 use crate::paths;
-use crate::store::{now_unix, Link};
+use crate::store::{now_unix, Link, LinkCursor};
 
 use super::{cookie_attributes, ApiError, ApiResult};
 
@@ -219,27 +219,38 @@ pub async fn admin_logout(State(app): State<Arc<App>>, headers: HeaderMap) -> Ap
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
 
-/// Streams audit rows after `since` as JSONL, oldest first. Caps at 10_000
-/// rows per call; callers paginate with `since`.
+/// Streams audit rows as JSONL. The legacy `since`/`after_rowid` mode is
+/// oldest-first; `before_rowid` opts into recent-first pagination.
 pub async fn admin_audit_export(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     Query(query): Query<AuditQuery>,
 ) -> ApiResult<Response> {
     let identity = require_admin(&app, &headers)?;
+    if query.before_rowid.is_some() && (query.since.is_some() || query.after_rowid.is_some()) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "before_rowid cannot be combined with since or after_rowid",
+        ));
+    }
     // Named-tenant principals see only their namespace's rows; the default
     // tenant (platform admin) sees everything.
     let tenant_filter = identity.tenant.clone();
     let limit = query.limit.unwrap_or(1000).min(10_000);
-    let rows = app
-        .store
-        .audit_export(
-            &tenant_filter,
-            query.since.unwrap_or(0),
-            query.after_rowid.unwrap_or(0),
-            limit,
-        )
-        .map_err(ApiError::internal)?;
+    let rows = if let Some(before_rowid) = query.before_rowid {
+        app.store
+            .audit_recent(&tenant_filter, before_rowid, limit)
+            .map_err(ApiError::internal)?
+    } else {
+        app.store
+            .audit_export(
+                &tenant_filter,
+                query.since.unwrap_or(0),
+                query.after_rowid.unwrap_or(0),
+                limit,
+            )
+            .map_err(ApiError::internal)?
+    };
     use std::fmt::Write as _;
     let mut body = String::new();
     for row in rows {
@@ -285,6 +296,7 @@ pub struct AuditQuery {
     /// Cursor for rows sharing `since`'s second (from the previous page's
     /// final `rowid`).
     after_rowid: Option<u64>,
+    before_rowid: Option<u64>,
     limit: Option<u64>,
 }
 
@@ -593,14 +605,22 @@ pub async fn delete_tenant(
 pub struct PatchTenantRequest {
     #[serde(default)]
     label: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "double_option")]
     admin_group: Option<Option<String>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "double_option")]
     max_total_bytes: Option<Option<u64>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "double_option")]
     max_links: Option<Option<u64>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "double_option")]
     max_sessions: Option<Option<u64>>,
+}
+
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
 fn patch_quota(field: &str, value: Option<u64>) -> ApiResult<Option<u64>> {
@@ -1209,6 +1229,15 @@ struct FileView {
     exists: bool,
 }
 
+#[derive(Deserialize)]
+pub struct LinkQuery {
+    limit: Option<u64>,
+    search: Option<String>,
+    status: Option<String>,
+    before_created_at: Option<u64>,
+    before_id: Option<String>,
+}
+
 pub(crate) fn base_url(app: &App, headers: &HeaderMap) -> String {
     if let Some(url) = &app.config.public_url {
         return url.clone();
@@ -1294,9 +1323,67 @@ fn link_view(app: &App, link: Link, base: &str) -> LinkView {
 pub async fn list_links(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
+    Query(query): Query<LinkQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_admin(&app, &headers)?;
     let base = base_url(&app, &headers);
+    let paged = query.limit.is_some()
+        || query.search.is_some()
+        || query.status.is_some()
+        || query.before_created_at.is_some()
+        || query.before_id.is_some();
+    if paged {
+        let limit = query.limit.unwrap_or(100);
+        if !(1..=100).contains(&limit) {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "limit must be between 1 and 100",
+            ));
+        }
+        let status = query
+            .status
+            .as_deref()
+            .unwrap_or("all")
+            .to_ascii_lowercase();
+        if !matches!(status.as_str(), "all" | "open" | "closed") {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "status must be all, open, or closed",
+            ));
+        }
+        let cursor = match (query.before_created_at, query.before_id) {
+            (Some(created_at), Some(id)) => Some(LinkCursor { created_at, id }),
+            (None, None) => None,
+            _ => {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "before_created_at and before_id must be supplied together",
+                ));
+            }
+        };
+        let page = app
+            .store
+            .links_page(
+                &identity.tenant,
+                limit,
+                cursor.as_ref(),
+                query.search.as_deref().unwrap_or(""),
+                &status,
+                now_unix(),
+            )
+            .map_err(super::store_unavailable)?;
+        let links: Vec<LinkView> = page
+            .links
+            .into_iter()
+            .map(|link| link_view(&app, link, &base))
+            .collect();
+        return Ok(Json(json!({
+            "links": links,
+            "receive_dir": app.config.receive_dir,
+            "receipt_key": app.signer.public_hex,
+            "next_cursor": page.next_cursor,
+        })));
+    }
     let links: Vec<LinkView> = app
         .store
         .links(&identity.tenant)
@@ -1508,7 +1595,7 @@ pub async fn delete_link(
     if app
         .store
         .link(&identity.tenant, &id)
-        .map_err(ApiError::internal)?
+        .map_err(super::store_unavailable)?
         .is_none()
     {
         return Err(ApiError::not_found());
@@ -1517,6 +1604,14 @@ pub async fn delete_link(
         .sessions
         .try_pin_link(&id)
         .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "link delete already in progress"))?;
+    let link = app
+        .store
+        .link(&identity.tenant, &id)
+        .map_err(super::store_unavailable)?
+        .ok_or_else(ApiError::not_found)?;
+    if link.legal_hold {
+        return Err(ApiError::new(StatusCode::CONFLICT, "link is on legal hold"));
+    }
     if app.sessions.active_for_link(&id) > 0 {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -1583,6 +1678,14 @@ pub async fn delete_upload_record(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
+    if app
+        .store
+        .link(&identity.tenant, &id)
+        .map_err(super::store_unavailable)?
+        .is_none()
+    {
+        return Err(ApiError::not_found());
+    }
     let _pin = app
         .sessions
         .try_pin_link(&id)
@@ -1598,6 +1701,12 @@ pub async fn delete_upload_record(
         .link(&identity.tenant, &id)
         .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
+    if link.legal_hold {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "received records cannot be deleted while the link is on legal hold",
+        ));
+    }
     let record = link
         .uploads
         .iter()
@@ -1645,19 +1754,14 @@ pub async fn delete_received_file(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    let link = app
+    if app
         .store
         .link(&identity.tenant, &id)
         .map_err(super::store_unavailable)?
-        .ok_or_else(ApiError::not_found)?;
-    let record = link
-        .uploads
-        .iter()
-        .find(|entry| entry.id == upload)
-        .and_then(|entry| entry.files.get(index))
-        .ok_or_else(ApiError::not_found)?;
-    let path = stored_path(&app, &identity.tenant, &record.stored_as)
-        .ok_or_else(|| ApiError::internal("stored path failed the join guard"))?;
+        .is_none()
+    {
+        return Err(ApiError::not_found());
+    }
     let _pin = app
         .sessions
         .try_pin_link(&id)
@@ -1668,6 +1772,25 @@ pub async fn delete_received_file(
             "uploads are in flight; try again when they finish",
         ));
     }
+    let link = app
+        .store
+        .link(&identity.tenant, &id)
+        .map_err(super::store_unavailable)?
+        .ok_or_else(ApiError::not_found)?;
+    if link.legal_hold {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "received files cannot be deleted while the link is on legal hold",
+        ));
+    }
+    let record = link
+        .uploads
+        .iter()
+        .find(|entry| entry.id == upload)
+        .and_then(|entry| entry.files.get(index))
+        .ok_or_else(ApiError::not_found)?;
+    let path = stored_path(&app, &identity.tenant, &record.stored_as)
+        .ok_or_else(|| ApiError::internal("stored path failed the join guard"))?;
     if app
         .store
         .has_active_outbound_grant(&identity.tenant, &id, &upload, index, now_unix())
@@ -2001,6 +2124,111 @@ mod handler_tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    #[tokio::test]
+    async fn legal_hold_refuses_all_received_data_deletions() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_link(crate::store::Link {
+                id: "held".to_owned(),
+                label: "held".to_owned(),
+                tenant: String::new(),
+                dest: String::new(),
+                password_hash: None,
+                created_at: 0,
+                expires_at: None,
+                max_bytes: None,
+                active: true,
+                legal_hold: true,
+                uploads: Vec::new(),
+                events: Vec::new(),
+            })
+            .unwrap();
+        let cookie = login_cookie(app::router(application.clone())).await;
+        for uri in [
+            "/api/admin/links/held",
+            "/api/admin/links/held/uploads/upload",
+            "/api/admin/links/held/uploads/upload/files/0",
+        ] {
+            let response = app::router(application.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(uri)
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{uri}");
+        }
+        assert!(application.store.link("", "held").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn paged_links_return_a_stable_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        for id in ["z-link", "m-link", "a-link"] {
+            application
+                .store
+                .insert_link(crate::store::Link {
+                    id: id.to_owned(),
+                    label: id.to_owned(),
+                    tenant: String::new(),
+                    dest: String::new(),
+                    password_hash: None,
+                    created_at: 10,
+                    expires_at: None,
+                    max_bytes: None,
+                    active: true,
+                    legal_hold: false,
+                    uploads: Vec::new(),
+                    events: Vec::new(),
+                })
+                .unwrap();
+        }
+        let cookie = login_cookie(app::router(application.clone())).await;
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::get("/api/admin/links?limit=2")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        use http_body_util::BodyExt as _;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let links = json["links"].as_array().unwrap();
+        assert_eq!(links[0]["id"], "z-link");
+        assert_eq!(links[1]["id"], "m-link");
+        assert_eq!(
+            json["next_cursor"],
+            serde_json::json!({"created_at": 10, "id": "m-link"})
+        );
+
+        let response = app::router(application)
+            .oneshot(
+                Request::get("/api/admin/links?limit=2&before_created_at=10&before_id=m-link")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["links"].as_array().unwrap()[0]["id"], "a-link");
+        assert!(json["next_cursor"].is_null());
+    }
+
     #[test]
     fn link_view_maps_legacy_upload_transport_to_http() {
         let directory = tempfile::tempdir().unwrap();
@@ -2035,6 +2263,24 @@ mod handler_tests {
         );
         let json = serde_json::to_value(view).unwrap();
         assert_eq!(json["uploads"][0]["transport"], "http");
+    }
+
+    #[test]
+    fn patch_tenant_null_clears_and_omission_preserves() {
+        let cleared: PatchTenantRequest = serde_json::from_str(
+            r#"{"admin_group":null,"max_total_bytes":null,"max_links":null,"max_sessions":null}"#,
+        )
+        .unwrap();
+        assert_eq!(cleared.admin_group, Some(None));
+        assert_eq!(cleared.max_total_bytes, Some(None));
+        assert_eq!(cleared.max_links, Some(None));
+        assert_eq!(cleared.max_sessions, Some(None));
+
+        let omitted: PatchTenantRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(omitted.admin_group, None);
+        assert_eq!(omitted.max_total_bytes, None);
+        assert_eq!(omitted.max_links, None);
+        assert_eq!(omitted.max_sessions, None);
     }
 
     #[tokio::test]
@@ -2110,6 +2356,52 @@ mod handler_tests {
         assert_eq!(line["event"], "link_created");
         assert_eq!(line["subject"], "l-1");
         assert_eq!(line["detail"]["label"], "x");
+    }
+
+    #[tokio::test]
+    async fn audit_recent_cursor_returns_newest_rows_and_rejects_mixed_cursors() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = login_cookie(app::router(application.clone())).await;
+        application
+            .store
+            .audit("", "", "oldest", "a", &serde_json::json!({}));
+        application
+            .store
+            .audit("", "", "middle", "b", &serde_json::json!({}));
+        application
+            .store
+            .audit("", "", "newest", "c", &serde_json::json!({}));
+
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::get("/api/admin/audit?before_rowid=0&limit=2")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        use http_body_util::BodyExt as _;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let events: Vec<_> = String::from_utf8(body.to_vec())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["event"].clone())
+            .collect();
+        assert_eq!(events, vec!["newest", "middle"]);
+
+        let response = app::router(application)
+            .oneshot(
+                Request::get("/api/admin/audit?before_rowid=3&since=0")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

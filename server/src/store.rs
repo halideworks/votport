@@ -164,6 +164,17 @@ pub struct Link {
     pub events: Vec<SessionEvent>,
 }
 
+#[derive(Serialize)]
+pub struct LinkCursor {
+    pub created_at: u64,
+    pub id: String,
+}
+
+pub struct LinkPage {
+    pub links: Vec<Link>,
+    pub next_cursor: Option<LinkCursor>,
+}
+
 impl Link {
     pub fn usable_now(&self) -> bool {
         self.active && self.expires_at.is_none_or(|at| now_unix() < at)
@@ -895,6 +906,75 @@ impl Store {
             )?;
             let rows = statement.query_map([tenant], row_to_link)?;
             rows.collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    pub fn links_page(
+        &self,
+        tenant: &str,
+        limit: u64,
+        before: Option<&LinkCursor>,
+        search: &str,
+        status: &str,
+        now: u64,
+    ) -> Result<LinkPage, String> {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let sql_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let (before_set, before_created_at, before_id) = before
+            .map(|cursor| {
+                (
+                    1_i64,
+                    i64::try_from(cursor.created_at).unwrap_or(i64::MAX),
+                    cursor.id.as_str(),
+                )
+            })
+            .unwrap_or((0, 0, ""));
+        let search = escape_like(search).to_lowercase();
+        let now = i64::try_from(now).unwrap_or(i64::MAX);
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
+                        active, legal_hold, uploads_json, events_json
+                 FROM links
+                 WHERE tenant = ?1
+                   AND (?2 = '' OR lower(label) LIKE '%' || ?2 || '%' ESCAPE '\\'
+                        OR lower(dest) LIKE '%' || ?2 || '%' ESCAPE '\\')
+                   AND (?3 = 'all'
+                        OR (?3 = 'open' AND active != 0
+                            AND (expires_at IS NULL OR expires_at > ?4))
+                        OR (?3 = 'closed' AND (active = 0
+                            OR (expires_at IS NOT NULL AND expires_at <= ?4))))
+                   AND (?5 = 0 OR created_at < ?6
+                        OR (created_at = ?6 AND id < ?7))
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT ?8",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![
+                    tenant,
+                    search,
+                    status,
+                    now,
+                    before_set,
+                    before_created_at,
+                    before_id,
+                    sql_limit,
+                ],
+                row_to_link,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .map(|mut links| {
+            let next_cursor = if links.len() > limit {
+                links.truncate(limit);
+                links.last().map(|link| LinkCursor {
+                    created_at: link.created_at,
+                    id: link.id.clone(),
+                })
+            } else {
+                None
+            };
+            LinkPage { links, next_cursor }
         })
     }
 
@@ -1839,6 +1919,13 @@ impl Store {
     }
 }
 
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 fn insert_link_row(connection: &Connection, link: &Link) -> rusqlite::Result<()> {
     connection.execute(
         "INSERT INTO links (id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
@@ -2253,6 +2340,32 @@ impl Store {
             } else {
                 Self::audit_export_query(connection, tenant, since, after_rowid, limit)
             }
+        })
+    }
+
+    pub fn audit_recent(
+        &self,
+        tenant: &str,
+        before_rowid: u64,
+        limit: u64,
+    ) -> Result<Vec<AuditRow>, String> {
+        self.with(|connection| {
+            let mut statement = connection.prepare_cached(
+                "SELECT rowid, at, tenant, actor, event, subject, detail
+                 FROM audit_log
+                 WHERE (?1 = '' OR tenant = ?1)
+                   AND (?2 = 0 OR rowid < ?2)
+                 ORDER BY rowid DESC LIMIT ?3",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![
+                    tenant,
+                    i64::try_from(before_rowid).unwrap_or(i64::MAX),
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+                map_audit_row,
+            )?;
+            rows.collect()
         })
     }
 
@@ -3926,7 +4039,7 @@ mod ops_tests {
 
 #[cfg(test)]
 mod phase4_review_tests {
-    use super::tests::link_in;
+    use super::tests::{link_in, test_tenant};
     use super::*;
 
     #[test]
@@ -4007,6 +4120,95 @@ mod phase4_review_tests {
         let scoped = store.audit_export("acme", 0, 0, 100).unwrap();
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].tenant, "acme");
+    }
+
+    #[test]
+    fn links_page_is_stable_literal_filtered_and_tenant_scoped() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut newest = link_in("", "z-link");
+        newest.created_at = 100;
+        newest.label = "Hundred% match".to_owned();
+        newest.dest = "incoming".to_owned();
+        let mut middle = link_in("", "m-link");
+        middle.created_at = 100;
+        middle.label = "100X match".to_owned();
+        let mut oldest = link_in("", "a-link");
+        oldest.created_at = 100;
+        oldest.active = false;
+        store.insert_link(newest).unwrap();
+        store.insert_link(middle).unwrap();
+        store.insert_link(oldest).unwrap();
+        store.insert_tenant(test_tenant("acme")).unwrap();
+        store.insert_link(link_in("acme", "foreign")).unwrap();
+
+        let first = store
+            .links_page("", 2, None, "HUNDRED%", "all", 1000)
+            .unwrap();
+        assert_eq!(
+            first
+                .links
+                .iter()
+                .map(|link| link.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["z-link"]
+        );
+
+        let first = store.links_page("", 2, None, "", "all", 1000).unwrap();
+        assert_eq!(
+            first
+                .links
+                .iter()
+                .map(|link| link.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["z-link", "m-link"]
+        );
+        let cursor = first.next_cursor.unwrap();
+        let second = store
+            .links_page("", 2, Some(&cursor), "", "all", 1000)
+            .unwrap();
+        assert_eq!(second.links[0].id, "a-link");
+        assert!(second.next_cursor.is_none());
+        assert!(store
+            .links_page("", 2, None, "", "all", 1000)
+            .unwrap()
+            .links
+            .iter()
+            .all(|link| link.tenant.is_empty()));
+        assert_eq!(
+            store
+                .links_page("", 10, None, "", "open", 1000)
+                .unwrap()
+                .links
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .links_page("", 10, None, "", "closed", 1000)
+                .unwrap()
+                .links
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn recent_audit_is_descending_and_tenant_scoped() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.audit("acme", "", "first", "a", &serde_json::json!({}));
+        store.audit("acme", "", "second", "b", &serde_json::json!({}));
+        store.audit("other", "", "foreign", "c", &serde_json::json!({}));
+
+        let page = store.audit_recent("acme", 0, 1).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].event, "second");
+        let older = store
+            .audit_recent("acme", page[0].rowid as u64, 10)
+            .unwrap();
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0].event, "first");
     }
 }
 
