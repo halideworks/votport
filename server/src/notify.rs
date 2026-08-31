@@ -23,8 +23,28 @@ pub struct NotificationReport {
     pub delivered: u32,
 }
 
+/// Product name for notification titles: the tenant's brand name when one is
+/// set, else the tenant label, else "votport".
+fn title_brand(app: &App, tenant: &str) -> String {
+    app.store
+        .branding(tenant)
+        .ok()
+        .flatten()
+        .map(|branding| branding.name)
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            app.store
+                .tenant(tenant)
+                .ok()
+                .flatten()
+                .map(|tenant| tenant.label)
+                .filter(|label| !label.is_empty())
+        })
+        .unwrap_or_else(|| "votport".to_owned())
+}
+
 /// Sends every configured notification for one completed upload.
-pub async fn uploaded(app: Arc<App>, label: String, report: FinishReport) {
+pub async fn uploaded(app: Arc<App>, tenant: String, label: String, report: FinishReport) {
     let transfer_id = report.upload_id.clone();
     let total: u64 = report.files.iter().map(|file| file.bytes).sum();
     let count = report.files.len();
@@ -34,7 +54,10 @@ pub async fn uploaded(app: Arc<App>, label: String, report: FinishReport) {
         .iter()
         .take(MAX_NOTIFICATION_FILES)
         .collect::<Vec<_>>();
-    let title = format!("votport: files received for \"{label}\"");
+    let title = format!(
+        "{}: files received for \"{label}\"",
+        title_brand(&app, &tenant)
+    );
     let mut body = format!(
         "{count} file(s), {total} bytes\n{}",
         files
@@ -107,7 +130,11 @@ pub async fn outbound_downloaded(
         )
     };
     let download_starts = grant.downloads.saturating_add(1);
-    let title = format!("votport: outbound {transition} for \"{}\"", grant.label);
+    let title = format!(
+        "{}: outbound {transition} for \"{}\"",
+        title_brand(&app, &grant.tenant),
+        grant.label
+    );
     let body = format!(
         "{}\n{transition}: {file_count} file(s), {total_bytes} bytes",
         grant.label
@@ -506,6 +533,7 @@ mod tests {
             .collect();
         uploaded(
             application,
+            String::new(),
             "upload-label".to_owned(),
             FinishReport {
                 upload_id: "upload-id".to_owned(),
@@ -722,6 +750,7 @@ mod tests {
 
         uploaded(
             application,
+            String::new(),
             "label".to_owned(),
             FinishReport {
                 upload_id: "up-1".to_owned(),
@@ -754,6 +783,7 @@ mod tests {
 
         uploaded(
             application,
+            String::new(),
             "smtp-label".to_owned(),
             FinishReport {
                 upload_id: "up-smtp".to_owned(),

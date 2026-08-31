@@ -394,7 +394,7 @@ pub(crate) fn upload_completed(
         let app = Arc::clone(app);
         let report = report.clone();
         runtime.spawn(async move {
-            crate::notify::uploaded(app, link.label, report).await;
+            crate::notify::uploaded(app, link.tenant, link.label, report).await;
         });
     }
     app.sessions.remove(session_id);
@@ -1502,6 +1502,18 @@ pub fn router(app: Arc<App>) -> Router {
             "/api/admin/tenants/{key}",
             axum::routing::patch(api::update_tenant).delete(api::delete_tenant),
         )
+        .route(
+            "/api/admin/branding/{key}",
+            get(api::get_branding)
+                .put(api::put_branding)
+                .delete(api::delete_branding),
+        )
+        .route(
+            "/api/admin/branding/{key}/logo",
+            axum::routing::put(api::put_branding_logo)
+                .delete(api::delete_branding_logo)
+                .layer(DefaultBodyLimit::max(api::admin::MAX_LOGO_BYTES + 1024)),
+        )
         .route("/api/admin/tenant", post(api::switch_tenant))
         .route("/api/admin/principals/revoke", post(api::revoke_principal))
         .route(
@@ -1570,10 +1582,12 @@ pub fn router(app: Arc<App>) -> Router {
             "/api/verify",
             post(api::verify_receipt).layer(DefaultBodyLimit::max(64 * 1024)),
         )
+        .route("/api/r/{token}/logo", get(api::link_logo))
         .route("/api/r/{token}/verify", post(api::verify_link_password))
         .route("/api/r/{token}/push", post(api::create_push_session))
         .route("/api/r/{token}/session", post(api::create_session))
         .route("/api/s/{token}", get(api::outbound_metadata))
+        .route("/api/s/{token}/logo", get(api::outbound_logo))
         .route("/api/s/{token}/verify", post(api::verify_outbound_password))
         .route("/api/s/{token}/bundle", get(api::outbound::outbound_bundle))
         .route("/api/s/{token}/batch", get(api::outbound::outbound_batch))

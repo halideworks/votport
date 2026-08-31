@@ -62,6 +62,12 @@ Multi-file deliveries offer a payload-only ZIP or separate-file bulk streaming.
 Receipts remain optional individual downloads. `max_downloads` applies per file
 and per full-delivery round. Separate streaming uses bounded concurrency.
 
+Per-tenant branding (name, accent color, logo) restyles the recipient pages,
+but serving a tenant under its own hostname is Caddy configuration, not
+votport: point the extra domain at the same upstream in the `Caddyfile` and
+Caddy provisions its certificate. votport sees only the request path, so links
+issued for any tenant work on every domain that reaches the instance.
+
 ## Native push
 
 Native push is disabled unless `VOTPORT_PUSH_BIND` is set. It is a QUIC/UDP

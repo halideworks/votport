@@ -267,6 +267,13 @@ body:has(#dashboard:not([hidden])) .sheet {
  color: var(--muted);
  font-size: 0.78rem;
 }
+/* Tenant logo, injected above the heading when branding carries one. */
+.masthead .brand-logo {
+ display: block;
+ max-height: 3rem;
+ max-width: 12rem;
+ margin-bottom: 0.75rem;
+}
 
 h2 {
  font-size: 0.66rem;

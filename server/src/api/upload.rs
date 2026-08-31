@@ -68,10 +68,17 @@ pub async fn link_info(
         .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
     let usable = link.usable_now();
+    let branding = if usable {
+        super::public_branding(&app, &link.tenant).map_err(super::store_unavailable)?
+    } else {
+        None
+    };
     Ok(Json(json!({
         // The label leaks nothing new to an authorized sender, but an old URL
         // for a closed request should not keep revealing what it was for.
         "label": if usable { Some(&link.label) } else { None },
+        // Same exposure as the label: shown pre-password, hidden once closed.
+        "branding": branding,
         "needs_password": link.password_hash.is_some(),
         "authorized": link_authorized(&app, &link, &headers),
         "usable": usable,
@@ -79,6 +86,21 @@ pub async fn link_info(
         "chunk_bytes": session::CHUNK_BYTES,
         "push": app.push.is_some(),
     })))
+}
+
+/// Tenant logo for a request link. Ungated like the link label: the metadata
+/// endpoint reveals the label pre-password, so the logo matches that level.
+pub async fn link_logo(
+    State(app): State<Arc<App>>,
+    Path(token): Path<String>,
+) -> ApiResult<axum::response::Response> {
+    let link = app
+        .store
+        .upload_link(&token)
+        .map_err(super::store_unavailable)?
+        .filter(Link::usable_now)
+        .ok_or_else(ApiError::not_found)?;
+    super::serve_branding_logo(&app, &link.tenant).await
 }
 
 fn effective_cap(app: &App, link: &Link) -> u64 {

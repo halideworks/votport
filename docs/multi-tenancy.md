@@ -121,6 +121,21 @@ still leave only the tracing event.
   records, emitting audit events; audit retention alone does not answer "how
   long does received data live", which every security review asks.
 
+## Per-tenant branding
+
+Recipient-facing surfaces can carry a tenant's identity instead of the stock
+VOTPort look. Branding is a display name, an accent color (`#rrggbb`), and an
+optional logo (PNG, JPEG, or SVG, 512 KiB cap) stored per tenant; the default
+tenant is branded from the System page, named tenants from their card on the
+Tenants page (tenant admins may also set their own via
+`/api/admin/branding/<key>`). The request/upload page, the download page, and
+notification titles use the brand name, falling back to the tenant label,
+falling back to today's appearance; logos are served on token-scoped public
+routes that expose exactly what the link or grant metadata already exposes,
+including password gating. Branding covers presentation only: it changes no
+paths, quotas, tokens, or verification behavior, and custom domains remain out
+of scope (see `docs/deployment.md`).
+
 ## Threat-model deltas
 
 | Change | Mitigation |

@@ -1,6 +1,7 @@
 // votport uploader: hashes files with vot-wasm, builds a VOT package, and
 // streams proven ranges to the server. VOTPORT PROPRIETARY LICENSE.
 
+import { applyBranding } from '/assets/branding.js';
 import { appendObjectCard, formatBytes } from '/assets/object-card.js';
 import { entryFiles } from '/assets/upload-entries.js';
 import init, {
@@ -1084,6 +1085,7 @@ function showResumeNote() {
   }
   $('title').textContent = info.label;
   $('subtitle').textContent = 'Files are verified on receipt.';
+  applyBranding(info.branding, `/api/r/${token}/logo`);
   chunkBytes = info.chunk_bytes || chunkBytes;
   maxBytes = Number.isFinite(info.max_bytes) ? info.max_bytes : null;
   try {

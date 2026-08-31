@@ -14,6 +14,7 @@ test('system settings are grouped and deployment values have DOM targets', () =>
     'email',
     'retention',
     'default-tenant-quotas',
+    'branding',
     'network-integrations',
     'maintenance-verification',
   ]);

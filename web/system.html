@@ -498,6 +498,55 @@
         </form>
       </section>
 
+      <section class="settings-group" data-group="branding">
+        <h2>Branding</h2>
+        <p class="settings-group-note">Default tenant, recipient-facing</p>
+        <form id="branding-form" class="card">
+          <h2>Recipient branding</h2>
+          <p class="muted">
+            Shown on request and download pages served by the default tenant.
+            Named tenants are branded from the Tenants page.
+          </p>
+          <div class="grid">
+            <label
+              >Brand name
+              <input id="branding-name" type="text" placeholder="votport" />
+            </label>
+            <div>
+              <label
+                >Accent color
+                <input id="branding-color" type="color" value="#38bdf8" />
+              </label>
+              <button type="button" class="ghost tiny" id="branding-color-clear">
+                Clear color
+              </button>
+            </div>
+            <div>
+              <label
+                >Logo <span class="muted">PNG, JPEG, or SVG &middot; 512 KiB max</span>
+                <input
+                  id="branding-logo"
+                  type="file"
+                  accept="image/png,image/jpeg,image/svg+xml"
+                />
+              </label>
+              <button type="button" class="tiny" id="branding-logo-upload">
+                Upload logo
+              </button>
+              <button type="button" class="tiny danger" id="branding-logo-remove">
+                Remove logo
+              </button>
+            </div>
+          </div>
+          <button type="submit">Save</button>
+          <button type="button" class="tiny danger" id="branding-remove">
+            Remove branding
+          </button>
+          <span id="branding-note" class="muted"></span>
+          <p class="error" id="branding-error" role="alert" hidden></p>
+        </form>
+      </section>
+
       <section class="settings-group" data-group="network-integrations">
         <h2>Network &amp; integrations</h2>
         <p class="settings-group-note">

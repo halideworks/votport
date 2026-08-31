@@ -1,5 +1,6 @@
 // votport public verified download page. VOTPORT PROPRIETARY LICENSE.
 
+import { applyBranding } from '/assets/branding.js';
 import { appendObjectCard, formatBytes } from '/assets/object-card.js';
 import {
   appendMetadataPage,
@@ -381,6 +382,7 @@ async function loadMetadata() {
     }
   }
   $('title').textContent = body.label || 'Verified download';
+  applyBranding(body.branding, `/api/s/${encodeURIComponent(token)}/logo`);
   $('status').textContent = 'The server verifies the file against this identity before download.';
   $('expires').textContent = body.expires_at
     ? `Link expires ${when(body.expires_at)}`

@@ -206,6 +206,18 @@ pub struct Tenant {
     pub created_at: u64,
 }
 
+/// Recipient-facing branding for a tenant ("" is the default tenant).
+#[derive(Clone, Debug, Serialize)]
+pub struct Branding {
+    pub tenant: String,
+    pub name: String,
+    /// Empty or "#rrggbb".
+    pub color: String,
+    /// Empty when no logo is stored; else "png", "jpg", or "svg".
+    pub logo_ext: String,
+    pub updated_at: u64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct TenantUsage {
     pub tenant: String,
@@ -317,7 +329,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 16;
+pub(crate) const SCHEMA_VERSION: u64 = 17;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -447,6 +459,16 @@ const OUTBOUND_GRANTS_LIMIT_SCHEMA: &str =
 const NOTIFICATION_POLICY_SCHEMA: &str =
     "ALTER TABLE links ADD COLUMN notify_on_upload INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE outbound_grants ADD COLUMN notify_on_download INTEGER NOT NULL DEFAULT 0;";
+
+const BRANDING_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS branding (
+    tenant TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    color TEXT NOT NULL DEFAULT '',
+    logo_ext TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL
+);
+";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -862,6 +884,11 @@ impl Store {
                         .map_err(|error| error.to_string())?;
                 }
             }
+        }
+        if stored < 17 {
+            transaction
+                .execute_batch(BRANDING_SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
         }
         transaction
             .execute(
@@ -1517,6 +1544,9 @@ impl Store {
             transaction
                 .execute("DELETE FROM automation_tokens WHERE tenant = ?1", [key])
                 .map_err(|error| error.to_string())?;
+            transaction
+                .execute("DELETE FROM branding WHERE tenant = ?1", [key])
+                .map_err(|error| error.to_string())?;
         }
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(removal)
@@ -1538,6 +1568,58 @@ impl Store {
                 ],
             )?;
             Ok(changed > 0)
+        })
+    }
+
+    // ------------------------------------------------------------ branding
+
+    pub fn branding(&self, tenant: &str) -> Result<Option<Branding>, String> {
+        self.with(|connection| {
+            connection
+                .prepare_cached(
+                    "SELECT tenant, name, color, logo_ext, updated_at
+                     FROM branding WHERE tenant = ?1",
+                )?
+                .query_row([tenant], |row| {
+                    Ok(Branding {
+                        tenant: row.get(0)?,
+                        name: row.get(1)?,
+                        color: row.get(2)?,
+                        logo_ext: row.get(3)?,
+                        updated_at: row.get::<_, i64>(4)?.max(0) as u64,
+                    })
+                })
+                .optional()
+        })
+    }
+
+    pub fn set_branding(&self, branding: &Branding) -> Result<(), String> {
+        self.with(|connection| {
+            connection
+                .prepare_cached(
+                    "INSERT INTO branding (tenant, name, color, logo_ext, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(tenant) DO UPDATE SET
+                        name = excluded.name, color = excluded.color,
+                        logo_ext = excluded.logo_ext, updated_at = excluded.updated_at",
+                )?
+                .execute(rusqlite::params![
+                    branding.tenant,
+                    branding.name,
+                    branding.color,
+                    branding.logo_ext,
+                    i64::try_from(branding.updated_at).unwrap_or(i64::MAX),
+                ])
+                .map(|_| ())
+        })
+    }
+
+    pub fn delete_branding(&self, tenant: &str) -> Result<bool, String> {
+        self.with(|connection| {
+            connection
+                .prepare_cached("DELETE FROM branding WHERE tenant = ?1")?
+                .execute([tenant])
+                .map(|changed| changed > 0)
         })
     }
 
@@ -3658,7 +3740,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(schema, "16");
+        assert_eq!(schema, "17");
         assert!(store
             .with(|connection| {
                 connection.query_row(
@@ -6204,9 +6286,111 @@ mod settings_tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         drop(store);
-        assert_eq!(schema_version(directory.path()), "16");
+        assert_eq!(schema_version(directory.path()), "17");
         Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "16");
+        assert_eq!(schema_version(directory.path()), "17");
+    }
+
+    #[test]
+    fn branding_rows_round_trip_and_delete() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        assert!(store.branding("acme").unwrap().is_none());
+
+        let branding = Branding {
+            tenant: "acme".to_owned(),
+            name: "Acme Corp".to_owned(),
+            color: "#0a84ff".to_owned(),
+            logo_ext: String::new(),
+            updated_at: 42,
+        };
+        store.set_branding(&branding).unwrap();
+        let read = store.branding("acme").unwrap().unwrap();
+        assert_eq!(read.name, "Acme Corp");
+        assert_eq!(read.color, "#0a84ff");
+        assert_eq!(read.logo_ext, "");
+        assert_eq!(read.updated_at, 42);
+
+        // Upsert replaces the row; the default tenant ("") is a row like any.
+        store
+            .set_branding(&Branding {
+                logo_ext: "png".to_owned(),
+                ..branding.clone()
+            })
+            .unwrap();
+        assert_eq!(store.branding("acme").unwrap().unwrap().logo_ext, "png");
+        store
+            .set_branding(&Branding {
+                tenant: String::new(),
+                ..branding
+            })
+            .unwrap();
+        assert_eq!(store.branding("").unwrap().unwrap().name, "Acme Corp");
+
+        assert!(store.delete_branding("acme").unwrap());
+        assert!(!store.delete_branding("acme").unwrap());
+        assert!(store.branding("acme").unwrap().is_none());
+        assert!(store.branding("").unwrap().is_some());
+    }
+
+    #[test]
+    fn tenant_delete_removes_its_branding_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .insert_tenant(Tenant {
+                key: "acme".to_owned(),
+                label: String::new(),
+                admin_group: None,
+                max_total_bytes: None,
+                max_links: None,
+                max_sessions: None,
+                created_at: 0,
+            })
+            .unwrap();
+        store
+            .set_branding(&Branding {
+                tenant: "acme".to_owned(),
+                name: "Acme".to_owned(),
+                color: String::new(),
+                logo_ext: String::new(),
+                updated_at: 0,
+            })
+            .unwrap();
+        assert!(matches!(
+            store.remove_tenant("acme").unwrap(),
+            TenantRemoval::Deleted
+        ));
+        assert!(store.branding("acme").unwrap().is_none());
+    }
+
+    #[test]
+    fn v16_database_gains_the_branding_table() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .with(|connection| {
+                connection.execute_batch(
+                    "DROP TABLE branding;
+                     UPDATE meta SET value = '16' WHERE key = 'schema_version';",
+                )
+            })
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(directory.path()).unwrap();
+        assert_eq!(schema_version(directory.path()), "17");
+        assert!(reopened.branding("acme").unwrap().is_none());
+        reopened
+            .set_branding(&Branding {
+                tenant: "acme".to_owned(),
+                name: "Acme".to_owned(),
+                color: String::new(),
+                logo_ext: String::new(),
+                updated_at: 1,
+            })
+            .unwrap();
+        assert_eq!(reopened.branding("acme").unwrap().unwrap().name, "Acme");
     }
 
     #[test]
@@ -6228,7 +6412,7 @@ mod settings_tests {
                 .unwrap();
         }
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "16");
+        assert_eq!(schema_version(directory.path()), "17");
         assert!(store.principals_page(50, 0, None).unwrap().0.is_empty());
         assert!(store.principal("nobody").unwrap().is_none());
     }
@@ -6250,7 +6434,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "16");
+        assert_eq!(schema_version(directory.path()), "17");
         assert!(!store.link("", "old-link").unwrap().unwrap().legal_hold);
     }
 
@@ -6292,7 +6476,7 @@ mod settings_tests {
         drop(store);
 
         let reopened = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "16");
+        assert_eq!(schema_version(directory.path()), "17");
         assert_eq!(reopened.tenant_received_bytes("").unwrap(), 9);
     }
 
@@ -6334,7 +6518,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "16");
+        assert_eq!(schema_version(directory.path()), "17");
         let grant = store
             .outbound_grant_by_token_hash("hash-g1")
             .unwrap()
@@ -6386,7 +6570,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "16");
+        assert_eq!(schema_version(directory.path()), "17");
         let grant = store
             .outbound_grant_by_token_hash("hash-g1")
             .unwrap()
@@ -6421,7 +6605,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "16");
+        assert_eq!(schema_version(directory.path()), "17");
         let columns: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('outbound_grants')
@@ -6453,7 +6637,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "16");
+        assert_eq!(schema_version(directory.path()), "17");
         let table_exists: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -6493,7 +6677,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "16");
+        assert_eq!(schema_version(directory.path()), "17");
         let default: Option<String> = connection
             .query_row(
                 "SELECT dflt_value FROM pragma_table_info('outbound_grants')
@@ -6549,7 +6733,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "16");
+        assert_eq!(schema_version(directory.path()), "17");
         let counts: Vec<(String, i64)> = {
             let mut statement = connection
                 .prepare("SELECT id, file_count FROM outbound_grants ORDER BY id")

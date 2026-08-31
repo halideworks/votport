@@ -2189,11 +2189,14 @@ pub async fn outbound_metadata(
             .map(|(index, file)| outbound_metadata_file(&token, index, &file))
             .collect::<Vec<_>>();
         let has_more = offset.saturating_add(files.len()) < files_total;
+        let branding =
+            super::public_branding(&app, &grant.tenant).map_err(super::store_unavailable)?;
         return Ok((
             [(header::CACHE_CONTROL, "no-store")],
             Json(json!({
                 "has_password": grant.password_hash.is_some(),
                 "authorized": authorized,
+                "branding": branding,
                 "label": grant.label,
                 "name": grant.name,
                 "suite": grant.suite,
@@ -2254,11 +2257,13 @@ pub async fn outbound_metadata(
             })
             .collect()
     };
+    let branding = super::public_branding(&app, &grant.tenant).map_err(super::store_unavailable)?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(json!({
             "has_password": grant.password_hash.is_some(),
             "authorized": authorized,
+            "branding": branding,
             "label": grant.label,
             "name": grant.name,
             "suite": grant.suite,
@@ -2278,6 +2283,18 @@ pub async fn outbound_metadata(
         })),
     )
         .into_response())
+}
+
+/// Tenant logo for a delivery. Password-gated like the metadata: the
+/// pre-password response reveals nothing, so the logo hides with it.
+pub async fn outbound_logo(
+    State(app): State<Arc<App>>,
+    AxumPath(token): AxumPath<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let grant = active_grant(&app, &token)?;
+    require_grant_access(&app, &grant, &headers)?;
+    super::serve_branding_logo(&app, &grant.tenant).await
 }
 
 #[derive(Deserialize)]
@@ -3970,6 +3987,165 @@ mod tests {
 
     async fn body(response: Response) -> serde_json::Value {
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    fn branding_grant(token: &str, password_hash: Option<String>) -> OutboundGrant {
+        OutboundGrant {
+            id: format!("grant-{token}"),
+            token_hash: hash_token(token),
+            password_hash,
+            tenant: String::new(),
+            link_id: String::new(),
+            upload_id: String::new(),
+            package_root: String::new(),
+            name: "file.bin".to_owned(),
+            suite: "blake3".to_owned(),
+            root: String::new(),
+            file_index: 0,
+            bytes: 3,
+            label: "delivery".to_owned(),
+            created_at: 1,
+            expires_at: now_unix() + 600,
+            revoked_at: None,
+            downloads: 0,
+            max_downloads: None,
+            notify_on_download: false,
+            first_download_at: None,
+            last_download_at: None,
+            files: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_branding_and_logo_hide_behind_the_password() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        app.store
+            .set_branding(&crate::store::Branding {
+                tenant: String::new(),
+                name: "Acme Corp".to_owned(),
+                color: "#12ab99".to_owned(),
+                logo_ext: "png".to_owned(),
+                updated_at: 0,
+            })
+            .unwrap();
+        let logo = crate::paths::branding_logo_path(&app.config.data_dir, "", "png");
+        std::fs::create_dir_all(logo.parent().unwrap()).unwrap();
+        std::fs::write(&logo, b"\x89PNG\r\n\x1a\npixels").unwrap();
+        let gated = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let open = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        app.store
+            .insert_outbound_grant(branding_grant(
+                gated,
+                Some(auth::hash_password("pw").unwrap()),
+            ))
+            .unwrap();
+        app.store
+            .insert_outbound_grant(branding_grant(open, None))
+            .unwrap();
+
+        // Pre-password metadata reveals nothing, branding included.
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{gated}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body(response).await;
+        assert_eq!(json["has_password"], true);
+        assert_eq!(json["authorized"], false);
+        assert!(json.get("branding").is_none(), "{json}");
+        // ... so the logo hides with it.
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{gated}/logo"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // The password cookie unlocks branding and the logo together.
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::post(format!("/api/s/{gated}/verify"))
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
+                    .body(Body::from(r#"{"password":"pw"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{gated}"))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json = body(response).await;
+        assert_eq!(json["authorized"], true);
+        assert_eq!(json["branding"]["name"], "Acme Corp");
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{gated}/logo"))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Without a password, metadata (plain and paged) carries branding
+        // and the logo streams.
+        for uri in [
+            format!("/api/s/{open}"),
+            format!("/api/s/{open}?offset=0&limit=10"),
+        ] {
+            let response = crate::app::router(app.clone())
+                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let json = body(response).await;
+            assert_eq!(json["branding"]["name"], "Acme Corp", "{uri}");
+            assert_eq!(json["branding"]["color"], "#12ab99", "{uri}");
+            assert_eq!(json["branding"]["has_logo"], true, "{uri}");
+        }
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{open}/logo"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
     }
 
     fn zip_entries(bytes: &[u8]) -> std::collections::HashMap<String, Vec<u8>> {
