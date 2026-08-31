@@ -30,7 +30,8 @@ test('VOTPort imposes no anchor fallback file-count cap; Chromium batches permis
 
 test('anchor fallback copy explains multiple downloads', () => {
   assert.match(outboundScript, /Requested \$\{pending\.files\.length\} downloads/);
-  assert.match(outboundScript, /Safari may ask you to allow multiple downloads; accept that prompt/);
+  assert.match(outboundScript, /Your browser may ask you to allow multiple downloads; accept that prompt to receive every file\./);
+  assert.doesNotMatch(outboundScript, /Safari may ask|If Safari asks/);
   assert.match(sendPage, /id="separate-download-confirm" class="modal"/);
   assert.match(sendPage, /id="separate-download-confirm-detail"/);
   assert.match(sendPage, /aria-describedby="separate-download-confirm-detail"/);

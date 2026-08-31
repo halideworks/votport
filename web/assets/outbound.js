@@ -141,7 +141,7 @@ async function prepareAnchorDownloads() {
     anchorDownloadPreflight = { files, names: dedupeFilenames(files.map((file) => file.name)) };
     $('separate-download-confirm-detail').textContent =
       `This will download ${files.length} payload files individually to your browser's configured download location. ` +
-      'No ZIP or receipt files are included. Safari may ask you to allow multiple downloads; accept that prompt to receive every file.';
+      'No ZIP or receipt files are included. Your browser may ask you to allow multiple downloads; accept that prompt to receive every file.';
     const dialog = $('separate-download-confirm');
     dialog.returnValue = 'cancel';
     dialog.showModal();
@@ -165,7 +165,7 @@ async function startAnchorDownloads() {
   try {
     await triggerSeparateDownloads(pending.files, pending.names);
     status.textContent =
-      `Requested ${pending.files.length} downloads. If Safari asks, allow multiple downloads to receive every file.`;
+      `Requested ${pending.files.length} downloads. Your browser may ask you to allow multiple downloads; accept that prompt to receive every file.`;
   } finally {
     separateDownloadBusy = false;
     button.disabled = false;
@@ -364,7 +364,7 @@ async function loadMetadata() {
       separateButton.disabled = false;
       $('separate-download-status').textContent = '';
     } else {
-      separateNote.textContent = 'Download files individually to your browser\'s configured download location. If Safari asks, allow multiple downloads to receive every file.';
+      separateNote.textContent = 'Download files individually to your browser\'s configured download location. Your browser may ask you to allow multiple downloads; accept that prompt to receive every file.';
       separateButton.onclick = () => prepareAnchorDownloads();
       separateButton.disabled = false;
       $('separate-download-status').textContent = '';
