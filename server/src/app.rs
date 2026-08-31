@@ -2023,6 +2023,10 @@ mod request_metrics_tests {
             .body(Body::empty())
             .unwrap();
         assert!(!is_outbound_upload(&other));
+        let list = Request::get("/api/admin/outbound-files")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!is_outbound_upload(&list));
 
         let metrics = RequestMetrics::default();
         metrics.observe_outbound_upload(Duration::from_millis(75));
