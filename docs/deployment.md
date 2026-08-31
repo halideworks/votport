@@ -470,6 +470,14 @@ queued-body memory rises linearly with it: sessions x 8 in-flight chunks x
 ~9 MiB, so 32 sessions bound roughly 2.3 GiB. Size it against available RAM
 before raising it for a busy facility.
 
+Static assets under `/assets` are served `no-cache` and answer conditional
+GETs with 304s, so a redeploy takes effect on the next page load. The heavy
+leaf assets (fonts, the hero image and ship mark, the wasm verification
+binary) are referenced with a `?v=<content hash>` stamp and those responses
+are `immutable`, cached for a year without revalidation. Stamps maintain
+themselves: `scripts/build-wasm.sh` and `scripts/fetch-fonts.sh` restamp
+what they generate, and `npm test` fails if a stamp goes stale.
+
 ## Logs
 
 Operational logs use a human-readable format by default. Set

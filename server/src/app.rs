@@ -1337,6 +1337,62 @@ mod health_tests {
     }
 }
 
+#[cfg(test)]
+mod asset_cache_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+
+    async fn fetch(path: &str) -> Response {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        router(app)
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unstamped_assets_revalidate_and_stamped_assets_are_immutable() {
+        let plain = fetch("/assets/fonts.css").await;
+        assert_eq!(plain.status(), StatusCode::OK);
+        assert_eq!(plain.headers()[header::CACHE_CONTROL], "no-cache");
+        assert_eq!(plain.headers()[header::REFERRER_POLICY], "no-referrer");
+
+        let stamped = fetch("/assets/favicon.png?v=0011223344556677").await;
+        assert_eq!(stamped.status(), StatusCode::OK);
+        assert_eq!(
+            stamped.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(stamped.headers()[header::REFERRER_POLICY], "no-referrer");
+
+        let missing = fetch("/assets/no-such-file.png?v=0011223344556677").await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing.headers()[header::CACHE_CONTROL], "no-cache");
+    }
+}
+
+/// Asset URLs stamped with a content hash (?v=) never change meaning, so
+/// successful responses to them are safe to cache forever. Everything else
+/// under /assets keeps no-cache and revalidates.
+async fn asset_cache_control(request: Request<axum::body::Body>, next: Next) -> Response {
+    let stamped = request
+        .uri()
+        .query()
+        .is_some_and(|query| query.split('&').any(|pair| pair.starts_with("v=")));
+    let mut response = next.run(request).await;
+    if stamped && (response.status().is_success() || response.status() == StatusCode::NOT_MODIFIED)
+    {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+    }
+    response
+}
+
 pub fn router(app: Arc<App>) -> Router {
     let web_root = app.config.web_root.clone();
     let admin_page = web_root.join("index.html");
@@ -1394,20 +1450,26 @@ pub fn router(app: Arc<App>) -> Router {
         // no-cache means revalidate, not never-cache: repeat visits answer
         // conditional GETs with 304s instead of re-downloading the wasm and
         // the hero image, while a redeploy still takes effect immediately.
+        // Content-stamped requests (?v=<hash>) skip even the revalidation;
+        // asset_cache_control marks those immutable.
         .nest_service(
             "/assets",
-            tower::ServiceBuilder::new()
+            Router::new()
+                .fallback_service(ServeDir::new(web_root.join("assets")))
                 .layer(
-                    tower_http::set_header::SetResponseHeaderLayer::if_not_present(
-                        axum::http::header::CACHE_CONTROL,
-                        axum::http::HeaderValue::from_static("no-cache"),
-                    ),
-                )
-                .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
-                    axum::http::header::REFERRER_POLICY,
-                    axum::http::HeaderValue::from_static("no-referrer"),
-                ))
-                .service(ServeDir::new(web_root.join("assets"))),
+                    tower::ServiceBuilder::new()
+                        .layer(
+                            tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+                                axum::http::header::CACHE_CONTROL,
+                                axum::http::HeaderValue::from_static("no-cache"),
+                            ),
+                        )
+                        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+                            axum::http::header::REFERRER_POLICY,
+                            axum::http::HeaderValue::from_static("no-referrer"),
+                        ))
+                        .layer(axum::middleware::from_fn(asset_cache_control)),
+                ),
         )
         // Admin API.
         .route("/api/admin/login", post(api::admin_login))
