@@ -492,7 +492,23 @@ impl Store {
     pub fn open(data_dir: &Path) -> Result<Self, String> {
         std::fs::create_dir_all(data_dir)
             .map_err(|error| format!("create {}: {error}", data_dir.display()))?;
+        crate::paths::tighten_private_dir(data_dir)?;
+        crate::paths::tighten_private_dir_contents(&data_dir.join("backups"))?;
         let path = data_dir.join("votport.db");
+        match crate::paths::tighten_private_file(&path)? {
+            true => {}
+            false => match crate::paths::create_private_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    crate::paths::tighten_private_file(&path)?;
+                }
+                Err(error) => return Err(format!("create {}: {error}", path.display())),
+            },
+        }
+        let wal = path.with_file_name("votport.db-wal");
+        let shm = path.with_file_name("votport.db-shm");
+        crate::paths::tighten_private_file(&wal)?;
+        crate::paths::tighten_private_file(&shm)?;
         let connection =
             Connection::open(&path).map_err(|error| format!("open {}: {error}", path.display()))?;
         connection
@@ -531,6 +547,9 @@ impl Store {
         })?;
         store.migrate()?;
         store.import_legacy(data_dir)?;
+        crate::paths::tighten_private_file(&path)?;
+        crate::paths::tighten_private_file(&wal)?;
+        crate::paths::tighten_private_file(&shm)?;
         Ok(store)
     }
 
@@ -1604,7 +1623,8 @@ impl Store {
         self.with(|connection| {
             connection.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])
         })
-        .map(|_| ())
+        .map_err(|error| error.to_string())?;
+        crate::paths::tighten_private_file(destination).map(|_| ())
     }
 
     /// Every link across every tenant. Internal use only (retention sweeps,
@@ -5339,6 +5359,14 @@ mod ops_tests {
         let snapshot = directory.path().join("snapshot.db");
         store.backup_into(&snapshot).unwrap();
         assert!(snapshot.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&snapshot).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
 
         // The snapshot is a real database with the same rows: drop it into
         // a fresh data dir and open it as one.
@@ -5352,6 +5380,59 @@ mod ops_tests {
         std::fs::remove_file(&snapshot).unwrap();
         store.backup_into(&snapshot).unwrap();
         assert!(snapshot.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_protects_existing_and_new_database_state() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("votport.db");
+        std::fs::write(&database, b"").unwrap();
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let backups = directory.path().join("backups");
+        std::fs::create_dir(&backups).unwrap();
+        let snapshot = backups.join("snapshot.db");
+        std::fs::write(&snapshot, b"snapshot").unwrap();
+        std::fs::set_permissions(&backups, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(
+            std::fs::metadata(directory.path().join("votport.db"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&backups).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(snapshot).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        for suffix in ["-wal", "-shm"] {
+            let path = directory.path().join(format!("votport.db{suffix}"));
+            if path.exists() {
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+        drop(store);
     }
 
     #[test]

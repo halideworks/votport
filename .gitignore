@@ -5,3 +5,8 @@ node_modules/
 .env
 HANDOFF.md
 .pi/
+AGENTS.md
+CLAUDE.md
+.agents/
+.claude/
+.codex/
