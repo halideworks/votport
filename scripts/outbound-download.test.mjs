@@ -2,14 +2,12 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import {
-  anchorDownloadsAllowed,
   appendMetadataPage,
   batchDownloadEligible,
   BATCH_LARGE_FILE_BYTES,
   dedupeFilenames,
   FILE_RENDER_BATCH_SIZE,
   metadataMoreAvailable,
-  MAX_ANCHOR_DOWNLOADS,
   publicMetadataPageUrl,
   runWorkerPool,
   saveBatchFiles,
@@ -22,22 +20,28 @@ import {
 const outboundScript = await readFile(new URL('../web/assets/outbound.js', import.meta.url), 'utf8');
 const sendPage = await readFile(new URL('../web/send.html', import.meta.url), 'utf8');
 
-test('anchor download fallback is capped at the supported browser threshold', () => {
-  assert.equal(MAX_ANCHOR_DOWNLOADS, 10);
-  assert.equal(anchorDownloadsAllowed(MAX_ANCHOR_DOWNLOADS), true);
-  assert.equal(anchorDownloadsAllowed(MAX_ANCHOR_DOWNLOADS + 1), false);
+test('VOTPort imposes no anchor fallback file-count cap; Chromium batches permission after 10', () => {
+  assert.doesNotMatch(outboundScript, /MAX_ANCHOR_DOWNLOADS|anchorDownloadsAllowed/);
+  assert.match(outboundScript, /prepareAnchorDownloads\(\)[\s\S]+loadRemainingMetadata\(\)/);
+  assert.match(outboundScript, /startAnchorDownloads\(\)[\s\S]+triggerSeparateDownloads\(pending\.files, pending\.names\)/);
+  assert.match(outboundScript, /const link = document\.createElement\('a'\);[\s\S]+await new Promise\(\(resolve\) => setTimeout\(resolve, 100\)\)/);
+  assert.doesNotMatch(outboundScript, /cannot request more than|Chrome\/Edge/);
 });
 
-test('anchor fallback copy explains the large-link limit', () => {
-  assert.match(outboundScript, /Requested \$\{files\.length\} downloads/);
-  assert.match(outboundScript, /Use Download as ZIP or Chrome\/Edge folder selection/);
+test('anchor fallback copy explains multiple downloads', () => {
+  assert.match(outboundScript, /Requested \$\{pending\.files\.length\} downloads/);
+  assert.match(outboundScript, /Safari may ask you to allow multiple downloads; accept that prompt/);
+  assert.match(sendPage, /id="separate-download-confirm" class="modal"/);
+  assert.match(sendPage, /id="separate-download-confirm-detail"/);
+  assert.match(sendPage, /aria-describedby="separate-download-confirm-detail"/);
+  assert.match(sendPage, />Start downloads<\/button>/);
 });
 
 test('recipient page makes individual files primary and ZIP secondary', () => {
   assert.ok(sendPage.indexOf('id="separate-download"') < sendPage.indexOf('id="bundle-download"'));
   assert.match(sendPage, /<h2>Download all files<\/h2>/);
   assert.match(sendPage, />Download all files<\/button>/);
-  assert.match(sendPage, /Chrome or Edge.*individually.*No ZIP or receipt files/s);
+  assert.match(sendPage, /Download every payload file individually.*configured download location.*No ZIP or receipt files/s);
   assert.match(sendPage, /<h2>Download as ZIP<\/h2>/);
   assert.match(sendPage, /id="bundle-download-button"[\s\S]*class="ghost"[\s\S]*>Download as ZIP<\/button>/);
   assert.doesNotMatch(sendPage, /Download everything/);

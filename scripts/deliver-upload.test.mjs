@@ -14,7 +14,9 @@ test('Deliver exposes file and folder pickers with an accessible drop zone', () 
   assert.match(deliver, /id="library-add-folder"[^>]*>a folder<\/button>/);
   assert.match(deliver, /id="library-folder-input" type="file" webkitdirectory[^>]*hidden/);
   assert.doesNotMatch(deliverScript, /libraryDrop\.addEventListener\('keydown'/);
-  assert.match(deliverScript, /libraryDrop\.addEventListener\('drop'/);
+  assert.match(deliverScript, /document\.addEventListener\('drop'/);
+  assert.match(deliverScript, /carriesFiles\(event\)/);
+  assert.match(deliverScript, /item\.getAsEntry\?\.\(\) \|\| item\.webkitGetAsEntry\?\.\(\)/);
   assert.match(deliverScript, /libraryDrop\.setAttribute\('aria-busy', 'true'\)/);
   assert.match(deliverScript, /An upload is already in progress\./);
 });

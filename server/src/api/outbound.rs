@@ -36,7 +36,7 @@ use crate::store::{
 };
 
 const MAX_ACTIVE: usize = 32;
-const MAX_ACTIVE_PER_GRANT: usize = 4;
+const MAX_ACTIVE_PER_GRANT: usize = 16;
 const CHUNK: usize = 1024 * 1024;
 const BATCH_STAGE_BYTES: u64 = 1024 * 1024 * 1024;
 const BATCH_STAGE_FILES: usize = 5_000;
@@ -4566,14 +4566,14 @@ mod tests {
     }
 
     #[test]
-    fn active_downloads_allow_four_distinct_files_per_grant() {
+    fn active_downloads_allow_sixteen_distinct_files_per_grant() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
         let active: Vec<_> = (0..MAX_ACTIVE_PER_GRANT)
             .map(|index| ActiveDownload::claim(Arc::clone(&app), &format!("grant:{index}")))
             .collect::<Result<_, _>>()
             .unwrap();
-        assert!(ActiveDownload::claim(Arc::clone(&app), "grant:4").is_err());
+        assert!(ActiveDownload::claim(Arc::clone(&app), "grant:16").is_err());
         assert!(ActiveDownload::claim(Arc::clone(&app), "grant:0").is_err());
         drop(active);
         assert!(ActiveDownload::claim(Arc::clone(&app), "grant:4").is_ok());

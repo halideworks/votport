@@ -922,24 +922,29 @@ const drop = $('drop');
 drop.addEventListener('click', (event) => {
   if (!event.target.closest('button')) $('file-input').click();
 });
+const carriesFiles = (event) => [...(event.dataTransfer?.types || [])].includes('Files');
 for (const eventName of ['dragenter', 'dragover']) {
-  drop.addEventListener(eventName, (event) => {
+  document.addEventListener(eventName, (event) => {
+    if ($('uploader').hidden || !carriesFiles(event)) return;
     event.preventDefault();
     drop.classList.add('hover');
   });
 }
 for (const eventName of ['dragleave', 'drop']) {
-  drop.addEventListener(eventName, (event) => {
+  document.addEventListener(eventName, (event) => {
+    if (!carriesFiles(event)) return;
+    if (eventName === 'dragleave' && event.relatedTarget) return;
     event.preventDefault();
     drop.classList.remove('hover');
   });
 }
-drop.addEventListener('drop', async (event) => {
+document.addEventListener('drop', async (event) => {
+  if ($('uploader').hidden || !carriesFiles(event)) return;
   // Entries must be captured before the first await; the DataTransferItemList
   // is neutered as soon as the handler yields.
   const items = event.dataTransfer.items;
   const entries = items
-    ? [...items].map((item) => item.webkitGetAsEntry?.()).filter(Boolean)
+    ? [...items].map((item) => item.getAsEntry?.() || item.webkitGetAsEntry?.()).filter(Boolean)
     : [];
   if (!entries.length) {
     addFiles(event.dataTransfer.files);
