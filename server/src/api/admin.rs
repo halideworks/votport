@@ -860,6 +860,10 @@ pub async fn backup_database(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let _identity = require_platform_admin(&app, &headers)?;
+    let _guard = app
+        .backup_lock
+        .try_lock()
+        .map_err(|_| ApiError::new(StatusCode::CONFLICT, "backup already running"))?;
     let backups = app.config.data_dir.join("backups");
     tokio::fs::create_dir_all(&backups)
         .await

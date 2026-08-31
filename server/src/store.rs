@@ -7,7 +7,7 @@
 //! (see docs/multi-tenancy.md).
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -486,6 +486,7 @@ CREATE TABLE IF NOT EXISTS links (
 
 pub struct Store {
     connection: Mutex<Connection>,
+    path: PathBuf,
 }
 
 impl Store {
@@ -529,6 +530,7 @@ impl Store {
         }
         let store = Self {
             connection: Mutex::new(connection),
+            path: path.clone(),
         };
         // v1/v2 databases predate tenant scoping: existing links belong to
         // the default tenant (""). Idempotent: ignored when the column exists.
@@ -1618,12 +1620,18 @@ impl Store {
     // ------------------------------------------------- operations helpers
 
     /// Consistent snapshot of the database via SQLite's VACUUM INTO. The
-    /// destination must not exist.
+    /// destination must not exist. Runs on its own connection so the
+    /// full-database rewrite never holds the shared store lock: WAL lets
+    /// this reader proceed alongside the serving connection.
     pub fn backup_into(&self, destination: &Path) -> Result<(), String> {
-        self.with(|connection| {
-            connection.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])
-        })
-        .map_err(|error| error.to_string())?;
+        let connection = Connection::open(&self.path)
+            .map_err(|error| format!("open {}: {error}", self.path.display()))?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])
+            .map_err(|error| error.to_string())?;
         crate::paths::tighten_private_file(destination).map(|_| ())
     }
 
@@ -5408,6 +5416,21 @@ mod ops_tests {
         // caller's contract.
         std::fs::remove_file(&snapshot).unwrap();
         store.backup_into(&snapshot).unwrap();
+        assert!(snapshot.exists());
+    }
+
+    #[test]
+    fn backup_runs_without_the_shared_store_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.insert_link(test_link("link-1")).unwrap();
+
+        // Hold the serving connection for the whole snapshot: requests keep
+        // flowing while VACUUM INTO runs on its own connection.
+        let guard = store.connection.lock().unwrap();
+        let snapshot = directory.path().join("snapshot.db");
+        store.backup_into(&snapshot).unwrap();
+        drop(guard);
         assert!(snapshot.exists());
     }
 
