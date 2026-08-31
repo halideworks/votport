@@ -59,6 +59,15 @@ async fn start_server_inner_with_idle(
     enable_push: bool,
     session_idle_secs: u64,
 ) -> TestServer {
+    start_server_custom(max_upload_bytes, enable_push, session_idle_secs, 32).await
+}
+
+async fn start_server_custom(
+    max_upload_bytes: u64,
+    enable_push: bool,
+    session_idle_secs: u64,
+    max_total_sessions: usize,
+) -> TestServer {
     let data = tempfile::tempdir().expect("data dir");
     let received = tempfile::tempdir().expect("receive dir");
     let config = Config {
@@ -95,7 +104,7 @@ async fn start_server_inner_with_idle(
         default_max_sessions: None,
         public_password_login: true,
         metrics_token: None,
-        max_total_sessions: 32,
+        max_total_sessions,
         sso_session_secs: 7 * 24 * 3600,
         trusted_proxies: Vec::new(),
         oidc: None,
@@ -2874,4 +2883,654 @@ async fn native_push_store_failure_rolls_back_published_files() {
         assert!(!destination.exists());
         assert!(!PathBuf::from(format!("{}.vot-receipt", destination.display())).exists());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent load rig. `throughput_baseline` above stays the single-stream
+// regression baseline; this test is the concurrency instrument. See
+// docs/load-testing.md for how to run it and read the output.
+// ---------------------------------------------------------------------------
+
+/// Per-worker timings: time to the first server response, then to completion.
+type WorkerResult = Result<(Duration, Duration), String>;
+
+/// Workers tagged by direction so the mixed phase reports both sides.
+type LoadSet = tokio::task::JoinSet<(bool, WorkerResult)>;
+
+/// A hashed file with its announcement, pages, and seal, keyed by worker.
+type PreparedUpload = (usize, ClientFile, (Value, Vec<Vec<u8>>, Vec<u8>));
+
+fn load_knob(name: &str, default: usize) -> usize {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} must be an integer, got {value:?}")),
+        Err(_) => default,
+    }
+}
+
+/// Deterministic per-run content: a rolling pattern with the salt stamped
+/// into the first bytes, so no two workers (or runs) ever share a root and
+/// dedupe-at-begin cannot skip the transfer.
+fn load_pattern(mib: usize, salt: u64) -> Vec<u8> {
+    let mut bytes = vec![0u8; mib * 1024 * 1024];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = ((index as u64).wrapping_add(salt) % 251) as u8;
+    }
+    bytes[..8].copy_from_slice(&salt.to_le_bytes());
+    bytes
+}
+
+/// Synthetic sender address, honored when the server sees a private or
+/// loopback peer and no proxy appended its own entry. Spreads workers across
+/// the per-IP session-creation throttle so the rig measures contention, not
+/// the rate limiter.
+fn load_ip(worker: usize) -> String {
+    format!("10.108.{}.{}", worker / 250, worker % 250 + 1)
+}
+
+async fn ok200(request: reqwest::RequestBuilder, phase: &str) -> Result<reqwest::Response, String> {
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("{phase}: {error}"))?;
+    let status = response.status();
+    if status != reqwest::StatusCode::OK {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("{phase}: {status} {body}"));
+    }
+    Ok(response)
+}
+
+/// One upload session: create, seal, pages, begin, chunks with eight ranges
+/// in flight (matching the real sender), finish. First response time is the
+/// session create; a failed session is aborted so it does not linger against
+/// the target's caps.
+async fn load_upload_session(
+    client: reqwest::Client,
+    base: String,
+    token: String,
+    ip: String,
+    file: ClientFile,
+    package: (Value, Vec<Vec<u8>>, Vec<u8>),
+) -> WorkerResult {
+    let (announcement, pages, seal) = package;
+    let started = std::time::Instant::now();
+    let response = ok200(
+        client
+            .post(format!("{base}/api/r/{token}/session"))
+            .header("x-forwarded-for", &ip)
+            .json(&json!({ "package": announcement })),
+        "session create",
+    )
+    .await?;
+    let first_response = started.elapsed();
+    let session = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("session create: {error}"))?["session"]
+        .as_str()
+        .ok_or("session create: no session id")?
+        .to_owned();
+
+    let transfer = async {
+        ok200(
+            client
+                .post(format!("{base}/api/session/{session}/seal"))
+                .body(seal),
+            "seal",
+        )
+        .await?;
+        for page in pages {
+            ok200(
+                client
+                    .post(format!("{base}/api/session/{session}/page"))
+                    .body(page),
+                "page",
+            )
+            .await?;
+        }
+        let begin = ok200(
+            client.post(format!("{base}/api/session/{session}/begin")),
+            "begin",
+        )
+        .await?
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("begin: {error}"))?;
+        let entry = &begin["entries"][0];
+        if entry["complete"].as_bool() == Some(true) {
+            return Err("entry complete at begin (deduped); no bytes moved".to_owned());
+        }
+        let index = entry["index"].as_u64().ok_or("begin: no entry index")?;
+
+        let length = file.bytes.len() as u64;
+        let mut offset = 0u64;
+        let mut inflight = tokio::task::JoinSet::new();
+        loop {
+            while offset < length && inflight.len() < 8 {
+                let want = CHUNK.min(length - offset);
+                let proof = file
+                    .prepared
+                    .prove(offset, want)
+                    .map_err(|error| format!("prove: {error:?}"))?;
+                let start = proof.covered_offset() as usize;
+                let end = start + proof.covered_length() as usize;
+                let mut body = proof.proof().to_vec();
+                let proof_len = body.len();
+                body.extend_from_slice(&file.bytes[start..end]);
+                let request = client
+                    .post(format!(
+                        "{base}/api/session/{session}/chunk?entry={index}&offset={start}"
+                    ))
+                    .header("X-Votport-Proof", proof_len.to_string())
+                    .body(body);
+                inflight.spawn(async move { ok200(request, "chunk").await });
+                offset = proof.covered_offset() + proof.covered_length();
+            }
+            match inflight.join_next().await {
+                None => break,
+                Some(joined) => {
+                    joined.map_err(|error| format!("chunk task: {error}"))??;
+                }
+            }
+        }
+        ok200(
+            client.post(format!("{base}/api/session/{session}/finish")),
+            "finish",
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    if transfer.is_err() {
+        let _ = client
+            .post(format!("{base}/api/session/{session}/abort"))
+            .send()
+            .await;
+    }
+    transfer.map(|()| (first_response, started.elapsed()))
+}
+
+/// One grant download, streamed and counted rather than buffered. First
+/// response time is the arrival of the response headers.
+async fn load_download(
+    client: reqwest::Client,
+    base: String,
+    token: String,
+    expected: u64,
+    bound: Duration,
+) -> WorkerResult {
+    let started = std::time::Instant::now();
+    let mut response = client
+        .get(format!("{base}/api/s/{token}/file"))
+        .timeout(bound)
+        .send()
+        .await
+        .map_err(|error| format!("download: {error}"))?;
+    if response.status() != reqwest::StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("download: {status} {body}"));
+    }
+    let first_response = started.elapsed();
+    let mut received = 0u64;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("download body: {error}"))?
+    {
+        received += chunk.len() as u64;
+    }
+    if received != expected {
+        return Err(format!(
+            "download: got {received} bytes, expected {expected}"
+        ));
+    }
+    Ok((first_response, started.elapsed()))
+}
+
+#[derive(Default)]
+struct PhaseStats {
+    first_response: Vec<Duration>,
+    complete: Vec<Duration>,
+    errors: Vec<String>,
+}
+
+impl PhaseStats {
+    fn record(&mut self, result: WorkerResult) {
+        match result {
+            Ok((first_response, complete)) => {
+                self.first_response.push(first_response);
+                self.complete.push(complete);
+            }
+            Err(error) => self.errors.push(error),
+        }
+    }
+}
+
+/// Joins every worker under one deadline. A wedged server fails the phase
+/// here with a count of who finished, instead of hanging the test; the
+/// error propagates so the caller can clean up before surfacing it.
+async fn drain_phase(
+    name: &str,
+    mut set: LoadSet,
+    deadline: Duration,
+) -> Result<(PhaseStats, PhaseStats), String> {
+    let total = set.len();
+    let mut finished = 0usize;
+    let started = std::time::Instant::now();
+    let mut uploads = PhaseStats::default();
+    let mut downloads = PhaseStats::default();
+    loop {
+        let stalled = || {
+            format!(
+                "{name} phase stalled: {finished}/{total} workers finished within \
+                 {deadline:?}; the server is likely wedged (check votport_sessions_active \
+                 and votport_http_requests_in_flight on /metrics)"
+            )
+        };
+        let Some(remaining) = deadline.checked_sub(started.elapsed()) else {
+            return Err(stalled());
+        };
+        match tokio::time::timeout(remaining, set.join_next()).await {
+            Err(_) => return Err(stalled()),
+            Ok(None) => break,
+            Ok(Some(joined)) => {
+                finished += 1;
+                let (is_upload, result) = joined.expect("load worker task");
+                if is_upload {
+                    uploads.record(result);
+                } else {
+                    downloads.record(result);
+                }
+            }
+        }
+    }
+    Ok((uploads, downloads))
+}
+
+fn print_phase(label: &str, workers: usize, file_mib: usize, wall: Duration, stats: &PhaseStats) {
+    let percentile = |values: &[Duration], pct: usize| -> Duration {
+        let mut sorted = values.to_vec();
+        sorted.sort();
+        sorted
+            .get((sorted.len().saturating_sub(1)) * pct / 100)
+            .copied()
+            .unwrap_or(Duration::ZERO)
+    };
+    let ok = stats.complete.len();
+    let rate = ok as f64 * file_mib as f64 / wall.as_secs_f64();
+    println!(
+        "{label:<14} {workers:>3} x {file_mib} MiB: {wall:.2?} wall, {rate:.1} MiB/s aggregate, \
+         first-response p50 {:.1?} p95 {:.1?}, complete p50 {:.1?} p95 {:.1?}, {}/{workers} errors",
+        percentile(&stats.first_response, 50),
+        percentile(&stats.first_response, 95),
+        percentile(&stats.complete, 50),
+        percentile(&stats.complete, 95),
+        stats.errors.len(),
+    );
+    for error in stats.errors.iter().take(3) {
+        println!("    error: {error}");
+    }
+    if stats.errors.len() > 3 {
+        println!("    ... and {} more", stats.errors.len() - 3);
+    }
+}
+
+/// Hashes and packages one distinct file per worker, in parallel, before the
+/// clock starts.
+async fn prepare_load_files(
+    sessions: usize,
+    file_mib: usize,
+    seed: u64,
+    phase: u64,
+) -> Vec<PreparedUpload> {
+    let mut prep = tokio::task::JoinSet::new();
+    for worker in 0..sessions {
+        let salt = seed ^ (phase << 56) ^ ((worker as u64) << 40);
+        // Distinct names: concurrent same-name uploads race on the suffix
+        // and fail with 409, which would drown the numbers this rig is
+        // after. The leak is a few bytes per worker in a test binary.
+        let name: &'static str = Box::leak(format!("load-{phase}-{worker}.bin").into_boxed_str());
+        prep.spawn_blocking(move || {
+            let file = prepare(vec![name], load_pattern(file_mib, salt));
+            let package = build_package(std::slice::from_ref(&file));
+            (worker, file, package)
+        });
+    }
+    let mut files = Vec::with_capacity(sessions);
+    while let Some(joined) = prep.join_next().await {
+        files.push(joined.expect("prepare task"));
+    }
+    files
+}
+
+/// What the run has created on the target so far, so cleanup can run even
+/// when setup or a phase fails partway.
+#[derive(Default)]
+struct LoadArtifacts {
+    link: Option<String>,
+    outbound_path: Option<String>,
+    grant_ids: Vec<String>,
+}
+
+/// Removes what the run created on the target, on failed and stalled runs
+/// included: revokes the grants, deletes the outbound file, the received
+/// copies, and the link. Best effort; a failure is printed, not fatal.
+async fn load_cleanup(admin: &reqwest::Client, base: &str, artifacts: &LoadArtifacts) {
+    let mut failures = 0usize;
+    let mut check = |ok: bool| {
+        if !ok {
+            failures += 1;
+        }
+    };
+    for id in &artifacts.grant_ids {
+        let response = admin
+            .delete(format!("{base}/api/admin/outbound-grants/{id}"))
+            .header("X-Votport", "1")
+            .send()
+            .await;
+        check(response.is_ok_and(|response| response.status() == 200));
+    }
+    if let Some(outbound_path) = &artifacts.outbound_path {
+        let response = admin
+            .delete(format!(
+                "{base}/api/admin/outbound-files?path={outbound_path}"
+            ))
+            .header("X-Votport", "1")
+            .send()
+            .await;
+        check(response.is_ok_and(|response| response.status() == 200));
+    }
+    if let Some(link) = &artifacts.link {
+        // Received copies first, then the link record.
+        if let Ok(listing) = admin
+            .get(format!("{base}/api/admin/links"))
+            .send()
+            .await
+            .and_then(|response| response.error_for_status())
+        {
+            if let Ok(listing) = listing.json::<Value>().await {
+                let uploads = listing["links"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|entry| entry["id"] == json!(link))
+                    .and_then(|entry| entry["uploads"].as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                for upload in uploads {
+                    let Some(id) = upload["id"].as_str() else {
+                        continue;
+                    };
+                    let count = upload["files"].as_array().map_or(0, Vec::len);
+                    for index in 0..count {
+                        let response = admin
+                            .delete(format!(
+                                "{base}/api/admin/links/{link}/uploads/{id}/files/{index}"
+                            ))
+                            .header("X-Votport", "1")
+                            .send()
+                            .await;
+                        check(response.is_ok_and(|response| response.status() == 200));
+                    }
+                }
+            }
+        }
+        let response = admin
+            .delete(format!("{base}/api/admin/links/{link}"))
+            .header("X-Votport", "1")
+            .send()
+            .await;
+        check(response.is_ok_and(|response| response.status() == 200));
+    }
+    if failures > 0 {
+        println!("cleanup: {failures} deletions failed; artifacts may remain on the target");
+    }
+}
+
+/// Concurrency instrument, run explicitly:
+/// `cargo test --release --test e2e -- --ignored --nocapture concurrent_load`.
+/// Three phases against one target: N concurrent upload sessions, M
+/// concurrent grant downloads, then both at once. Knobs (all env):
+/// VOTPORT_LOAD_TARGET (base URL; unset runs an in-process server),
+/// VOTPORT_LOAD_ADMIN_PASSWORD (required with a target),
+/// VOTPORT_LOAD_SESSIONS (16), VOTPORT_LOAD_DOWNLOADS (8),
+/// VOTPORT_LOAD_FILE_MIB (64), VOTPORT_LOAD_TIMEOUT_SECS (600 per phase).
+/// Errors are data (a 429 near the cap is the measurement, not a failure);
+/// the test fails only when a phase stalls past its deadline or every worker
+/// in a phase fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "load rig; run explicitly"]
+async fn concurrent_load() {
+    const MIB: u64 = 1024 * 1024;
+    let sessions = load_knob("VOTPORT_LOAD_SESSIONS", 16);
+    let downloads = load_knob("VOTPORT_LOAD_DOWNLOADS", 8);
+    let file_mib = load_knob("VOTPORT_LOAD_FILE_MIB", 64).max(1);
+    let deadline = Duration::from_secs(load_knob("VOTPORT_LOAD_TIMEOUT_SECS", 600) as u64);
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos() as u64;
+
+    let (base, admin_password, _local) = match std::env::var("VOTPORT_LOAD_TARGET") {
+        Ok(target) => {
+            let password = std::env::var("VOTPORT_LOAD_ADMIN_PASSWORD")
+                .expect("VOTPORT_LOAD_ADMIN_PASSWORD is required when VOTPORT_LOAD_TARGET is set");
+            (target.trim_end_matches('/').to_owned(), password, None)
+        }
+        Err(_) => {
+            let server =
+                start_server_custom((file_mib as u64 * 2 + 16) * MIB, false, 600, sessions + 8)
+                    .await;
+            let base = server.base.clone();
+            (base, ADMIN_PASSWORD.to_owned(), Some(server))
+        }
+    };
+    println!(
+        "concurrent load target: {base} ({})",
+        if _local.is_some() {
+            "in-process"
+        } else {
+            "remote"
+        }
+    );
+
+    let admin = reqwest::Client::builder()
+        .cookie_store(true)
+        .timeout(Duration::from_secs(120))
+        .build()
+        .unwrap();
+    let load = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .unwrap();
+
+    let params = LoadParams {
+        sessions,
+        downloads,
+        file_mib,
+        deadline,
+        seed,
+    };
+    let mut artifacts = LoadArtifacts::default();
+    let result = run_load(
+        &admin,
+        &load,
+        &base,
+        &admin_password,
+        &params,
+        &mut artifacts,
+    )
+    .await;
+    // Cleanup runs whatever happened, stall included; then the original
+    // diagnosis surfaces.
+    load_cleanup(&admin, &base, &artifacts).await;
+    if let Err(error) = result {
+        panic!("{error}");
+    }
+}
+
+struct LoadParams {
+    sessions: usize,
+    downloads: usize,
+    file_mib: usize,
+    deadline: Duration,
+    seed: u64,
+}
+
+/// The whole run against a chosen target, returning instead of panicking so
+/// the caller can always clean up first.
+async fn run_load(
+    admin: &reqwest::Client,
+    load: &reqwest::Client,
+    base: &str,
+    admin_password: &str,
+    params: &LoadParams,
+    artifacts: &mut LoadArtifacts,
+) -> Result<(), String> {
+    let LoadParams {
+        sessions,
+        downloads,
+        file_mib,
+        deadline,
+        seed,
+    } = *params;
+
+    // --- setup: link for uploads, outbound file plus one grant per stream --
+    ok200(
+        admin
+            .post(format!("{base}/api/admin/login"))
+            .json(&json!({ "password": admin_password })),
+        "admin login",
+    )
+    .await?;
+    let link = ok200(
+        admin
+            .post(format!("{base}/api/admin/links"))
+            .header("X-Votport", "1")
+            .json(&json!({ "label": "load rig", "dest": "load-test" })),
+        "create link",
+    )
+    .await?
+    .json::<Value>()
+    .await
+    .map_err(|error| format!("create link: {error}"))?["link"]["id"]
+        .as_str()
+        .ok_or("create link: no id in response")?
+        .to_owned();
+    artifacts.link = Some(link.clone());
+
+    let outbound_path = format!("load-rig-{seed:016x}.bin");
+    let outbound_bytes = load_pattern(file_mib, seed ^ (2 << 56));
+    let expected = outbound_bytes.len() as u64;
+    ok200(
+        admin
+            .post(format!(
+                "{base}/api/admin/outbound-files?path={outbound_path}"
+            ))
+            .header("X-Votport", "1")
+            .timeout(deadline)
+            .body(outbound_bytes),
+        "outbound upload",
+    )
+    .await?;
+    artifacts.outbound_path = Some(outbound_path.clone());
+    let mut grants = Vec::with_capacity(downloads);
+    for _ in 0..downloads {
+        let created = ok200(
+            admin
+                .post(format!("{base}/api/admin/outbound-grants"))
+                .header("X-Votport", "1")
+                .json(&json!({ "paths": [outbound_path], "expires_days": 1 })),
+            "create grant",
+        )
+        .await?
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("create grant: {error}"))?;
+        artifacts.grant_ids.push(
+            created["grant"]["id"]
+                .as_str()
+                .ok_or("create grant: no id in response")?
+                .to_owned(),
+        );
+        grants.push(
+            created["url"]
+                .as_str()
+                .and_then(|url| url.rsplit('/').next())
+                .ok_or("create grant: no url in response")?
+                .to_owned(),
+        );
+    }
+
+    let spawn_uploads = |set: &mut LoadSet, files: Vec<PreparedUpload>, ip_offset: usize| {
+        for (worker, file, package) in files {
+            let client = load.clone();
+            let base = base.to_owned();
+            let token = link.clone();
+            let ip = load_ip(ip_offset + worker);
+            set.spawn(async move {
+                (
+                    true,
+                    load_upload_session(client, base, token, ip, file, package).await,
+                )
+            });
+        }
+    };
+    let spawn_downloads = |set: &mut LoadSet| {
+        for token in &grants {
+            let client = load.clone();
+            let base = base.to_owned();
+            let token = token.clone();
+            set.spawn(async move {
+                (
+                    false,
+                    load_download(client, base, token, expected, deadline).await,
+                )
+            });
+        }
+    };
+
+    // --- phase 1: uploads ---------------------------------------------------
+    let files = prepare_load_files(sessions, file_mib, seed, 0).await;
+    let mut set = LoadSet::new();
+    spawn_uploads(&mut set, files, 0);
+    let started = std::time::Instant::now();
+    let (up, _) = drain_phase("upload", set, deadline).await?;
+    print_phase("upload", sessions, file_mib, started.elapsed(), &up);
+
+    // --- phase 2: downloads -------------------------------------------------
+    let mut set = LoadSet::new();
+    spawn_downloads(&mut set);
+    let started = std::time::Instant::now();
+    let (_, down) = drain_phase("download", set, deadline).await?;
+    print_phase("download", downloads, file_mib, started.elapsed(), &down);
+
+    // --- phase 3: both at once ----------------------------------------------
+    let files = prepare_load_files(sessions, file_mib, seed, 1).await;
+    let mut set = LoadSet::new();
+    spawn_uploads(&mut set, files, sessions);
+    spawn_downloads(&mut set);
+    let started = std::time::Instant::now();
+    let (mixed_up, mixed_down) = drain_phase("mixed", set, deadline).await?;
+    let wall = started.elapsed();
+    print_phase("mixed upload", sessions, file_mib, wall, &mixed_up);
+    print_phase("mixed download", downloads, file_mib, wall, &mixed_down);
+
+    for (phase, workers, stats) in [
+        ("upload", sessions, &up),
+        ("download", downloads, &down),
+        ("mixed upload", sessions, &mixed_up),
+        ("mixed download", downloads, &mixed_down),
+    ] {
+        if workers > 0 && stats.complete.is_empty() {
+            return Err(format!(
+                "{phase} phase: every worker failed; first error: {:?}",
+                stats.errors.first()
+            ));
+        }
+    }
+    Ok(())
 }
