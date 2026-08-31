@@ -913,6 +913,7 @@ fn capability_refusal_reason(
 
 fn load_push_issuer(data_dir: &std::path::Path) -> Result<ed25519_dalek::SigningKey, String> {
     let path = data_dir.join("push-issuer.key");
+    crate::paths::tighten_private_file(&path)?;
     let create = || {
         let mut bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut bytes);
@@ -946,7 +947,13 @@ fn push_credentials(config: &Config) -> Result<(std::path::PathBuf, std::path::P
         .unwrap_or_else(|| config.data_dir.join("push.key"));
     let managed = config.push_certificate.is_none() && config.push_private_key.is_none();
     match (certificate.exists(), key.exists()) {
-        (true, true) => return Ok((certificate, key)),
+        (true, true) => {
+            if managed {
+                crate::paths::tighten_private_file(&certificate)?;
+                crate::paths::tighten_private_file(&key)?;
+            }
+            return Ok((certificate, key));
+        }
         (true, false) | (false, true) => {
             if !managed {
                 return Err(format!(
@@ -1793,6 +1800,28 @@ mod push_tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn managed_credentials_tighten_existing_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let config = push_config(directory.path());
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let (certificate, key) = push_credentials(&config).unwrap();
+        for path in [&certificate, &key] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        push_credentials(&config).unwrap();
+        for path in [certificate, key] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
     #[test]
     fn invalid_push_issuer_is_regenerated_and_then_stable() {
         let directory = tempfile::tempdir().unwrap();
@@ -1805,6 +1834,23 @@ mod push_tests {
         let second = load_push_issuer(directory.path()).unwrap();
         assert_eq!(first.to_bytes(), second.to_bytes());
         assert_eq!(std::fs::read(path).unwrap(), first_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_issuer_tightens_an_existing_key() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("push-issuer.key");
+        std::fs::write(&path, [9u8; 32]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        load_push_issuer(directory.path()).unwrap();
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

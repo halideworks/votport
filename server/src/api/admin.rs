@@ -864,6 +864,7 @@ pub async fn backup_database(
     tokio::fs::create_dir_all(&backups)
         .await
         .map_err(|error| ApiError::internal(format!("create backups dir: {error}")))?;
+    paths::tighten_private_dir(&backups).map_err(ApiError::internal)?;
     let name = format!("votport-{}-{}.db", now_unix(), &auth::random_token()[..8]);
     let destination = backups.join(&name);
     let store = Arc::clone(&app.store);

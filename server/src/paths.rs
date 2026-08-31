@@ -52,6 +52,118 @@ pub fn tighten_dir(path: &Path) {
     let _ = path;
 }
 
+/// Makes the application state directory private without following a
+/// symlink. This is separate from `tighten_dir`, whose group-write policy is
+/// intentionally used for receive and outbound trees.
+pub fn tighten_private_dir(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing symlink for private directory {}",
+            path.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(format!(
+            "private state path is not a directory: {}",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let file = rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| format!("open private directory {}: {error}", path.display()))?;
+        rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o700))
+            .map_err(|error| format!("protect {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Tightens an existing regular file without following a symlink. Missing
+/// files are normal for lazily-created keys and database auxiliaries.
+pub fn tighten_private_file(path: &Path) -> Result<bool, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("inspect {}: {error}", path.display())),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing symlink for private file {}",
+            path.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "private state path is not a regular file: {}",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let file = rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| format!("open private file {}: {error}", path.display()))?;
+        rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o600))
+            .map_err(|error| format!("protect {}: {error}", path.display()))?;
+    }
+    Ok(true)
+}
+
+/// Creates an empty owner-only regular file, refusing to replace anything
+/// that appeared at the path concurrently.
+pub fn create_private_file(path: &Path) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path).map(|_| ())
+}
+
+/// Makes an existing private directory and its regular child files private.
+/// Symlink children are ignored rather than followed.
+pub fn tighten_private_dir_contents(path: &Path) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("inspect {}: {error}", path.display())),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing symlink for private directory {}",
+            path.display()
+        ));
+    }
+    tighten_private_dir(path)?;
+    for entry in std::fs::read_dir(path)
+        .map_err(|error| format!("read private directory {}: {error}", path.display()))?
+    {
+        let entry = entry.map_err(|error| format!("read private directory entry: {error}"))?;
+        if entry
+            .file_type()
+            .map_err(|error| format!("inspect {}: {error}", entry.path().display()))?
+            .is_file()
+        {
+            tighten_private_file(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 /// Validates one package path component for on-disk placement.
 pub fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String> {
     if component.is_empty() || component.len() > 255 {
@@ -213,6 +325,59 @@ fn walk(dir: &Path, visit: &mut impl FnMut(&Path, &str, bool) -> bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn private_modes_tighten_existing_regular_files_and_directories() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let private = directory.path().join("private");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = private.join("secret");
+        std::fs::write(&file, b"secret").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        tighten_private_dir(&private).unwrap();
+        assert_eq!(
+            std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(tighten_private_file(&file).unwrap());
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let link = directory.path().join("secret-link");
+        symlink(&file, &link).unwrap();
+        assert!(tighten_private_file(&link).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_tightening_covers_regular_children_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let backups = directory.path().join("backups");
+        std::fs::create_dir(&backups).unwrap();
+        let snapshot = backups.join("snapshot.db");
+        std::fs::write(&snapshot, b"snapshot").unwrap();
+        std::fs::set_permissions(&backups, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        tighten_private_dir_contents(&backups).unwrap();
+        assert_eq!(
+            std::fs::metadata(&backups).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(snapshot).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     #[test]
     fn components_reject_traversal_and_hidden() {

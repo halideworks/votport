@@ -42,6 +42,7 @@ pub fn random_token() -> String {
 /// Loads or creates the 32-byte cookie-signing secret in the data directory.
 pub fn load_secret(data_dir: &std::path::Path) -> Result<[u8; 32], String> {
     let path = data_dir.join("secret");
+    crate::paths::tighten_private_file(&path)?;
     match std::fs::read(&path) {
         Ok(bytes) if bytes.len() == 32 => {
             let mut secret = [0u8; 32];
@@ -560,5 +561,22 @@ mod tests {
         assert_eq!(identity.credential_version, 1);
         assert_eq!(identity.subject, "user@example.com");
         assert!(!payload.contains("cv"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_secret_tightens_an_existing_secret() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("secret");
+        std::fs::write(&path, [7u8; 32]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(load_secret(directory.path()).unwrap(), [7u8; 32]);
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

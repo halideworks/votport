@@ -35,6 +35,7 @@ impl ReceiptSigner {
     /// Loads or creates the 32-byte signing seed in the data directory.
     pub fn load_or_create(data_dir: &Path) -> Result<Self, String> {
         let path = data_dir.join("receipt.key");
+        crate::paths::tighten_private_file(&path)?;
         let seed: [u8; 32] = match std::fs::read(&path) {
             Ok(bytes) => bytes
                 .try_into()
@@ -218,6 +219,23 @@ mod tests {
         let verified = vot_receipt::verify_ed25519(&decoded, &key).unwrap();
         assert_eq!(verified.receipt().subject_digest, [9; 32]);
         assert_eq!(verified.receipt().sequence, 7);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_an_existing_receipt_key_tightens_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("receipt.key");
+        std::fs::write(&path, [8u8; 32]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        ReceiptSigner::load_or_create(directory.path()).unwrap();
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

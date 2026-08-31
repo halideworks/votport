@@ -8,13 +8,14 @@ backups, metrics, and content lifecycle.
 
 ```text
 docker-compose.yml          service definition (ports, env, volumes)
-data/                       votport state - keep private
-  votport.db                SQLite store (links, tenants, audit log)
+data/                       votport state (directory 0700, keep private)
+  votport.db                SQLite store (links, tenants, audit log) (0600)
+  votport.db-wal / -shm     SQLite write-ahead log and shared-memory files (0600)
   secret                    cookie-signing key        (0600)
   receipt.key               ed25519 receipt signer    (0600)
   push-issuer.key           native-push capability issuer, always here (0600)
   push.crt / push.key       generated native-push certificate and key (0600)
-  backups/                  snapshots written by /api/admin/backup
+  backups/                  snapshots written by /api/admin/backup (directory 0700, files 0600)
 /received                   received files, published per tenant/link
 /outbound                   Deliver library files and rendered projects
   .vot-tenants.stage/<tenant> tenant-scoped library subtree
