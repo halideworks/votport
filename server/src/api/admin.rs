@@ -78,6 +78,18 @@ pub(crate) fn require_admin(app: &App, headers: &HeaderMap) -> ApiResult<auth::A
     Ok(identity)
 }
 
+/// Read routes for operators: admins and viewers pass, auditors do not.
+/// The auditor role sees only its own session and the audit trail; every
+/// link, file, grant, and settings route goes through this gate instead of
+/// bare `require_admin`.
+pub(crate) fn require_operator(app: &App, headers: &HeaderMap) -> ApiResult<auth::AdminIdentity> {
+    let identity = require_admin(app, headers)?;
+    if identity.role == "auditor" {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "audit-only session"));
+    }
+    Ok(identity)
+}
+
 fn local_admin_grants(app: &App) -> Result<Vec<auth::TenantGrant>, String> {
     let mut grants = vec![auth::TenantGrant {
         tenant: String::new(),
@@ -364,7 +376,11 @@ pub async fn admin_session(
     // Which dashboard pages this principal may open. Named tenants get their
     // own links plus a tenant-filtered audit view; platform administration
     // (tenants, system) is default-tenant admin only.
-    let mut pages = vec!["receive", "deliver", "audit"];
+    let mut pages = if identity.role == "auditor" {
+        vec!["audit"]
+    } else {
+        vec!["receive", "deliver", "audit"]
+    };
     if identity.tenant.is_empty() && identity.role == "admin" {
         pages.push("tenants");
         pages.push("system");
@@ -1626,7 +1642,7 @@ pub async fn admin_change_password(
     headers: HeaderMap,
     Json(request): Json<ChangePasswordRequest>,
 ) -> ApiResult<Response> {
-    let identity = require_admin(&app, &headers)?;
+    let identity = require_operator(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
     // The local password is the break-glass credential for the platform;
     // SSO tenant admins rotate access at their identity provider instead.
@@ -1846,7 +1862,7 @@ pub async fn list_links(
     headers: HeaderMap,
     Query(query): Query<LinkQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_admin(&app, &headers)?;
+    let identity = require_operator(&app, &headers)?;
     let base = base_url(&app, &headers);
     let paged = query.limit.is_some()
         || query.search.is_some()
@@ -1939,7 +1955,7 @@ pub async fn create_link(
     headers: HeaderMap,
     Json(request): Json<CreateLinkRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_admin(&app, &headers)?;
+    let identity = require_operator(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
     let label = request.label.trim().to_owned();
     if label.is_empty() || label.len() > 200 {
@@ -2060,7 +2076,7 @@ pub async fn update_link(
     headers: HeaderMap,
     Json(request): Json<UpdateLinkRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_admin(&app, &headers)?;
+    let identity = require_operator(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
     let fields = [
         request.active.is_some(),
@@ -2143,7 +2159,7 @@ pub async fn delete_link(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_admin(&app, &headers)?;
+    let identity = require_operator(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
     if app
         .store
@@ -2205,7 +2221,7 @@ pub async fn link_qr(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let identity = require_admin(&app, &headers)?;
+    let identity = require_operator(&app, &headers)?;
     let link = app
         .store
         .link(&identity.tenant, &id)
@@ -2229,7 +2245,7 @@ pub async fn delete_upload_record(
     Path((id, upload)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_admin(&app, &headers)?;
+    let identity = require_operator(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
     if app
         .store
@@ -2305,7 +2321,7 @@ pub async fn delete_received_file(
     Path((id, upload, index)): Path<(String, String, usize)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = require_admin(&app, &headers)?;
+    let identity = require_operator(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
     if app
         .store
@@ -3153,6 +3169,142 @@ mod tenant_authz_tests {
             credential_version: 1,
         };
         super::test_admin_cookie(app, &identity)
+    }
+
+    /// A new handler that calls bare `require_admin` silently reopens the
+    /// audit-only surface; the allow-list below is every function that may
+    /// serve an auditor. Extend it deliberately or use `require_operator`.
+    #[test]
+    fn bare_require_admin_stays_on_the_allow_list() {
+        let allowed = [
+            "require_operator",
+            "require_platform_admin",
+            "admin_logout",
+            "admin_audit_export",
+            "admin_session",
+            "switch_tenant",
+        ];
+        for file in [
+            "src/api/admin.rs",
+            "src/api/outbound.rs",
+            "src/api/sso.rs",
+            "src/api/upload.rs",
+            "src/api/verify.rs",
+            "src/api/mod.rs",
+            "src/api/session_rate.rs",
+            "src/app.rs",
+        ] {
+            let text = std::fs::read_to_string(file).unwrap();
+            let mut current_fn = String::new();
+            // Test modules exercise require_admin directly; skip them by
+            // brace-tracking from each #[cfg(test)] marker. Approximate
+            // (string literals with braces would confuse it) but the lint
+            // only needs to be right about handler code.
+            let mut test_depth = 0usize;
+            let mut pending_test_mod = false;
+            for (number, line) in text.lines().enumerate() {
+                if test_depth == 0 && line.trim_start().starts_with("#[cfg(test)]") {
+                    pending_test_mod = true;
+                }
+                if test_depth > 0 || pending_test_mod {
+                    let opens = line.matches('{').count();
+                    let closes = line.matches('}').count();
+                    if pending_test_mod && opens > 0 {
+                        pending_test_mod = false;
+                        test_depth = 1 + opens.saturating_sub(1);
+                    } else if test_depth > 0 {
+                        test_depth += opens;
+                    }
+                    test_depth = test_depth.saturating_sub(closes);
+                    continue;
+                }
+                if let Some(rest) = line.trim_start().strip_prefix("pub async fn ").or_else(|| {
+                    line.trim_start()
+                        .strip_prefix("async fn ")
+                        .or_else(|| line.trim_start().strip_prefix("pub(crate) fn "))
+                        .or_else(|| line.trim_start().strip_prefix("pub fn "))
+                        .or_else(|| line.trim_start().strip_prefix("fn "))
+                }) {
+                    current_fn = rest.split(['(', '<']).next().unwrap_or_default().to_owned();
+                }
+                // Split so this test's own source cannot match the needle.
+                let needle = ["require_admin", "("].concat();
+                let bare = line.contains(&needle)
+                    && !line.contains("fn require_admin")
+                    && !line.contains("require_admin_write");
+                if bare && current_fn != "require_admin" {
+                    assert!(
+                        allowed.contains(&current_fn.as_str()),
+                        "{file}:{}: bare require_admin in fn {current_fn}; \
+                         use require_operator or extend the allow-list",
+                        number + 1
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn auditor_sees_the_audit_trail_and_nothing_else() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = cookie_for(&application, "", "auditor");
+        let get = |path: &'static str| {
+            let cookie = cookie.clone();
+            let application = application.clone();
+            async move {
+                app::router(application)
+                    .oneshot(
+                        Request::get(path)
+                            .header("cookie", cookie)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let session = get("/api/admin/session").await;
+        assert_eq!(session.status(), StatusCode::OK);
+        let session: serde_json::Value = serde_json::from_slice(
+            &http_body_util::BodyExt::collect(session.into_body())
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(session["pages"], serde_json::json!(["audit"]));
+        assert_eq!(get("/api/admin/audit").await.status(), StatusCode::OK);
+        for denied in [
+            "/api/admin/links",
+            "/api/admin/outbound-files",
+            "/api/admin/outbound-grants",
+            "/api/admin/automation-tokens",
+        ] {
+            assert_eq!(
+                get(denied).await.status(),
+                StatusCode::FORBIDDEN,
+                "{denied} must refuse the auditor role"
+            );
+        }
+        // Platform routes already demand the admin role.
+        assert_eq!(
+            get("/api/admin/holdings").await.status(),
+            StatusCode::FORBIDDEN
+        );
+        // Writes fail on the role check even with the CSRF header present.
+        let write = app::router(application.clone())
+            .oneshot(
+                Request::post("/api/admin/links")
+                    .header("cookie", cookie.clone())
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"label":"x","dest":"d"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(write.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

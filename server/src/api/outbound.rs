@@ -197,7 +197,7 @@ pub async fn list_outbound_files(
     headers: HeaderMap,
     Query(query): Query<OutboundListQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = admin::require_admin(&app, &headers)?;
+    let identity = admin::require_operator(&app, &headers)?;
     let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     let root = library_root(&app, &identity.tenant);
     if [
@@ -311,7 +311,7 @@ pub async fn upload_outbound_file(
     Query(query): Query<OutboundPathQuery>,
     body: Body,
 ) -> ApiResult<Response> {
-    let identity = admin::require_admin(&app, &headers)?;
+    let identity = admin::require_operator(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
     let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     if headers.contains_key(header::CONTENT_RANGE) || headers.contains_key(OUTBOUND_UPLOAD_ID) {
@@ -649,7 +649,7 @@ pub async fn delete_outbound_file(
     headers: HeaderMap,
     Query(query): Query<OutboundPathQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = admin::require_admin(&app, &headers)?;
+    let identity = admin::require_operator(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
     let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     let relative_path = query.path.trim_matches('/').to_owned();
@@ -1133,7 +1133,7 @@ pub async fn list_outbound_grants(
     headers: HeaderMap,
     Query(query): Query<OutboundGrantsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = admin::require_admin(&app, &headers)?;
+    let identity = admin::require_operator(&app, &headers)?;
     let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     let (limit, offset) = outbound_grants_paging(query)?;
     let (grants, total) = app
@@ -1256,7 +1256,7 @@ pub async fn delete_automation_token(
 }
 
 fn require_automation_admin(app: &App, headers: &HeaderMap) -> ApiResult<auth::AdminIdentity> {
-    let identity = admin::require_admin(app, headers)?;
+    let identity = admin::require_operator(app, headers)?;
     if identity.role != "admin" {
         return Err(ApiError::new(StatusCode::FORBIDDEN, "admin role required"));
     }
@@ -1268,7 +1268,7 @@ pub async fn create_outbound_grant(
     headers: HeaderMap,
     Json(request): Json<CreateOutboundRequest>,
 ) -> ApiResult<Response> {
-    let identity = admin::require_admin(&app, &headers)?;
+    let identity = admin::require_operator(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
     if !(1..=30).contains(&request.expires_days) {
         return Err(ApiError::new(
@@ -2036,7 +2036,7 @@ pub async fn delete_outbound_grant(
     AxumPath(id): AxumPath<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let identity = admin::require_admin(&app, &headers)?;
+    let identity = admin::require_operator(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
     let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     if !app
@@ -2072,7 +2072,7 @@ pub async fn update_outbound_grant(
     headers: HeaderMap,
     Json(request): Json<UpdateOutboundGrantRequest>,
 ) -> ApiResult<Response> {
-    let identity = admin::require_admin(&app, &headers)?;
+    let identity = admin::require_operator(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
     let _operation = begin_outbound_operation(&app, &identity.tenant)?;
     let fields = [
