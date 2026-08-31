@@ -53,10 +53,131 @@ const MAX_LIBRARY_SEARCH_CHARS: usize = 100;
 const MAX_LIBRARY_SEARCH_RESULTS: usize = 200;
 const RETAINED_LIBRARY_SEARCH_RESULTS: usize = MAX_LIBRARY_SEARCH_RESULTS + 1;
 const LIBRARY_HASH_CONCURRENCY: usize = 4;
+const MIN_STAGE_FREE_BYTES: u64 = 1024 * 1024 * 1024;
+const ZIP_LOCAL_HEADER_BYTES: u64 = 30;
+const ZIP_CENTRAL_HEADER_BYTES: u64 = 46;
+const ZIP_ENTRY_EXTRA_BYTES: u64 = 64;
+const ZIP_END_BYTES: u64 = 98;
 
 // ponytail: one tiny global critical section; use per-tenant locks only if contention is measured.
 static LIBRARY_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static LIBRARY_HASH_PERMITS: Semaphore = Semaphore::const_new(LIBRARY_HASH_CONCURRENCY);
+
+/// Admission control for temporary outbound files. One free-space epoch is
+/// shared by all active preparations so concurrent requests cannot each pass
+/// the same statvfs check.
+pub struct StageBudget {
+    state: Mutex<StageBudgetState>,
+}
+
+struct StageBudgetState {
+    epoch_capacity: Option<u64>,
+    reserved: u64,
+    active: usize,
+}
+
+impl StageBudget {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(StageBudgetState {
+                epoch_capacity: None,
+                reserved: 0,
+                active: 0,
+            }),
+        }
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+        filesystem: &Path,
+        bytes: u64,
+    ) -> Result<StageReservation, StageReserveError> {
+        let mut state = self.state.lock().expect("outbound stage budget poisoned");
+        if state.active == 0 {
+            let stats = rustix::fs::statvfs(filesystem)
+                .map_err(|error| StageReserveError::Probe(error.into()))?;
+            let free = stats
+                .f_bavail
+                .checked_mul(stats.f_frsize)
+                .ok_or(StageReserveError::Overflow)?;
+            Self::start_epoch(&mut state, free);
+        }
+        self.try_reserve(&mut state, bytes)
+    }
+
+    #[cfg(test)]
+    fn reserve_with_free_space(
+        self: &Arc<Self>,
+        free: u64,
+        bytes: u64,
+    ) -> Result<StageReservation, StageReserveError> {
+        let mut state = self.state.lock().expect("outbound stage budget poisoned");
+        if state.active == 0 {
+            Self::start_epoch(&mut state, free);
+        }
+        self.try_reserve(&mut state, bytes)
+    }
+
+    fn start_epoch(state: &mut StageBudgetState, free: u64) {
+        state.epoch_capacity = Some(free.saturating_sub(MIN_STAGE_FREE_BYTES));
+        state.reserved = 0;
+    }
+
+    fn try_reserve(
+        self: &Arc<Self>,
+        state: &mut StageBudgetState,
+        bytes: u64,
+    ) -> Result<StageReservation, StageReserveError> {
+        let capacity = state.epoch_capacity.expect("stage capacity initialized");
+        let next = state
+            .reserved
+            .checked_add(bytes)
+            .ok_or(StageReserveError::Overflow)?;
+        if next > capacity {
+            return Err(StageReserveError::Insufficient);
+        }
+        state.reserved = next;
+        state.active += 1;
+        Ok(StageReservation {
+            budget: Arc::clone(self),
+            bytes,
+        })
+    }
+}
+
+impl Default for StageBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug)]
+enum StageReserveError {
+    Insufficient,
+    Overflow,
+    Probe(io::Error),
+}
+
+struct StageReservation {
+    budget: Arc<StageBudget>,
+    bytes: u64,
+}
+
+impl Drop for StageReservation {
+    fn drop(&mut self) {
+        let mut state = self
+            .budget
+            .state
+            .lock()
+            .expect("outbound stage budget poisoned");
+        state.reserved = state.reserved.saturating_sub(self.bytes);
+        state.active = state.active.saturating_sub(1);
+        if state.active == 0 {
+            state.epoch_capacity = None;
+            state.reserved = 0;
+        }
+    }
+}
 
 #[derive(Deserialize)]
 pub struct OutboundPathQuery {
@@ -2581,16 +2702,21 @@ fn bundle_collision_key(name: &str) -> String {
 }
 
 async fn build_bundle(app: &App, files: Vec<(Source, String)>) -> ApiResult<StagedFile> {
-    let stage_dir = app
-        .config
-        .data_dir
-        .join("outbound.stage")
-        .join(format!(".vot-outbound-{}", auth::random_token()));
+    let bound = archive_size_bound(&files).ok_or_else(stage_capacity_error)?;
+    let stage_root = app.config.data_dir.join("outbound.stage");
+    std::fs::create_dir_all(&stage_root)
+        .map_err(|_| ApiError::internal("create bundle stage failed"))?;
+    let reservation = app
+        .outbound_stage_budget
+        .reserve(&stage_root, bound)
+        .map_err(map_stage_reserve_error)?;
+    let stage_dir = stage_root.join(format!(".vot-outbound-{}", auth::random_token()));
     std::fs::create_dir_all(&stage_dir)
         .map_err(|_| ApiError::internal("create bundle stage failed"))?;
     let archive_path = stage_dir.join(format!("{}.zip", auth::random_token()));
     let archive = StagedFile {
         path: archive_path.clone(),
+        reservation: Some(reservation),
     };
     let verifying_key = app.signer.verifying_key();
     tokio::task::spawn_blocking(move || {
@@ -2663,6 +2789,48 @@ async fn build_bundle(app: &App, files: Vec<(Source, String)>) -> ApiResult<Stag
     .map_err(|_| ApiError::internal("bundle preparation failed"))?
     .map_err(map_bundle_error)?;
     Ok(archive)
+}
+
+fn archive_size_bound(files: &[(Source, String)]) -> Option<u64> {
+    let total_bytes = files.iter().try_fold(0u64, |total, (source, _)| {
+        total.checked_add(source.object.length)
+    })?;
+    let entry_count = u64::try_from(files.len()).ok()?;
+    let path_bytes = files.iter().try_fold(0u64, |total, (_, name)| {
+        total.checked_add(u64::try_from(name.len()).ok()?)
+    })?;
+    let entry_overhead = entry_count.checked_mul(
+        ZIP_LOCAL_HEADER_BYTES
+            .checked_add(ZIP_CENTRAL_HEADER_BYTES)?
+            .checked_add(ZIP_ENTRY_EXTRA_BYTES)?,
+    )?;
+    total_bytes
+        .checked_add(entry_overhead)?
+        .checked_add(path_bytes.checked_mul(2)?)?
+        .checked_add(ZIP_END_BYTES)
+}
+
+fn staged_length(source_length: u64, range: Option<(u64, u64)>) -> Option<u64> {
+    range.map_or(Some(source_length), |(start, end)| {
+        end.checked_sub(start)?.checked_add(1)
+    })
+}
+
+fn stage_capacity_error() -> ApiError {
+    ApiError::new(
+        StatusCode::INSUFFICIENT_STORAGE,
+        "not enough temporary disk space to prepare this download; free space and retry",
+    )
+}
+
+fn map_stage_reserve_error(error: StageReserveError) -> ApiError {
+    match error {
+        StageReserveError::Insufficient | StageReserveError::Overflow => stage_capacity_error(),
+        StageReserveError::Probe(error) => {
+            tracing::error!(%error, "inspect outbound staging filesystem failed");
+            ApiError::internal("inspect outbound staging filesystem failed")
+        }
+    }
 }
 
 fn map_bundle_error(error: io::Error) -> ApiError {
@@ -2811,15 +2979,21 @@ async fn prepare(
 ) -> ApiResult<(StagedFile, Source, Vec<u8>)> {
     let _pin = legacy_link_pin(app, grant, grant.files.is_empty() && indexed_file.is_none())?;
     let source = source_info_indexed_with_file(app, grant, index, indexed_file)?;
-    let stage_dir = app
-        .config
-        .data_dir
-        .join("outbound.stage")
-        .join(format!(".vot-outbound-{}", auth::random_token()));
+    let stage_len = staged_length(source.object.length, range)
+        .ok_or_else(|| ApiError::internal("outbound range length overflow"))?;
+    let stage_root = app.config.data_dir.join("outbound.stage");
+    std::fs::create_dir_all(&stage_root)
+        .map_err(|_| ApiError::internal("create outbound stage failed"))?;
+    let reservation = app
+        .outbound_stage_budget
+        .reserve(&stage_root, stage_len)
+        .map_err(map_stage_reserve_error)?;
+    let stage_dir = stage_root.join(format!(".vot-outbound-{}", auth::random_token()));
     std::fs::create_dir_all(&stage_dir)
         .map_err(|_| ApiError::internal("create outbound stage failed"))?;
     let stage = StagedFile {
         path: stage_dir.join("file"),
+        reservation: Some(reservation),
     };
     let source_path = source.path.clone();
     let expected = source.object.clone();
@@ -3069,6 +3243,7 @@ impl Drop for ActiveDownload {
 
 struct StagedFile {
     path: PathBuf,
+    reservation: Option<StageReservation>,
 }
 impl Drop for StagedFile {
     fn drop(&mut self) {
@@ -3076,6 +3251,7 @@ impl Drop for StagedFile {
         if let Some(parent) = self.path.parent() {
             let _ = std::fs::remove_dir(parent);
         }
+        drop(self.reservation.take());
     }
 }
 
@@ -3616,13 +3792,24 @@ mod tests {
         let stage = directory.path().join("stage").join("file");
         std::fs::create_dir_all(stage.parent().unwrap()).unwrap();
         std::fs::write(&stage, b"payload").unwrap();
+        let budget = Arc::new(StageBudget::new());
+        let reservation = budget
+            .reserve_with_free_space(MIN_STAGE_FREE_BYTES + 1, 1)
+            .unwrap();
+        assert!(budget
+            .reserve_with_free_space(MIN_STAGE_FREE_BYTES + 1, 1)
+            .is_err());
         let staged = StagedFile {
             path: stage.clone(),
+            reservation: Some(reservation),
         };
         let active = ActiveDownload::claim(Arc::clone(&app), "grant").unwrap();
         drop((staged, active));
         assert!(!stage.exists());
         assert!(!app.outbound_active.lock().unwrap().contains("grant"));
+        assert!(budget
+            .reserve_with_free_space(MIN_STAGE_FREE_BYTES + 1, 1)
+            .is_ok());
     }
 
     #[tokio::test]
@@ -3733,6 +3920,71 @@ mod tests {
         assert_eq!(
             map_bundle_error(io::Error::other("disk full")).status,
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn archive_size_bound_checks_payload_and_zip_overhead() {
+        let source = Source {
+            path: PathBuf::new(),
+            object: ObjectId {
+                suite: 1,
+                root: [0; 32],
+                length: 10,
+            },
+            name: "unused".to_owned(),
+            receipt: None,
+        };
+        let files = vec![(source, "project/file.exr".to_owned())];
+        assert_eq!(
+            archive_size_bound(&files),
+            Some(10 + 30 + 46 + 64 + 2 * "project/file.exr".len() as u64 + 98)
+        );
+        assert!(archive_size_bound(&[(
+            Source {
+                path: PathBuf::new(),
+                object: ObjectId {
+                    suite: 1,
+                    root: [0; 32],
+                    length: u64::MAX,
+                },
+                name: "unused".to_owned(),
+                receipt: None,
+            },
+            "file".to_owned(),
+        )])
+        .is_none());
+    }
+
+    #[test]
+    fn stage_budget_reserves_concurrently_and_resets_after_last_drop() {
+        let budget = Arc::new(StageBudget::new());
+        let first = budget
+            .reserve_with_free_space(MIN_STAGE_FREE_BYTES + 10, 10)
+            .unwrap();
+        assert!(matches!(
+            budget.reserve_with_free_space(MIN_STAGE_FREE_BYTES + 10, 1),
+            Err(StageReserveError::Insufficient)
+        ));
+        drop(first);
+        let second = budget
+            .reserve_with_free_space(MIN_STAGE_FREE_BYTES + 20, 20)
+            .unwrap();
+        drop(second);
+        assert!(budget
+            .reserve_with_free_space(MIN_STAGE_FREE_BYTES + 1, 1)
+            .is_ok());
+    }
+
+    #[test]
+    fn stage_capacity_errors_are_507() {
+        assert_eq!(
+            stage_capacity_error().status,
+            StatusCode::INSUFFICIENT_STORAGE
+        );
+        assert_eq!(
+            map_stage_reserve_error(StageReserveError::Overflow).status,
+            StatusCode::INSUFFICIENT_STORAGE
         );
     }
 
