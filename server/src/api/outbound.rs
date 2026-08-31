@@ -2500,8 +2500,26 @@ pub async fn outbound_batch(
     .await?;
     let file = first_file;
     drop(_pin);
-    let indexes: Vec<usize> = (0..count).collect();
-    record_download(&app, &grant, &indexes).await?;
+    // Downloads are recorded per file as its last byte is handed to the
+    // transport, not all up front: an interrupted batch must leave the
+    // files it never sent still downloadable individually. The stale-copy
+    // check here refuses obviously exhausted grants before any bytes; the
+    // per-file record enforces max_downloads atomically, so two racing
+    // batch streams can both start but only one records each capped file.
+    for index in 0..count {
+        if grant_is_exhausted(&grant, index, None) {
+            return Err(ApiError::not_found());
+        }
+    }
+    let boundaries: Vec<u64> = (0..count)
+        .scan(0u64, |total, index| {
+            *total += grant
+                .files
+                .get(index)
+                .map_or(grant.bytes, |file| file.bytes);
+            Some(*total)
+        })
+        .collect();
     let lookahead = start_batch_lookahead(&app, &grant, &chunks, 0);
     let stream = futures_util::stream::try_unfold(
         BatchStream {
@@ -2513,13 +2531,27 @@ pub async fn outbound_batch(
             chunk_index: 0,
             file: Some(file),
             lookahead,
+            boundaries,
+            sent_bytes: 0,
+            recorded: 0,
         },
         |mut state| async move {
+            // Recording trails delivery by one poll: only files whose bytes
+            // a previous poll already handed to the transport are recorded,
+            // so a record failure can never abort bytes ahead of what it
+            // recorded and lock a capped client out of files it never got.
+            // The trade runs the safe direction: a drop or failure at a
+            // boundary can leave the last yielded file unrecorded, and the
+            // client's per-file retry records it then.
+            state.record_delivered().await.map_err(api_error_io)?;
             loop {
                 if let Some(file) = state.file.as_mut() {
                     if let Some(item) = file.next().await {
                         return match item {
-                            Ok(bytes) => Ok(Some((bytes, state))),
+                            Ok(bytes) => {
+                                state.sent_bytes += bytes.len() as u64;
+                                Ok(Some((bytes, state)))
+                            }
                             Err(error) => Err(error),
                         };
                     }
@@ -2527,6 +2559,10 @@ pub async fn outbound_batch(
                 state.file = None;
                 state.chunk_index += 1;
                 if state.chunk_index >= state.chunks.len() {
+                    // Defense in depth: this poll's entry call already
+                    // recorded everything the yield path delivered, but a
+                    // future change to that path must not lose the tail.
+                    state.record_delivered().await.map_err(api_error_io)?;
                     return Ok(None);
                 }
                 let chunk = state.chunks[state.chunk_index].clone();
@@ -3042,6 +3078,9 @@ pub async fn outbound_bundle(
     let file = tokio::fs::File::open(&archive.path)
         .await
         .map_err(|_| ApiError::internal("open bundle failed"))?;
+    // The ZIP is one opaque response with no per-file boundaries a client
+    // commits against, so the bundle keeps up-front recording; the batch
+    // endpoint records per delivered file instead.
     let indexes: Vec<usize> = (0..count).collect();
     record_download(&app, &grant, &indexes).await?;
     let stream = ReaderStream::with_capacity(
@@ -3870,6 +3909,26 @@ struct BatchStream {
     chunk_index: usize,
     file: Option<BatchFile>,
     lookahead: Option<tokio::task::JoinHandle<io::Result<BatchFile>>>,
+    /// Cumulative end offset of each file in the concatenated body; a file
+    /// is recorded as downloaded once `sent_bytes` from already-yielded
+    /// polls covers its boundary.
+    boundaries: Vec<u64>,
+    sent_bytes: u64,
+    recorded: usize,
+}
+
+impl BatchStream {
+    /// Records every file whose bytes previous polls fully yielded.
+    async fn record_delivered(&mut self) -> ApiResult<()> {
+        while self.recorded < self.boundaries.len()
+            && self.sent_bytes >= self.boundaries[self.recorded]
+        {
+            let index = self.recorded;
+            record_download(&self.app, &self.grant, &[index]).await?;
+            self.recorded += 1;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for BatchStream {
@@ -3983,6 +4042,103 @@ mod tests {
             .lock()
             .unwrap()
             .contains_key(&catalog_path(&root, &expected)));
+    }
+
+    #[tokio::test]
+    async fn interrupted_batch_leaves_unsent_files_downloadable() {
+        let (_directory, app, cookie, _first) = fixture().await;
+        for (path, bytes) in [
+            ("cap/a.bin", b"file a".as_slice()),
+            ("cap/b.bin", b"file b"),
+        ] {
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::post(format!("/api/admin/outbound-files?path={path}"))
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .body(Body::from(bytes.to_vec()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let created = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"paths":["cap/a.bin","cap/b.bin"],"max_downloads":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let created = body(created).await;
+        let token = created["url"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_owned();
+        let peer = |port| ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+
+        // A batch response dropped before any body frame is polled records
+        // nothing: the old up-front recording burned every file's single
+        // download here.
+        let aborted = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/batch"))
+                    .extension(peer(11))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(aborted.status(), StatusCode::OK);
+        drop(aborted);
+        let grant = app
+            .store
+            .outbound_grant_by_token_hash(&hash_token(&token))
+            .unwrap()
+            .unwrap();
+        assert!(grant.files.iter().all(|file| file.downloads == 0));
+
+        // Full consumption records each file exactly once.
+        let batch = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/batch"))
+                    .extension(peer(12))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch.status(), StatusCode::OK);
+        let bytes = batch.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), b"file afile b");
+        let grant = app
+            .store
+            .outbound_grant_by_token_hash(&hash_token(&token))
+            .unwrap()
+            .unwrap();
+        assert!(grant.files.iter().all(|file| file.downloads == 1));
+
+        // The cap is now spent: another batch is refused before any bytes.
+        let refused = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/batch"))
+                    .extension(peer(13))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
     }
 
     async fn fixture() -> (tempfile::TempDir, Arc<App>, String, Vec<u8>) {
