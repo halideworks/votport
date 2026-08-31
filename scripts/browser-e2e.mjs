@@ -322,6 +322,52 @@ if (!(await page.textContent("#separate-download-note")).includes("multiple down
   throw new Error("separate download fallback note is missing");
 }
 
+const streamedBatch = await page.evaluate(async () => {
+  const token = location.pathname.split("/").filter(Boolean).pop();
+  const metadata = await fetch(`/api/s/${encodeURIComponent(token)}?offset=0&limit=100`, {
+    credentials: "same-origin",
+  }).then((response) => response.json());
+  const { saveStoredZipFiles } = await import("/assets/outbound-download.js");
+  const files = new Map();
+  const directory = {
+    async getFileHandle(name) {
+      return {
+        async createWritable() {
+          const chunks = [];
+          return {
+            async write(chunk) { chunks.push(new Uint8Array(chunk)); },
+            async close() {
+              const bytes = new Uint8Array(chunks.reduce((size, chunk) => size + chunk.length, 0));
+              let offset = 0;
+              for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+              files.set(name, new TextDecoder().decode(bytes));
+            },
+            async abort() { chunks.length = 0; },
+          };
+        },
+      };
+    },
+  };
+  await saveStoredZipFiles(
+    await fetch(metadata.bundle_url, { credentials: "same-origin" }),
+    directory,
+    metadata.files,
+    ["deliver-one.txt", "deliver-two.txt"],
+  );
+  return Object.fromEntries(files);
+});
+if (
+  streamedBatch["deliver-one.txt"] !== "first deliverable\n" ||
+  streamedBatch["deliver-two.txt"] !== "second deliverable\n" ||
+  Object.keys(streamedBatch).length !== 2
+) {
+  throw new Error(`streamed batch payload mismatch: ${JSON.stringify(streamedBatch)}`);
+}
+console.log("streamed individual batch: ok");
+if (fs.readdirSync(dir).some((name) => name.endsWith(".zip"))) {
+  throw new Error("streamed individual batch created a ZIP artifact");
+}
+
 const [bundleDownload] = await collectDownloads(
   () => page.click("#bundle-download-button"),
   1,

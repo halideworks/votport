@@ -4,6 +4,7 @@ import { appendObjectCard, formatBytes } from '/assets/object-card.js';
 import {
   anchorDownloadsAllowed,
   appendMetadataPage,
+  BATCH_DOWNLOAD_THRESHOLD,
   dedupeFilenames,
   FILE_RENDER_BATCH_SIZE,
   metadataMoreAvailable,
@@ -11,6 +12,8 @@ import {
   MAX_ANCHOR_DOWNLOADS,
   publicMetadataPageUrl,
   runWorkerPool,
+  saveStoredZipFiles,
+  StoredZipUnsupportedError,
   summarizeFailures,
 } from '/assets/outbound-download.js';
 
@@ -21,6 +24,7 @@ let renderedFileCount = 0;
 let metadataTotal = 0;
 let metadataHasMore = false;
 let metadataLoading = false;
+let bundleUrl = null;
 
 function when(seconds) {
   return new Date(seconds * 1000).toLocaleString();
@@ -230,6 +234,25 @@ async function downloadSeparately() {
         `Requested ${files.length} downloads. Your browser may ask once to allow multiple downloads.`;
       return;
     }
+    if (bundleUrl && files.length >= BATCH_DOWNLOAD_THRESHOLD) {
+      status.textContent = `Downloading files in optimized batch mode: 0/${files.length}`;
+      try {
+        const response = await fetch(bundleUrl, { credentials: 'same-origin' });
+        if (response.status === 413 || response.status === 507) {
+          throw new StoredZipUnsupportedError(`bundle unavailable (${response.status})`);
+        }
+        if (response.status === 404) throw new Error('The verified bundle is no longer available.');
+        if (!response.ok) throw new Error(`server returned ${response.status}`);
+        await saveStoredZipFiles(response, directory, files, names, (completed, total) => {
+          status.textContent = `Downloading files in optimized batch mode: ${completed}/${total}`;
+        });
+        status.textContent = `Downloaded ${files.length} files.`;
+        return;
+      } catch (error) {
+        if (!(error instanceof StoredZipUnsupportedError) || error.filesWritten) throw error;
+        status.textContent = 'Batch mode unavailable; downloading files individually…';
+      }
+    }
     const failures = [];
     await runWorkerPool(
       files,
@@ -288,6 +311,7 @@ async function loadMetadata() {
   metadataFiles = next.files;
   metadataTotal = next.total;
   metadataHasMore = next.hasMore;
+  bundleUrl = body.bundle_url || null;
   renderNextFileBatch();
   const bundle = $('bundle-download');
   bundle.hidden = !body.bundle_url;
