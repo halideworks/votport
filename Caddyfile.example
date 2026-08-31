@@ -5,6 +5,10 @@
 # localhost.
 
 drop.example.com {
+	# Compresses JS, CSS, and the multi-MB vot-wasm binary (3-4x smaller);
+	# votport itself sends uncompressed responses and relies on the proxy.
+	encode zstd gzip
+
 	reverse_proxy 127.0.0.1:8321
 
 	# votport uploads travel as chunks of at most ~9 MiB per request, so no

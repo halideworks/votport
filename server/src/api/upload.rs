@@ -387,23 +387,28 @@ async fn register_session(
 ) -> ApiResult<()> {
     #[cfg(test)]
     app.sessions.wait_session_create_stall().await;
-    app.sessions
-        .insert_admitted(
-            session::SessionAdmission {
-                id: id.to_owned(),
-                link_id: prepared.link.id.clone(),
-                tenant: prepared.link.tenant.clone(),
-                reserved_bytes: prepared.expected.length,
-                max_total_bytes: prepared.max_total,
-                max_tenant_sessions: prepared.max_sessions,
-                max_link_sessions: MAX_SESSIONS_PER_LINK,
-                max_sessions: app.config.max_total_sessions,
-                kind,
-            },
-            sender,
-            || app.store.tenant_received_bytes(&prepared.link.tenant),
-        )
-        .map_err(|error| session_insert_error(app, &prepared.link.tenant, error))?;
+    let admission = session::SessionAdmission {
+        id: id.to_owned(),
+        link_id: prepared.link.id.clone(),
+        tenant: prepared.link.tenant.clone(),
+        reserved_bytes: prepared.expected.length,
+        max_total_bytes: prepared.max_total,
+        max_tenant_sessions: prepared.max_sessions,
+        max_link_sessions: MAX_SESSIONS_PER_LINK,
+        max_sessions: app.config.max_total_sessions,
+        kind,
+    };
+    // Off the runtime thread: admission's quota check reads the store.
+    let admit_app = Arc::clone(app);
+    let admit_tenant = prepared.link.tenant.clone();
+    tokio::task::spawn_blocking(move || {
+        admit_app.sessions.insert_admitted(admission, sender, || {
+            admit_app.store.tenant_received_bytes(&admit_tenant)
+        })
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?
+    .map_err(|error| session_insert_error(app, &prepared.link.tenant, error))?;
     match app.store.upload_link(&prepared.link.id) {
         Ok(Some(current)) if current.tenant == prepared.link.tenant && current.usable_now() => {
             Ok(())
@@ -801,7 +806,27 @@ pub async fn upload_finish(
     #[cfg(test)]
     app.sessions.wait_finish_stall().await;
     let runtime = tokio::runtime::Handle::current();
-    crate::app::upload_completed(&app, &sid, link_id, &report, &runtime);
+    // Off the runtime thread: completion does a link read plus an fsync'd
+    // audit insert, once per finished file. The push path calls this from
+    // its own OS thread and needs no wrapper.
+    let app_for_completion = Arc::clone(&app);
+    let session_id = sid.clone();
+    let report_for_completion = report.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        crate::app::upload_completed(
+            &app_for_completion,
+            &session_id,
+            link_id,
+            &report_for_completion,
+            &runtime,
+        )
+    })
+    .await
+    {
+        // A panic here loses the completion audit row and notification for
+        // good; the session slot itself is reclaimed by the idle sweep.
+        tracing::error!(%error, session = %sid.get(..8).unwrap_or(&sid), "upload completion bookkeeping failed");
+    }
     Ok(Json(report))
 }
 

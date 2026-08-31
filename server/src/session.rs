@@ -2002,6 +2002,14 @@ impl Sessions {
             max_sessions,
             kind,
         } = admission;
+        // Read the committed byte total before taking the lock: the read is
+        // a blocking SQL query and this mutex gates every in-flight chunk's
+        // touch(). The reserved sum below stays exact under the lock; only
+        // the committed figure can be a moment stale, fine for a soft quota.
+        let received = match max_total_bytes {
+            Some(_) => Some(received_bytes().map_err(InsertError::Store)?),
+            None => None,
+        };
         let mut inner = self.inner.lock().expect("sessions poisoned");
         if !tenant.is_empty() && inner.pinned.contains(&tenant) {
             return Err(InsertError::TenantPinned);
@@ -2028,7 +2036,7 @@ impl Sessions {
             return Err(InsertError::TenantSessionLimit);
         }
         if let Some(max_total) = max_total_bytes {
-            let received = received_bytes().map_err(InsertError::Store)?;
+            let received = received.unwrap_or(0);
             let already_reserved = inner
                 .map
                 .values()

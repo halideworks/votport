@@ -526,6 +526,21 @@ impl Store {
         connection
             .pragma_update(None, "synchronous", "FULL")
             .map_err(|error| error.to_string())?;
+        // Read-path tuning; durability is governed by the two pragmas above.
+        // 64 MiB page cache keeps hot index pages resident, mmap skips a
+        // copy for OS-cached pages, and temp b-trees stay off disk.
+        connection
+            .pragma_update(None, "cache_size", -64000)
+            .map_err(|error| error.to_string())?;
+        connection
+            .pragma_update(None, "mmap_size", 268435456)
+            .map_err(|error| error.to_string())?;
+        connection
+            .pragma_update(None, "temp_store", "MEMORY")
+            .map_err(|error| error.to_string())?;
+        // The hot-path statement set must fit or the LRU silently defeats
+        // prepare_cached; default capacity is too small at 16.
+        connection.set_prepared_statement_cache_capacity(64);
         connection
             .execute_batch(SCHEMA)
             .map_err(|error| format!("schema: {error}"))?;
@@ -1151,14 +1166,37 @@ impl Store {
     pub fn upload_link(&self, id: &str) -> Result<Option<Link>, String> {
         self.with(|connection| {
             connection
-                .query_row(
+                .prepare_cached(
                     "SELECT id, tenant, label, dest, password_hash, created_at, expires_at,
                             max_bytes, active, legal_hold, notify_on_upload, '[]' AS uploads_json,
                             '[]' AS events_json
                      FROM links WHERE id = ?1",
-                    [id],
-                    row_to_link,
-                )
+                )?
+                .query_row([id], row_to_link)
+                .optional()
+        })
+    }
+
+    /// One upload record by id, extracted in SQLite. Legacy outbound grants
+    /// resolve their source through this on every download request, so it
+    /// must not scale with the link's accumulated history the way a full
+    /// `link()` read does.
+    pub fn link_upload(
+        &self,
+        tenant: &str,
+        link_id: &str,
+        upload_id: &str,
+    ) -> Result<Option<UploadRecord>, String> {
+        self.with(|connection| {
+            connection
+                .prepare_cached(
+                    "SELECT je.value FROM links, json_each(links.uploads_json) AS je
+                     WHERE links.tenant = ?1 AND links.id = ?2
+                       AND json_extract(je.value, '$.id') = ?3",
+                )?
+                .query_row([tenant, link_id, upload_id], |row| {
+                    parse_json(&row.get::<_, String>(0)?, 0)
+                })
                 .optional()
         })
     }
@@ -1764,12 +1802,13 @@ impl Store {
     pub fn tenant_received_bytes(&self, tenant: &str) -> Result<u64, String> {
         self.with(|connection| {
             connection
-                .query_row(
+                .prepare_cached(
                     "SELECT COALESCE(SUM(bytes_hi), 0), COALESCE(SUM(bytes_lo), 0) FROM files
                      WHERE tenant = ?1 AND deleted = 0",
-                    [tenant],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                )
+                )?
+                .query_row([tenant], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })
                 .map(|(hi, lo)| combine_byte_sums(hi, lo))
         })
     }
@@ -1963,16 +2002,15 @@ impl Store {
     ) -> Result<Option<OutboundGrant>, String> {
         self.with(|connection| {
             connection
-                .query_row(
+                .prepare_cached(
                     "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
                             name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
                             expires_at, revoked_at, downloads, max_downloads, notify_on_download, first_download_at,
                             last_download_at,
                             files_json
                      FROM outbound_grants WHERE token_hash = ?1",
-                    [token_hash],
-                    map_outbound_grant,
-                )
+                )?
+                .query_row([token_hash], map_outbound_grant)
                 .optional()
                 .and_then(|grant| {
                     grant
@@ -1993,14 +2031,14 @@ impl Store {
     ) -> Result<Option<(OutboundGrant, Option<OutboundGrantFile>)>, String> {
         self.with(|connection| {
             let parent = connection
-                .query_row(
+                .prepare_cached(
                     "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
                             name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
                             expires_at, revoked_at, downloads, max_downloads, notify_on_download,
                             first_download_at, last_download_at, file_count
                      FROM outbound_grants WHERE token_hash = ?1",
-                    [token_hash],
-                    |row| {
+                )?
+                .query_row([token_hash], |row| {
                         let file_count = row.get::<_, i64>("file_count")?;
                         let file_count = usize::try_from(file_count.max(0)).map_err(|error| {
                             rusqlite::Error::FromSqlConversionFailure(
@@ -2010,8 +2048,7 @@ impl Store {
                             )
                         })?;
                         Ok((map_outbound_grant_base(row)?, file_count))
-                    },
-                )
+                })
                 .optional()?;
             let Some((grant, file_count)) = parent else {
                 return Ok(None);
@@ -2020,10 +2057,12 @@ impl Store {
                 return Ok(None);
             }
             let row = connection
-                .query_row(
+                .prepare_cached(
                     "SELECT source, name, suite, root, bytes_hi, bytes_lo, receipt_b64,
                             downloads, first_download_at, last_download_at
                      FROM outbound_grant_files WHERE grant_id = ?1 AND file_index = ?2",
+                )?
+                .query_row(
                     rusqlite::params![grant.id, i64::try_from(index).unwrap_or(i64::MAX)],
                     map_outbound_grant_file,
                 )
@@ -2065,14 +2104,14 @@ impl Store {
         let limit = i64::try_from(limit).map_err(|_| "outbound file limit overflow".to_owned())?;
         self.with(|connection| {
             let parent = connection
-                .query_row(
+                .prepare_cached(
                     "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
                             name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
                             expires_at, revoked_at, downloads, max_downloads, notify_on_download,
                             first_download_at, last_download_at, file_count
                      FROM outbound_grants WHERE token_hash = ?1",
-                    [token_hash],
-                    |row| {
+                )?
+                .query_row([token_hash], |row| {
                         let file_count = row.get::<_, i64>("file_count")?;
                         let file_count = usize::try_from(file_count.max(0)).map_err(|error| {
                             rusqlite::Error::FromSqlConversionFailure(
@@ -2082,8 +2121,7 @@ impl Store {
                             )
                         })?;
                         Ok((map_outbound_grant_base(row)?, file_count))
-                    },
-                )
+                })
                 .optional()?;
             let Some((grant, file_count)) = parent else {
                 return Ok(None);
@@ -2345,7 +2383,7 @@ impl Store {
                     }
                 } else {
                     let mut update = transaction
-                        .prepare(
+                        .prepare_cached(
                             "UPDATE outbound_grant_files
                              SET downloads = CASE WHEN downloads = 9223372036854775807
                                                   THEN downloads ELSE downloads + 1 END,
@@ -3033,18 +3071,19 @@ fn insert_audit_row(
     subject: &str,
     detail: &serde_json::Value,
 ) -> rusqlite::Result<usize> {
-    connection.execute(
-        "INSERT INTO audit_log (at, tenant, actor, event, subject, detail)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![
+    connection
+        .prepare_cached(
+            "INSERT INTO audit_log (at, tenant, actor, event, subject, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?
+        .execute(rusqlite::params![
             i64::try_from(now_unix()).unwrap_or(0),
             tenant,
             actor,
             event,
             subject,
             detail.to_string()
-        ],
-    )
+        ])
 }
 
 impl Store {
@@ -4657,6 +4696,36 @@ mod tests {
             .set_link_legal_hold("", "held", true, "admin")
             .is_err());
         assert!(!store.link("", "held").unwrap().unwrap().legal_hold);
+    }
+
+    #[test]
+    fn link_upload_extracts_one_record_without_the_full_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut link = test_link("link-1");
+        for index in 0..3 {
+            link.uploads.push(UploadRecord {
+                id: format!("up-{index}"),
+                started_at: 1,
+                completed_at: 2,
+                replayed_chunks: 0,
+                rejected_chunks: 0,
+                transport: None,
+                package_root: format!("root-{index}"),
+                total_bytes: 5,
+                files: Vec::new(),
+            });
+        }
+        store.insert_link(link).unwrap();
+        let found = store.link_upload("", "link-1", "up-1").unwrap().unwrap();
+        assert_eq!(found.id, "up-1");
+        assert_eq!(found.package_root, "root-1");
+        assert!(store.link_upload("", "link-1", "up-9").unwrap().is_none());
+        // Tenant scoping holds: the wrong namespace sees nothing.
+        assert!(store
+            .link_upload("other", "link-1", "up-1")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
