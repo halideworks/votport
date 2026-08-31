@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{header, HeaderMap, Request, StatusCode};
+use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse as _, Response};
 use axum::routing::{get, post};
@@ -171,6 +171,8 @@ pub(crate) struct RequestMetrics {
     status: [AtomicU64; 5],
     latency_buckets: [AtomicU64; 7],
     latency_sum_ns: AtomicU64,
+    outbound_upload_latency_buckets: [AtomicU64; 7],
+    outbound_upload_latency_sum_ns: AtomicU64,
 }
 
 impl RequestMetrics {
@@ -184,6 +186,21 @@ impl RequestMetrics {
         let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
         self.latency_sum_ns.fetch_add(nanos, Ordering::Relaxed);
         for (bucket, bound) in self.latency_buckets.iter().zip(REQUEST_LATENCY_BUCKETS_NS) {
+            if nanos <= bound {
+                bucket.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn observe_outbound_upload(&self, elapsed: std::time::Duration) {
+        let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        self.outbound_upload_latency_sum_ns
+            .fetch_add(nanos, Ordering::Relaxed);
+        for (bucket, bound) in self
+            .outbound_upload_latency_buckets
+            .iter()
+            .zip(REQUEST_LATENCY_BUCKETS_NS)
+        {
             if nanos <= bound {
                 bucket.fetch_add(1, Ordering::Relaxed);
             }
@@ -229,6 +246,28 @@ impl RequestMetrics {
             self.latency_buckets[6].load(Ordering::Relaxed),
             self.latency_sum_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0
         );
+        body.push_str(
+            "# HELP votport_http_outbound_upload_duration_seconds HTTP time to response headers for outbound library uploads in seconds.\n# TYPE votport_http_outbound_upload_duration_seconds histogram\n",
+        );
+        for (bucket, label) in self
+            .outbound_upload_latency_buckets
+            .iter()
+            .zip(REQUEST_LATENCY_BUCKET_LABELS)
+            .take(REQUEST_LATENCY_BUCKET_LABELS.len() - 1)
+        {
+            let _ = writeln!(
+                body,
+                "votport_http_outbound_upload_duration_seconds_bucket{{le=\"{label}\"}} {}",
+                bucket.load(Ordering::Relaxed)
+            );
+        }
+        let _ = writeln!(
+            body,
+            "votport_http_outbound_upload_duration_seconds_bucket{{le=\"+Inf\"}} {}\nvotport_http_outbound_upload_duration_seconds_count {}\nvotport_http_outbound_upload_duration_seconds_sum {:.9}",
+            self.outbound_upload_latency_buckets[6].load(Ordering::Relaxed),
+            self.outbound_upload_latency_buckets[6].load(Ordering::Relaxed),
+            self.outbound_upload_latency_sum_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0
+        );
         body
     }
 }
@@ -266,18 +305,26 @@ fn request_id(request: &Request<axum::body::Body>) -> String {
         .unwrap_or_else(crate::auth::random_token)
 }
 
+fn is_outbound_upload(request: &Request<axum::body::Body>) -> bool {
+    request.method() == Method::POST && request.uri().path() == "/api/admin/outbound-files"
+}
+
 async fn request_observability(
     State(app): State<Arc<App>>,
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     let id = request_id(&request);
+    let outbound_upload = is_outbound_upload(&request);
     let started = std::time::Instant::now();
     let _in_flight = app.request_metrics.begin();
     let span = tracing::info_span!("http_request", request_id = %id);
     let mut response = next.run(request).instrument(span).await;
-    app.request_metrics
-        .observe(response.status(), started.elapsed());
+    let elapsed = started.elapsed();
+    app.request_metrics.observe(response.status(), elapsed);
+    if outbound_upload {
+        app.request_metrics.observe_outbound_upload(elapsed);
+    }
     response.headers_mut().insert(
         "x-request-id",
         axum::http::HeaderValue::from_str(&id).expect("generated request id is valid"),
@@ -1967,6 +2014,35 @@ mod request_metrics_tests {
     }
 
     #[test]
+    fn outbound_upload_timing_uses_one_fixed_route_and_histogram() {
+        let upload = Request::post("/api/admin/outbound-files?path=project/file.bin")
+            .body(Body::empty())
+            .unwrap();
+        assert!(is_outbound_upload(&upload));
+        let other = Request::post("/api/admin/outbound-grants")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!is_outbound_upload(&other));
+        let list = Request::get("/api/admin/outbound-files")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!is_outbound_upload(&list));
+
+        let metrics = RequestMetrics::default();
+        metrics.observe_outbound_upload(Duration::from_millis(75));
+        let text = metrics.prometheus();
+        assert!(text.contains(
+            "# HELP votport_http_outbound_upload_duration_seconds HTTP time to response headers for outbound library uploads in seconds."
+        ));
+        assert!(text.contains("votport_http_outbound_upload_duration_seconds_bucket{le=\"0.1\"} 1"));
+        assert!(
+            text.contains("votport_http_outbound_upload_duration_seconds_bucket{le=\"+Inf\"} 1")
+        );
+        assert!(text.contains("votport_http_outbound_upload_duration_seconds_count 1"));
+        assert!(text.contains("votport_http_outbound_upload_duration_seconds_sum 0.075000000"));
+    }
+
+    #[test]
     fn request_metrics_in_flight_returns_to_zero() {
         let metrics = RequestMetrics::default();
         let in_flight = metrics.begin();
@@ -2010,6 +2086,39 @@ mod request_metrics_tests {
         assert!(generated
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')));
+    }
+
+    #[tokio::test]
+    async fn request_middleware_records_only_outbound_upload_posts() {
+        use tower::ServiceExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/outbound-files?path=x")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(app
+            .request_metrics
+            .prometheus()
+            .contains("votport_http_outbound_upload_duration_seconds_count 1"));
+
+        router(app.clone())
+            .oneshot(
+                Request::get("/api/admin/outbound-files?path=x")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(app
+            .request_metrics
+            .prometheus()
+            .contains("votport_http_outbound_upload_duration_seconds_count 1"));
     }
 }
 
