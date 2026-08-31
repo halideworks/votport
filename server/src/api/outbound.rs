@@ -3625,15 +3625,10 @@ fn source_info_indexed_with_file(
     if index != 0 {
         return Err(ApiError::not_found());
     }
-    let link = app
+    let upload = app
         .store
-        .link(&grant.tenant, &grant.link_id)
+        .link_upload(&grant.tenant, &grant.link_id, &grant.upload_id)
         .map_err(super::store_unavailable)?
-        .ok_or_else(ApiError::not_found)?;
-    let upload = link
-        .uploads
-        .iter()
-        .find(|upload| upload.id == grant.upload_id)
         .ok_or_else(ApiError::not_found)?;
     let file = upload
         .files
