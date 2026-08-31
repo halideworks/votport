@@ -58,7 +58,7 @@ test('one upload batch validates paths and reports per-file progress', () => {
 
 test('upload batches cap concurrency and wait for running work after failure', async () => {
   const deferred = new Map();
-  for (const item of [0, 2, 3]) {
+  for (const item of [0, 2, 3, 4, 5, 6, 7]) {
     let resolve;
     const promise = new Promise((finish) => { resolve = finish; });
     deferred.set(item, { promise, resolve });
@@ -66,7 +66,7 @@ test('upload batches cap concurrency and wait for running work after failure', a
   let active = 0;
   let maximum = 0;
   const started = [];
-  const batch = runUploadBatch([0, 1, 2, 3, 4, 5], async (item) => {
+  const batch = runUploadBatch([...Array(12).keys()], async (item) => {
     started.push(item);
     active += 1;
     maximum = Math.max(maximum, active);
@@ -83,9 +83,9 @@ test('upload batches cap concurrency and wait for running work after failure', a
     throw error;
   });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(started, [0, 1, 2, 3]);
-  assert.ok(maximum <= 4);
-  assert.equal(active, 3);
+  assert.deepEqual(started, [0, 1, 2, 3, 4, 5, 6, 7]);
+  assert.ok(maximum <= 8);
+  assert.equal(active, 7);
   assert.equal(settled, false);
   for (const { resolve } of deferred.values()) resolve();
   await assert.rejects(result, (error) => error === undefined);
