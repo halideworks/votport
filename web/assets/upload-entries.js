@@ -30,7 +30,7 @@ export function entryFiles(entry) {
   });
 }
 
-const UPLOAD_CONCURRENCY = 4;
+const UPLOAD_CONCURRENCY = 8;
 
 export async function runUploadBatch(items, upload, onProgress = () => {}, onComplete = () => {}) {
   let next = 0;
