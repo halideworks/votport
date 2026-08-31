@@ -41,6 +41,7 @@ async fn main() {
     };
     app::start_push_receiver(application.clone());
     tokio::spawn(app::session_sweeper(application.clone()));
+    tokio::spawn(votport::backup::scheduler(application.clone()));
     let router = app::router(application.clone());
     let listener = match tokio::net::TcpListener::bind(bind).await {
         Ok(listener) => listener,
@@ -58,7 +59,7 @@ async fn main() {
         listener,
         router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(shutdown_signal(application.clone()))
     .await
     {
         tracing::error!("server error: {error}");
@@ -215,7 +216,7 @@ async fn share(arguments: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(application: std::sync::Arc<votport::app::App>) {
     // Docker and systemd stop the process with SIGTERM; ctrl_c is SIGINT
     // only. Without this a container stop skips graceful shutdown entirely.
     let ctrl_c = async {
@@ -234,6 +235,7 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+        _ = application.shutdown.notified() => {},
     }
     tracing::info!("shutting down");
 }

@@ -103,15 +103,26 @@ services:
 ```
 
 Keep the complete image reference, including its digest, with the matching
-database and `/received` and `/outbound` backup set.
+database and `/received` and `/outbound` backup set. System-page automatic
+archives cover the database and VOTPort-managed identity files only; the two
+content volumes still need operator-owned file backups.
 
 ## Configuration
 
 Environment variables are the boot defaults (see `docker-compose.yml`). A
 default-tenant admin can overlay notify channels, retention, and default
-quotas from **System** without SSH (`GET`/`PUT /api/admin/settings`). A written
-settings key wins; `""` disables a URL or token; JSON `null` deletes the row
-so env applies again. Details: [`docs/deployment.md`](docs/deployment.md).
+quotas from **System** without SSH (`GET`/`PUT /api/admin/settings`). The same
+page configures automatic local and S3-compatible backups, reports redacted
+status, and stages restores for the service supervisor. Backup archives include
+the database and VOTPort-managed identity files only; a blank local path uses
+`<data_dir>/backups` (normally `/data/backups`), while a custom path must be a
+writable service-filesystem path mounted by the operator. S3 prefix settings
+cover VOTPort backup objects only, and `/received` and `/outbound` remain
+operator backups.
+Optional backup secrets are unchanged when left blank and never returned by
+GET. A restore rotates the cookie secret and signs out existing sessions. A
+written settings key wins; `""` disables a URL or token; JSON `null` deletes
+the row so env applies again. Details: [`docs/deployment.md`](docs/deployment.md).
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -275,8 +286,9 @@ hashed, verified range by range, independent of every proxy in between.
    `max_downloads` applies per file and per full-delivery round.
 5. **Tenants** (platform admin): namespaces, quotas, principals, revoke.
 6. **Audit:** queryable event log and JSONL export.
-7. **System:** password, backup download, receipt public key, notify/SMTP,
-   retention, default quotas.
+7. **System:** password, automatic backup configuration/status/restore,
+   database snapshot download, receipt public key, notify/SMTP, retention,
+   default quotas.
 
 Senders can drop folders as well as files; browser support requires
 WebAssembly SIMD and module workers (Safari 16.4, Chrome 91, Firefox 114 or

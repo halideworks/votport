@@ -755,12 +755,17 @@ Two stores, two clocks.
 | `data/votport.db` | `GET /api/admin/backup` (`VACUUM INTO`) | last time someone clicked Download (not the DR clock) | same stop-replace-start |
 | `/received` | existing file backup (restic, borg, zfs send, rsync) | that job's interval | restore files, start |
 
-Restore procedure (unchanged shape, spelled):
-
-1. Stop the container.
-2. Replace `data/votport.db` with the Litestream restore or a `VACUUM INTO` snapshot. Do not copy a live `-wal` over a restored file.
-3. Restore `/received` from the file backup taken nearest that snapshot.
-4. Start. Staging leftovers are removed by `paths::clean_staging` at boot.
+Restore is staged by the System-page action and applied at boot. With a
+supervised service, the restart request applies it automatically; without one,
+stop the container or process and start it manually. The restore replaces the
+database and VOTPort-managed identity files, but not `/received` or
+`/outbound`; restore those from their operator-owned backups. Do not copy a
+live `-wal` over a restored database. Failed activation keeps the private
+rollback directory for recovery. File installation removes the restore stage
+and marker before later application initialization, so keep the rollback until
+health checks pass. The restored backup destination is cleared and automatic
+backups remain disabled until an admin re-saves them. `paths::clean_staging`
+only sweeps receive/outbound staging, not restore stages.
 
 Worked Litestream snippet (document, do not add a sidecar to `docker-compose.yml` in this stack):
 

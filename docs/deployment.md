@@ -15,7 +15,7 @@ data/                       votport state (directory 0700, keep private)
   receipt.key               ed25519 receipt signer    (0600)
   push-issuer.key           native-push capability issuer, always here (0600)
   push.crt / push.key       generated native-push certificate and key (0600)
-  backups/                  snapshots written by /api/admin/backup (directory 0700, files 0600)
+  backups/                  automatic and manual snapshots (directory 0700, files 0600)
 /received                   received files, published per tenant/link
 /outbound                   Deliver library files and rendered projects
   .vot-tenants.stage/<tenant> tenant-scoped library subtree
@@ -112,9 +112,29 @@ DNS before calling the VOT push API.
 
 ## Backups
 
-Three stores, two clocks. Litestream (or an equivalent WAL replica) is the
-database RPO. `/received` and `/outbound` stay on existing file backups. `GET
-/api/admin/backup` is a consistent copy-home button, not the HA story.
+Three stores, two clocks. The System page can run scheduled backups to a local
+target and/or an S3-compatible bucket. Litestream (or an equivalent WAL
+replica) remains the database RPO for deployments that need continuous
+replication. `/received` and `/outbound` stay on existing file backups.
+
+Automatic archives contain the SQLite database and VOTPort-managed identity
+files only: the cookie secret, receipt signer, native-push issuer, and
+VOTPort-generated push certificate pair. They exclude WAL/SHM files,
+`data/backups/`, staging data, and everything under `/received` and
+`/outbound`. Configured external certificate files are not copied. The local
+path is interpreted inside the service filesystem and must be writable by the
+container user; blank uses `<data_dir>/backups` (normally `/data/backups`). A
+custom path must already exist with no symlink or group/other-writable ancestor.
+A dedicated host directory must be mounted at that container path. S3 uploads
+use the configured bucket and prefix. The UI reports credential and passphrase
+configured flags, never their values.
+
+Pruning is owned by VOTPort for snapshots it created under the configured
+local path and for generated `votport-backup-v1-*` objects under the configured
+S3 prefix. It does not delete unrelated local files or bucket objects. Keep an
+external recovery copy of the encryption passphrase. An
+encrypted archive is unrecoverable without it, and storing that passphrase in
+the same deployment backup defeats recovery isolation.
 
 | Store | Mechanism | RPO | RTO |
 | --- | --- | --- | --- |
@@ -132,6 +152,10 @@ by SQLite's `VACUUM INTO`, with `Content-Length`. Snapshots land under
 ```sh
 sqlite3 data/votport.db ".backup data/backups/manual.db"
 ```
+
+The legacy Download snapshot action remains database-only. It is useful for a
+quick copy home, but it is not a replacement for the scheduled archive or the
+external `/received` and `/outbound` backups.
 
 ### Litestream
 
@@ -159,12 +183,34 @@ database snapshot so records and bytes stay consistent with each other.
 
 ### Restore
 
-1. Stop the container.
-2. Replace `data/votport.db` with the Litestream restore or a `VACUUM INTO`
-   snapshot. Do not copy a live `-wal` over a restored file.
-3. Restore `/received` and `/outbound` from the file backups taken nearest that
-   snapshot.
-4. Start. Staging leftovers are removed by `paths::clean_staging` at boot.
+The System page's Restore action validates the selected archive, stages it,
+and asks the supervised service to restart. At boot, VOTPort moves the current
+managed files into a private `.votport-restore-rollback-<token>/` directory
+under `data/`, installs the staged database and identity files, then removes
+the restore stage and marker after the file installation and integrity checks
+finish. Later database migration, receipt signer, or push initialization can
+still fail; the private rollback directory remains for operator recovery and
+can be removed after the restored deployment is accepted. The archive still
+does not restore `/received` or `/outbound`; use the matching operator-owned
+file backups for those volumes.
+
+With the default compose restart policy, the process restart request is
+observed by the supervisor and the service comes back. Without a supervisor,
+the action only stages the restore: stop the container or process, then start
+it manually so boot can apply the pending restore. Never copy a live `-wal`
+over a restored database. The install clears the restored backup destination
+and leaves automatic backups disabled, preventing historical S3 targets from
+receiving data with current credentials. Re-save and re-enable backup settings
+after verifying the deployment.
+
+Restoring the managed cookie secret rotates the admin cookie signing key and
+signs out every existing admin session. Plan to sign in again after restart.
+
+For a manual restore, use the System action or place a validated archive in
+the pending restore workflow; do not copy archive members directly over a live
+database. Verify `/healthz` and a known Receive and Deliver link. A
+database-only restore cannot serve Deliver files whose source remains absent
+from `/outbound`.
 
 For an upgrade or rollback, record the complete image reference, including its
 digest, with the point-in-time backup set. Restore the database and both file

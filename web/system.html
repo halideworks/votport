@@ -546,13 +546,117 @@
         <div class="card">
           <h2>Backups</h2>
           <p class="muted">
-            A consistent SQLite snapshot of links, tenants and the audit log;
-            it excludes received and outbound files. Those files live
-            separately under their receive and outbound storage roots.
+            Automatic snapshots contain the database and VOTPort-managed
+            identity files only. Received and outbound files remain separate
+            operator backups.
           </p>
-          <a id="backup-download" class="ghost" href="/api/admin/backup"
-            >Download snapshot</a
-          >
+          <form id="backup-form">
+            <div class="grid">
+              <label
+                >Destination
+                <select id="backup-destination">
+                  <option value="local">Local filesystem</option>
+                  <option value="s3">S3-compatible bucket</option>
+                  <option value="both">Both</option>
+                </select>
+              </label>
+              <label
+                ><input type="checkbox" id="backup-enabled" />
+                Enable automatic backups
+              </label>
+              <label
+                >Schedule <span class="muted">minutes</span>
+                <input id="backup-interval-minutes" type="number" min="1" step="1" required />
+              </label>
+              <label
+                >Local path <span class="muted">service filesystem path; blank uses &lt;data_dir&gt;/backups; custom paths must already exist with private ancestry</span>
+                <input id="backup-local-path" autocomplete="off" placeholder="/data/backups" />
+              </label>
+              <label
+                >Retention days <span class="muted">all configured targets, 0 is off</span>
+                <input id="backup-local-retention-days" type="number" min="0" step="1" required />
+              </label>
+              <label
+                >Retention count <span class="muted">snapshots, 0 is off</span>
+                <input id="backup-retention-count" type="number" min="0" step="1" required />
+              </label>
+            </div>
+
+            <h3>S3-compatible target</h3>
+            <div class="grid">
+              <label
+                >Endpoint <span class="muted">https://...</span>
+                <input id="backup-s3-endpoint" autocomplete="off" placeholder="https://s3.example.com" />
+              </label>
+              <label
+                >Region
+                <input id="backup-s3-region" autocomplete="off" placeholder="us-east-1" />
+              </label>
+              <label
+                >Bucket
+                <input id="backup-s3-bucket" autocomplete="off" />
+              </label>
+              <label
+                >Prefix/path <span class="muted">backup objects only</span>
+                <input id="backup-s3-prefix" autocomplete="off" placeholder="votport" />
+              </label>
+              <label
+                ><input type="checkbox" id="backup-s3-path-style" />
+                Use path-style requests <span class="muted">for endpoints that require it</span>
+              </label>
+              <label
+                >Access key <span class="muted" id="backup-s3-access-key-source"></span>
+                <input id="backup-s3-access-key" autocomplete="off" />
+              </label>
+              <label
+                >Secret key <span class="muted" id="backup-s3-secret-key-source"></span>
+                <input id="backup-s3-secret-key" type="password" autocomplete="new-password" />
+              </label>
+            </div>
+            <p class="muted">Leave credential fields blank to keep saved secrets unchanged; GET never returns them.</p>
+
+            <label
+              ><input type="checkbox" id="backup-encryption-enabled" />
+              Encrypt snapshots
+            </label>
+            <label
+              >Encryption passphrase <span class="muted" id="backup-encryption-passphrase-source"></span>
+              <input id="backup-encryption-passphrase" type="password" autocomplete="new-password" />
+            </label>
+            <p class="muted">Leave the passphrase blank to keep it unchanged; there is no in-app secret clear control.</p>
+            <p class="warning" id="backup-encryption-warning">
+              Keep an external recovery copy of the passphrase. Without it,
+              encrypted snapshots cannot be restored.
+            </p>
+            <button type="submit" id="backup-save" disabled>Save backup settings</button>
+            <span id="backup-note" class="muted"></span>
+            <p class="error" id="backup-error" role="alert" hidden></p>
+          </form>
+        </div>
+
+        <div class="card" id="backup-status-card">
+          <h2>Backup status</h2>
+          <p id="backup-status" class="muted">Loading backup status…</p>
+          <p><a id="backup-download" class="ghost" href="/api/admin/backup">Download database snapshot</a></p>
+          <div class="grid">
+            <button type="button" id="backup-run" class="ghost" disabled>Run now</button>
+            <label
+              >Restore snapshot
+              <select id="backup-restore-snapshot" disabled>
+                <option value="">No snapshots available</option>
+              </select>
+            </label>
+          </div>
+          <p class="muted">
+            Restore stages the selected snapshot, replaces current application
+            state, and restarts the supervised service. Current application
+            state will be replaced, the cookie secret will rotate, and every
+            existing admin session will be signed out. Automatic backups will
+            remain disabled until an admin re-enables them. Confirm the
+            snapshot before continuing.
+          </p>
+          <p id="backup-inventory" class="muted"></p>
+          <p class="error" id="backup-status-error" role="alert" hidden></p>
         </div>
 
         <div class="card">

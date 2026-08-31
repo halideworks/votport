@@ -99,6 +99,10 @@ pub struct App {
     pub(crate) push_metrics: PushMetrics,
     pub(crate) request_metrics: RequestMetrics,
     pub(crate) push_tickets: Mutex<HashMap<[u8; 16], PushTicket>>,
+    /// A process-wide maintenance lock: an operator click and the scheduler
+    /// must never produce two snapshots or apply two restores concurrently.
+    pub backup_lock: Arc<tokio::sync::Mutex<()>>,
+    pub shutdown: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -540,6 +544,10 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     std::fs::create_dir_all(&config.outbound_dir)
         .map_err(|error| format!("create {}: {error}", config.outbound_dir.display()))?;
     crate::paths::tighten_dir(&config.outbound_dir);
+    std::fs::create_dir_all(&config.data_dir)
+        .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
+    crate::paths::tighten_private_dir(&config.data_dir).map_err(|error| error.to_string())?;
+    crate::backup::apply_pending_restore(&config.data_dir, crate::store::SCHEMA_VERSION)?;
     crate::paths::clean_staging(&config.outbound_dir);
     let store = Arc::new(Store::open(&config.data_dir)?);
     clean_outbound_stage(&config.data_dir);
@@ -589,8 +597,16 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         push_metrics: PushMetrics::default(),
         request_metrics: RequestMetrics::default(),
         push_tickets: Mutex::new(HashMap::new()),
+        backup_lock: Arc::new(tokio::sync::Mutex::new(())),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
         config,
     }))
+}
+
+impl App {
+    pub fn request_shutdown(&self) {
+        self.shutdown.notify_waiters();
+    }
 }
 
 /// Remove only VOTPORT-owned outbound staging entries. `symlink_metadata` and
@@ -1400,6 +1416,13 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/admin/audit", get(api::admin_audit_export))
         .route("/api/admin/holdings", get(api::holdings))
         .route("/api/admin/backup", get(api::backup_database))
+        .route(
+            "/api/admin/backups",
+            get(api::get_backups)
+                .put(api::put_backups_config)
+                .post(api::create_backup),
+        )
+        .route("/api/admin/backups/restore", post(api::restore_backup))
         .route(
             "/api/admin/tenants",
             get(api::list_tenants).post(api::create_tenant),
@@ -2550,18 +2573,7 @@ pub async fn session_sweeper(app: Arc<App>) {
                 let backup_dir = app.config.data_dir.join("backups");
                 let cutoff_modified =
                     std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
-                if let Ok(entries) = std::fs::read_dir(&backup_dir) {
-                    for entry in entries.flatten() {
-                        let expired = entry
-                            .metadata()
-                            .and_then(|meta| meta.modified())
-                            .map(|modified| modified < cutoff_modified)
-                            .unwrap_or(false);
-                        if expired {
-                            let _ = std::fs::remove_file(entry.path());
-                        }
-                    }
-                }
+                prune_legacy_snapshots(&backup_dir, cutoff_modified);
 
                 // Received-content lifecycle: delete expired uploads from
                 // disk and tombstone their records, per tenant. Only records
@@ -2586,10 +2598,49 @@ pub async fn session_sweeper(app: Arc<App>) {
     }
 }
 
+fn prune_legacy_snapshots(backup_dir: &std::path::Path, cutoff: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(backup_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !crate::backup::owned_legacy_snapshot(name) {
+            continue;
+        }
+        let expired = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|modified| modified < cutoff);
+        if expired {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod retention_tests {
     use super::*;
     use crate::store::{FileRecord, Link, OutboundGrant, SettingWrite, UploadRecord};
+
+    #[test]
+    fn legacy_snapshot_pruning_keeps_operator_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let generated = directory.path().join("votport-1-deadbeef.db");
+        let operator = directory.path().join("votport-before-upgrade.db");
+        let modified = std::fs::FileTimes::new()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1));
+        for path in [&generated, &operator] {
+            let file = std::fs::File::create(path).unwrap();
+            file.set_times(modified).unwrap();
+        }
+        prune_legacy_snapshots(
+            directory.path(),
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(2),
+        );
+        assert!(!generated.exists());
+        assert!(operator.exists());
+    }
 
     #[tokio::test]
     async fn retention_preserves_protected_files_and_tombstones_expired_files() {
