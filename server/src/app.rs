@@ -543,6 +543,8 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     crate::paths::clean_staging(&config.outbound_dir);
     let store = Arc::new(Store::open(&config.data_dir)?);
     clean_outbound_stage(&config.data_dir);
+    clean_outbound_proof_stages(&config.data_dir);
+    clean_outbound_proofs(&config.data_dir, &store, now_unix());
     store.migrate_tenant_storage(&config.receive_dir)?;
     // Staging files from a previous crash or kill have no live session to
     // sweep them; remove them once at startup.
@@ -636,9 +638,189 @@ fn clean_outbound_stage(data_dir: &std::path::Path) {
     }
 }
 
+fn clean_outbound_proof_stages(data_dir: &std::path::Path) {
+    let root = data_dir.join("outbound.proofs");
+    let Ok(meta) = std::fs::symlink_metadata(&root) else {
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !owned_catalog_stage_name(&name) {
+            continue;
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            if meta.file_type().is_file() && !meta.file_type().is_symlink() {
+                if let Err(error) = std::fs::remove_file(path) {
+                    tracing::warn!(%error, stage = %name, "outbound catalog stage cleanup failed");
+                }
+            }
+        }
+    }
+}
+
+fn active_catalog_names(keys: Vec<(String, String, u64)>) -> HashSet<String> {
+    keys.into_iter()
+        .filter_map(|(suite, root, length)| {
+            let suite = match suite.as_str() {
+                "blake3" => 1,
+                "sha256" => 2,
+                _ => return None,
+            };
+            let bytes = hex::decode(root).ok()?;
+            let root = <[u8; 32]>::try_from(bytes).ok().map(hex::encode)?;
+            Some(format!("{suite}-{root}-{length}.vot-catalog"))
+        })
+        .collect()
+}
+
+fn canonical_catalog_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".vot-catalog") else {
+        return false;
+    };
+    let Some((suite, rest)) = stem.split_once('-') else {
+        return false;
+    };
+    if !matches!(suite, "1" | "2") {
+        return false;
+    }
+    let Some((root, length)) = rest.rsplit_once('-') else {
+        return false;
+    };
+    if root.len() != 64
+        || !root
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return false;
+    }
+    let Ok(length_value) = length.parse::<u64>() else {
+        return false;
+    };
+    length == length_value.to_string()
+        && name == format!("{suite}-{root}-{length_value}.vot-catalog")
+}
+
+fn owned_catalog_stage_name(name: &str) -> bool {
+    let Some(name) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some((catalog, token)) = name.rsplit_once(".stage-") else {
+        return false;
+    };
+    canonical_catalog_name(catalog)
+        && token.len() == 32
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn clean_outbound_proofs(data_dir: &std::path::Path, store: &Store, now: u64) {
+    let root = data_dir.join("outbound.proofs");
+    let Ok(meta) = std::fs::symlink_metadata(&root) else {
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return;
+    }
+    let keys = match store.active_outbound_object_keys(now) {
+        Ok(keys) => active_catalog_names(keys),
+        Err(error) => {
+            tracing::error!(%error, "outbound catalog references unavailable; skipping prune");
+            return;
+        }
+    };
+    prune_outbound_proofs(&root, &keys);
+}
+
+fn prune_outbound_proofs(root: &std::path::Path, keys: &HashSet<String>) {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(%error, "outbound catalog directory read failed");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !canonical_catalog_name(&name) || keys.contains(&name) {
+            continue;
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            if meta.file_type().is_file() && !meta.file_type().is_symlink() {
+                if let Err(error) = std::fs::remove_file(path) {
+                    tracing::warn!(%error, catalog = %name, "outbound catalog prune failed");
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod outbound_stage_tests {
     use super::*;
+
+    #[test]
+    fn catalog_prune_keeps_active_and_foreign_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("outbound.proofs");
+        std::fs::create_dir_all(&root).unwrap();
+        let active_root = "00".repeat(32);
+        let active = format!("1-{active_root}-10.vot-catalog");
+        let stale = format!("2-{}-11.vot-catalog", "11".repeat(32));
+        let foreign =
+            "1-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-12.vot-catalog";
+        std::fs::write(root.join(&active), b"active").unwrap();
+        std::fs::write(root.join(&stale), b"stale").unwrap();
+        std::fs::write(root.join(foreign), b"foreign").unwrap();
+        std::fs::write(root.join("operator.txt"), b"operator").unwrap();
+        let foreign_stage = root.join(".1-operator.vot-catalog.stage-foreign");
+        std::fs::write(&foreign_stage, b"operator").unwrap();
+        let owned_stage = root.join(format!(".{active}.stage-{}", "aa".repeat(16)));
+        std::fs::write(&owned_stage, b"owned").unwrap();
+        #[cfg(unix)]
+        {
+            let stage_link = root.join(format!(".{active}.stage-{}", "bb".repeat(16)));
+            std::os::unix::fs::symlink(&owned_stage, &stage_link).unwrap();
+            std::os::unix::fs::symlink(
+                &stale,
+                root.join(format!("2-{}-12.vot-catalog", "22".repeat(32))),
+            )
+            .unwrap();
+        }
+        let keys = active_catalog_names(vec![("blake3".to_owned(), active_root, 10)]);
+
+        prune_outbound_proofs(&root, &keys);
+
+        assert!(root.join(&active).exists());
+        assert!(!root.join(stale).exists());
+        assert!(root.join(foreign).exists());
+        assert!(root.join("operator.txt").exists());
+        clean_outbound_proof_stages(directory.path());
+        assert!(foreign_stage.exists());
+        assert!(!owned_stage.exists());
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(
+            root.join(format!("2-{}-12.vot-catalog", "22".repeat(32)))
+        )
+        .is_ok());
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(
+            root.join(format!(".{active}.stage-{}", "bb".repeat(16)))
+        )
+        .is_ok());
+    }
 
     #[test]
     fn startup_cleanup_removes_only_outbound_stage_entries() {
@@ -1309,6 +1491,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/s/{token}", get(api::outbound_metadata))
         .route("/api/s/{token}/verify", post(api::verify_outbound_password))
         .route("/api/s/{token}/bundle", get(api::outbound::outbound_bundle))
+        .route("/api/s/{token}/batch", get(api::outbound::outbound_batch))
         .route("/api/automation/share", post(api::automation_share))
         .route("/api/s/{token}/receipt", get(api::outbound_receipt))
         .route(
@@ -2350,6 +2533,7 @@ pub async fn session_sweeper(app: Arc<App>) {
                         continue;
                     }
                 };
+                clean_outbound_proofs(&app.config.data_dir, &app.store, crate::store::now_unix());
                 if settings.audit_retention_days > 0 {
                     let cutoff =
                         crate::store::now_unix().saturating_sub(settings.audit_retention_days.saturating_mul(86_400));

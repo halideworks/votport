@@ -2547,6 +2547,35 @@ impl Store {
         })
     }
 
+    /// Returns globally referenced object keys for non-expired, non-revoked
+    /// outbound grants. Catalogs are content-addressed, so tenant is omitted.
+    pub fn active_outbound_object_keys(
+        &self,
+        now: u64,
+    ) -> Result<Vec<(String, String, u64)>, String> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT suite, root, bytes_hi, bytes_lo
+                 FROM outbound_grants
+                 WHERE revoked_at IS NULL AND expires_at > ?1
+                 UNION
+                 SELECT files.suite, files.root, files.bytes_hi, files.bytes_lo
+                 FROM outbound_grant_files AS files
+                 JOIN outbound_grants AS grants ON grants.id = files.grant_id
+                 WHERE grants.revoked_at IS NULL AND grants.expires_at > ?1
+                 ORDER BY suite, root, bytes_hi, bytes_lo",
+            )?;
+            let rows = statement.query_map([i64::try_from(now).unwrap_or(i64::MAX)], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    combine_byte_sums(row.get(2)?, row.get(3)?),
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+    }
+
     pub fn link_has_active_outbound_grants(
         &self,
         tenant: &str,
@@ -5680,6 +5709,54 @@ mod phase4_review_tests {
             })
             .unwrap();
         assert!(store.active_outbound_file_keys("acme", "link", 19).is_err());
+    }
+
+    #[test]
+    fn active_outbound_object_keys_are_global_and_deduplicated() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let object = |suite: &str, root: &str, bytes: u64| OutboundGrantFile {
+            source: format!("objects/{root}"),
+            name: root.to_owned(),
+            suite: suite.to_owned(),
+            root: root.to_owned(),
+            bytes,
+            receipt_b64: String::new(),
+            downloads: 0,
+            first_download_at: None,
+            last_download_at: None,
+        };
+
+        let mut legacy = test_outbound_grant("legacy", "acme", 0);
+        legacy.root = "parent".to_owned();
+        legacy.bytes = 3;
+        store.insert_outbound_grant(legacy).unwrap();
+
+        let mut active = test_outbound_grant("active", "other", 0);
+        active.root = "parent".to_owned();
+        active.bytes = 3;
+        active.files = vec![object("blake3", "parent", 3), object("sha256", "child", 4)];
+        store.insert_outbound_grant(active).unwrap();
+
+        let mut expired = test_outbound_grant("expired", "acme", 0);
+        expired.root = "expired-parent".to_owned();
+        expired.expires_at = 19;
+        expired.files = vec![object("blake3", "expired-child", 5)];
+        store.insert_outbound_grant(expired).unwrap();
+
+        let mut revoked = test_outbound_grant("revoked", "other", 0);
+        revoked.root = "revoked-parent".to_owned();
+        revoked.revoked_at = Some(1);
+        revoked.files = vec![object("blake3", "revoked-child", 6)];
+        store.insert_outbound_grant(revoked).unwrap();
+
+        assert_eq!(
+            store.active_outbound_object_keys(19).unwrap(),
+            vec![
+                ("blake3".to_owned(), "parent".to_owned(), 3),
+                ("sha256".to_owned(), "child".to_owned(), 4),
+            ]
+        );
     }
 
     #[test]

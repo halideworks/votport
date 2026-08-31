@@ -327,7 +327,7 @@ const streamedBatch = await page.evaluate(async () => {
   const metadata = await fetch(`/api/s/${encodeURIComponent(token)}?offset=0&limit=100`, {
     credentials: "same-origin",
   }).then((response) => response.json());
-  const { saveStoredZipFiles } = await import("/assets/outbound-download.js");
+  const { saveBatchFiles } = await import("/assets/outbound-download.js");
   const files = new Map();
   const directory = {
     async getFileHandle(name) {
@@ -348,8 +348,8 @@ const streamedBatch = await page.evaluate(async () => {
       };
     },
   };
-  await saveStoredZipFiles(
-    await fetch(metadata.bundle_url, { credentials: "same-origin" }),
+  await saveBatchFiles(
+    await fetch(metadata.batch_url, { credentials: "same-origin" }),
     directory,
     metadata.files,
     ["deliver-one.txt", "deliver-two.txt"],

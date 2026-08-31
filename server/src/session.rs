@@ -1642,7 +1642,7 @@ pub fn suite_name(identifier: u16) -> String {
 
 /// Registry of live sessions reachable from async handlers.
 pub struct Sessions {
-    inner: Mutex<SessionsInner>,
+    inner: Arc<Mutex<SessionsInner>>,
 }
 
 pub struct LinkPin<'a> {
@@ -1676,6 +1676,27 @@ struct SessionsInner {
 pub struct OutboundOperation<'a> {
     sessions: &'a Sessions,
     tenant: Option<String>,
+}
+
+/// Outbound admission that can live with a streaming response body.
+pub struct OwnedOutboundOperation {
+    inner: Arc<Mutex<SessionsInner>>,
+    tenant: Option<String>,
+}
+
+impl Drop for OwnedOutboundOperation {
+    fn drop(&mut self) {
+        let Some(tenant) = self.tenant.take() else {
+            return;
+        };
+        let mut inner = self.inner.lock().expect("sessions poisoned");
+        if let Some(count) = inner.outbound.get_mut(&tenant) {
+            *count -= 1;
+            if *count == 0 {
+                inner.outbound.remove(&tenant);
+            }
+        }
+    }
 }
 
 impl Drop for OutboundOperation<'_> {
@@ -1770,7 +1791,7 @@ impl Default for Sessions {
 impl Sessions {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(SessionsInner {
+            inner: Arc::new(Mutex::new(SessionsInner {
                 map: HashMap::new(),
                 pinned: HashSet::new(),
                 outbound: HashMap::new(),
@@ -1781,7 +1802,7 @@ impl Sessions {
                 session_create_stall: None,
                 #[cfg(test)]
                 finish_stall: None,
-            }),
+            })),
         }
     }
 
@@ -1834,6 +1855,26 @@ impl Sessions {
         *inner.outbound.entry(tenant.to_owned()).or_default() += 1;
         Some(OutboundOperation {
             sessions: self,
+            tenant: Some(tenant.to_owned()),
+        })
+    }
+
+    /// Registers an outbound operation whose guard can outlive the request
+    /// handler, such as a response body stream.
+    pub fn try_begin_outbound_owned(&self, tenant: &str) -> Option<OwnedOutboundOperation> {
+        let mut inner = self.inner.lock().expect("sessions poisoned");
+        if tenant.is_empty() {
+            return Some(OwnedOutboundOperation {
+                inner: Arc::clone(&self.inner),
+                tenant: None,
+            });
+        }
+        if inner.pinned.contains(tenant) {
+            return None;
+        }
+        *inner.outbound.entry(tenant.to_owned()).or_default() += 1;
+        Some(OwnedOutboundOperation {
+            inner: Arc::clone(&self.inner),
             tenant: Some(tenant.to_owned()),
         })
     }
@@ -2271,6 +2312,18 @@ mod pin_tests {
         assert_eq!(sessions.active_outbound_for_tenant("acme"), 1);
         assert!(sessions.pin_tenant_for_delete("acme"));
         assert!(sessions.try_begin_outbound("acme").is_none());
+        drop(operation);
+        assert_eq!(sessions.active_outbound_for_tenant("acme"), 0);
+        sessions.unpin_tenant("acme");
+    }
+
+    #[test]
+    fn owned_outbound_operation_keeps_tenant_admitted_until_drop() {
+        let sessions = Sessions::new();
+        let operation = sessions.try_begin_outbound_owned("acme").unwrap();
+        assert_eq!(sessions.active_outbound_for_tenant("acme"), 1);
+        assert!(sessions.pin_tenant_for_delete("acme"));
+        assert!(sessions.try_begin_outbound_owned("acme").is_none());
         drop(operation);
         assert_eq!(sessions.active_outbound_for_tenant("acme"), 0);
         sessions.unpin_tenant("acme");
