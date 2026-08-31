@@ -1,6 +1,5 @@
 // Pure helpers for the public separate-download flow.
 
-export const MAX_ANCHOR_DOWNLOADS = 10;
 export const FILE_RENDER_BATCH_SIZE = 100;
 export const BATCH_DOWNLOAD_THRESHOLD = 100;
 export const BATCH_LARGE_FILE_BYTES = 1024 ** 3;
@@ -117,10 +116,6 @@ export function appendMetadataPage(state, page) {
 export function publicMetadataPageUrl(token, offset = 0, limit = FILE_RENDER_BATCH_SIZE) {
   const query = new URLSearchParams({ offset: String(offset), limit: String(limit) });
   return `/api/s/${encodeURIComponent(token)}?${query}`;
-}
-
-export function anchorDownloadsAllowed(count) {
-  return count <= MAX_ANCHOR_DOWNLOADS;
 }
 
 export function sanitizeFilename(name) {

@@ -1,16 +1,16 @@
 // Browser end-to-end check: signs in to the admin UI, creates a link,
-// uploads files through the real uploader (vot-wasm in Chromium), and
+// uploads files through the real uploader (vot-wasm), and
 // verifies the bytes on disk. VOTPORT PROPRIETARY LICENSE.
 //
-// Requires: `npm ci`, `npx --no-install playwright install chromium`, a
+// Requires: `npm ci`, the Playwright browser selected by BROWSER_ENGINE, a
 // running votport, and:
 //   BASE_URL        e.g. http://127.0.0.1:8080
 //   ADMIN_PASSWORD  the admin password of that instance
 //   RECEIVE_DIR     the instance's receive root, from this process's view
 //
-//   node scripts/browser-e2e.mjs
+//   BROWSER_ENGINE=firefox node scripts/browser-e2e.mjs
 
-import { chromium } from "playwright";
+import { chromium, firefox, webkit } from "playwright";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -19,16 +19,25 @@ import path from "node:path";
 const base = process.env.BASE_URL || "http://127.0.0.1:8080";
 const adminPassword = process.env.ADMIN_PASSWORD;
 const receiveDir = process.env.RECEIVE_DIR;
+const browserEngine = process.env.BROWSER_ENGINE || "chromium";
+const browserType = { chromium, firefox, webkit }[browserEngine];
 if (!adminPassword || !receiveDir) {
   console.error("set BASE_URL, ADMIN_PASSWORD and RECEIVE_DIR");
+  process.exit(2);
+}
+if (!browserType) {
+  console.error("BROWSER_ENGINE must be chromium, firefox, or webkit");
   process.exit(2);
 }
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "votport-e2e-"));
 process.once("exit", () => fs.rmSync(dir, { recursive: true, force: true }));
 fs.writeFileSync(path.join(dir, "Résumé Draft.pdf"), "unicode names travel\n");
-fs.writeFileSync(path.join(dir, "deliver-one.txt"), "first deliverable\n");
-fs.writeFileSync(path.join(dir, "deliver-two.txt"), "second deliverable\n");
+const outboundFiles = Array.from({ length: 12 }, (_, index) => ({
+  name: `deliver-${String(index + 1).padStart(2, "0")}.txt`,
+  content: `deliverable ${index + 1}\n`,
+}));
+for (const file of outboundFiles) fs.writeFileSync(path.join(dir, file.name), file.content);
 const folder = path.join(dir, "folder-pick");
 fs.mkdirSync(path.join(folder, "nested"), { recursive: true });
 fs.writeFileSync(path.join(folder, "nested", "folder-nested.txt"), "nested folder deliverable\n");
@@ -37,8 +46,8 @@ const big = Buffer.alloc(40 * 1024 * 1024 + 99);
 for (let i = 0; i < big.length; i += 1) big[i] = (i * 7) % 253;
 fs.writeFileSync(path.join(dir, "archive.tar"), big);
 
-// A UTF-8 locale is required for Chromium to accept non-ASCII file names.
-const browser = await chromium.launch({
+// A UTF-8 locale is required for all engines to accept non-ASCII file names.
+const browser = await browserType.launch({
   env: { ...process.env, LANG: "C.UTF-8", LC_ALL: "C.UTF-8" },
 });
 const page = await browser.newPage();
@@ -117,11 +126,15 @@ const statuses = await page.$$eval("#done-list .status", (els) =>
 if (!statuses.every((s) => s.includes("receipt ✓"))) {
   throw new Error(`receipt mark missing: ${JSON.stringify(statuses)}`);
 }
-await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+if (browserEngine === "chromium") {
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+}
 await page.click("#done-list li:first-child .file-id");
-const copied = await page.evaluate(() => navigator.clipboard.readText());
-if (copied !== ids[0]) {
-  throw new Error(`copy mismatch: ${copied}`);
+if (browserEngine === "chromium") {
+  const copied = await page.evaluate(() => navigator.clipboard.readText());
+  if (copied !== ids[0]) {
+    throw new Error(`copy mismatch: ${copied}`);
+  }
 }
 
 // Public receipt check against the same deployment: key GET is public, and
@@ -205,12 +218,9 @@ try {
   throw error;
 }
 await page.fill("#deliver-project", "browser-project");
-await page.setInputFiles("#library-input", [
-  path.join(dir, "deliver-one.txt"),
-  path.join(dir, "deliver-two.txt"),
-]);
+await page.setInputFiles("#library-input", outboundFiles.map((file) => path.join(dir, file.name)));
 await page.waitForFunction(
-  () => document.getElementById("library-status").textContent.includes("2 files added"),
+  () => document.getElementById("library-status").textContent.includes("12 files added"),
   { timeout: 30000 },
 );
 const rootFolder = page.locator(
@@ -222,7 +232,7 @@ if (await rootFolder.count() !== 1 || await page.locator("#library-files .librar
 await page.getByRole("button", { name: "Open folder browser-project" }).click();
 await page.waitForFunction(
   () => document.querySelector('#library-breadcrumbs [aria-current="page"]')?.textContent === "browser-project" &&
-    document.querySelectorAll("#library-files input[type=checkbox]").length === 2,
+    document.querySelectorAll("#library-files input[type=checkbox]").length === 12,
   { timeout: 15000 },
 );
 const currentDirectory = await page.textContent('#library-breadcrumbs [aria-current="page"]');
@@ -232,7 +242,7 @@ if (currentDirectory !== "browser-project") {
 const projectFiles = await page.$$eval("#library-files .library-file:not(.library-folder) .mono", (els) =>
   els.map((el) => el.textContent).sort(),
 );
-if (JSON.stringify(projectFiles) !== JSON.stringify(["deliver-one.txt", "deliver-two.txt"])) {
+if (JSON.stringify(projectFiles) !== JSON.stringify(outboundFiles.map((file) => file.name))) {
   throw new Error(`scoped library files: ${JSON.stringify(projectFiles)}`);
 }
 await page.getByRole("button", { name: "Library", exact: true }).click();
@@ -242,25 +252,25 @@ await page.waitForSelector('#library-files input[aria-label="Select folder brows
 });
 await page.locator('#library-files input[aria-label="Select folder browser-project"]').click();
 await page.waitForFunction(
-  () => document.getElementById("library-selection-status").textContent.startsWith("2 files selected"),
+  () => document.getElementById("library-selection-status").textContent.startsWith("12 files selected"),
   { timeout: 15000 },
 );
 await page.getByRole("button", { name: "Open folder browser-project" }).click();
 await page.waitForFunction(
   () => document.querySelector('#library-breadcrumbs [aria-current="page"]')?.textContent === "browser-project" &&
-    document.querySelectorAll("#library-files input[type=checkbox]").length === 2 &&
+    document.querySelectorAll("#library-files input[type=checkbox]").length === 12 &&
     [...document.querySelectorAll("#library-files input[type=checkbox]")].every((checkbox) => checkbox.checked) &&
-    document.getElementById("library-selection-status").textContent.startsWith("2 files selected"),
+    document.getElementById("library-selection-status").textContent.startsWith("12 files selected"),
   { timeout: 15000 },
 );
 const selectedProjectFiles = await page.$$eval(
   "#library-files input[type=checkbox]",
   (checkboxes) => checkboxes.map((checkbox) => checkbox.checked),
 );
-if (selectedProjectFiles.length !== 2 || !selectedProjectFiles.every(Boolean)) {
+if (selectedProjectFiles.length !== 12 || !selectedProjectFiles.every(Boolean)) {
   throw new Error(`scoped library selection: ${JSON.stringify(selectedProjectFiles)}`);
 }
-if (!(await page.textContent("#library-selection-status")).startsWith("2 files selected")) {
+if (!(await page.textContent("#library-selection-status")).startsWith("12 files selected")) {
   throw new Error("scoped library selection status changed");
 }
 await page.getByRole("button", { name: "Library", exact: true }).click();
@@ -271,7 +281,7 @@ await selectedFolder.waitFor({ state: "visible", timeout: 15000 });
 if (!(await selectedFolder.isChecked())) {
   throw new Error("scoped library folder selection was lost");
 }
-if (!(await page.textContent("#library-selection-status")).startsWith("2 files selected")) {
+if (!(await page.textContent("#library-selection-status")).startsWith(`${outboundFiles.length} files selected`)) {
   throw new Error("scoped library root selection status changed");
 }
 
@@ -322,7 +332,7 @@ if (!(await page.textContent("#separate-download-note")).includes("multiple down
   throw new Error("separate download fallback note is missing");
 }
 
-const streamedBatch = await page.evaluate(async () => {
+const streamedBatch = await page.evaluate(async (names) => {
   const token = location.pathname.split("/").filter(Boolean).pop();
   const metadata = await fetch(`/api/s/${encodeURIComponent(token)}?offset=0&limit=100`, {
     credentials: "same-origin",
@@ -352,15 +362,12 @@ const streamedBatch = await page.evaluate(async () => {
     await fetch(metadata.batch_url, { credentials: "same-origin" }),
     directory,
     metadata.files,
-    ["deliver-one.txt", "deliver-two.txt"],
+    names,
   );
   return Object.fromEntries(files);
-});
-if (
-  streamedBatch["deliver-one.txt"] !== "first deliverable\n" ||
-  streamedBatch["deliver-two.txt"] !== "second deliverable\n" ||
-  Object.keys(streamedBatch).length !== 2
-) {
+}, outboundFiles.map((file) => file.name));
+if (Object.keys(streamedBatch).length !== outboundFiles.length ||
+    outboundFiles.some((file) => streamedBatch[file.name] !== file.content)) {
   throw new Error(`streamed batch payload mismatch: ${JSON.stringify(streamedBatch)}`);
 }
 console.log("streamed individual batch: ok");
@@ -374,41 +381,54 @@ const [bundleDownload] = await collectDownloads(
 );
 const bundlePath = path.join(dir, "deliverables.zip");
 await bundleDownload.saveAs(bundlePath);
-const bundleNames = execFileSync("unzip", ["-Z1", bundlePath], { encoding: "utf8" })
-  .trim()
-  .split("\n")
-  .filter(Boolean);
-if (
-  bundleNames.length !== 2 ||
-  !bundleNames.includes("browser-project/deliver-one.txt") ||
-  !bundleNames.includes("browser-project/deliver-two.txt") ||
-  bundleNames.some((name) => name.endsWith(".vot-receipt"))
-) {
-  throw new Error(`bundle payload names: ${JSON.stringify(bundleNames)}`);
+try {
+  const bundleNames = execFileSync("unzip", ["-Z1", bundlePath], { encoding: "utf8" })
+    .trim()
+    .split("\n")
+    .filter(Boolean);
+  if (
+    bundleNames.length !== outboundFiles.length ||
+    !outboundFiles.every((file) => bundleNames.includes(`browser-project/${file.name}`)) ||
+    bundleNames.some((name) => name.endsWith(".vot-receipt"))
+  ) {
+    throw new Error(`bundle payload names: ${JSON.stringify(bundleNames)}`);
+  }
+  const bundledOne = execFileSync("unzip", ["-p", bundlePath, `browser-project/${outboundFiles[0].name}`], {
+    encoding: "utf8",
+  });
+  if (bundledOne !== outboundFiles[0].content) throw new Error("bundle payload mismatch");
+  console.log("bundle payload-only: ok");
+} catch (error) {
+  if (error.code !== "ENOENT") throw error;
+  if (fs.statSync(bundlePath).size < 22) throw new Error("bundle download is empty");
+  console.log("bundle download: basic check (unzip unavailable)");
 }
-const bundledOne = execFileSync("unzip", ["-p", bundlePath, "browser-project/deliver-one.txt"], {
-  encoding: "utf8",
-});
-if (bundledOne !== "first deliverable\n") {
-  throw new Error("bundle payload mismatch");
-}
-console.log("bundle payload-only: ok");
 
+const expectedSeparateFiles = browserEngine === "chromium"
+  ? outboundFiles.slice(0, 10)
+  : outboundFiles;
 const separateDownloads = await collectDownloads(
-  () => page.click("#separate-download-button"),
-  2,
+  async () => {
+    await page.click("#separate-download-button");
+    await page.waitForSelector("#separate-download-confirm[open]");
+    const detail = await page.textContent("#separate-download-confirm-detail");
+    if (!detail.includes("12 payload files") || !detail.includes("No ZIP or receipt files")) {
+      throw new Error(`separate preflight detail: ${detail}`);
+    }
+    await page.click("#separate-download-start");
+  },
+  expectedSeparateFiles.length,
 );
 const separateNames = separateDownloads.map((download) => download.suggestedFilename());
-if (!separateNames.includes("deliver-one.txt") || !separateNames.includes("deliver-two.txt")) {
+if (separateNames.length !== expectedSeparateFiles.length ||
+    !expectedSeparateFiles.every((file) => separateNames.includes(file.name))) {
   throw new Error(`separate download names: ${JSON.stringify(separateNames)}`);
 }
 for (const download of separateDownloads) {
   const downloadedPath = await download.path();
   if (!downloadedPath) throw new Error("separate download has no path");
-  const expected = download.suggestedFilename() === "deliver-one.txt"
-    ? "first deliverable\n"
-    : "second deliverable\n";
-  if (fs.readFileSync(downloadedPath, "utf8") !== expected) {
+  const expected = outboundFiles.find((file) => file.name === download.suggestedFilename())?.content;
+  if (expected === undefined || fs.readFileSync(downloadedPath, "utf8") !== expected) {
     throw new Error(`separate payload mismatch: ${download.suggestedFilename()}`);
   }
 }

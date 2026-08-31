@@ -16,8 +16,12 @@ test('drop zones are named and keyboard controls are not nested', () => {
   assert.doesNotMatch(deliver, /id="library-drop"[^>]+(?:tabindex|role="button")/);
   assert.match(deliver, /id="library-add-files"[^>]+>files<\/button>[\s\S]+id="library-add-folder"[^>]+>a folder<\/button>/);
   assert.doesNotMatch(deliverScript, /libraryDrop\.addEventListener\('keydown'/);
+  assert.match(deliverScript, /document\.addEventListener\('drop'/);
+  assert.match(deliverScript, /if \(!carriesFiles\(event\)\) return/);
   assert.match(verify, /id="verify-drop"[^>]+role="button"[^>]+aria-label="Choose a file or receipt"/);
   assert.doesNotMatch(uploadScript, /drop\.addEventListener\('keydown'/);
+  assert.match(uploadScript, /document\.addEventListener\('drop'/);
+  assert.match(uploadScript, /!carriesFiles\(event\)[\s\S]+return/);
   assert.match(verifyScript, /dropZone\.addEventListener\('keydown',[\s\S]+e\.preventDefault\(\);[\s\S]+\$\('payload-input'\)\.click\(\)/);
 });
 

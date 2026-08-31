@@ -50,7 +50,7 @@
     <div id="separate-download" class="card ok" hidden>
       <h2>Download all files</h2>
       <p id="separate-download-note" class="muted">
-        In Chrome or Edge, choose a folder to save every payload file individually. No ZIP or receipt files are included.
+        Download every payload file individually. Browsers with folder access let you choose where to save them; otherwise they go to your browser's configured download location. No ZIP or receipt files are included.
       </p>
       <button
         type="button"
@@ -94,6 +94,17 @@
 
   <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
 </div>
+
+<dialog id="separate-download-confirm" class="modal" aria-labelledby="separate-download-confirm-title" aria-describedby="separate-download-confirm-detail">
+  <form method="dialog">
+    <h2 id="separate-download-confirm-title">Download all files?</h2>
+    <p id="separate-download-confirm-detail"></p>
+    <div class="modal-actions">
+      <button type="submit" value="cancel" class="ghost">Cancel</button>
+      <button type="button" id="separate-download-start">Start downloads</button>
+    </div>
+  </form>
+</dialog>
 
 <script type="module" src="/assets/outbound.js"></script>
 </body>

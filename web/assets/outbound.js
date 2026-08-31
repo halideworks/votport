@@ -2,7 +2,6 @@
 
 import { appendObjectCard, formatBytes } from '/assets/object-card.js';
 import {
-  anchorDownloadsAllowed,
   appendMetadataPage,
   batchDownloadEligible,
   BatchDownloadUnsupportedError,
@@ -10,7 +9,6 @@ import {
   FILE_RENDER_BATCH_SIZE,
   metadataMoreAvailable,
   nextFileBatch,
-  MAX_ANCHOR_DOWNLOADS,
   publicMetadataPageUrl,
   runWorkerPool,
   saveBatchFiles,
@@ -25,6 +23,7 @@ let metadataTotal = 0;
 let metadataHasMore = false;
 let metadataLoading = false;
 let batchUrl = null;
+let anchorDownloadPreflight = null;
 
 function when(seconds) {
   return new Date(seconds * 1000).toLocaleString();
@@ -115,7 +114,7 @@ async function saveFile(directory, file, name) {
   }
 }
 
-function triggerSeparateDownloads(files, names) {
+async function triggerSeparateDownloads(files, names) {
   for (const [index, file] of files.entries()) {
     const link = document.createElement('a');
     link.href = file.download_url;
@@ -124,10 +123,54 @@ function triggerSeparateDownloads(files, names) {
     document.body.append(link);
     link.click();
     link.remove();
+    // WebKit drops later downloads unless each anchor yields to the event loop.
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
 }
 
 let separateDownloadBusy = false;
+
+async function prepareAnchorDownloads() {
+  if (separateDownloadBusy) return;
+  separateDownloadBusy = true;
+  const button = $('separate-download-button');
+  const status = $('separate-download-status');
+  button.disabled = true;
+  try {
+    const files = metadataHasMore ? await loadRemainingMetadata() : metadataFiles;
+    anchorDownloadPreflight = { files, names: dedupeFilenames(files.map((file) => file.name)) };
+    $('separate-download-confirm-detail').textContent =
+      `This will download ${files.length} payload files individually to your browser's configured download location. ` +
+      'No ZIP or receipt files are included. Safari may ask you to allow multiple downloads; accept that prompt to receive every file.';
+    const dialog = $('separate-download-confirm');
+    dialog.returnValue = 'cancel';
+    dialog.showModal();
+  } catch (error) {
+    status.textContent = `Could not prepare downloads: ${error.message}`;
+  } finally {
+    separateDownloadBusy = false;
+    button.disabled = false;
+  }
+}
+
+async function startAnchorDownloads() {
+  const pending = anchorDownloadPreflight;
+  if (!pending || separateDownloadBusy) return;
+  anchorDownloadPreflight = null;
+  $('separate-download-confirm').close('start');
+  const button = $('separate-download-button');
+  const status = $('separate-download-status');
+  separateDownloadBusy = true;
+  button.disabled = true;
+  try {
+    await triggerSeparateDownloads(pending.files, pending.names);
+    status.textContent =
+      `Requested ${pending.files.length} downloads. If Safari asks, allow multiple downloads to receive every file.`;
+  } finally {
+    separateDownloadBusy = false;
+    button.disabled = false;
+  }
+}
 
 async function fetchMetadataPage(offset, limit = FILE_RENDER_BATCH_SIZE) {
   let response;
@@ -215,7 +258,6 @@ async function loadRemainingMetadata() {
 }
 
 async function downloadSeparately() {
-  if (typeof window.showDirectoryPicker !== 'function' && !anchorDownloadsAllowed(metadataTotal)) return;
   if (separateDownloadBusy) return;
   separateDownloadBusy = true;
   const button = $('separate-download-button');
@@ -228,12 +270,6 @@ async function downloadSeparately() {
     }
     const files = metadataHasMore ? await loadRemainingMetadata() : metadataFiles;
     const names = dedupeFilenames(files.map((file) => file.name));
-    if (typeof window.showDirectoryPicker !== 'function') {
-      triggerSeparateDownloads(files, names);
-      status.textContent =
-        `Requested ${files.length} downloads. Your browser may ask once to allow multiple downloads.`;
-      return;
-    }
     if (batchUrl && batchDownloadEligible(files)) {
       status.textContent = `Downloading files in optimized batch mode: 0/${files.length}`;
       try {
@@ -327,16 +363,11 @@ async function loadMetadata() {
       separateButton.onclick = () => downloadSeparately();
       separateButton.disabled = false;
       $('separate-download-status').textContent = '';
-    } else if (anchorDownloadsAllowed(metadataTotal)) {
-      separateNote.textContent = 'Your browser may ask once to allow multiple downloads.';
-      separateButton.onclick = () => downloadSeparately();
+    } else {
+      separateNote.textContent = 'Download files individually to your browser\'s configured download location. If Safari asks, allow multiple downloads to receive every file.';
+      separateButton.onclick = () => prepareAnchorDownloads();
       separateButton.disabled = false;
       $('separate-download-status').textContent = '';
-    } else {
-      separateNote.textContent =
-        `This browser cannot request more than ${MAX_ANCHOR_DOWNLOADS} separate downloads. Use Download as ZIP or Chrome/Edge folder selection.`;
-      separateButton.disabled = true;
-      $('separate-download-status').textContent = 'Separate downloads are unavailable for this link in this browser.';
     }
   }
   $('title').textContent = body.label || 'Verified download';
@@ -347,6 +378,11 @@ async function loadMetadata() {
   $('receipt-key').textContent = body.receipt_key;
   $('download-content').hidden = false;
 }
+
+$('separate-download-start').addEventListener('click', startAnchorDownloads);
+$('separate-download-confirm').addEventListener('close', (event) => {
+  if (event.target.returnValue !== 'start') anchorDownloadPreflight = null;
+});
 
 $('show-more-files').addEventListener('click', async () => {
   if (metadataLoading || !metadataMoreAvailable(renderedFileCount, metadataFiles.length, metadataHasMore)) return;

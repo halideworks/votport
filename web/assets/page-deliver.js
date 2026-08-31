@@ -770,26 +770,31 @@ $('library-input').addEventListener('change', (event) => uploadLibraryFiles(libr
 $('library-folder-input').addEventListener('change', (event) => uploadLibraryFiles(libraryFilePairs(event.currentTarget.files)));
 
 const libraryDrop = $('library-drop');
+const carriesFiles = (event) => [...(event.dataTransfer?.types || [])].includes('Files');
 for (const eventName of ['dragenter', 'dragover']) {
-  libraryDrop.addEventListener(eventName, (event) => {
+  document.addEventListener(eventName, (event) => {
+    if (!carriesFiles(event)) return;
     event.preventDefault();
     libraryDrop.classList.add('hover');
   });
 }
 for (const eventName of ['dragleave', 'drop']) {
-  libraryDrop.addEventListener(eventName, (event) => {
+  document.addEventListener(eventName, (event) => {
+    if (!carriesFiles(event)) return;
+    if (eventName === 'dragleave' && event.relatedTarget) return;
     event.preventDefault();
     libraryDrop.classList.remove('hover');
   });
 }
-libraryDrop.addEventListener('drop', async (event) => {
+document.addEventListener('drop', async (event) => {
+  if (!carriesFiles(event)) return;
   if (libraryUploading) {
     $('library-status').textContent = 'An upload is already in progress.';
     return;
   }
   const items = event.dataTransfer.items;
   const entries = items
-    ? [...items].map((item) => item.webkitGetAsEntry?.()).filter(Boolean)
+    ? [...items].map((item) => item.getAsEntry?.() || item.webkitGetAsEntry?.()).filter(Boolean)
     : [];
   if (!entries.length) {
     await uploadLibraryFiles(libraryFilePairs(event.dataTransfer.files));
