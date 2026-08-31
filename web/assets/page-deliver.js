@@ -436,8 +436,8 @@ async function uploadLibraryFiles(pairs) {
           `Uploading ${file.name}: 100% (${completed} of ${total} files complete)`;
       },
     );
-    $('library-status').textContent = `${uploads.length} file${uploads.length === 1 ? '' : 's'} added.`;
     await refreshLibrary();
+    $('library-status').textContent = `${uploads.length} file${uploads.length === 1 ? '' : 's'} added.`;
   } catch (error) {
     if (completedUploads > 0) {
       await refreshLibrary();

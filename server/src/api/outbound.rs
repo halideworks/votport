@@ -2405,7 +2405,7 @@ pub async fn outbound_bundle(
         BundleReader {
             file,
             _archive: archive,
-            _stages: stages,
+            _stages: Some(stages),
             _active: active,
         },
         CHUNK,
@@ -3040,7 +3040,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for OutboundReader<R> {
 struct BundleReader {
     file: tokio::fs::File,
     _archive: StagedFile,
-    _stages: Vec<StagedFile>,
+    _stages: Option<Vec<StagedFile>>,
     _active: ActiveDownload,
 }
 
@@ -3051,6 +3051,23 @@ impl AsyncRead for BundleReader {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.file).poll_read(cx, buf)
+    }
+}
+
+fn cleanup_bundle_stages(stages: Vec<StagedFile>) -> Option<tokio::task::JoinHandle<()>> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        Some(handle.spawn_blocking(move || drop(stages)))
+    } else {
+        drop(stages);
+        None
+    }
+}
+
+impl Drop for BundleReader {
+    fn drop(&mut self) {
+        if let Some(stages) = self._stages.take() {
+            let _ = cleanup_bundle_stages(stages);
+        }
     }
 }
 
@@ -3556,6 +3573,33 @@ mod tests {
         drop((staged, active));
         assert!(!stage.exists());
         assert!(!app.outbound_active.lock().unwrap().contains("grant"));
+    }
+
+    #[test]
+    fn bundle_stage_cleanup_falls_back_without_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let stage = directory.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        let file = stage.join("file");
+        std::fs::write(&file, b"payload").unwrap();
+
+        assert!(cleanup_bundle_stages(vec![StagedFile { path: file.clone() }]).is_none());
+        assert!(!file.exists());
+        assert!(!stage.exists());
+    }
+
+    #[tokio::test]
+    async fn bundle_stage_cleanup_runs_in_blocking_task() {
+        let directory = tempfile::tempdir().unwrap();
+        let stage = directory.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        let file = stage.join("file");
+        std::fs::write(&file, b"payload").unwrap();
+
+        let cleanup = cleanup_bundle_stages(vec![StagedFile { path: file.clone() }]).unwrap();
+        cleanup.await.unwrap();
+        assert!(!file.exists());
+        assert!(!stage.exists());
     }
 
     #[test]
