@@ -258,6 +258,7 @@ pub struct ResolvedSettings {
     pub default_max_links: Option<u64>,
     pub default_max_sessions: Option<u64>,
     pub public_password_login: bool,
+    pub sso_session_secs: u64,
 }
 
 /// Assembled SMTP channel. Username and password are optional.
@@ -304,6 +305,7 @@ pub struct SettingsOverlay {
     pub default_max_links_source: &'static str,
     pub default_max_sessions_source: &'static str,
     pub public_password_login_source: &'static str,
+    pub sso_session_secs_source: &'static str,
 }
 
 /// The pre-SQLite state document, kept only to import legacy state.json files.
@@ -3322,6 +3324,18 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
         overlay_positive(rows, "default_max_sessions", config.default_max_sessions);
     let (public_password_login, public_password_login_source) =
         overlay_bool(rows, "public_password_login", config.public_password_login);
+    let (sso_session_secs, sso_session_secs_source) =
+        overlay_u64(rows, "sso_session_secs", config.sso_session_secs);
+    // The write path refuses zero; a hand-edited row falls back to env.
+    let (sso_session_secs, sso_session_secs_source) = if sso_session_secs == 0 {
+        tracing::error!(
+            key = "sso_session_secs",
+            "invalid settings value; using env default"
+        );
+        (config.sso_session_secs, "env")
+    } else {
+        (sso_session_secs, sso_session_secs_source)
+    };
     SettingsOverlay {
         resolved: ResolvedSettings {
             notify_webhook,
@@ -3335,6 +3349,7 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
             default_max_links,
             default_max_sessions,
             public_password_login,
+            sso_session_secs,
         },
         notify_webhook_source,
         notify_ntfy_source,
@@ -3363,6 +3378,7 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
         default_max_links_source,
         default_max_sessions_source,
         public_password_login_source,
+        sso_session_secs_source,
     }
 }
 
@@ -5940,7 +5956,7 @@ mod settings_tests {
             upload_retention_days: 0,
             metrics_token: None,
             max_total_sessions: 32,
-            sso_session_secs: 12 * 3600,
+            sso_session_secs: 7 * 24 * 3600,
             trusted_proxies: Vec::new(),
             oidc: None,
             default_max_total_bytes: None,

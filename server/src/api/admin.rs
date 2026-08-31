@@ -141,12 +141,17 @@ fn admin_hash(app: &App) -> ApiResult<String> {
 
 /// Builds the signed admin session cookie value for `identity`. The local
 /// break-glass subject keeps the fixed 7-day lifetime; SSO identities use
-/// the configurable (shorter) one so IdP-side offboarding is bounded.
+/// the adjustable one (VOTPORT_SSO_SESSION_SECS, overridable live from the
+/// System page) so IdP-side offboarding latency is a policy knob.
 pub(crate) fn issue_admin_cookie(app: &App, identity: &auth::AdminIdentity) -> ApiResult<String> {
     let ttl = if identity.subject == "local" {
         7 * 24 * 3600
     } else {
-        app.config.sso_session_secs
+        app.store
+            .overlay(&app.config)
+            .map_err(super::store_unavailable)?
+            .resolved
+            .sso_session_secs
     };
     let token =
         auth::issue_admin_token_with_ttl(&app.secret, identity, &admin_token_phc(app)?, ttl);
@@ -1252,6 +1257,7 @@ const SETTINGS_KEYS: &[&str] = &[
     "default_max_links",
     "default_max_sessions",
     "public_password_login",
+    "sso_session_secs",
 ];
 
 pub async fn get_settings(
@@ -1378,6 +1384,8 @@ fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
         "default_max_sessions_source": overlay.default_max_sessions_source,
         "public_password_login": resolved.public_password_login,
         "public_password_login_source": overlay.public_password_login_source,
+        "sso_session_secs": resolved.sso_session_secs,
+        "sso_session_secs_source": overlay.sso_session_secs_source,
         "sso_configured": app.sso_config.is_some(),
         "deployment": deployment,
     }))
@@ -1518,9 +1526,10 @@ pub async fn put_settings(
             | "smtp_from"
             | "smtp_to" => write_secret(key, value)?,
             "audit_retention_days" | "upload_retention_days" => write_u64(key, value, true)?,
-            "default_max_total_bytes" | "default_max_links" | "default_max_sessions" => {
-                write_u64(key, value, false)?
-            }
+            "default_max_total_bytes"
+            | "default_max_links"
+            | "default_max_sessions"
+            | "sso_session_secs" => write_u64(key, value, false)?,
             "public_password_login" | "smtp_starttls" => write_bool(key, value)?,
             "smtp_port" => write_smtp_port(key, value)?,
             _ => unreachable!(),
@@ -4196,7 +4205,7 @@ mod ops_tests {
             public_password_login: true,
             metrics_token: None,
             max_total_sessions: 32,
-            sso_session_secs: 12 * 3600,
+            sso_session_secs: 7 * 24 * 3600,
             trusted_proxies: Vec::new(),
             oidc: None,
         }
@@ -4543,6 +4552,40 @@ mod settings_api_tests {
     use crate::auth::{self, TenantGrant};
     use crate::store::SettingWrite;
 
+    #[tokio::test]
+    async fn sso_session_lifetime_follows_the_settings_overlay() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let sso = auth::AdminIdentity {
+            subject: "sso:user".to_owned(),
+            tenant: String::new(),
+            role: "admin".to_owned(),
+            grants: vec![TenantGrant {
+                tenant: String::new(),
+                role: "admin".to_owned(),
+            }],
+            credential_version: 1,
+        };
+        // Env default: 7 days for both SSO and break-glass.
+        let cookie = issue_admin_cookie(&application, &sso).unwrap();
+        assert!(cookie.contains("Max-Age=604800"), "{cookie}");
+        application
+            .store
+            .put_settings(
+                "sso:admin",
+                &[(
+                    "sso_session_secs".to_owned(),
+                    SettingWrite::Set("3600".to_owned()),
+                )],
+            )
+            .unwrap();
+        let cookie = issue_admin_cookie(&application, &sso).unwrap();
+        assert!(cookie.contains("Max-Age=3600"), "{cookie}");
+        // Break-glass keeps its fixed lifetime regardless of the setting.
+        let local = issue_admin_cookie(&application, &auth::AdminIdentity::local_admin()).unwrap();
+        assert!(local.contains("Max-Age=604800"), "{local}");
+    }
+
     fn cookie_for(app: &App, tenant: &str, role: &str) -> String {
         let identity = auth::AdminIdentity {
             subject: format!("sso:{tenant}:{role}"),
@@ -4663,6 +4706,8 @@ mod settings_api_tests {
             "default_max_sessions_source",
             "public_password_login",
             "public_password_login_source",
+            "sso_session_secs",
+            "sso_session_secs_source",
             "sso_configured",
         ] {
             assert!(json.get(field).is_some(), "missing settings field {field}");

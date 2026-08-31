@@ -79,8 +79,8 @@ pub struct Config {
     /// Worst-case queued-body memory rises linearly with it: sessions x 8
     /// in-flight chunks x ~9 MiB.
     pub max_total_sessions: usize,
-    /// Lifetime of admin sessions issued through SSO. Local break-glass
-    /// sessions keep their own longer fixed lifetime.
+    /// Lifetime of admin sessions issued through SSO; the settings overlay
+    /// can override it live. Local break-glass sessions keep a fixed 7 days.
     pub sso_session_secs: u64,
     /// Peers whose `X-Forwarded-For` is believed, as CIDR blocks. Empty means
     /// the built-in default: loopback plus the private ranges. Naming the
@@ -104,7 +104,7 @@ pub struct OidcConfig {
 
 const DEFAULT_MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024 * 1024; // 50 GiB
 const DEFAULT_MAX_TOTAL_SESSIONS: usize = 32;
-const DEFAULT_SSO_SESSION_SECS: u64 = 12 * 3600;
+const DEFAULT_SSO_SESSION_SECS: u64 = 7 * 24 * 3600;
 
 /// Shortest admin password this build accepts. Enforced on anything set
 /// through the UI and on `VOTPORT_ADMIN_PASSWORD`, which refuses to start

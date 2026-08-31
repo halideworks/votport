@@ -73,6 +73,24 @@
             Collapse the local password form when SSO is offered
             <span class="muted" id="signin-source"></span>
           </label>
+          <label>
+            SSO session lifetime (hours)
+            <span class="muted" id="sso-session-source"></span>
+            <input
+              type="number"
+              id="sso-session-hours"
+              min="1"
+              max="8760"
+              step="1"
+              disabled
+            />
+          </label>
+          <p class="muted">
+            How long an SSO sign-in stays valid before the identity provider
+            is consulted again. Group changes at the provider take effect at
+            the next sign-in, so this bounds offboarding latency. The local
+            break-glass session is fixed at 7 days.
+          </p>
           <button type="submit" id="signin-save" disabled>Save</button>
           <span id="signin-note" class="muted"></span>
           <p class="error" id="signin-error" role="alert" hidden></p>

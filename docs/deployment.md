@@ -248,12 +248,14 @@ Discovery runs on first SSO use, not at process start. Failed discovery cools
 down for 30 seconds and then retries. A successful discovery stays loaded
 until process restart, so rotating IdP metadata still needs a restart.
 
-SSO sessions last `VOTPORT_SSO_SESSION_SECS` (default 43200, 12 hours); the
-local break-glass session keeps a fixed 7 days. The session cookie freezes the
-principal's tenants and roles at login, so removing a user's IdP group takes
-effect at their next login, bounded by this lifetime. To cut access
-immediately, also revoke the principal in the Tenants page; offboarding is a
-two-step action across the IdP and votport.
+SSO sessions last `VOTPORT_SSO_SESSION_SECS` (default 604800, 7 days), and a
+platform admin can adjust the value live from System > Sign-in; the stored
+setting overrides the environment. The local break-glass session keeps a
+fixed 7 days. The session cookie freezes the principal's tenants and roles at
+login, so removing a user's IdP group takes effect at their next login,
+bounded by this lifetime; shorten it when offboarding latency matters. To cut
+access immediately, also revoke the principal in the Tenants page;
+offboarding is a two-step action across the IdP and votport.
 
 ### Authentik
 
