@@ -100,6 +100,9 @@ pub struct OidcConfig {
     /// Group whose members sign in as admins; everyone else gets read-only
     /// access. None means every authenticated principal is an admin.
     pub admin_group: Option<String>,
+    /// Members of this group get the audit-only role; admin membership
+    /// outranks it, everyone else is a viewer.
+    pub auditor_group: Option<String>,
 }
 
 const DEFAULT_MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024 * 1024; // 50 GiB
@@ -441,11 +444,15 @@ pub fn from_env() -> Result<Config, String> {
                      provider authenticates will have full admin access"
                 );
             }
+            let auditor_group = env::var("VOTPORT_OIDC_AUDITOR_GROUP")
+                .ok()
+                .filter(|group| !group.trim().is_empty());
             Some(OidcConfig {
                 issuer,
                 client_id,
                 client_secret,
                 admin_group,
+                auditor_group,
             })
         }
         (None, None, None) => None,

@@ -229,10 +229,14 @@ VOTPORT_OIDC_ISSUER: "https://idp.example.com"
 VOTPORT_OIDC_CLIENT_ID: "..."
 VOTPORT_OIDC_CLIENT_SECRET: "..."
 VOTPORT_OIDC_ADMIN_GROUP: "votport-admins"   # omit = every principal is admin
+VOTPORT_OIDC_AUDITOR_GROUP: "votport-auditors" # optional audit-only role
 ```
 
 Roles come from the provider's `groups` claim: members of the admin group are
-administrators, everyone else read-only viewers. The local password always
+administrators, members of the auditor group (when configured) get an
+audit-only session that can read and export the audit trail but sees no
+links, files, grants, or settings, and everyone else is a read-only viewer.
+Admin membership outranks auditor membership. The local password always
 remains available as break-glass access. `POST /api/admin/login` is never
 disabled. System can collapse the password form behind a "Use local password"
 disclosure when SSO is configured; the form stays in the page. Without SSO

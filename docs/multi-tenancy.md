@@ -76,7 +76,9 @@ still leave only the tracing event.
   sessions when a grant must disappear immediately.
 - Tenant mapping uses the OIDC `groups` claim against configured platform groups
   and each tenant's `admin_group`. `viewer` gets read-only admin routes (enforced
-  by `require_admin_write`); finer roles are deferred until a concrete use case.
+  by `require_admin_write`); `auditor` (VOTPORT_OIDC_AUDITOR_GROUP) sees only
+  the audit trail, enforced by `require_operator` on every other read route.
+  Finer roles stay deferred until a concrete use case.
   SAML is out of scope: OIDC covers every provider named above, and SAML-in-front
   of an OIDC bridge is the standard enterprise answer.
 - Local password auth remains the zero-config default and the break-glass path;

@@ -99,13 +99,21 @@ fn blocked_principal_error(blocked: bool) -> Option<&'static str> {
     blocked.then_some("this account is blocked")
 }
 
-/// Role from an optional required-group: no requirement means every
-/// authenticated principal is an admin; otherwise membership decides.
-fn sso_role(admin_group: Option<&str>, groups: &[String]) -> &'static str {
+/// Role from the optional required groups: no admin requirement means every
+/// authenticated principal is an admin; otherwise admin membership wins,
+/// then auditor membership, and everyone else is a read-only viewer.
+fn sso_role(
+    admin_group: Option<&str>,
+    auditor_group: Option<&str>,
+    groups: &[String],
+) -> &'static str {
     match admin_group {
         None => "admin",
         Some(required) if groups.iter().any(|group| group == required) => "admin",
-        Some(_) => "viewer",
+        Some(_) => match auditor_group {
+            Some(required) if groups.iter().any(|group| group == required) => "auditor",
+            _ => "viewer",
+        },
     }
 }
 
@@ -492,7 +500,12 @@ pub async fn sso_callback(
         }
     }
 
-    let role = sso_role(sso_config.0.admin_group.as_deref(), &groups).to_owned();
+    let role = sso_role(
+        sso_config.0.admin_group.as_deref(),
+        sso_config.0.auditor_group.as_deref(),
+        &groups,
+    )
+    .to_owned();
     let identity = match finish_sso_login(&app.store, &subject, role, &groups) {
         Ok(identity) => identity,
         Err(message) => return home(message),
@@ -580,6 +593,7 @@ mod tests {
             client_id: "votport".to_owned(),
             client_secret: "secret".to_owned(),
             admin_group: None,
+            auditor_group: None,
         });
         let application = crate::app::build(config).unwrap();
         assert!(!application.sso_client.health_peek());
@@ -672,11 +686,28 @@ mod tests {
     fn role_mapping_follows_the_group_requirement() {
         let groups = ["employees".to_owned(), "platform-admins".to_owned()];
         // No required group: every principal is an admin.
-        assert_eq!(sso_role(None, &groups), "admin");
-        assert_eq!(sso_role(None, &[]), "admin");
-        assert_eq!(sso_role(Some("platform-admins"), &groups), "admin");
-        assert_eq!(sso_role(Some("missing"), &groups), "viewer");
-        assert_eq!(sso_role(Some("platform-admins"), &[]), "viewer");
+        assert_eq!(sso_role(None, None, &groups), "admin");
+        // auditor_group alone never demotes when admin_group is unset.
+        assert_eq!(
+            sso_role(None, Some("auditors"), &["auditors".to_owned()]),
+            "admin"
+        );
+        assert_eq!(sso_role(None, None, &[]), "admin");
+        assert_eq!(sso_role(Some("platform-admins"), None, &groups), "admin");
+        assert_eq!(sso_role(Some("missing"), None, &groups), "viewer");
+        assert_eq!(
+            sso_role(Some("missing"), Some("auditors"), &["auditors".to_owned()],),
+            "auditor"
+        );
+        // Admin membership outranks auditor membership.
+        assert_eq!(
+            sso_role(Some("platform-admins"), Some("platform-admins"), &groups,),
+            "admin"
+        );
+        assert_eq!(
+            sso_role(Some("platform-admins"), Some("aud"), &[]),
+            "viewer"
+        );
     }
 
     #[test]
