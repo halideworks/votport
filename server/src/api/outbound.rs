@@ -7,30 +7,29 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine as _;
-use futures_util::StreamExt as _;
+use futures_util::{Stream, StreamExt as _};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::io::{
-    AsyncRead, AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _, ReadBuf, SeekFrom,
-};
-use tokio::sync::Semaphore;
+use tokio::io::{AsyncRead, AsyncSeekExt as _, AsyncWriteExt as _, ReadBuf, SeekFrom};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio_util::io::ReaderStream;
 use vot_receipt::SubjectKind;
 use vot_sdk::object::{InMemoryObjectBuilder, ObjectId, Suite};
+use vot_sdk::proof::{self, CatalogHeader};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 use super::{ApiError, ApiResult};
 use crate::api::admin;
 use crate::app::App;
 use crate::auth;
-use crate::session::OutboundOperation;
+use crate::session::{OutboundOperation, OwnedOutboundOperation};
 use crate::store::{
     now_unix, AutomationToken, OutboundDownloadResult, OutboundGrant, OutboundGrantFile,
     OUTBOUND_DOWNLOAD_LIMIT_REACHED,
@@ -39,6 +38,8 @@ use crate::store::{
 const MAX_ACTIVE: usize = 32;
 const MAX_ACTIVE_PER_GRANT: usize = 4;
 const CHUNK: usize = 1024 * 1024;
+const BATCH_STAGE_BYTES: u64 = 1024 * 1024 * 1024;
+const BATCH_STAGE_FILES: usize = 5_000;
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
 const MAX_PASSWORD_BYTES: usize = 256;
 const MAX_AUTOMATION_LABEL_CHARS: usize = 100;
@@ -724,6 +725,23 @@ fn begin_outbound_operation<'a>(app: &'a App, tenant: &str) -> ApiResult<Outboun
     Ok(operation)
 }
 
+fn begin_outbound_operation_owned(app: &App, tenant: &str) -> ApiResult<OwnedOutboundOperation> {
+    let operation = app
+        .sessions
+        .try_begin_outbound_owned(tenant)
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "tenant deletion in progress"))?;
+    if !tenant.is_empty()
+        && app
+            .store
+            .tenant(tenant)
+            .map_err(super::store_unavailable)?
+            .is_none()
+    {
+        return Err(ApiError::not_found());
+    }
+    Ok(operation)
+}
+
 fn list_library_dir(root: &Path, dir: &Path, files: &mut Vec<serde_json::Value>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1361,6 +1379,38 @@ pub async fn create_outbound_grant(
     if !source.is_file() || !receipt_path(&source).is_file() {
         return Err(ApiError::not_found());
     }
+    if file.bytes >= BATCH_STAGE_BYTES {
+        let root: [u8; 32] = hex::decode(&file.root)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(ApiError::not_found)?;
+        let suite = match file.suite.as_str() {
+            "blake3" => 1,
+            "sha256" => 2,
+            _ => return Err(ApiError::not_found()),
+        };
+        let expected = ObjectId {
+            suite,
+            root,
+            length: file.bytes,
+        };
+        let receipt = read_source_receipt(&Source {
+            path: source.clone(),
+            object: expected.clone(),
+            name: file.path.clone(),
+            receipt: None,
+        })
+        .map_err(|_| ApiError::not_found())?;
+        verify_receipt(&app, &receipt, &expected).map_err(|_| ApiError::not_found())?;
+        let proof_root = app.config.data_dir.join("outbound.proofs");
+        let source_for_catalog = source.clone();
+        tokio::task::spawn_blocking(move || {
+            ensure_catalog(&proof_root, &source_for_catalog, &expected)
+        })
+        .await
+        .map_err(|_| ApiError::internal("catalog generation failed"))?
+        .map_err(|_| ApiError::not_found())?;
+    }
     let label = request
         .label
         .unwrap_or_else(|| file.path.clone())
@@ -1657,17 +1707,21 @@ async fn create_library_grant(
     let max = app.config.max_upload_bytes;
     let revalidation = selections.clone();
     let hash_root = root.clone();
+    let proof_root = app.config.data_dir.join("outbound.proofs");
     let hashed = futures_util::stream::iter(selections.into_iter().map(|(name, path)| {
         let hash_root = hash_root.clone();
+        let proof_root = proof_root.clone();
         async move {
             let _permit = LIBRARY_HASH_PERMITS
                 .acquire()
                 .await
                 .map_err(|_| ApiError::internal("hash outbound files failed"))?;
-            tokio::task::spawn_blocking(move || hash_library_file(&hash_root, &name, &path, max))
-                .await
-                .map_err(|_| ApiError::internal("hash outbound files failed"))?
-                .map_err(|_| ApiError::not_found())
+            tokio::task::spawn_blocking(move || {
+                hash_library_file(&hash_root, &name, &path, &proof_root, max)
+            })
+            .await
+            .map_err(|_| ApiError::internal("hash outbound files failed"))?
+            .map_err(|_| ApiError::not_found())
         }
     }))
     .buffered(LIBRARY_HASH_CONCURRENCY)
@@ -1779,6 +1833,7 @@ fn hash_library_file(
     root: &Path,
     name: &str,
     path: &Path,
+    proof_root: &Path,
     max: u64,
 ) -> io::Result<OutboundGrantFile> {
     use std::io::Read as _;
@@ -1803,11 +1858,11 @@ fn hash_library_file(
             .update(&buf[..count])
             .map_err(|_| io::Error::other("object"))?;
     }
-    let object = builder
-        .finish()
-        .map_err(|_| io::Error::other("object"))?
-        .object_id()
-        .clone();
+    let prepared = builder.finish().map_err(|_| io::Error::other("object"))?;
+    let object = prepared.object_id().clone();
+    if bytes >= BATCH_STAGE_BYTES {
+        ensure_catalog_from_prepared(proof_root, &prepared)?;
+    }
     Ok(OutboundGrantFile {
         source: path
             .strip_prefix(root)
@@ -1823,6 +1878,120 @@ fn hash_library_file(
         first_download_at: None,
         last_download_at: None,
     })
+}
+
+fn catalog_path(root: &Path, object: &ObjectId) -> PathBuf {
+    root.join(format!(
+        "{}-{}-{}.vot-catalog",
+        object.suite,
+        hex::encode(object.root),
+        object.length
+    ))
+}
+
+fn catalog_header(file: &mut std::fs::File, expected: &ObjectId) -> io::Result<CatalogHeader> {
+    use std::io::{Read as _, Seek as _};
+    let mut bytes = [0u8; proof::HEADER_LENGTH];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut bytes)?;
+    let header = proof::decode_header(&bytes, expected)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "catalog header"))?;
+    let physical = file.metadata()?.len();
+    if physical != header.catalog_length() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "catalog length"));
+    }
+    Ok(header)
+}
+
+fn ensure_catalog_from_prepared(
+    root: &Path,
+    prepared: &vot_sdk::object::InMemoryPreparedObject,
+) -> io::Result<PathBuf> {
+    let expected = prepared.object_id();
+    std::fs::create_dir_all(root)?;
+    let path = catalog_path(root, expected);
+    if let Ok(mut file) = std::fs::File::open(&path) {
+        if catalog_header(&mut file, expected).is_ok() {
+            return Ok(path);
+        }
+    }
+    let mut stage = root.to_path_buf();
+    stage.push(format!(
+        ".{}.stage-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("catalog"),
+        auth::random_token()
+    ));
+    let result = (|| {
+        use std::io::{Seek as _, Write as _};
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).read(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&stage)?;
+        file.write_all(&[0; proof::HEADER_LENGTH])?;
+        let mut encoder = proof::CatalogEncoder::new(prepared)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "catalog encoder"))?;
+        while let Some(record) = encoder
+            .next_record()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "catalog record"))?
+        {
+            file.seek(SeekFrom::Start(record.index_offset()))?;
+            file.write_all(record.index_entry())?;
+            file.seek(SeekFrom::Start(record.proof_offset()))?;
+            file.write_all(record.proof())?;
+        }
+        let finished = encoder
+            .finish()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "catalog finish"))?;
+        file.set_len(finished.catalog_length())?;
+        file.sync_all()?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(finished.header())?;
+        file.sync_all()?;
+        std::fs::rename(&stage, &path)?;
+        Ok(path.clone())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&stage);
+    }
+    result
+}
+
+fn ensure_catalog(root: &Path, source: &Path, expected: &ObjectId) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(root)?;
+    let path = catalog_path(root, expected);
+    if let Ok(mut file) = std::fs::File::open(&path) {
+        if catalog_header(&mut file, expected).is_ok() {
+            return Ok(path);
+        }
+    }
+    use std::io::Read as _;
+    let mut input = std::fs::File::open(source)?;
+    let suite = Suite::try_from(expected.suite).map_err(|_| io::Error::other("suite"))?;
+    let mut builder = InMemoryObjectBuilder::new(suite, Some(expected.length), expected.length)
+        .map_err(|_| io::Error::other("builder"))?;
+    let mut buf = vec![0; CHUNK];
+    loop {
+        let count = input.read(&mut buf)?;
+        if count == 0 {
+            break;
+        }
+        builder
+            .update(&buf[..count])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "source"))?;
+    }
+    let prepared = builder
+        .finish()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "source"))?;
+    if prepared.object_id() != expected {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "source"));
+    }
+    ensure_catalog_from_prepared(root, &prepared)
 }
 
 pub async fn delete_outbound_grant(
@@ -2002,6 +2171,7 @@ pub async fn outbound_metadata(
                 "receipt_url": format!("/api/s/{token}/receipt"),
                 "download_url": format!("/api/s/{token}/file"),
                 "bundle_url": format!("/api/s/{token}/bundle"),
+                "batch_url": format!("/api/s/{token}/batch"),
                 "files": files,
                 "files_total": files_total,
                 "offset": offset,
@@ -2066,6 +2236,7 @@ pub async fn outbound_metadata(
             "receipt_url": format!("/api/s/{token}/receipt"),
             "download_url": format!("/api/s/{token}/file"),
             "bundle_url": format!("/api/s/{token}/bundle"),
+            "batch_url": format!("/api/s/{token}/batch"),
             "files": files,
         })),
     )
@@ -2247,6 +2418,311 @@ pub async fn outbound_file_indexed_head(
     outbound_file_head_inner(app, headers, token, index).await
 }
 
+pub async fn outbound_batch(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    AxumPath(token): AxumPath<String>,
+) -> ApiResult<Response> {
+    let grant = Arc::new(active_grant(&app, &token)?);
+    let operation = begin_outbound_operation_owned(&app, &grant.tenant)?;
+    require_grant_access(&app, &grant, &headers)?;
+    if !app.outbound_rate.allow(&grant.token_hash) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many downloads; try again later",
+        ));
+    }
+    let count = if grant.files.is_empty() {
+        1
+    } else {
+        grant.files.len()
+    };
+    let total_bytes = (0..count)
+        .map(|index| {
+            grant
+                .files
+                .get(index)
+                .map_or(grant.bytes, |file| file.bytes)
+        })
+        .try_fold(0u64, u64::checked_add)
+        .ok_or_else(|| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "batch size overflow"))?;
+    if total_bytes > app.config.max_upload_bytes {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "batch exceeds total size limit",
+        ));
+    }
+    let active = ActiveDownload::claim(Arc::clone(&app), &format!("{}:batch", grant.token_hash))?;
+    let chunks = batch_chunks(&grant, count);
+    let _pin = legacy_link_pin(&app, &grant, grant.files.is_empty())?;
+    let first_file = await_batch_chunk(start_batch_chunk(
+        Arc::clone(&app),
+        Arc::clone(&grant),
+        chunks[0].clone(),
+    )?)
+    .await?;
+    let file = first_file;
+    drop(_pin);
+    let indexes: Vec<usize> = (0..count).collect();
+    record_download(&app, &grant, &indexes)?;
+    let lookahead = start_batch_lookahead(&app, &grant, &chunks, 0);
+    let stream = futures_util::stream::try_unfold(
+        BatchStream {
+            app,
+            grant,
+            _operation: operation,
+            _active: active,
+            chunks,
+            chunk_index: 0,
+            file: Some(file),
+            lookahead,
+        },
+        |mut state| async move {
+            loop {
+                if let Some(file) = state.file.as_mut() {
+                    if let Some(item) = file.next().await {
+                        return match item {
+                            Ok(bytes) => Ok(Some((bytes, state))),
+                            Err(error) => Err(error),
+                        };
+                    }
+                }
+                state.file = None;
+                state.chunk_index += 1;
+                if state.chunk_index >= state.chunks.len() {
+                    return Ok(None);
+                }
+                let chunk = state.chunks[state.chunk_index].clone();
+                let handle = if let Some(handle) = state.lookahead.take() {
+                    handle
+                } else {
+                    match start_batch_chunk(
+                        Arc::clone(&state.app),
+                        state.grant.clone(),
+                        chunk.clone(),
+                    ) {
+                        Ok(handle) => handle,
+                        Err(error) => return Err(api_error_io(error)),
+                    }
+                };
+                let file = await_batch_chunk(handle).await.map_err(api_error_io)?;
+                state.file = Some(file);
+                state.lookahead = start_batch_lookahead(
+                    &state.app,
+                    &state.grant,
+                    &state.chunks,
+                    state.chunk_index,
+                );
+            }
+        },
+    );
+    let mut response = Body::from_stream(stream).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/vnd.votport.batch"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(total_bytes));
+    Ok(response)
+}
+
+enum BatchFile {
+    Staged(ReaderStream<StagedReader>),
+    Verified(VerifiedStream),
+}
+
+impl Stream for BatchFile {
+    type Item = Result<Bytes, io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match &mut *self {
+            Self::Staged(stream) => Pin::new(stream).poll_next(cx),
+            Self::Verified(stream) => Pin::new(stream).poll_next(cx),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BatchChunk {
+    start: usize,
+    end: usize,
+    bytes: u64,
+    oversized: bool,
+}
+
+fn batch_chunks(grant: &OutboundGrant, count: usize) -> Vec<BatchChunk> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0;
+    for index in 0..count {
+        let length = grant
+            .files
+            .get(index)
+            .map_or(grant.bytes, |file| file.bytes);
+        if length >= BATCH_STAGE_BYTES {
+            if start < index {
+                chunks.push(BatchChunk {
+                    start,
+                    end: index,
+                    bytes,
+                    oversized: false,
+                });
+            }
+            chunks.push(BatchChunk {
+                start: index,
+                end: index + 1,
+                bytes: length,
+                oversized: true,
+            });
+            start = index + 1;
+            bytes = 0;
+            continue;
+        }
+        if start < index
+            && (index - start >= BATCH_STAGE_FILES
+                || bytes.saturating_add(length) > BATCH_STAGE_BYTES)
+        {
+            chunks.push(BatchChunk {
+                start,
+                end: index,
+                bytes,
+                oversized: false,
+            });
+            start = index;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(length);
+    }
+    if start < count {
+        chunks.push(BatchChunk {
+            start,
+            end: count,
+            bytes,
+            oversized: false,
+        });
+    }
+    chunks
+}
+
+fn start_batch_chunk(
+    app: Arc<App>,
+    grant: Arc<OutboundGrant>,
+    chunk: BatchChunk,
+) -> ApiResult<tokio::task::JoinHandle<io::Result<BatchFile>>> {
+    if chunk.oversized {
+        return Ok(tokio::spawn(async move {
+            let source = source_info_indexed(&app, &grant, chunk.start).map_err(api_error_io)?;
+            let pin =
+                legacy_link_pin(&app, &grant, grant.files.is_empty()).map_err(api_error_io)?;
+            let receipt = read_source_receipt(&source).map_err(map_source_io_error)?;
+            verify_receipt(&app, &receipt, &source.object)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "receipt"))?;
+            let proof_root = app.config.data_dir.join("outbound.proofs");
+            let source_path = source.path.clone();
+            let expected = source.object.clone();
+            let catalog = tokio::task::spawn_blocking(move || {
+                ensure_catalog(&proof_root, &source_path, &expected)
+            })
+            .await
+            .map_err(|_| io::Error::other("catalog generation failed"))?
+            .map_err(map_source_io_error)?;
+            let stream =
+                start_verified_stream(source.path, source.object, catalog, None, None, None)
+                    .await?;
+            drop(pin);
+            Ok(BatchFile::Verified(stream))
+        }));
+    }
+    let stage_root = app.config.data_dir.join("outbound.stage");
+    std::fs::create_dir_all(&stage_root)
+        .map_err(|_| ApiError::internal("create outbound stage failed"))?;
+    let reservation = app
+        .outbound_stage_budget
+        .reserve(&stage_root, chunk.bytes)
+        .map_err(map_stage_reserve_error)?;
+    let stage_dir = stage_root.join(format!(".vot-outbound-{}", auth::random_token()));
+    std::fs::create_dir_all(&stage_dir)
+        .map_err(|_| ApiError::internal("create outbound stage failed"))?;
+    let stage = StagedFile {
+        path: stage_dir.join("file"),
+        reservation: Some(reservation),
+    };
+    let verifying_key = app.signer.verifying_key();
+    Ok(tokio::task::spawn_blocking(move || {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut output = options.open(&stage.path)?;
+        let mut buf = vec![0u8; CHUNK];
+        for index in chunk.start..chunk.end {
+            let source = source_info_indexed(&app, &grant, index).map_err(api_error_io)?;
+            write_verified_source(&mut output, source, &verifying_key, &mut buf)?;
+        }
+        Ok(BatchFile::Staged(open_staged_reader(stage)?))
+    }))
+}
+
+fn open_staged_reader(stage: StagedFile) -> io::Result<ReaderStream<StagedReader>> {
+    let file = std::fs::File::open(&stage.path)?;
+    let file = tokio::fs::File::from_std(file);
+    Ok(ReaderStream::with_capacity(
+        StagedReader {
+            file,
+            _stage: stage,
+        },
+        CHUNK,
+    ))
+}
+
+async fn await_batch_chunk(
+    handle: tokio::task::JoinHandle<io::Result<BatchFile>>,
+) -> ApiResult<BatchFile> {
+    handle
+        .await
+        .map_err(|_| ApiError::internal("outbound batch preparation failed"))?
+        .map_err(map_batch_error)
+}
+
+fn start_batch_lookahead(
+    app: &Arc<App>,
+    grant: &Arc<OutboundGrant>,
+    chunks: &[BatchChunk],
+    current: usize,
+) -> Option<tokio::task::JoinHandle<io::Result<BatchFile>>> {
+    let next = current + 1;
+    let next_chunk = chunks.get(next)?;
+    if chunks[current].oversized || next_chunk.oversized {
+        return None;
+    }
+    start_batch_chunk(Arc::clone(app), Arc::clone(grant), next_chunk.clone()).ok()
+}
+
+fn api_error_io(error: ApiError) -> io::Error {
+    if error.status == StatusCode::NOT_FOUND {
+        io::Error::new(io::ErrorKind::InvalidData, error.message)
+    } else {
+        io::Error::other(error.message)
+    }
+}
+
+fn map_batch_error(error: io::Error) -> ApiError {
+    if error.kind() == io::ErrorKind::InvalidData {
+        tracing::warn!("outbound batch verification failed");
+        ApiError::not_found()
+    } else {
+        tracing::error!(%error, "outbound batch build failed");
+        ApiError::internal("build outbound batch failed")
+    }
+}
+
 async fn outbound_file_inner(
     app: Arc<App>,
     headers: HeaderMap,
@@ -2254,7 +2730,7 @@ async fn outbound_file_inner(
     index: usize,
 ) -> ApiResult<Response> {
     let (grant, leased, file) = active_download_grant(&app, &token, index, &headers)?;
-    let _operation = begin_outbound_operation(&app, &grant.tenant)?;
+    let operation = begin_outbound_operation_owned(&app, &grant.tenant)?;
     require_grant_access(&app, &grant, &headers)?;
     if !app.outbound_rate.allow(&grant.token_hash) {
         return Err(ApiError::new(
@@ -2273,33 +2749,45 @@ async fn outbound_file_inner(
     } else {
         ActiveDownload::claim(Arc::clone(&app), &format!("{}:{index}", grant.token_hash))?
     };
-    let (stage, source, _receipt) = prepare(&app, &grant, index, range, file.as_ref()).await?;
-    let file = tokio::fs::File::open(&stage.path)
+    {
+        let pin = legacy_link_pin(&app, &grant, grant.files.is_empty() && file.is_none())?;
+        let receipt = read_source_receipt(&source).map_err(|_| ApiError::not_found())?;
+        verify_receipt(&app, &receipt, &source.object).map_err(|_| ApiError::not_found())?;
+        let proof_root = app.config.data_dir.join("outbound.proofs");
+        let source_path = source.path.clone();
+        let expected = source.object.clone();
+        let catalog = tokio::task::spawn_blocking(move || {
+            ensure_catalog(&proof_root, &source_path, &expected)
+        })
         .await
-        .map_err(|_| ApiError::internal("open staged file failed"))?;
-    if !leased {
-        record_download(&app, &grant, &[index])?;
+        .map_err(|_| ApiError::internal("catalog generation failed"))?
+        .map_err(|_| ApiError::not_found())?;
+        let stream = start_verified_stream(
+            source.path.clone(),
+            source.object.clone(),
+            catalog,
+            range,
+            Some(operation),
+            Some(active),
+        )
+        .await
+        .map_err(|_| ApiError::not_found())?;
+        drop(pin);
+        if !leased {
+            record_download(&app, &grant, &[index])?;
+        }
+        let length = range.map_or(source.object.length, |(start, end)| end - start + 1);
+        let filename = safe_filename(&source.name);
+        let mut response = Body::from_stream(stream).into_response();
+        add_file_headers(&mut response, &source, filename, length, range)?;
+        if range.is_some() {
+            *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+        }
+        if !leased {
+            issue_download_lease(&app, &grant, &token, index, &mut response);
+        }
+        Ok(response)
     }
-    let length = range.map_or(source.object.length, |(start, end)| end - start + 1);
-    let file = file.take(length);
-    let stream = ReaderStream::with_capacity(
-        OutboundReader {
-            file,
-            _stage: stage,
-            _active: active,
-        },
-        CHUNK,
-    );
-    let filename = safe_filename(&source.name);
-    let mut response = Body::from_stream(stream).into_response();
-    add_file_headers(&mut response, &source, filename, length, range)?;
-    if range.is_some() {
-        *response.status_mut() = StatusCode::PARTIAL_CONTENT;
-    }
-    if !leased {
-        issue_download_lease(&app, &grant, &token, index, &mut response);
-    }
-    Ok(response)
 }
 
 async fn outbound_file_head_inner(
@@ -2720,8 +3208,6 @@ async fn build_bundle(app: &App, files: Vec<(Source, String)>) -> ApiResult<Stag
     };
     let verifying_key = app.signer.verifying_key();
     tokio::task::spawn_blocking(move || {
-        use std::io::{Read, Write};
-
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -2733,53 +3219,12 @@ async fn build_bundle(app: &App, files: Vec<(Source, String)>) -> ApiResult<Stag
         let mut builder = ZipWriter::new(output);
         let mut buf = vec![0u8; CHUNK];
         for (source, name) in files {
-            let expected = source.object;
-            let suite = Suite::try_from(expected.suite)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "suite"))?;
-            let mut input = std::fs::File::open(&source.path)?;
+            let expected = source.object.clone();
             let options = SimpleFileOptions::default()
                 .compression_method(CompressionMethod::Stored)
                 .large_file(expected.length >= u32::MAX as u64);
             builder.start_file(name, options)?;
-            let mut object =
-                InMemoryObjectBuilder::new(suite, Some(expected.length), expected.length)
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "builder"))?;
-            loop {
-                let count = input.read(&mut buf)?;
-                if count == 0 {
-                    break;
-                }
-                object
-                    .update(&buf[..count])
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "object"))?;
-                builder.write_all(&buf[..count])?;
-            }
-            let actual = object
-                .finish()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "object"))?;
-            if actual.object_id() != &expected {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "source mismatch",
-                ));
-            }
-            let receipt = if let Some(receipt) = source.receipt {
-                receipt
-            } else {
-                let mut receipt = Vec::new();
-                std::fs::File::open(receipt_path(&source.path))?
-                    .take(MAX_RECEIPT_BYTES + 1)
-                    .read_to_end(&mut receipt)?;
-                receipt
-            };
-            if receipt.len() as u64 > MAX_RECEIPT_BYTES
-                || verify_receipt_with_key(&verifying_key, &receipt, &expected).is_err()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "receipt verification failed",
-                ));
-            }
+            write_verified_source(&mut builder, source, &verifying_key, &mut buf)?;
         }
         let output = builder.finish()?;
         output.sync_all()?;
@@ -2789,6 +3234,68 @@ async fn build_bundle(app: &App, files: Vec<(Source, String)>) -> ApiResult<Stag
     .map_err(|_| ApiError::internal("bundle preparation failed"))?
     .map_err(map_bundle_error)?;
     Ok(archive)
+}
+
+fn write_verified_source<W: io::Write>(
+    output: &mut W,
+    source: Source,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+    buf: &mut [u8],
+) -> io::Result<()> {
+    use std::io::Read;
+
+    let expected = source.object;
+    let suite = Suite::try_from(expected.suite)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "suite"))?;
+    let mut input = std::fs::File::open(&source.path).map_err(map_source_io_error)?;
+    let mut object = InMemoryObjectBuilder::new(suite, Some(expected.length), expected.length)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "builder"))?;
+    loop {
+        let count = input.read(buf).map_err(map_source_io_error)?;
+        if count == 0 {
+            break;
+        }
+        object
+            .update(&buf[..count])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "object"))?;
+        output.write_all(&buf[..count])?;
+    }
+    let actual = object
+        .finish()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "object"))?;
+    if actual.object_id() != &expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "source mismatch",
+        ));
+    }
+    let receipt = if let Some(receipt) = source.receipt {
+        receipt
+    } else {
+        let mut receipt = Vec::new();
+        std::fs::File::open(receipt_path(&source.path))
+            .map_err(map_source_io_error)?
+            .take(MAX_RECEIPT_BYTES + 1)
+            .read_to_end(&mut receipt)?;
+        receipt
+    };
+    if receipt.len() as u64 > MAX_RECEIPT_BYTES
+        || verify_receipt_with_key(verifying_key, &receipt, &expected).is_err()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "receipt verification failed",
+        ));
+    }
+    Ok(())
+}
+
+fn map_source_io_error(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::NotFound {
+        io::Error::new(io::ErrorKind::InvalidData, error)
+    } else {
+        error
+    }
 }
 
 fn archive_size_bound(files: &[(Source, String)]) -> Option<u64> {
@@ -2808,12 +3315,6 @@ fn archive_size_bound(files: &[(Source, String)]) -> Option<u64> {
         .checked_add(entry_overhead)?
         .checked_add(path_bytes.checked_mul(2)?)?
         .checked_add(ZIP_END_BYTES)
-}
-
-fn staged_length(source_length: u64, range: Option<(u64, u64)>) -> Option<u64> {
-    range.map_or(Some(source_length), |(start, end)| {
-        end.checked_sub(start)?.checked_add(1)
-    })
 }
 
 fn stage_capacity_error() -> ApiError {
@@ -2873,6 +3374,157 @@ struct Source {
     object: ObjectId,
     name: String,
     receipt: Option<Vec<u8>>,
+}
+
+fn read_source_receipt(source: &Source) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    if let Some(receipt) = &source.receipt {
+        if receipt.len() as u64 > MAX_RECEIPT_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "receipt"));
+        }
+        return Ok(receipt.clone());
+    }
+    let mut receipt = Vec::new();
+    std::fs::File::open(receipt_path(&source.path))?
+        .take(MAX_RECEIPT_BYTES + 1)
+        .read_to_end(&mut receipt)?;
+    if receipt.len() as u64 > MAX_RECEIPT_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "receipt"));
+    }
+    Ok(receipt)
+}
+
+struct VerifiedStream {
+    first: Option<Result<Bytes, io::Error>>,
+    receiver: mpsc::Receiver<Result<Bytes, io::Error>>,
+    _operation: Option<OwnedOutboundOperation>,
+    _active: Option<ActiveDownload>,
+}
+
+impl Stream for VerifiedStream {
+    type Item = Result<Bytes, io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(item) = self.first.take() {
+            return Poll::Ready(Some(item));
+        }
+        self.receiver.poll_recv(cx)
+    }
+}
+
+async fn start_verified_stream(
+    source: PathBuf,
+    expected: ObjectId,
+    catalog: PathBuf,
+    range: Option<(u64, u64)>,
+    operation: Option<OwnedOutboundOperation>,
+    active: Option<ActiveDownload>,
+) -> io::Result<VerifiedStream> {
+    let (first_tx, first_rx) = oneshot::channel();
+    let (sender, receiver) = mpsc::channel(1);
+    tokio::task::spawn_blocking(move || {
+        let result = produce_verified_stream(source, expected, catalog, range, first_tx, sender);
+        if let Err(error) = result {
+            tracing::debug!(%error, "verified outbound stream stopped");
+        }
+    });
+    let first = first_rx
+        .await
+        .map_err(|_| io::Error::other("verified stream stopped"))??;
+    Ok(VerifiedStream {
+        first: Some(Ok(first)),
+        receiver,
+        _operation: operation,
+        _active: active,
+    })
+}
+
+fn produce_verified_stream(
+    source: PathBuf,
+    expected: ObjectId,
+    catalog: PathBuf,
+    range: Option<(u64, u64)>,
+    first: oneshot::Sender<io::Result<Bytes>>,
+    sender: mpsc::Sender<io::Result<Bytes>>,
+) -> io::Result<()> {
+    use std::io::{Read as _, Seek as _};
+    let mut first = Some(first);
+    let mut first_sent = false;
+    let result = (|| {
+        let mut input = std::fs::File::open(&source).map_err(map_source_io_error)?;
+        let mut catalog_file = std::fs::File::open(&catalog).map_err(map_source_io_error)?;
+        let header = catalog_header(&mut catalog_file, &expected)?;
+        if header.record_count() == 0 {
+            first
+                .take()
+                .expect("first result sender")
+                .send(Ok(Bytes::new()))
+                .map_err(|_| io::Error::other("stream cancelled"))?;
+            first_sent = true;
+            return Ok(());
+        }
+        let first_ordinal = range.map_or(0, |(start, _)| start / proof::RANGE_LENGTH);
+        let last_ordinal = range.map_or(header.record_count() - 1, |(_, end)| {
+            end / proof::RANGE_LENGTH
+        });
+        for ordinal in first_ordinal..=last_ordinal {
+            let index_offset = header
+                .index_entry_offset(ordinal)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "catalog entry"))?;
+            let mut index = [0u8; proof::INDEX_ENTRY_LENGTH];
+            catalog_file.seek(SeekFrom::Start(index_offset))?;
+            catalog_file.read_exact(&mut index)?;
+            let entry = header
+                .decode_entry(ordinal, &index)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "catalog entry"))?;
+            let proof_length = usize::try_from(entry.proof_length())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "proof length"))?;
+            let mut proof_bytes = vec![0u8; proof_length];
+            catalog_file.seek(SeekFrom::Start(entry.proof_offset()))?;
+            catalog_file.read_exact(&mut proof_bytes)?;
+            let data_length = usize::try_from(entry.data_length())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "data length"))?;
+            let mut data = vec![0u8; data_length];
+            input.seek(SeekFrom::Start(entry.data_offset()))?;
+            input.read_exact(&mut data).map_err(map_source_io_error)?;
+            entry
+                .verify(&data, &proof_bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "source proof"))?;
+            let (begin, end) = if let Some((start, end)) = range {
+                let begin = usize::try_from(start.saturating_sub(entry.data_offset()))
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "range start"))?;
+                let end = usize::try_from(
+                    end.saturating_add(1)
+                        .saturating_sub(entry.data_offset())
+                        .min(entry.data_length()),
+                )
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "range end"))?;
+                (begin, end)
+            } else {
+                (0, data.len())
+            };
+            let output = Bytes::from(data).slice(begin..end);
+            if !first_sent {
+                first
+                    .take()
+                    .expect("first result sender")
+                    .send(Ok(output))
+                    .map_err(|_| io::Error::other("stream cancelled"))?;
+                first_sent = true;
+            } else if sender.blocking_send(Ok(output)).is_err() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if first_sent {
+            let _ = sender.blocking_send(Err(error));
+        } else if let Some(first) = first.take() {
+            let _ = first.send(Err(error));
+        }
+    }
+    Ok(())
 }
 
 fn source_info_indexed(app: &App, grant: &OutboundGrant, index: usize) -> ApiResult<Source> {
@@ -2970,51 +3622,6 @@ fn source_info_indexed_with_file(
     })
 }
 
-async fn prepare(
-    app: &Arc<App>,
-    grant: &OutboundGrant,
-    index: usize,
-    range: Option<(u64, u64)>,
-    indexed_file: Option<&OutboundGrantFile>,
-) -> ApiResult<(StagedFile, Source, Vec<u8>)> {
-    let _pin = legacy_link_pin(app, grant, grant.files.is_empty() && indexed_file.is_none())?;
-    let source = source_info_indexed_with_file(app, grant, index, indexed_file)?;
-    let stage_len = staged_length(source.object.length, range)
-        .ok_or_else(|| ApiError::internal("outbound range length overflow"))?;
-    let stage_root = app.config.data_dir.join("outbound.stage");
-    std::fs::create_dir_all(&stage_root)
-        .map_err(|_| ApiError::internal("create outbound stage failed"))?;
-    let reservation = app
-        .outbound_stage_budget
-        .reserve(&stage_root, stage_len)
-        .map_err(map_stage_reserve_error)?;
-    let stage_dir = stage_root.join(format!(".vot-outbound-{}", auth::random_token()));
-    std::fs::create_dir_all(&stage_dir)
-        .map_err(|_| ApiError::internal("create outbound stage failed"))?;
-    let stage = StagedFile {
-        path: stage_dir.join("file"),
-        reservation: Some(reservation),
-    };
-    let source_path = source.path.clone();
-    let expected = source.object.clone();
-    let source_receipt = source.receipt.clone();
-    let prepared = tokio::task::spawn_blocking(move || {
-        let receipt = copy_verify(&source_path, &stage.path, expected, source_receipt, range)?;
-        Ok::<_, io::Error>((stage, receipt))
-    })
-    .await
-    .map_err(|_| ApiError::internal("outbound preparation failed"))?
-    .map_err(|error| {
-        tracing::warn!(%error, "outbound source verification failed");
-        ApiError::not_found()
-    })?;
-    let (stage, receipt) = prepared;
-    if verify_receipt(app, &receipt, &source.object).is_err() {
-        return Err(ApiError::not_found());
-    }
-    Ok((stage, source, receipt))
-}
-
 fn legacy_link_pin<'a>(
     app: &'a App,
     grant: &OutboundGrant,
@@ -3031,77 +3638,6 @@ fn legacy_link_pin<'a>(
         return Err(ApiError::new(StatusCode::CONFLICT, "uploads are in flight"));
     }
     Ok(Some(pin))
-}
-
-fn copy_verify(
-    source: &Path,
-    stage: &Path,
-    expected: ObjectId,
-    receipt_bytes: Option<Vec<u8>>,
-    range: Option<(u64, u64)>,
-) -> io::Result<Vec<u8>> {
-    use std::io::{Read, Write};
-    let mut input = std::fs::File::open(source)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut output = options.open(stage)?;
-    let suite = Suite::try_from(expected.suite).map_err(|_| io::Error::other("suite"))?;
-    let mut builder = InMemoryObjectBuilder::new(suite, Some(expected.length), expected.length)
-        .map_err(|_| io::Error::other("builder"))?;
-    let mut buf = vec![0u8; CHUNK];
-    let mut receipt = Vec::new();
-    let mut offset = 0u64;
-    loop {
-        let count = input.read(&mut buf)?;
-        if count == 0 {
-            break;
-        }
-        builder
-            .update(&buf[..count])
-            .map_err(|_| io::Error::other("object"))?;
-        if let Some((start, end)) = range {
-            let chunk_end = offset
-                .checked_add(count as u64)
-                .and_then(|end| end.checked_sub(1))
-                .ok_or_else(|| io::Error::other("source too large"))?;
-            let write_start = start.max(offset);
-            let write_end = end.min(chunk_end);
-            if write_start <= write_end {
-                let begin = usize::try_from(write_start - offset)
-                    .map_err(|_| io::Error::other("range offset"))?;
-                let finish = usize::try_from(write_end - offset + 1)
-                    .map_err(|_| io::Error::other("range offset"))?;
-                output.write_all(&buf[begin..finish])?;
-            }
-        } else {
-            output.write_all(&buf[..count])?;
-        }
-        offset = offset
-            .checked_add(count as u64)
-            .ok_or_else(|| io::Error::other("source too large"))?;
-    }
-    let actual = builder.finish().map_err(|_| io::Error::other("object"))?;
-    if actual.object_id() != &expected {
-        return Err(io::Error::other("source mismatch"));
-    }
-    if let Some(bytes) = receipt_bytes {
-        receipt = bytes;
-    } else {
-        let mut sidecar = source.as_os_str().to_os_string();
-        sidecar.push(".vot-receipt");
-        std::fs::File::open(sidecar)?
-            .take(MAX_RECEIPT_BYTES + 1)
-            .read_to_end(&mut receipt)?;
-    }
-    if receipt.len() as u64 > MAX_RECEIPT_BYTES {
-        return Err(io::Error::other("receipt too large"));
-    }
-    Ok(receipt)
 }
 
 fn verify_receipt(app: &App, bytes: &[u8], object: &ObjectId) -> Result<(), ()> {
@@ -3255,12 +3791,18 @@ impl Drop for StagedFile {
     }
 }
 
-struct OutboundReader<R> {
-    file: R,
-    _stage: StagedFile,
+struct BundleReader {
+    file: tokio::fs::File,
+    _archive: StagedFile,
     _active: ActiveDownload,
 }
-impl<R: AsyncRead + Unpin> AsyncRead for OutboundReader<R> {
+
+struct StagedReader {
+    file: tokio::fs::File,
+    _stage: StagedFile,
+}
+
+impl AsyncRead for StagedReader {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -3270,10 +3812,23 @@ impl<R: AsyncRead + Unpin> AsyncRead for OutboundReader<R> {
     }
 }
 
-struct BundleReader {
-    file: tokio::fs::File,
-    _archive: StagedFile,
+struct BatchStream {
+    app: Arc<App>,
+    grant: Arc<OutboundGrant>,
+    _operation: OwnedOutboundOperation,
     _active: ActiveDownload,
+    chunks: Vec<BatchChunk>,
+    chunk_index: usize,
+    file: Option<BatchFile>,
+    lookahead: Option<tokio::task::JoinHandle<io::Result<BatchFile>>>,
+}
+
+impl Drop for BatchStream {
+    fn drop(&mut self) {
+        if let Some(handle) = self.lookahead.take() {
+            handle.abort();
+        }
+    }
 }
 
 impl AsyncRead for BundleReader {
@@ -3331,6 +3886,29 @@ mod tests {
         .unwrap();
         builder.update(bytes).unwrap();
         builder.finish().unwrap().object_id().clone()
+    }
+
+    #[test]
+    fn proof_catalog_round_trip_rejects_tampered_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = vec![7u8; 32 * 1024];
+        let mut builder = InMemoryObjectBuilder::new(
+            Suite::try_from(1).unwrap(),
+            Some(bytes.len() as u64),
+            bytes.len() as u64,
+        )
+        .unwrap();
+        builder.update(&bytes).unwrap();
+        let prepared = builder.finish().unwrap();
+        let path = ensure_catalog_from_prepared(directory.path(), &prepared).unwrap();
+        let encoded = std::fs::read(&path).unwrap();
+        assert!(proof::validate_catalog(&encoded, prepared.object_id()).is_ok());
+        let mut tampered = encoded;
+        tampered[24] ^= 1;
+        std::fs::write(&path, tampered).unwrap();
+        assert!(ensure_catalog_from_prepared(directory.path(), &prepared).is_ok());
+        let repaired = std::fs::read(path).unwrap();
+        assert!(proof::validate_catalog(&repaired, prepared.object_id()).is_ok());
     }
 
     async fn fixture() -> (tempfile::TempDir, Arc<App>, String, Vec<u8>) {
@@ -3401,6 +3979,73 @@ mod tests {
         assert!(valid_token(&"a".repeat(32)));
         assert!(!valid_token("x"));
         assert!(!valid_token(&"g".repeat(32)));
+    }
+
+    #[test]
+    fn batch_chunks_bound_file_count_bytes_and_oversized_files() {
+        let file = |bytes| OutboundGrantFile {
+            source: String::new(),
+            name: String::new(),
+            suite: "blake3".to_owned(),
+            root: String::new(),
+            bytes,
+            receipt_b64: String::new(),
+            downloads: 0,
+            first_download_at: None,
+            last_download_at: None,
+        };
+        let mut grant = OutboundGrant {
+            id: String::new(),
+            token_hash: String::new(),
+            password_hash: None,
+            tenant: String::new(),
+            link_id: String::new(),
+            upload_id: String::new(),
+            package_root: String::new(),
+            name: String::new(),
+            suite: String::new(),
+            root: String::new(),
+            file_index: 0,
+            bytes: 0,
+            label: String::new(),
+            created_at: 0,
+            expires_at: 0,
+            revoked_at: None,
+            downloads: 0,
+            max_downloads: None,
+            notify_on_download: false,
+            first_download_at: None,
+            last_download_at: None,
+            files: (0..5_001).map(|_| file(1)).collect(),
+        };
+        let chunks = batch_chunks(&grant, grant.files.len());
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(
+            (chunks[0].start, chunks[0].end, chunks[0].bytes),
+            (0, 5_000, 5_000)
+        );
+        assert!(!chunks[0].oversized);
+        assert_eq!(
+            (chunks[1].start, chunks[1].end, chunks[1].bytes),
+            (5_000, 5_001, 1)
+        );
+
+        grant.files = vec![file(BATCH_STAGE_BYTES), file(1)];
+        let chunks = batch_chunks(&grant, grant.files.len());
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].oversized);
+        assert!(!chunks[1].oversized);
+        assert_eq!((chunks[0].bytes, chunks[1].bytes), (BATCH_STAGE_BYTES, 1));
+
+        grant.files = vec![file(BATCH_STAGE_BYTES + 1), file(1)];
+        let chunks = batch_chunks(&grant, grant.files.len());
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].oversized);
+        assert_eq!(
+            (chunks[0].start, chunks[0].end, chunks[0].bytes),
+            (0, 1, BATCH_STAGE_BYTES + 1)
+        );
+        assert!(!chunks[1].oversized);
     }
 
     #[test]
@@ -3716,74 +4361,6 @@ mod tests {
             bundle_collision_key("Project/FINAL.MOV"),
             bundle_collision_key("project/final.mov")
         );
-    }
-    #[test]
-    fn source_identity_mismatch_is_rejected() {
-        let directory = tempfile::tempdir().unwrap();
-        let source = directory.path().join("source");
-        let stage = directory.path().join("stage");
-        std::fs::write(&source, b"payload").unwrap();
-        let expected = ObjectId {
-            suite: 1,
-            root: [0; 32],
-            length: 7,
-        };
-        assert!(copy_verify(&source, &stage, expected, None, Some((1, 3))).is_err());
-    }
-
-    #[test]
-    fn copy_verify_stages_exact_range_and_full_source() {
-        let directory = tempfile::tempdir().unwrap();
-        let source = directory.path().join("source");
-        let range_stage = directory.path().join("range-stage");
-        let full_stage = directory.path().join("full-stage");
-        let payload = b"0123456789";
-        std::fs::write(&source, payload).unwrap();
-
-        let mut builder = InMemoryObjectBuilder::new(
-            Suite::try_from(1).unwrap(),
-            Some(payload.len() as u64),
-            payload.len() as u64,
-        )
-        .unwrap();
-        builder.update(payload).unwrap();
-        let expected = builder.finish().unwrap().object_id().clone();
-
-        copy_verify(
-            &source,
-            &range_stage,
-            expected.clone(),
-            Some(Vec::new()),
-            Some((2, 6)),
-        )
-        .unwrap();
-        assert_eq!(std::fs::read(&range_stage).unwrap(), b"23456");
-
-        copy_verify(&source, &full_stage, expected, Some(Vec::new()), None).unwrap();
-        assert_eq!(std::fs::read(&full_stage).unwrap(), payload);
-
-        let boundary_source = directory.path().join("boundary-source");
-        let boundary_stage = directory.path().join("boundary-stage");
-        let mut boundary_payload = vec![0u8; CHUNK + 3];
-        boundary_payload[CHUNK - 2..].copy_from_slice(b"abcde");
-        std::fs::write(&boundary_source, &boundary_payload).unwrap();
-        let mut boundary_builder = InMemoryObjectBuilder::new(
-            Suite::try_from(1).unwrap(),
-            Some(boundary_payload.len() as u64),
-            boundary_payload.len() as u64,
-        )
-        .unwrap();
-        boundary_builder.update(&boundary_payload).unwrap();
-        let boundary_expected = boundary_builder.finish().unwrap().object_id().clone();
-        copy_verify(
-            &boundary_source,
-            &boundary_stage,
-            boundary_expected,
-            Some(Vec::new()),
-            Some((CHUNK as u64 - 2, CHUNK as u64 + 2)),
-        )
-        .unwrap();
-        assert_eq!(std::fs::read(&boundary_stage).unwrap(), b"abcde");
     }
     #[test]
     fn drop_guards_remove_stage_and_active_grant() {
@@ -4112,6 +4689,29 @@ mod tests {
             file.into_body().collect().await.unwrap().to_bytes(),
             expected_bytes
         );
+        let catalog = app.config.data_dir.join("outbound.proofs").join(format!(
+            "1-{}-{}.vot-catalog",
+            metadata["root"].as_str().unwrap(),
+            expected_bytes.len()
+        ));
+        assert!(catalog.is_file());
+        let catalog_bytes = std::fs::read(&catalog).unwrap();
+        assert!(!app.config.data_dir.join("outbound.stage").exists());
+        let second = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/file"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 3))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            second.into_body().collect().await.unwrap().to_bytes(),
+            expected_bytes
+        );
+        assert_eq!(std::fs::read(catalog).unwrap(), catalog_bytes);
         std::fs::write(
             app.config.receive_dir.join("received.bin"),
             b"tampered fixture",
@@ -4603,9 +5203,9 @@ mod tests {
             json!({ "has_password": true, "authorized": false })
         );
 
-        for suffix in ["/file", "/receipt", "/bundle"] {
+        for suffix in ["/file", "/receipt", "/bundle", "/batch"] {
             let mut request = Request::get(format!("/api/s/{token}{suffix}"));
-            if matches!(suffix, "/file" | "/bundle") {
+            if matches!(suffix, "/file" | "/bundle" | "/batch") {
                 request =
                     request.extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))));
             }
@@ -4902,6 +5502,31 @@ mod tests {
         assert_eq!(end["offset"], 2);
         assert_eq!(end["files"], json!([]));
         assert_eq!(end["has_more"], false);
+        assert_eq!(metadata["batch_url"], format!("/api/s/{token}/batch"));
+        let batch = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/batch"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch.status(), StatusCode::OK);
+        assert_eq!(
+            batch.headers()[header::CONTENT_TYPE],
+            "application/vnd.votport.batch"
+        );
+        assert_eq!(batch.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            batch.headers()[header::CONTENT_LENGTH],
+            (first.len() + 11).to_string()
+        );
+        assert_eq!(
+            batch.into_body().collect().await.unwrap().to_bytes(),
+            [first.clone(), b"second file".to_vec()].concat()
+        );
+        assert!(app.outbound_active.lock().unwrap().is_empty());
         let bundle = crate::app::router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/bundle"))
@@ -4955,6 +5580,22 @@ mod tests {
             assert_eq!(verified.receipt().subject_length, expected.len() as u64);
         }
         std::fs::write(app.config.outbound_dir.join("project/one.bin"), b"mutated").unwrap();
+        let batch = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/batch"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 7))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch.status(), StatusCode::NOT_FOUND);
+        assert!(
+            std::fs::read_dir(app.config.data_dir.join("outbound.stage"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
         let mutated = crate::app::router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{token}/files/0"))

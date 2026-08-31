@@ -2,6 +2,65 @@
 
 export const MAX_ANCHOR_DOWNLOADS = 10;
 export const FILE_RENDER_BATCH_SIZE = 100;
+export const BATCH_DOWNLOAD_THRESHOLD = 100;
+export const BATCH_LARGE_FILE_BYTES = 1024 ** 3;
+export class BatchDownloadUnsupportedError extends Error {}
+
+export function batchDownloadEligible(files) {
+  return files.length >= BATCH_DOWNLOAD_THRESHOLD ||
+    (files.length > 1 && files.some((file) => file.bytes >= BATCH_LARGE_FILE_BYTES));
+}
+
+export async function saveBatchFiles(response, directory, files, names, onComplete) {
+  if (!response?.body) throw new BatchDownloadUnsupportedError('batch streaming unavailable');
+  const contentType = response.headers?.get?.('content-type')?.split(';', 1)[0].trim().toLowerCase();
+  if (contentType !== 'application/vnd.votport.batch') {
+    throw new BatchDownloadUnsupportedError('unexpected batch content type');
+  }
+  if (!Array.isArray(files) || files.length !== names.length) throw new Error('batch metadata mismatch');
+  const sizes = files.map((file) => file.bytes);
+  if (sizes.some((bytes) => !Number.isSafeInteger(bytes) || bytes < 0)) {
+    throw new Error('batch metadata has invalid file size');
+  }
+  const reader = response.body.getReader();
+  let pending = new Uint8Array(); let pendingOffset = 0; let done = false;
+  const nextBytes = async () => {
+    while (pendingOffset >= pending.length && !done) {
+      const result = await reader.read(); pending = result.value || new Uint8Array();
+      pendingOffset = 0; done = Boolean(result.done);
+    }
+    return pendingOffset < pending.length ? pending.subarray(pendingOffset) : null;
+  };
+  try {
+    for (let index = 0; index < files.length; index += 1) {
+      const expected = sizes[index];
+      const handle = await directory.getFileHandle(names[index], { create: true });
+      const writable = await handle.createWritable();
+      let remaining = expected;
+      try {
+        while (remaining) {
+          const chunk = await nextBytes();
+          if (!chunk) throw new Error('batch response truncated');
+          const length = Math.min(chunk.length, remaining);
+          await writable.write(chunk.subarray(0, length));
+          pendingOffset += length;
+          remaining -= length;
+        }
+        await writable.close();
+      } catch (error) {
+        await writable.abort().catch(() => {});
+        throw error;
+      }
+      onComplete?.(index + 1, files.length);
+    }
+    if (await nextBytes()) throw new Error('batch response has trailing bytes');
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+}
 
 export function nextFileBatch(files, offset = 0) {
   const start = Math.max(0, Math.min(offset, files.length));

@@ -4,12 +4,16 @@ import { test } from 'node:test';
 import {
   anchorDownloadsAllowed,
   appendMetadataPage,
+  batchDownloadEligible,
+  BATCH_LARGE_FILE_BYTES,
   dedupeFilenames,
   FILE_RENDER_BATCH_SIZE,
   metadataMoreAvailable,
   MAX_ANCHOR_DOWNLOADS,
   publicMetadataPageUrl,
   runWorkerPool,
+  saveBatchFiles,
+  BatchDownloadUnsupportedError,
   sanitizeFilename,
   summarizeFailures,
   nextFileBatch,
@@ -46,6 +50,12 @@ test('file batches are fixed and bounded at both ends', () => {
   assert.deepEqual(nextFileBatch(files, 100), files.slice(100, 200));
   assert.deepEqual(nextFileBatch(files, 200), files.slice(200));
   assert.deepEqual(nextFileBatch(files, 300), []);
+});
+
+test('uses batch transport for multi-file selections with a large file', () => {
+  assert.equal(batchDownloadEligible(Array.from({ length: 99 }, () => ({ bytes: 1 }))), false);
+  assert.equal(batchDownloadEligible([{ bytes: BATCH_LARGE_FILE_BYTES }, { bytes: 1 }]), true);
+  assert.equal(batchDownloadEligible([{ bytes: BATCH_LARGE_FILE_BYTES }]), false);
 });
 
 test('show more remains available for loaded or pending metadata', () => {
@@ -118,6 +128,7 @@ test('public metadata starts with the bounded page and picker precedes fetch', (
   assert.match(outboundScript, /metadataMoreAvailable\(renderedFileCount, metadataFiles\.length, metadataHasMore\)/);
   assert.match(outboundScript, /renderedFileCount >= metadataFiles\.length && metadataHasMore/);
   assert.match(outboundScript, /appendMetadataPageAt\(metadataFiles\.length, 500\)/);
+  assert.match(outboundScript, /batchUrl = body\.batch_url/);
   assert.match(
     outboundScript,
     /showDirectoryPicker\(\{ mode: 'readwrite' \}\)[\s\S]+loadRemainingMetadata\(\)/,
@@ -163,4 +174,92 @@ test('runs at most four workers and keeps result order', async () => {
   });
   assert.equal(peak, 4);
   assert.deepEqual(result, [2, 4, 6, 8, 10, 12]);
+});
+
+function responseInChunks(chunks, status = 200, contentType = 'application/vnd.votport.batch; charset=binary') {
+  return {
+    status,
+    headers: new Headers({ 'content-type': contentType }),
+    body: new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        controller.close();
+      },
+    }),
+  };
+}
+
+function fakeDirectory({ failWrite = false } = {}) {
+  const files = new Map();
+  const aborted = [];
+  return {
+    files,
+    aborted,
+    async getFileHandle(name) {
+      return {
+        async createWritable() {
+          const chunks = [];
+          return {
+            async write(chunk) {
+              if (failWrite) throw new Error('write failed');
+              chunks.push(new Uint8Array(chunk));
+            },
+            async close() { files.set(name, new TextDecoder().decode(join(...chunks))); },
+            async abort() { aborted.push(name); },
+          };
+        },
+      };
+    },
+  };
+}
+
+function join(...parts) {
+  const output = new Uint8Array(parts.reduce((size, part) => size + part.length, 0));
+  let offset = 0;
+  for (const part of parts) { output.set(part, offset); offset += part.length; }
+  return output;
+}
+
+test('streams concatenated batch payloads by trusted metadata lengths', async () => {
+  const directory = fakeDirectory();
+  const response = responseInChunks([
+    new TextEncoder().encode('fi'), new TextEncoder().encode('rstse'),
+    new TextEncoder().encode('cond'),
+  ]);
+  const progress = [];
+  await saveBatchFiles(response, directory, [{ bytes: 5 }, { bytes: 6 }], ['first.bin', 'second.bin'],
+    (completed, total) => progress.push([completed, total]));
+  assert.deepEqual([...directory.files], [['first.bin', 'first'], ['second.bin', 'second']]);
+  assert.deepEqual(progress, [[1, 2], [2, 2]]);
+});
+
+test('rejects truncation and trailing bytes without direct fallback', async () => {
+  const truncated = fakeDirectory();
+  await assert.rejects(
+    saveBatchFiles(responseInChunks([new TextEncoder().encode('first')]), truncated, [{ bytes: 5 }, { bytes: 6 }], ['one', 'two']),
+    /truncated/,
+  );
+  assert.deepEqual(truncated.aborted, ['two']);
+  await assert.rejects(
+    saveBatchFiles(responseInChunks([new TextEncoder().encode('first!')]), fakeDirectory(), [{ bytes: 5 }], ['one']),
+    /trailing bytes/,
+  );
+});
+
+test('aborts a failed writer and validates all metadata before writing', async () => {
+  const failed = fakeDirectory({ failWrite: true });
+  await assert.rejects(saveBatchFiles(responseInChunks([new TextEncoder().encode('first')]), failed, [{ bytes: 5 }], ['one']), /write failed/);
+  assert.deepEqual(failed.aborted, ['one']);
+  await assert.rejects(
+    saveBatchFiles(responseInChunks([]), fakeDirectory(), [{ bytes: 1 }, { bytes: Number.MAX_SAFE_INTEGER + 1 }], ['one', 'two']),
+    /invalid file size/,
+  );
+});
+
+test('only an empty batch response raises the fallback classification', async () => {
+  await assert.rejects(saveBatchFiles({ status: 413 }, fakeDirectory(), [{ bytes: 1 }], ['one']), BatchDownloadUnsupportedError);
+  await assert.rejects(
+    saveBatchFiles(responseInChunks([new TextEncoder().encode('first')], 200, 'application/octet-stream'), fakeDirectory(), [{ bytes: 5 }], ['one']),
+    BatchDownloadUnsupportedError,
+  );
 });
