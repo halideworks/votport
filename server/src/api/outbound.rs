@@ -2377,21 +2377,18 @@ pub async fn outbound_bundle(
         ));
     }
     let active = ActiveDownload::claim(Arc::clone(&app), &format!("{}:bundle", grant.token_hash))?;
+    let _pin = legacy_link_pin(&app, &grant, grant.files.is_empty())?;
     let mut files = Vec::with_capacity(count);
     let mut names = std::collections::HashSet::with_capacity(count);
     for index in 0..count {
-        let (stage, source, _receipt) = prepare(&app, &grant, index, None, None).await?;
+        let source = source_info_indexed(&app, &grant, index)?;
         let relative = bundle_path(&source.name).ok_or_else(ApiError::not_found)?;
         if !names.insert(bundle_collision_key(&relative)) {
             return Err(ApiError::not_found());
         }
-        files.push(PreparedBundleFile {
-            stage,
-            name: relative,
-            bytes: source.object.length,
-        });
+        files.push((source, relative));
     }
-    let (archive, stages) = build_bundle(&app, files).await?;
+    let archive = build_bundle(&app, files).await?;
     let length = tokio::fs::metadata(&archive.path)
         .await
         .map_err(|_| ApiError::internal("inspect bundle failed"))?
@@ -2405,7 +2402,6 @@ pub async fn outbound_bundle(
         BundleReader {
             file,
             _archive: archive,
-            _stages: Some(stages),
             _active: active,
         },
         CHUNK,
@@ -2568,12 +2564,6 @@ fn require_grant_access(app: &App, grant: &OutboundGrant, headers: &HeaderMap) -
     }
 }
 
-struct PreparedBundleFile {
-    stage: StagedFile,
-    name: String,
-    bytes: u64,
-}
-
 fn bundle_path(name: &str) -> Option<String> {
     let normalized = name.replace('\\', "/");
     let mut components = Vec::new();
@@ -2590,10 +2580,7 @@ fn bundle_collision_key(name: &str) -> String {
     name.to_lowercase()
 }
 
-async fn build_bundle(
-    app: &App,
-    files: Vec<PreparedBundleFile>,
-) -> ApiResult<(StagedFile, Vec<StagedFile>)> {
+async fn build_bundle(app: &App, files: Vec<(Source, String)>) -> ApiResult<StagedFile> {
     let stage_dir = app
         .config
         .data_dir
@@ -2605,7 +2592,10 @@ async fn build_bundle(
     let archive = StagedFile {
         path: archive_path.clone(),
     };
-    let prepared = tokio::task::spawn_blocking(move || {
+    let verifying_key = app.signer.verifying_key();
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -2615,22 +2605,74 @@ async fn build_bundle(
         }
         let output = options.open(&archive_path)?;
         let mut builder = ZipWriter::new(output);
-        for file in &files {
-            let mut input = std::fs::File::open(&file.stage.path)?;
+        let mut buf = vec![0u8; CHUNK];
+        for (source, name) in files {
+            let expected = source.object;
+            let suite = Suite::try_from(expected.suite)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "suite"))?;
+            let mut input = std::fs::File::open(&source.path)?;
             let options = SimpleFileOptions::default()
                 .compression_method(CompressionMethod::Stored)
-                .large_file(file.bytes >= u32::MAX as u64);
-            builder.start_file(&file.name, options)?;
-            io::copy(&mut input, &mut builder)?;
+                .large_file(expected.length >= u32::MAX as u64);
+            builder.start_file(name, options)?;
+            let mut object =
+                InMemoryObjectBuilder::new(suite, Some(expected.length), expected.length)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "builder"))?;
+            loop {
+                let count = input.read(&mut buf)?;
+                if count == 0 {
+                    break;
+                }
+                object
+                    .update(&buf[..count])
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "object"))?;
+                builder.write_all(&buf[..count])?;
+            }
+            let actual = object
+                .finish()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "object"))?;
+            if actual.object_id() != &expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "source mismatch",
+                ));
+            }
+            let receipt = if let Some(receipt) = source.receipt {
+                receipt
+            } else {
+                let mut receipt = Vec::new();
+                std::fs::File::open(receipt_path(&source.path))?
+                    .take(MAX_RECEIPT_BYTES + 1)
+                    .read_to_end(&mut receipt)?;
+                receipt
+            };
+            if receipt.len() as u64 > MAX_RECEIPT_BYTES
+                || verify_receipt_with_key(&verifying_key, &receipt, &expected).is_err()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "receipt verification failed",
+                ));
+            }
         }
         let output = builder.finish()?;
         output.sync_all()?;
-        Ok::<_, io::Error>(files.into_iter().map(|file| file.stage).collect())
+        Ok::<_, io::Error>(())
     })
     .await
     .map_err(|_| ApiError::internal("bundle preparation failed"))?
-    .map_err(|_| ApiError::internal("build bundle failed"))?;
-    Ok((archive, prepared))
+    .map_err(map_bundle_error)?;
+    Ok(archive)
+}
+
+fn map_bundle_error(error: io::Error) -> ApiError {
+    if error.kind() == io::ErrorKind::InvalidData {
+        tracing::warn!("outbound bundle verification failed");
+        ApiError::not_found()
+    } else {
+        tracing::error!(%error, "outbound bundle build failed");
+        ApiError::internal("build bundle failed")
+    }
 }
 
 fn hash_optional_password(password: Option<&str>) -> ApiResult<Option<String>> {
@@ -2767,17 +2809,7 @@ async fn prepare(
     range: Option<(u64, u64)>,
     indexed_file: Option<&OutboundGrantFile>,
 ) -> ApiResult<(StagedFile, Source, Vec<u8>)> {
-    let _pin = if grant.files.is_empty() && indexed_file.is_none() {
-        let pin = app.sessions.try_pin_link(&grant.link_id).ok_or_else(|| {
-            ApiError::new(StatusCode::CONFLICT, "link lifecycle update in progress")
-        })?;
-        if app.sessions.active_for_link(&grant.link_id) > 0 {
-            return Err(ApiError::new(StatusCode::CONFLICT, "uploads are in flight"));
-        }
-        Some(pin)
-    } else {
-        None
-    };
+    let _pin = legacy_link_pin(app, grant, grant.files.is_empty() && indexed_file.is_none())?;
     let source = source_info_indexed_with_file(app, grant, index, indexed_file)?;
     let stage_dir = app
         .config
@@ -2807,6 +2839,24 @@ async fn prepare(
         return Err(ApiError::not_found());
     }
     Ok((stage, source, receipt))
+}
+
+fn legacy_link_pin<'a>(
+    app: &'a App,
+    grant: &OutboundGrant,
+    should_pin: bool,
+) -> ApiResult<Option<crate::session::LinkPin<'a>>> {
+    if !should_pin {
+        return Ok(None);
+    }
+    let pin = app
+        .sessions
+        .try_pin_link(&grant.link_id)
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "link lifecycle update in progress"))?;
+    if app.sessions.active_for_link(&grant.link_id) > 0 {
+        return Err(ApiError::new(StatusCode::CONFLICT, "uploads are in flight"));
+    }
+    Ok(Some(pin))
 }
 
 fn copy_verify(
@@ -2881,9 +2931,16 @@ fn copy_verify(
 }
 
 fn verify_receipt(app: &App, bytes: &[u8], object: &ObjectId) -> Result<(), ()> {
+    verify_receipt_with_key(&app.signer.verifying_key(), bytes, object)
+}
+
+fn verify_receipt_with_key(
+    verifying_key: &ed25519_dalek::VerifyingKey,
+    bytes: &[u8],
+    object: &ObjectId,
+) -> Result<(), ()> {
     let decoded = vot_receipt::decode_authenticated(bytes).map_err(|_| ())?;
-    let verified =
-        vot_receipt::verify_ed25519(&decoded, &app.signer.verifying_key()).map_err(|_| ())?;
+    let verified = vot_receipt::verify_ed25519(&decoded, verifying_key).map_err(|_| ())?;
     let receipt = verified.receipt();
     if receipt.subject_kind != SubjectKind::Object
         || receipt.suite_id != object.suite
@@ -3040,7 +3097,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for OutboundReader<R> {
 struct BundleReader {
     file: tokio::fs::File,
     _archive: StagedFile,
-    _stages: Option<Vec<StagedFile>>,
     _active: ActiveDownload,
 }
 
@@ -3051,23 +3107,6 @@ impl AsyncRead for BundleReader {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.file).poll_read(cx, buf)
-    }
-}
-
-fn cleanup_bundle_stages(stages: Vec<StagedFile>) -> Option<tokio::task::JoinHandle<()>> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        Some(handle.spawn_blocking(move || drop(stages)))
-    } else {
-        drop(stages);
-        None
-    }
-}
-
-impl Drop for BundleReader {
-    fn drop(&mut self) {
-        if let Some(stages) = self._stages.take() {
-            let _ = cleanup_bundle_stages(stages);
-        }
     }
 }
 
@@ -3105,6 +3144,17 @@ mod tests {
             entries.insert(name, contents);
         }
         entries
+    }
+
+    fn object_id(bytes: &[u8]) -> ObjectId {
+        let mut builder = InMemoryObjectBuilder::new(
+            Suite::try_from(1).unwrap(),
+            Some(bytes.len() as u64),
+            bytes.len() as u64,
+        )
+        .unwrap();
+        builder.update(bytes).unwrap();
+        builder.finish().unwrap().object_id().clone()
     }
 
     async fn fixture() -> (tempfile::TempDir, Arc<App>, String, Vec<u8>) {
@@ -3575,31 +3625,115 @@ mod tests {
         assert!(!app.outbound_active.lock().unwrap().contains("grant"));
     }
 
-    #[test]
-    fn bundle_stage_cleanup_falls_back_without_runtime() {
+    #[tokio::test]
+    async fn build_bundle_verifies_sources_and_keeps_archive_readable() {
         let directory = tempfile::tempdir().unwrap();
-        let stage = directory.path().join("stage");
-        std::fs::create_dir_all(&stage).unwrap();
-        let file = stage.join("file");
-        std::fs::write(&file, b"payload").unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let first_path = directory.path().join("first");
+        let second_path = directory.path().join("second");
+        let first_bytes = b"first payload";
+        let second_bytes = b"second payload";
+        std::fs::write(&first_path, first_bytes).unwrap();
+        std::fs::write(&second_path, second_bytes).unwrap();
+        let first_object = object_id(first_bytes);
+        let second_object = object_id(second_bytes);
+        let first_receipt = app
+            .signer
+            .encode(
+                &first_object,
+                [1; 16],
+                PublishObservation {
+                    incarnation: [2; 16],
+                    sequence: 1,
+                },
+            )
+            .unwrap();
+        let second_receipt = app
+            .signer
+            .encode(
+                &second_object,
+                [3; 16],
+                PublishObservation {
+                    incarnation: [4; 16],
+                    sequence: 2,
+                },
+            )
+            .unwrap();
 
-        assert!(cleanup_bundle_stages(vec![StagedFile { path: file.clone() }]).is_none());
-        assert!(!file.exists());
-        assert!(!stage.exists());
+        let archive = build_bundle(
+            &app,
+            vec![
+                (
+                    Source {
+                        path: first_path,
+                        object: first_object,
+                        name: "first.txt".to_owned(),
+                        receipt: Some(first_receipt),
+                    },
+                    "first.txt".to_owned(),
+                ),
+                (
+                    Source {
+                        path: second_path,
+                        object: second_object,
+                        name: "second.txt".to_owned(),
+                        receipt: Some(second_receipt),
+                    },
+                    "second.txt".to_owned(),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let entries = zip_entries(&std::fs::read(&archive.path).unwrap());
+        assert_eq!(entries["first.txt"], b"first payload");
+        assert_eq!(entries["second.txt"], b"second payload");
+        drop(archive);
     }
 
     #[tokio::test]
-    async fn bundle_stage_cleanup_runs_in_blocking_task() {
+    async fn build_bundle_rejects_source_mismatch_without_archive() {
         let directory = tempfile::tempdir().unwrap();
-        let stage = directory.path().join("stage");
-        std::fs::create_dir_all(&stage).unwrap();
-        let file = stage.join("file");
-        std::fs::write(&file, b"payload").unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let source_path = directory.path().join("source");
+        std::fs::write(&source_path, b"actual payload").unwrap();
+        let expected = object_id(b"expected payload");
 
-        let cleanup = cleanup_bundle_stages(vec![StagedFile { path: file.clone() }]).unwrap();
-        cleanup.await.unwrap();
-        assert!(!file.exists());
-        assert!(!stage.exists());
+        assert!(build_bundle(
+            &app,
+            vec![(
+                Source {
+                    path: source_path,
+                    object: expected,
+                    name: "source.txt".to_owned(),
+                    receipt: Some(Vec::new()),
+                },
+                "source.txt".to_owned(),
+            )],
+        )
+        .await
+        .is_err());
+        assert!(app
+            .config
+            .data_dir
+            .join("outbound.stage")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn bundle_error_mapping_keeps_io_failures_internal() {
+        assert_eq!(
+            map_bundle_error(io::Error::new(io::ErrorKind::InvalidData, "mismatch")).status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            map_bundle_error(io::Error::other("disk full")).status,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]

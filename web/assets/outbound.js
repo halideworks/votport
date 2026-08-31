@@ -299,7 +299,7 @@ async function loadMetadata() {
     const separateButton = $('separate-download-button');
     const pickerAvailable = typeof window.showDirectoryPicker === 'function';
     if (pickerAvailable) {
-      separateNote.textContent = 'Choose a folder and save each payload file separately.';
+      separateNote.textContent = 'Choose a folder to save every payload file individually. No ZIP or receipt files are included.';
       separateButton.onclick = () => downloadSeparately();
       separateButton.disabled = false;
       $('separate-download-status').textContent = '';
@@ -310,7 +310,7 @@ async function loadMetadata() {
       $('separate-download-status').textContent = '';
     } else {
       separateNote.textContent =
-        `This browser cannot request more than ${MAX_ANCHOR_DOWNLOADS} separate downloads. Use Download everything or Chrome/Edge folder selection.`;
+        `This browser cannot request more than ${MAX_ANCHOR_DOWNLOADS} separate downloads. Use Download as ZIP or Chrome/Edge folder selection.`;
       separateButton.disabled = true;
       $('separate-download-status').textContent = 'Separate downloads are unavailable for this link in this browser.';
     }

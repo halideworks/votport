@@ -47,29 +47,30 @@
   </section>
 
   <section id="download-content" hidden aria-live="polite">
-    <div id="bundle-download" class="card ok" hidden>
-      <h2>Download everything</h2>
-      <p id="bundle-download-note" class="muted">
-        This ZIP contains the payload files only. Download receipts individually when needed.
-      </p>
-      <button
-        type="button"
-        id="bundle-download-button"
-        aria-describedby="bundle-download-note"
-      >Download everything</button>
-    </div>
-
     <div id="separate-download" class="card ok" hidden>
-      <h2>Download files separately</h2>
+      <h2>Download all files</h2>
       <p id="separate-download-note" class="muted">
-        Choose a folder and save each payload file separately.
+        In Chrome or Edge, choose a folder to save every payload file individually. No ZIP or receipt files are included.
       </p>
       <button
         type="button"
         id="separate-download-button"
         aria-describedby="separate-download-note separate-download-status"
-      >Download files separately</button>
+      >Download all files</button>
       <p id="separate-download-status" class="muted" aria-live="polite"></p>
+    </div>
+
+    <div id="bundle-download" class="card ok" hidden>
+      <h2>Download as ZIP</h2>
+      <p id="bundle-download-note" class="muted">
+        Fallback: download all payload files in one ZIP. Receipt files are not included.
+      </p>
+      <button
+        type="button"
+        id="bundle-download-button"
+        class="ghost"
+        aria-describedby="bundle-download-note"
+      >Download as ZIP</button>
     </div>
 
     <div class="card ok">

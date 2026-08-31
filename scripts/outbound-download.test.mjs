@@ -26,7 +26,17 @@ test('anchor download fallback is capped at the supported browser threshold', ()
 
 test('anchor fallback copy explains the large-link limit', () => {
   assert.match(outboundScript, /Requested \$\{files\.length\} downloads/);
-  assert.match(outboundScript, /Use Download everything or Chrome\/Edge folder selection/);
+  assert.match(outboundScript, /Use Download as ZIP or Chrome\/Edge folder selection/);
+});
+
+test('recipient page makes individual files primary and ZIP secondary', () => {
+  assert.ok(sendPage.indexOf('id="separate-download"') < sendPage.indexOf('id="bundle-download"'));
+  assert.match(sendPage, /<h2>Download all files<\/h2>/);
+  assert.match(sendPage, />Download all files<\/button>/);
+  assert.match(sendPage, /Chrome or Edge.*individually.*No ZIP or receipt files/s);
+  assert.match(sendPage, /<h2>Download as ZIP<\/h2>/);
+  assert.match(sendPage, /id="bundle-download-button"[\s\S]*class="ghost"[\s\S]*>Download as ZIP<\/button>/);
+  assert.doesNotMatch(sendPage, /Download everything/);
 });
 
 test('file batches are fixed and bounded at both ends', () => {
