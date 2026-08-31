@@ -1,5 +1,5 @@
 # Workspace instructions
 
-- Never use `/tmp` for temporary files, caches, worktrees, test data, downloads, or build artifacts.
-- Use `/nvme-mirror/temp/claude/tmp` for all temporary storage and set `TMPDIR` to that path for tools that create temporary files implicitly.
-- Preserve recoverable work when cleaning temporary storage. Delete only verified generated artifacts.
+- Use `/nvme-mirror/temp/claude/tmp` for temporary files, caches, worktrees, test data, and build artifacts; export `TMPDIR`, `TMP`, and `TEMP` to it for tools and child processes.
+- On remote hosts without that path, create an explicit scratch directory under the remote workspace or home (never `/tmp`) and export all three variables to it.
+- Do not create `/tmp` artifacts. After work, inspect and remove only exact task-specific `/tmp` artifacts left by tools; preserve recoverable work and never delete platform/runtime files.
