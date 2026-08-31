@@ -166,6 +166,12 @@ function fillSettings(data) {
   collapse.checked = data.public_password_login === false;
   collapse.disabled = !data.sso_configured;
   setSource('signin-source', data.public_password_login_source);
+  // Lossy round-trip: the UI works in whole hours; an API-written value
+  // under an hour must not display as 0, which would fail the min="1"
+  // constraint and block saving the unrelated collapse toggle too.
+  $('sso-session-hours').value = Math.max(1, Math.round(data.sso_session_secs / 3600));
+  $('sso-session-hours').disabled = !data.sso_configured;
+  setSource('sso-session-source', data.sso_session_secs_source);
   $('signin-save').disabled = !data.sso_configured;
 }
 
@@ -375,8 +381,14 @@ $('signin-form').addEventListener('submit', async (event) => {
     }
     return;
   }
+  const hours = parseInt($('sso-session-hours').value, 10);
+  if (!Number.isInteger(hours) || hours < 1) {
+    formError(event.currentTarget, new Error('SSO session lifetime must be at least 1 hour.'));
+    return;
+  }
   await saveSettings(event.currentTarget, {
     public_password_login: !$('signin-collapse').checked,
+    sso_session_secs: hours * 3600,
   });
 });
 
