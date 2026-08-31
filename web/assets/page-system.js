@@ -1,7 +1,7 @@
 // votport system page: credentials, backups, verification key, overlay settings.
 // VOTPORT PROPRIETARY LICENSE.
 
-import { api, formatBytes, requireSession } from '/assets/admin-common.js';
+import { api, confirmModal, formatBytes, formatWhen, requireSession } from '/assets/admin-common.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -16,6 +16,11 @@ function setSource(id, source) {
 function setSecret(id, isSet) {
   $(id).value = '';
   $(id).placeholder = isSet ? 'unchanged' : '';
+}
+
+function setBackupSecret(input, isSet) {
+  setSecret(input, isSet);
+  $(`${input}-source`).textContent = isSet ? 'saved' : 'not configured';
 }
 
 function deploymentValue(id, value, fallback = 'Not configured') {
@@ -164,6 +169,77 @@ function fillSettings(data) {
   $('signin-save').disabled = !data.sso_configured;
 }
 
+function fillBackups(data) {
+  const config = data.config;
+  $('backup-destination').value = config.destination || 'local';
+  $('backup-enabled').checked = config.enabled === true;
+  $('backup-interval-minutes').value = config.interval_secs ? Math.ceil(config.interval_secs / 60) : 60;
+  $('backup-local-path').value = config.local_path || '';
+  $('backup-local-retention-days').value = config.retention_days ?? 30;
+  $('backup-retention-count').value = config.retention_count ?? 30;
+  $('backup-s3-endpoint').value = config.s3_endpoint || '';
+  $('backup-s3-region').value = config.s3_region || '';
+  $('backup-s3-bucket').value = config.s3_bucket || '';
+  $('backup-s3-prefix').value = config.s3_prefix || '';
+  $('backup-s3-path-style').checked = config.s3_path_style === true;
+  setBackupSecret('backup-s3-access-key', config.s3_credentials_configured === true);
+  setBackupSecret('backup-s3-secret-key', config.s3_credentials_configured === true);
+  $('backup-encryption-enabled').checked = config.encrypt === true;
+  setBackupSecret('backup-encryption-passphrase', config.passphrase_configured === true);
+
+  const status = data.status;
+  const statusText = status.running
+    ? 'Backup running…'
+    : status.last_error
+      ? `Last run failed: ${status.last_error}`
+      : status.last_success_at
+        ? `Last successful run ${formatWhen(status.last_success_at)}`
+        : status.last_attempt_at
+          ? `Last attempt ${formatWhen(status.last_attempt_at)}`
+          : 'No backup has run yet.';
+  $('backup-status').textContent = statusText;
+  $('backup-status-error').hidden = !status.last_error;
+  if (status.last_error) $('backup-status-error').textContent = status.last_error;
+  if (!status.last_error && data.inventory_error) {
+    $('backup-status-error').textContent = `Snapshot inventory unavailable: ${data.inventory_error}`;
+    $('backup-status-error').hidden = false;
+  }
+
+  const snapshots = data.inventory;
+  const select = $('backup-restore-snapshot');
+  const addOption = (label, value) => {
+    const option = document.createElement('option');
+    option.textContent = label;
+    option.value = value;
+    select.add(option);
+    return option;
+  };
+  select.replaceChildren();
+  if (!snapshots.length) {
+    addOption('No snapshots available', '');
+    select.disabled = true;
+  } else {
+    addOption('Choose a snapshot…', '');
+    for (const snapshot of snapshots) {
+      const source = snapshot.source || 'local';
+      const label = snapshot.name || snapshot.id;
+      const when = snapshot.created_at ? ` · ${formatWhen(snapshot.created_at)}` : '';
+      const bytes = snapshot.bytes === undefined ? '' : ` · ${formatBytes(snapshot.bytes)}`;
+      const option = addOption(`${source}: ${label}${when}${bytes}`, snapshot.id);
+      option.dataset.source = source;
+    }
+    select.disabled = false;
+  }
+  $('backup-inventory').textContent = snapshots.length
+    ? `${snapshots.length} snapshot${snapshots.length === 1 ? '' : 's'} available.`
+    : 'No snapshots available.';
+}
+
+function setBackupActions(enabled) {
+  $('backup-save').disabled = !enabled;
+  $('backup-run').disabled = !enabled;
+}
+
 function formControls(form) {
   const prefix = form.id.replace(/-form$/, '');
   return { note: $(`${prefix}-note`), error: $(`${prefix}-error`) };
@@ -304,6 +380,93 @@ $('signin-form').addEventListener('submit', async (event) => {
   });
 });
 
+$('backup-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const interval = parseInt($('backup-interval-minutes').value, 10);
+  const retention = parseInt($('backup-local-retention-days').value, 10);
+  const retentionCount = parseInt($('backup-retention-count').value, 10);
+  if (!Number.isInteger(interval) || interval < 1 || !Number.isInteger(retention) || retention < 0
+    || !Number.isInteger(retentionCount) || retentionCount < 0) {
+    formError(event.currentTarget, new Error('Schedule and retention must be valid numbers.'));
+    return;
+  }
+  const body = {
+    destination: $('backup-destination').value,
+    enabled: $('backup-enabled').checked,
+    interval_secs: interval * 60,
+    local_path: $('backup-local-path').value.trim() || null,
+    retention_days: retention,
+    retention_count: retentionCount,
+    s3_endpoint: $('backup-s3-endpoint').value.trim() || null,
+    s3_region: $('backup-s3-region').value.trim() || null,
+    s3_bucket: $('backup-s3-bucket').value.trim() || null,
+    s3_prefix: $('backup-s3-prefix').value.trim() || null,
+    s3_path_style: $('backup-s3-path-style').checked,
+    encrypt: $('backup-encryption-enabled').checked,
+  };
+  if ($('backup-s3-access-key').value !== '') body.access_key_id = $('backup-s3-access-key').value;
+  if ($('backup-s3-secret-key').value !== '') body.secret_access_key = $('backup-s3-secret-key').value;
+  if ($('backup-encryption-passphrase').value !== '') {
+    body.passphrase = $('backup-encryption-passphrase').value;
+  }
+  formNote(event.currentTarget, '');
+  try {
+    await api('/api/admin/backups', {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    });
+    fillBackups(await api('/api/admin/backups'));
+    formNote(event.currentTarget, 'Saved.');
+  } catch (error) {
+    formError(event.currentTarget, error);
+  }
+});
+
+$('backup-run').addEventListener('click', async () => {
+  const button = $('backup-run');
+  button.disabled = true;
+  $('backup-status').textContent = 'Running backup…';
+  $('backup-status-error').hidden = true;
+  try {
+    await api('/api/admin/backups', { method: 'POST' });
+    fillBackups(await api('/api/admin/backups'));
+  } catch (error) {
+    $('backup-status').textContent = 'Backup failed.';
+    $('backup-status-error').textContent = error.message;
+    $('backup-status-error').hidden = false;
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$('backup-restore-snapshot').addEventListener('change', async (event) => {
+  const option = event.currentTarget.selectedOptions[0];
+  if (!option?.value) return;
+  const source = option.dataset.source || 'local';
+  const name = option.textContent;
+  const confirmed = await confirmModal(
+    'Restore this snapshot?',
+    `Restore ${name}. Current application state will be replaced; the cookie secret will rotate and every existing admin session will be signed out. Automatic backups will be disabled until re-enabled by an admin. The staged restore will restart the supervised service.`,
+    'Restore and restart',
+  );
+  event.currentTarget.value = '';
+  if (!confirmed) return;
+  const error = $('backup-status-error');
+  error.hidden = true;
+  $('backup-status').textContent = 'Staging restore…';
+  try {
+    await api('/api/admin/backups/restore', {
+      method: 'POST',
+      body: JSON.stringify({ source, id: option.value }),
+    });
+    $('backup-status').textContent = 'Restore staged. The supervised service will restart.';
+  } catch (requestError) {
+    $('backup-status').textContent = 'Restore failed.';
+    error.textContent = requestError.message;
+    error.hidden = false;
+  }
+});
+
 for (const button of document.querySelectorAll('[data-reset]')) {
   button.addEventListener('click', async () => {
     const form = button.closest('form');
@@ -342,6 +505,15 @@ try {
 } catch (error) {
   formError($('notify-form'), error);
   formError($('smtp-form'), error);
+}
+try {
+  fillBackups(await api('/api/admin/backups'));
+  setBackupActions(true);
+} catch (error) {
+  setBackupActions(true);
+  $('backup-status').textContent = 'Backup status unavailable.';
+  $('backup-status-error').textContent = error.message;
+  $('backup-status-error').hidden = false;
 }
 // The public endpoint answers with the key alone; the links payload carries
 // it too, but that is every link with every upload for one hex string.

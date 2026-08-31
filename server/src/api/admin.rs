@@ -865,7 +865,7 @@ pub async fn backup_database(
         .await
         .map_err(|error| ApiError::internal(format!("create backups dir: {error}")))?;
     paths::tighten_private_dir(&backups).map_err(ApiError::internal)?;
-    let name = format!("votport-{}-{}.db", now_unix(), &auth::random_token()[..8]);
+    let name = crate::backup::legacy_snapshot_filename();
     let destination = backups.join(&name);
     let store = Arc::clone(&app.store);
     let destination_clone = destination.clone();
@@ -896,6 +896,319 @@ pub async fn backup_database(
         Body::from_stream(ReaderStream::new(file)),
     )
         .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupConfigRequest {
+    #[serde(flatten)]
+    pub config: crate::backup::BackupConfig,
+    #[serde(default, deserialize_with = "double_option")]
+    pub access_key_id: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub secret_access_key: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub passphrase: Option<Option<String>>,
+}
+
+pub async fn get_backups(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let _identity = require_platform_admin(&app, &headers)?;
+    let guard = app.backup_lock.try_lock().ok();
+    let busy = guard.is_none();
+    let config = crate::backup::decode_config(
+        app.store
+            .setting(crate::backup::SETTING_KEY)
+            .map_err(super::store_unavailable)?,
+    )
+    .map_err(ApiError::internal)?;
+    let secrets = crate::backup::read_secrets(&app.config.data_dir).map_err(ApiError::internal)?;
+    let local_root = config
+        .local_root(&app.config.data_dir)
+        .map_err(ApiError::internal)?;
+    let (mut inventory, mut inventory_error) =
+        match crate::backup::inventory_local_root(&local_root) {
+            Ok(inventory) => (inventory, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+    if !busy
+        && matches!(
+            config.destination,
+            crate::backup::Destination::S3 | crate::backup::Destination::Both
+        )
+        && secrets.access_key_id.is_some()
+        && secrets.secret_access_key.is_some()
+    {
+        match crate::backup::inventory_s3(&config, &secrets).await {
+            Ok(remote) => inventory.extend(remote),
+            Err(error) => inventory_error = Some(error),
+        }
+    }
+    let mut status =
+        crate::backup::read_status(&app.config.data_dir).map_err(ApiError::internal)?;
+    status.running = busy;
+    Ok(Json(json!({
+        "config": config.public(&secrets),
+        "inventory": inventory,
+        "inventory_error": inventory_error.map(|error| error.chars().take(512).collect::<String>()),
+        "status": status
+    })))
+}
+
+pub async fn put_backups_config(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(mut body): Json<BackupConfigRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_platform_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
+    for value in [
+        &mut body.config.local_path,
+        &mut body.config.s3_endpoint,
+        &mut body.config.s3_region,
+        &mut body.config.s3_bucket,
+        &mut body.config.s3_prefix,
+    ] {
+        if value.as_deref().is_some_and(str::is_empty) {
+            *value = None;
+        }
+    }
+    for value in [
+        body.access_key_id.as_ref().and_then(Option::as_ref),
+        body.secret_access_key.as_ref().and_then(Option::as_ref),
+        body.passphrase.as_ref().and_then(Option::as_ref),
+    ] {
+        if value.is_some_and(|value| value.is_empty()) {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "backup secrets must not be empty",
+            ));
+        }
+        if value.is_some_and(|value| value.len() > 4096) {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "backup secret is too long",
+            ));
+        }
+    }
+    body.config
+        .validate(&app.config.data_dir)
+        .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let _guard = app
+        .backup_lock
+        .try_lock()
+        .map_err(|_| ApiError::new(StatusCode::CONFLICT, "backup already running"))?;
+    let mut secrets =
+        crate::backup::read_secrets(&app.config.data_dir).map_err(ApiError::internal)?;
+    if let Some(value) = body.access_key_id {
+        secrets.access_key_id = value;
+    }
+    if let Some(value) = body.secret_access_key {
+        secrets.secret_access_key = value;
+    }
+    if let Some(value) = body.passphrase {
+        secrets.passphrase = value;
+    }
+    secrets
+        .validate()
+        .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    if matches!(
+        body.config.destination,
+        crate::backup::Destination::S3 | crate::backup::Destination::Both
+    ) && (secrets.access_key_id.is_none() || secrets.secret_access_key.is_none())
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "S3 credentials are required",
+        ));
+    }
+    if body.config.encrypt && secrets.passphrase.is_none() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "encryption passphrase is required",
+        ));
+    }
+    let mut disabled = body.config.clone();
+    disabled.enabled = false;
+    let disabled_value =
+        serde_json::to_string(&disabled).map_err(|error| ApiError::internal(error.to_string()))?;
+    app.store
+        .put_settings(
+            &identity.subject,
+            &[(
+                crate::backup::SETTING_KEY.to_owned(),
+                crate::store::SettingWrite::Set(disabled_value),
+            )],
+        )
+        .map_err(ApiError::internal)?;
+    crate::backup::write_secrets(&app.config.data_dir, &secrets).map_err(ApiError::internal)?;
+    if body.config.enabled {
+        let value = serde_json::to_string(&body.config)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        app.store
+            .put_settings(
+                &identity.subject,
+                &[(
+                    crate::backup::SETTING_KEY.to_owned(),
+                    crate::store::SettingWrite::Set(value),
+                )],
+            )
+            .map_err(ApiError::internal)?;
+    }
+    app.store
+        .audit("", &identity.subject, "backups_configured", "", &json!({}));
+    Ok(Json(json!({ "config": body.config.public(&secrets) })))
+}
+
+pub async fn create_backup(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_platform_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
+    let _guard = app
+        .backup_lock
+        .try_lock()
+        .map_err(|_| ApiError::new(StatusCode::CONFLICT, "backup already running"))?;
+    crate::backup::ensure_no_pending_restore(&app.config.data_dir)
+        .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
+    let config = crate::backup::parse_config(
+        app.store
+            .setting(crate::backup::SETTING_KEY)
+            .map_err(super::store_unavailable)?,
+        &app.config.data_dir,
+    )
+    .map_err(ApiError::internal)?;
+    let secrets = crate::backup::read_secrets(&app.config.data_dir).map_err(ApiError::internal)?;
+    let id = crate::backup::run(Arc::clone(&app), config, secrets)
+        .await
+        .map_err(ApiError::internal)?;
+    app.store
+        .audit("", &identity.subject, "backup_created", &id, &json!({}));
+    Ok(Json(json!({ "id": id })))
+}
+
+pub async fn restore_backup(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(body): Json<crate::backup::RestoreRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_platform_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
+    crate::backup::validate_id(&body.id)
+        .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let _guard = app
+        .backup_lock
+        .try_lock()
+        .map_err(|_| ApiError::new(StatusCode::CONFLICT, "backup already running"))?;
+    crate::backup::ensure_no_pending_restore(&app.config.data_dir)
+        .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
+    let config = crate::backup::parse_config(
+        app.store
+            .setting(crate::backup::SETTING_KEY)
+            .map_err(super::store_unavailable)?,
+        &app.config.data_dir,
+    )
+    .map_err(ApiError::internal)?;
+    let secrets = crate::backup::read_secrets(&app.config.data_dir).map_err(ApiError::internal)?;
+    let stage = app.config.data_dir.join(format!(
+        ".votport-restore-stage-{}",
+        crate::auth::random_token()
+    ));
+    std::fs::create_dir(&stage).map_err(|e| ApiError::internal(e.to_string()))?;
+    paths::tighten_private_dir(&stage).map_err(ApiError::internal)?;
+    let mut stage_cleanup = crate::backup::CleanupPath::directory(stage.clone());
+    let incoming = app.config.data_dir.join(format!(
+        ".votport-restore-{}.download",
+        crate::auth::random_token()
+    ));
+    let _incoming_cleanup = crate::backup::CleanupPath::new(incoming.clone());
+    if body.source == "local" {
+        let local_root = config
+            .local_root(&app.config.data_dir)
+            .map_err(ApiError::internal)?;
+        let source = local_root.join(&body.id);
+        let source_meta = std::fs::symlink_metadata(&source)
+            .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "backup not found"))?;
+        if source_meta.file_type().is_symlink() || !source_meta.file_type().is_file() {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "backup not found"));
+        }
+        let output = incoming.clone();
+        tokio::task::spawn_blocking(move || crate::backup::copy_private_file(&source, &output))
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .map_err(ApiError::internal)?;
+    } else if body.source == "s3" {
+        crate::backup::download_s3(&config, &secrets, &body.id, &incoming)
+            .await
+            .map_err(ApiError::internal)?;
+    } else {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "source must be local or s3",
+        ));
+    }
+    let tar_path = app.config.data_dir.join(format!(
+        ".votport-restore-{}.tar",
+        crate::auth::random_token()
+    ));
+    let _tar_cleanup = crate::backup::CleanupPath::new(tar_path.clone());
+    if body.id.ends_with(".age") {
+        let pass = secrets
+            .passphrase
+            .as_deref()
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "encryption passphrase is not configured",
+                )
+            })?
+            .to_owned();
+        let input = incoming.clone();
+        let output = tar_path.clone();
+        tokio::task::spawn_blocking(move || crate::backup::decrypt_file(&input, &output, &pass))
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .map_err(ApiError::internal)?;
+    } else {
+        tokio::fs::rename(&incoming, &tar_path)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+    }
+    let extracted = stage.clone();
+    let tar_for_extract = tar_path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::backup::validate_and_extract(
+            &tar_for_extract,
+            &extracted,
+            crate::store::SCHEMA_VERSION,
+        )
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(ApiError::internal)?;
+    crate::backup::write_pending_restore(&app.config.data_dir, &stage, result.clone())
+        .map_err(ApiError::internal)?;
+    stage_cleanup.keep();
+    app.store.audit(
+        "",
+        &identity.subject,
+        "backup_restore_pending",
+        &body.id,
+        &json!({ "version": result.version }),
+    );
+    tracing::info!(
+        target: "audit",
+        event = "backup_restore_pending",
+        id = %body.id,
+        source = %body.source,
+        version = result.version,
+        "backup restore staged"
+    );
+    app.request_shutdown();
+    Ok(Json(json!({ "pending": true, "restart_required": true })))
 }
 
 const SETTINGS_KEYS: &[&str] = &[
@@ -3885,6 +4198,37 @@ mod backup_tests {
     use crate::api::testing;
     use crate::app;
 
+    async fn login(application: Arc<App>) -> String {
+        let response = app::router(application)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/login")
+                    .header("content-type", "application/json")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        1234,
+                    ))))
+                    .body(Body::from(format!(
+                        "{{\"password\":\"{}\"}}",
+                        testing::TEST_PASSWORD
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
     #[tokio::test]
     async fn backup_route_serves_a_snapshot_and_requires_sign_in() {
         let directory = tempfile::tempdir().unwrap();
@@ -3906,31 +4250,7 @@ mod backup_tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         // Signed in, the route serves a non-empty SQLite snapshot.
-        let router = app::router(application.clone());
-        let login = Request::builder()
-            .method("POST")
-            .uri("/api/admin/login")
-            .header("content-type", "application/json")
-            .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
-                [127, 0, 0, 1],
-                1234,
-            ))))
-            .body(Body::from(format!(
-                "{{\"password\":\"{}\"}}",
-                testing::TEST_PASSWORD
-            )))
-            .unwrap();
-        let response = router.oneshot(login).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let cookie = response
-            .headers()
-            .get(header::SET_COOKIE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_owned();
+        let cookie = login(application.clone()).await;
 
         let router = app::router(application);
         let response = router
@@ -3953,6 +4273,238 @@ mod backup_tests {
         // SQLite databases begin with the magic string.
         assert!(body.starts_with(b"SQLite format 3\0"));
         assert_eq!(content_length, Some(body.len()));
+    }
+
+    #[tokio::test]
+    async fn backup_settings_match_the_browser_contract_and_redact_secrets() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = login(application.clone()).await;
+        let local_path = application.config.data_dir.join("custom-backups");
+        std::fs::create_dir(&local_path).unwrap();
+        let body = serde_json::json!({
+            "enabled": true,
+            "interval_secs": 3600,
+            "retention_days": 7,
+            "retention_count": 5,
+            "destination": "local",
+            "local_path": local_path,
+            "s3_endpoint": null,
+            "s3_region": null,
+            "s3_bucket": null,
+            "s3_prefix": null,
+            "s3_path_style": false,
+            "encrypt": true,
+            "access_key_id": "visible-only-on-write",
+            "secret_access_key": "never-return-this",
+            "passphrase": "correct horse battery staple"
+        });
+
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::put("/api/admin/backups")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let guard = application.backup_lock.lock().await;
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::put("/api/admin/backups")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let error = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&error)
+        );
+        drop(guard);
+
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::put("/api/admin/backups")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::get("/api/admin/backups")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(!text.contains("never-return-this"));
+        assert!(!text.contains("correct horse battery staple"));
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["config"]["interval_secs"], 3600);
+        assert_eq!(response["config"]["passphrase_configured"], true);
+
+        let mut unknown = body;
+        unknown["unexpected"] = serde_json::json!(true);
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::put("/api/admin/backups")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .body(Body::from(unknown.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::post("/api/admin/backups")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let id = created["id"].as_str().unwrap();
+        let shutdown = Arc::clone(&application.shutdown);
+        let shutdown_waiter = tokio::spawn(async move { shutdown.notified().await });
+        tokio::task::yield_now().await;
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::post("/api/admin/backups/restore")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .body(Body::from(
+                        serde_json::json!({ "source": "local", "id": id }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let restored: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(restored["pending"], true);
+        tokio::time::timeout(std::time::Duration::from_secs(1), shutdown_waiter)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::post("/api/admin/backups")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::backup::scheduler(application),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_backup_mount_can_be_repaired_in_app() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = login(application.clone()).await;
+        let missing = application.config.data_dir.join("detached-backups");
+        std::fs::create_dir(&missing).unwrap();
+        let mut body = serde_json::json!({
+            "enabled": false,
+            "interval_secs": 3600,
+            "retention_days": 7,
+            "retention_count": 5,
+            "destination": "local",
+            "local_path": missing,
+            "s3_endpoint": null,
+            "s3_region": null,
+            "s3_bucket": null,
+            "s3_prefix": null,
+            "s3_path_style": false,
+            "encrypt": false
+        });
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::put("/api/admin/backups")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        std::fs::remove_dir(&missing).unwrap();
+
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::get("/api/admin/backups")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(response["inventory_error"].is_string());
+        assert_eq!(response["config"]["local_path"], body["local_path"]);
+
+        body["local_path"] = serde_json::Value::Null;
+        let response = app::router(application)
+            .oneshot(
+                Request::put("/api/admin/backups")
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .header("x-votport", "1")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
 
