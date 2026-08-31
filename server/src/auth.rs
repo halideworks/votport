@@ -179,7 +179,19 @@ fn admin_mac(secret: &[u8; 32], payload: &str, version: &str, expires: u64, nonc
 /// credential) invalidates every outstanding session, while SSO identities
 /// carry their own subjects, tenants and roles.
 pub fn issue_admin_token(secret: &[u8; 32], id: &AdminIdentity, version: &str) -> String {
-    let expires = now_unix() + ADMIN_SESSION_SECS;
+    issue_admin_token_with_ttl(secret, id, version, ADMIN_SESSION_SECS)
+}
+
+/// SSO sessions get a shorter, configurable lifetime than break-glass ones:
+/// an IdP-side deprovisioning only takes effect at the next login, so the
+/// token lifetime bounds that exposure.
+pub fn issue_admin_token_with_ttl(
+    secret: &[u8; 32],
+    id: &AdminIdentity,
+    version: &str,
+    ttl_secs: u64,
+) -> String {
+    let expires = now_unix() + ttl_secs;
     let nonce = random_token();
     let payload = identity_payload(id);
     let mac = admin_mac(secret, &payload, version, expires, &nonce);
@@ -289,19 +301,7 @@ pub fn verify_download_lease(
     )
 }
 
-pub fn hex_encode(bytes: &[u8]) -> String {
-    hex::encode(bytes)
-}
-
-pub fn hex_decode(text: &str) -> Option<Vec<u8>> {
-    hex::decode(text).ok()
-}
-
-pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    constant_time_eq(a, b)
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -488,6 +488,17 @@ pub fn cookie_value<'header>(header: &'header str, name: &str) -> Option<&'heade
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admin_token_ttl_bounds_verification() {
+        let secret = [7u8; 32];
+        let identity = AdminIdentity::local_admin();
+        let live = issue_admin_token_with_ttl(&secret, &identity, "v", 60);
+        assert!(verify_admin_token(&secret, "v", &live).is_some());
+        // A zero ttl expires at issuance: now >= expires refuses.
+        let dead = issue_admin_token_with_ttl(&secret, &identity, "v", 0);
+        assert!(verify_admin_token(&secret, "v", &dead).is_none());
+    }
 
     #[test]
     fn the_global_counter_also_counts_before_it_checks() {

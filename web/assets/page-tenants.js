@@ -4,6 +4,7 @@
 import {
   alertModal,
   api,
+  button,
   confirmModal,
   formatBytes,
   formatWhen,
@@ -19,17 +20,6 @@ let principalTotal = 0;
 let principalLoading = false;
 let principalReloadPending = false;
 let principalSearchTimer;
-
-function button(text, classes, onClick) {
-  const element = document.createElement('button');
-  element.type = 'button';
-  element.className = classes;
-  element.textContent = text;
-  element.addEventListener('click', () => {
-    onClick().catch?.((error) => alertModal(error.message));
-  });
-  return element;
-}
 
 function quotaText(tenant) {
   const parts = [];

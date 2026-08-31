@@ -12,6 +12,7 @@ import {
   publicMetadataPageUrl,
   runWorkerPool,
   saveBatchFiles,
+  streamToWritable,
   summarizeFailures,
 } from '/assets/outbound-download.js';
 
@@ -101,13 +102,11 @@ function validateMetadataFiles(files) {
 }
 
 async function saveFile(directory, file, name) {
-  const response = await fetch(file.download_url, { credentials: 'same-origin' });
-  if (!response.ok) throw new Error(`server returned ${response.status}`);
-  if (!response.body) throw new Error('browser cannot stream this response');
   const handle = await directory.getFileHandle(name, { create: true });
   const writable = await handle.createWritable();
   try {
-    await response.body.pipeTo(writable);
+    await streamToWritable((...args) => fetch(...args), writable, file);
+    await writable.close();
   } catch (error) {
     await writable.abort().catch(() => {});
     throw error;
@@ -270,6 +269,9 @@ async function downloadSeparately() {
     }
     const files = metadataHasMore ? await loadRemainingMetadata() : metadataFiles;
     const names = dedupeFilenames(files.map((file) => file.name));
+    let remainingFiles = files;
+    let remainingNames = names;
+    let batchSaved = 0;
     if (batchUrl && batchDownloadEligible(files)) {
       status.textContent = `Downloading files in optimized batch mode: 0/${files.length}`;
       try {
@@ -280,32 +282,40 @@ async function downloadSeparately() {
         if (response.status === 404) throw new Error('The verified batch is no longer available.');
         if (!response.ok) throw new Error(`server returned ${response.status}`);
         await saveBatchFiles(response, directory, files, names, (completed, total) => {
+          batchSaved = completed;
           status.textContent = `Downloading files in optimized batch mode: ${completed}/${total}`;
         });
         status.textContent = `Downloaded ${files.length} files.`;
         return;
       } catch (error) {
-        if (!(error instanceof BatchDownloadUnsupportedError)) throw error;
-        status.textContent = 'Batch mode unavailable; downloading files individually…';
+        if (error?.name === 'AbortError') throw error;
+        // Files the batch fully wrote stay on disk; finish the rest
+        // individually instead of failing the whole set.
+        remainingFiles = files.slice(batchSaved);
+        remainingNames = names.slice(batchSaved);
+        status.textContent = error instanceof BatchDownloadUnsupportedError
+          ? 'Batch mode unavailable; downloading files individually…'
+          : `Batch stream interrupted; downloading the remaining ${remainingFiles.length} files individually…`;
       }
     }
     const failures = [];
     await runWorkerPool(
-      files,
+      remainingFiles,
       async (file, index) => {
         try {
-          await saveFile(directory, file, names[index]);
+          await saveFile(directory, file, remainingNames[index]);
         } catch (error) {
-          failures.push(`${names[index]}: ${error.message}`);
+          failures.push(`${remainingNames[index]}: ${error.message}`);
         }
       },
       4,
-      (_file, _index, completed, total) => {
-        status.textContent = `Downloading files: ${completed}/${total}`;
+      (_file, _index, completed, _total) => {
+        status.textContent = `Downloading files: ${batchSaved + completed}/${files.length}`;
       },
     );
+    const saved = files.length - failures.length;
     status.textContent = failures.length
-      ? `Downloaded ${files.length - failures.length}/${files.length}. Failed: ${summarizeFailures(failures)}`
+      ? `Downloaded ${saved}/${files.length}. Failed: ${summarizeFailures(failures)}`
       : `Downloaded ${files.length} files.`;
   } catch (error) {
     status.textContent = error?.name === 'AbortError'

@@ -248,6 +248,13 @@ Discovery runs on first SSO use, not at process start. Failed discovery cools
 down for 30 seconds and then retries. A successful discovery stays loaded
 until process restart, so rotating IdP metadata still needs a restart.
 
+SSO sessions last `VOTPORT_SSO_SESSION_SECS` (default 43200, 12 hours); the
+local break-glass session keeps a fixed 7 days. The session cookie freezes the
+principal's tenants and roles at login, so removing a user's IdP group takes
+effect at their next login, bounded by this lifetime. To cut access
+immediately, also revoke the principal in the Tenants page; offboarding is a
+two-step action across the IdP and votport.
+
 ### Authentik
 
 1. Applications > Applications > Create: choose *Authorization code with PKCE*.
@@ -450,3 +457,33 @@ Cargo.lock. Measure with:
 ```sh
 cargo test --test e2e -- --ignored --nocapture throughput_baseline
 ```
+
+`VOTPORT_MAX_TOTAL_SESSIONS` (default 32) caps concurrent upload sessions
+process-wide; the 33rd sender gets a 429 until one finishes. Worst-case
+queued-body memory rises linearly with it: sessions x 8 in-flight chunks x
+~9 MiB, so 32 sessions bound roughly 2.3 GiB. Size it against available RAM
+before raising it for a busy facility.
+
+## Logs
+
+Operational logs use a human-readable format by default. Set
+`VOTPORT_LOG_FORMAT=json` to emit one JSON object per line for log pipelines.
+`RUST_LOG` controls the filter either way; the audit trail is separate and
+exports as JSONL from the Audit page regardless of this setting.
+
+## Scaling and availability
+
+votport is a single-replica service by design: SQLite is the one writer, and
+upload sessions, throttles, and rate state live in process memory. Running two
+replicas behind one hostname is unsupported; scale up (CPU, RAM, faster disk),
+not out. This is the deliberate trade for atomic verified publication with no
+external dependencies; see docs/multi-tenancy.md non-goals.
+
+A restart discards in-flight upload sessions: staged partials are swept at
+boot, and senders start those files over (files already published from a
+multi-file session survive and dedupe on re-send). Long streaming downloads
+die with the process too. For a planned upgrade, drain first: stop handing out
+new links or wait for a quiet window, watch `votport_sessions_active` on
+/metrics reach 0, then restart. The compose file sets `stop_grace_period: 5m`
+so in-flight downloads get a window to finish; no grace period covers a
+multi-hundred-GiB upload, which is what the drain is for.

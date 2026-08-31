@@ -13,6 +13,7 @@ import {
   saveBatchFiles,
   BatchDownloadUnsupportedError,
   sanitizeFilename,
+  streamToWritable,
   summarizeFailures,
   nextFileBatch,
 } from '../web/assets/outbound-download.js';
@@ -266,5 +267,77 @@ test('only an empty batch response raises the fallback classification', async ()
   await assert.rejects(
     saveBatchFiles(responseInChunks([new TextEncoder().encode('first')], 200, 'application/octet-stream'), fakeDirectory(), [{ bytes: 5 }], ['one']),
     BatchDownloadUnsupportedError,
+  );
+});
+
+function fakeWritable() {
+  return {
+    chunks: [],
+    truncated: 0,
+    async write(bytes) { this.chunks.push(bytes); },
+    async truncate(size) { this.truncated += 1; this.chunks = []; assert.equal(size, 0); },
+    written() { return this.chunks.reduce((total, chunk) => total + chunk.byteLength, 0); },
+  };
+}
+
+function bodyOf(chunks, { failAfter = Infinity } = {}) {
+  let index = 0;
+  let delivered = 0;
+  return {
+    getReader() {
+      return {
+        async read() {
+          if (delivered >= failAfter) throw new TypeError('network dropped');
+          if (index >= chunks.length) return { done: true };
+          delivered += 1;
+          return { value: chunks[index++], done: false };
+        },
+        releaseLock() {},
+      };
+    },
+  };
+}
+
+const bytes = (count, fill) => new Uint8Array(count).fill(fill);
+const noSleep = { sleep: async () => {} };
+
+test('streamToWritable resumes a dropped stream with a byte range', async () => {
+  const requests = [];
+  const responses = [
+    { ok: true, status: 200, body: bodyOf([bytes(4, 1), bytes(4, 2)], { failAfter: 1 }) },
+    { ok: true, status: 206, body: bodyOf([bytes(4, 2)]) },
+  ];
+  const fetchFn = async (url, options) => { requests.push(options.headers); return responses.shift(); };
+  const writable = fakeWritable();
+  const total = await streamToWritable(fetchFn, writable, { download_url: '/f/0' }, noSleep);
+  assert.equal(total, 8);
+  assert.equal(writable.written(), 8);
+  assert.deepEqual(requests, [{}, { Range: 'bytes=4-' }]);
+  assert.equal(writable.truncated, 0);
+});
+
+test('streamToWritable restarts from zero when a resume is answered with 200', async () => {
+  const responses = [
+    { ok: true, status: 200, body: bodyOf([bytes(4, 1)], { failAfter: 1 }) },
+    { ok: true, status: 200, body: bodyOf([bytes(4, 1), bytes(4, 2)]) },
+  ];
+  const writable = fakeWritable();
+  const total = await streamToWritable(async () => responses.shift(), writable, { download_url: '/f/0' }, noSleep);
+  assert.equal(total, 8);
+  assert.equal(writable.truncated, 1);
+  assert.equal(writable.written(), 8);
+});
+
+test('streamToWritable gives up after the retry limit and on non-transient statuses', async () => {
+  let calls = 0;
+  await assert.rejects(
+    streamToWritable(async () => { calls += 1; return { ok: true, status: 200, body: bodyOf([], { failAfter: 0 }) }; },
+      fakeWritable(), { download_url: '/f/0' }, { retries: 3, ...noSleep }),
+    TypeError,
+  );
+  assert.equal(calls, 3);
+  await assert.rejects(
+    streamToWritable(async () => ({ ok: false, status: 404 }), fakeWritable(), { download_url: '/f/0' }, noSleep),
+    /server returned 404/,
   );
 });

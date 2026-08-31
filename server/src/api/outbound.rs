@@ -1962,6 +1962,12 @@ fn ensure_catalog_from_prepared(
     result
 }
 
+/// One in-flight catalog build per object: N cold requests for the same
+/// file wait on a single full read+hash instead of each paying it.
+static CATALOG_BUILDS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, Arc<Mutex<()>>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
 fn ensure_catalog(root: &Path, source: &Path, expected: &ObjectId) -> io::Result<PathBuf> {
     std::fs::create_dir_all(root)?;
     let path = catalog_path(root, expected);
@@ -1970,6 +1976,37 @@ fn ensure_catalog(root: &Path, source: &Path, expected: &ObjectId) -> io::Result
             return Ok(path);
         }
     }
+    let build_lock = Arc::clone(
+        CATALOG_BUILDS
+            .lock()
+            .expect("catalog builds poisoned")
+            .entry(path.clone())
+            .or_default(),
+    );
+    let _building = build_lock.lock().expect("catalog build poisoned");
+    // A racer may have finished the build while this thread waited.
+    if let Ok(mut file) = std::fs::File::open(&path) {
+        if catalog_header(&mut file, expected).is_ok() {
+            drop(_building);
+            CATALOG_BUILDS
+                .lock()
+                .expect("catalog builds poisoned")
+                .remove(&path);
+            return Ok(path);
+        }
+    }
+    let result = build_catalog(root, source, expected);
+    drop(_building);
+    // Waiters still hold their Arc; a later request re-creates the entry
+    // and finds the finished catalog on the recheck above.
+    CATALOG_BUILDS
+        .lock()
+        .expect("catalog builds poisoned")
+        .remove(&path);
+    result
+}
+
+fn build_catalog(root: &Path, source: &Path, expected: &ObjectId) -> io::Result<PathBuf> {
     use std::io::Read as _;
     let mut input = std::fs::File::open(source)?;
     let suite = Suite::try_from(expected.suite).map_err(|_| io::Error::other("suite"))?;
@@ -2464,7 +2501,7 @@ pub async fn outbound_batch(
     let file = first_file;
     drop(_pin);
     let indexes: Vec<usize> = (0..count).collect();
-    record_download(&app, &grant, &indexes)?;
+    record_download(&app, &grant, &indexes).await?;
     let lookahead = start_batch_lookahead(&app, &grant, &chunks, 0);
     let stream = futures_util::stream::try_unfold(
         BatchStream {
@@ -2774,7 +2811,7 @@ async fn outbound_file_inner(
         .map_err(|_| ApiError::not_found())?;
         drop(pin);
         if !leased {
-            record_download(&app, &grant, &[index])?;
+            record_download(&app, &grant, &[index]).await?;
         }
         let length = range.map_or(source.object.length, |(start, end)| end - start + 1);
         let filename = safe_filename(&source.name);
@@ -3006,7 +3043,7 @@ pub async fn outbound_bundle(
         .await
         .map_err(|_| ApiError::internal("open bundle failed"))?;
     let indexes: Vec<usize> = (0..count).collect();
-    record_download(&app, &grant, &indexes)?;
+    record_download(&app, &grant, &indexes).await?;
     let stream = ReaderStream::with_capacity(
         BundleReader {
             file,
@@ -3092,32 +3129,46 @@ fn grant_is_exhausted(
         })
 }
 
-fn record_download(
+async fn record_download(
     app: &Arc<App>,
     grant: &OutboundGrant,
     indexes: &[usize],
 ) -> ApiResult<OutboundDownloadResult> {
-    match app
-        .store
-        .record_outbound_download(&grant.id, indexes, now_unix())
-    {
-        Ok(result) => {
-            if grant.notify_on_download && (result.first_download || result.completed_delivery) {
-                match app.store.outbound_grant_by_token_hash(&grant.token_hash) {
-                    Ok(Some(full_grant)) => {
-                        tokio::spawn(crate::notify::outbound_downloaded(
-                            Arc::clone(app),
-                            full_grant,
-                            result,
-                        ));
-                    }
-                    Ok(None) => {
-                        tracing::warn!(grant_id = %grant.id, "download notification grant reload found no grant");
-                    }
-                    Err(error) => {
-                        tracing::warn!(grant_id = %grant.id, %error, "download notification grant reload failed");
-                    }
+    // Store writes and the grant reload run off the runtime thread; this
+    // sits ahead of every download response.
+    let store = Arc::clone(&app.store);
+    let grant_id = grant.id.clone();
+    let token_hash = grant.token_hash.clone();
+    let notify = grant.notify_on_download;
+    let indexes = indexes.to_vec();
+    let recorded = tokio::task::spawn_blocking(move || {
+        let result = store.record_outbound_download(&grant_id, &indexes, now_unix())?;
+        let reload = if notify && (result.first_download || result.completed_delivery) {
+            Some(store.outbound_grant_by_token_hash(&token_hash))
+        } else {
+            None
+        };
+        Ok::<_, String>((result, reload))
+    })
+    .await
+    .map_err(|_| ApiError::internal("record download failed"))?;
+    match recorded {
+        Ok((result, reload)) => {
+            match reload {
+                Some(Ok(Some(full_grant))) => {
+                    tokio::spawn(crate::notify::outbound_downloaded(
+                        Arc::clone(app),
+                        full_grant,
+                        result,
+                    ));
                 }
+                Some(Ok(None)) => {
+                    tracing::warn!(grant_id = %grant.id, "download notification grant reload found no grant");
+                }
+                Some(Err(error)) => {
+                    tracing::warn!(grant_id = %grant.id, %error, "download notification grant reload failed");
+                }
+                None => {}
             }
             Ok(result)
         }
@@ -3189,6 +3240,9 @@ fn bundle_collision_key(name: &str) -> String {
     name.to_lowercase()
 }
 
+// ponytail: every request re-copies and re-verifies each source; cache the
+// built archive keyed by grant id + file set if concurrent same-ZIP fetches
+// are ever measured as a pattern.
 async fn build_bundle(app: &App, files: Vec<(Source, String)>) -> ApiResult<StagedFile> {
     let bound = archive_size_bound(&files).ok_or_else(stage_capacity_error)?;
     let stage_root = app.config.data_dir.join("outbound.stage");
@@ -3909,6 +3963,31 @@ mod tests {
         assert!(ensure_catalog_from_prepared(directory.path(), &prepared).is_ok());
         let repaired = std::fs::read(path).unwrap();
         assert!(proof::validate_catalog(&repaired, prepared.object_id()).is_ok());
+    }
+
+    #[test]
+    fn concurrent_cold_catalog_requests_share_one_build() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = vec![9u8; 64 * 1024];
+        let source = directory.path().join("source.bin");
+        std::fs::write(&source, &bytes).unwrap();
+        let expected = object_id(&bytes);
+        let root = directory.path().join("proofs");
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| scope.spawn(|| ensure_catalog(&root, &source, &expected).unwrap()))
+                .collect();
+            for worker in workers {
+                let path = worker.join().unwrap();
+                let mut file = std::fs::File::open(&path).unwrap();
+                assert!(catalog_header(&mut file, &expected).is_ok());
+            }
+        });
+        // Other tests share the static map; only this object's entry matters.
+        assert!(!CATALOG_BUILDS
+            .lock()
+            .unwrap()
+            .contains_key(&catalog_path(&root, &expected)));
     }
 
     async fn fixture() -> (tempfile::TempDir, Arc<App>, String, Vec<u8>) {

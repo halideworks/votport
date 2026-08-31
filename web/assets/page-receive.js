@@ -5,11 +5,13 @@ import { appendObjectCard } from '/assets/object-card.js';
 import {
   alertModal,
   api,
+  button,
   confirmModal,
   formatBytes,
   formatDuration,
   formatWhen,
   requireSession,
+  showGrantResult,
 } from '/assets/admin-common.js';
 
 const $ = (id) => document.getElementById(id);
@@ -20,30 +22,6 @@ function chunkTrouble(record) {
   if (record.replayed_chunks) text += ` · ${record.replayed_chunks} re-sent chunks`;
   if (record.rejected_chunks) text += ` · ${record.rejected_chunks} rejected chunks`;
   return text;
-}
-
-function button(text, classes, onClick) {
-  const element = document.createElement('button');
-  element.type = 'button';
-  element.className = classes;
-  element.textContent = text;
-  element.addEventListener('click', () => {
-    onClick().catch?.((error) => alertModal(error.message));
-  });
-  return element;
-}
-
-function showGrantResult(url, protectedGrant = false) {
-  $('outbound-result').hidden = false;
-  $('outbound-url').value = url;
-  $('outbound-url').onclick = () => $('outbound-url').select();
-  $('outbound-note').textContent =
-    `Shown once. Copy it now; this URL cannot be retrieved later.`
-    + (protectedGrant ? ' This download is password-protected. Send the password by a separate channel.' : '');
-  $('outbound-copy').onclick = async () => {
-    await navigator.clipboard.writeText(url);
-    $('outbound-copy').textContent = 'Copied';
-  };
 }
 
 async function issueReceivedGrant(link, upload, fileIndex, file) {

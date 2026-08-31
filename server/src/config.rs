@@ -75,6 +75,13 @@ pub struct Config {
     pub public_password_login: bool,
     /// When set, /metrics requires this bearer token.
     pub metrics_token: Option<String>,
+    /// Process-wide cap on concurrent upload sessions across all tenants.
+    /// Worst-case queued-body memory rises linearly with it: sessions x 8
+    /// in-flight chunks x ~9 MiB.
+    pub max_total_sessions: usize,
+    /// Lifetime of admin sessions issued through SSO. Local break-glass
+    /// sessions keep their own longer fixed lifetime.
+    pub sso_session_secs: u64,
     /// Peers whose `X-Forwarded-For` is believed, as CIDR blocks. Empty means
     /// the built-in default: loopback plus the private ranges. Naming the
     /// reverse proxy explicitly is what stops anything else that can reach
@@ -96,6 +103,8 @@ pub struct OidcConfig {
 }
 
 const DEFAULT_MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024 * 1024; // 50 GiB
+const DEFAULT_MAX_TOTAL_SESSIONS: usize = 32;
+const DEFAULT_SSO_SESSION_SECS: u64 = 12 * 3600;
 
 /// Shortest admin password this build accepts. Enforced on anything set
 /// through the UI and on `VOTPORT_ADMIN_PASSWORD`, which refuses to start
@@ -296,6 +305,38 @@ pub fn from_env() -> Result<Config, String> {
         Err(_) => 0,
     };
     let metrics_token = optional("VOTPORT_METRICS_TOKEN");
+    if metrics_token.is_none() {
+        eprintln!(
+            "votport: VOTPORT_METRICS_TOKEN is unset; /metrics is unauthenticated and \
+             lists tenant keys and per-tenant totals"
+        );
+    }
+
+    let max_total_sessions = match env::var("VOTPORT_MAX_TOTAL_SESSIONS") {
+        Ok(value) => {
+            let parsed: usize = value
+                .parse()
+                .map_err(|error| format!("VOTPORT_MAX_TOTAL_SESSIONS: {error}"))?;
+            if parsed == 0 {
+                return Err("VOTPORT_MAX_TOTAL_SESSIONS must be at least 1".to_owned());
+            }
+            parsed
+        }
+        Err(_) => DEFAULT_MAX_TOTAL_SESSIONS,
+    };
+
+    let sso_session_secs = match env::var("VOTPORT_SSO_SESSION_SECS") {
+        Ok(value) => {
+            let parsed: u64 = value
+                .parse()
+                .map_err(|error| format!("VOTPORT_SSO_SESSION_SECS: {error}"))?;
+            if parsed == 0 {
+                return Err("VOTPORT_SSO_SESSION_SECS must be at least 1".to_owned());
+            }
+            parsed
+        }
+        Err(_) => DEFAULT_SSO_SESSION_SECS,
+    };
 
     // Read raw, not through `optional`: that helper treats a whitespace-only
     // value as unset, which for this variable means "trust every private
@@ -322,7 +363,15 @@ pub fn from_env() -> Result<Config, String> {
             }
             blocks
         }
-        None => Vec::new(),
+        None => {
+            eprintln!(
+                "votport: VOTPORT_TRUSTED_PROXIES is unset; X-Forwarded-For from any \
+                 loopback or private peer is believed, so a LAN peer that reaches the \
+                 port directly can pick its own per-IP throttle bucket. Name the \
+                 reverse proxy before production use (docs/deployment.md)"
+            );
+            Vec::new()
+        }
     };
 
     let audit_retention_days = match env::var("VOTPORT_AUDIT_RETENTION_DAYS") {
@@ -443,6 +492,8 @@ pub fn from_env() -> Result<Config, String> {
         default_max_sessions,
         public_password_login,
         metrics_token,
+        max_total_sessions,
+        sso_session_secs,
         trusted_proxies,
         oidc,
     })

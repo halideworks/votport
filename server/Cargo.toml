@@ -48,7 +48,7 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls", "hostname"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 openidconnect = { version = "4.0.1", features = ["reqwest"] }
 rcgen = { version = "0.14.9", default-features = false, features = ["aws_lc_rs", "pem"] }

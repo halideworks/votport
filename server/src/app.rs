@@ -2105,7 +2105,9 @@ async fn metrics(State(app): State<std::sync::Arc<App>>, headers: HeaderMap) -> 
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
-            .is_some_and(|token| crate::auth::ct_eq(token.as_bytes(), expected.as_bytes()));
+            .is_some_and(|token| {
+                crate::auth::constant_time_eq(token.as_bytes(), expected.as_bytes())
+            });
         if !authorized {
             return (StatusCode::UNAUTHORIZED, "metrics token required").into_response();
         }
@@ -2177,6 +2179,11 @@ fn metrics_text(app: &App) -> Result<String, String> {
         body,
         "# TYPE votport_audit_rows gauge\nvotport_audit_rows {}\n",
         app.store.audit_count()?
+    );
+    let _ = write!(
+        body,
+        "# TYPE votport_audit_insert_failures_total counter\nvotport_audit_insert_failures_total {}\n",
+        crate::store::AUDIT_INSERT_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
     );
     body.push_str(&app.request_metrics.prometheus());
     Ok(body)

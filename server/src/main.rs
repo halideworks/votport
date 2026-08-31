@@ -17,13 +17,21 @@ async fn main() {
         }
         return;
     }
-    tracing_subscriber::fmt()
-        // RUST_LOG wins; info is the right default for a deployed server.
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // RUST_LOG wins; info is the right default for a deployed server.
+    // VOTPORT_LOG_FORMAT=json emits one JSON object per line for log
+    // pipelines; anything else keeps the human format.
+    let filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    };
+    if std::env::var("VOTPORT_LOG_FORMAT").as_deref() == Ok("json") {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter())
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter()).init();
+    }
     let config = match config::from_env() {
         Ok(config) => config,
         Err(error) => {

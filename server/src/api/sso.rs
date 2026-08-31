@@ -362,13 +362,15 @@ pub async fn sso_callback(
     if crate::store::now_unix() >= expires {
         return home("sign-in timed out; try again");
     }
-    let payload =
-        match auth::hex_decode(payload_hex).and_then(|bytes| String::from_utf8(bytes).ok()) {
-            Some(payload) => payload,
-            None => return home("invalid sign-in state"),
-        };
+    let payload = match hex::decode(payload_hex)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+    {
+        Some(payload) => payload,
+        None => return home("invalid sign-in state"),
+    };
     let expected = sign_payload(&app.secret, expires, &payload);
-    if !auth::ct_eq(expected.as_bytes(), mac.as_bytes()) {
+    if !auth::constant_time_eq(expected.as_bytes(), mac.as_bytes()) {
         return home("invalid sign-in state");
     }
     let flow: serde_json::Value = serde_json::from_str(&payload).unwrap_or(json!({}));

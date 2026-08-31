@@ -95,6 +95,8 @@ async fn start_server_inner_with_idle(
         default_max_sessions: None,
         public_password_login: true,
         metrics_token: None,
+        max_total_sessions: 32,
+        sso_session_secs: 12 * 3600,
         trusted_proxies: Vec::new(),
         oidc: None,
     };
