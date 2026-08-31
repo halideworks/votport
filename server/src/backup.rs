@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use age::secrecy::SecretString;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
-use object_store::{MultipartUpload, ObjectStore};
+use object_store::{MultipartUpload, ObjectStore, ObjectStoreExt as _};
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

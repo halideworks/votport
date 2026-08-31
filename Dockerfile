@@ -40,7 +40,7 @@ RUN touch /src/server/src/main.rs /src/server/src/lib.rs \
     && cargo build --release --locked
 
 FROM debian:stable-slim@sha256:04634311a8d5fc442b6eb06d792293c4f3e2268652ca7634e00ce8ef5cc0a28a
-# curl exists only for the healthcheck.
+# curl serves the healthcheck; CA roots serve HTTPS notification and S3 clients.
 ARG VOTPORT_VERSION=dev
 ARG VOTPORT_REVISION=unknown
 LABEL org.opencontainers.image.version="$VOTPORT_VERSION" \
@@ -48,8 +48,9 @@ LABEL org.opencontainers.image.version="$VOTPORT_VERSION" \
       org.opencontainers.image.source="https://github.com/halideworks/votport" \
       org.opencontainers.image.licenses="LicenseRef-VOTPort-Proprietary"
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
+    && test -s /etc/ssl/certs/ca-certificates.crt \
     && mkdir -p /app /data /received /outbound
 COPY --from=build /src/server/target/release/votport /app/votport
 COPY LICENSE /app/LICENSE
