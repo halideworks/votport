@@ -2087,6 +2087,39 @@ mod request_metrics_tests {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')));
     }
+
+    #[tokio::test]
+    async fn request_middleware_records_only_outbound_upload_posts() {
+        use tower::ServiceExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/outbound-files?path=x")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(app
+            .request_metrics
+            .prometheus()
+            .contains("votport_http_outbound_upload_duration_seconds_count 1"));
+
+        router(app.clone())
+            .oneshot(
+                Request::get("/api/admin/outbound-files?path=x")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(app
+            .request_metrics
+            .prometheus()
+            .contains("votport_http_outbound_upload_duration_seconds_count 1"));
+    }
 }
 
 async fn expire_link_uploads(app: &App, candidate: crate::store::Link, cutoff: u64) {
