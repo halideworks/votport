@@ -88,7 +88,7 @@ body {
    rgba(8, 16, 24, 0.1) 40%,
    rgba(8, 16, 24, 0.85) 100%
   ),
-  url("/assets/pommern_painting.jpg");
+  url("/assets/pommern_painting.jpg?v=74074f2bbf39a081");
  background-size: cover;
  background-position: center;
  user-select: none;
