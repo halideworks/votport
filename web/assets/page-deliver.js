@@ -8,37 +8,15 @@ import { entryFiles, runUploadBatch } from '/assets/upload-entries.js';
 import {
   alertModal,
   api,
+  button,
   confirmModal,
   formatBytes,
   formatWhen,
   requireSession,
+  showGrantResult,
 } from '/assets/admin-common.js';
 
 const $ = (id) => document.getElementById(id);
-
-function button(text, classes, onClick) {
-  const element = document.createElement('button');
-  element.type = 'button';
-  element.className = classes;
-  element.textContent = text;
-  element.addEventListener('click', () => {
-    onClick().catch?.((error) => alertModal(error.message));
-  });
-  return element;
-}
-
-function showGrantResult(url, protectedGrant = false) {
-  $('outbound-result').hidden = false;
-  $('outbound-url').value = url;
-  $('outbound-url').onclick = () => $('outbound-url').select();
-  $('outbound-note').textContent =
-    `Shown once. Copy it now; this URL cannot be retrieved later.`
-    + (protectedGrant ? ' This download is password-protected. Send the password by a separate channel.' : '');
-  $('outbound-copy').onclick = async () => {
-    await navigator.clipboard.writeText(url);
-    $('outbound-copy').textContent = 'Copied';
-  };
-}
 
 function grantStatus(grant) {
   if (grant.revoked_at) return 'revoked';

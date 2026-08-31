@@ -23,6 +23,16 @@ const MAX_PASSWORD_BYTES: usize = 256;
 const PRINCIPAL_PAGE_DEFAULT: usize = 50;
 const PRINCIPAL_PAGE_MAX: usize = 100;
 
+/// Signed admin cookie for a test identity; the shared body behind each
+/// test module's `cookie_for`.
+#[cfg(test)]
+fn test_admin_cookie(app: &App, identity: &auth::AdminIdentity) -> String {
+    format!(
+        "votport_admin={}; Path=/",
+        auth::issue_admin_token(&app.secret, identity, &admin_token_phc(app).unwrap())
+    )
+}
+
 /// Credential tag bound into admin token MACs: the stored hash when the
 /// UI has set one, else the stable tag derived from the environment
 /// credential. Either way, rotating the credential evicts sessions and a
@@ -129,11 +139,19 @@ fn admin_hash(app: &App) -> ApiResult<String> {
         .unwrap_or_else(|| app.config.admin_password_hash.clone()))
 }
 
-/// Builds the signed admin session cookie value for `identity`.
+/// Builds the signed admin session cookie value for `identity`. The local
+/// break-glass subject keeps the fixed 7-day lifetime; SSO identities use
+/// the configurable (shorter) one so IdP-side offboarding is bounded.
 pub(crate) fn issue_admin_cookie(app: &App, identity: &auth::AdminIdentity) -> ApiResult<String> {
-    let token = auth::issue_admin_token(&app.secret, identity, &admin_token_phc(app)?);
+    let ttl = if identity.subject == "local" {
+        7 * 24 * 3600
+    } else {
+        app.config.sso_session_secs
+    };
+    let token =
+        auth::issue_admin_token_with_ttl(&app.secret, identity, &admin_token_phc(app)?, ttl);
     Ok(format!(
-        "{ADMIN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{}",
+        "{ADMIN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl}{}",
         cookie_attributes(app)
     ))
 }
@@ -3125,10 +3143,7 @@ mod tenant_authz_tests {
             }],
             credential_version: 1,
         };
-        format!(
-            "votport_admin={}; Path=/",
-            auth::issue_admin_token(&app.secret, &identity, &admin_token_phc(app).unwrap())
-        )
+        super::test_admin_cookie(app, &identity)
     }
 
     #[tokio::test]
@@ -4180,6 +4195,8 @@ mod ops_tests {
             default_max_sessions: None,
             public_password_login: true,
             metrics_token: None,
+            max_total_sessions: 32,
+            sso_session_secs: 12 * 3600,
             trusted_proxies: Vec::new(),
             oidc: None,
         }
@@ -4537,10 +4554,7 @@ mod settings_api_tests {
             }],
             credential_version: 1,
         };
-        format!(
-            "votport_admin={}; Path=/",
-            auth::issue_admin_token(&app.secret, &identity, &admin_token_phc(app).unwrap())
-        )
+        super::test_admin_cookie(app, &identity)
     }
 
     async fn send(
@@ -5183,10 +5197,7 @@ mod principals_api_tests {
     use crate::auth::{self, TenantGrant};
 
     fn cookie_for(app: &App, identity: auth::AdminIdentity) -> String {
-        format!(
-            "votport_admin={}; Path=/",
-            auth::issue_admin_token(&app.secret, &identity, &admin_token_phc(app).unwrap())
-        )
+        super::test_admin_cookie(app, &identity)
     }
 
     fn sso_identity(subject: &str, cv: u64) -> auth::AdminIdentity {

@@ -22,10 +22,9 @@ use crate::store::{now_unix, Link};
 
 use super::{client_ip, cookie_attributes, ApiError, ApiResult};
 
-// Worst case memory: MAX_SESSIONS x 8 in-flight chunks x ~9 MiB of queued
-// request bodies, plus each worker's pinned merkle trees. Raising these caps
-// raises that ceiling linearly.
-const MAX_SESSIONS: usize = 32;
+// Worst case memory: max_total_sessions (VOTPORT_MAX_TOTAL_SESSIONS, default
+// 32) x 8 in-flight chunks x ~9 MiB of queued request bodies, plus each
+// worker's pinned merkle trees. Raising the cap raises that ceiling linearly.
 const MAX_SESSIONS_PER_LINK: usize = 8;
 
 /// Cookie carrying proof that this link's password was verified once.
@@ -398,7 +397,7 @@ async fn register_session(
                 max_total_bytes: prepared.max_total,
                 max_tenant_sessions: prepared.max_sessions,
                 max_link_sessions: MAX_SESSIONS_PER_LINK,
-                max_sessions: MAX_SESSIONS,
+                max_sessions: app.config.max_total_sessions,
                 kind,
             },
             sender,
@@ -516,13 +515,17 @@ pub async fn create_session(
         session_tag = %session_id.get(..8).unwrap_or(&session_id),
         bytes = announced_bytes, "upload session started"
     );
-    app.store.audit(
-        &prepared.link.tenant,
-        "",
-        "upload_session_created",
-        &prepared.link.id,
-        &serde_json::json!({ "session_tag": &session_id[..8.min(session_id.len())], "bytes": announced_bytes }),
-    );
+    // Off the runtime thread: the audit insert takes the store lock and an
+    // fsync'd commit, and this is the hottest write path in the app.
+    let store = Arc::clone(&app.store);
+    let tenant = prepared.link.tenant.clone();
+    let link_id = prepared.link.id.clone();
+    let detail = serde_json::json!({ "session_tag": &session_id[..8.min(session_id.len())], "bytes": announced_bytes });
+    tokio::task::spawn_blocking(move || {
+        store.audit(&tenant, "", "upload_session_created", &link_id, &detail)
+    })
+    .await
+    .ok();
     Ok(Json(json!({
         "session": session_id,
         "chunk_bytes": session::CHUNK_BYTES,

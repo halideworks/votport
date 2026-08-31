@@ -33,9 +33,11 @@ library, use **Deliver** to choose one or more files. Server-rendered projects
 may populate nested project subdirectories under the outbound directory, and
 admin uploads land there too. VOTPort issues one expiring bearer URL for the
 selection, shown once and revocable by an admin.
-Before a download starts, the server copies each source into private staging,
-verifies its VOT object identity and signed receipt, then serves an immutable
-verified copy. Individual files support RFC 9110 single-byte-range requests for
+Before an individual file download starts, the server verifies the source's
+VOT object identity and signed receipt against a cached proof catalog (built
+once per object), then streams verified ranges directly from the source. ZIP
+and grouped batch downloads copy each source into private staging and verify
+it per request. Individual files support RFC 9110 single-byte-range requests for
 resumable downloads; each logical file download is counted once and a short-lived
 secure lease permits subsequent ranges. For multi-file deliveries, recipients may download a payload-only
 ZIP or stream the files separately in bulk; signed receipts remain optional

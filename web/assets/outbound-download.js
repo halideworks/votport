@@ -61,6 +61,50 @@ export async function saveBatchFiles(response, directory, files, names, onComple
   }
 }
 
+export const SAVE_RETRY_LIMIT = 5;
+
+// Streams file.download_url into an open writable, retrying transient
+// failures with a byte-range resume so bytes already on disk are kept. A
+// resume answered with 200 instead of 206 (range ignored, e.g. the download
+// lease expired) starts the file over. The caller closes or aborts the
+// writable. fetchFn and sleep are injectable for tests.
+export async function streamToWritable(fetchFn, writable, file, options = {}) {
+  const retries = options.retries ?? SAVE_RETRY_LIMIT;
+  const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  let written = 0;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const headers = written ? { Range: `bytes=${written}-` } : {};
+      const response = await fetchFn(file.download_url, { credentials: 'same-origin', headers });
+      if (response.status >= 500 || response.status === 429) {
+        throw Object.assign(new Error(`server returned ${response.status}`), { transient: true });
+      }
+      if (!response.ok) throw new Error(`server returned ${response.status}`);
+      if (!response.body) throw new Error('browser cannot stream this response');
+      if (written && response.status !== 206) {
+        await writable.truncate(0);
+        written = 0;
+      }
+      const reader = response.body.getReader();
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          await writable.write(value);
+          written += value.byteLength;
+        }
+      } finally {
+        reader.releaseLock();
+      }
+      return written;
+    } catch (error) {
+      const transient = error.transient || error instanceof TypeError;
+      if (!transient || attempt + 1 >= retries) throw error;
+      await sleep(Math.min(500 * 2 ** attempt, 8000));
+    }
+  }
+}
+
 export function nextFileBatch(files, offset = 0) {
   const start = Math.max(0, Math.min(offset, files.length));
   return files.slice(start, start + FILE_RENDER_BATCH_SIZE);

@@ -3,6 +3,10 @@ services:
     build: .
     container_name: votport
     restart: unless-stopped
+    # Docker's default 10s SIGKILL cuts off streaming downloads mid-transfer.
+    # No value covers a 500 GiB upload; for upgrades, drain first (stop
+    # admitting sessions, watch votport_sessions_active reach 0).
+    stop_grace_period: 5m
     # Received files land in /mediastorage-pool as davidtorcivia:davidtorcivia,
     # matching the other *-in drop folders, instead of root.
     user: "1000:1000"

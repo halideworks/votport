@@ -116,12 +116,33 @@ export function alertModal(message) {
   dialog.showModal();
 }
 
-export function formatBytes(bytes) {
-  if (bytes === 0) return '0 B';
-  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
-  const exponent = Math.min(Math.floor(Math.log2(bytes) / 10), units.length - 1);
-  const value = bytes / 2 ** (10 * exponent);
-  return `${value >= 100 || exponent === 0 ? Math.round(value) : value.toFixed(1)} ${units[exponent]}`;
+export { formatBytes } from '/assets/object-card.js';
+
+/// Action button whose async handler reports failures via the shared modal.
+export function button(text, classes, onClick) {
+  const element = document.createElement('button');
+  element.type = 'button';
+  element.className = classes;
+  element.textContent = text;
+  element.addEventListener('click', () => {
+    onClick().catch?.((error) => alertModal(error.message));
+  });
+  return element;
+}
+
+/// Fills the shared show-once outbound grant URL card on receive/deliver.
+export function showGrantResult(url, protectedGrant = false) {
+  const output = document.getElementById('outbound-url');
+  document.getElementById('outbound-result').hidden = false;
+  output.value = url;
+  output.onclick = () => output.select();
+  document.getElementById('outbound-note').textContent =
+    `Shown once. Copy it now; this URL cannot be retrieved later.`
+    + (protectedGrant ? ' This download is password-protected. Send the password by a separate channel.' : '');
+  document.getElementById('outbound-copy').onclick = async () => {
+    await navigator.clipboard.writeText(url);
+    document.getElementById('outbound-copy').textContent = 'Copied';
+  };
 }
 
 export function formatWhen(unixSeconds) {

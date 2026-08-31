@@ -484,6 +484,10 @@ CREATE TABLE IF NOT EXISTS links (
 );
 ";
 
+/// Audit rows the store failed to persist since boot; exported on /metrics.
+pub static AUDIT_INSERT_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub struct Store {
     connection: Mutex<Connection>,
     path: PathBuf,
@@ -3052,8 +3056,15 @@ impl Store {
         subject: &str,
         detail: &serde_json::Value,
     ) {
-        let _ = self
-            .with(|connection| insert_audit_row(connection, tenant, actor, event, subject, detail));
+        if let Err(error) = self
+            .with(|connection| insert_audit_row(connection, tenant, actor, event, subject, detail))
+        {
+            // Best-effort by design: the tracing event above each call site
+            // still records the action. The counter lets operators alert on
+            // the divergence between the log and the exportable trail.
+            AUDIT_INSERT_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(%error, event, "audit row insert failed");
+        }
     }
 
     /// Changes a legal hold and records it in the same transaction.
@@ -5928,6 +5939,8 @@ mod settings_tests {
             audit_retention_days: 400,
             upload_retention_days: 0,
             metrics_token: None,
+            max_total_sessions: 32,
+            sso_session_secs: 12 * 3600,
             trusted_proxies: Vec::new(),
             oidc: None,
             default_max_total_bytes: None,

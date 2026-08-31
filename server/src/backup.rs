@@ -1146,17 +1146,6 @@ pub fn ensure_backup_root(path: &Path) -> Result<PathBuf, String> {
     Ok(path.to_path_buf())
 }
 
-pub fn prune_local(
-    data_dir: &Path,
-    retention_days: u64,
-    retention_count: u64,
-) -> Result<(), String> {
-    prune_local_root(
-        &ensure_backups_dir(data_dir)?,
-        retention_days,
-        retention_count,
-    )
-}
 pub fn prune_local_root(
     root: &Path,
     retention_days: u64,
@@ -1422,9 +1411,6 @@ async fn prune_s3_store(
     Ok(())
 }
 
-pub fn inventory_local(data_dir: &Path) -> Result<Vec<InventoryItem>, String> {
-    inventory_local_root(&ensure_backups_dir(data_dir)?)
-}
 pub fn inventory_local_root(root: &Path) -> Result<Vec<InventoryItem>, String> {
     validate_private_ancestry(root, None)?;
     let mut result = Vec::new();

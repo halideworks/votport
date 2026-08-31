@@ -731,8 +731,10 @@ async function runUpload() {
           }
         }
         if (!entries) {
-          const session = await apiJson(`/api/r/${token}/session`, {
-            method: 'POST',
+          // Retried like every other call in the send path. A retry after a
+          // request that reached the server can orphan a session; the server
+          // sweeps idle sessions, so that costs nothing durable.
+          const session = await postWithRetry(`/api/r/${token}/session`, {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               password: password || null,
