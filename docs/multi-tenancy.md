@@ -4,7 +4,7 @@ Status: phases 1-5 shipped (#23 store, #24 audit, #25 SSO, #26 tenants,
 #27 ops polish) plus the multi-page admin (#28). Phases 6+ shipped (settings
 overlay, SMTP, SSO discovery retry, principals/revoke, tenant purge, backup
 streaming). Design: [`enterprise-ops.md`](enterprise-ops.md). Per-link legal
-hold is also shipped. Automation tokens shipped for one route; per-token scopes remain.
+hold is also shipped. Automation tokens shipped for one route, optionally confined to a library folder.
 Each phase landed as its own PR with the standard gate (fmt, clippy -D
 warnings, tests, e2e, docker build) and review.
 
@@ -157,8 +157,8 @@ of scope (see `docs/deployment.md`).
   ever outgrows one node, the `Store` struct is the seam (a trait gets introduced
   only when a second backend actually exists).
 - Public API tokens: `POST /api/automation/share` accepts per-tenant bearer
-  tokens with expiry, revocation, a per-IP rate limit, and audit rows for use
-  and refusal. Scoped grants would matter once a second route accepts them.
+  tokens with expiry, revocation, a per-IP rate limit, an optional folder
+  scope, and audit rows for use and token refusal.
 
 ## Deliberately unchanged
 

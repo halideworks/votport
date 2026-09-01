@@ -89,7 +89,7 @@
         <summary>Automation tokens</summary>
         <section class="card" aria-labelledby="automation-token-create-title">
           <h2 id="automation-token-create-title">Create automation token</h2>
-          <p class="muted">This token can create transfer links for this tenant only.</p>
+          <p class="muted">This token can create download links for this tenant only and, if a folder is set, only under that folder.</p>
           <form id="automation-token-form">
             <div class="grid">
               <label>Label
@@ -97,6 +97,9 @@
               </label>
               <label>Expires after <span class="muted">days</span>
                 <input id="automation-token-expires" type="number" min="1" max="365" value="30" required />
+              </label>
+              <label>Restrict to folder <span class="muted">library path, optional</span>
+                <input id="automation-token-directory" class="mono" maxlength="512" placeholder="any folder" />
               </label>
             </div>
             <button type="submit" id="automation-token-submit">Issue token</button>

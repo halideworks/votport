@@ -124,6 +124,9 @@ pub struct AutomationToken {
     pub token_hash: String,
     pub tenant: String,
     pub label: String,
+    /// Library directory this token may share, itself or below; None means
+    /// any directory in the tenant's library.
+    pub directory: Option<String>,
     pub created_at: u64,
     pub expires_at: u64,
     pub revoked_at: Option<u64>,
@@ -371,7 +374,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 19;
+pub(crate) const SCHEMA_VERSION: u64 = 20;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -426,6 +429,10 @@ UPDATE files SET stored_as = COALESCE((
         '$[' || files.upload_index || '].files[' || files.file_index || '].stored_as')
     FROM links WHERE links.id = files.link_id), '');
 ";
+
+// Tokens issued before v20 carry no folder scope; the column is nullable.
+const AUTOMATION_TOKEN_DIRECTORY_SCHEMA: &str =
+    "ALTER TABLE automation_tokens ADD COLUMN directory TEXT;";
 
 const OUTBOUND_GRANTS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS outbound_grants (
@@ -503,7 +510,8 @@ CREATE TABLE IF NOT EXISTS automation_tokens (
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     revoked_at INTEGER,
-    last_used_at INTEGER
+    last_used_at INTEGER,
+    directory TEXT
 );
 CREATE INDEX IF NOT EXISTS automation_tokens_tenant_created
     ON automation_tokens(tenant, created_at);
@@ -1008,6 +1016,22 @@ impl Store {
                 .execute_batch(FILES_STORED_AS_BACKFILL)
                 .map_err(|error| format!("schema: {error}"))?;
         }
+        if stored < 20 {
+            // Tables created before v20 gain the column; fresh ones have it.
+            let has_column: bool = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('automation_tokens')
+                     WHERE name = 'directory'",
+                    [],
+                    |row| row.get::<_, i64>(0).map(|count| count > 0),
+                )
+                .map_err(|error| format!("schema: {error}"))?;
+            if !has_column {
+                transaction
+                    .execute_batch(AUTOMATION_TOKEN_DIRECTORY_SCHEMA)
+                    .map_err(|error| format!("schema: {error}"))?;
+            }
+        }
         transaction
             .execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
@@ -1128,8 +1152,8 @@ impl Store {
                 .execute(
                     "INSERT INTO automation_tokens
                          (id, token_hash, tenant, label, created_at, expires_at, revoked_at,
-                          last_used_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                          last_used_at, directory)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     rusqlite::params![
                         token.id,
                         token.token_hash,
@@ -1143,6 +1167,7 @@ impl Store {
                         token
                             .last_used_at
                             .map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
+                        token.directory,
                     ],
                 )
                 .map(|_| ())
@@ -1153,7 +1178,7 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, token_hash, tenant, label, created_at, expires_at, revoked_at,
-                        last_used_at
+                        last_used_at, directory
                  FROM automation_tokens
                  WHERE tenant = ?1 ORDER BY created_at, rowid",
             )?;
@@ -1175,7 +1200,7 @@ impl Store {
                      SET last_used_at = ?2
                      WHERE token_hash = ?1 AND revoked_at IS NULL AND expires_at > ?2
                      RETURNING id, token_hash, tenant, label, created_at, expires_at,
-                               revoked_at, last_used_at",
+                               revoked_at, last_used_at, directory",
                     rusqlite::params![token_hash, at],
                     map_automation_token,
                 )
@@ -3378,6 +3403,7 @@ fn map_automation_token(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationT
         token_hash: row.get("token_hash")?,
         tenant: row.get("tenant")?,
         label: row.get("label")?,
+        directory: row.get("directory")?,
         created_at: row.get::<_, i64>("created_at")?.max(0) as u64,
         expires_at: row.get::<_, i64>("expires_at")?.max(0) as u64,
         revoked_at: row
@@ -4067,6 +4093,7 @@ mod tests {
             token_hash: format!("hash-{id}"),
             tenant: tenant.to_owned(),
             label: format!("Token {id}"),
+            directory: None,
             created_at: 10,
             expires_at: 20,
             revoked_at: None,
@@ -5832,6 +5859,39 @@ mod tenant_tests {
             .unwrap();
         assert_eq!(paths, ["a.bin", "a.bin"]);
         assert_eq!(store.tenant_received_bytes("acme").unwrap(), 300);
+    }
+
+    /// A v19 token table gains the nullable directory column.
+    #[test]
+    fn v20_adds_the_token_directory_column() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .insert_automation_token(AutomationToken {
+                id: "t1".to_owned(),
+                token_hash: "hash-t1".to_owned(),
+                tenant: String::new(),
+                label: "Token".to_owned(),
+                directory: None,
+                created_at: 10,
+                expires_at: 20,
+                revoked_at: None,
+                last_used_at: None,
+            })
+            .unwrap();
+        store
+            .with(|connection| {
+                connection.execute_batch(
+                    "ALTER TABLE automation_tokens DROP COLUMN directory;
+                     UPDATE meta SET value = '19' WHERE key = 'schema_version';",
+                )
+            })
+            .unwrap();
+        drop(store);
+        let store = Store::open(directory.path()).unwrap();
+        let tokens = store.automation_tokens("").unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].directory, None);
     }
 
     #[test]

@@ -82,7 +82,7 @@ A security team can put one instance behind their IdP, give each group a namespa
 - Closing the quota TOCTOU.
 - Dashboard rewrite, component library, Kubernetes.
 - Invites or SCIM.
-- Automation tokens exist (`POST /api/automation/share`, per-tenant, expiring, revocable, rate limited per IP, refusals audited). Scopes beyond that one route are unbuilt.
+- Automation tokens exist (`POST /api/automation/share`, per-tenant, expiring, revocable, rate limited per IP, optionally confined to a library folder, use and token refusal audited).
 - Legal hold versus retention (per-tenant or per-link "do not sweep" flag). Own design later.
 
 ### Engineering constraints
@@ -956,7 +956,7 @@ Rollback: revert the PR. Schema v4/v5 tables are additive; a reverted binary tha
 
 ## Follow-ons (write-first, not these PRs)
 
-- **Automation token scopes.** Tokens today reach one route, `POST /api/automation/share`, behind their own `SessionRate` (60 / IP / 10 min), with expiry, revocation, and audit of both use and refusal. Per-token grants would matter once a second route accepts them.
+- **Automation tokens.** One route, `POST /api/automation/share`, behind its own `SessionRate` (60 / IP / 10 min), with expiry, revocation, an optional folder scope (a token restricted to `project` shares `project` and paths below it, nothing else), and audit of both use and token refusal.
 - **Legal hold vs retention.** A per-tenant or per-link "do not sweep" flag when a customer names a case. Own design. Until then, `upload_retention_days = 0` is the hold.
 
 ## References
