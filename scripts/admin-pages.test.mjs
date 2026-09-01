@@ -10,7 +10,11 @@ const system = await readFile(new URL('../web/system.html', import.meta.url), 'u
 const receiveScript = await readFile(new URL('../web/assets/page-receive.js', import.meta.url), 'utf8');
 const deliverScript = await readFile(new URL('../web/assets/page-deliver.js', import.meta.url), 'utf8');
 const tenantsScript = await readFile(new URL('../web/assets/page-tenants.js', import.meta.url), 'utf8');
+const systemScript = await readFile(new URL('../web/assets/page-system.js', import.meta.url), 'utf8');
 const commonScript = await readFile(new URL('../web/assets/admin-common.js', import.meta.url), 'utf8');
+const brandingScript = await readFile(new URL('../web/assets/branding.js', import.meta.url), 'utf8');
+const uploadScript = await readFile(new URL('../web/assets/upload.js', import.meta.url), 'utf8');
+const outboundScript = await readFile(new URL('../web/assets/outbound.js', import.meta.url), 'utf8');
 const style = await readFile(new URL('../web/assets/style.css', import.meta.url), 'utf8');
 
 test('receive and deliver pages keep transfer concerns separate', () => {
@@ -46,6 +50,30 @@ test('admin navigation exposes the current page and tenant selector', () => {
   for (const page of [receive, deliver, audit, tenants, system]) {
     assert.match(page, /<select id="tenant-switcher" aria-label="Tenant" hidden>/);
   }
+});
+
+test('public pages apply tenant branding from their metadata', () => {
+  assert.match(brandingScript, /export function applyBranding/);
+  assert.match(brandingScript, /document\.createElement\('img'\)/);
+  assert.doesNotMatch(brandingScript, /innerHTML/);
+  assert.match(brandingScript, /setProperty\('--progress', branding\.color\)/);
+  assert.ok(brandingScript.includes('/^#[0-9a-fA-F]{6}$/'));
+  assert.match(brandingScript, /if \(!branding\) return;/);
+  assert.match(uploadScript, /applyBranding\(info\.branding, `\/api\/r\/\$\{token\}\/logo`\)/);
+  assert.match(outboundScript, /applyBranding\(body\.branding, `\/api\/s\/\$\{encodeURIComponent\(token\)\}\/logo`\)/);
+  assert.match(style, /\.masthead \.brand-logo/);
+});
+
+test('admin pages expose the branding forms', () => {
+  assert.match(system, /id="branding-form"/);
+  assert.match(system, /id="branding-color"[^>]*\n?[^>]*type="color"/);
+  assert.match(system, /id="branding-logo"/);
+  assert.match(systemScript, /api\('\/api\/admin\/branding\/default'/);
+  assert.match(systemScript, /'Content-Type': file\.type/);
+  assert.match(tenantsScript, /api\(`\/api\/admin\/branding\/\$\{key\}`/);
+  assert.match(tenantsScript, /api\(`\/api\/admin\/branding\/\$\{key\}\/logo`/);
+  assert.match(tenantsScript, /colorInput\.type = 'color'/);
+  assert.match(tenantsScript, /logoInput\.type = 'file'/);
 });
 
 test('tenant principals use a bounded searchable page', () => {

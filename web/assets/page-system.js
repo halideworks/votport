@@ -373,6 +373,99 @@ $('quotas-form').addEventListener('submit', async (event) => {
   await saveSettings(event.currentTarget, body);
 });
 
+// type=color always holds a value; the flag records whether one is meant.
+let brandingColorSet = false;
+$('branding-color').addEventListener('input', () => {
+  brandingColorSet = true;
+});
+$('branding-color-clear').addEventListener('click', () => {
+  brandingColorSet = false;
+  $('branding-color').value = '#000000';
+});
+
+async function fillBranding() {
+  const branding = await api('/api/admin/branding/default');
+  $('branding-name').value = branding.name || '';
+  if (branding.color) {
+    $('branding-color').value = branding.color;
+    brandingColorSet = true;
+  }
+  $('branding-logo-remove').disabled = !branding.has_logo;
+}
+
+$('branding-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  formNote(event.currentTarget, '');
+  try {
+    await api('/api/admin/branding/default', {
+      method: 'PUT',
+      body: JSON.stringify({
+        name: $('branding-name').value,
+        color: brandingColorSet ? $('branding-color').value : '',
+      }),
+    });
+    formNote(event.currentTarget, 'Saved.');
+  } catch (error) {
+    formError(event.currentTarget, error);
+  }
+});
+
+$('branding-logo-upload').addEventListener('click', async () => {
+  const form = $('branding-form');
+  formNote(form, '');
+  const file = $('branding-logo').files?.[0];
+  if (!file) {
+    formError(form, new Error('Choose a logo file first.'));
+    return;
+  }
+  try {
+    await api('/api/admin/branding/default/logo', {
+      method: 'PUT',
+      headers: { 'Content-Type': file.type || 'application/octet-stream' },
+      body: file,
+    });
+    $('branding-logo').value = '';
+    await fillBranding();
+    formNote(form, 'Logo uploaded.');
+  } catch (error) {
+    formError(form, error);
+  }
+});
+
+$('branding-logo-remove').addEventListener('click', async () => {
+  const form = $('branding-form');
+  formNote(form, '');
+  try {
+    await api('/api/admin/branding/default/logo', { method: 'DELETE' });
+    await fillBranding();
+    formNote(form, 'Logo removed.');
+  } catch (error) {
+    formError(form, error);
+  }
+});
+
+$('branding-remove').addEventListener('click', async () => {
+  const form = $('branding-form');
+  if (
+    !(await confirmModal(
+      'Remove branding',
+      'Recipient pages for the default tenant go back to the stock appearance.',
+      'Remove',
+    ))
+  )
+    return;
+  formNote(form, '');
+  try {
+    await api('/api/admin/branding/default', { method: 'DELETE' });
+    form.reset();
+    brandingColorSet = false;
+    await fillBranding();
+    formNote(form, 'Branding removed.');
+  } catch (error) {
+    formError(form, error);
+  }
+});
+
 $('signin-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   if ($('signin-collapse').disabled || $('signin-save').disabled) {
@@ -517,6 +610,11 @@ try {
 } catch (error) {
   formError($('notify-form'), error);
   formError($('smtp-form'), error);
+}
+try {
+  await fillBranding();
+} catch (error) {
+  formError($('branding-form'), error);
 }
 try {
   fillBackups(await api('/api/admin/backups'));

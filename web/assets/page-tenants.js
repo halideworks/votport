@@ -116,6 +116,133 @@ function editTenantForm(tenant) {
   return details;
 }
 
+function brandingForm(tenant) {
+  const key = encodeURIComponent(tenant.key === '' ? 'default' : tenant.key);
+  const details = document.createElement('details');
+  const summary = document.createElement('summary');
+  summary.textContent = 'Branding';
+  details.append(summary);
+  const form = document.createElement('form');
+  form.className = 'tenant-edit';
+  const grid = document.createElement('div');
+  grid.className = 'grid';
+
+  const nameLabel = document.createElement('label');
+  nameLabel.textContent = 'Brand name';
+  const nameInput = document.createElement('input');
+  nameInput.type = 'text';
+  nameLabel.append(nameInput);
+
+  const colorLabel = document.createElement('label');
+  colorLabel.textContent = 'Accent color';
+  const colorInput = document.createElement('input');
+  colorInput.type = 'color';
+  colorLabel.append(colorInput);
+  // type=color always holds a value; the flag records whether one is meant.
+  let colorSet = false;
+  colorInput.addEventListener('input', () => {
+    colorSet = true;
+  });
+
+  const logoLabel = document.createElement('label');
+  logoLabel.textContent = 'Logo (PNG, JPEG, or SVG, 512 KiB max)';
+  const logoInput = document.createElement('input');
+  logoInput.type = 'file';
+  logoInput.accept = 'image/png,image/jpeg,image/svg+xml';
+  logoLabel.append(logoInput);
+
+  grid.append(nameLabel, colorLabel, logoLabel);
+
+  const save = document.createElement('button');
+  save.type = 'submit';
+  save.className = 'tiny';
+  save.textContent = 'Save branding';
+  const error = document.createElement('p');
+  error.className = 'error';
+  error.setAttribute('role', 'alert');
+  error.hidden = true;
+
+  const load = async () => {
+    const branding = await api(`/api/admin/branding/${key}`);
+    nameInput.value = branding.name || '';
+    if (branding.color) {
+      colorInput.value = branding.color;
+      colorSet = true;
+    }
+    logoLabel.firstChild.textContent = branding.has_logo
+      ? 'Logo (uploaded; choose a file to replace)'
+      : 'Logo (PNG, JPEG, or SVG, 512 KiB max)';
+  };
+  let loaded = false;
+  details.addEventListener('toggle', () => {
+    if (!details.open || loaded) return;
+    loaded = true;
+    load().catch((requestError) => alertModal(requestError.message));
+  });
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    save.disabled = true;
+    error.hidden = true;
+    try {
+      await api(`/api/admin/branding/${key}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          name: nameInput.value,
+          color: colorSet ? colorInput.value : '',
+        }),
+      });
+    } catch (requestError) {
+      error.textContent = requestError.message;
+      error.hidden = false;
+    } finally {
+      save.disabled = false;
+    }
+  });
+
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+  actions.append(
+    button('Clear color', 'ghost tiny', async () => {
+      colorSet = false;
+      colorInput.value = '#000000';
+    }),
+    button('Upload logo', 'tiny', async () => {
+      const file = logoInput.files?.[0];
+      if (!file) throw new Error('Choose a logo file first.');
+      await api(`/api/admin/branding/${key}/logo`, {
+        method: 'PUT',
+        headers: { 'Content-Type': file.type || 'application/octet-stream' },
+        body: file,
+      });
+      logoInput.value = '';
+      await load();
+    }),
+    button('Remove logo', 'tiny danger', async () => {
+      await api(`/api/admin/branding/${key}/logo`, { method: 'DELETE' });
+      await load();
+    }),
+    button('Remove branding', 'tiny danger', async () => {
+      if (
+        !(await confirmModal(
+          'Remove branding',
+          'Recipient pages for this tenant go back to the stock appearance.',
+          'Remove',
+        ))
+      )
+        return;
+      await api(`/api/admin/branding/${key}`, { method: 'DELETE' });
+      form.reset();
+      colorSet = false;
+      await load();
+    }),
+  );
+
+  form.append(grid, save, actions, error);
+  details.append(form);
+  return details;
+}
+
 function renderTenant(tenant, usage) {
   const card = document.createElement('div');
   card.className = 'card link-item';
@@ -140,7 +267,7 @@ function renderTenant(tenant, usage) {
   if (tenant.admin_group) parts.push(`admins: ${tenant.admin_group}`);
   meta.textContent = parts.join(' · ');
   card.append(meta);
-  if (tenant.key !== '') card.append(editTenantForm(tenant));
+  if (tenant.key !== '') card.append(editTenantForm(tenant), brandingForm(tenant));
 
   if (tenant.key !== '') {
     card.append(

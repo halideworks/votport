@@ -33,6 +33,17 @@ pub fn portable_tenant_key(key: &str) -> bool {
             && matches!(key.as_bytes()[3], b'1'..=b'9'))
 }
 
+/// On-disk location for a tenant's uploaded logo. The tenant key is hex
+/// encoded so arbitrary legacy keys cannot shape the path.
+pub fn branding_logo_path(data_dir: &Path, tenant: &str, ext: &str) -> PathBuf {
+    let stem = if tenant.is_empty() {
+        "default".to_owned()
+    } else {
+        hex::encode(tenant.as_bytes())
+    };
+    data_dir.join("branding").join(format!("{stem}.{ext}"))
+}
+
 /// Drops group/other write bits on a directory files are received into. VOT
 /// stages next to the destination and refuses a group-writable parent, so a
 /// mount created 0775 (umask 002 hosts) would fail every upload into it.

@@ -709,6 +709,14 @@ pub async fn delete_tenant(
     } else {
         (None, None)
     };
+    // Read before the row delete cascades the branding row away.
+    let logo_ext = app
+        .store
+        .branding(&key)
+        .ok()
+        .flatten()
+        .map(|branding| branding.logo_ext)
+        .filter(|ext| !ext.is_empty());
     use crate::store::TenantRemoval;
     let row_deleted = match app.store.remove_tenant(&key) {
         Ok(TenantRemoval::Deleted) => true,
@@ -756,6 +764,12 @@ pub async fn delete_tenant(
                     "tenant subtree purge failed; retry DELETE",
                 ));
             }
+        }
+    }
+    if row_deleted {
+        if let Some(ext) = logo_ext {
+            let stale = paths::branding_logo_path(&app.config.data_dir, &key, &ext);
+            let _ = tokio::fs::remove_file(stale).await;
         }
     }
     app.sessions.unpin_tenant(&key);
@@ -857,6 +871,321 @@ pub async fn update_tenant(
             "max_links": tenant.max_links,
             "max_sessions": tenant.max_sessions,
         }),
+    );
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Hard cap on stored logo bytes; the route body limit adds header slack.
+pub(crate) const MAX_LOGO_BYTES: usize = 512 * 1024;
+
+/// Maps the branding path key to a stored tenant: "default" is the default
+/// tenant (""), anything else must name an existing tenant row.
+fn branding_tenant(app: &App, key: &str, identity: &auth::AdminIdentity) -> ApiResult<String> {
+    let tenant = if key == "default" {
+        String::new()
+    } else {
+        admit_tenant_ref(key)?
+    };
+    // Grant check before the store lookup: a foreign admin learns nothing
+    // about which tenant keys exist.
+    if !identity
+        .grants
+        .iter()
+        .any(|grant| grant.role == "admin" && (grant.tenant == tenant || grant.tenant.is_empty()))
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "no admin access to that tenant",
+        ));
+    }
+    if !tenant.is_empty()
+        && app
+            .store
+            .tenant(&tenant)
+            .map_err(super::store_unavailable)?
+            .is_none()
+    {
+        return Err(ApiError::not_found());
+    }
+    Ok(tenant)
+}
+
+fn admit_brand_color(color: &str) -> ApiResult<()> {
+    let valid = color.is_empty()
+        || (color.len() == 7
+            && color.starts_with('#')
+            && color.bytes().skip(1).all(|byte| byte.is_ascii_hexdigit()));
+    if valid {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "color must be empty or #rrggbb",
+        ))
+    }
+}
+
+/// Audit subject for branding events; the default tenant has no key to name.
+fn branding_subject(tenant: &str) -> &str {
+    if tenant.is_empty() {
+        "default"
+    } else {
+        tenant
+    }
+}
+
+/// Current branding for the admin form. Empty fields when no row exists.
+pub async fn get_branding(
+    State(app): State<Arc<App>>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_operator(&app, &headers)?;
+    let tenant = branding_tenant(&app, &key, &identity)?;
+    let branding = app
+        .store
+        .branding(&tenant)
+        .map_err(super::store_unavailable)?;
+    Ok(Json(match branding {
+        Some(branding) => json!({
+            "name": branding.name,
+            "color": branding.color,
+            "has_logo": !branding.logo_ext.is_empty(),
+        }),
+        None => json!({ "name": "", "color": "", "has_logo": false }),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct PutBrandingRequest {
+    name: String,
+    #[serde(default)]
+    color: String,
+}
+
+/// Sets a tenant's recipient-facing name and accent color. The logo has its
+/// own PUT; its stored extension survives this write.
+pub async fn put_branding(
+    State(app): State<Arc<App>>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<PutBrandingRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_operator(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
+    let tenant = branding_tenant(&app, &key, &identity)?;
+    admit_brand_color(&request.color)?;
+    let logo_ext = app
+        .store
+        .branding(&tenant)
+        .map_err(super::store_unavailable)?
+        .map(|branding| branding.logo_ext)
+        .unwrap_or_default();
+    let branding = crate::store::Branding {
+        tenant: tenant.clone(),
+        name: request.name.trim().to_owned(),
+        color: request.color,
+        logo_ext,
+        updated_at: now_unix(),
+    };
+    app.store
+        .set_branding(&branding)
+        .map_err(ApiError::internal)?;
+    tracing::info!(target: "audit", event = "branding_updated", tenant = %tenant, "tenant branding updated");
+    app.store.audit(
+        &tenant,
+        &identity.subject,
+        "branding_updated",
+        branding_subject(&tenant),
+        &json!({ "name": branding.name, "color": branding.color }),
+    );
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Removes a tenant's branding row and any stored logo file.
+pub async fn delete_branding(
+    State(app): State<Arc<App>>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_operator(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
+    let tenant = branding_tenant(&app, &key, &identity)?;
+    let logo_ext = app
+        .store
+        .branding(&tenant)
+        .map_err(super::store_unavailable)?
+        .map(|branding| branding.logo_ext)
+        .ok_or_else(ApiError::not_found)?;
+    app.store
+        .delete_branding(&tenant)
+        .map_err(ApiError::internal)?;
+    if !logo_ext.is_empty() {
+        let path = paths::branding_logo_path(&app.config.data_dir, &tenant, &logo_ext);
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    tracing::info!(target: "audit", event = "branding_deleted", tenant = %tenant, "tenant branding removed");
+    app.store.audit(
+        &tenant,
+        &identity.subject,
+        "branding_deleted",
+        branding_subject(&tenant),
+        &json!({}),
+    );
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Declared logo type checked against the leading bytes. SVG has no magic
+/// and is stored as declared; the serving CSP is what keeps it inert.
+fn admit_logo(headers: &HeaderMap, bytes: &[u8]) -> ApiResult<&'static str> {
+    let declared = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or(value).trim().to_owned())
+        .unwrap_or_default();
+    let (ext, sniffed) = match declared.as_str() {
+        "image/png" => ("png", bytes.starts_with(b"\x89PNG\r\n\x1a\n")),
+        "image/jpeg" => ("jpg", bytes.starts_with(b"\xff\xd8\xff")),
+        "image/svg+xml" => ("svg", true),
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "logo must be image/png, image/jpeg, or image/svg+xml",
+            ));
+        }
+    };
+    if !sniffed {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "logo bytes do not match the declared type",
+        ));
+    }
+    Ok(ext)
+}
+
+/// Stores a tenant logo, replacing any previous one atomically.
+pub async fn put_branding_logo(
+    State(app): State<Arc<App>>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_operator(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
+    let tenant = branding_tenant(&app, &key, &identity)?;
+    if body.len() > MAX_LOGO_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "logo exceeds 512 KiB",
+        ));
+    }
+    if body.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "logo body is empty",
+        ));
+    }
+    let ext = admit_logo(&headers, &body)?;
+    let target = paths::branding_logo_path(&app.config.data_dir, &tenant, ext);
+    let directory = target.parent().expect("logo path has a parent").to_owned();
+    let staged = target.with_extension(format!("{ext}.tmp"));
+    let bytes = body.to_vec();
+    let written: Result<(), String> = tokio::task::spawn_blocking({
+        let target = target.clone();
+        move || {
+            std::fs::create_dir_all(&directory)
+                .map_err(|error| format!("create {}: {error}", directory.display()))?;
+            paths::tighten_private_dir(&directory)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&staged)
+                .map_err(|error| format!("create {}: {error}", staged.display()))?;
+            use std::io::Write as _;
+            file.write_all(&bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| format!("write {}: {error}", staged.display()))?;
+            drop(file);
+            paths::tighten_private_file(&staged)?;
+            std::fs::rename(&staged, &target)
+                .map_err(|error| format!("publish {}: {error}", target.display()))
+        }
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?;
+    written.map_err(ApiError::internal)?;
+    let previous = app
+        .store
+        .branding(&tenant)
+        .map_err(super::store_unavailable)?;
+    let previous_ext = previous
+        .as_ref()
+        .map(|branding| branding.logo_ext.clone())
+        .unwrap_or_default();
+    let branding = crate::store::Branding {
+        tenant: tenant.clone(),
+        name: previous
+            .as_ref()
+            .map(|b| b.name.clone())
+            .unwrap_or_default(),
+        color: previous.map(|b| b.color).unwrap_or_default(),
+        logo_ext: ext.to_owned(),
+        updated_at: now_unix(),
+    };
+    app.store
+        .set_branding(&branding)
+        .map_err(ApiError::internal)?;
+    if !previous_ext.is_empty() && previous_ext != ext {
+        let stale = paths::branding_logo_path(&app.config.data_dir, &tenant, &previous_ext);
+        let _ = tokio::fs::remove_file(stale).await;
+    }
+    tracing::info!(target: "audit", event = "branding_logo_updated", tenant = %tenant, "tenant logo stored");
+    app.store.audit(
+        &tenant,
+        &identity.subject,
+        "branding_logo_updated",
+        branding_subject(&tenant),
+        &json!({ "ext": ext, "bytes": body.len() }),
+    );
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Removes a tenant logo; the name and color survive.
+pub async fn delete_branding_logo(
+    State(app): State<Arc<App>>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_operator(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
+    let tenant = branding_tenant(&app, &key, &identity)?;
+    let branding = app
+        .store
+        .branding(&tenant)
+        .map_err(super::store_unavailable)?
+        .filter(|branding| !branding.logo_ext.is_empty())
+        .ok_or_else(ApiError::not_found)?;
+    let path = paths::branding_logo_path(&app.config.data_dir, &tenant, &branding.logo_ext);
+    app.store
+        .set_branding(&crate::store::Branding {
+            logo_ext: String::new(),
+            updated_at: now_unix(),
+            ..branding
+        })
+        .map_err(ApiError::internal)?;
+    let _ = tokio::fs::remove_file(path).await;
+    tracing::info!(target: "audit", event = "branding_logo_deleted", tenant = %tenant, "tenant logo removed");
+    app.store.audit(
+        &tenant,
+        &identity.subject,
+        "branding_logo_deleted",
+        branding_subject(&tenant),
+        &json!({}),
     );
     Ok(Json(json!({ "ok": true })))
 }
@@ -3506,6 +3835,342 @@ mod tenant_authz_tests {
             .unwrap();
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+#[cfg(test)]
+mod branding_tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt;
+
+    use crate::api::testing;
+    use crate::app;
+    use crate::auth::{self, TenantGrant};
+
+    fn cookie_for(app: &App, tenant: &str, role: &str) -> String {
+        let identity = auth::AdminIdentity {
+            subject: format!("sso:{tenant}:{role}"),
+            tenant: tenant.to_owned(),
+            role: role.to_owned(),
+            grants: vec![TenantGrant {
+                tenant: tenant.to_owned(),
+                role: role.to_owned(),
+            }],
+            credential_version: 1,
+        };
+        super::test_admin_cookie(app, &identity)
+    }
+
+    fn insert_tenant(app: &App, key: &str) {
+        app.store
+            .insert_tenant(crate::store::Tenant {
+                key: key.to_owned(),
+                label: String::new(),
+                admin_group: None,
+                max_total_bytes: None,
+                max_links: None,
+                max_sessions: None,
+                created_at: 0,
+            })
+            .unwrap();
+    }
+
+    async fn put_branding(app: &Arc<App>, cookie: &str, key: &str, body: &str) -> StatusCode {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/api/admin/branding/{key}"))
+            .header("cookie", cookie)
+            .header("content-type", "application/json")
+            .header("x-votport", "1")
+            .body(Body::from(body.to_owned()))
+            .unwrap();
+        app::router(app.clone())
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn put_logo(
+        app: &Arc<App>,
+        cookie: &str,
+        key: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> StatusCode {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/api/admin/branding/{key}/logo"))
+            .header("cookie", cookie)
+            .header("content-type", content_type)
+            .header("x-votport", "1")
+            .body(Body::from(bytes))
+            .unwrap();
+        app::router(app.clone())
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn put_branding_validates_color_and_stores_the_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let platform = cookie_for(&application, "", "admin");
+
+        for bad in ["#12zz99", "12ab99", "#12ab9", "#12ab999", "red"] {
+            let body = format!(r#"{{"name":"Acme","color":"{bad}"}}"#);
+            assert_eq!(
+                put_branding(&application, &platform, "default", &body).await,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "color {bad:?} was admitted"
+            );
+        }
+        assert!(application.store.branding("").unwrap().is_none());
+
+        assert_eq!(
+            put_branding(
+                &application,
+                &platform,
+                "default",
+                r##"{"name":"  Acme Corp  ","color":"#12Ab99"}"##
+            )
+            .await,
+            StatusCode::OK
+        );
+        let row = application.store.branding("").unwrap().unwrap();
+        assert_eq!(row.name, "Acme Corp");
+        assert_eq!(row.color, "#12Ab99");
+        assert_eq!(row.logo_ext, "");
+
+        // Empty color clears the accent; DELETE removes the row entirely.
+        assert_eq!(
+            put_branding(
+                &application,
+                &platform,
+                "default",
+                r#"{"name":"Acme Corp","color":""}"#
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(application.store.branding("").unwrap().unwrap().color, "");
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/api/admin/branding/default")
+            .header("cookie", &platform)
+            .header("x-votport", "1")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app::router(application.clone())
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert!(application.store.branding("").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn wrong_tenant_admin_cannot_brand_other_tenants() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        insert_tenant(&application, "acme");
+        insert_tenant(&application, "beta");
+        let acme = cookie_for(&application, "acme", "admin");
+
+        for foreign in ["default", "beta", "missing"] {
+            assert_eq!(
+                put_branding(
+                    &application,
+                    &acme,
+                    foreign,
+                    r#"{"name":"Acme","color":""}"#
+                )
+                .await,
+                StatusCode::FORBIDDEN,
+                "{foreign} accepted a foreign admin"
+            );
+        }
+        assert_eq!(
+            put_branding(&application, &acme, "acme", r#"{"name":"Acme","color":""}"#).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            application.store.branding("acme").unwrap().unwrap().name,
+            "Acme"
+        );
+
+        // A platform admin brands any tenant; an unknown one is 404.
+        let platform = cookie_for(&application, "", "admin");
+        assert_eq!(
+            put_branding(
+                &application,
+                &platform,
+                "beta",
+                r#"{"name":"Beta","color":""}"#
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            put_branding(
+                &application,
+                &platform,
+                "missing",
+                r#"{"name":"X","color":""}"#
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn logo_upload_enforces_type_magic_and_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let platform = cookie_for(&application, "", "admin");
+        let png = b"\x89PNG\r\n\x1a\npixels".to_vec();
+
+        assert_eq!(
+            put_logo(&application, &platform, "default", "image/gif", png.clone()).await,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert_eq!(
+            put_logo(
+                &application,
+                &platform,
+                "default",
+                "image/png",
+                b"\xff\xd8\xffjpeg".to_vec()
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let mut oversized = png.clone();
+        oversized.resize(MAX_LOGO_BYTES + 1, 0);
+        assert_eq!(
+            put_logo(&application, &platform, "default", "image/png", oversized).await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert!(application.store.branding("").unwrap().is_none());
+
+        assert_eq!(
+            put_logo(&application, &platform, "default", "image/png", png).await,
+            StatusCode::OK
+        );
+        let row = application.store.branding("").unwrap().unwrap();
+        assert_eq!(row.logo_ext, "png");
+        let stored = paths::branding_logo_path(&application.config.data_dir, "", "png");
+        assert!(stored.is_file());
+
+        // Replacing with another type removes the stale file.
+        assert_eq!(
+            put_logo(
+                &application,
+                &platform,
+                "default",
+                "image/svg+xml",
+                b"<svg xmlns='http://www.w3.org/2000/svg'/>".to_vec()
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            application.store.branding("").unwrap().unwrap().logo_ext,
+            "svg"
+        );
+        assert!(!stored.exists());
+
+        // DELETE clears the extension and the file; name and color survive.
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/api/admin/branding/default/logo")
+            .header("cookie", &platform)
+            .header("x-votport", "1")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app::router(application.clone())
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            application.store.branding("").unwrap().unwrap().logo_ext,
+            ""
+        );
+        assert!(!paths::branding_logo_path(&application.config.data_dir, "", "svg").exists());
+    }
+
+    #[tokio::test]
+    async fn tenant_delete_removes_the_branding_row_and_logo_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        insert_tenant(&application, "acme");
+        let platform = cookie_for(&application, "", "admin");
+        assert_eq!(
+            put_logo(
+                &application,
+                &platform,
+                "acme",
+                "image/png",
+                b"\x89PNG\r\n\x1a\npixels".to_vec()
+            )
+            .await,
+            StatusCode::OK
+        );
+        let logo = paths::branding_logo_path(&application.config.data_dir, "acme", "png");
+        assert!(logo.is_file());
+
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/api/admin/tenants/acme")
+            .header("cookie", &platform)
+            .header("x-votport", "1")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app::router(application.clone())
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert!(application.store.branding("acme").unwrap().is_none());
+        assert!(!logo.exists());
+    }
+
+    #[tokio::test]
+    async fn branding_mutations_require_the_csrf_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let platform = cookie_for(&application, "", "admin");
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/api/admin/branding/default")
+            .header("cookie", &platform)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"Acme","color":""}"#))
+            .unwrap();
+        let response = app::router(application.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "missing X-Votport header");
     }
 }
 

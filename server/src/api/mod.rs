@@ -11,23 +11,25 @@ pub mod verify;
 
 pub use admin::{
     admin_audit_export, admin_change_password, admin_login, admin_logout, admin_session,
-    backup_database, create_backup, create_link, create_tenant, delete_link, delete_received_file,
-    delete_tenant, delete_upload_record, get_backups, get_settings, holdings, link_qr, list_links,
-    list_principals, list_tenants, put_backups_config, put_settings, restore_backup,
-    revoke_principal, switch_tenant, test_notifications, unblock_principal, update_link,
-    update_tenant,
+    backup_database, create_backup, create_link, create_tenant, delete_branding,
+    delete_branding_logo, delete_link, delete_received_file, delete_tenant, delete_upload_record,
+    get_backups, get_branding, get_settings, holdings, link_qr, list_links, list_principals,
+    list_tenants, put_backups_config, put_branding, put_branding_logo, put_settings,
+    restore_backup, revoke_principal, switch_tenant, test_notifications, unblock_principal,
+    update_link, update_tenant,
 };
 pub use outbound::{
     automation_share, create_automation_token, create_outbound_grant, delete_automation_token,
     delete_outbound_file, delete_outbound_grant, list_automation_tokens, list_outbound_files,
     list_outbound_grants, outbound_file, outbound_file_head, outbound_file_indexed,
-    outbound_file_indexed_head, outbound_metadata, outbound_receipt, outbound_receipt_indexed,
-    update_outbound_grant, upload_outbound_file, verify_outbound_password,
+    outbound_file_indexed_head, outbound_logo, outbound_metadata, outbound_receipt,
+    outbound_receipt_indexed, update_outbound_grant, upload_outbound_file,
+    verify_outbound_password,
 };
 pub use sso::{sso_available, sso_callback, sso_start};
 pub use upload::{
-    create_push_session, create_session, link_info, upload_abort, upload_begin, upload_chunk,
-    upload_finish, upload_page, upload_seal, verify_link_password,
+    create_push_session, create_session, link_info, link_logo, upload_abort, upload_begin,
+    upload_chunk, upload_finish, upload_page, upload_seal, verify_link_password,
 };
 pub use verify::{receipt_key, verify_receipt};
 
@@ -198,6 +200,73 @@ pub(crate) fn store_unavailable(error: String) -> ApiError {
         StatusCode::INTERNAL_SERVER_ERROR,
         "database unavailable; try again",
     )
+}
+
+/// Recipient-facing branding for a tenant: the stored row's name (falling
+/// back to the tenant label), color, and logo flag. None when neither a
+/// branding row nor a tenant label exists, so unbranded deployments present
+/// exactly what they do today.
+pub(crate) fn public_branding(
+    app: &App,
+    tenant: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let label = |app: &App| -> Result<Option<String>, String> {
+        Ok(app
+            .store
+            .tenant(tenant)?
+            .map(|tenant| tenant.label)
+            .filter(|label| !label.is_empty()))
+    };
+    match app.store.branding(tenant)? {
+        Some(row) => {
+            let name = if row.name.is_empty() {
+                label(app)?
+            } else {
+                Some(row.name)
+            };
+            Ok(Some(json!({
+                "name": name,
+                "color": row.color,
+                "has_logo": !row.logo_ext.is_empty(),
+            })))
+        }
+        None => Ok(label(app)?.map(|name| json!({ "name": name, "color": "", "has_logo": false }))),
+    }
+}
+
+/// Streams the stored tenant logo with its content type. Callers decide who
+/// may see it; this only resolves the row and the file. The CSP is what
+/// keeps an admin-supplied SVG inert on this origin: no script, no loads,
+/// and a sandboxed browsing context even when the URL is opened directly.
+pub(crate) async fn serve_branding_logo(app: &App, tenant: &str) -> ApiResult<Response> {
+    let branding = app
+        .store
+        .branding(tenant)
+        .map_err(store_unavailable)?
+        .ok_or_else(ApiError::not_found)?;
+    let content_type = match branding.logo_ext.as_str() {
+        "png" => "image/png",
+        "jpg" => "image/jpeg",
+        "svg" => "image/svg+xml",
+        _ => return Err(ApiError::not_found()),
+    };
+    let path = crate::paths::branding_logo_path(&app.config.data_dir, tenant, &branding.logo_ext);
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|_| ApiError::not_found())?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-cache"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+    )
+        .into_response())
 }
 
 fn cookie_attributes(app: &App) -> &'static str {
@@ -436,5 +505,196 @@ mod handler_tests {
         assert_eq!(json["usable"], false);
         assert_eq!(json["label"], serde_json::Value::Null);
         assert_eq!(json["authorized"], false);
+    }
+
+    fn test_link(id: &str, password_hash: Option<String>) -> Link {
+        Link {
+            id: id.to_owned(),
+            tenant: String::new(),
+            label: "quarterly docs".to_owned(),
+            dest: String::new(),
+            password_hash,
+            created_at: 0,
+            expires_at: None,
+            max_bytes: None,
+            active: true,
+            legal_hold: false,
+            notify_on_upload: false,
+            uploads: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn link_metadata_and_logo_share_the_label_exposure() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .set_branding(&crate::store::Branding {
+                tenant: String::new(),
+                name: "Acme Corp".to_owned(),
+                color: "#12ab99".to_owned(),
+                logo_ext: "png".to_owned(),
+                updated_at: 0,
+            })
+            .unwrap();
+        let logo = crate::paths::branding_logo_path(&application.config.data_dir, "", "png");
+        std::fs::create_dir_all(logo.parent().unwrap()).unwrap();
+        std::fs::write(&logo, b"\x89PNG\r\n\x1a\npixels").unwrap();
+        // Password-protected but usable: the label shows pre-password, so
+        // branding and the logo do too.
+        let hash = crate::auth::hash_password("secret").unwrap();
+        application
+            .store
+            .insert_link(test_link("gated-link-000", Some(hash)))
+            .unwrap();
+        let mut closed = test_link("closed-link-000", None);
+        closed.active = false;
+        application.store.insert_link(closed).unwrap();
+
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::get("/api/r/gated-link-000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["authorized"], false);
+        assert_eq!(json["branding"]["name"], "Acme Corp");
+        assert_eq!(json["branding"]["color"], "#12ab99");
+        assert_eq!(json["branding"]["has_logo"], true);
+
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::get("/api/r/gated-link-000/logo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
+
+        // A closed link hides its label; branding and the logo hide with it.
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::get("/api/r/closed-link-000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["branding"], serde_json::Value::Null);
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::get("/api/r/closed-link-000/logo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn svg_logo_is_served_inert() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .set_branding(&crate::store::Branding {
+                tenant: String::new(),
+                name: "Acme".to_owned(),
+                color: String::new(),
+                logo_ext: "svg".to_owned(),
+                updated_at: 0,
+            })
+            .unwrap();
+        let logo = crate::paths::branding_logo_path(&application.config.data_dir, "", "svg");
+        std::fs::create_dir_all(logo.parent().unwrap()).unwrap();
+        std::fs::write(
+            &logo,
+            b"<svg xmlns='http://www.w3.org/2000/svg' onload='alert(1)'/>",
+        )
+        .unwrap();
+        application
+            .store
+            .insert_link(test_link("svg-link-0000000", None))
+            .unwrap();
+
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::get("/api/r/svg-link-0000000/logo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/svg+xml"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .unwrap(),
+            "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
+    }
+
+    #[tokio::test]
+    async fn unbranded_named_tenant_falls_back_to_its_label() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(crate::store::Tenant {
+                key: "acme".to_owned(),
+                label: "Acme Legal".to_owned(),
+                admin_group: None,
+                max_total_bytes: None,
+                max_links: None,
+                max_sessions: None,
+                created_at: 0,
+            })
+            .unwrap();
+        let mut link = test_link("acme-link-00000", None);
+        link.tenant = "acme".to_owned();
+        application.store.insert_link(link).unwrap();
+
+        let response = app::router(application)
+            .oneshot(
+                Request::get("/api/r/acme-link-00000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["branding"]["name"], "Acme Legal");
+        assert_eq!(json["branding"]["has_logo"], false);
     }
 }
