@@ -991,7 +991,7 @@ fn library_components_safe(root: &Path, path: &Path) -> bool {
     true
 }
 
-fn safe_library_path(app: &App, tenant: &str, input: &str) -> ApiResult<PathBuf> {
+pub(crate) fn safe_library_path(app: &App, tenant: &str, input: &str) -> ApiResult<PathBuf> {
     let input = input.trim_matches('/');
     if input.is_empty() {
         return Err(ApiError::new(

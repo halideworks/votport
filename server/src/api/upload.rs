@@ -109,9 +109,9 @@ fn effective_cap(app: &App, link: &Link) -> u64 {
 pub struct PackageAnnouncement {
     /// "blake3" or "sha256" — package roots are blake3 today, but the wire
     /// format carries the suite so the client stays authoritative.
-    suite: String,
-    root: String,
-    length: u64,
+    pub(crate) suite: String,
+    pub(crate) root: String,
+    pub(crate) length: u64,
 }
 
 #[derive(Deserialize)]
@@ -121,7 +121,7 @@ pub struct CreateSessionRequest {
     package: PackageAnnouncement,
 }
 
-fn parse_object(package: &PackageAnnouncement) -> ApiResult<ObjectId> {
+pub(crate) fn parse_object(package: &PackageAnnouncement) -> ApiResult<ObjectId> {
     let suite = match package.suite.as_str() {
         "blake3" => Suite::Blake3Bao64,
         "sha256" => Suite::Sha256Bep52,
