@@ -3210,14 +3210,15 @@ async fn prepare_load_files(
 /// when setup or a phase fails partway.
 #[derive(Default)]
 struct LoadArtifacts {
-    link: Option<String>,
+    links: Vec<String>,
     outbound_path: Option<String>,
     grant_ids: Vec<String>,
 }
 
 /// Removes what the run created on the target, on failed and stalled runs
 /// included: revokes the grants, deletes the outbound file, the received
-/// copies, and the link. Best effort; a failure is printed, not fatal.
+/// copies, and every seeded link. Best effort; a failure is printed, not
+/// fatal.
 async fn load_cleanup(admin: &reqwest::Client, base: &str, artifacts: &LoadArtifacts) {
     let mut failures = 0usize;
     let mut check = |ok: bool| {
@@ -3243,47 +3244,49 @@ async fn load_cleanup(admin: &reqwest::Client, base: &str, artifacts: &LoadArtif
             .await;
         check(response.is_ok_and(|response| response.status() == 200));
     }
-    if let Some(link) = &artifacts.link {
-        // Received copies first, then the link record.
-        if let Ok(listing) = admin
+    if !artifacts.links.is_empty() {
+        // Received copies first, then the link records.
+        let listing = match admin
             .get(format!("{base}/api/admin/links"))
             .send()
             .await
             .and_then(|response| response.error_for_status())
         {
-            if let Ok(listing) = listing.json::<Value>().await {
-                let uploads = listing["links"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find(|entry| entry["id"] == json!(link))
-                    .and_then(|entry| entry["uploads"].as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                for upload in uploads {
-                    let Some(id) = upload["id"].as_str() else {
-                        continue;
-                    };
-                    let count = upload["files"].as_array().map_or(0, Vec::len);
-                    for index in 0..count {
-                        let response = admin
-                            .delete(format!(
-                                "{base}/api/admin/links/{link}/uploads/{id}/files/{index}"
-                            ))
-                            .header("X-Votport", "1")
-                            .send()
-                            .await;
-                        check(response.is_ok_and(|response| response.status() == 200));
-                    }
+            Ok(response) => response.json::<Value>().await.unwrap_or(Value::Null),
+            Err(_) => Value::Null,
+        };
+        for link in &artifacts.links {
+            let uploads = listing["links"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|entry| entry["id"] == json!(link))
+                .and_then(|entry| entry["uploads"].as_array())
+                .cloned()
+                .unwrap_or_default();
+            for upload in uploads {
+                let Some(id) = upload["id"].as_str() else {
+                    continue;
+                };
+                let count = upload["files"].as_array().map_or(0, Vec::len);
+                for index in 0..count {
+                    let response = admin
+                        .delete(format!(
+                            "{base}/api/admin/links/{link}/uploads/{id}/files/{index}"
+                        ))
+                        .header("X-Votport", "1")
+                        .send()
+                        .await;
+                    check(response.is_ok_and(|response| response.status() == 200));
                 }
             }
+            let response = admin
+                .delete(format!("{base}/api/admin/links/{link}"))
+                .header("X-Votport", "1")
+                .send()
+                .await;
+            check(response.is_ok_and(|response| response.status() == 200));
         }
-        let response = admin
-            .delete(format!("{base}/api/admin/links/{link}"))
-            .header("X-Votport", "1")
-            .send()
-            .await;
-        check(response.is_ok_and(|response| response.status() == 200));
     }
     if failures > 0 {
         println!("cleanup: {failures} deletions failed; artifacts may remain on the target");
@@ -3406,21 +3409,28 @@ async fn run_load(
         "admin login",
     )
     .await?;
-    let link = ok200(
-        admin
-            .post(format!("{base}/api/admin/links"))
-            .header("X-Votport", "1")
-            .json(&json!({ "label": "load rig", "dest": "load-test" })),
-        "create link",
-    )
-    .await?
-    .json::<Value>()
-    .await
-    .map_err(|error| format!("create link: {error}"))?["link"]["id"]
-        .as_str()
-        .ok_or("create link: no id in response")?
-        .to_owned();
-    artifacts.link = Some(link.clone());
+    // One link per eight upload workers: sessions are capped at eight
+    // concurrent per link, and the rig is after the process-wide cap, not
+    // the per-link one.
+    let mut links = Vec::new();
+    for index in 0..sessions.div_ceil(8).max(1) {
+        let link = ok200(
+            admin
+                .post(format!("{base}/api/admin/links"))
+                .header("X-Votport", "1")
+                .json(&json!({ "label": format!("load rig {index}"), "dest": "load-test" })),
+            "create link",
+        )
+        .await?
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("create link: {error}"))?["link"]["id"]
+            .as_str()
+            .ok_or("create link: no id in response")?
+            .to_owned();
+        artifacts.links.push(link.clone());
+        links.push(link);
+    }
 
     let outbound_path = format!("load-rig-{seed:016x}.bin");
     let outbound_bytes = load_pattern(file_mib, seed ^ (2 << 56));
@@ -3469,7 +3479,7 @@ async fn run_load(
         for (worker, file, package) in files {
             let client = load.clone();
             let base = base.to_owned();
-            let token = link.clone();
+            let token = links[worker % links.len()].clone();
             let ip = load_ip(ip_offset + worker);
             set.spawn(async move {
                 (
