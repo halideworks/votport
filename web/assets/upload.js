@@ -18,6 +18,27 @@ const token = window.location.pathname.split('/').filter(Boolean).pop();
 const UPLOADS_IN_FLIGHT = 8;
 let chunkBytes = 2 * 1024 * 1024;
 let maxBytes = null;
+// Server-reported hash of the sender assets at page load; a mismatch later
+// means a deploy happened underneath this tab.
+let webBuild = null;
+let reloading = false;
+
+// After a deploy, an old tab keeps talking to a server whose contract may
+// have moved. Instead of surfacing that as a fatal error, reload so the
+// sender resumes from the saved cursor with the current script.
+async function reloadIfServerUpdated() {
+  if (!webBuild) return;
+  try {
+    const info = await apiJson(`/api/r/${token}`);
+    if (info.web_build && info.web_build !== webBuild) {
+      $('subtitle').textContent = 'The site was updated. Reloading to resume…';
+      reloading = true;
+      window.location.reload();
+      // The page is going away; never let the caller carry on with old code.
+      await new Promise(() => {});
+    }
+  } catch { /* the original error stands */ }
+}
 const picked = new Map(); // relative path -> File
 let uploading = false;
 let cancelled = false;
@@ -812,8 +833,9 @@ async function runUpload() {
           report = await postWithRetry(`/api/session/${sessionId}/finish`, {});
         } catch (error) {
           // Coverage lost across a restart before any range reply carried
-          // rebegin: the begin reply says where to resume.
-          if (error.status === 400 && /not fully received/.test(error.message || '')) {
+          // rebegin: the begin reply says where to resume. SessionError::bad
+          // is 422, so the earlier check for 400 never matched.
+          if (error.status === 422 && /not fully received/.test(error.message || '')) {
             error.rebegin = true;
           }
           throw error;
@@ -981,7 +1003,7 @@ document.addEventListener('drop', async (event) => {
 });
 
 window.addEventListener('beforeunload', (event) => {
-  if (uploading) event.preventDefault();
+  if (uploading && !reloading) event.preventDefault();
 });
 
 $('gate-form').addEventListener('submit', async (event) => {
@@ -1028,6 +1050,9 @@ $('upload-form').addEventListener('submit', async (event) => {
   try {
     await runUpload();
   } catch (error) {
+    // Any failure but a deliberate cancel may be a stale tab after a deploy;
+    // the reload only happens when the server's build hash actually differs.
+    if (!error.cancelled) await reloadIfServerUpdated();
     // The server no longer holds the session, so the saved resume record is
     // useless; clearing it also hides the stale "held on the server" note and
     // keeps the advice below honest.
@@ -1108,6 +1133,7 @@ function showResumeNote() {
   applyBranding(info.branding, `/api/r/${token}/logo`);
   chunkBytes = info.chunk_bytes || chunkBytes;
   maxBytes = Number.isFinite(info.max_bytes) ? info.max_bytes : null;
+  webBuild = info.web_build || null;
   try {
     await init();
   } catch {

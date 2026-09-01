@@ -80,6 +80,7 @@ pub async fn link_info(
         "max_bytes": effective_cap(&app, &link),
         "chunk_bytes": session::CHUNK_BYTES,
         "push": app.push.is_some(),
+        "web_build": app.web_build,
     })))
 }
 
@@ -1238,7 +1239,12 @@ mod push_preflight_tests {
             .oneshot(Request::get("/api/r/disabled").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response_json(info).await["push"], false);
+        let info = response_json(info).await;
+        assert_eq!(info["push"], false);
+        // The web build hash lets a stale tab notice a deploy and reload.
+        assert_eq!(info["web_build"], application.web_build);
+        assert_eq!(application.web_build.len(), 16);
+        assert!(application.web_build.chars().all(|c| c.is_ascii_hexdigit()));
 
         let holder = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
         assert_eq!(

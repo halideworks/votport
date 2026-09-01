@@ -108,3 +108,13 @@ test('no page repeats an element id', () => {
     }
   }
 });
+
+test('a stale sender tab reloads when the server reports a new web build', () => {
+  assert.match(uploadScript, /webBuild = info\.web_build \|\| null/);
+  assert.match(uploadScript, /info\.web_build !== webBuild[\s\S]{0,200}window\.location\.reload\(\)/);
+  assert.match(uploadScript, /if \(!error\.cancelled\) await reloadIfServerUpdated\(\);/);
+  assert.match(uploadScript, /if \(uploading && !reloading\) event\.preventDefault\(\);/);
+  assert.match(uploadScript, /reloading = true;\s*window\.location\.reload\(\);/);
+  // A finish refused as early is a 422; rebegin must key on that status.
+  assert.match(uploadScript, /error\.status === 422 && \/not fully received\//);
+});
