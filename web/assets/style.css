@@ -558,14 +558,26 @@ button.danger:hover:not(:disabled) {
  .grid {
   grid-template-columns: 1fr;
  }
+ /* The object id is a copy control; a 64-hex string cannot fit a phone row. */
+ .uploads .object-card > .file-id {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  word-break: normal;
+ }
 }
 
 .bar {
  display: flex;
+ flex-wrap: wrap;
  justify-content: space-between;
  align-items: center;
- gap: 1rem;
+ gap: 0.5rem 1rem;
  margin-bottom: 1.5rem;
+}
+.bar > button {
+ flex: none;
+ white-space: nowrap;
 }
 
 /* ---- text utilities ------------------------------------------------------ */
@@ -675,10 +687,10 @@ button.danger:hover:not(:disabled) {
  flex-wrap: wrap;
  margin: 0.25rem 0;
 }
-.upload-head {
- justify-content: space-between;
-}
+/* The first span (date line or file name) grows; badges and buttons cluster right. */
+.upload-head > span:first-child,
 .upload-file > span:first-child {
+ flex: 1 1 auto;
  min-width: 0;
  overflow-wrap: anywhere;
 }
@@ -986,6 +998,13 @@ button.danger:hover:not(:disabled) {
  min-width: 0;
  overflow-wrap: anywhere;
 }
+/* Folder rows have no size column; the name button keeps its natural width. */
+.library-folder {
+ grid-template-columns: auto minmax(0, 1fr) auto;
+}
+.library-folder > button:first-of-type {
+ justify-self: start;
+}
 
 /* ---- modal --------------------------------------------------------------- */
 
@@ -1050,7 +1069,8 @@ details summary:focus-visible {
 /* ---- admin nav ------------------------------------------------------------ */
 .nav {
  display: flex;
- gap: 0.9rem;
+ flex-wrap: wrap;
+ gap: 0.3rem 0.9rem;
  align-items: center;
 }
 .nav a {
