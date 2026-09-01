@@ -548,19 +548,22 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
     crate::paths::tighten_private_dir(&config.data_dir).map_err(|error| error.to_string())?;
     crate::backup::apply_pending_restore(&config.data_dir, crate::store::SCHEMA_VERSION)?;
-    crate::paths::clean_staging(&config.outbound_dir);
+    crate::paths::clean_staging(&config.outbound_dir, &HashSet::new());
     let store = Arc::new(Store::open(&config.data_dir)?);
     clean_outbound_stage(&config.data_dir);
     clean_outbound_proof_stages(&config.data_dir);
     clean_outbound_proofs(&config.data_dir, &store, now_unix());
     store.migrate_tenant_storage(&config.receive_dir)?;
-    // Staging files from a previous crash or kill have no live session to
-    // sweep them; remove them once at startup.
-    crate::paths::clean_staging(&config.receive_dir);
     let secret = crate::auth::load_secret(&config.data_dir)?;
     let signer = Arc::new(crate::receipt::ReceiptSigner::load_or_create(
         &config.data_dir,
     )?);
+    // Upload sessions suspended by the last shutdown re-attach their
+    // staging; every other staging file from a crash or kill has no live
+    // session to sweep it, so remove those once at startup.
+    let sessions = Sessions::new();
+    let kept = resume_upload_sessions(&config, &store, &signer, &sessions);
+    crate::paths::clean_staging(&config.receive_dir, &kept);
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -571,7 +574,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         .transpose()?;
     Ok(Arc::new(App {
         store,
-        sessions: Sessions::new(),
+        sessions,
         secret,
         change_password_throttle: LoginThrottle::new(),
         login_throttle: crate::auth::IpThrottle::new(),
@@ -607,6 +610,115 @@ impl App {
     pub fn request_shutdown(&self) {
         self.shutdown.notify_waiters();
     }
+}
+
+/// Suspends every HTTP upload session for a restart: each worker
+/// checkpoints and leaves its staging on disk for [`build`] to re-attach.
+/// Called once the server has stopped serving, so no handler can reach a
+/// session. A worker that does not answer in time is left to the process
+/// exit, which is the crash path the checkpoint already covers.
+pub async fn suspend_sessions(app: &App) {
+    let senders = app.sessions.take_http();
+    let mut replies = Vec::with_capacity(senders.len());
+    for sender in senders {
+        let (reply, done) = tokio::sync::oneshot::channel();
+        if sender.send(session::Cmd::Suspend { reply }).await.is_ok() {
+            replies.push(done);
+        }
+    }
+    let count = replies.len();
+    if count == 0 {
+        return;
+    }
+    let all = futures_util::future::join_all(replies);
+    match tokio::time::timeout(std::time::Duration::from_secs(30), all).await {
+        Ok(_) => tracing::info!(count, "suspended upload sessions for restart"),
+        Err(_) => tracing::warn!(count, "suspending upload sessions timed out"),
+    }
+}
+
+/// Re-attaches the upload sessions the last shutdown suspended, and returns
+/// the staging paths they own. A session that cannot be re-attached (its
+/// link is gone, its staging is missing or short, its journal moved on) is
+/// dropped: the record goes and its staging falls to the sweep.
+fn resume_upload_sessions(
+    config: &Config,
+    store: &Arc<Store>,
+    signer: &Arc<crate::receipt::ReceiptSigner>,
+    sessions: &Sessions,
+) -> HashSet<std::path::PathBuf> {
+    let persisted = match store.load_upload_sessions() {
+        Ok(persisted) => persisted,
+        Err(error) => {
+            tracing::warn!(%error, "loading suspended upload sessions failed");
+            return HashSet::new();
+        }
+    };
+    let mut kept = HashSet::new();
+    for session in persisted {
+        let session_tag = session.id.get(..8).unwrap_or(&session.id).to_owned();
+        match resume_upload_session(config, store, signer, sessions, &session) {
+            Ok(paths) => {
+                tracing::info!(
+                    target: "audit", event = "upload_session_resumed", link = %session.link_id,
+                    session_tag = %session_tag, files = session.files.len(),
+                    "re-attached upload session after restart"
+                );
+                kept.extend(paths);
+            }
+            Err(error) => {
+                tracing::warn!(session_tag = %session_tag, %error, "dropped suspended upload session");
+                if let Err(error) = store.delete_upload_session(&session.id) {
+                    tracing::warn!(session_tag = %session_tag, %error, "delete upload session failed");
+                }
+            }
+        }
+    }
+    kept
+}
+
+fn resume_upload_session(
+    config: &Config,
+    store: &Arc<Store>,
+    signer: &Arc<crate::receipt::ReceiptSigner>,
+    sessions: &Sessions,
+    session: &crate::store::PersistedUploadSession,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let link = store
+        .upload_link(&session.link_id)?
+        .ok_or_else(|| "link no longer exists".to_owned())?;
+    if link.tenant != session.tenant || !link.usable_now() {
+        return Err("link is no longer accepting uploads".to_owned());
+    }
+    let session_id: [u8; 16] = hex::decode(&session.id)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| "session id shape".to_owned())?;
+    let setup = session::WorkerSetup {
+        store: Arc::clone(store),
+        link_id: session.link_id.clone(),
+        tenant: session.tenant.clone(),
+        dest_dir: session.dest_dir.clone(),
+        dest_rel: session.dest_rel.clone(),
+        expected_package: session.package.clone(),
+        max_total_bytes: session.max_total_bytes.unwrap_or(u64::MAX),
+        allow_hidden: config.allow_hidden,
+        signer: Arc::clone(signer),
+        session_id,
+        started_at: session.started_at,
+    };
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let kept = session::resume_worker(setup, receiver, session)?;
+    sessions
+        .insert_resumed(
+            session.id.clone(),
+            session.link_id.clone(),
+            session.tenant.clone(),
+            session.package.length,
+            sender,
+        )
+        .map_err(|error| format!("register session: {error:?}"))?;
+    Ok(kept)
 }
 
 /// Remove only VOTPORT-owned outbound staging entries. `symlink_metadata` and

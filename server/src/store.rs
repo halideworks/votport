@@ -246,6 +246,9 @@ pub struct PersistedUploadFile {
     /// Contiguous covered offset from zero; the restart resumes from here.
     pub prefix_bytes: u64,
     pub published: bool,
+    /// Whether the published file's receipt sidecar was written, carried
+    /// into the upload record at finish.
+    pub receipt: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -535,6 +538,7 @@ CREATE TABLE IF NOT EXISTS upload_session_files (
     incarnation TEXT NOT NULL,
     prefix_bytes INTEGER NOT NULL DEFAULT 0,
     published INTEGER NOT NULL DEFAULT 0,
+    receipt INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (session_id, entry)
 );
 ";
@@ -1741,8 +1745,8 @@ impl Store {
                     "INSERT INTO upload_session_files
                      (session_id, entry, display_path, stored_components, object_suite,
                       object_root, object_length, staging_path, journal_path, incarnation,
-                      prefix_bytes, published)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                      prefix_bytes, published, receipt)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     rusqlite::params![
                         session.id,
                         i64::try_from(file.entry).unwrap_or(i64::MAX),
@@ -1756,6 +1760,7 @@ impl Store {
                         hex::encode(file.incarnation),
                         i64::try_from(file.prefix_bytes).unwrap_or(i64::MAX),
                         i64::from(file.published),
+                        i64::from(file.receipt),
                     ],
                 )
                 .map_err(|error| error.to_string())?;
@@ -1763,21 +1768,22 @@ impl Store {
         transaction.commit().map_err(|error| error.to_string())
     }
 
-    /// Updates one file's covered prefix and published flag, the periodic
-    /// checkpoint from the worker. Under-claiming is always safe: the sender
-    /// re-sends from the reported prefix on resume.
+    /// Updates one file's covered prefix and published and receipt flags,
+    /// the periodic checkpoint from the worker. Under-claiming is always
+    /// safe: the sender re-sends from the reported prefix on resume.
     pub fn update_upload_file_progress(
         &self,
         session_id: &str,
         entry: usize,
         prefix_bytes: u64,
         published: bool,
+        receipt: bool,
     ) -> Result<(), String> {
         self.with(|connection| {
             connection
                 .prepare_cached(
                     "UPDATE upload_session_files
-                     SET prefix_bytes = ?3, published = ?4
+                     SET prefix_bytes = ?3, published = ?4, receipt = ?5
                      WHERE session_id = ?1 AND entry = ?2",
                 )?
                 .execute(rusqlite::params![
@@ -1785,6 +1791,7 @@ impl Store {
                     i64::try_from(entry).unwrap_or(i64::MAX),
                     i64::try_from(prefix_bytes).unwrap_or(i64::MAX),
                     i64::from(published),
+                    i64::from(receipt),
                 ])
                 .map(|_| ())
         })
@@ -1820,7 +1827,7 @@ impl Store {
             let mut file_statement = connection.prepare(
                 "SELECT entry, display_path, stored_components, object_suite, object_root,
                         object_length, staging_path, journal_path, incarnation,
-                        prefix_bytes, published
+                        prefix_bytes, published, receipt
                  FROM upload_session_files WHERE session_id = ?1 ORDER BY entry",
             )?;
             for session in &mut sessions {
@@ -1852,6 +1859,7 @@ impl Store {
                         incarnation,
                         prefix_bytes: row.get::<_, i64>(9)?.max(0) as u64,
                         published: row.get::<_, i64>(10)? != 0,
+                        receipt: row.get::<_, i64>(11)? != 0,
                     })
                 })?;
                 for file in files {
@@ -6692,17 +6700,20 @@ mod settings_tests {
                 incarnation: [3u8; 16],
                 prefix_bytes: 0,
                 published: false,
+                receipt: false,
             }],
         };
         store.insert_upload_session(&session).unwrap();
         store
-            .update_upload_file_progress(&session.id, 0, 64 * 1024, false)
+            .update_upload_file_progress(&session.id, 0, 64 * 1024, true, true)
             .unwrap();
 
         let loaded = store.load_upload_sessions().unwrap();
         assert_eq!(loaded.len(), 1);
         let mut expected = session.clone();
         expected.files[0].prefix_bytes = 64 * 1024;
+        expected.files[0].published = true;
+        expected.files[0].receipt = true;
         assert_eq!(loaded[0], expected);
 
         // Re-inserting the same id replaces its file rows, no duplication.

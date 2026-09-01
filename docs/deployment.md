@@ -503,15 +503,25 @@ replicas behind one hostname is unsupported; scale up (CPU, RAM, faster disk),
 not out. This is the deliberate trade for atomic verified publication with no
 external dependencies; see docs/multi-tenancy.md non-goals.
 
-A restart discards in-flight upload sessions: staged partials are swept at
-boot, and senders start those files over (files already published from a
-multi-file session survive and dedupe on re-send). Long streaming downloads
-die with the process too. For a planned upgrade, drain first: turn on
-**Drain for restart** on the System page (or set the `draining` setting), which
-refuses new upload sessions with a transient 503 while leaving downloads,
-deliveries, and admin available. A sender who starts an upload during the drain
-is paused by the client and resumes on its own after the restart. Watch
-`votport_sessions_active` on /metrics reach 0 (`votport_draining` reads 1 while
-draining), then restart, then turn drain back off. The compose file sets
-`stop_grace_period: 5m` so in-flight downloads get a window to finish; no grace
-period covers a multi-hundred-GiB upload, which is what the drain is for.
+In-flight upload sessions survive a restart. On SIGTERM the process stops
+serving, then each upload worker records how far its file is contiguously
+verified and leaves its staging on disk; at boot those sessions are re-attached
+under the same session id and the sender continues from that offset (the
+browser pauses while the server is down, then re-begins on its own). Ranges
+that had landed beyond the contiguous prefix are re-sent, at most the sender's
+in-flight window. A partial that cannot be re-attached (a link deleted while
+down, staging missing or shorter than its checkpoint, or the process killed
+before the checkpoint) is dropped at boot and that file starts over; files
+already published from a multi-file session survive and dedupe on re-send. A
+re-attached file is published under VOT's Strict profile, which re-hashes the
+staged bytes before they become the destination, so a partial altered while
+the server was down cannot publish. Long streaming downloads die with the
+process. The compose file sets `stop_grace_period: 5m` so in-flight downloads
+get a window to finish.
+
+For a zero-surprise upgrade you can still drain first: turn on **Drain for
+restart** on the System page (or set the `draining` setting), which refuses new
+upload sessions with a transient 503 while leaving downloads, deliveries, and
+admin available. Watch `votport_sessions_active` on /metrics reach 0
+(`votport_draining` reads 1 while draining), then restart, then turn drain back
+off.

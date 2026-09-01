@@ -605,7 +605,7 @@ async function uploadEntryChunks(sessionId, entryIndex, item, from, onProgress) 
         const body = new Uint8Array(proof.bytes.length + data.length);
         body.set(proof.bytes, 0);
         body.set(data, proof.bytes.length);
-        await postWithRetry(
+        const progress = await postWithRetry(
           `/api/session/${sessionId}/chunk?entry=${entryIndex}&offset=${start}`,
           {
             headers: {
@@ -616,6 +616,12 @@ async function uploadEntryChunks(sessionId, entryIndex, item, from, onProgress) 
           },
         );
         onProgress(length);
+        // The server restarted and re-attached this session from its
+        // checkpoint; ranges past that prefix are gone. Begin again to
+        // learn the prefix instead of finishing into a refusal.
+        if (progress?.rebegin) {
+          throw Object.assign(new Error('server restarted; resuming'), { rebegin: true });
+        }
       } catch (error) {
         failure ||= error;
       }
@@ -797,7 +803,17 @@ async function runUpload() {
             setStatus(item.path, `${formatBytes(fileSent)} / ${formatBytes(item.file.size)}`);
           });
         }
-        const report = await postWithRetry(`/api/session/${sessionId}/finish`, {});
+        let report;
+        try {
+          report = await postWithRetry(`/api/session/${sessionId}/finish`, {});
+        } catch (error) {
+          // Coverage lost across a restart before any range reply carried
+          // rebegin: the begin reply says where to resume.
+          if (error.status === 400 && /not fully received/.test(error.message || '')) {
+            error.rebegin = true;
+          }
+          throw error;
+        }
         delivered.push(...report.files);
         clearResume();
         workerByPath.get(item.path)?.postMessage({ op: 'drop', key: item.path }); // frees the tree
@@ -814,7 +830,7 @@ async function runUpload() {
           sendCursor = null;
           throw error;
         }
-        if (error.paused) {
+        if (error.paused || error.rebegin) {
           // The pool may have died again while we were between proves.
           if (!hashWorkers.length && !recovering) recoverWorkers();
           if (workerFatal) throw workerFatal;

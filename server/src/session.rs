@@ -101,6 +101,9 @@ pub enum Cmd {
         reply: Reply<()>,
         _lease: SessionLease,
     },
+    /// Process shutdown: checkpoint, keep staging on disk for boot
+    /// re-attach, and exit.
+    Suspend { reply: oneshot::Sender<()> },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -123,6 +126,10 @@ pub struct ChunkProgress {
     pub covered_bytes: u64,
     pub total_bytes: u64,
     pub complete: bool,
+    /// The session was re-attached after a restart and its coverage restarted
+    /// from the checkpointed prefix: the sender must call begin again to
+    /// learn where to resume. Cleared by the next begin.
+    pub rebegin: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -239,13 +246,25 @@ enum Phase {
 /// Runs the per-session worker. The caller creates the channel, registers the
 /// sender, then passes the receiver here so the thread cannot touch disk
 /// before the session is in the map.
-pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
+pub fn spawn_worker(setup: WorkerSetup, receiver: mpsc::Receiver<Cmd>) {
+    spawn_worker_from(setup, receiver, Phase::AwaitSeal, false);
+}
+
+fn spawn_worker_from(
+    setup: WorkerSetup,
+    mut receiver: mpsc::Receiver<Cmd>,
+    mut phase: Phase,
+    resumed: bool,
+) {
     std::thread::spawn(move || {
-        let mut phase = Phase::AwaitSeal;
         // Feedback for the admin: bytes newly accepted this session and the
         // last error handed to the sender, recorded if the session dies.
         let mut received: u64 = 0;
         let mut persist = PersistTracker::new();
+        let mut rebegin = resumed;
+        let mut suspended = false;
+        // The registry dropped the sender (idle sweep or removal).
+        let mut dropped = false;
         let mut replays: u64 = 0;
         let mut rejected: u64 = 0;
         let mut last_error: Option<String> = None;
@@ -271,7 +290,10 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
                 Some(cmd) => cmd,
                 None => match receiver.blocking_recv() {
                     Some(cmd) => cmd,
-                    None => break,
+                    None => {
+                        dropped = true;
+                        break;
+                    }
                 },
             };
             last_seen = now_unix();
@@ -292,6 +314,7 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
                 }
                 Cmd::Begin { reply, _lease } => {
                     let result = handle_begin(&setup, &mut phase);
+                    rebegin = false;
                     // A failed begin has consumed the pages: the phase is
                     // already Done, the worker exits below, and the exit-time
                     // "interrupted" fall-through is skipped. Record it here.
@@ -356,6 +379,10 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
                     let outcomes = accept_batch(&setup, &mut phase, &batch);
                     let received_before = received;
                     for (item, outcome) in batch.into_iter().zip(outcomes) {
+                        let outcome = outcome.map(|mut progress| {
+                            progress.rebegin = rebegin;
+                            progress
+                        });
                         match &outcome {
                             Ok(progress) if progress.replay => replays += 1,
                             Ok(progress) if progress.accepted => {
@@ -396,12 +423,33 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
                     phase = Phase::Done;
                     let _ = reply.send(Ok(()));
                 }
+                Cmd::Suspend { reply } => {
+                    // Checkpoint the exact prefix, then release the staging
+                    // handles without removing the files: boot re-attaches
+                    // them. Sessions before begin have nothing persisted.
+                    if let Phase::Receiving { files } = &mut phase {
+                        checkpoint_session(&setup, files);
+                        for file in files.iter_mut() {
+                            if let Some(native) = file.native.take() {
+                                native.abandon();
+                            }
+                        }
+                    }
+                    suspended = true;
+                    phase = Phase::Done;
+                    let _ = reply.send(());
+                }
             }
             if matches!(phase, Phase::Done) {
                 break;
             }
         }
-        if !matches!(phase, Phase::Done) {
+        if dropped {
+            // Staging goes with the dropped handles below, so the record
+            // must not offer it for re-attach.
+            forget_session(&setup);
+        }
+        if !matches!(phase, Phase::Done) && !suspended {
             record_event(
                 &setup,
                 received,
@@ -617,6 +665,7 @@ fn persisted_session(setup: &WorkerSetup, files: &[FileState]) -> PersistedUploa
                 incarnation,
                 prefix_bytes,
                 published: file.published,
+                receipt: file.receipt,
             }
         })
         .collect();
@@ -652,11 +701,13 @@ fn checkpoint_session(setup: &WorkerSetup, files: &[FileState]) {
             .native
             .as_ref()
             .map_or(file.object.length, |native| native.progress().prefix_bytes);
-        if let Err(error) =
-            setup
-                .store
-                .update_upload_file_progress(&id, entry, prefix, file.published)
-        {
+        if let Err(error) = setup.store.update_upload_file_progress(
+            &id,
+            entry,
+            prefix,
+            file.published,
+            file.receipt,
+        ) {
             tracing::warn!(%error, entry, "checkpoint upload session failed");
         }
     }
@@ -670,6 +721,65 @@ fn forget_session(setup: &WorkerSetup) {
     {
         tracing::warn!(%error, "forget upload session failed");
     }
+}
+
+/// Re-attaches a persisted session after a restart: reopens each unpublished
+/// file's staging from its checkpointed prefix, publishes any file that
+/// prefix already completes, and starts the worker in the receiving phase.
+/// Returns the staging and journal paths now owned by the worker. On any
+/// failure nothing runs and the dropped handles remove their staging.
+pub fn resume_worker(
+    setup: WorkerSetup,
+    receiver: mpsc::Receiver<Cmd>,
+    persisted: &PersistedUploadSession,
+) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::with_capacity(persisted.files.len());
+    let mut kept = Vec::new();
+    for file in &persisted.files {
+        let native = if file.published {
+            None
+        } else {
+            let destination = paths::join_under(&setup.dest_dir, &file.stored_components)?;
+            // Only the contiguous prefix is trusted, and only as bookkeeping:
+            // Strict re-hashes the whole staged object at publish, so a
+            // prefix the disk does not actually hold cannot publish.
+            let runs = (file.prefix_bytes > 0).then_some((0, file.prefix_bytes));
+            let native = NativeFile::resume(
+                &file.object,
+                &destination,
+                file.staging_path.clone(),
+                file.journal_path.clone(),
+                file.incarnation,
+                CommitProfile::Strict,
+                runs,
+            )
+            .map_err(|error| format!("{}: {error}", file.display_path))?;
+            kept.push(file.staging_path.clone());
+            kept.push(file.journal_path.clone());
+            Some(native)
+        };
+        files.push(FileState {
+            display_path: file.display_path.clone(),
+            stored_components: file.stored_components.clone(),
+            object: file.object.clone(),
+            native,
+            published: file.published,
+            receipt: file.receipt,
+        });
+    }
+    // A prefix that already covers the object publishes now, as begin does
+    // for empty objects; the sender only has finish left to call.
+    for file in &mut files {
+        let complete = file.native.as_ref().is_some_and(|native| {
+            let progress = native.progress();
+            progress.covered_bytes == progress.total_bytes
+        });
+        if complete {
+            publish_file(&setup, file).map_err(|error| error.message)?;
+        }
+    }
+    spawn_worker_from(setup, receiver, Phase::Receiving { files }, true);
+    Ok(kept)
 }
 
 fn entry_infos(setup: &WorkerSetup, files: &[FileState]) -> Vec<EntryInfo> {
@@ -949,6 +1059,7 @@ fn accept_batch(
                 covered_bytes: core.covered_bytes,
                 total_bytes: core.total_bytes,
                 complete: core.complete,
+                rebegin: false,
             })
         })
         .collect()
@@ -2355,12 +2466,25 @@ impl Sessions {
         tenant: String,
         sender: mpsc::Sender<Cmd>,
     ) -> Result<(), InsertError> {
+        self.insert_resumed(id, link_id, tenant, 0, sender)
+    }
+
+    /// Registers a session re-attached at boot. It was admitted before the
+    /// restart, so only its byte reservation is re-established.
+    pub fn insert_resumed(
+        &self,
+        id: String,
+        link_id: String,
+        tenant: String,
+        reserved_bytes: u64,
+        sender: mpsc::Sender<Cmd>,
+    ) -> Result<(), InsertError> {
         self.insert_admitted(
             SessionAdmission {
                 id,
                 link_id,
                 tenant,
-                reserved_bytes: 0,
+                reserved_bytes,
                 max_total_bytes: None,
                 max_tenant_sessions: None,
                 max_link_sessions: usize::MAX,
@@ -2370,6 +2494,25 @@ impl Sessions {
             sender,
             || Ok(0),
         )
+    }
+
+    /// Removes every HTTP session from the registry and returns its command
+    /// sender, for shutdown: the workers are suspended through these, and
+    /// nothing else can reach or sweep them meanwhile.
+    pub fn take_http(&self) -> Vec<mpsc::Sender<Cmd>> {
+        let mut senders = Vec::new();
+        self.inner
+            .lock()
+            .expect("sessions poisoned")
+            .map
+            .retain(|_, handle| {
+                if matches!(handle.kind, SessionKind::Http) {
+                    senders.push(handle.sender.clone());
+                    return false;
+                }
+                true
+            });
+        senders
     }
 
     /// Concurrent sessions for one tenant namespace.

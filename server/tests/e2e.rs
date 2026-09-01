@@ -70,6 +70,44 @@ async fn start_server_custom(
 ) -> TestServer {
     let data = tempfile::tempdir().expect("data dir");
     let received = tempfile::tempdir().expect("receive dir");
+    start_server_in(
+        data,
+        received,
+        max_upload_bytes,
+        enable_push,
+        session_idle_secs,
+        max_total_sessions,
+    )
+    .await
+}
+
+impl TestServer {
+    /// Shuts the server down the way main does, suspending in-flight upload
+    /// sessions, and hands back its directories for [`boot`].
+    async fn suspend(self) -> (tempfile::TempDir, tempfile::TempDir) {
+        app::suspend_sessions(&self.application).await;
+        (self._data, self._received)
+    }
+
+    async fn restart(self) -> TestServer {
+        let (data, received) = self.suspend().await;
+        boot(data, received).await
+    }
+}
+
+/// Boots a fresh server over an earlier server's directories.
+async fn boot(data: tempfile::TempDir, received: tempfile::TempDir) -> TestServer {
+    start_server_in(data, received, 64 * 1024 * 1024, false, 600, 32).await
+}
+
+async fn start_server_in(
+    data: tempfile::TempDir,
+    received: tempfile::TempDir,
+    max_upload_bytes: u64,
+    enable_push: bool,
+    session_idle_secs: u64,
+    max_total_sessions: usize,
+) -> TestServer {
     let config = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         push_bind: enable_push.then(|| "127.0.0.1:0".parse().unwrap()),
@@ -2282,6 +2320,310 @@ async fn upload_session_is_recorded_at_begin_and_forgotten_at_finish() {
         .load_upload_sessions()
         .unwrap()
         .is_empty());
+}
+
+/// Creates a link and a session, and pushes the seal and pages so the next
+/// call is begin. Returns the link token and session id.
+async fn open_session(
+    client: &reqwest::Client,
+    base: &str,
+    label: &str,
+    files: &[ClientFile],
+) -> (String, String) {
+    client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    let token = client
+        .post(format!("{base}/api/admin/links"))
+        .header("x-votport", "1")
+        .json(&json!({ "label": label }))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["link"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (announcement, pages, seal) = build_package(files);
+    let session = client
+        .post(format!("{base}/api/r/{token}/session"))
+        .json(&json!({ "password": "", "package": announcement }))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    client
+        .post(format!("{base}/api/session/{session}/seal"))
+        .body(seal)
+        .send()
+        .await
+        .unwrap();
+    for page in pages {
+        client
+            .post(format!("{base}/api/session/{session}/page"))
+            .body(page)
+            .send()
+            .await
+            .unwrap();
+    }
+    (token, session)
+}
+
+async fn begin(client: &reqwest::Client, base: &str, session: &str) -> (u16, Value) {
+    let response = client
+        .post(format!("{base}/api/session/{session}/begin"))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (
+        status,
+        response.json::<Value>().await.unwrap_or(Value::Null),
+    )
+}
+
+/// Posts the one range of entry 0 starting at `offset`; returns status and body.
+async fn post_chunk(
+    client: &reqwest::Client,
+    base: &str,
+    session: &str,
+    file: &ClientFile,
+    offset: u64,
+) -> (u16, Value) {
+    let length = file.bytes.len() as u64;
+    let proof = file
+        .prepared
+        .prove(offset, CHUNK.min(length - offset))
+        .unwrap();
+    let start = proof.covered_offset() as usize;
+    let end = start + proof.covered_length() as usize;
+    let mut body = proof.proof().to_vec();
+    let proof_len = body.len();
+    body.extend_from_slice(&file.bytes[start..end]);
+    let response = client
+        .post(format!(
+            "{base}/api/session/{session}/chunk?entry=0&offset={start}"
+        ))
+        .header("X-Votport-Proof", proof_len.to_string())
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (
+        status,
+        response.json::<Value>().await.unwrap_or(Value::Null),
+    )
+}
+
+fn twenty_mib() -> ClientFile {
+    let bytes: Vec<u8> = (0..20 * 1024 * 1024)
+        .map(|index| (index * 7 % 251) as u8)
+        .collect();
+    prepare(vec!["resume.bin"], bytes)
+}
+
+fn staging_files(root: &std::path::Path) -> Vec<PathBuf> {
+    std::fs::read_dir(root)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".vot-"))
+        })
+        .collect()
+}
+
+/// A restart keeps the contiguous prefix of an in-flight upload: the sender
+/// learns it from begin (and from the rebegin flag on any earlier range
+/// reply), re-sends from there, and the file publishes byte for byte.
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_session_survives_a_restart() {
+    let server = start_server().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let files = [twenty_mib()];
+    let file = &files[0];
+    let (token, session) = open_session(&client, &server.base, "restart", &files).await;
+    let base = server.base.clone();
+    assert_eq!(begin(&client, &base, &session).await.0, 200);
+    // Ranges 0 and 2 land; range 1 is still in flight when the server stops,
+    // so the contiguous prefix is one range and range 2 is a hole.
+    assert_eq!(post_chunk(&client, &base, &session, file, 0).await.0, 200);
+    assert_eq!(
+        post_chunk(&client, &base, &session, file, 2 * CHUNK)
+            .await
+            .0,
+        200
+    );
+    let receive_dir = server.receive_dir.clone();
+    assert_eq!(staging_files(&receive_dir).len(), 2, "staging and journal");
+
+    let server = server.restart().await;
+    let base = server.base.clone();
+    assert_eq!(
+        staging_files(&receive_dir).len(),
+        2,
+        "re-attached staging survives the boot sweep"
+    );
+    // The retried in-flight range is accepted and flagged: the session was
+    // re-attached and the sender must begin again.
+    let (status, progress) = post_chunk(&client, &base, &session, file, CHUNK).await;
+    assert_eq!(status, 200, "{progress}");
+    assert_eq!(progress["rebegin"], true);
+    let (status, body) = begin(&client, &base, &session).await;
+    assert_eq!(status, 200, "{body}");
+    // The prefix is ranges 0 and 1; the hole at range 2 was dropped.
+    assert_eq!(body["entries"][0]["covered_bytes"], 2 * CHUNK);
+    assert_eq!(body["entries"][0]["complete"], false);
+    let (status, progress) = post_chunk(&client, &base, &session, file, 2 * CHUNK).await;
+    assert_eq!(status, 200, "{progress}");
+    assert_eq!(progress["rebegin"], false);
+    assert_eq!(progress["complete"], true);
+    let finish = client
+        .post(format!("{base}/api/session/{session}/finish"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(finish.status(), 200, "{}", finish.text().await.unwrap());
+
+    assert_eq!(
+        std::fs::read(receive_dir.join("resume.bin")).unwrap(),
+        file.bytes
+    );
+    assert!(receive_dir.join("resume.bin.vot-receipt").is_file());
+    assert!(staging_files(&receive_dir).is_empty());
+    assert!(server
+        .application
+        .store
+        .load_upload_sessions()
+        .unwrap()
+        .is_empty());
+    let uploads = server
+        .application
+        .store
+        .uploads_by_id(&token)
+        .unwrap()
+        .unwrap();
+    assert_eq!(uploads.len(), 1);
+    assert!(uploads[0].files[0].receipt);
+}
+
+/// Staging corrupted while the process was down cannot publish: the resume
+/// trusts the checkpointed prefix only as bookkeeping, and Strict re-hashes
+/// the object at publish.
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_refuses_corrupted_staging() {
+    let server = start_server().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let files = [twenty_mib()];
+    let file = &files[0];
+    let (_token, session) = open_session(&client, &server.base, "corrupt", &files).await;
+    let base = server.base.clone();
+    assert_eq!(begin(&client, &base, &session).await.0, 200);
+    assert_eq!(post_chunk(&client, &base, &session, file, 0).await.0, 200);
+    let receive_dir = server.receive_dir.clone();
+    let staging = server.application.store.load_upload_sessions().unwrap()[0].files[0]
+        .staging_path
+        .clone();
+
+    let (data, received) = server.suspend().await;
+    // Flip one byte inside the checkpointed prefix.
+    let mut bytes = std::fs::read(&staging).unwrap();
+    bytes[1024 * 1024] ^= 0xff;
+    std::fs::write(&staging, &bytes).unwrap();
+    let server = boot(data, received).await;
+    let base = server.base.clone();
+
+    let (status, body) = begin(&client, &base, &session).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["entries"][0]["covered_bytes"], CHUNK);
+    assert_eq!(
+        post_chunk(&client, &base, &session, file, CHUNK).await.0,
+        200
+    );
+    // The last range completes coverage and triggers publish, which the
+    // Strict read-back refuses.
+    let (status, body) = post_chunk(&client, &base, &session, file, 2 * CHUNK).await;
+    assert_ne!(status, 200, "{body}");
+    assert!(
+        body["error"].as_str().unwrap_or("").contains("publish"),
+        "{body}"
+    );
+    assert!(!receive_dir.join("resume.bin").exists());
+    let finish = client
+        .post(format!("{base}/api/session/{session}/finish"))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(finish.status(), 200);
+}
+
+/// A staging file shorter than its checkpointed prefix (power loss before
+/// the data reached disk) is refused at boot: the record and staging go,
+/// and the sender starts a fresh session.
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_drops_a_truncated_staging_session() {
+    let server = start_server().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let files = [twenty_mib()];
+    let file = &files[0];
+    let (token, session) = open_session(&client, &server.base, "truncated", &files).await;
+    let base = server.base.clone();
+    assert_eq!(begin(&client, &base, &session).await.0, 200);
+    assert_eq!(post_chunk(&client, &base, &session, file, 0).await.0, 200);
+    let receive_dir = server.receive_dir.clone();
+    let staging = server.application.store.load_upload_sessions().unwrap()[0].files[0]
+        .staging_path
+        .clone();
+
+    let (data, received) = server.suspend().await;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&staging)
+        .unwrap()
+        .set_len(1024 * 1024)
+        .unwrap();
+    let server = boot(data, received).await;
+    let base = server.base.clone();
+
+    assert!(server
+        .application
+        .store
+        .load_upload_sessions()
+        .unwrap()
+        .is_empty());
+    assert!(
+        staging_files(&receive_dir).is_empty(),
+        "refused staging is swept"
+    );
+    assert_eq!(begin(&client, &base, &session).await.0, 404);
+    // A fresh session over the same link completes normally.
+    run_upload(&client, &base, &token, "", &files).await;
+    assert_eq!(
+        std::fs::read(receive_dir.join("resume.bin")).unwrap(),
+        file.bytes
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

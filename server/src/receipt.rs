@@ -303,7 +303,7 @@ mod tests {
             .join(format!(".vot-{}.stage", crate::auth::random_token()));
         std::fs::write(&orphan, b"partial receipt").unwrap();
 
-        crate::paths::clean_staging(directory.path());
+        crate::paths::clean_staging(directory.path(), &Default::default());
 
         assert!(!orphan.exists());
     }
