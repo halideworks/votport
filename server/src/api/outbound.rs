@@ -75,6 +75,15 @@ const ZIP_END_BYTES: u64 = 98;
 // ponytail: one tiny global critical section; use per-tenant locks only if contention is measured.
 static LIBRARY_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static LIBRARY_HASH_PERMITS: Semaphore = Semaphore::const_new(LIBRARY_HASH_CONCURRENCY);
+// Batch staging copies, hashes, and receipt-checks files on the blocking
+// pool; every batch stream keeps up to BATCH_LOOKAHEAD stages running (the
+// streaming chunk's stage is done), so MAX_ACTIVE streams could run 64
+// multi-hundred-MiB copies at once. The stage budget caps bytes, not task
+// count, so this caps the concurrent staging I/O against the disk. A permit
+// from App::staging_permits is taken before the stage-budget reservation and
+// released when the stage finishes;
+// streaming the staged file needs none.
+pub(crate) const STAGING_CONCURRENCY: usize = 8;
 
 /// Admission control for temporary outbound files. One free-space epoch is
 /// shared by all active preparations so concurrent requests cannot each pass
@@ -2537,11 +2546,16 @@ pub async fn outbound_batch(
     }
     let active = ActiveDownload::claim(Arc::clone(&app), &format!("{}:batch", grant.token_hash))?;
     let chunks = batch_chunks(&grant, count);
-    let _pin = legacy_link_pin(&app, &grant, grant.files.is_empty())?;
+    // Permit first, then the pin: a legacy link stays open to uploads while
+    // this download waits its turn. An oversized first chunk pins the link
+    // itself inside its task, so pinning it here too would self-conflict.
+    let permit = staging_permit(&app, &chunks[0]).await;
+    let _pin = legacy_link_pin(&app, &grant, grant.files.is_empty() && !chunks[0].oversized)?;
     let first_file = await_batch_chunk(start_batch_chunk(
         Arc::clone(&app),
         Arc::clone(&grant),
         chunks[0].clone(),
+        permit,
     )?)
     .await?;
     let file = first_file;
@@ -2612,7 +2626,9 @@ pub async fn outbound_batch(
                 handle
             } else {
                 let chunk = state.chunks[state.chunk_index].clone();
-                match start_batch_chunk(Arc::clone(&state.app), state.grant.clone(), chunk) {
+                let permit = staging_permit(&state.app, &chunk).await;
+                match start_batch_chunk(Arc::clone(&state.app), state.grant.clone(), chunk, permit)
+                {
                     Ok(handle) => handle,
                     Err(error) => return Err(api_error_io(error)),
                 }
@@ -2715,16 +2731,31 @@ fn batch_chunks(grant: &OutboundGrant, count: usize) -> Vec<BatchChunk> {
     chunks
 }
 
+/// Waits for a staging permit; oversized chunks stream from source without
+/// staging and take none.
+async fn staging_permit(
+    app: &Arc<App>,
+    chunk: &BatchChunk,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    if chunk.oversized {
+        return None;
+    }
+    // The semaphore is never closed, so acquire only fails if it were.
+    Arc::clone(&app.staging_permits).acquire_owned().await.ok()
+}
+
 fn start_batch_chunk(
     app: Arc<App>,
     grant: Arc<OutboundGrant>,
     chunk: BatchChunk,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> ApiResult<tokio::task::JoinHandle<io::Result<BatchFile>>> {
     if chunk.oversized {
+        drop(permit);
         return Ok(tokio::spawn(async move {
-            let source = source_info_indexed(&app, &grant, chunk.start).map_err(api_error_io)?;
             let pin =
                 legacy_link_pin(&app, &grant, grant.files.is_empty()).map_err(api_error_io)?;
+            let source = source_info_indexed(&app, &grant, chunk.start).map_err(api_error_io)?;
             let receipt = read_source_receipt(&source).map_err(map_source_io_error)?;
             verify_receipt(&app, &receipt, &source.object)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "receipt"))?;
@@ -2763,6 +2794,7 @@ fn start_batch_chunk(
     // throwaway stage; cache staged chunks keyed by grant id and file range
     // if repeated batch fetches of one grant are ever measured.
     Ok(tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -3991,10 +4023,15 @@ impl BatchStream {
             if chunk.oversized {
                 break;
             }
+            // No free permit: stage this chunk inline when its turn comes.
+            let Ok(permit) = Arc::clone(&self.app.staging_permits).try_acquire_owned() else {
+                break;
+            };
             match start_batch_chunk(
                 Arc::clone(&self.app),
                 Arc::clone(&self.grant),
                 chunk.clone(),
+                Some(permit),
             ) {
                 Ok(handle) => self.lookahead.push_back(handle),
                 // The stream loop retries inline and surfaces the error.
@@ -4469,6 +4506,12 @@ mod tests {
             vec![1, 1, 1]
         );
         assert_eq!(grant.downloads, 1);
+        // Every staging permit is returned once the stream has drained.
+        assert_eq!(
+            app.staging_permits.available_permits(),
+            STAGING_CONCURRENCY,
+            "a staging permit leaked"
+        );
     }
 
     async fn fixture() -> (tempfile::TempDir, Arc<App>, String, Vec<u8>) {
