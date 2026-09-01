@@ -23,7 +23,9 @@ use vot_sdk::verify::verify_range;
 use vot_sdk_file::{CommitProfile, NativeFile, RangeStatus};
 
 use crate::paths;
-use crate::store::{now_unix, FileRecord, Store, UploadRecord};
+use crate::store::{
+    now_unix, FileRecord, PersistedUploadFile, PersistedUploadSession, Store, UploadRecord,
+};
 
 pub const MAX_SEAL_BYTES: usize = 1024 * 1024;
 pub const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
@@ -243,6 +245,7 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
         // Feedback for the admin: bytes newly accepted this session and the
         // last error handed to the sender, recorded if the session dies.
         let mut received: u64 = 0;
+        let mut persist = PersistTracker::new();
         let mut replays: u64 = 0;
         let mut rejected: u64 = 0;
         let mut last_error: Option<String> = None;
@@ -351,6 +354,7 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
                         }
                     }
                     let outcomes = accept_batch(&setup, &mut phase, &batch);
+                    let received_before = received;
                     for (item, outcome) in batch.into_iter().zip(outcomes) {
                         match &outcome {
                             Ok(progress) if progress.replay => replays += 1,
@@ -362,9 +366,20 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
                         }
                         send_noted!(item.reply, outcome);
                     }
+                    // Checkpoint covered progress on a byte or time threshold,
+                    // never per batch, so the fsync never paces accept.
+                    if persist.should_checkpoint(received - received_before) {
+                        if let Phase::Receiving { files } = &phase {
+                            checkpoint_session(&setup, files);
+                        }
+                    }
                 }
                 Cmd::Finish { reply, _lease } => {
-                    send_noted!(reply, handle_finish(&setup, &mut phase, replays, rejected));
+                    let report = handle_finish(&setup, &mut phase, replays, rejected);
+                    // A finished (or terminally failed) session has nothing
+                    // left to re-attach; drop its resume record.
+                    forget_session(&setup);
+                    send_noted!(reply, report);
                 }
                 Cmd::Abort { reply, _lease } => {
                     record_event(
@@ -376,6 +391,8 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
                         replays,
                         rejected,
                     );
+                    // The sender gave up; nothing to re-attach.
+                    forget_session(&setup);
                     phase = Phase::Done;
                     let _ = reply.send(Ok(()));
                 }
@@ -531,8 +548,128 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
     }
 
     let infos = entry_infos(setup, &files);
+    // Record the session (and its staging paths) so a restart can re-attach.
+    persist_session(setup, &files);
     *phase = Phase::Receiving { files };
     Ok(infos)
+}
+
+/// Persist checkpoint pacing: write covered progress no more than this often
+/// by bytes or by time, so the fsync'd update never paces the accept path.
+const PERSIST_BYTES: u64 = 256 * 1024 * 1024;
+const PERSIST_INTERVAL: Duration = Duration::from_secs(5);
+
+struct PersistTracker {
+    bytes_since: u64,
+    last_at: Instant,
+}
+
+impl PersistTracker {
+    fn new() -> Self {
+        Self {
+            bytes_since: 0,
+            last_at: Instant::now(),
+        }
+    }
+
+    /// Returns true when accumulated bytes or elapsed time crosses a
+    /// checkpoint threshold, resetting the counters.
+    fn should_checkpoint(&mut self, added: u64) -> bool {
+        self.bytes_since += added;
+        if self.bytes_since >= PERSIST_BYTES || self.last_at.elapsed() >= PERSIST_INTERVAL {
+            self.bytes_since = 0;
+            self.last_at = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Builds the resume record for a session's current files. Published files
+/// carry no staging handle; boot re-attach skips them.
+fn persisted_session(setup: &WorkerSetup, files: &[FileState]) -> PersistedUploadSession {
+    let persisted = files
+        .iter()
+        .enumerate()
+        .map(|(entry, file)| {
+            let (staging_path, journal_path, incarnation, prefix_bytes) = match &file.native {
+                Some(native) => (
+                    native.staging_path().to_path_buf(),
+                    native.journal_path().to_path_buf(),
+                    native.incarnation(),
+                    native.progress().prefix_bytes,
+                ),
+                None => (
+                    PathBuf::new(),
+                    PathBuf::new(),
+                    [0u8; 16],
+                    file.object.length,
+                ),
+            };
+            PersistedUploadFile {
+                entry,
+                display_path: file.display_path.clone(),
+                stored_components: file.stored_components.clone(),
+                object: file.object.clone(),
+                staging_path,
+                journal_path,
+                incarnation,
+                prefix_bytes,
+                published: file.published,
+            }
+        })
+        .collect();
+    PersistedUploadSession {
+        id: hex::encode(setup.session_id),
+        link_id: setup.link_id.clone(),
+        tenant: setup.tenant.clone(),
+        dest_dir: setup.dest_dir.clone(),
+        dest_rel: setup.dest_rel.clone(),
+        package: setup.expected_package.clone(),
+        max_total_bytes: (setup.max_total_bytes != u64::MAX).then_some(setup.max_total_bytes),
+        started_at: setup.started_at,
+        files: persisted,
+    }
+}
+
+/// Records the session so a restart can re-attach its staging. Best effort:
+/// a persist failure only loses the resume opportunity, never a byte.
+fn persist_session(setup: &WorkerSetup, files: &[FileState]) {
+    if let Err(error) = setup
+        .store
+        .insert_upload_session(&persisted_session(setup, files))
+    {
+        tracing::warn!(%error, "persist upload session failed");
+    }
+}
+
+/// Updates each in-progress file's covered prefix at a checkpoint.
+fn checkpoint_session(setup: &WorkerSetup, files: &[FileState]) {
+    let id = hex::encode(setup.session_id);
+    for (entry, file) in files.iter().enumerate() {
+        let prefix = file
+            .native
+            .as_ref()
+            .map_or(file.object.length, |native| native.progress().prefix_bytes);
+        if let Err(error) =
+            setup
+                .store
+                .update_upload_file_progress(&id, entry, prefix, file.published)
+        {
+            tracing::warn!(%error, entry, "checkpoint upload session failed");
+        }
+    }
+}
+
+/// Removes the resume record once a session is complete or cancelled.
+fn forget_session(setup: &WorkerSetup) {
+    if let Err(error) = setup
+        .store
+        .delete_upload_session(&hex::encode(setup.session_id))
+    {
+        tracing::warn!(%error, "forget upload session failed");
+    }
 }
 
 fn entry_infos(setup: &WorkerSetup, files: &[FileState]) -> Vec<EntryInfo> {
@@ -3097,5 +3234,18 @@ mod parallel_accept_tests {
         );
         // A full-object range completes the file for both callers.
         assert!(results.iter().all(|core| core.complete));
+    }
+
+    #[test]
+    fn persist_tracker_checkpoints_on_bytes_and_on_time() {
+        let mut tracker = PersistTracker::new();
+        // A small addition well under the byte threshold does not checkpoint.
+        assert!(!tracker.should_checkpoint(1024));
+        // Crossing the byte threshold does, and resets the counter.
+        assert!(tracker.should_checkpoint(PERSIST_BYTES));
+        assert!(!tracker.should_checkpoint(1024));
+        // The time threshold fires independently of bytes.
+        tracker.last_at = Instant::now() - PERSIST_INTERVAL;
+        assert!(tracker.should_checkpoint(0));
     }
 }

@@ -2198,6 +2198,93 @@ async fn identical_resend_is_deduped_not_suffixed() {
 /// ranges across scoped threads, so a batch of distinct ranges corrupting
 /// the staged object or the published bytes fails here.
 #[tokio::test(flavor = "multi_thread")]
+async fn upload_session_is_recorded_at_begin_and_forgotten_at_finish() {
+    let server = start_server().await;
+    let base = &server.base;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    let token = client
+        .post(format!("{base}/api/admin/links"))
+        .header("x-votport", "1")
+        .json(&json!({ "label": "resume" }))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["link"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let bytes: Vec<u8> = (0..512 * 1024).map(|index| (index % 251) as u8).collect();
+    let files = [prepare(vec!["resume.bin"], bytes)];
+    let (announcement, pages, seal) = build_package(&files);
+    let session = client
+        .post(format!("{base}/api/r/{token}/session"))
+        .json(&json!({ "password": "", "package": announcement }))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    client
+        .post(format!("{base}/api/session/{session}/seal"))
+        .body(seal)
+        .send()
+        .await
+        .unwrap();
+    for page in pages {
+        client
+            .post(format!("{base}/api/session/{session}/page"))
+            .body(page)
+            .send()
+            .await
+            .unwrap();
+    }
+    client
+        .post(format!("{base}/api/session/{session}/begin"))
+        .send()
+        .await
+        .unwrap();
+
+    // Begin recorded the session so a restart could re-attach it.
+    let recorded = server.application.store.load_upload_sessions().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].id, session);
+    assert_eq!(recorded[0].link_id, token);
+    assert_eq!(recorded[0].files.len(), 1);
+    assert!(!recorded[0].files[0].published);
+
+    upload_chunks(&client, base, &session, 0, &files[0]).await;
+    let response = client
+        .post(format!("{base}/api/session/{session}/finish"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    // A finished session leaves no resume record behind.
+    assert!(server
+        .application
+        .store
+        .load_upload_sessions()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn concurrent_distinct_ranges_reassemble_byte_for_byte() {
     let server = start_server().await;
     let base = &server.base;
