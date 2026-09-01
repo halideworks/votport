@@ -1603,6 +1603,7 @@ const SETTINGS_KEYS: &[&str] = &[
     "default_max_sessions",
     "public_password_login",
     "sso_session_secs",
+    "draining",
 ];
 
 pub async fn get_settings(
@@ -1731,6 +1732,8 @@ fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
         "public_password_login_source": overlay.public_password_login_source,
         "sso_session_secs": resolved.sso_session_secs,
         "sso_session_secs_source": overlay.sso_session_secs_source,
+        "draining": resolved.draining,
+        "draining_source": overlay.draining_source,
         "sso_configured": app.sso_config.is_some(),
         "deployment": deployment,
     }))
@@ -1875,7 +1878,7 @@ pub async fn put_settings(
             | "default_max_links"
             | "default_max_sessions"
             | "sso_session_secs" => write_u64(key, value, false)?,
-            "public_password_login" | "smtp_starttls" => write_bool(key, value)?,
+            "public_password_login" | "smtp_starttls" | "draining" => write_bool(key, value)?,
             "smtp_port" => write_smtp_port(key, value)?,
             _ => unreachable!(),
         };
@@ -5426,6 +5429,55 @@ mod settings_api_tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn draining_round_trips_through_the_settings_route() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = cookie_for(&application, "", "admin");
+        let (status, json) = send(
+            application.clone(),
+            Request::get("/api/admin/settings")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["draining"], false);
+
+        let (status, _) = send(
+            application.clone(),
+            Request::builder()
+                .method("PUT")
+                .uri("/api/admin/settings")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"draining":true}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // The JSON bool is stored and resolves back to draining.
+        assert!(
+            application
+                .store
+                .resolved_settings(&application.config)
+                .unwrap()
+                .draining
+        );
+        let (_, json) = send(
+            application,
+            Request::get("/api/admin/settings")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(json["draining"], true);
+        assert_eq!(json["draining_source"], "db");
     }
 
     #[tokio::test]

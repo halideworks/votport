@@ -506,8 +506,12 @@ external dependencies; see docs/multi-tenancy.md non-goals.
 A restart discards in-flight upload sessions: staged partials are swept at
 boot, and senders start those files over (files already published from a
 multi-file session survive and dedupe on re-send). Long streaming downloads
-die with the process too. For a planned upgrade, drain first: stop handing out
-new links or wait for a quiet window, watch `votport_sessions_active` on
-/metrics reach 0, then restart. The compose file sets `stop_grace_period: 5m`
-so in-flight downloads get a window to finish; no grace period covers a
-multi-hundred-GiB upload, which is what the drain is for.
+die with the process too. For a planned upgrade, drain first: turn on
+**Drain for restart** on the System page (or set the `draining` setting), which
+refuses new upload sessions with a transient 503 while leaving downloads,
+deliveries, and admin available. A sender who starts an upload during the drain
+is paused by the client and resumes on its own after the restart. Watch
+`votport_sessions_active` on /metrics reach 0 (`votport_draining` reads 1 while
+draining), then restart, then turn drain back off. The compose file sets
+`stop_grace_period: 5m` so in-flight downloads get a window to finish; no grace
+period covers a multi-hundred-GiB upload, which is what the drain is for.

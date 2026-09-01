@@ -2,6 +2,9 @@
 //!
 //! Licensed under the VOTPORT PROPRIETARY LICENSE.
 
+// The settings JSON object expands past the default macro recursion limit.
+#![recursion_limit = "256"]
+
 pub mod api;
 pub mod app;
 pub mod auth;

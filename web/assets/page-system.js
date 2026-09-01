@@ -173,6 +173,9 @@ function fillSettings(data) {
   $('sso-session-hours').disabled = !data.sso_configured;
   setSource('sso-session-source', data.sso_session_secs_source);
   $('signin-save').disabled = !data.sso_configured;
+
+  $('drain-toggle').checked = data.draining === true;
+  setSource('drain-source', data.draining_source);
 }
 
 function fillBackups(data) {
@@ -483,6 +486,11 @@ $('signin-form').addEventListener('submit', async (event) => {
     public_password_login: !$('signin-collapse').checked,
     sso_session_secs: hours * 3600,
   });
+});
+
+$('drain-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  await saveSettings(event.currentTarget, { draining: $('drain-toggle').checked });
 });
 
 $('backup-form').addEventListener('submit', async (event) => {

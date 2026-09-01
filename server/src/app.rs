@@ -2232,6 +2232,16 @@ fn metrics_text(app: &App) -> Result<String, String> {
         "# TYPE votport_sessions_active gauge\nvotport_sessions_active {}\n",
         app.sessions.total()
     );
+    let draining = app
+        .store
+        .resolved_settings(&app.config)
+        .map(|settings| settings.draining)
+        .unwrap_or(false);
+    let _ = write!(
+        body,
+        "# TYPE votport_draining gauge\nvotport_draining {}\n",
+        u8::from(draining)
+    );
     let _ = write!(
         body,
         "# TYPE votport_push_sessions_active gauge\nvotport_push_sessions_active {}\n",
