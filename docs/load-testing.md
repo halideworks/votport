@@ -47,9 +47,9 @@ with different content race on the collision suffix and fail with 409, which
 is real server behavior but not the contention this rig is pointed at. Downloads stream one admin outbound file through one grant per
 stream. On a real target the rig cleans up after itself, best effort, and
 the cleanup also runs when setup fails partway or a phase stalls: grants
-revoked, outbound file, received copies, and the link deleted. A hard kill
-of the rig process skips it and leaves the seeded link and outbound file
-behind.
+revoked, outbound file, received copies, and every seeded link deleted. A
+hard kill of the rig process skips it and leaves the seeded links and
+outbound file behind.
 
 Mind the rig's own appetite: it holds `SESSIONS x FILE_MIB` of prepared bytes
 in memory during each upload phase, and hashing them front-loads a burst of
@@ -69,6 +69,10 @@ of data:
   three-phase run through a proxy is capped at 20 session creations total:
   keep `SESSIONS` at 10 or below there, or run from inside the network.
   Synthetic addresses appear in link events and the audit log on a real box.
+- **Upload sessions: 8 concurrent per link (`MAX_SESSIONS_PER_LINK`).** The
+  rig seeds one link per eight upload workers and spreads sessions across
+  them, so runs reach the process-wide cap instead of this one. A single
+  real link still refuses its ninth concurrent sender.
 - **`VOTPORT_MAX_TOTAL_SESSIONS` (default 32).** The process-wide session
   cap; this is the knob the rig exists to size. Runs with `SESSIONS` above it
   report the overflow as 429 errors, which is the measurement working.
