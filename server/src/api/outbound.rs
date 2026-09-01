@@ -2553,14 +2553,14 @@ pub async fn outbound_batch(
             recorded: 0,
         },
         |mut state| async move {
-            // Recording trails delivery by one poll: only files whose bytes
-            // a previous poll already handed to the transport are recorded,
-            // so a record failure can never abort bytes ahead of what it
-            // recorded and lock a capped client out of files it never got.
-            // The trade runs the safe direction: a drop or failure at a
-            // boundary can leave the last yielded file unrecorded, and the
-            // client's per-file retry records it then.
-            state.record_delivered().await.map_err(api_error_io)?;
+            // Recording trails delivery: only files whose bytes a previous
+            // poll already handed to the transport are recorded, so a record
+            // failure can never abort bytes ahead of what it recorded and
+            // lock a capped client out of files it never got. The trade runs
+            // the safe direction: a drop or failure can leave the last
+            // yielded files unrecorded, and the client's per-file retry
+            // records them then.
+            state.record_delivered(false).await.map_err(api_error_io)?;
             loop {
                 if let Some(file) = state.file.as_mut() {
                     if let Some(item) = file.next().await {
@@ -2576,10 +2576,8 @@ pub async fn outbound_batch(
                 state.file = None;
                 state.chunk_index += 1;
                 if state.chunk_index >= state.chunks.len() {
-                    // Defense in depth: this poll's entry call already
-                    // recorded everything the yield path delivered, but a
-                    // future change to that path must not lose the tail.
-                    state.record_delivered().await.map_err(api_error_io)?;
+                    // End of stream: record the coalesced tail.
+                    state.record_delivered(true).await.map_err(api_error_io)?;
                     return Ok(None);
                 }
                 let chunk = state.chunks[state.chunk_index].clone();
@@ -3934,16 +3932,46 @@ struct BatchStream {
     recorded: usize,
 }
 
+/// Delivered files are recorded in one store transaction per this many
+/// delivered bytes, not one per file: every commit is an fsync inside the
+/// stream, and a batch of small files paid one per file (1024 x 256 KiB
+/// measured 320 MiB/s against 867 MiB/s for one file of the same size).
+/// A dropped stream can now leave up to this many bytes of fully delivered
+/// files unrecorded instead of one file, still the safe direction: those
+/// files stay downloadable and a later per-file fetch records them.
+const RECORD_COALESCE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The files to record now: those past `recorded` whose boundary `sent_bytes`
+/// has covered, once they span the coalesce window, or all of them on
+/// `flush`.
+fn record_range(
+    boundaries: &[u64],
+    recorded: usize,
+    sent_bytes: u64,
+    flush: bool,
+) -> Option<std::ops::Range<usize>> {
+    let mut end = recorded;
+    while end < boundaries.len() && sent_bytes >= boundaries[end] {
+        end += 1;
+    }
+    if end == recorded {
+        return None;
+    }
+    let recorded_end = recorded.checked_sub(1).map_or(0, |last| boundaries[last]);
+    (flush || boundaries[end - 1] - recorded_end >= RECORD_COALESCE_BYTES).then_some(recorded..end)
+}
+
 impl BatchStream {
-    /// Records every file whose bytes previous polls fully yielded.
-    async fn record_delivered(&mut self) -> ApiResult<()> {
-        while self.recorded < self.boundaries.len()
-            && self.sent_bytes >= self.boundaries[self.recorded]
-        {
-            let index = self.recorded;
-            record_download(&self.app, &self.grant, &[index]).await?;
-            self.recorded += 1;
-        }
+    /// Records every file whose bytes previous polls fully yielded, once
+    /// enough of them have accumulated or when `flush` ends the stream.
+    async fn record_delivered(&mut self, flush: bool) -> ApiResult<()> {
+        let Some(range) = record_range(&self.boundaries, self.recorded, self.sent_bytes, flush)
+        else {
+            return Ok(());
+        };
+        let indexes: Vec<usize> = range.clone().collect();
+        record_download(&self.app, &self.grant, &indexes).await?;
+        self.recorded = range.end;
         Ok(())
     }
 }
@@ -4385,6 +4413,29 @@ mod tests {
         assert!(valid_token(&"a".repeat(32)));
         assert!(!valid_token("x"));
         assert!(!valid_token(&"g".repeat(32)));
+    }
+
+    #[test]
+    fn record_range_coalesces_delivered_files() {
+        let mib = 1024 * 1024;
+        // Forty 1 MiB files.
+        let boundaries: Vec<u64> = (1..=40).map(|index| index * mib).collect();
+        // Nothing delivered yet, and a partial first file, record nothing.
+        assert_eq!(record_range(&boundaries, 0, 0, false), None);
+        assert_eq!(record_range(&boundaries, 0, mib - 1, false), None);
+        // Under the window: wait, unless the stream is ending.
+        assert_eq!(record_range(&boundaries, 0, 15 * mib, false), None);
+        assert_eq!(record_range(&boundaries, 0, 15 * mib, true), Some(0..15));
+        // At the window: record exactly the covered files.
+        assert_eq!(
+            record_range(&boundaries, 0, 16 * mib + 7, false),
+            Some(0..16)
+        );
+        // The window is measured from the last recorded boundary.
+        assert_eq!(record_range(&boundaries, 16, 31 * mib, false), None);
+        assert_eq!(record_range(&boundaries, 16, 32 * mib, false), Some(16..32));
+        // Everything recorded: a flush has nothing to do.
+        assert_eq!(record_range(&boundaries, 40, 40 * mib, true), None);
     }
 
     #[test]

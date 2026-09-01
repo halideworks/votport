@@ -2433,6 +2433,98 @@ async fn throughput_outbound() {
     );
 }
 
+/// Batch counterpart to `throughput_outbound`: the same 256 MiB split across
+/// VOTPORT_BENCH_FILES library files (default 1024), granted as a directory
+/// and fetched through /batch twice, so the multi-file path can be compared
+/// against the single-file number on the same host.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark; run explicitly"]
+async fn throughput_outbound_batch() {
+    const MIB: usize = 1024 * 1024;
+    let count = load_knob("VOTPORT_BENCH_FILES", 1024);
+    let each = 256 * MIB / count;
+    let total = each * count;
+    let server = start_server_with_cap(512 * MIB as u64).await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    client
+        .post(format!("{}/api/admin/login", server.base))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let upload_started = std::time::Instant::now();
+    for index in 0..count {
+        let bytes: Vec<u8> = (0..each).map(|i| ((i + index) * 7 % 251) as u8).collect();
+        client
+            .post(format!(
+                "{}/api/admin/outbound-files?path=batch/f{index:05}.bin",
+                server.base
+            ))
+            .header("x-votport", "1")
+            .body(bytes)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+    let uploaded = upload_started.elapsed();
+    let grant = client
+        .post(format!("{}/api/admin/outbound-grants", server.base))
+        .header("x-votport", "1")
+        .json(&json!({ "directory": "batch", "expires_days": 1 }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let token = grant["url"]
+        .as_str()
+        .and_then(|url| url.rsplit('/').next())
+        .unwrap();
+    let mib = |elapsed: std::time::Duration| {
+        format!(
+            "{:.0} MiB/s",
+            total as f64 / MIB as f64 / elapsed.as_secs_f64()
+        )
+    };
+    println!(
+        "outbound upload {count} x {} KiB: {uploaded:.3?} ({})",
+        each / 1024,
+        mib(uploaded)
+    );
+    for run in 1..=2 {
+        let started = std::time::Instant::now();
+        let mut response = client
+            .get(format!("{}/api/s/{token}/batch", server.base))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let first = started.elapsed();
+        let mut received = 0usize;
+        while let Some(chunk) = response.chunk().await.unwrap() {
+            received += chunk.len();
+        }
+        let downloaded = started.elapsed();
+        assert_eq!(received, total);
+        println!(
+            "outbound batch run {run} {count} files {} MiB: first byte {first:.3?}, total {downloaded:.3?} ({})",
+            total / MIB,
+            mib(downloaded)
+        );
+    }
+}
+
 /// Native-push counterpart to `throughput_baseline`.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "benchmark; run explicitly"]
