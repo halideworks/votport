@@ -1,7 +1,7 @@
 // votport system page: credentials, backups, verification key, overlay settings.
 // VOTPORT PROPRIETARY LICENSE.
 
-import { api, confirmModal, formatBytes, formatWhen, requireSession } from '/assets/admin-common.js';
+import { api, colorPair, confirmModal, formatBytes, formatWhen, requireSession } from '/assets/admin-common.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -176,7 +176,23 @@ function fillSettings(data) {
 
   $('drain-toggle').checked = data.draining === true;
   setSource('drain-source', data.draining_source);
+
+  // Reset and clear links only where they do something: a saved override
+  // to drop, or a stored secret to wipe.
+  for (const button of document.querySelectorAll('[data-reset]')) {
+    button.hidden = data[`${button.dataset.reset}_source`] !== 'db';
+  }
+  for (const button of document.querySelectorAll('[data-clear]')) {
+    button.hidden = !data[`${button.dataset.clear}_set`];
+  }
 }
+
+function syncBackupFields() {
+  $('backup-s3-fields').hidden = $('backup-destination').value === 'local';
+  $('backup-encryption-fields').hidden = !$('backup-encryption-enabled').checked;
+}
+$('backup-destination').addEventListener('change', syncBackupFields);
+$('backup-encryption-enabled').addEventListener('change', syncBackupFields);
 
 function fillBackups(data) {
   const config = data.config;
@@ -195,6 +211,7 @@ function fillBackups(data) {
   setBackupSecret('backup-s3-secret-key', config.s3_credentials_configured === true);
   $('backup-encryption-enabled').checked = config.encrypt === true;
   setBackupSecret('backup-encryption-passphrase', config.passphrase_configured === true);
+  syncBackupFields();
 
   const status = data.status;
   const statusText = status.running
@@ -376,40 +393,32 @@ $('quotas-form').addEventListener('submit', async (event) => {
   await saveSettings(event.currentTarget, body);
 });
 
-// type=color always holds a value; the flag records whether one is meant.
-let brandingColorSet = false;
-$('branding-color').addEventListener('input', () => {
-  brandingColorSet = true;
-});
-$('branding-color-clear').addEventListener('click', () => {
-  brandingColorSet = false;
-  $('branding-color').value = '#000000';
-});
+const accent = colorPair($('branding-color'), $('branding-color-hex'));
+$('branding-color-clear').addEventListener('click', () => accent.set(''));
 
 async function fillBranding() {
   const branding = await api('/api/admin/branding/default');
   $('branding-name').value = branding.name || '';
-  if (branding.color) {
-    $('branding-color').value = branding.color;
-    brandingColorSet = true;
-  }
+  accent.set(branding.color || '');
   $('branding-logo-remove').disabled = !branding.has_logo;
 }
 
 $('branding-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  formNote(event.currentTarget, '');
+  // currentTarget is null once the handler yields; keep the form.
+  const form = event.currentTarget;
+  formNote(form, '');
   try {
     await api('/api/admin/branding/default', {
       method: 'PUT',
       body: JSON.stringify({
         name: $('branding-name').value,
-        color: brandingColorSet ? $('branding-color').value : '',
+        color: accent.get(),
       }),
     });
-    formNote(event.currentTarget, 'Saved.');
+    formNote(form, 'Saved.');
   } catch (error) {
-    formError(event.currentTarget, error);
+    formError(form, error);
   }
 });
 
@@ -461,7 +470,6 @@ $('branding-remove').addEventListener('click', async () => {
   try {
     await api('/api/admin/branding/default', { method: 'DELETE' });
     form.reset();
-    brandingColorSet = false;
     await fillBranding();
     formNote(form, 'Branding removed.');
   } catch (error) {
@@ -495,12 +503,13 @@ $('drain-form').addEventListener('submit', async (event) => {
 
 $('backup-form').addEventListener('submit', async (event) => {
   event.preventDefault();
+  const form = event.currentTarget;
   const interval = parseInt($('backup-interval-minutes').value, 10);
   const retention = parseInt($('backup-local-retention-days').value, 10);
   const retentionCount = parseInt($('backup-retention-count').value, 10);
   if (!Number.isInteger(interval) || interval < 1 || !Number.isInteger(retention) || retention < 0
     || !Number.isInteger(retentionCount) || retentionCount < 0) {
-    formError(event.currentTarget, new Error('Schedule and retention must be valid numbers.'));
+    formError(form, new Error('Schedule and retention must be valid numbers.'));
     return;
   }
   const body = {
@@ -522,16 +531,16 @@ $('backup-form').addEventListener('submit', async (event) => {
   if ($('backup-encryption-passphrase').value !== '') {
     body.passphrase = $('backup-encryption-passphrase').value;
   }
-  formNote(event.currentTarget, '');
+  formNote(form, '');
   try {
     await api('/api/admin/backups', {
       method: 'PUT',
       body: JSON.stringify(body),
     });
     fillBackups(await api('/api/admin/backups'));
-    formNote(event.currentTarget, 'Saved.');
+    formNote(form, 'Saved.');
   } catch (error) {
-    formError(event.currentTarget, error);
+    formError(form, error);
   }
 });
 
@@ -553,7 +562,8 @@ $('backup-run').addEventListener('click', async () => {
 });
 
 $('backup-restore-snapshot').addEventListener('change', async (event) => {
-  const option = event.currentTarget.selectedOptions[0];
+  const select = event.currentTarget;
+  const option = select.selectedOptions[0];
   if (!option?.value) return;
   const source = option.dataset.source || 'local';
   const name = option.textContent;
@@ -562,7 +572,7 @@ $('backup-restore-snapshot').addEventListener('change', async (event) => {
     `Restore ${name}. Current application state will be replaced; the cookie secret will rotate and every existing admin session will be signed out. Automatic backups will be disabled until re-enabled by an admin. The staged restore will restart the supervised service.`,
     'Restore and restart',
   );
-  event.currentTarget.value = '';
+  select.value = '';
   if (!confirmed) return;
   const error = $('backup-status-error');
   error.hidden = true;
@@ -606,6 +616,24 @@ for (const button of document.querySelectorAll('[data-clear]')) {
     }
   });
 }
+
+// Section nav follows the scroll position.
+const navLinks = [...document.querySelectorAll('.settings-nav a')];
+const observer = new IntersectionObserver(
+  (entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      for (const link of navLinks) {
+        const active = link.getAttribute('href') === `#${entry.target.id}`;
+        link.classList.toggle('active', active);
+        if (active) link.setAttribute('aria-current', 'location');
+        else link.removeAttribute('aria-current');
+      }
+    }
+  },
+  { rootMargin: '-10% 0px -70% 0px' },
+);
+for (const section of document.querySelectorAll('.settings-group[id]')) observer.observe(section);
 
 const session = await requireSession();
 if (!session.pages.includes('system')) {

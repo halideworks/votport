@@ -30,736 +30,708 @@
 
       <h1>System</h1>
 
-      <section class="settings-group" data-group="access-security">
-        <h2>Access &amp; security</h2>
-        <p class="settings-group-note">Editable here</p>
+      <div class="settings-layout">
+        <nav class="settings-nav" aria-label="Settings sections">
+          <a href="#access-security">Access</a>
+          <a href="#notifications">Notifications</a>
+          <a href="#email">Email</a>
+          <a href="#retention">Retention</a>
+          <a href="#default-tenant-quotas">Quotas</a>
+          <a href="#branding">Branding</a>
+          <a href="#network-integrations">Deployment</a>
+          <a href="#maintenance-verification">Maintenance</a>
+          <a href="#backups">Backups</a>
+        </nav>
 
-        <form id="password-form" class="card">
-          <h2>Administrator password</h2>
-          <div class="grid">
-            <label
-              >Current password
-              <input
-                type="password"
-                id="password-current"
-                autocomplete="current-password"
-                required
-              />
-            </label>
-            <label
-              >New password <span class="muted">12 characters minimum</span>
-              <input
-                type="password"
-                id="password-new"
-                autocomplete="new-password"
-                required
-                minlength="12"
-              />
-            </label>
-          </div>
-          <button type="submit">Update password</button>
-          <span id="password-note" class="muted"></span>
-          <p class="error" id="password-error" role="alert" hidden></p>
-        </form>
+        <div class="settings-main">
+          <section class="settings-group" id="access-security" data-group="access-security">
+            <h2>Access &amp; security</h2>
+            <form id="password-form" class="card">
+              <h3>Administrator password</h3>
+              <div class="grid">
+                <label
+                  >Current password
+                  <input
+                    type="password"
+                    id="password-current"
+                    autocomplete="current-password"
+                    required
+                  />
+                </label>
+                <label
+                  >New password <span class="muted">12 characters minimum</span>
+                  <input
+                    type="password"
+                    id="password-new"
+                    autocomplete="new-password"
+                    required
+                    minlength="12"
+                  />
+                </label>
+              </div>
+              <div class="actions">
+                <button type="submit">Update password</button>
+                <span id="password-note" class="muted"></span>
+              </div>
+              <p class="error" id="password-error" role="alert" hidden></p>
+            </form>
 
-        <form id="signin-form" class="card">
-          <h2>Sign-in</h2>
-          <p class="muted">
-            The password form stays in the page behind a disclosure. POST
-            /api/admin/login always works. Without SSO the form stays expanded.
-          </p>
-          <label
-            ><input type="checkbox" id="signin-collapse" />
-            Collapse the local password form when SSO is offered
-            <span class="muted" id="signin-source"></span>
-          </label>
-          <label>
-            SSO session lifetime (hours)
-            <span class="muted" id="sso-session-source"></span>
-            <input
-              type="number"
-              id="sso-session-hours"
-              min="1"
-              max="8760"
-              step="1"
-              disabled
-            />
-          </label>
-          <p class="muted">
-            How long an SSO sign-in stays valid before the identity provider
-            is consulted again. Group changes at the provider take effect at
-            the next sign-in, so this bounds offboarding latency. The local
-            break-glass session is fixed at 7 days.
-          </p>
-          <button type="submit" id="signin-save" disabled>Save</button>
-          <span id="signin-note" class="muted"></span>
-          <p class="error" id="signin-error" role="alert" hidden></p>
-        </form>
-      </section>
+            <form id="signin-form" class="card">
+              <h3>Sign-in</h3>
+              <label class="check"
+                ><input type="checkbox" id="signin-collapse" />
+                Collapse the password form when SSO is offered
+                <span class="muted" id="signin-source"></span>
+              </label>
+              <div class="grid">
+                <label>
+                  SSO session lifetime <span class="muted">hours</span>
+                  <span class="muted" id="sso-session-source"></span>
+                  <input
+                    type="number"
+                    id="sso-session-hours"
+                    min="1"
+                    max="8760"
+                    step="1"
+                    disabled
+                  />
+                </label>
+              </div>
+              <p class="muted">
+                Group changes at the identity provider take effect at the next
+                sign-in, so this bounds offboarding latency. The local
+                break-glass session is fixed at 7 days.
+              </p>
+              <div class="actions">
+                <button type="submit" id="signin-save" disabled>Save</button>
+                <span id="signin-note" class="muted"></span>
+              </div>
+              <p class="error" id="signin-error" role="alert" hidden></p>
+            </form>
+          </section>
 
-      <section class="settings-group" data-group="storage-transfer">
-        <h2>Storage &amp; transfer</h2>
-        <p class="settings-group-note">
-          Deployment settings &middot; restart required
-        </p>
-        <div class="card">
-          <h2>Storage and transfer limits</h2>
-          <dl class="settings-status">
-            <div>
-              <dt>Data directory</dt>
-              <dd id="setting-data-dir" class="mono"></dd>
-            </div>
-            <div>
-              <dt>Received files directory</dt>
-              <dd id="setting-receive-dir" class="mono"></dd>
-            </div>
-            <div>
-              <dt>Outbound files directory</dt>
-              <dd id="setting-outbound-dir" class="mono"></dd>
-            </div>
-            <div>
-              <dt>Web assets directory</dt>
-              <dd id="setting-web-root" class="mono"></dd>
-            </div>
-            <div>
-              <dt>Maximum upload</dt>
-              <dd id="setting-max-upload" class="mono"></dd>
-            </div>
-            <div>
-              <dt>Hidden files</dt>
-              <dd id="setting-allow-hidden"></dd>
-            </div>
-            <div>
-              <dt>Idle session timeout</dt>
-              <dd id="setting-idle-timeout" class="mono"></dd>
-            </div>
-          </dl>
-        </div>
-      </section>
-
-      <section class="settings-group" data-group="notifications">
-        <h2>Notifications</h2>
-        <p class="settings-group-note">Editable here</p>
-        <form id="notify-form" class="card">
-          <h2>Notifications</h2>
-          <div class="grid">
-            <div>
-              <label
-                >Webhook URL
-                <span class="muted" id="notify-webhook-source"></span>
-                <input id="notify-webhook" placeholder="https://" />
-              </label>
-              <button
-                type="button"
-                class="ghost tiny"
-                data-reset="notify_webhook"
-              >
-                Use environment
-              </button>
-            </div>
-            <div>
-              <label
-                >ntfy URL <span class="muted" id="notify-ntfy-source"></span>
-                <input id="notify-ntfy" placeholder="https://" />
-              </label>
-              <button type="button" class="ghost tiny" data-reset="notify_ntfy">
-                Use environment
-              </button>
-            </div>
-            <div>
-              <label
-                >ntfy token
-                <span class="muted" id="notify-ntfy-token-source"></span>
-                <input
-                  id="notify-ntfy-token"
-                  type="password"
-                  autocomplete="off"
-                />
-              </label>
-              <button
-                type="button"
-                class="ghost tiny"
-                data-reset="notify_ntfy_token"
-              >
-                Use environment
-              </button>
-              <button
-                type="button"
-                class="ghost tiny"
-                data-clear="notify_ntfy_token"
-                disabled
-              >
-                Clear
-              </button>
-            </div>
-            <div>
-              <label
-                >Pushover token
-                <span class="muted" id="notify-pushover-token-source"></span>
-                <input
-                  id="notify-pushover-token"
-                  type="password"
-                  autocomplete="off"
-                />
-              </label>
-              <button
-                type="button"
-                class="ghost tiny"
-                data-reset="notify_pushover_token"
-              >
-                Use environment
-              </button>
-              <button
-                type="button"
-                class="ghost tiny"
-                data-clear="notify_pushover_token"
-                disabled
-              >
-                Clear
-              </button>
-            </div>
-            <div>
-              <label
-                >Pushover user
-                <span class="muted" id="notify-pushover-user-source"></span>
-                <input id="notify-pushover-user" autocomplete="off" />
-              </label>
-              <button
-                type="button"
-                class="ghost tiny"
-                data-reset="notify_pushover_user"
-              >
-                Use environment
-              </button>
-              <button
-                type="button"
-                class="ghost tiny"
-                data-clear="notify_pushover_user"
-                disabled
-              >
-                Clear
-              </button>
-            </div>
-          </div>
-          <button type="submit" id="notify-save" disabled>Save</button>
-          <button type="button" id="notify-test" class="ghost" disabled>
-            Send test
-          </button>
-          <span id="notify-test-note" class="muted">
-            Tests the currently active notification settings.
-          </span>
-          <p class="error" id="notify-test-error" role="alert" hidden></p>
-          <span id="notify-note" class="muted"></span>
-          <p class="error" id="notify-error" role="alert" hidden></p>
-        </form>
-      </section>
-
-      <section class="settings-group" data-group="email">
-        <h2>Email</h2>
-        <p class="settings-group-note">Editable here</p>
-        <form id="smtp-form" class="card">
-          <h2>SMTP delivery</h2>
-          <p class="muted">
-            Sent when an upload finishes. Requires host, from, and at least one
-            recipient. Port 465 uses implicit TLS.
-          </p>
-          <div class="grid">
-            <div>
-              <label
-                >Host <span class="muted" id="smtp-host-source"></span>
-                <input
-                  id="smtp-host"
-                  placeholder="smtp.example.com"
-                  autocomplete="off"
-                />
-              </label>
-              <button type="button" class="ghost tiny" data-reset="smtp_host">
-                Use environment
-              </button>
-            </div>
-            <div>
-              <label
-                >Port <span class="muted" id="smtp-port-source"></span>
-                <input
-                  id="smtp-port"
-                  type="number"
-                  min="1"
-                  max="65535"
-                  step="1"
-                />
-              </label>
-              <button type="button" class="ghost tiny" data-reset="smtp_port">
-                Use environment
-              </button>
-            </div>
-            <div>
-              <label
-                ><input type="checkbox" id="smtp-starttls" />
-                STARTTLS
-                <span class="muted" id="smtp-starttls-source"></span>
-              </label>
-              <button
-                type="button"
-                class="ghost tiny"
-                data-reset="smtp_starttls"
-              >
-                Use environment
-              </button>
-            </div>
-            <div>
-              <label
-                >Username <span class="muted" id="smtp-username-source"></span>
-                <input id="smtp-username" autocomplete="off" />
-              </label>
-              <button
-                type="button"
-                class="ghost tiny"
-                data-reset="smtp_username"
-              >
-                Use environment
-              </button>
-            </div>
-            <div>
-              <label
-                >Password <span class="muted" id="smtp-password-source"></span>
-                <input id="smtp-password" type="password" autocomplete="off" />
-              </label>
-              <button
-                type="button"
-                class="ghost tiny"
-                data-reset="smtp_password"
-              >
-                Use environment
-              </button>
-              <button
-                type="button"
-                class="ghost tiny"
-                data-clear="smtp_password"
-                disabled
-              >
-                Clear
-              </button>
-            </div>
-            <div>
-              <label
-                >From <span class="muted" id="smtp-from-source"></span>
-                <input
-                  id="smtp-from"
-                  placeholder="votport@example.com"
-                  autocomplete="off"
-                />
-              </label>
-              <button type="button" class="ghost tiny" data-reset="smtp_from">
-                Use environment
-              </button>
-            </div>
-            <div>
-              <label
-                >To
-                <span class="muted">comma-separated</span>
-                <span class="muted" id="smtp-to-source"></span>
-                <input
-                  id="smtp-to"
-                  placeholder="ops@example.com"
-                  autocomplete="off"
-                />
-              </label>
-              <button type="button" class="ghost tiny" data-reset="smtp_to">
-                Use environment
-              </button>
-            </div>
-          </div>
-          <button type="submit" id="smtp-save" disabled>Save</button>
-          <span id="smtp-note" class="muted"></span>
-          <p class="error" id="smtp-error" role="alert" hidden></p>
-        </form>
-      </section>
-
-      <section class="settings-group" data-group="retention">
-        <h2>Retention</h2>
-        <p class="settings-group-note">Editable here</p>
-        <form id="retention-form" class="card">
-          <h2>Data retention</h2>
-          <div class="grid">
-            <div>
-              <label
-                >Audit log
-                <span class="muted">days, 0 is off</span>
-                <span class="muted" id="audit-retention-source"></span>
-                <input
-                  id="audit-retention-days"
-                  type="number"
-                  min="0"
-                  step="1"
-                />
-              </label>
-              <button
-                type="button"
-                class="ghost tiny"
-                data-reset="audit_retention_days"
-              >
-                Use environment
-              </button>
-            </div>
-            <div>
-              <label
-                >Received files
-                <span class="muted">days, 0 is off</span>
-                <span class="muted" id="upload-retention-source"></span>
-                <input
-                  id="upload-retention-days"
-                  type="number"
-                  min="0"
-                  step="1"
-                />
-              </label>
-              <button
-                type="button"
-                class="ghost tiny"
-                data-reset="upload_retention_days"
-              >
-                Use environment
-              </button>
-            </div>
-          </div>
-          <button type="submit">Save</button>
-          <span id="retention-note" class="muted"></span>
-          <p class="error" id="retention-error" role="alert" hidden></p>
-        </form>
-      </section>
-
-      <section class="settings-group" data-group="default-tenant-quotas">
-        <h2>Default tenant quotas</h2>
-        <p class="settings-group-note">Editable here</p>
-        <form id="quotas-form" class="card">
-          <h2>Default tenant limits</h2>
-          <div class="grid">
-            <div>
-              <label
-                >Storage quota <span class="muted">GiB</span>
-                <span class="muted" id="default-max-total-source"></span>
-                <input
-                  id="default-max-total"
-                  type="number"
-                  min="1"
-                  placeholder="none"
-                />
-              </label>
-              <button
-                type="button"
-                class="ghost tiny"
-                data-reset="default_max_total_bytes"
-              >
-                Use environment
-              </button>
-            </div>
-            <div>
-              <label
-                >Link limit <span class="muted">optional</span>
-                <span class="muted" id="default-max-links-source"></span>
-                <input
-                  id="default-max-links"
-                  type="number"
-                  min="1"
-                  placeholder="none"
-                />
-              </label>
-              <button
-                type="button"
-                class="ghost tiny"
-                data-reset="default_max_links"
-              >
-                Use environment
-              </button>
-            </div>
-            <div>
-              <label
-                >Concurrent uploads <span class="muted">optional</span>
-                <span class="muted" id="default-max-sessions-source"></span>
-                <input
-                  id="default-max-sessions"
-                  type="number"
-                  min="1"
-                  placeholder="none"
-                />
-              </label>
-              <button
-                type="button"
-                class="ghost tiny"
-                data-reset="default_max_sessions"
-              >
-                Use environment
-              </button>
-            </div>
-          </div>
-          <button type="submit">Save</button>
-          <span id="quotas-note" class="muted"></span>
-          <p class="error" id="quotas-error" role="alert" hidden></p>
-        </form>
-      </section>
-
-      <section class="settings-group" data-group="branding">
-        <h2>Branding</h2>
-        <p class="settings-group-note">Default tenant, recipient-facing</p>
-        <form id="branding-form" class="card">
-          <h2>Recipient branding</h2>
-          <p class="muted">
-            Shown on request and download pages served by the default tenant.
-            Named tenants are branded from the Tenants page.
-          </p>
-          <div class="grid">
-            <label
-              >Brand name
-              <input id="branding-name" type="text" placeholder="votport" />
-            </label>
-            <div>
-              <label
-                >Accent color
-                <input id="branding-color" type="color" value="#38bdf8" />
-              </label>
-              <button type="button" class="ghost tiny" id="branding-color-clear">
-                Clear color
-              </button>
-            </div>
-            <div>
-              <label
-                >Logo <span class="muted">PNG, JPEG, or SVG &middot; 512 KiB max</span>
-                <input
-                  id="branding-logo"
-                  type="file"
-                  accept="image/png,image/jpeg,image/svg+xml"
-                />
-              </label>
-              <button type="button" class="tiny" id="branding-logo-upload">
-                Upload logo
-              </button>
-              <button type="button" class="tiny danger" id="branding-logo-remove">
-                Remove logo
-              </button>
-            </div>
-          </div>
-          <button type="submit">Save</button>
-          <button type="button" class="tiny danger" id="branding-remove">
-            Remove branding
-          </button>
-          <span id="branding-note" class="muted"></span>
-          <p class="error" id="branding-error" role="alert" hidden></p>
-        </form>
-      </section>
-
-      <section class="settings-group" data-group="network-integrations">
-        <h2>Network &amp; integrations</h2>
-        <p class="settings-group-note">
-          Deployment settings &middot; restart required
-        </p>
-        <div class="card">
-          <h2>Network and sign-on</h2>
-          <dl class="settings-status">
-            <div>
-              <dt>HTTP bind</dt>
-              <dd id="setting-bind" class="mono"></dd>
-            </div>
-            <div>
-              <dt>Public URL</dt>
-              <dd id="setting-public-url" class="mono"></dd>
-            </div>
-            <div>
-              <dt>Trusted proxies</dt>
-              <dd id="setting-trusted-proxies" class="mono"></dd>
-            </div>
-            <div>
-              <dt>Metrics endpoint</dt>
-              <dd id="setting-metrics"></dd>
-            </div>
-            <div>
-              <dt>OIDC issuer</dt>
-              <dd id="setting-oidc-issuer" class="mono"></dd>
-            </div>
-            <div>
-              <dt>OIDC client ID</dt>
-              <dd id="setting-oidc-client-id" class="mono"></dd>
-            </div>
-            <div>
-              <dt>OIDC admin group</dt>
-              <dd id="setting-oidc-admin-group"></dd>
-            </div>
-            <div>
-              <dt>OIDC client secret</dt>
-              <dd id="setting-oidc-secret"></dd>
-            </div>
-            <div>
-              <dt>Native push listener</dt>
-              <dd id="setting-push-bind" class="mono"></dd>
-            </div>
-            <div>
-              <dt>Native push advertise</dt>
-              <dd id="setting-push-advertise" class="mono"></dd>
-            </div>
-            <div>
-              <dt>Native push certificate</dt>
-              <dd id="setting-push-certificate"></dd>
-            </div>
-            <div>
-              <dt>Native push private key</dt>
-              <dd id="setting-push-key"></dd>
-            </div>
-          </dl>
-        </div>
-      </section>
-
-      <section class="settings-group" data-group="maintenance-verification">
-        <h2>Maintenance &amp; verification</h2>
-        <p class="settings-group-note">Operational tools</p>
-        <div class="card">
-          <h2>Drain for restart</h2>
-          <p class="muted">
-            Refuses new upload sessions so active ones can finish before a
-            restart. Downloads, deliveries, and admin stay available. Turn it
-            on, watch active uploads reach zero
-            (<code>votport_sessions_active</code> on <code>/metrics</code>),
-            then restart. A sender who starts during drain is paused and
-            resumes on its own afterward.
-          </p>
-          <form id="drain-form" class="card">
-            <label
-              ><input type="checkbox" id="drain-toggle" />
-              Draining: refuse new upload sessions
-              <span class="muted" id="drain-source"></span>
-            </label>
-            <button type="submit" id="drain-save">Save</button>
-            <span id="drain-note" class="muted"></span>
-            <p class="error" id="drain-error" role="alert" hidden></p>
-          </form>
-        </div>
-        <div class="card">
-          <h2>Backups</h2>
-          <p class="muted">
-            Automatic snapshots contain the database and VOTPort-managed
-            identity files only. Received and outbound files remain separate
-            operator backups.
-          </p>
-          <form id="backup-form">
-            <div class="grid">
-              <label
-                >Destination
-                <select id="backup-destination">
-                  <option value="local">Local filesystem</option>
-                  <option value="s3">S3-compatible bucket</option>
-                  <option value="both">Both</option>
-                </select>
-              </label>
-              <label
-                ><input type="checkbox" id="backup-enabled" />
-                Enable automatic backups
-              </label>
-              <label
-                >Schedule <span class="muted">minutes</span>
-                <input id="backup-interval-minutes" type="number" min="1" step="1" required />
-              </label>
-              <label
-                >Local path <span class="muted">service filesystem path; blank uses &lt;data_dir&gt;/backups; custom paths must already exist with private ancestry</span>
-                <input id="backup-local-path" autocomplete="off" placeholder="/data/backups" />
-              </label>
-              <label
-                >Retention days <span class="muted">all configured targets, 0 is off</span>
-                <input id="backup-local-retention-days" type="number" min="0" step="1" required />
-              </label>
-              <label
-                >Retention count <span class="muted">snapshots, 0 is off</span>
-                <input id="backup-retention-count" type="number" min="0" step="1" required />
-              </label>
-            </div>
-
-            <h3>S3-compatible target</h3>
-            <div class="grid">
-              <label
-                >Endpoint <span class="muted">https://...</span>
-                <input id="backup-s3-endpoint" autocomplete="off" placeholder="https://s3.example.com" />
-              </label>
-              <label
-                >Region
-                <input id="backup-s3-region" autocomplete="off" placeholder="us-east-1" />
-              </label>
-              <label
-                >Bucket
-                <input id="backup-s3-bucket" autocomplete="off" />
-              </label>
-              <label
-                >Prefix/path <span class="muted">backup objects only</span>
-                <input id="backup-s3-prefix" autocomplete="off" placeholder="votport" />
-              </label>
-              <label
-                ><input type="checkbox" id="backup-s3-path-style" />
-                Use path-style requests <span class="muted">for endpoints that require it</span>
-              </label>
-              <label
-                >Access key <span class="muted" id="backup-s3-access-key-source"></span>
-                <input id="backup-s3-access-key" autocomplete="off" />
-              </label>
-              <label
-                >Secret key <span class="muted" id="backup-s3-secret-key-source"></span>
-                <input id="backup-s3-secret-key" type="password" autocomplete="new-password" />
-              </label>
-            </div>
-            <p class="muted">Leave credential fields blank to keep saved secrets unchanged; GET never returns them.</p>
-
-            <label
-              ><input type="checkbox" id="backup-encryption-enabled" />
-              Encrypt snapshots
-            </label>
-            <label
-              >Encryption passphrase <span class="muted" id="backup-encryption-passphrase-source"></span>
-              <input id="backup-encryption-passphrase" type="password" autocomplete="new-password" />
-            </label>
-            <p class="muted">Leave the passphrase blank to keep it unchanged; there is no in-app secret clear control.</p>
-            <p class="warning" id="backup-encryption-warning">
-              Keep an external recovery copy of the passphrase. Without it,
-              encrypted snapshots cannot be restored.
+          <section class="settings-group" id="storage-transfer" data-group="storage-transfer">
+            <h2>Storage &amp; transfer</h2>
+            <p class="settings-group-note">
+              Deployment settings &middot; restart required
             </p>
-            <button type="submit" id="backup-save" disabled>Save backup settings</button>
-            <span id="backup-note" class="muted"></span>
-            <p class="error" id="backup-error" role="alert" hidden></p>
-          </form>
-        </div>
+            <details class="card deployment">
+              <summary>Directories, upload limit, idle timeout</summary>
+              <dl class="settings-status">
+                <div>
+                  <dt>Data directory</dt>
+                  <dd id="setting-data-dir" class="mono"></dd>
+                </div>
+                <div>
+                  <dt>Received files directory</dt>
+                  <dd id="setting-receive-dir" class="mono"></dd>
+                </div>
+                <div>
+                  <dt>Outbound files directory</dt>
+                  <dd id="setting-outbound-dir" class="mono"></dd>
+                </div>
+                <div>
+                  <dt>Web assets directory</dt>
+                  <dd id="setting-web-root" class="mono"></dd>
+                </div>
+                <div>
+                  <dt>Maximum upload</dt>
+                  <dd id="setting-max-upload" class="mono"></dd>
+                </div>
+                <div>
+                  <dt>Hidden files</dt>
+                  <dd id="setting-allow-hidden"></dd>
+                </div>
+                <div>
+                  <dt>Idle session timeout</dt>
+                  <dd id="setting-idle-timeout" class="mono"></dd>
+                </div>
+              </dl>
+            </details>
+          </section>
 
-        <div class="card" id="backup-status-card">
-          <h2>Backup status</h2>
-          <p id="backup-status" class="muted">Loading backup status…</p>
-          <p><a id="backup-download" class="ghost" href="/api/admin/backup">Download database snapshot</a></p>
-          <div class="grid">
-            <button type="button" id="backup-run" class="ghost" disabled>Run now</button>
-            <label
-              >Restore snapshot
-              <select id="backup-restore-snapshot" disabled>
-                <option value="">No snapshots available</option>
-              </select>
-            </label>
-          </div>
-          <p class="muted">
-            Restore stages the selected snapshot, replaces current application
-            state, and restarts the supervised service. Current application
-            state will be replaced, the cookie secret will rotate, and every
-            existing admin session will be signed out. Automatic backups will
-            remain disabled until an admin re-enables them. Confirm the
-            snapshot before continuing.
-          </p>
-          <p id="backup-inventory" class="muted"></p>
-          <p class="error" id="backup-status-error" role="alert" hidden></p>
-        </div>
+          <section class="settings-group" id="notifications" data-group="notifications">
+            <h2>Notifications</h2>
+            <form id="notify-form" class="card">
+              <p class="muted">Sent when an upload finishes. Blank secrets stay unchanged.</p>
+              <div class="grid">
+                <div class="field">
+                  <label
+                    >Webhook URL
+                    <span class="muted" id="notify-webhook-source"></span>
+                    <input id="notify-webhook" placeholder="https://" />
+                  </label>
+                  <button type="button" class="link" data-reset="notify_webhook">
+                    Use environment
+                  </button>
+                </div>
+                <div class="field">
+                  <label
+                    >ntfy URL <span class="muted" id="notify-ntfy-source"></span>
+                    <input id="notify-ntfy" placeholder="https://" />
+                  </label>
+                  <button type="button" class="link" data-reset="notify_ntfy">
+                    Use environment
+                  </button>
+                </div>
+                <div class="field">
+                  <label
+                    >ntfy token
+                    <span class="muted" id="notify-ntfy-token-source"></span>
+                    <input
+                      id="notify-ntfy-token"
+                      type="password"
+                      autocomplete="off"
+                    />
+                  </label>
+                  <button type="button" class="link" data-reset="notify_ntfy_token">
+                    Use environment
+                  </button>
+                  <button type="button" class="link" data-clear="notify_ntfy_token" disabled>
+                    Clear
+                  </button>
+                </div>
+                <div class="field">
+                  <label
+                    >Pushover token
+                    <span class="muted" id="notify-pushover-token-source"></span>
+                    <input
+                      id="notify-pushover-token"
+                      type="password"
+                      autocomplete="off"
+                    />
+                  </label>
+                  <button type="button" class="link" data-reset="notify_pushover_token">
+                    Use environment
+                  </button>
+                  <button type="button" class="link" data-clear="notify_pushover_token" disabled>
+                    Clear
+                  </button>
+                </div>
+                <div class="field">
+                  <label
+                    >Pushover user
+                    <span class="muted" id="notify-pushover-user-source"></span>
+                    <input id="notify-pushover-user" autocomplete="off" />
+                  </label>
+                  <button type="button" class="link" data-reset="notify_pushover_user">
+                    Use environment
+                  </button>
+                  <button type="button" class="link" data-clear="notify_pushover_user" disabled>
+                    Clear
+                  </button>
+                </div>
+              </div>
+              <div class="actions">
+                <button type="submit" id="notify-save" disabled>Save</button>
+                <button type="button" id="notify-test" class="ghost" disabled>
+                  Send test
+                </button>
+                <span id="notify-note" class="muted"></span>
+                <span id="notify-test-note" class="muted"></span>
+              </div>
+              <p class="error" id="notify-test-error" role="alert" hidden></p>
+              <p class="error" id="notify-error" role="alert" hidden></p>
+            </form>
+          </section>
 
-        <div class="card">
-          <h2>Receipt verification</h2>
-          <p class="muted">
-            Every received file carries a signed
-            <code>.vot-receipt</code> sidecar. Verify signatures against this
-            public key.
-          </p>
-          <p class="mono" id="receipt-key"></p>
-          <p class="muted">
-            Anyone can check a sidecar at <a href="/verify">/verify</a>.
-          </p>
+          <section class="settings-group" id="email" data-group="email">
+            <h2>Email</h2>
+            <form id="smtp-form" class="card">
+              <p class="muted">
+                Needs a host, a from address, and at least one recipient. Port
+                465 uses implicit TLS.
+              </p>
+              <div class="grid">
+                <div class="field">
+                  <label
+                    >Host <span class="muted" id="smtp-host-source"></span>
+                    <input
+                      id="smtp-host"
+                      placeholder="smtp.example.com"
+                      autocomplete="off"
+                    />
+                  </label>
+                  <button type="button" class="link" data-reset="smtp_host">
+                    Use environment
+                  </button>
+                </div>
+                <div class="field">
+                  <label
+                    >Port <span class="muted" id="smtp-port-source"></span>
+                    <input
+                      id="smtp-port"
+                      type="number"
+                      min="1"
+                      max="65535"
+                      step="1"
+                    />
+                  </label>
+                  <button type="button" class="link" data-reset="smtp_port">
+                    Use environment
+                  </button>
+                </div>
+                <div class="field">
+                  <label
+                    >Username <span class="muted" id="smtp-username-source"></span>
+                    <input id="smtp-username" autocomplete="off" />
+                  </label>
+                  <button type="button" class="link" data-reset="smtp_username">
+                    Use environment
+                  </button>
+                </div>
+                <div class="field">
+                  <label
+                    >Password <span class="muted" id="smtp-password-source"></span>
+                    <input id="smtp-password" type="password" autocomplete="off" />
+                  </label>
+                  <button type="button" class="link" data-reset="smtp_password">
+                    Use environment
+                  </button>
+                  <button type="button" class="link" data-clear="smtp_password" disabled>
+                    Clear
+                  </button>
+                </div>
+                <div class="field">
+                  <label
+                    >From <span class="muted" id="smtp-from-source"></span>
+                    <input
+                      id="smtp-from"
+                      placeholder="votport@example.com"
+                      autocomplete="off"
+                    />
+                  </label>
+                  <button type="button" class="link" data-reset="smtp_from">
+                    Use environment
+                  </button>
+                </div>
+                <div class="field">
+                  <label
+                    >To
+                    <span class="muted">comma-separated</span>
+                    <span class="muted" id="smtp-to-source"></span>
+                    <input
+                      id="smtp-to"
+                      placeholder="ops@example.com"
+                      autocomplete="off"
+                    />
+                  </label>
+                  <button type="button" class="link" data-reset="smtp_to">
+                    Use environment
+                  </button>
+                </div>
+                <div class="field">
+                  <label class="check"
+                    ><input type="checkbox" id="smtp-starttls" />
+                    STARTTLS
+                    <span class="muted" id="smtp-starttls-source"></span>
+                  </label>
+                  <button type="button" class="link" data-reset="smtp_starttls">
+                    Use environment
+                  </button>
+                </div>
+              </div>
+              <div class="actions">
+                <button type="submit" id="smtp-save" disabled>Save</button>
+                <span id="smtp-note" class="muted"></span>
+              </div>
+              <p class="error" id="smtp-error" role="alert" hidden></p>
+            </form>
+          </section>
+
+          <section class="settings-group" id="retention" data-group="retention">
+            <h2>Retention</h2>
+            <form id="retention-form" class="card">
+              <div class="grid">
+                <div class="field">
+                  <label
+                    >Audit log
+                    <span class="muted">days, 0 keeps everything</span>
+                    <span class="muted" id="audit-retention-source"></span>
+                    <input
+                      id="audit-retention-days"
+                      type="number"
+                      min="0"
+                      step="1"
+                    />
+                  </label>
+                  <button type="button" class="link" data-reset="audit_retention_days">
+                    Use environment
+                  </button>
+                </div>
+                <div class="field">
+                  <label
+                    >Received files
+                    <span class="muted">days, 0 keeps everything</span>
+                    <span class="muted" id="upload-retention-source"></span>
+                    <input
+                      id="upload-retention-days"
+                      type="number"
+                      min="0"
+                      step="1"
+                    />
+                  </label>
+                  <button type="button" class="link" data-reset="upload_retention_days">
+                    Use environment
+                  </button>
+                </div>
+              </div>
+              <div class="actions">
+                <button type="submit">Save</button>
+                <span id="retention-note" class="muted"></span>
+              </div>
+              <p class="error" id="retention-error" role="alert" hidden></p>
+            </form>
+          </section>
+
+          <section class="settings-group" id="default-tenant-quotas" data-group="default-tenant-quotas">
+            <h2>Default tenant quotas</h2>
+            <form id="quotas-form" class="card">
+              <p class="muted">Applied to tenants without their own limits. Blank means no limit.</p>
+              <div class="grid">
+                <div class="field">
+                  <label
+                    >Storage quota <span class="muted">GiB</span>
+                    <span class="muted" id="default-max-total-source"></span>
+                    <input
+                      id="default-max-total"
+                      type="number"
+                      min="1"
+                      placeholder="none"
+                    />
+                  </label>
+                  <button type="button" class="link" data-reset="default_max_total_bytes">
+                    Use environment
+                  </button>
+                </div>
+                <div class="field">
+                  <label
+                    >Link limit
+                    <span class="muted" id="default-max-links-source"></span>
+                    <input
+                      id="default-max-links"
+                      type="number"
+                      min="1"
+                      placeholder="none"
+                    />
+                  </label>
+                  <button type="button" class="link" data-reset="default_max_links">
+                    Use environment
+                  </button>
+                </div>
+                <div class="field">
+                  <label
+                    >Concurrent uploads
+                    <span class="muted" id="default-max-sessions-source"></span>
+                    <input
+                      id="default-max-sessions"
+                      type="number"
+                      min="1"
+                      placeholder="none"
+                    />
+                  </label>
+                  <button type="button" class="link" data-reset="default_max_sessions">
+                    Use environment
+                  </button>
+                </div>
+              </div>
+              <div class="actions">
+                <button type="submit">Save</button>
+                <span id="quotas-note" class="muted"></span>
+              </div>
+              <p class="error" id="quotas-error" role="alert" hidden></p>
+            </form>
+          </section>
+
+          <section class="settings-group" id="branding" data-group="branding">
+            <h2>Branding</h2>
+            <form id="branding-form" class="card">
+              <p class="muted">
+                Shown on the request and download pages of the default tenant.
+                Named tenants are branded from the Tenants page.
+              </p>
+              <div class="grid">
+                <label
+                  >Brand name
+                  <input id="branding-name" type="text" placeholder="VOTPort" />
+                </label>
+                <div class="field">
+                  <label for="branding-color-hex">
+                    Accent color <span class="muted">buttons and progress on recipient pages</span>
+                  </label>
+                  <div class="color-pair">
+                    <input
+                      id="branding-color"
+                      type="color"
+                      value="#38bdf8"
+                      aria-label="Pick accent color"
+                    />
+                    <input
+                      id="branding-color-hex"
+                      type="text"
+                      class="mono"
+                      placeholder="none"
+                      pattern="#[0-9a-fA-F]{6}"
+                      maxlength="7"
+                      autocomplete="off"
+                      spellcheck="false"
+                    />
+                  </div>
+                  <button type="button" class="link" id="branding-color-clear">
+                    No accent
+                  </button>
+                </div>
+                <div class="field">
+                  <label
+                    >Logo <span class="muted">PNG, JPEG, or SVG, 512 KiB max</span>
+                    <input
+                      id="branding-logo"
+                      type="file"
+                      accept="image/png,image/jpeg,image/svg+xml"
+                    />
+                  </label>
+                  <button type="button" class="ghost tiny" id="branding-logo-upload">
+                    Upload logo
+                  </button>
+                  <button type="button" class="danger tiny" id="branding-logo-remove">
+                    Remove logo
+                  </button>
+                </div>
+              </div>
+              <div class="actions">
+                <button type="submit">Save</button>
+                <button type="button" class="danger" id="branding-remove">
+                  Remove branding
+                </button>
+                <span id="branding-note" class="muted"></span>
+              </div>
+              <p class="error" id="branding-error" role="alert" hidden></p>
+            </form>
+          </section>
+
+          <section class="settings-group" id="network-integrations" data-group="network-integrations">
+            <h2>Network &amp; integrations</h2>
+            <p class="settings-group-note">
+              Deployment settings &middot; restart required
+            </p>
+            <details class="card deployment">
+              <summary>Bind, public URL, proxies, metrics, OIDC, native push</summary>
+              <dl class="settings-status">
+                <div>
+                  <dt>HTTP bind</dt>
+                  <dd id="setting-bind" class="mono"></dd>
+                </div>
+                <div>
+                  <dt>Public URL</dt>
+                  <dd id="setting-public-url" class="mono"></dd>
+                </div>
+                <div>
+                  <dt>Trusted proxies</dt>
+                  <dd id="setting-trusted-proxies" class="mono"></dd>
+                </div>
+                <div>
+                  <dt>Metrics endpoint</dt>
+                  <dd id="setting-metrics"></dd>
+                </div>
+                <div>
+                  <dt>OIDC issuer</dt>
+                  <dd id="setting-oidc-issuer" class="mono"></dd>
+                </div>
+                <div>
+                  <dt>OIDC client ID</dt>
+                  <dd id="setting-oidc-client-id" class="mono"></dd>
+                </div>
+                <div>
+                  <dt>OIDC admin group</dt>
+                  <dd id="setting-oidc-admin-group"></dd>
+                </div>
+                <div>
+                  <dt>OIDC client secret</dt>
+                  <dd id="setting-oidc-secret"></dd>
+                </div>
+                <div>
+                  <dt>Native push listener</dt>
+                  <dd id="setting-push-bind" class="mono"></dd>
+                </div>
+                <div>
+                  <dt>Native push advertise</dt>
+                  <dd id="setting-push-advertise" class="mono"></dd>
+                </div>
+                <div>
+                  <dt>Native push certificate</dt>
+                  <dd id="setting-push-certificate"></dd>
+                </div>
+                <div>
+                  <dt>Native push private key</dt>
+                  <dd id="setting-push-key"></dd>
+                </div>
+              </dl>
+            </details>
+          </section>
+
+          <section class="settings-group" id="maintenance-verification" data-group="maintenance-verification">
+            <h2>Maintenance &amp; verification</h2>
+            <form id="drain-form" class="card">
+              <h3>Drain for restart</h3>
+              <p class="muted">
+                Refuses new upload sessions with a transient error so active
+                ones finish first; downloads and admin stay available. Restart
+                once <code>votport_sessions_active</code> on
+                <code>/metrics</code> reads 0, then turn it off. Uploads also
+                survive a restart on their own; drain is for a zero-surprise
+                upgrade.
+              </p>
+              <label class="check"
+                ><input type="checkbox" id="drain-toggle" />
+                Draining: refuse new upload sessions
+                <span class="muted" id="drain-source"></span>
+              </label>
+              <div class="actions">
+                <button type="submit" id="drain-save">Save</button>
+                <span id="drain-note" class="muted"></span>
+              </div>
+              <p class="error" id="drain-error" role="alert" hidden></p>
+            </form>
+
+            <div class="card">
+              <h3>Receipt verification</h3>
+              <p class="muted">
+                Every received file carries a signed <code>.vot-receipt</code>
+                sidecar. Anyone can check one at <a href="/verify">/verify</a>
+                against this public key.
+              </p>
+              <p class="mono" id="receipt-key"></p>
+            </div>
+          </section>
+
+          <section class="settings-group" id="backups">
+            <h2>Backups</h2>
+            <div class="card" id="backup-status-card">
+              <h3>Status</h3>
+              <p id="backup-status" class="muted">Loading backup status…</p>
+              <p id="backup-inventory" class="muted"></p>
+              <div class="actions">
+                <button type="button" id="backup-run" class="ghost" disabled>Run now</button>
+                <a id="backup-download" class="button ghost" href="/api/admin/backup">Download database snapshot</a>
+              </div>
+              <div class="grid">
+                <label
+                  >Restore snapshot
+                  <select id="backup-restore-snapshot" disabled>
+                    <option value="">No snapshots available</option>
+                  </select>
+                </label>
+              </div>
+              <p class="muted">
+                Restore replaces current application state and restarts the
+                supervised service. Current application state will be replaced,
+                the cookie secret will rotate, and
+                every existing admin session will be signed out.
+                Automatic backups will remain disabled until an admin re-enables
+                them.
+              </p>
+              <p class="error" id="backup-status-error" role="alert" hidden></p>
+            </div>
+
+            <form id="backup-form" class="card">
+              <h3>Schedule</h3>
+              <p class="muted">
+                Automatic snapshots contain the database and VOTPort-managed
+                identity files only. Received and outbound files remain separate
+                operator backups.
+              </p>
+              <div class="grid">
+                <label
+                  >Destination
+                  <select id="backup-destination">
+                    <option value="local">Local filesystem</option>
+                    <option value="s3">S3-compatible bucket</option>
+                    <option value="both">Both</option>
+                  </select>
+                </label>
+                <label class="check"
+                  ><input type="checkbox" id="backup-enabled" />
+                  Enable automatic backups
+                </label>
+                <label
+                  >Every <span class="muted">minutes</span>
+                  <input id="backup-interval-minutes" type="number" min="1" step="1" required />
+                </label>
+                <label
+                  >Local path <span class="muted">service filesystem path; blank uses &lt;data_dir&gt;/backups; a custom path must already exist with private ancestry</span>
+                  <input id="backup-local-path" autocomplete="off" placeholder="/data/backups" />
+                </label>
+                <label
+                  >Keep for <span class="muted">days, all targets, 0 is off</span>
+                  <input id="backup-local-retention-days" type="number" min="0" step="1" required />
+                </label>
+                <label
+                  >Keep at most <span class="muted">snapshots, 0 is off</span>
+                  <input id="backup-retention-count" type="number" min="0" step="1" required />
+                </label>
+              </div>
+
+              <div id="backup-s3-fields" hidden>
+                <h3>S3-compatible target</h3>
+                <div class="grid">
+                  <label
+                    >Endpoint
+                    <input id="backup-s3-endpoint" autocomplete="off" placeholder="https://s3.example.com" />
+                  </label>
+                  <label
+                    >Region
+                    <input id="backup-s3-region" autocomplete="off" placeholder="us-east-1" />
+                  </label>
+                  <label
+                    >Bucket
+                    <input id="backup-s3-bucket" autocomplete="off" />
+                  </label>
+                  <label
+                    >Prefix <span class="muted">backup objects only</span>
+                    <input id="backup-s3-prefix" autocomplete="off" placeholder="votport" />
+                  </label>
+                  <label
+                    >Access key <span class="muted" id="backup-s3-access-key-source"></span>
+                    <input id="backup-s3-access-key" autocomplete="off" />
+                  </label>
+                  <label
+                    >Secret key <span class="muted" id="backup-s3-secret-key-source"></span>
+                    <input id="backup-s3-secret-key" type="password" autocomplete="new-password" />
+                  </label>
+                  <label class="check"
+                    ><input type="checkbox" id="backup-s3-path-style" />
+                    Use path-style requests <span class="muted">for endpoints that require it</span>
+                  </label>
+                </div>
+                <p class="muted">Leave credential fields blank to keep saved secrets unchanged; GET never returns them.</p>
+              </div>
+
+              <label class="check"
+                ><input type="checkbox" id="backup-encryption-enabled" />
+                Encrypt snapshots
+              </label>
+              <div id="backup-encryption-fields" hidden>
+                <div class="grid">
+                  <label
+                    >Encryption passphrase <span class="muted" id="backup-encryption-passphrase-source"></span>
+                    <input id="backup-encryption-passphrase" type="password" autocomplete="new-password" />
+                  </label>
+                </div>
+                <p class="muted">Leave the passphrase blank to keep it unchanged; there is no in-app secret clear control.</p>
+                <p class="warning" id="backup-encryption-warning">
+                  Keep an external recovery copy of the passphrase. Without it,
+                  encrypted snapshots cannot be restored.
+                </p>
+              </div>
+              <div class="actions">
+                <button type="submit" id="backup-save" disabled>Save backup settings</button>
+                <span id="backup-note" class="muted"></span>
+              </div>
+              <p class="error" id="backup-error" role="alert" hidden></p>
+            </form>
+          </section>
         </div>
-      </section>
+      </div>
       <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
     </div>
 

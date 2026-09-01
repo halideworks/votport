@@ -41,8 +41,15 @@ test('system settings are grouped and deployment values have DOM targets', () =>
   ]) {
     assert.match(html, new RegExp(`id="${id}"`));
   }
-  assert.match(html, /Editable here/);
   assert.match(html, /Deployment settings &middot; restart required/);
+  // Read-only deployment values fold behind a details element per group.
+  assert.equal((html.match(/<details class="card deployment">/g) || []).length, 2);
+  // Every section the side nav links to exists.
+  for (const anchor of html.matchAll(/class="settings-nav"[\s\S]*?<\/nav>/g)) {
+    for (const href of anchor[0].matchAll(/href="#([^"]+)"/g)) {
+      assert.match(html, new RegExp(`<section[^>]*id="${href[1]}"`));
+    }
+  }
   assert.match(html, /id="password-form"/);
   assert.match(html, /id="signin-source"/);
 });
@@ -111,6 +118,10 @@ test('backup card exposes scoped configuration, status, and restore controls', (
   assert.match(html, /saved secrets unchanged; GET never returns them/);
   assert.match(html, /no in-app secret clear control/);
   assert.match(html, /path-style requests.*endpoints that require it/);
+  // S3 and encryption fields show only when their option is chosen.
+  assert.match(html, /id="backup-s3-fields" hidden/);
+  assert.match(html, /id="backup-encryption-fields" hidden/);
+  assert.match(script, /\$\('backup-s3-fields'\)\.hidden = \$\('backup-destination'\)\.value === 'local'/);
   assert.match(html, /Current application\s+state will be replaced/);
   assert.match(html, /cookie secret will rotate/);
   assert.match(html, /every\s+existing admin session will be signed out/);
