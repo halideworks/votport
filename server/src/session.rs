@@ -1033,6 +1033,10 @@ fn accept_range(
 /// files a chunk completed. Parallelism is per batch; a shared thread pool
 /// would only matter if scoped-thread churn ever measures.
 // ponytail: scoped threads per batch; add a pool only if churn measures.
+// Measured 2026-09-01 (concurrent_load upload phase, 16 x 64 MiB at once):
+// 1400 to 1740 MiB/s aggregate, completion p50 550 to 700 ms, p95 580 to
+// 730 ms, no errors. At 8 MiB chunks that run spawns about 130 scoped
+// threads, so churn is not visible at this chunk size.
 fn accept_batch(
     setup: &WorkerSetup,
     phase: &mut Phase,
@@ -1091,7 +1095,12 @@ struct Publication {
     receipt: Option<PathBuf>,
 }
 
-// ponytail: process-wide lock; shard by destination only if publication throughput measures a need.
+// ponytail: process-wide lock; shard by destination only if publication
+// throughput measures a need. On the HTTP path the lock covers the rename
+// and receipt write (the push path also holds it across rollback capture);
+// measured 2026-09-01 (concurrent_load upload phase, 16 uploads publishing
+// within the same second) it added nothing visible: p95 completion 580 to
+// 730 ms for 64 MiB, 0 errors.
 static PUBLICATION_NAMESPACE: Mutex<()> = Mutex::new(());
 
 struct PublishedPushFiles {
