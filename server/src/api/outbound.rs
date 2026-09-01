@@ -3936,9 +3936,12 @@ struct BatchStream {
 /// delivered bytes, not one per file: every commit is an fsync inside the
 /// stream, and a batch of small files paid one per file (1024 x 256 KiB
 /// measured 320 MiB/s against 867 MiB/s for one file of the same size).
-/// A dropped stream can now leave up to this many bytes of fully delivered
-/// files unrecorded instead of one file, still the safe direction: those
-/// files stay downloadable and a later per-file fetch records them.
+/// A dropped stream can now leave fully delivered files unrecorded up to
+/// this many bytes plus the file that crosses the window, instead of one
+/// file, still the safe direction: those files stay downloadable and a later
+/// per-file fetch records them. Per-file download counts are one per stream
+/// either way, and the grant count is the minimum over its files, so the
+/// window changes when files are recorded, never how many times.
 const RECORD_COALESCE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The files to record now: those past `recorded` whose boundary `sent_bytes`
@@ -4343,6 +4346,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Mid-stream recording (a flush inside the window) and the end flush
+    /// count each file once and the grant once, the same as per-file
+    /// recording did.
+    #[tokio::test]
+    async fn batch_over_the_window_records_each_file_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::api::testing::config(directory.path());
+        config.max_upload_bytes = 64 * 1024 * 1024;
+        let app = crate::app::build(config).unwrap();
+        let cookie = admin_cookie(&app);
+        let mib = 1024 * 1024;
+        // 9 + 9 MiB crosses the 16 MiB window after the second file, so the
+        // third is recorded by the end-of-stream flush in a second call.
+        for (path, size) in [
+            ("win/a.bin", 9 * mib),
+            ("win/b.bin", 9 * mib),
+            ("win/c.bin", 1),
+        ] {
+            let bytes: Vec<u8> = (0..size).map(|index| (index % 251) as u8).collect();
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::post(format!("/api/admin/outbound-files?path={path}"))
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .body(Body::from(bytes))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let created = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"paths":["win/a.bin","win/b.bin","win/c.bin"],"max_downloads":2}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let token = body(created).await["url"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_owned();
+        let batch = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/batch"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        21,
+                    ))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch.status(), StatusCode::OK);
+        let bytes = batch.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.len(), 18 * mib + 1);
+        let grant = app
+            .store
+            .outbound_grant_by_token_hash(&hash_token(&token))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            grant
+                .files
+                .iter()
+                .map(|file| file.downloads)
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
+        assert_eq!(grant.downloads, 1);
     }
 
     async fn fixture() -> (tempfile::TempDir, Arc<App>, String, Vec<u8>) {
