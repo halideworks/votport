@@ -3283,22 +3283,32 @@ async fn throughput_outbound_batch() {
             .unwrap();
     }
     let uploaded = upload_started.elapsed();
-    let grant = client
-        .post(format!("{}/api/admin/outbound-grants", server.base))
-        .header("x-votport", "1")
-        .json(&json!({ "directory": "batch", "expires_days": 1 }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap();
-    let token = grant["url"]
-        .as_str()
-        .and_then(|url| url.rsplit('/').next())
-        .unwrap();
+    // One grant per stream: a second batch of the same grant is refused
+    // while the first streams (ActiveDownload), so concurrency here means
+    // distinct grants over the same files.
+    let streams = load_knob("VOTPORT_BENCH_STREAMS", 1);
+    let mut tokens = Vec::with_capacity(streams);
+    for _ in 0..streams {
+        let grant = client
+            .post(format!("{}/api/admin/outbound-grants", server.base))
+            .header("x-votport", "1")
+            .json(&json!({ "directory": "batch", "expires_days": 1 }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        tokens.push(
+            grant["url"]
+                .as_str()
+                .and_then(|url| url.rsplit('/').next())
+                .unwrap()
+                .to_owned(),
+        );
+    }
     let mib = |elapsed: std::time::Duration| {
         format!(
             "{:.0} MiB/s",
@@ -3312,25 +3322,42 @@ async fn throughput_outbound_batch() {
     );
     for run in 1..=2 {
         let started = std::time::Instant::now();
-        let mut response = client
-            .get(format!("{}/api/s/{token}/batch", server.base))
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap();
-        let first = started.elapsed();
-        let mut received = 0usize;
-        while let Some(chunk) = response.chunk().await.unwrap() {
-            received += chunk.len();
-        }
+        let fetches = tokens.iter().map(|token| {
+            let client = client.clone();
+            let url = format!("{}/api/s/{token}/batch", server.base);
+            async move {
+                let began = std::time::Instant::now();
+                let mut response = client
+                    .get(url)
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap();
+                let first = began.elapsed();
+                let mut received = 0usize;
+                while let Some(chunk) = response.chunk().await.unwrap() {
+                    received += chunk.len();
+                }
+                (first, began.elapsed(), received)
+            }
+        });
+        let results = futures_util::future::join_all(fetches).await;
         let downloaded = started.elapsed();
-        assert_eq!(received, total);
-        println!(
-            "outbound batch run {run} {count} files {} MiB: first byte {first:.3?}, total {downloaded:.3?} ({})",
-            total / MIB,
-            mib(downloaded)
-        );
+        for (index, (first, elapsed, received)) in results.iter().enumerate() {
+            assert_eq!(*received, total);
+            println!(
+                "outbound batch run {run} stream {index} {count} files {} MiB: first byte {first:.3?}, total {elapsed:.3?} ({})",
+                total / MIB,
+                mib(*elapsed)
+            );
+        }
+        if streams > 1 {
+            println!(
+                "outbound batch run {run} x {streams} streams: wall {downloaded:.3?}, aggregate {:.0} MiB/s",
+                (total * streams) as f64 / MIB as f64 / downloaded.as_secs_f64()
+            );
+        }
     }
 }
 

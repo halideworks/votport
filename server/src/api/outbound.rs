@@ -2848,8 +2848,16 @@ fn start_batch_chunk(
     };
     let verifying_key = app.signer.verifying_key();
     // ponytail: every request re-copies and re-verifies each source into a
-    // throwaway stage; cache staged chunks keyed by grant id and file range
-    // if repeated batch fetches of one grant are ever measured.
+    // throwaway stage. Measured 2026-09-01 (throughput_outbound_batch, 1024 x
+    // 256 KiB, VOTPORT_BENCH_STREAMS, sources page-cached, client in the same
+    // process): one stream 1160 to 1310 MiB/s; four streams over four grants
+    // 760 to 1010 MiB/s each, 2760 to 3660 MiB/s aggregate. Four streams is the
+    // most that fit STAGING_CONCURRENCY = 8 at BATCH_LOOKAHEAD = 2 without
+    // queueing, so up to that point staging is not the ceiling under parallel
+    // clients. A second batch of the same grant is refused while the first
+    // streams (ActiveDownload), so a staged-chunk cache could only serve
+    // sequential re-fetches of one grant; add one keyed by grant id and file
+    // range if that pattern shows.
     Ok(tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let mut options = std::fs::OpenOptions::new();
