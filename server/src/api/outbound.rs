@@ -40,6 +40,18 @@ const MAX_ACTIVE_PER_GRANT: usize = 16;
 const CHUNK: usize = 1024 * 1024;
 const BATCH_STAGE_BYTES: u64 = 1024 * 1024 * 1024;
 const BATCH_STAGE_FILES: usize = 5_000;
+// Batch chunks ramp from the lead size, doubling per chunk up to the caps,
+// so the first byte waits on a small stage while later chunks are large
+// enough to stage efficiently. BATCH_LOOKAHEAD chunks stage concurrently
+// ahead of the one streaming; each holds a stage-budget reservation. A
+// single file above BATCH_CHUNK_BYTES but below BATCH_STAGE_BYTES is its own
+// chunk at full size, so live reservations can reach (1 + BATCH_LOOKAHEAD) x
+// BATCH_STAGE_BYTES; many-small-file batches stay near (1 + BATCH_LOOKAHEAD)
+// x BATCH_CHUNK_BYTES.
+const BATCH_LEAD_FILES: usize = 64;
+const BATCH_LEAD_BYTES: u64 = 16 * 1024 * 1024;
+const BATCH_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
+const BATCH_LOOKAHEAD: usize = 2;
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
 const MAX_PASSWORD_BYTES: usize = 256;
 const MAX_AUTOMATION_LABEL_CHARS: usize = 100;
@@ -2554,73 +2566,62 @@ pub async fn outbound_batch(
             Some(*total)
         })
         .collect();
-    let lookahead = start_batch_lookahead(&app, &grant, &chunks, 0);
-    let stream = futures_util::stream::try_unfold(
-        BatchStream {
-            app,
-            grant,
-            _operation: operation,
-            _active: active,
-            chunks,
-            chunk_index: 0,
-            file: Some(file),
-            lookahead,
-            boundaries,
-            sent_bytes: 0,
-            recorded: 0,
-        },
-        |mut state| async move {
-            // Recording trails delivery: only files whose bytes a previous
-            // poll already handed to the transport are recorded, so a record
-            // failure can never abort bytes ahead of what it recorded and
-            // lock a capped client out of files it never got. The trade runs
-            // the safe direction: a drop or failure can leave the last
-            // yielded files unrecorded, and the client's per-file retry
-            // records them then.
-            state.record_delivered(false).await.map_err(api_error_io)?;
-            loop {
-                if let Some(file) = state.file.as_mut() {
-                    if let Some(item) = file.next().await {
-                        return match item {
-                            Ok(bytes) => {
-                                state.sent_bytes += bytes.len() as u64;
-                                Ok(Some((bytes, state)))
-                            }
-                            Err(error) => Err(error),
-                        };
-                    }
+    let mut state = BatchStream {
+        app,
+        grant,
+        _operation: operation,
+        _active: active,
+        chunks,
+        chunk_index: 0,
+        file: Some(file),
+        lookahead: std::collections::VecDeque::new(),
+        boundaries,
+        sent_bytes: 0,
+        recorded: 0,
+    };
+    state.fill_lookahead();
+    let stream = futures_util::stream::try_unfold(state, |mut state| async move {
+        // Recording trails delivery: only files whose bytes a previous
+        // poll already handed to the transport are recorded, so a record
+        // failure can never abort bytes ahead of what it recorded and
+        // lock a capped client out of files it never got. The trade runs
+        // the safe direction: a drop or failure can leave the last
+        // yielded files unrecorded, and the client's per-file retry
+        // records them then.
+        state.record_delivered(false).await.map_err(api_error_io)?;
+        loop {
+            if let Some(file) = state.file.as_mut() {
+                if let Some(item) = file.next().await {
+                    return match item {
+                        Ok(bytes) => {
+                            state.sent_bytes += bytes.len() as u64;
+                            Ok(Some((bytes, state)))
+                        }
+                        Err(error) => Err(error),
+                    };
                 }
-                state.file = None;
-                state.chunk_index += 1;
-                if state.chunk_index >= state.chunks.len() {
-                    // End of stream: record the coalesced tail.
-                    state.record_delivered(true).await.map_err(api_error_io)?;
-                    return Ok(None);
-                }
-                let chunk = state.chunks[state.chunk_index].clone();
-                let handle = if let Some(handle) = state.lookahead.take() {
-                    handle
-                } else {
-                    match start_batch_chunk(
-                        Arc::clone(&state.app),
-                        state.grant.clone(),
-                        chunk.clone(),
-                    ) {
-                        Ok(handle) => handle,
-                        Err(error) => return Err(api_error_io(error)),
-                    }
-                };
-                let file = await_batch_chunk(handle).await.map_err(api_error_io)?;
-                state.file = Some(file);
-                state.lookahead = start_batch_lookahead(
-                    &state.app,
-                    &state.grant,
-                    &state.chunks,
-                    state.chunk_index,
-                );
             }
-        },
-    );
+            state.file = None;
+            state.chunk_index += 1;
+            if state.chunk_index >= state.chunks.len() {
+                // End of stream: record the coalesced tail.
+                state.record_delivered(true).await.map_err(api_error_io)?;
+                return Ok(None);
+            }
+            let handle = if let Some(handle) = state.lookahead.pop_front() {
+                handle
+            } else {
+                let chunk = state.chunks[state.chunk_index].clone();
+                match start_batch_chunk(Arc::clone(&state.app), state.grant.clone(), chunk) {
+                    Ok(handle) => handle,
+                    Err(error) => return Err(api_error_io(error)),
+                }
+            };
+            let file = await_batch_chunk(handle).await.map_err(api_error_io)?;
+            state.file = Some(file);
+            state.fill_lookahead();
+        }
+    });
     let mut response = Body::from_stream(stream).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -2663,6 +2664,8 @@ fn batch_chunks(grant: &OutboundGrant, count: usize) -> Vec<BatchChunk> {
     let mut chunks = Vec::new();
     let mut start = 0;
     let mut bytes = 0;
+    let mut file_cap = BATCH_LEAD_FILES;
+    let mut byte_cap = BATCH_LEAD_BYTES;
     for index in 0..count {
         let length = grant
             .files
@@ -2687,16 +2690,15 @@ fn batch_chunks(grant: &OutboundGrant, count: usize) -> Vec<BatchChunk> {
             bytes = 0;
             continue;
         }
-        if start < index
-            && (index - start >= BATCH_STAGE_FILES
-                || bytes.saturating_add(length) > BATCH_STAGE_BYTES)
-        {
+        if start < index && (index - start >= file_cap || bytes.saturating_add(length) > byte_cap) {
             chunks.push(BatchChunk {
                 start,
                 end: index,
                 bytes,
                 oversized: false,
             });
+            file_cap = (file_cap * 2).min(BATCH_STAGE_FILES);
+            byte_cap = (byte_cap * 2).min(BATCH_CHUNK_BYTES);
             start = index;
             bytes = 0;
         }
@@ -2757,6 +2759,9 @@ fn start_batch_chunk(
         reservation: Some(reservation),
     };
     let verifying_key = app.signer.verifying_key();
+    // ponytail: every request re-copies and re-verifies each source into a
+    // throwaway stage; cache staged chunks keyed by grant id and file range
+    // if repeated batch fetches of one grant are ever measured.
     Ok(tokio::task::spawn_blocking(move || {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -2794,20 +2799,6 @@ async fn await_batch_chunk(
         .await
         .map_err(|_| ApiError::internal("outbound batch preparation failed"))?
         .map_err(map_batch_error)
-}
-
-fn start_batch_lookahead(
-    app: &Arc<App>,
-    grant: &Arc<OutboundGrant>,
-    chunks: &[BatchChunk],
-    current: usize,
-) -> Option<tokio::task::JoinHandle<io::Result<BatchFile>>> {
-    let next = current + 1;
-    let next_chunk = chunks.get(next)?;
-    if chunks[current].oversized || next_chunk.oversized {
-        return None;
-    }
-    start_batch_chunk(Arc::clone(app), Arc::clone(grant), next_chunk.clone()).ok()
 }
 
 fn api_error_io(error: ApiError) -> io::Error {
@@ -3940,7 +3931,9 @@ struct BatchStream {
     chunks: Vec<BatchChunk>,
     chunk_index: usize,
     file: Option<BatchFile>,
-    lookahead: Option<tokio::task::JoinHandle<io::Result<BatchFile>>>,
+    /// Staging tasks for the chunks after `chunk_index`, in order: entry i
+    /// is chunk `chunk_index + 1 + i`.
+    lookahead: std::collections::VecDeque<tokio::task::JoinHandle<io::Result<BatchFile>>>,
     /// Cumulative end offset of each file in the concatenated body; a file
     /// is recorded as downloaded once `sent_bytes` from already-yielded
     /// polls covers its boundary.
@@ -3982,6 +3975,34 @@ fn record_range(
 }
 
 impl BatchStream {
+    /// Keeps BATCH_LOOKAHEAD chunks staging ahead of the streaming one. An
+    /// oversized chunk streams straight from its source with its own
+    /// blocking producer, so staging stops at the first one and never runs
+    /// beside one.
+    fn fill_lookahead(&mut self) {
+        if self.chunks[self.chunk_index].oversized {
+            return;
+        }
+        while self.lookahead.len() < BATCH_LOOKAHEAD {
+            let next = self.chunk_index + 1 + self.lookahead.len();
+            let Some(chunk) = self.chunks.get(next) else {
+                break;
+            };
+            if chunk.oversized {
+                break;
+            }
+            match start_batch_chunk(
+                Arc::clone(&self.app),
+                Arc::clone(&self.grant),
+                chunk.clone(),
+            ) {
+                Ok(handle) => self.lookahead.push_back(handle),
+                // The stream loop retries inline and surfaces the error.
+                Err(_) => break,
+            }
+        }
+    }
+
     /// Records every file whose bytes previous polls fully yielded, once
     /// enough of them have accumulated or when `flush` ends the stream.
     async fn record_delivered(&mut self, flush: bool) -> ApiResult<()> {
@@ -3998,7 +4019,9 @@ impl BatchStream {
 
 impl Drop for BatchStream {
     fn drop(&mut self) {
-        if let Some(handle) = self.lookahead.take() {
+        // A running spawn_blocking stage finishes anyway and its StagedFile
+        // drop removes the stage; abort only stops ones not yet started.
+        for handle in self.lookahead.drain(..) {
             handle.abort();
         }
     }
@@ -4579,17 +4602,30 @@ mod tests {
             last_download_at: None,
             files: (0..5_001).map(|_| file(1)).collect(),
         };
+        // File counts ramp from the lead size, doubling per chunk.
         let chunks = batch_chunks(&grant, grant.files.len());
-        assert_eq!(chunks.len(), 2);
+        let spans: Vec<(usize, usize)> = chunks.iter().map(|c| (c.start, c.end)).collect();
         assert_eq!(
-            (chunks[0].start, chunks[0].end, chunks[0].bytes),
-            (0, 5_000, 5_000)
+            spans,
+            [
+                (0, 64),
+                (64, 192),
+                (192, 448),
+                (448, 960),
+                (960, 1_984),
+                (1_984, 4_032),
+                (4_032, 5_001),
+            ]
         );
-        assert!(!chunks[0].oversized);
-        assert_eq!(
-            (chunks[1].start, chunks[1].end, chunks[1].bytes),
-            (5_000, 5_001, 1)
-        );
+        assert!(chunks.iter().all(|c| !c.oversized));
+        assert_eq!(chunks[6].bytes, 969);
+
+        // Byte caps ramp the same way and never exceed BATCH_CHUNK_BYTES.
+        grant.files = (0..12).map(|_| file(64 * 1024 * 1024)).collect();
+        let chunks = batch_chunks(&grant, grant.files.len());
+        let spans: Vec<(usize, usize)> = chunks.iter().map(|c| (c.start, c.end)).collect();
+        assert_eq!(spans, [(0, 1), (1, 2), (2, 3), (3, 5), (5, 9), (9, 12)]);
+        assert!(chunks.iter().all(|c| c.bytes <= BATCH_CHUNK_BYTES));
 
         grant.files = vec![file(BATCH_STAGE_BYTES), file(1)];
         let chunks = batch_chunks(&grant, grant.files.len());
