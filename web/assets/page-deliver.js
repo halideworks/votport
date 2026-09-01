@@ -196,10 +196,11 @@ function renderGrants() {
       files.className = 'uploads';
       for (const file of grant.files) {
         const item = document.createElement('li');
-        const fileName = document.createElement('div');
+        item.className = 'upload-file';
+        const fileName = document.createElement('span');
         fileName.className = 'mono';
         fileName.textContent = file.name;
-        const fileMeta = document.createElement('div');
+        const fileMeta = document.createElement('span');
         fileMeta.className = 'muted';
         const fileDownloads = file.downloads ?? 0;
         const fileParts = [
