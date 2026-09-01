@@ -143,6 +143,7 @@ async fn start_server_in(
         public_password_login: true,
         metrics_token: None,
         max_total_sessions,
+        max_link_sessions: 8,
         sso_session_secs: 7 * 24 * 3600,
         trusted_proxies: Vec::new(),
         oidc: None,

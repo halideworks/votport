@@ -64,6 +64,8 @@ test('deployment settings are populated without rendering secret fields', () => 
     'max_upload_bytes',
     'allow_hidden',
     'session_idle_secs',
+    'max_total_sessions',
+    'max_link_sessions',
     'bind',
     'public_url',
     'trusted_proxies',
@@ -170,4 +172,13 @@ test('backup client uses the redacted API contract and confirmation guard', () =
   assert.doesNotMatch(script, /interval_minutes|local_target|local_retention_days|encryption_enabled|s3_access_key|s3_secret_key|encryption_passphrase/);
   assert.doesNotMatch(script, /config\.encrypted/);
   assert.doesNotMatch(script, /config\.(access_key_id|secret_access_key|passphrase)(?!_configured)/);
+});
+
+test('deployment warnings and the snapshot download carry the CSRF header', () => {
+  assert.doesNotMatch(html, /href="\/api\/admin\/backup"/);
+  assert.match(html, /<button[^>]+id="backup-download"/);
+  assert.match(script, /fetch\('\/api\/admin\/backup',[\s\S]{0,80}'X-Votport': '1'/);
+  for (const id of ['setting-trusted-proxies', 'setting-metrics', 'setting-oidc-admin-group']) {
+    assert.match(script, new RegExp(`deploymentWarning\\(\\s*'${id}'`));
+  }
 });

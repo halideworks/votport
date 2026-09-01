@@ -146,6 +146,14 @@
                   <dt>Idle session timeout</dt>
                   <dd id="setting-idle-timeout" class="mono"></dd>
                 </div>
+                <div>
+                  <dt>Concurrent uploads, server-wide</dt>
+                  <dd id="setting-max-total-sessions" class="mono"></dd>
+                </div>
+                <div>
+                  <dt>Concurrent uploads per request</dt>
+                  <dd id="setting-max-link-sessions" class="mono"></dd>
+                </div>
               </dl>
             </details>
           </section>
@@ -612,7 +620,7 @@
               <p id="backup-inventory" class="muted"></p>
               <div class="actions">
                 <button type="button" id="backup-run" class="ghost" disabled>Run now</button>
-                <a id="backup-download" class="button ghost" href="/api/admin/backup">Download database snapshot</a>
+                <button type="button" id="backup-download" class="ghost">Download database snapshot</button>
               </div>
               <div class="grid">
                 <label

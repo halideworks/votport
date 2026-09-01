@@ -1221,13 +1221,16 @@ fn tenant_outbound_dir(
     Ok(path)
 }
 
-/// Streams a consistent SQLite snapshot as a download. Read-only operation:
-/// admin session required, CSRF header not (nothing mutates).
+/// Streams a consistent SQLite snapshot as a download. It writes a snapshot
+/// file and an audit row, so it takes the CSRF header like every other
+/// mutating route; the System page fetches it with the header and saves the
+/// body itself.
 pub async fn backup_database(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let _identity = require_platform_admin(&app, &headers)?;
+    let identity = require_platform_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
     let _guard = app
         .backup_lock
         .try_lock()
@@ -1678,6 +1681,8 @@ fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
         "max_upload_bytes": app.config.max_upload_bytes,
         "allow_hidden": app.config.allow_hidden,
         "session_idle_secs": app.config.session_idle_secs,
+        "max_total_sessions": app.config.max_total_sessions,
+        "max_link_sessions": app.config.max_link_sessions,
         "trusted_proxies": app.config.trusted_proxies.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "metrics_configured": app.config.metrics_token.is_some(),
         "push_bind": app.config.push_bind.map(|value| value.to_string()),
@@ -5025,6 +5030,7 @@ mod ops_tests {
             public_password_login: true,
             metrics_token: None,
             max_total_sessions: 32,
+            max_link_sessions: 8,
             sso_session_secs: 7 * 24 * 3600,
             trusted_proxies: Vec::new(),
             oidc: None,
@@ -5102,11 +5108,25 @@ mod backup_tests {
         // Signed in, the route serves a non-empty SQLite snapshot.
         let cookie = login(application.clone()).await;
 
+        // Without the CSRF header a cross-site navigation cannot trigger a snapshot.
+        let router = app::router(application.clone());
+        let response = router
+            .oneshot(
+                Request::get("/api/admin/backup")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
         let router = app::router(application);
         let response = router
             .oneshot(
                 Request::get("/api/admin/backup")
                     .header("cookie", &cookie)
+                    .header("x-votport", "1")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -5591,6 +5611,8 @@ mod settings_api_tests {
             "max_upload_bytes",
             "allow_hidden",
             "session_idle_secs",
+            "max_total_sessions",
+            "max_link_sessions",
             "trusted_proxies",
             "metrics_configured",
             "push_bind",

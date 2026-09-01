@@ -27,6 +27,12 @@ function deploymentValue(id, value, fallback = 'Not configured') {
   $(id).textContent = value === null || value === undefined || value === '' ? fallback : value;
 }
 
+// Marks a deployment value the server also warns about at startup.
+function deploymentWarning(id, warn, note) {
+  $(id).classList.toggle('warning', warn);
+  if (warn) $(id).textContent += ` (${note})`;
+}
+
 function fillDeployment(data) {
   const deployment = data.deployment;
   deploymentValue('setting-data-dir', deployment.data_dir);
@@ -42,6 +48,8 @@ function fillDeployment(data) {
       : `${deployment.session_idle_secs} seconds`,
   );
 
+  deploymentValue('setting-max-total-sessions', deployment.max_total_sessions);
+  deploymentValue('setting-max-link-sessions', deployment.max_link_sessions);
   deploymentValue('setting-bind', deployment.bind);
   deploymentValue('setting-public-url', deployment.public_url);
   deploymentValue(
@@ -49,13 +57,28 @@ function fillDeployment(data) {
     deployment.trusted_proxies?.length ? deployment.trusted_proxies.join(', ') : null,
     'Built-in loopback and private ranges',
   );
+  deploymentWarning(
+    'setting-trusted-proxies',
+    !deployment.trusted_proxies?.length,
+    'any private peer can pick its own throttle bucket; set VOTPORT_TRUSTED_PROXIES',
+  );
   deploymentValue('setting-metrics', deployment.metrics_configured ? 'Configured' : 'Not configured');
+  deploymentWarning(
+    'setting-metrics',
+    !deployment.metrics_configured,
+    'unauthenticated; set VOTPORT_METRICS_TOKEN',
+  );
   deploymentValue('setting-oidc-issuer', deployment.oidc_issuer);
   deploymentValue('setting-oidc-client-id', deployment.oidc_client_id);
   deploymentValue(
     'setting-oidc-admin-group',
     deployment.oidc_admin_group,
     deployment.oidc_configured ? 'All authenticated principals' : 'Not configured',
+  );
+  deploymentWarning(
+    'setting-oidc-admin-group',
+    deployment.oidc_configured && !deployment.oidc_admin_group,
+    'every SSO user is a platform admin; set VOTPORT_OIDC_ADMIN_GROUP',
   );
   deploymentValue(
     'setting-oidc-secret',
@@ -541,6 +564,38 @@ $('backup-form').addEventListener('submit', async (event) => {
     formNote(form, 'Saved.');
   } catch (error) {
     formError(form, error);
+  }
+});
+
+// The snapshot route takes the CSRF header like every mutating route, so a
+// plain link cannot fetch it; save the response body ourselves.
+$('backup-download').addEventListener('click', async () => {
+  const button = $('backup-download');
+  button.disabled = true;
+  $('backup-status-error').hidden = true;
+  try {
+    const response = await fetch('/api/admin/backup', {
+      headers: { 'X-Votport': '1' },
+      credentials: 'same-origin',
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      throw new Error(body?.error || `request failed (${response.status})`);
+    }
+    const name = /filename="([^"]+)"/.exec(response.headers.get('content-disposition') || '')?.[1]
+      || 'votport.db';
+    const url = window.URL.createObjectURL(await response.blob());
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = name;
+    link.click();
+    // Revoking in the same tick can cancel the save before the browser reads it.
+    setTimeout(() => window.URL.revokeObjectURL(url), 0);
+  } catch (error) {
+    $('backup-status-error').textContent = error.message;
+    $('backup-status-error').hidden = false;
+  } finally {
+    button.disabled = false;
   }
 });
 
