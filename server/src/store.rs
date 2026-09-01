@@ -115,6 +115,8 @@ pub struct OutboundGrant {
 pub struct OutboundGrantFilesPage {
     pub grant: OutboundGrant,
     pub file_count: usize,
+    /// Sum over every file in the grant, not only the returned page.
+    pub total_bytes: u64,
     pub files: Vec<(usize, OutboundGrantFile)>,
 }
 
@@ -2606,9 +2608,20 @@ impl Store {
                     }
                 }
             }
+            let (bytes_hi, bytes_lo): (i64, i64) = connection.query_row(
+                "SELECT COALESCE(SUM(bytes_hi), 0), COALESCE(SUM(bytes_lo), 0)
+                 FROM outbound_grant_files WHERE grant_id = ?1",
+                [&grant.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let total_bytes = match combine_byte_sums(bytes_hi, bytes_lo) {
+                0 => grant.bytes,
+                total => total,
+            };
             Ok(Some(OutboundGrantFilesPage {
                 grant,
                 file_count,
+                total_bytes,
                 files,
             }))
         })

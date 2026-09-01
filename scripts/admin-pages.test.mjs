@@ -98,8 +98,12 @@ test('list actions announce their outcome and copy buttons confirm', () => {
   assert.match(commonScript, /export async function copyToClipboard/);
 });
 
+const send = await readFile(new URL('../web/send.html', import.meta.url), 'utf8');
+const request = await readFile(new URL('../web/request.html', import.meta.url), 'utf8');
+const verify = await readFile(new URL('../web/verify.html', import.meta.url), 'utf8');
+
 test('no page repeats an element id', () => {
-  for (const [name, html] of Object.entries({ receive, deliver, audit, tenants, system })) {
+  for (const [name, html] of Object.entries({ receive, deliver, audit, tenants, system, send, request, verify })) {
     const ids = [...html.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]);
     const seen = new Set();
     for (const id of ids) {

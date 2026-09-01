@@ -2309,6 +2309,7 @@ pub async fn outbound_metadata(
                 "batch_url": format!("/api/s/{token}/batch"),
                 "files": files,
                 "files_total": files_total,
+                "total_bytes": page.total_bytes,
                 "offset": offset,
                 "limit": limit,
                 "has_more": has_more,
@@ -2374,6 +2375,11 @@ pub async fn outbound_metadata(
             "download_url": format!("/api/s/{token}/file"),
             "bundle_url": format!("/api/s/{token}/bundle"),
             "batch_url": format!("/api/s/{token}/batch"),
+            "total_bytes": if grant.files.is_empty() {
+                grant.bytes
+            } else {
+                grant.files.iter().fold(0u64, |total, file| total.saturating_add(file.bytes))
+            },
             "files": files,
         })),
     )
@@ -6161,6 +6167,14 @@ mod tests {
             .unwrap();
         let metadata = body(metadata).await;
         assert_eq!(metadata["files"].as_array().unwrap().len(), 2);
+        // The unpaged shape sums every file too, not the first file's bytes.
+        let expected: u64 = metadata["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["bytes"].as_u64().unwrap())
+            .sum();
+        assert_eq!(metadata["total_bytes"].as_u64().unwrap(), expected);
         for (offset, expected_name, expected_url, has_more) in [
             (
                 0,
@@ -6187,6 +6201,8 @@ mod tests {
             assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
             let page = body(response).await;
             assert_eq!(page["files_total"], 2);
+            // The byte total covers the whole grant, not only this page.
+            assert_eq!(page["total_bytes"].as_u64().unwrap(), expected);
             assert_eq!(page["offset"], offset);
             assert_eq!(page["limit"], 1);
             assert_eq!(page["has_more"], has_more);

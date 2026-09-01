@@ -26,6 +26,46 @@ let metadataHasMore = false;
 let metadataLoading = false;
 let batchUrl = null;
 let anchorDownloadPreflight = null;
+let totalBytes = 0;
+// Manifest rows by file index, so a finished download can mark its row.
+const rows = new Map();
+// Saved file indexes, counted whether or not their row is rendered yet
+// (rows past the first page appear only after Show more).
+const saved = new Set();
+
+function manifestStatus() {
+  $('manifest-status').textContent = saved.size
+    ? `${saved.size} of ${metadataTotal} saved to this device`
+    : `${metadataTotal} file${metadataTotal === 1 ? '' : 's'}, each verified by the server before it is sent`;
+}
+
+// The browser cannot verify bytes; the server does that before serving. A
+// finished save is exactly that: the file landed on this device.
+function landedBadge(row) {
+  row.classList.add('saved');
+  const badge = document.createElement('span');
+  badge.className = 'badge on';
+  badge.textContent = 'landed';
+  row.querySelector('.status').after(badge);
+}
+
+function markSaved(index) {
+  if (saved.has(index)) return;
+  saved.add(index);
+  manifestStatus();
+  const row = rows.get(index);
+  if (row) landedBadge(row);
+}
+
+function availability(body) {
+  const parts = [
+    `${metadataTotal} file${metadataTotal === 1 ? '' : 's'}`,
+    formatBytes(totalBytes),
+    body.expires_at ? `available until ${when(body.expires_at)}` : 'does not expire',
+  ];
+  if (body.has_password && body.authorized) parts.push('password checked');
+  return parts.join(' · ');
+}
 
 function when(seconds) {
   return new Date(seconds * 1000).toLocaleString();
@@ -58,7 +98,7 @@ function downloadButton(text, url, classes) {
 
 function renderNextFileBatch() {
   const batch = nextFileBatch(metadataFiles, renderedFileCount);
-  for (const file of batch) {
+  for (const [offset, file] of batch.entries()) {
     const extras = [
       downloadButton('Download file', file.download_url, 'tiny'),
       downloadButton('Download receipt', file.receipt_url, 'tiny ghost'),
@@ -69,6 +109,13 @@ function renderNextFileBatch() {
       { status: formatBytes(file.bytes), extras },
     );
     row.setAttribute('aria-label', `Verified ${file.name}`);
+    // The id line ellipsizes; the full identity stays readable on hover.
+    const id = row.querySelector('.file-id');
+    id.title = `${id.textContent} (click to copy)`;
+    const index = renderedFileCount + offset;
+    rows.set(index, row);
+    // A file saved before its row was rendered still gets its badge.
+    if (saved.has(index)) landedBadge(row);
   }
   renderedFileCount += batch.length;
   const controls = $('file-list-controls');
@@ -284,7 +331,8 @@ async function downloadSeparately() {
         if (!response.ok) throw new Error(`server returned ${response.status}`);
         await saveBatchFiles(response, directory, files, names, (completed, total) => {
           batchSaved = completed;
-          status.textContent = `Downloading files in optimized batch mode: ${completed}/${total}`;
+          markSaved(completed - 1);
+          status.textContent = `Saving files: ${completed} of ${total}`;
         });
         status.textContent = `Downloaded ${files.length} files.`;
         return;
@@ -305,18 +353,19 @@ async function downloadSeparately() {
       async (file, index) => {
         try {
           await saveFile(directory, file, remainingNames[index]);
+          markSaved(batchSaved + index);
         } catch (error) {
           failures.push(`${remainingNames[index]}: ${error.message}`);
         }
       },
       4,
       (_file, _index, completed, _total) => {
-        status.textContent = `Downloading files: ${batchSaved + completed}/${files.length}`;
+        status.textContent = `Saving files: ${batchSaved + completed} of ${files.length}`;
       },
     );
-    const saved = files.length - failures.length;
+    const savedFiles = files.length - failures.length;
     status.textContent = failures.length
-      ? `Downloaded ${saved}/${files.length}. Failed: ${summarizeFailures(failures)}`
+      ? `Downloaded ${savedFiles}/${files.length}. Failed: ${summarizeFailures(failures)}`
       : `Downloaded ${files.length} files.`;
   } catch (error) {
     status.textContent = error?.name === 'AbortError'
@@ -344,6 +393,8 @@ async function loadMetadata() {
 
   $('download-gate').hidden = true;
   $('object').replaceChildren();
+  rows.clear();
+  saved.clear();
   metadataFiles = [];
   metadataTotal = 0;
   metadataHasMore = false;
@@ -359,35 +410,37 @@ async function loadMetadata() {
   metadataTotal = next.total;
   metadataHasMore = next.hasMore;
   batchUrl = body.batch_url || null;
+  totalBytes = Number.isFinite(body.total_bytes) ? body.total_bytes : 0;
   renderNextFileBatch();
+  manifestStatus();
   const bundle = $('bundle-download');
   bundle.hidden = !body.bundle_url;
   if (body.bundle_url) $('bundle-download-button').onclick = () => window.location.assign(body.bundle_url);
-  const separate = $('separate-download');
-  separate.hidden = metadataTotal < 2;
+  const separateNote = $('separate-download-note');
+  const separateButton = $('separate-download-button');
+  $('separate-download-status').textContent = '';
+  separateButton.disabled = false;
   if (metadataTotal > 1) {
-    const separateNote = $('separate-download-note');
-    const separateButton = $('separate-download-button');
     const pickerAvailable = typeof window.showDirectoryPicker === 'function';
     if (pickerAvailable) {
-      separateNote.textContent = 'Choose a folder to save every payload file individually. No ZIP or receipt files are included.';
+      separateNote.textContent = 'You choose the folder; each file is saved as it arrives. Receipt files are not included.';
       separateButton.onclick = () => downloadSeparately();
-      separateButton.disabled = false;
-      $('separate-download-status').textContent = '';
     } else {
-      separateNote.textContent = 'Download files individually to your browser\'s configured download location. Your browser may ask you to allow multiple downloads; accept that prompt to receive every file.';
+      separateNote.textContent = 'Files go to your browser\'s download location. Your browser may ask you to allow multiple downloads; accept that prompt to receive every file.';
       separateButton.onclick = () => prepareAnchorDownloads();
-      separateButton.disabled = false;
-      $('separate-download-status').textContent = '';
     }
+  } else {
+    // One file: the primary action is that file.
+    separateButton.textContent = 'Download file';
+    separateNote.textContent = '';
+    const only = metadataFiles[0];
+    separateButton.onclick = () => { window.location.assign(only.download_url); };
   }
   $('title').textContent = body.label || 'Verified download';
   applyBranding(body.branding, `/api/s/${encodeURIComponent(token)}/logo`);
-  $('status').textContent = 'The server verifies the file against this identity before download.';
-  $('expires').textContent = body.expires_at
-    ? `Link expires ${when(body.expires_at)}`
-    : 'This link does not expire.';
+  $('status').textContent = availability(body);
   $('receipt-key').textContent = body.receipt_key;
+  $('receipt-key').title = body.receipt_key;
   $('download-content').hidden = false;
 }
 
