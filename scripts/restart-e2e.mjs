@@ -97,8 +97,15 @@ try {
   await page.waitForSelector("#new-link:not([hidden])");
   const linkUrl = (await page.textContent("#new-link-url")).trim();
 
+  console.log("link:", linkUrl);
   await page.goto(linkUrl);
-  await page.waitForSelector("#uploader:not([hidden])", { timeout: 15000 });
+  try {
+    await page.waitForSelector("#uploader:not([hidden])", { timeout: 15000 });
+  } catch (error) {
+    console.log("page text:", (await page.textContent("body")).replace(/\s+/g, " ").slice(0, 600));
+    console.log("server log tail:", logs.slice(-5).join(""));
+    throw error;
+  }
   await page.setInputFiles("#file-input", [source]);
   const uploadStarted = Date.now();
   await page.click("#send");
