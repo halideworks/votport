@@ -623,6 +623,7 @@ function renderLibraryDirectory(directory, container) {
     await browseLibrary(directory);
   });
   open.setAttribute('aria-label', `Open folder ${name}`);
+  open.title = name;
   const share = button('Share folder', 'tiny', async () => {
     await submitDeliverGrant({ directory }, share);
   });
