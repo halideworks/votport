@@ -772,7 +772,10 @@ pub fn resume_worker(
             native,
             published: file.published,
             receipt: file.receipt,
-            rehash: !file.published,
+            // A file resumed from a zero prefix receives every byte through
+            // verify_range like a fresh session; only a trusted prefix needs
+            // the rehash.
+            rehash: !file.published && file.prefix_bytes > 0,
         });
     }
     // A prefix that already covers the object publishes now, as begin does
@@ -1196,6 +1199,24 @@ fn publish_push_entry(
 }
 
 fn publish_file(setup: &WorkerSetup, file: &mut FileState) -> Result<Publication, SessionError> {
+    // Outside the publication lock: a multi-GiB rehash must not stall every
+    // other session's publish. Nothing writes this staging meanwhile, since
+    // publish runs on the session's worker after its accepts have joined.
+    if file.rehash {
+        let staging = file
+            .native
+            .as_ref()
+            .ok_or_else(|| SessionError::internal("file state lost"))?
+            .staging_path()
+            .to_path_buf();
+        staged_object_matches(&staging, &file.object).map_err(|error| {
+            SessionError::bad(format!(
+                "publish {} refused after resume: {error}; retry the upload",
+                file.display_path
+            ))
+        })?;
+        file.rehash = false;
+    }
     let _publication_namespace = PUBLICATION_NAMESPACE
         .lock()
         .expect("publication namespace poisoned");
@@ -1212,14 +1233,6 @@ fn publish_file_locked(
         .native
         .as_mut()
         .ok_or_else(|| SessionError::internal("file state lost"))?;
-    if file.rehash {
-        staged_object_matches(native.staging_path(), &file.object).map_err(|error| {
-            SessionError::bad(format!(
-                "publish {} refused after resume: {error}; retry the upload",
-                file.display_path
-            ))
-        })?;
-    }
     native.publish().map_err(|error| {
         SessionError::conflict(format!(
             "publish {} failed: {error}; the name may have been taken mid-upload, retry the upload",
