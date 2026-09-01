@@ -699,3 +699,75 @@ mod handler_tests {
         assert_eq!(json["branding"]["has_logo"], false);
     }
 }
+
+/// Seeded random inputs against every parser that reads unauthenticated
+/// input in this crate (the receipt, manifest, and proof decoders live
+/// upstream in VOT). Each call may fail; none may panic.
+#[cfg(test)]
+mod no_panic_tests {
+    use axum::http::{HeaderMap, HeaderValue};
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        /// Bytes drawn from a small alphabet of path, address, and hex
+        /// characters half the time, from the full byte range otherwise.
+        fn string(&mut self) -> String {
+            const ALPHABET: &[u8] = b"./\\:0123456789abcdefABCDEF-_ ~%\x00\n";
+            let len = (self.next() % 96) as usize;
+            let narrow = self.next().is_multiple_of(2);
+            (0..len)
+                .map(|_| {
+                    let value = self.next();
+                    if narrow {
+                        ALPHABET[(value % ALPHABET.len() as u64) as usize] as char
+                    } else {
+                        value as u8 as char
+                    }
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn untrusted_parsers_never_panic() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = super::testing::build(directory.path());
+        let trusted = vec![crate::config::IpCidr::parse("10.0.0.0/8").unwrap()];
+        let peer: std::net::SocketAddr = "10.1.2.3:4444".parse().unwrap();
+        let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
+        for round in 0..4000u64 {
+            let text = rng.string();
+            let _ = crate::backup::validate_id(&text);
+            let _ = crate::config::IpCidr::parse(&text);
+            let _ = crate::paths::admit_component(&text, round.is_multiple_of(2));
+            let _ = super::outbound::safe_library_path(&app, "", &text);
+            let _ = super::outbound::safe_library_path(&app, "acme", &text);
+            let _ = super::upload::parse_object(&super::upload::PackageAnnouncement {
+                suite: if round.is_multiple_of(3) {
+                    "blake3".to_owned()
+                } else {
+                    rng.string()
+                },
+                root: text.clone(),
+                length: rng.next(),
+            });
+            let mut headers = HeaderMap::new();
+            if let Ok(value) = HeaderValue::from_bytes(text.as_bytes()) {
+                headers.append("x-forwarded-for", value.clone());
+                headers.append("x-forwarded-for", value);
+            }
+            let _ = super::client_ip(&headers, &peer, &[]);
+            let _ = super::client_ip(&headers, &peer, &trusted);
+        }
+    }
+}

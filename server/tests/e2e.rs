@@ -2841,6 +2841,121 @@ async fn refused_resume_records_published_files_as_partial() {
     assert_eq!(uploads[0].files[0].stored_as, "first.bin");
 }
 
+/// Restore drill: a backup taken through the API restores through a restart
+/// and the database reflects the backup, not what came after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn backup_restores_through_a_restart() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let response = client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let local_path = server.application.config.data_dir.join("drill-backups");
+    std::fs::create_dir(&local_path).unwrap();
+    let response = client
+        .put(format!("{base}/api/admin/backups"))
+        .header("X-Votport", "1")
+        .json(&json!({
+            "enabled": false,
+            "interval_secs": 3600,
+            "retention_days": 7,
+            "retention_count": 5,
+            "destination": "local",
+            "local_path": local_path,
+            "encrypt": false,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+
+    let create_link = |label: &'static str| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            client
+                .post(format!("{base}/api/admin/links"))
+                .header("X-Votport", "1")
+                .json(&json!({ "label": label }))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()["link"]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    };
+    let before = create_link("before backup").await;
+    let response = client
+        .post(format!("{base}/api/admin/backups"))
+        .header("X-Votport", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let id = response.json::<Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let after = create_link("after backup").await;
+
+    let response = client
+        .post(format!("{base}/api/admin/backups/restore"))
+        .header("X-Votport", "1")
+        .json(&json!({ "source": "local", "id": id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let body = response.json::<Value>().await.unwrap();
+    assert_eq!(body["pending"], json!(true));
+
+    // Boot applies the pending restore; the restored cookie secret signs the
+    // old session out.
+    let server = server.restart().await;
+    let base = server.base.clone();
+    let response = client
+        .get(format!("{base}/api/admin/links"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    let response = client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let links = client
+        .get(format!("{base}/api/admin/links"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = links["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|link| link["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&before.as_str()), "{ids:?}");
+    assert!(!ids.contains(&after.as_str()), "{ids:?}");
+}
+
 /// A staging file shorter than its checkpointed prefix (power loss before
 /// the data reached disk) is refused at boot: the record and staging go,
 /// and the sender starts a fresh session.

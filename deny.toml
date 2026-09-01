@@ -1,6 +1,5 @@
-# Advisories only for now: a license gate would need a full review of every
-# transitive license, and bans/duplicates add upkeep without a consumer.
-# CI runs `deny check advisories`, so other checks are simply not invoked.
+# CI runs `deny check advisories licenses bans sources` (ci.yml).
+
 [advisories]
 version = 2
 yanked = "deny"
@@ -10,4 +9,44 @@ yanked = "deny"
 # Revisit when RustCrypto ships the constant-time implementation.
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa used for public-key signature verification only" },
+]
+
+# Inventory on 2026-09-01 (cargo deny list): every third-party crate offers
+# one of the permissive licenses below. GPL-2.0-only (self_cell) and
+# LGPL-2.1-or-later (r-efi) appear only as alternatives beside MIT or
+# Apache-2.0 and are satisfied by those. The AGPL-3.0-only vot-* crates are
+# publish = false and skipped here like votport itself; [sources] is what
+# confines them to the halideworks repositories.
+[licenses]
+version = 2
+private = { ignore = true }
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+# Informational today (duplicates warn, none banned); add `deny` entries here
+# when a crate must be kept out.
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+    "https://github.com/halideworks/VOT",
+    "https://github.com/halideworks/quiche",
 ]
