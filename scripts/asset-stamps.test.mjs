@@ -28,12 +28,7 @@ const mustBeStamped = [
   'fonts/InstrumentSerif-400-italic.woff2',
   'fonts/InstrumentSerif-400.woff2',
   'fonts/JetBrainsMono-400.woff2',
-  'fonts/JetBrainsMono-500.woff2',
   'fonts/PlusJakartaSans-300.woff2',
-  'fonts/PlusJakartaSans-400.woff2',
-  'fonts/PlusJakartaSans-500.woff2',
-  'fonts/PlusJakartaSans-600.woff2',
-  'fonts/PlusJakartaSans-700.woff2',
   'pommern_painting.jpg',
   'pommern_ship_white.png',
 ];
