@@ -65,6 +65,7 @@ function renderAutomationTokens(tokens) {
       Number.isFinite(token.last_used_at)
         ? `last used ${formatWhen(token.last_used_at)}`
         : 'never used',
+      token.directory ? `folder ${token.directory}` : 'any folder',
     ];
     meta.textContent = parts.join(' · ');
     card.append(meta);
@@ -711,6 +712,7 @@ $('automation-token-form').addEventListener('submit', async (event) => {
   error.hidden = true;
   const label = $('automation-token-label').value.trim();
   const expires = Number($('automation-token-expires').value);
+  const directory = $('automation-token-directory').value.trim();
   if (!label || label.length > 100) {
     error.textContent = 'Label must be 1 to 100 characters.';
     error.hidden = false;
@@ -726,7 +728,7 @@ $('automation-token-form').addEventListener('submit', async (event) => {
   try {
     const response = await api('/api/admin/automation-tokens', {
       method: 'POST',
-      body: JSON.stringify({ label, expires_days: expires }),
+      body: JSON.stringify({ label, expires_days: expires, directory: directory || null }),
     });
     if (!response.token) throw new Error('server did not return the automation token');
     $('automation-token-form').reset();

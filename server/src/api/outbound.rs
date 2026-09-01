@@ -1181,6 +1181,9 @@ pub async fn list_outbound_grants(
 pub struct AutomationTokenRequest {
     label: String,
     expires_days: u64,
+    /// Optional library directory the token is confined to.
+    #[serde(default)]
+    directory: Option<String>,
 }
 
 pub async fn list_automation_tokens(
@@ -1219,6 +1222,26 @@ pub async fn create_automation_token(
             "expires_days must be 1..=365",
         ));
     }
+    // Shape only: the folder may not exist yet when the token is issued.
+    let directory = match request.directory.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(directory) => {
+            if directory.len() > MAX_LIBRARY_DIRECTORY_INPUT_BYTES {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "directory is too long",
+                ));
+            }
+            if Path::new(directory).is_absolute() || directory.contains('\\') {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "directory must be a relative path",
+                ));
+            }
+            safe_library_path(&app, &identity.tenant, directory)?;
+            Some(directory.trim_matches('/').to_owned())
+        }
+    };
     let raw = auth::random_token();
     let created_at = now_unix();
     let token = AutomationToken {
@@ -1226,6 +1249,7 @@ pub async fn create_automation_token(
         token_hash: hash_token(&raw),
         tenant: identity.tenant.clone(),
         label,
+        directory,
         created_at,
         expires_at: created_at.saturating_add(request.expires_days * 86_400),
         revoked_at: None,
@@ -1239,7 +1263,7 @@ pub async fn create_automation_token(
         &identity.subject,
         "automation_token_created",
         &token.id,
-        &json!({ "label": token.label, "expires_at": token.expires_at }),
+        &json!({ "label": token.label, "expires_at": token.expires_at, "directory": token.directory }),
     );
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
@@ -1539,6 +1563,29 @@ pub async fn automation_share(
             ApiError::unauthorized()
         })?;
     let _operation = begin_outbound_operation(&app, &token.tenant)?;
+    // Length first: it needs no filesystem, and it bounds the audit subject
+    // below before the scope check can write it.
+    if request.directory.len() > MAX_LIBRARY_DIRECTORY_INPUT_BYTES {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "directory is too long",
+        ));
+    }
+    if let Some(scope) = token.directory.as_deref() {
+        if !within_scope(scope, &request.directory) {
+            app.store.audit(
+                &token.tenant,
+                &format!("automation:{}", token.id),
+                "automation_refused",
+                &request.directory,
+                &json!({ "reason": "directory outside token scope", "scope": scope }),
+            );
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "directory is outside this token's scope",
+            ));
+        }
+    }
     if !(1..=30).contains(&request.expires_days) {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1579,6 +1626,16 @@ pub async fn automation_share(
         },
     )
     .await
+}
+
+/// True when `directory` is `scope` or a path below it, comparing whole
+/// components so "project" does not admit "project-old".
+fn within_scope(scope: &str, directory: &str) -> bool {
+    let scope: Vec<&str> = scope.trim_matches('/').split('/').collect();
+    let mut directory = directory.trim_matches('/').split('/');
+    scope
+        .iter()
+        .all(|component| directory.next() == Some(*component))
 }
 
 fn automation_bearer(headers: &HeaderMap) -> ApiResult<String> {
@@ -3863,6 +3920,7 @@ fn public_automation_token(token: &AutomationToken) -> serde_json::Value {
         "id": token.id,
         "tenant": token.tenant,
         "label": token.label,
+        "directory": token.directory,
         "created_at": token.created_at,
         "expires_at": token.expires_at,
         "revoked_at": token.revoked_at,
@@ -6806,7 +6864,7 @@ mod tests {
         }
         for payload in [
             json!({ "directory": "project", "paths": ["project/file-00.bin"] }),
-            json!({ "directory": "x".repeat(MAX_LIBRARY_DIRECTORY_INPUT_BYTES + 1) }),
+            json!({ "directory": "a/".repeat(MAX_LIBRARY_DIRECTORY_INPUT_BYTES / 2 + 1) }),
         ] {
             let response = crate::app::router(app.clone())
                 .oneshot(
@@ -6982,6 +7040,114 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         }
+    }
+
+    #[test]
+    fn scope_matches_whole_components() {
+        assert!(within_scope("project", "project"));
+        assert!(within_scope("project", "project/sub"));
+        assert!(within_scope("/project/", "project/sub/deeper"));
+        assert!(!within_scope("project", "project-old"));
+        assert!(!within_scope("project", "other"));
+        assert!(!within_scope("project/sub", "project"));
+    }
+
+    /// A token confined to a directory shares that directory and its
+    /// children only; anything else is refused and audited.
+    #[tokio::test]
+    async fn scoped_automation_token_shares_only_its_directory() {
+        let (_directory, app, cookie, _bytes) = fixture().await;
+        for path in ["project/sub", "project-old", "other"] {
+            std::fs::create_dir_all(app.config.outbound_dir.join(path)).unwrap();
+            std::fs::write(app.config.outbound_dir.join(path).join("f.txt"), b"f").unwrap();
+        }
+        let create = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/automation-tokens")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"label":"Nightly","expires_days":1,"directory":"project/"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = create.status();
+        let created = body(create).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["automation_token"]["directory"], json!("project"));
+        let raw = created["token"].as_str().unwrap().to_owned();
+        // A traversal, absolute, or over-long directory is refused at issue time.
+        let long = format!("\"{}\"", "a/".repeat(600));
+        for bad in [r#""../x""#, r#""/abs""#, long.as_str()] {
+            let create = crate::app::router(app.clone())
+                .oneshot(
+                    Request::post("/api/admin/automation-tokens")
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(
+                            r#"{{"label":"bad","expires_days":1,"directory":{bad}}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(create.status(), StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+        }
+        let share = |directory: &'static str| {
+            let app = app.clone();
+            let raw = raw.clone();
+            async move {
+                crate::app::router(app)
+                    .oneshot(
+                        Request::post("/api/automation/share")
+                            .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+                            .header("content-type", "application/json")
+                            .extension(ConnectInfo(std::net::SocketAddr::from((
+                                [127, 0, 0, 1],
+                                12,
+                            ))))
+                            .body(Body::from(format!(
+                                r#"{{"directory":"{directory}","expires_days":1}}"#
+                            )))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        assert_eq!(share("project").await, StatusCode::OK);
+        assert_eq!(share("project/sub").await, StatusCode::OK);
+        assert_eq!(share("project-old").await, StatusCode::FORBIDDEN);
+        assert_eq!(share("other").await, StatusCode::FORBIDDEN);
+        let refusals: Vec<String> = app
+            .store
+            .audit_export("", 0, 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.event == "automation_refused")
+            .map(|row| format!("{} {}", row.actor, row.subject))
+            .collect();
+        assert_eq!(refusals.len(), 2, "{refusals:?}");
+        assert!(refusals.iter().all(|row| row.starts_with("automation:")));
+        assert!(refusals.iter().any(|row| row.ends_with(" project-old")));
+        let listed = crate::app::router(app.clone())
+            .oneshot(
+                Request::get("/api/admin/automation-tokens")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            body(listed).await["tokens"][0]["directory"],
+            json!("project")
+        );
     }
 
     #[tokio::test]
