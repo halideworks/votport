@@ -39,14 +39,22 @@ test('anchor fallback copy explains multiple downloads', () => {
   assert.match(sendPage, />Start downloads<\/button>/);
 });
 
-test('recipient page makes individual files primary and ZIP secondary', () => {
-  assert.ok(sendPage.indexOf('id="separate-download"') < sendPage.indexOf('id="bundle-download"'));
-  assert.match(sendPage, /<h2>Download all files<\/h2>/);
-  assert.match(sendPage, />Download all files<\/button>/);
-  assert.match(sendPage, /Download every payload file individually.*configured download location.*No ZIP or receipt files/s);
-  assert.match(sendPage, /<h2>Download as ZIP<\/h2>/);
-  assert.match(sendPage, /id="bundle-download-button"[\s\S]*class="ghost"[\s\S]*>Download as ZIP<\/button>/);
-  assert.doesNotMatch(sendPage, /Download everything/);
+test('recipient page has one primary action with ZIP as a secondary link', () => {
+  // The primary button sits in the hero block; ZIP is a text-style link after it.
+  assert.match(sendPage, /id="separate-download" class="hero-action"/);
+  assert.ok(sendPage.indexOf('id="separate-download-button"') < sendPage.indexOf('id="bundle-download-button"'));
+  assert.match(sendPage, /id="separate-download-button"[^>]*>Download all files<\/button>/);
+  assert.match(sendPage, /id="bundle-download-button" class="link"[^>]*>Download as ZIP<\/button>/);
+  assert.doesNotMatch(sendPage, /<h2>Download all files<\/h2>|<h2>Download as ZIP<\/h2>/);
+  // The manifest is the file list; the availability line lives in the masthead.
+  assert.match(sendPage, /<h2>Manifest<\/h2>/);
+  assert.doesNotMatch(sendPage, /id="expires"/);
+  assert.match(outboundScript, /available until \$\{when\(body\.expires_at\)\}/);
+  // A finished save is "landed", never "verified": the browser checks nothing.
+  assert.match(outboundScript, /badge\.textContent = 'landed'/);
+  assert.doesNotMatch(outboundScript, /verified on this device/);
+  // The anchor-fallback path still carries the multiple-downloads advice.
+  assert.match(outboundScript, /prepareAnchorDownloads\(\)/);
 });
 
 test('file batches are fixed and bounded at both ends', () => {

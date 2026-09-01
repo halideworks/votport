@@ -47,49 +47,40 @@
   </section>
 
   <section id="download-content" hidden aria-live="polite">
-    <div id="separate-download" class="card ok" hidden>
-      <h2>Download all files</h2>
-      <p id="separate-download-note" class="muted">
-        Download every payload file individually. Browsers with folder access let you choose where to save them; otherwise they go to your browser's configured download location. No ZIP or receipt files are included.
-      </p>
+    <!-- One primary action. The ids stay: the browser e2e drives them. -->
+    <div id="separate-download" class="hero-action">
       <button
         type="button"
         id="separate-download-button"
         aria-describedby="separate-download-note separate-download-status"
       >Download all files</button>
       <p id="separate-download-status" class="muted" aria-live="polite"></p>
+      <p id="separate-download-note" class="muted"></p>
+      <div class="secondary-actions">
+        <span id="bundle-download" hidden>
+          <button type="button" id="bundle-download-button" class="link" aria-describedby="bundle-download-note">Download as ZIP</button>
+          <span id="bundle-download-note" hidden>All payload files in one ZIP. Receipt files are not included.</span>
+        </span>
+        <a href="#manifest" class="link-action">Pick files individually</a>
+      </div>
     </div>
 
-    <div id="bundle-download" class="card ok" hidden>
-      <h2>Download as ZIP</h2>
-      <p id="bundle-download-note" class="muted">
-        Fallback: download all payload files in one ZIP. Receipt files are not included.
-      </p>
-      <button
-        type="button"
-        id="bundle-download-button"
-        class="ghost"
-        aria-describedby="bundle-download-note"
-      >Download as ZIP</button>
-    </div>
-
-    <div class="card ok">
-      <h2>Expected object identities</h2>
+    <div class="card ok" id="manifest">
+      <div class="manifest-head">
+        <h2>Manifest</h2>
+        <p id="manifest-status" class="muted" aria-live="polite"></p>
+      </div>
       <ul id="object" class="files"></ul>
       <div id="file-list-controls" hidden>
         <button type="button" id="show-more-files" class="tiny ghost">Show more files</button>
         <p id="file-list-status" class="muted" aria-live="polite"></p>
       </div>
-      <p id="expires" class="muted"></p>
     </div>
 
-    <div class="outbound-actions"><a href="/verify">Verify these receipts</a></div>
-
-    <details class="key-box" open>
-      <summary>Receipt issuer</summary>
-      <p class="muted">The receipt is signed by this server's key.</p>
-      <p class="mono" id="receipt-key"></p>
-    </details>
+    <div class="outbound-actions">
+      <a href="/verify">Verify these receipts</a>
+      <span class="muted">Receipt issuer <span class="mono" id="receipt-key"></span></span>
+    </div>
   </section>
 
   <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>

@@ -948,13 +948,83 @@ button.danger:hover:not(:disabled) {
 .outbound-actions {
  display: flex;
  align-items: center;
- gap: 0.5rem;
+ justify-content: space-between;
+ gap: 0.5rem 1rem;
  flex-wrap: wrap;
  margin-bottom: 1rem;
 }
 .outbound-actions a {
  color: var(--text-soft);
  font-size: 0.78rem;
+}
+/* The issuer key is a fingerprint to compare, not prose; keep it one line. */
+.outbound-actions #receipt-key {
+ display: inline-block;
+ max-width: 14rem;
+ vertical-align: bottom;
+ white-space: nowrap;
+ overflow: hidden;
+ text-overflow: ellipsis;
+ font-size: 0.7rem;
+}
+
+/* ---- recipient page: one primary action, then the manifest ------------- */
+.hero-action {
+ display: flex;
+ flex-direction: column;
+ align-items: center;
+ gap: 0.6rem;
+ margin: 1.4rem 0 1.6rem;
+ text-align: center;
+}
+.hero-action > button {
+ padding: 1rem 1.7rem;
+ font-size: 0.8rem;
+}
+.hero-action > p {
+ margin: 0;
+}
+#separate-download-note:empty {
+ display: none;
+}
+.secondary-actions {
+ display: flex;
+ align-items: center;
+ gap: 1.2rem;
+ flex-wrap: wrap;
+ justify-content: center;
+}
+.secondary-actions .link-action {
+ color: var(--muted);
+ font-size: 0.66rem;
+ font-weight: 600;
+ letter-spacing: 0.08em;
+ text-transform: uppercase;
+ text-decoration: none;
+}
+.secondary-actions .link-action:hover {
+ color: var(--text);
+}
+.manifest-head {
+ display: flex;
+ align-items: baseline;
+ justify-content: space-between;
+ gap: 1rem;
+ flex-wrap: wrap;
+}
+.manifest-head > p {
+ margin: 0 0 1rem;
+}
+/* Object ids on the recipient page are copy controls; one line each. */
+#object .file-id {
+ white-space: nowrap;
+ overflow: hidden;
+ text-overflow: ellipsis;
+ word-break: normal;
+}
+/* A file that landed on this device. */
+.files li.saved > span:first-child {
+ color: var(--text);
 }
 
 .library-head {
