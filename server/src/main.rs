@@ -73,6 +73,9 @@ async fn main() {
         tracing::error!("server error: {error}");
         std::process::exit(1);
     }
+    // No handler can reach a session now; park the in-flight uploads on
+    // disk so the next boot re-attaches them.
+    app::suspend_sessions(&application).await;
 }
 
 #[derive(Debug, PartialEq)]

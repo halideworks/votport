@@ -294,13 +294,15 @@ pub fn with_suffix(name: &str, attempt: u32) -> String {
 /// `<name>.stage` (plus `<name>.journal` under the Balanced profile) next to
 /// its destination, where `<name>` always starts with `.vot-`; push sessions
 /// additionally stage under `.vot-push-<session-id>/`.
-pub fn clean_staging(root: &Path) {
+/// `keep` names staging and journal files a re-attached upload session
+/// still owns; everything else VOT-staged under `root` is an orphan.
+pub fn clean_staging(root: &Path, keep: &std::collections::HashSet<PathBuf>) {
     #[cfg(unix)]
     fn is_staging_file(name: &str) -> bool {
         name.starts_with(".vot-") && (name.ends_with(".stage") || name.ends_with(".journal"))
     }
     #[cfg(not(unix))]
-    let _ = root;
+    let _ = (root, keep);
     #[cfg(unix)]
     walk(root, &mut |path, name, is_dir| {
         if is_dir && is_push_staging_name(name) {
@@ -309,7 +311,7 @@ pub fn clean_staging(root: &Path) {
             let _ = std::fs::remove_dir_all(path);
             return false;
         }
-        if !is_dir && is_staging_file(name) {
+        if !is_dir && is_staging_file(name) && !keep.contains(path) {
             let _ = std::fs::remove_file(path);
         }
         true
@@ -452,7 +454,7 @@ mod tests {
         for path in [&orphan, &journal, &kept, &foreign] {
             std::fs::write(path, b"x").unwrap();
         }
-        clean_staging(directory.path());
+        clean_staging(directory.path(), &Default::default());
         assert!(!orphan.exists());
         assert!(!journal.exists());
         assert!(kept.exists());
@@ -470,7 +472,7 @@ mod tests {
         let foreign = directory.path().join(".vot-push-session");
         std::fs::create_dir_all(foreign.join("objects")).unwrap();
 
-        clean_staging(directory.path());
+        clean_staging(directory.path(), &Default::default());
 
         assert!(!push_staging.exists());
         assert!(foreign.exists());
@@ -501,7 +503,7 @@ mod tests {
         )
         .unwrap();
 
-        clean_staging(directory.path());
+        clean_staging(directory.path(), &Default::default());
 
         assert!(std::fs::symlink_metadata(
             directory

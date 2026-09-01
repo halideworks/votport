@@ -23,7 +23,9 @@ use vot_sdk::verify::verify_range;
 use vot_sdk_file::{CommitProfile, NativeFile, RangeStatus};
 
 use crate::paths;
-use crate::store::{now_unix, FileRecord, Store, UploadRecord};
+use crate::store::{
+    now_unix, FileRecord, PersistedUploadFile, PersistedUploadSession, Store, UploadRecord,
+};
 
 pub const MAX_SEAL_BYTES: usize = 1024 * 1024;
 pub const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
@@ -99,6 +101,9 @@ pub enum Cmd {
         reply: Reply<()>,
         _lease: SessionLease,
     },
+    /// Process shutdown: checkpoint, keep staging on disk for boot
+    /// re-attach, and exit.
+    Suspend { reply: oneshot::Sender<()> },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -121,6 +126,10 @@ pub struct ChunkProgress {
     pub covered_bytes: u64,
     pub total_bytes: u64,
     pub complete: bool,
+    /// The session was re-attached after a restart and its coverage restarted
+    /// from the checkpointed prefix: the sender must call begin again to
+    /// learn where to resume. Cleared by the next begin.
+    pub rebegin: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -217,6 +226,10 @@ struct FileState {
     native: Option<NativeFile>,
     published: bool,
     receipt: bool,
+    /// Re-attached after a restart: the staged bytes are re-hashed against
+    /// the announced object before publish, since the resumed coverage is
+    /// trusted bookkeeping rather than verified ranges.
+    rehash: bool,
 }
 
 // One Phase exists per session; the variant size gap is irrelevant here.
@@ -237,12 +250,25 @@ enum Phase {
 /// Runs the per-session worker. The caller creates the channel, registers the
 /// sender, then passes the receiver here so the thread cannot touch disk
 /// before the session is in the map.
-pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
+pub fn spawn_worker(setup: WorkerSetup, receiver: mpsc::Receiver<Cmd>) {
+    spawn_worker_from(setup, receiver, Phase::AwaitSeal, false);
+}
+
+fn spawn_worker_from(
+    setup: WorkerSetup,
+    mut receiver: mpsc::Receiver<Cmd>,
+    mut phase: Phase,
+    resumed: bool,
+) {
     std::thread::spawn(move || {
-        let mut phase = Phase::AwaitSeal;
         // Feedback for the admin: bytes newly accepted this session and the
         // last error handed to the sender, recorded if the session dies.
         let mut received: u64 = 0;
+        let mut persist = PersistTracker::new();
+        let mut rebegin = resumed;
+        let mut suspended = false;
+        // The registry dropped the sender (idle sweep or removal).
+        let mut dropped = false;
         let mut replays: u64 = 0;
         let mut rejected: u64 = 0;
         let mut last_error: Option<String> = None;
@@ -268,7 +294,10 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
                 Some(cmd) => cmd,
                 None => match receiver.blocking_recv() {
                     Some(cmd) => cmd,
-                    None => break,
+                    None => {
+                        dropped = true;
+                        break;
+                    }
                 },
             };
             last_seen = now_unix();
@@ -289,6 +318,7 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
                 }
                 Cmd::Begin { reply, _lease } => {
                     let result = handle_begin(&setup, &mut phase);
+                    rebegin = false;
                     // A failed begin has consumed the pages: the phase is
                     // already Done, the worker exits below, and the exit-time
                     // "interrupted" fall-through is skipped. Record it here.
@@ -351,7 +381,12 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
                         }
                     }
                     let outcomes = accept_batch(&setup, &mut phase, &batch);
+                    let received_before = received;
                     for (item, outcome) in batch.into_iter().zip(outcomes) {
+                        let outcome = outcome.map(|mut progress| {
+                            progress.rebegin = rebegin;
+                            progress
+                        });
                         match &outcome {
                             Ok(progress) if progress.replay => replays += 1,
                             Ok(progress) if progress.accepted => {
@@ -362,9 +397,20 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
                         }
                         send_noted!(item.reply, outcome);
                     }
+                    // Checkpoint covered progress on a byte or time threshold,
+                    // never per batch, so the fsync never paces accept.
+                    if persist.should_checkpoint(received - received_before) {
+                        if let Phase::Receiving { files } = &phase {
+                            checkpoint_session(&setup, files);
+                        }
+                    }
                 }
                 Cmd::Finish { reply, _lease } => {
-                    send_noted!(reply, handle_finish(&setup, &mut phase, replays, rejected));
+                    let report = handle_finish(&setup, &mut phase, replays, rejected);
+                    // A finished (or terminally failed) session has nothing
+                    // left to re-attach; drop its resume record.
+                    forget_session(&setup);
+                    send_noted!(reply, report);
                 }
                 Cmd::Abort { reply, _lease } => {
                     record_event(
@@ -376,15 +422,38 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
                         replays,
                         rejected,
                     );
+                    // The sender gave up; nothing to re-attach.
+                    forget_session(&setup);
                     phase = Phase::Done;
                     let _ = reply.send(Ok(()));
+                }
+                Cmd::Suspend { reply } => {
+                    // Checkpoint the exact prefix, then release the staging
+                    // handles without removing the files: boot re-attaches
+                    // them. Sessions before begin have nothing persisted.
+                    if let Phase::Receiving { files } = &mut phase {
+                        checkpoint_session(&setup, files);
+                        for file in files.iter_mut() {
+                            if let Some(native) = file.native.take() {
+                                native.abandon();
+                            }
+                        }
+                    }
+                    suspended = true;
+                    phase = Phase::Done;
+                    let _ = reply.send(());
                 }
             }
             if matches!(phase, Phase::Done) {
                 break;
             }
         }
-        if !matches!(phase, Phase::Done) {
+        if dropped {
+            // Staging goes with the dropped handles below, so the record
+            // must not offer it for re-attach.
+            forget_session(&setup);
+        }
+        if !matches!(phase, Phase::Done) && !suspended {
             record_event(
                 &setup,
                 received,
@@ -517,6 +586,7 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
                 native: None,
                 published: true,
                 receipt: existing.receipt,
+                rehash: false,
             });
             continue;
         }
@@ -531,8 +601,196 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
     }
 
     let infos = entry_infos(setup, &files);
+    // Record the session (and its staging paths) so a restart can re-attach.
+    persist_session(setup, &files);
     *phase = Phase::Receiving { files };
     Ok(infos)
+}
+
+/// Persist checkpoint pacing: write covered progress no more than this often
+/// by bytes or by time, so the fsync'd update never paces the accept path.
+const PERSIST_BYTES: u64 = 256 * 1024 * 1024;
+const PERSIST_INTERVAL: Duration = Duration::from_secs(5);
+
+struct PersistTracker {
+    bytes_since: u64,
+    last_at: Instant,
+}
+
+impl PersistTracker {
+    fn new() -> Self {
+        Self {
+            bytes_since: 0,
+            last_at: Instant::now(),
+        }
+    }
+
+    /// Returns true when accumulated bytes or elapsed time crosses a
+    /// checkpoint threshold, resetting the counters.
+    fn should_checkpoint(&mut self, added: u64) -> bool {
+        self.bytes_since += added;
+        if self.bytes_since >= PERSIST_BYTES || self.last_at.elapsed() >= PERSIST_INTERVAL {
+            self.bytes_since = 0;
+            self.last_at = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Builds the resume record for a session's current files. Published files
+/// carry no staging handle; boot re-attach skips them.
+fn persisted_session(setup: &WorkerSetup, files: &[FileState]) -> PersistedUploadSession {
+    let persisted = files
+        .iter()
+        .enumerate()
+        .map(|(entry, file)| {
+            let (staging_path, journal_path, incarnation, prefix_bytes) = match &file.native {
+                Some(native) => (
+                    native.staging_path().to_path_buf(),
+                    native.journal_path().to_path_buf(),
+                    native.incarnation(),
+                    native.progress().prefix_bytes,
+                ),
+                None => (
+                    PathBuf::new(),
+                    PathBuf::new(),
+                    [0u8; 16],
+                    file.object.length,
+                ),
+            };
+            PersistedUploadFile {
+                entry,
+                display_path: file.display_path.clone(),
+                stored_components: file.stored_components.clone(),
+                object: file.object.clone(),
+                staging_path,
+                journal_path,
+                incarnation,
+                prefix_bytes,
+                published: file.published,
+                receipt: file.receipt,
+            }
+        })
+        .collect();
+    PersistedUploadSession {
+        id: hex::encode(setup.session_id),
+        link_id: setup.link_id.clone(),
+        tenant: setup.tenant.clone(),
+        dest_dir: setup.dest_dir.clone(),
+        dest_rel: setup.dest_rel.clone(),
+        package: setup.expected_package.clone(),
+        max_total_bytes: (setup.max_total_bytes != u64::MAX).then_some(setup.max_total_bytes),
+        started_at: setup.started_at,
+        files: persisted,
+    }
+}
+
+/// Records the session so a restart can re-attach its staging. Best effort:
+/// a persist failure only loses the resume opportunity, never a byte.
+fn persist_session(setup: &WorkerSetup, files: &[FileState]) {
+    if let Err(error) = setup
+        .store
+        .insert_upload_session(&persisted_session(setup, files))
+    {
+        tracing::warn!(%error, "persist upload session failed");
+    }
+}
+
+/// Updates each in-progress file's covered prefix at a checkpoint.
+fn checkpoint_session(setup: &WorkerSetup, files: &[FileState]) {
+    let id = hex::encode(setup.session_id);
+    for (entry, file) in files.iter().enumerate() {
+        let prefix = file
+            .native
+            .as_ref()
+            .map_or(file.object.length, |native| native.progress().prefix_bytes);
+        if let Err(error) = setup.store.update_upload_file_progress(
+            &id,
+            entry,
+            prefix,
+            file.published,
+            file.receipt,
+        ) {
+            tracing::warn!(%error, entry, "checkpoint upload session failed");
+        }
+    }
+}
+
+/// Removes the resume record once a session is complete or cancelled.
+fn forget_session(setup: &WorkerSetup) {
+    if let Err(error) = setup
+        .store
+        .delete_upload_session(&hex::encode(setup.session_id))
+    {
+        tracing::warn!(%error, "forget upload session failed");
+    }
+}
+
+/// Re-attaches a persisted session after a restart: reopens each unpublished
+/// file's staging from its checkpointed prefix, publishes any file that
+/// prefix already completes, and starts the worker in the receiving phase.
+/// The staging is reopened under the profile it was created with; the
+/// integrity of the resumed bytes is established by the rehash at publish.
+/// Returns the staging and journal paths now owned by the worker. On any
+/// failure nothing runs and the dropped handles remove their staging.
+pub fn resume_worker(
+    setup: WorkerSetup,
+    receiver: mpsc::Receiver<Cmd>,
+    persisted: &PersistedUploadSession,
+) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::with_capacity(persisted.files.len());
+    let mut kept = Vec::new();
+    for file in &persisted.files {
+        let native = if file.published {
+            None
+        } else {
+            let destination = paths::join_under(&setup.dest_dir, &file.stored_components)?;
+            // Only the contiguous prefix is trusted, and only as bookkeeping:
+            // publish re-hashes the whole staged object (FileState::rehash),
+            // so a prefix the disk does not actually hold cannot publish.
+            let runs = (file.prefix_bytes > 0).then_some((0, file.prefix_bytes));
+            let native = NativeFile::resume(
+                &file.object,
+                &destination,
+                file.staging_path.clone(),
+                file.journal_path.clone(),
+                file.incarnation,
+                CommitProfile::Balanced,
+                runs,
+            )
+            .map_err(|error| format!("{}: {error}", file.display_path))?;
+            kept.push(file.staging_path.clone());
+            kept.push(file.journal_path.clone());
+            Some(native)
+        };
+        files.push(FileState {
+            display_path: file.display_path.clone(),
+            stored_components: file.stored_components.clone(),
+            object: file.object.clone(),
+            native,
+            published: file.published,
+            receipt: file.receipt,
+            // A file resumed from a zero prefix receives every byte through
+            // verify_range like a fresh session; only a trusted prefix needs
+            // the rehash.
+            rehash: !file.published && file.prefix_bytes > 0,
+        });
+    }
+    // A prefix that already covers the object publishes now, as begin does
+    // for empty objects; the sender only has finish left to call.
+    for file in &mut files {
+        let complete = file.native.as_ref().is_some_and(|native| {
+            let progress = native.progress();
+            progress.covered_bytes == progress.total_bytes
+        });
+        if complete {
+            publish_file(&setup, file).map_err(|error| error.message)?;
+        }
+    }
+    spawn_worker_from(setup, receiver, Phase::Receiving { files }, true);
+    Ok(kept)
 }
 
 fn entry_infos(setup: &WorkerSetup, files: &[FileState]) -> Vec<EntryInfo> {
@@ -658,6 +916,7 @@ fn open_destination_for(
                     native: Some(native),
                     published: false,
                     receipt: false,
+                    rehash: false,
                 });
             }
             Err(error) if error.kind() == vot_sdk_file::ErrorKind::AlreadyExists => {}
@@ -812,6 +1071,7 @@ fn accept_batch(
                 covered_bytes: core.covered_bytes,
                 total_bytes: core.total_bytes,
                 complete: core.complete,
+                rebegin: false,
             })
         })
         .collect()
@@ -939,6 +1199,24 @@ fn publish_push_entry(
 }
 
 fn publish_file(setup: &WorkerSetup, file: &mut FileState) -> Result<Publication, SessionError> {
+    // Outside the publication lock: a multi-GiB rehash must not stall every
+    // other session's publish. Nothing writes this staging meanwhile, since
+    // publish runs on the session's worker after its accepts have joined.
+    if file.rehash {
+        let staging = file
+            .native
+            .as_ref()
+            .ok_or_else(|| SessionError::internal("file state lost"))?
+            .staging_path()
+            .to_path_buf();
+        staged_object_matches(&staging, &file.object).map_err(|error| {
+            SessionError::bad(format!(
+                "publish {} refused after resume: {error}; retry the upload",
+                file.display_path
+            ))
+        })?;
+        file.rehash = false;
+    }
     let _publication_namespace = PUBLICATION_NAMESPACE
         .lock()
         .expect("publication namespace poisoned");
@@ -986,6 +1264,35 @@ fn publish_file_locked(
         destination,
         receipt,
     })
+}
+
+/// Hashes a fully covered staging file and checks it is the announced object.
+/// Runs on a re-attached file before publish: the resumed prefix was
+/// bookkeeping, and this is what makes the published bytes verified.
+fn staged_object_matches(path: &std::path::Path, object: &ObjectId) -> Result<(), String> {
+    let suite = Suite::try_from(object.suite).map_err(|_| "unsupported suite".to_owned())?;
+    let mut input = fs::File::open(path).map_err(|error| format!("open staging: {error}"))?;
+    let mut builder = InMemoryObjectBuilder::new(suite, Some(object.length), object.length)
+        .map_err(|error| format!("object builder: {:?}", error.code()))?;
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let count = input
+            .read(&mut buf)
+            .map_err(|error| format!("read staging: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        builder
+            .update(&buf[..count])
+            .map_err(|error| format!("hash staging: {:?}", error.code()))?;
+    }
+    let prepared = builder
+        .finish()
+        .map_err(|error| format!("hash staging: {:?}", error.code()))?;
+    if prepared.object_id() != object {
+        return Err("staged bytes do not match the announced object".to_owned());
+    }
+    Ok(())
 }
 
 fn handle_finish(
@@ -1178,6 +1485,7 @@ impl PushReceive {
                 native: None,
                 published: true,
                 receipt: existing.receipt,
+                rehash: false,
             });
             let index = inner.entries.len();
             inner.entries.push(PushEntry {
@@ -2218,12 +2526,25 @@ impl Sessions {
         tenant: String,
         sender: mpsc::Sender<Cmd>,
     ) -> Result<(), InsertError> {
+        self.insert_resumed(id, link_id, tenant, 0, sender)
+    }
+
+    /// Registers a session re-attached at boot. It was admitted before the
+    /// restart, so only its byte reservation is re-established.
+    pub fn insert_resumed(
+        &self,
+        id: String,
+        link_id: String,
+        tenant: String,
+        reserved_bytes: u64,
+        sender: mpsc::Sender<Cmd>,
+    ) -> Result<(), InsertError> {
         self.insert_admitted(
             SessionAdmission {
                 id,
                 link_id,
                 tenant,
-                reserved_bytes: 0,
+                reserved_bytes,
                 max_total_bytes: None,
                 max_tenant_sessions: None,
                 max_link_sessions: usize::MAX,
@@ -2233,6 +2554,25 @@ impl Sessions {
             sender,
             || Ok(0),
         )
+    }
+
+    /// Removes every HTTP session from the registry and returns its command
+    /// sender, for shutdown: the workers are suspended through these, and
+    /// nothing else can reach or sweep them meanwhile.
+    pub fn take_http(&self) -> Vec<mpsc::Sender<Cmd>> {
+        let mut senders = Vec::new();
+        self.inner
+            .lock()
+            .expect("sessions poisoned")
+            .map
+            .retain(|_, handle| {
+                if matches!(handle.kind, SessionKind::Http) {
+                    senders.push(handle.sender.clone());
+                    return false;
+                }
+                true
+            });
+        senders
     }
 
     /// Concurrent sessions for one tenant namespace.
@@ -3071,6 +3411,7 @@ mod parallel_accept_tests {
             native: Some(native),
             published: false,
             receipt: false,
+            rehash: false,
         }];
         let results: Vec<AcceptCore> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..2)
@@ -3097,5 +3438,18 @@ mod parallel_accept_tests {
         );
         // A full-object range completes the file for both callers.
         assert!(results.iter().all(|core| core.complete));
+    }
+
+    #[test]
+    fn persist_tracker_checkpoints_on_bytes_and_on_time() {
+        let mut tracker = PersistTracker::new();
+        // A small addition well under the byte threshold does not checkpoint.
+        assert!(!tracker.should_checkpoint(1024));
+        // Crossing the byte threshold does, and resets the counter.
+        assert!(tracker.should_checkpoint(PERSIST_BYTES));
+        assert!(!tracker.should_checkpoint(1024));
+        // The time threshold fires independently of bytes.
+        tracker.last_at = Instant::now() - PERSIST_INTERVAL;
+        assert!(tracker.should_checkpoint(0));
     }
 }
