@@ -85,3 +85,26 @@ test('tenant principals use a bounded searchable page', () => {
   assert.match(tenantsScript, /principalRows\.concat\(page\.principals\)/);
   assert.match(tenantsScript, /refreshPrincipals\(true\)/);
 });
+
+test('list actions announce their outcome and copy buttons confirm', () => {
+  assert.match(receive, /id="links-action-status"[^>]+role="status"/);
+  assert.match(deliver, /id="outbound-grants-status"[^>]+role="status"/);
+  assert.match(receiveScript, /announce\('links-action-status'/);
+  assert.match(deliverScript, /announce\('outbound-grants-status'/);
+  assert.match(deliverScript, /confirmModal\('Extend download'/);
+  // Every clipboard write goes through copyToClipboard so the button flips to Copied.
+  assert.doesNotMatch(receiveScript, /navigator\.clipboard/);
+  assert.doesNotMatch(deliverScript, /navigator\.clipboard/);
+  assert.match(commonScript, /export async function copyToClipboard/);
+});
+
+test('no page repeats an element id', () => {
+  for (const [name, html] of Object.entries({ receive, deliver, audit, tenants, system })) {
+    const ids = [...html.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]);
+    const seen = new Set();
+    for (const id of ids) {
+      assert.ok(!seen.has(id), `${name}.html repeats id="${id}"`);
+      seen.add(id);
+    }
+  }
+});

@@ -91,7 +91,11 @@ await page.click("#login-form button[type=submit]");
 // Signed-in users land on /receive; the create form is the first element.
 await page.waitForSelector("#create-form:not([hidden])", { timeout: 15000 });
 
-const dest = `e2e-${Date.now().toString(36)}`;
+const run = Date.now().toString(36);
+const dest = `e2e-${run}`;
+// Unique per run so the script can be re-run against the same instance.
+const PROJECT = `browser-project-${run}`;
+const FOLDER_PROJECT = `browser-folder-project-${run}`;
 await page.fill("#create-label", "browser e2e");
 await page.fill("#create-dest", dest);
 await page.click("#create-form button[type=submit]");
@@ -217,26 +221,28 @@ try {
   console.error(`deliver page did not load at ${page.url()}: ${await page.locator("body").innerText()}`);
   throw error;
 }
-await page.fill("#deliver-project", "browser-project");
+await page.fill("#deliver-project", PROJECT);
 await page.setInputFiles("#library-input", outboundFiles.map((file) => path.join(dir, file.name)));
 await page.waitForFunction(
   () => document.getElementById("library-status").textContent.includes("12 files added"),
   { timeout: 30000 },
 );
 const rootFolder = page.locator(
-  '#library-files input[aria-label="Select folder browser-project"]',
+  `#library-files input[aria-label="Select folder ${PROJECT}"]`,
 );
-if (await rootFolder.count() !== 1 || await page.locator("#library-files .library-folder").count() !== 1) {
-  throw new Error("scoped library root did not show browser-project");
+// Earlier runs leave their own project folders behind; only this run's must be a folder row.
+if (await rootFolder.count() !== 1 || await page.locator("#library-files .library-file:not(.library-folder)").count() !== 0) {
+  throw new Error(`scoped library root did not show ${PROJECT} as a folder`);
 }
-await page.getByRole("button", { name: "Open folder browser-project" }).click();
+await page.getByRole("button", { name: `Open folder ${PROJECT}` }).click();
 await page.waitForFunction(
-  () => document.querySelector('#library-breadcrumbs [aria-current="page"]')?.textContent === "browser-project" &&
+  (project) => document.querySelector('#library-breadcrumbs [aria-current="page"]')?.textContent === project &&
     document.querySelectorAll("#library-files input[type=checkbox]").length === 12,
+  PROJECT,
   { timeout: 15000 },
 );
 const currentDirectory = await page.textContent('#library-breadcrumbs [aria-current="page"]');
-if (currentDirectory !== "browser-project") {
+if (currentDirectory !== PROJECT) {
   throw new Error(`scoped library breadcrumb: ${currentDirectory}`);
 }
 const projectFiles = await page.$$eval("#library-files .library-file:not(.library-folder) .mono", (els) =>
@@ -246,21 +252,22 @@ if (JSON.stringify(projectFiles) !== JSON.stringify(outboundFiles.map((file) => 
   throw new Error(`scoped library files: ${JSON.stringify(projectFiles)}`);
 }
 await page.getByRole("button", { name: "Library", exact: true }).click();
-await page.waitForSelector('#library-files input[aria-label="Select folder browser-project"]', {
+await page.waitForSelector(`#library-files input[aria-label="Select folder ${PROJECT}"]`, {
   state: "visible",
   timeout: 15000,
 });
-await page.locator('#library-files input[aria-label="Select folder browser-project"]').click();
+await page.locator(`#library-files input[aria-label="Select folder ${PROJECT}"]`).click();
 await page.waitForFunction(
   () => document.getElementById("library-selection-status").textContent.startsWith("12 files selected"),
   { timeout: 15000 },
 );
-await page.getByRole("button", { name: "Open folder browser-project" }).click();
+await page.getByRole("button", { name: `Open folder ${PROJECT}` }).click();
 await page.waitForFunction(
-  () => document.querySelector('#library-breadcrumbs [aria-current="page"]')?.textContent === "browser-project" &&
+  (project) => document.querySelector('#library-breadcrumbs [aria-current="page"]')?.textContent === project &&
     document.querySelectorAll("#library-files input[type=checkbox]").length === 12 &&
     [...document.querySelectorAll("#library-files input[type=checkbox]")].every((checkbox) => checkbox.checked) &&
     document.getElementById("library-selection-status").textContent.startsWith("12 files selected"),
+  PROJECT,
   { timeout: 15000 },
 );
 const selectedProjectFiles = await page.$$eval(
@@ -275,7 +282,7 @@ if (!(await page.textContent("#library-selection-status")).startsWith("12 files 
 }
 await page.getByRole("button", { name: "Library", exact: true }).click();
 const selectedFolder = page.locator(
-  '#library-files input[aria-label="Select folder browser-project"]',
+  `#library-files input[aria-label="Select folder ${PROJECT}"]`,
 );
 await selectedFolder.waitFor({ state: "visible", timeout: 15000 });
 if (!(await selectedFolder.isChecked())) {
@@ -285,7 +292,7 @@ if (!(await page.textContent("#library-selection-status")).startsWith(`${outboun
   throw new Error("scoped library root selection status changed");
 }
 
-await page.fill("#deliver-project", "browser-folder-project");
+await page.fill("#deliver-project", FOLDER_PROJECT);
 await page.setInputFiles("#library-folder-input", folder);
 await page.waitForFunction(
   () => document.getElementById("library-status").textContent.includes("1 file added"),
@@ -293,13 +300,13 @@ await page.waitForFunction(
 );
 await page.getByRole("button", { name: "Library", exact: true }).click();
 await page.waitForSelector(
-  '#library-files button[aria-label="Share folder browser-folder-project"]',
+  `#library-files button[aria-label="Share folder ${FOLDER_PROJECT}"]`,
   { state: "visible", timeout: 15000 },
 );
 await page.fill("#library-search", "folder-nested.txt");
 await page.waitForFunction(
-  () => [...document.querySelectorAll("#library-files .mono")]
-    .some((el) => el.textContent === "browser-folder-project/folder-pick/nested/folder-nested.txt"),
+  (expected) => [...document.querySelectorAll("#library-files .mono")].some((el) => el.textContent === expected),
+  `${FOLDER_PROJECT}/folder-pick/nested/folder-nested.txt`,
   { timeout: 15000 },
 );
 await page.fill("#library-search", "");
@@ -388,12 +395,12 @@ try {
     .filter(Boolean);
   if (
     bundleNames.length !== outboundFiles.length ||
-    !outboundFiles.every((file) => bundleNames.includes(`browser-project/${file.name}`)) ||
+    !outboundFiles.every((file) => bundleNames.includes(`${PROJECT}/${file.name}`)) ||
     bundleNames.some((name) => name.endsWith(".vot-receipt"))
   ) {
     throw new Error(`bundle payload names: ${JSON.stringify(bundleNames)}`);
   }
-  const bundledOne = execFileSync("unzip", ["-p", bundlePath, `browser-project/${outboundFiles[0].name}`], {
+  const bundledOne = execFileSync("unzip", ["-p", bundlePath, `${PROJECT}/${outboundFiles[0].name}`], {
     encoding: "utf8",
   });
   if (bundledOne !== outboundFiles[0].content) throw new Error("bundle payload mismatch");
