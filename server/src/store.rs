@@ -79,6 +79,11 @@ pub struct UploadRecord {
     pub package_root: String,
     pub total_bytes: u64,
     pub files: Vec<FileRecord>,
+    /// The session ended before every file was received; `files` holds only
+    /// the ones that were published, so they stay visible to retention,
+    /// dedupe, and the operator instead of lingering on disk unrecorded.
+    #[serde(default)]
+    pub partial: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -5077,6 +5082,7 @@ mod tests {
         let mut link = test_link("link-1");
         for index in 0..3 {
             link.uploads.push(UploadRecord {
+                partial: false,
                 id: format!("up-{index}"),
                 started_at: 1,
                 completed_at: 2,
@@ -5106,6 +5112,7 @@ mod tests {
         let store = Store::open(directory.path()).unwrap();
         let mut link = test_link("link-1");
         link.uploads.push(UploadRecord {
+            partial: false,
             id: "up-1".to_owned(),
             started_at: 1,
             completed_at: 2,
@@ -5233,6 +5240,7 @@ mod tests {
         std::fs::write(receive.join("acme/invoice.pdf"), b"default").unwrap();
         let mut link = test_link("root");
         link.uploads.push(UploadRecord {
+            partial: false,
             id: "upload".to_owned(),
             started_at: 0,
             completed_at: 1,
@@ -5587,6 +5595,7 @@ mod tenant_tests {
             deleted: false,
         };
         link.uploads.push(UploadRecord {
+            partial: false,
             id: "up".to_owned(),
             started_at: 0,
             completed_at: 0,
@@ -5649,6 +5658,7 @@ mod tenant_tests {
         store.insert_tenant(test_tenant("acme")).unwrap();
         let mut link = link_in("acme", "large");
         link.uploads.push(UploadRecord {
+            partial: false,
             id: "up".to_owned(),
             started_at: 0,
             completed_at: 0,
@@ -5687,6 +5697,7 @@ mod tenant_tests {
                 "acme",
                 "large",
                 UploadRecord {
+                    partial: false,
                     id: "second".to_owned(),
                     started_at: u64::MAX,
                     completed_at: u64::MAX,
@@ -5783,6 +5794,7 @@ mod tenant_tests {
             deleted: false,
         };
         link.uploads.push(UploadRecord {
+            partial: false,
             id: "up".to_owned(),
             started_at: 0,
             completed_at: 0,
@@ -5817,6 +5829,7 @@ mod tenant_tests {
                 "acme",
                 "link",
                 UploadRecord {
+                    partial: false,
                     id: "new".to_owned(),
                     started_at: 0,
                     completed_at: 0,
@@ -6805,6 +6818,7 @@ mod settings_tests {
         let store = Store::open(directory.path()).unwrap();
         let mut link = test_link("old-link");
         link.uploads.push(UploadRecord {
+            partial: false,
             id: "up".to_owned(),
             started_at: 0,
             completed_at: 1,

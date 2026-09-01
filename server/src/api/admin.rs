@@ -2088,6 +2088,7 @@ struct UploadView {
     package_root: String,
     total_bytes: u64,
     files: Vec<FileView>,
+    partial: bool,
 }
 
 #[derive(Serialize)]
@@ -2174,6 +2175,7 @@ fn link_view(app: &App, link: Link, base: &str) -> LinkView {
             rejected_chunks: upload.rejected_chunks,
             package_root: upload.package_root,
             total_bytes: upload.total_bytes,
+            partial: upload.partial,
         })
         .collect();
     LinkView {
@@ -3180,6 +3182,7 @@ mod handler_tests {
                 legal_hold: false,
                 notify_on_upload: false,
                 uploads: vec![UploadRecord {
+                    partial: false,
                     id: "upload".to_owned(),
                     started_at: 0,
                     completed_at: 1,
@@ -3397,6 +3400,7 @@ mod handler_tests {
                 legal_hold: false,
                 notify_on_upload: false,
                 uploads: vec![crate::store::UploadRecord {
+                    partial: false,
                     id: "upload".to_owned(),
                     started_at: 0,
                     completed_at: 1,

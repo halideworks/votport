@@ -2350,6 +2350,17 @@ async fn open_session(
         .as_str()
         .unwrap()
         .to_owned();
+    let session = open_session_on(client, base, &token, files).await;
+    (token, session)
+}
+
+/// Announces and pages a package on an existing link; returns the session id.
+async fn open_session_on(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    files: &[ClientFile],
+) -> String {
     let (announcement, pages, seal) = build_package(files);
     let session = client
         .post(format!("{base}/api/r/{token}/session"))
@@ -2377,7 +2388,7 @@ async fn open_session(
             .await
             .unwrap();
     }
-    (token, session)
+    session
 }
 
 async fn begin(client: &reqwest::Client, base: &str, session: &str) -> (u16, Value) {
@@ -2644,6 +2655,190 @@ async fn multi_file_session_survives_a_restart_after_one_file_published() {
     assert_eq!(uploads[0].files.len(), 2);
     assert!(uploads[0].files.iter().all(|file| file.receipt));
     assert!(staging_files(&receive_dir).is_empty());
+}
+
+/// A session abandoned after one file published leaves a partial record, so
+/// the file is visible to the operator and a re-send dedupes it instead of
+/// landing beside it with a suffix.
+#[tokio::test(flavor = "multi_thread")]
+async fn abandoned_session_records_its_published_files_as_partial() {
+    let server = start_server().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let small: Vec<u8> = (0..3 * 1024 * 1024)
+        .map(|index| (index % 241) as u8)
+        .collect();
+    let files = [prepare(vec!["first.bin"], small), twenty_mib()];
+    let (token, session) = open_session(&client, &server.base, "partial", &files).await;
+    let base = server.base.clone();
+    assert_eq!(begin(&client, &base, &session).await.0, 200);
+    upload_chunks(&client, &base, &session, 0, &files[0]).await;
+    let (status, progress) = post_chunk_entry(&client, &base, &session, 1, &files[1], 0).await;
+    assert_eq!(status, 200, "{progress}");
+    let response = client
+        .post(format!("{base}/api/session/{session}/abort"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let receive_dir = server.receive_dir.clone();
+    assert!(receive_dir.join("first.bin").is_file());
+    assert!(staging_files(&receive_dir).is_empty());
+    let uploads = server
+        .application
+        .store
+        .uploads_by_id(&token)
+        .unwrap()
+        .unwrap();
+    assert_eq!(uploads.len(), 1, "{uploads:?}");
+    assert!(uploads[0].partial);
+    assert_eq!(uploads[0].files.len(), 1);
+    assert_eq!(uploads[0].files[0].stored_as, "first.bin");
+    assert!(uploads[0].files[0].receipt);
+    assert_eq!(uploads[0].total_bytes, files[0].bytes.len() as u64);
+
+    // The operator listing carries the flag.
+    let links = client
+        .get(format!("{base}/api/admin/links"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let link = links["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == json!(token))
+        .unwrap();
+    assert_eq!(link["uploads"][0]["partial"], json!(true));
+
+    // Re-sending the same package dedupes the published file and completes.
+    let session = open_session_on(&client, &base, &token, &files).await;
+    let (status, body) = begin(&client, &base, &session).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["entries"][0]["complete"], true);
+    assert_eq!(body["entries"][1]["complete"], false);
+    upload_chunks(&client, &base, &session, 1, &files[1]).await;
+    let finish = client
+        .post(format!("{base}/api/session/{session}/finish"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(finish.status(), 200, "{}", finish.text().await.unwrap());
+    assert!(!receive_dir.join("first-1.bin").exists());
+    assert_eq!(
+        std::fs::read(receive_dir.join("resume.bin")).unwrap(),
+        files[1].bytes
+    );
+    let uploads = server
+        .application
+        .store
+        .uploads_by_id(&token)
+        .unwrap()
+        .unwrap();
+    assert_eq!(uploads.len(), 2);
+    assert!(!uploads[1].partial);
+    assert_eq!(uploads[1].files.len(), 2);
+}
+
+/// A finish refused as early does not drop the resume record: the session
+/// keeps receiving and still survives a restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn early_finish_keeps_the_session_resumable() {
+    let server = start_server().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let small: Vec<u8> = (0..2 * 1024 * 1024)
+        .map(|index| (index % 233) as u8)
+        .collect();
+    let files = [prepare(vec!["first.bin"], small), twenty_mib()];
+    let (_token, session) = open_session(&client, &server.base, "early", &files).await;
+    let base = server.base.clone();
+    assert_eq!(begin(&client, &base, &session).await.0, 200);
+    upload_chunks(&client, &base, &session, 0, &files[0]).await;
+    let (status, progress) = post_chunk_entry(&client, &base, &session, 1, &files[1], 0).await;
+    assert_eq!(status, 200, "{progress}");
+    let finish = client
+        .post(format!("{base}/api/session/{session}/finish"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(finish.status(), 422);
+    assert_eq!(
+        server
+            .application
+            .store
+            .load_upload_sessions()
+            .unwrap()
+            .len(),
+        1,
+        "the resume record survives a refused finish"
+    );
+
+    let server = server.restart().await;
+    let base = server.base.clone();
+    let (status, body) = begin(&client, &base, &session).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["entries"][0]["complete"], true);
+    assert_eq!(body["entries"][1]["covered_bytes"], CHUNK);
+}
+
+/// A suspended session the boot resume refuses still records the files it
+/// had already published.
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_resume_records_published_files_as_partial() {
+    let server = start_server().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let small: Vec<u8> = (0..2 * 1024 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let files = [prepare(vec!["first.bin"], small), twenty_mib()];
+    let (token, session) = open_session(&client, &server.base, "refused", &files).await;
+    let base = server.base.clone();
+    assert_eq!(begin(&client, &base, &session).await.0, 200);
+    upload_chunks(&client, &base, &session, 0, &files[0]).await;
+    let (status, progress) = post_chunk_entry(&client, &base, &session, 1, &files[1], 0).await;
+    assert_eq!(status, 200, "{progress}");
+    let staging = server.application.store.load_upload_sessions().unwrap()[0].files[1]
+        .staging_path
+        .clone();
+    let receive_dir = server.receive_dir.clone();
+
+    let (data, received) = server.suspend().await;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&staging)
+        .unwrap()
+        .set_len(1024)
+        .unwrap();
+    let server = boot(data, received).await;
+    assert!(server
+        .application
+        .store
+        .load_upload_sessions()
+        .unwrap()
+        .is_empty());
+    assert!(receive_dir.join("first.bin").is_file());
+    let uploads = server
+        .application
+        .store
+        .uploads_by_id(&token)
+        .unwrap()
+        .unwrap();
+    assert_eq!(uploads.len(), 1, "{uploads:?}");
+    assert!(uploads[0].partial);
+    assert_eq!(uploads[0].files.len(), 1);
+    assert_eq!(uploads[0].files[0].stored_as, "first.bin");
 }
 
 /// A staging file shorter than its checkpointed prefix (power loss before

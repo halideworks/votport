@@ -655,9 +655,9 @@ fn resume_upload_sessions(
         }
     };
     let mut kept = HashSet::new();
-    for session in persisted {
+    for mut session in persisted {
         let session_tag = session.id.get(..8).unwrap_or(&session.id).to_owned();
-        match resume_upload_session(config, store, signer, sessions, &session) {
+        match resume_upload_session(config, store, signer, sessions, &mut session) {
             Ok(paths) => {
                 tracing::info!(
                     target: "audit", event = "upload_session_resumed", link = %session.link_id,
@@ -668,6 +668,11 @@ fn resume_upload_sessions(
             }
             Err(error) => {
                 tracing::warn!(session_tag = %session_tag, %error, "dropped suspended upload session");
+                // Every Err above comes before the worker is spawned
+                // (resume_worker fails before spawn; insert_resumed cannot
+                // fail at boot with unbounded caps and empty pins), so no
+                // worker will write a second partial record for these files.
+                session::commit_persisted_partial(store, &session);
                 if let Err(error) = store.delete_upload_session(&session.id) {
                     tracing::warn!(session_tag = %session_tag, %error, "delete upload session failed");
                 }
@@ -682,7 +687,7 @@ fn resume_upload_session(
     store: &Arc<Store>,
     signer: &Arc<crate::receipt::ReceiptSigner>,
     sessions: &Sessions,
-    session: &crate::store::PersistedUploadSession,
+    session: &mut crate::store::PersistedUploadSession,
 ) -> Result<Vec<std::path::PathBuf>, String> {
     let link = store
         .upload_link(&session.link_id)?
@@ -2888,6 +2893,7 @@ mod retention_tests {
             legal_hold: true,
             notify_on_upload: false,
             uploads: vec![UploadRecord {
+                partial: false,
                 id: "upload".to_owned(),
                 started_at: 0,
                 completed_at: 1,
