@@ -2,7 +2,7 @@
 // streams proven ranges to the server. VOTPORT PROPRIETARY LICENSE.
 
 import { applyBranding } from '/assets/branding.js';
-import { appendObjectCard, formatBytes } from '/assets/object-card.js';
+import { appendObjectCard, copyToClipboard, formatBytes } from '/assets/object-card.js';
 import { entryFiles } from '/assets/upload-entries.js';
 import init, {
   ObjectId,
@@ -421,11 +421,42 @@ function renderPicked() {
   $('send').disabled = picked.size === 0 || Boolean(limitError);
 }
 
-function setStatus(path, text, done = false) {
+// Each row carries the honest state of that file: hashing before anything
+// is sent, sending with its own meter, paused while the pool or network
+// recovers, verified once the server has published it with a receipt.
+function setStatus(path, text, done = false, fraction = null) {
   const item = rows.get(path);
   if (!item) return;
   item.querySelector('.status').textContent = text;
   item.classList.toggle('done', done);
+  // data-state is the one source of truth; the stylesheet colours by it.
+  const state = done ? 'verified'
+    : text === 'Preparing' ? 'hashing'
+      : text === 'Paused' ? 'paused'
+        : text === 'Ready' ? 'ready'
+          : 'sending';
+  item.dataset.state = state;
+  let badge = item.querySelector('.state');
+  if (!badge) {
+    badge = document.createElement('span');
+    badge.className = 'badge state';
+    item.querySelector('.status').before(badge);
+  }
+  badge.textContent = state;
+  let meter = item.querySelector('.row-meter');
+  if (fraction !== null && !done) {
+    if (!meter) {
+      meter = document.createElement('div');
+      meter.className = 'row-meter';
+      meter.append(document.createElement('div'));
+      item.append(meter);
+    }
+    meter.firstChild.style.width = `${Math.min(100, Math.round(fraction * 100))}%`;
+  } else if (meter && done) {
+    // A state change without a fraction (a retry's Continuing) keeps the
+    // last known progress on screen instead of flickering the bar away.
+    meter.remove();
+  }
 }
 
 // ------------------------------------------------------------------- network
@@ -543,6 +574,8 @@ function renderNote() {
     }
   }
   parts.push(`${formatBytes(sentForNote)} of ${formatBytes(totalForNote)}`);
+  const verified = $('file-list').querySelectorAll('.done').length;
+  if (picked.size > 1) parts.push(`${verified} of ${picked.size} files verified`);
   $('progress-note').textContent = parts.join(' · ');
 }
 
@@ -717,7 +750,8 @@ async function runUpload() {
     const rootHex = hex(packageId.root);
     const suite = packageId.suite === Suite.Blake3Bao64 ? 'blake3' : 'sha256';
     sendCursor = item.path;
-    setStatus(item.path, 'Preparing');
+    // Hashing is done; this is the session announce, seal, and pages.
+    setStatus(item.path, 'Opening');
 
     // Re-attach to an interrupted session for this exact file. The root is
     // part of the match, so a file edited since the interruption starts over
@@ -825,7 +859,12 @@ async function runUpload() {
             lastSendBps = sendRate(step);
             lastSendAt = performance.now();
             renderNote();
-            setStatus(item.path, `${formatBytes(fileSent)} / ${formatBytes(item.file.size)}`);
+            setStatus(
+              item.path,
+              `${formatBytes(fileSent)} / ${formatBytes(item.file.size)}`,
+              false,
+              item.file.size ? fileSent / item.file.size : 1,
+            );
           });
         }
         let report;
@@ -913,6 +952,19 @@ function showDone(report) {
   $('progress-card').hidden = true;
   $('upload-form').hidden = true;
   $('done-card').hidden = false;
+  const bytes = report.files.reduce((sum, file) => sum + file.bytes, 0);
+  const at = new Date().toLocaleString();
+  const count = report.files.length;
+  // The per-file identities below are what the server attested; the host
+  // and time are the sender's own record of when it shipped.
+  const summary = `${count} file${count === 1 ? '' : 's'} · ${formatBytes(bytes)} · delivered to ${window.location.host}, verified on receipt, ${at}`;
+  $('done-summary').textContent = summary;
+  const proof = [
+    summary,
+    ...report.files.map((file) => `${file.path}  ${file.suite}:${file.root}`),
+  ].join('\n');
+  const copy = $('copy-proof');
+  copy.onclick = () => copyToClipboard(copy, proof);
   const list = $('done-list');
   list.replaceChildren();
   for (const file of report.files) {
@@ -1089,12 +1141,16 @@ function showResumeNote() {
     note.hidden = true;
     return;
   }
-  note.textContent =
-    `An interrupted transfer of "${saved.path}" is held on the server. `
-    + 'Select the same file again and it continues from where it stopped, '
-    + 'as long as it has not been left idle too long.';
+  $('resume-detail').textContent = Number.isFinite(saved.size)
+    ? `${formatBytes(saved.size)} of "${saved.path}" is held on the server.`
+    : `"${saved.path}" is held on the server.`;
   note.hidden = false;
 }
+
+$('resume-discard').addEventListener('click', () => {
+  clearResume();
+  showResumeNote();
+});
 
 (async () => {
   // Only a definitive server answer (404/410, or usable:false below) means the
