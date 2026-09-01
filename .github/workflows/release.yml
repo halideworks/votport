@@ -45,6 +45,11 @@ jobs:
         with:
           context: .
           push: true
+          # Attach an SBOM to the image index in GHCR (the action already adds
+          # provenance for a public repository). The scanner is pinned like
+          # every other image here; re-resolve the digest when bumping it.
+          # `docker buildx imagetools inspect <image> --format '{{ json .SBOM }}'` reads it.
+          sbom: generator=docker/buildkit-syft-scanner:stable-1@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9
           cache-from: type=gha,scope=votport-ci
           tags: |
             ${{ env.IMAGE }}:${{ env.VERSION }}

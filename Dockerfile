@@ -16,6 +16,9 @@ RUN apt-get update \
 RUN rustup target add wasm32-unknown-unknown
 # Must match the wasm-bindgen version pinned by vot-wasm.
 RUN cargo install wasm-bindgen-cli --version 0.2.126 --locked
+# Embeds the crate list in the binary so the image SBOM lists Rust crates,
+# not only Debian packages.
+RUN cargo install cargo-auditable --version 0.7.5 --locked
 
 # Browser-side VOT: hashing, proofs, and package building in WebAssembly.
 ARG VOT_GIT=https://github.com/halideworks/VOT
@@ -37,7 +40,7 @@ RUN mkdir -p /src/server/src \
 COPY server/src /src/server/src
 RUN touch /src/server/src/main.rs /src/server/src/lib.rs \
     && cd /src/server \
-    && cargo build --release --locked
+    && cargo auditable build --release --locked
 
 FROM debian:stable-slim@sha256:04634311a8d5fc442b6eb06d792293c4f3e2268652ca7634e00ce8ef5cc0a28a
 # curl serves the healthcheck; CA roots serve HTTPS notification and S3 clients.
