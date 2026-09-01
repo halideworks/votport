@@ -2553,14 +2553,14 @@ pub async fn outbound_batch(
             recorded: 0,
         },
         |mut state| async move {
-            // Recording trails delivery by one poll: only files whose bytes
-            // a previous poll already handed to the transport are recorded,
-            // so a record failure can never abort bytes ahead of what it
-            // recorded and lock a capped client out of files it never got.
-            // The trade runs the safe direction: a drop or failure at a
-            // boundary can leave the last yielded file unrecorded, and the
-            // client's per-file retry records it then.
-            state.record_delivered().await.map_err(api_error_io)?;
+            // Recording trails delivery: only files whose bytes a previous
+            // poll already handed to the transport are recorded, so a record
+            // failure can never abort bytes ahead of what it recorded and
+            // lock a capped client out of files it never got. The trade runs
+            // the safe direction: a drop or failure can leave the last
+            // yielded files unrecorded, and the client's per-file retry
+            // records them then.
+            state.record_delivered(false).await.map_err(api_error_io)?;
             loop {
                 if let Some(file) = state.file.as_mut() {
                     if let Some(item) = file.next().await {
@@ -2576,10 +2576,8 @@ pub async fn outbound_batch(
                 state.file = None;
                 state.chunk_index += 1;
                 if state.chunk_index >= state.chunks.len() {
-                    // Defense in depth: this poll's entry call already
-                    // recorded everything the yield path delivered, but a
-                    // future change to that path must not lose the tail.
-                    state.record_delivered().await.map_err(api_error_io)?;
+                    // End of stream: record the coalesced tail.
+                    state.record_delivered(true).await.map_err(api_error_io)?;
                     return Ok(None);
                 }
                 let chunk = state.chunks[state.chunk_index].clone();
@@ -3934,16 +3932,49 @@ struct BatchStream {
     recorded: usize,
 }
 
+/// Delivered files are recorded in one store transaction per this many
+/// delivered bytes, not one per file: every commit is an fsync inside the
+/// stream, and a batch of small files paid one per file (1024 x 256 KiB
+/// measured 320 MiB/s against 867 MiB/s for one file of the same size).
+/// A dropped stream can now leave fully delivered files unrecorded up to
+/// this many bytes plus the file that crosses the window, instead of one
+/// file, still the safe direction: those files stay downloadable and a later
+/// per-file fetch records them. Per-file download counts are one per stream
+/// either way, and the grant count is the minimum over its files, so the
+/// window changes when files are recorded, never how many times.
+const RECORD_COALESCE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The files to record now: those past `recorded` whose boundary `sent_bytes`
+/// has covered, once they span the coalesce window, or all of them on
+/// `flush`.
+fn record_range(
+    boundaries: &[u64],
+    recorded: usize,
+    sent_bytes: u64,
+    flush: bool,
+) -> Option<std::ops::Range<usize>> {
+    let mut end = recorded;
+    while end < boundaries.len() && sent_bytes >= boundaries[end] {
+        end += 1;
+    }
+    if end == recorded {
+        return None;
+    }
+    let recorded_end = recorded.checked_sub(1).map_or(0, |last| boundaries[last]);
+    (flush || boundaries[end - 1] - recorded_end >= RECORD_COALESCE_BYTES).then_some(recorded..end)
+}
+
 impl BatchStream {
-    /// Records every file whose bytes previous polls fully yielded.
-    async fn record_delivered(&mut self) -> ApiResult<()> {
-        while self.recorded < self.boundaries.len()
-            && self.sent_bytes >= self.boundaries[self.recorded]
-        {
-            let index = self.recorded;
-            record_download(&self.app, &self.grant, &[index]).await?;
-            self.recorded += 1;
-        }
+    /// Records every file whose bytes previous polls fully yielded, once
+    /// enough of them have accumulated or when `flush` ends the stream.
+    async fn record_delivered(&mut self, flush: bool) -> ApiResult<()> {
+        let Some(range) = record_range(&self.boundaries, self.recorded, self.sent_bytes, flush)
+        else {
+            return Ok(());
+        };
+        let indexes: Vec<usize> = range.clone().collect();
+        record_download(&self.app, &self.grant, &indexes).await?;
+        self.recorded = range.end;
         Ok(())
     }
 }
@@ -4317,6 +4348,89 @@ mod tests {
         assert_eq!(refused.status(), StatusCode::NOT_FOUND);
     }
 
+    /// Mid-stream recording (a flush inside the window) and the end flush
+    /// count each file once and the grant once, the same as per-file
+    /// recording did.
+    #[tokio::test]
+    async fn batch_over_the_window_records_each_file_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::api::testing::config(directory.path());
+        config.max_upload_bytes = 64 * 1024 * 1024;
+        let app = crate::app::build(config).unwrap();
+        let cookie = admin_cookie(&app);
+        let mib = 1024 * 1024;
+        // 9 + 9 MiB crosses the 16 MiB window after the second file, so the
+        // third is recorded by the end-of-stream flush in a second call.
+        for (path, size) in [
+            ("win/a.bin", 9 * mib),
+            ("win/b.bin", 9 * mib),
+            ("win/c.bin", 1),
+        ] {
+            let bytes: Vec<u8> = (0..size).map(|index| (index % 251) as u8).collect();
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::post(format!("/api/admin/outbound-files?path={path}"))
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .body(Body::from(bytes))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let created = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"paths":["win/a.bin","win/b.bin","win/c.bin"],"max_downloads":2}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let token = body(created).await["url"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_owned();
+        let batch = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/batch"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        21,
+                    ))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch.status(), StatusCode::OK);
+        let bytes = batch.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.len(), 18 * mib + 1);
+        let grant = app
+            .store
+            .outbound_grant_by_token_hash(&hash_token(&token))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            grant
+                .files
+                .iter()
+                .map(|file| file.downloads)
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
+        assert_eq!(grant.downloads, 1);
+    }
+
     async fn fixture() -> (tempfile::TempDir, Arc<App>, String, Vec<u8>) {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
@@ -4385,6 +4499,29 @@ mod tests {
         assert!(valid_token(&"a".repeat(32)));
         assert!(!valid_token("x"));
         assert!(!valid_token(&"g".repeat(32)));
+    }
+
+    #[test]
+    fn record_range_coalesces_delivered_files() {
+        let mib = 1024 * 1024;
+        // Forty 1 MiB files.
+        let boundaries: Vec<u64> = (1..=40).map(|index| index * mib).collect();
+        // Nothing delivered yet, and a partial first file, record nothing.
+        assert_eq!(record_range(&boundaries, 0, 0, false), None);
+        assert_eq!(record_range(&boundaries, 0, mib - 1, false), None);
+        // Under the window: wait, unless the stream is ending.
+        assert_eq!(record_range(&boundaries, 0, 15 * mib, false), None);
+        assert_eq!(record_range(&boundaries, 0, 15 * mib, true), Some(0..15));
+        // At the window: record exactly the covered files.
+        assert_eq!(
+            record_range(&boundaries, 0, 16 * mib + 7, false),
+            Some(0..16)
+        );
+        // The window is measured from the last recorded boundary.
+        assert_eq!(record_range(&boundaries, 16, 31 * mib, false), None);
+        assert_eq!(record_range(&boundaries, 16, 32 * mib, false), Some(16..32));
+        // Everything recorded: a flush has nothing to do.
+        assert_eq!(record_range(&boundaries, 40, 40 * mib, true), None);
     }
 
     #[test]
