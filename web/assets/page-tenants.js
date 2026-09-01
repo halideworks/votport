@@ -82,7 +82,6 @@ function editTenantForm(tenant) {
   }
   const save = document.createElement('button');
   save.type = 'submit';
-  save.className = 'tiny';
   save.textContent = 'Save';
   const error = document.createElement('p');
   error.className = 'error';
@@ -112,7 +111,10 @@ function editTenantForm(tenant) {
       save.disabled = false;
     }
   });
-  form.append(grid, save, error);
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+  actions.append(save);
+  form.append(grid, actions, error);
   details.append(form);
   return details;
 }
@@ -165,7 +167,6 @@ function brandingForm(tenant) {
 
   const save = document.createElement('button');
   save.type = 'submit';
-  save.className = 'tiny';
   save.textContent = 'Save branding';
   const error = document.createElement('p');
   error.className = 'error';
@@ -210,8 +211,8 @@ function brandingForm(tenant) {
   const actions = document.createElement('div');
   actions.className = 'actions';
   actions.append(
-    button('No accent', 'ghost tiny', async () => accent.set('')),
-    button('Upload logo', 'tiny', async () => {
+    save,
+    button('Upload logo', 'ghost', async () => {
       const file = logoInput.files?.[0];
       if (!file) throw new Error('Choose a logo file first.');
       await api(`/api/admin/branding/${key}/logo`, {
@@ -222,11 +223,12 @@ function brandingForm(tenant) {
       logoInput.value = '';
       await load();
     }),
-    button('Remove logo', 'tiny danger', async () => {
+    button('Remove logo', 'danger', async () => {
       await api(`/api/admin/branding/${key}/logo`, { method: 'DELETE' });
       await load();
     }),
-    button('Remove branding', 'tiny danger', async () => {
+    button('No accent', 'link', async () => accent.set('')),
+    button('Remove branding', 'danger', async () => {
       if (
         !(await confirmModal(
           'Remove branding',
@@ -241,7 +243,7 @@ function brandingForm(tenant) {
     }),
   );
 
-  form.append(grid, save, actions, error);
+  form.append(grid, actions, error);
   details.append(form);
   return details;
 }
@@ -273,8 +275,11 @@ function renderTenant(tenant, usage) {
   if (tenant.key !== '') card.append(editTenantForm(tenant), brandingForm(tenant));
 
   if (tenant.key !== '') {
-    card.append(
-      button('Delete', 'tiny danger', async () => {
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+    card.append(actions);
+    actions.append(
+      button('Delete', 'danger', async () => {
         if (
           !(await confirmModal(
             'Delete tenant',

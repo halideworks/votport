@@ -45,24 +45,30 @@ function renderRow(row) {
   line.className = 'audit-row';
 
   const when = document.createElement('span');
-  when.className = 'muted';
-  when.textContent = `${formatWhen(row.at)} · ${row.tenant || 'default'}`;
+  when.className = 'audit-when muted';
+  when.textContent = formatWhen(row.at);
+
+  const tenant = document.createElement('span');
+  tenant.className = 'audit-tenant muted';
+  tenant.textContent = row.tenant || 'default';
 
   const event = document.createElement('strong');
-  event.textContent = ` ${row.event}`;
+  event.className = 'audit-event';
+  event.textContent = row.event;
 
   const subject = document.createElement('span');
-  subject.textContent = row.subject ? ` ${row.subject}` : '';
+  subject.className = 'audit-subject';
+  subject.textContent = row.subject || '';
 
   const actor = document.createElement('span');
-  actor.className = 'muted';
-  actor.textContent = row.actor ? ` · actor ${row.actor}` : '';
+  actor.className = 'audit-actor muted';
+  actor.textContent = row.actor || '';
 
+  line.append(when, tenant, event, subject, actor);
   const keys = Object.keys(row.detail ?? {});
-  let details;
   if (keys.length) {
-    details = document.createElement('details');
-    details.className = 'muted file-id';
+    const details = document.createElement('details');
+    details.className = 'audit-detail muted';
     const summary = document.createElement('summary');
     summary.textContent = 'Details';
     const detail = document.createElement('div');
@@ -70,10 +76,8 @@ function renderRow(row) {
       .map((key) => `${key}=${JSON.stringify(row.detail[key])}`)
       .join(' ');
     details.append(summary, detail);
+    line.append(details);
   }
-
-  line.append(when, event, subject, actor);
-  if (details) line.append(details);
   return line;
 }
 

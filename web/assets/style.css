@@ -1265,3 +1265,85 @@ details.deployment .settings-status {
  color: var(--danger);
  font-size: 0.8rem;
 }
+
+/* ---- tenants page --------------------------------------------------------- */
+
+/* The masthead tenant switcher lives outside any card. */
+#tenant-switcher {
+ display: inline-block;
+ width: auto;
+ max-width: 100%;
+ margin-top: 0.6rem;
+ padding: 0.4rem 2rem 0.4rem 0.7rem;
+ border-radius: 0.6rem;
+ border: 1px solid var(--border);
+ background: rgba(255, 255, 255, 0.03);
+ color: var(--text-soft);
+ font-family: inherit;
+ /* 16px minimum, as for every other control: iOS Safari zooms below it. */
+ font-size: 1rem;
+ font-weight: 600;
+}
+#tenant-switcher:focus {
+ outline: none;
+ border-color: var(--border-active);
+}
+
+.link-item > details > summary {
+ padding: 0.35rem 0;
+}
+.link-item > details > form {
+ margin: 0.5rem 0 0.25rem;
+}
+
+/* ---- audit page ----------------------------------------------------------- */
+
+#audit-log {
+ font-size: 0.74rem;
+}
+.audit-row {
+ display: grid;
+ grid-template-columns: 10.5rem 6rem minmax(9rem, auto) minmax(0, 1fr) auto;
+ gap: 0.2rem 0.9rem;
+ align-items: baseline;
+ padding: 0.5rem 0;
+ border-top: 1px solid var(--border-faint);
+}
+.audit-row:first-child {
+ border-top: 0;
+}
+.audit-event {
+ color: var(--text);
+ font-weight: 600;
+}
+.audit-subject {
+ color: var(--text-soft);
+ min-width: 0;
+ overflow-wrap: anywhere;
+}
+.audit-actor {
+ white-space: nowrap;
+}
+.audit-actor:not(:empty)::before {
+ content: "by ";
+}
+.audit-detail {
+ grid-column: 1 / -1;
+ overflow-wrap: anywhere;
+}
+.audit-detail > div {
+ padding: 0.25rem 0 0.15rem 0.9rem;
+ border-left: 2px solid var(--border);
+ margin-top: 0.2rem;
+}
+@media (max-width: 720px) {
+ .audit-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+ }
+ .audit-when {
+  grid-column: 1 / -1;
+ }
+ .audit-subject {
+  grid-column: 1 / -1;
+ }
+}
