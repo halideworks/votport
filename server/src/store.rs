@@ -271,6 +271,9 @@ pub struct ResolvedSettings {
     pub default_max_sessions: Option<u64>,
     pub public_password_login: bool,
     pub sso_session_secs: u64,
+    /// When true, new upload sessions are refused so active ones can finish
+    /// before a restart. Downloads and admin are unaffected.
+    pub draining: bool,
 }
 
 /// Assembled SMTP channel. Username and password are optional.
@@ -318,6 +321,7 @@ pub struct SettingsOverlay {
     pub default_max_sessions_source: &'static str,
     pub public_password_login_source: &'static str,
     pub sso_session_secs_source: &'static str,
+    pub draining_source: &'static str,
 }
 
 /// The pre-SQLite state document, kept only to import legacy state.json files.
@@ -3457,6 +3461,9 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
     } else {
         (sso_session_secs, sso_session_secs_source)
     };
+    // No env default: draining is an operator action, off unless the db says
+    // otherwise.
+    let (draining, draining_source) = overlay_bool(rows, "draining", false);
     SettingsOverlay {
         resolved: ResolvedSettings {
             notify_webhook,
@@ -3471,6 +3478,7 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
             default_max_sessions,
             public_password_login,
             sso_session_secs,
+            draining,
         },
         notify_webhook_source,
         notify_ntfy_source,
@@ -3500,6 +3508,7 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
         default_max_sessions_source,
         public_password_login_source,
         sso_session_secs_source,
+        draining_source,
     }
 }
 

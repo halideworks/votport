@@ -611,6 +611,27 @@
         <h2>Maintenance &amp; verification</h2>
         <p class="settings-group-note">Operational tools</p>
         <div class="card">
+          <h2>Drain for restart</h2>
+          <p class="muted">
+            Refuses new upload sessions so active ones can finish before a
+            restart. Downloads, deliveries, and admin stay available. Turn it
+            on, watch active uploads reach zero
+            (<code>votport_sessions_active</code> on <code>/metrics</code>),
+            then restart. A sender who starts during drain is paused and
+            resumes on its own afterward.
+          </p>
+          <form id="drain-form" class="card">
+            <label
+              ><input type="checkbox" id="drain-toggle" />
+              Draining: refuse new upload sessions
+              <span class="muted" id="drain-source"></span>
+            </label>
+            <button type="submit" id="drain-save">Save</button>
+            <span id="drain-note" class="muted"></span>
+            <p class="error" id="drain-error" role="alert" hidden></p>
+          </form>
+        </div>
+        <div class="card">
           <h2>Backups</h2>
           <p class="muted">
             Automatic snapshots contain the database and VOTPort-managed

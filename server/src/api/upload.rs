@@ -308,6 +308,19 @@ async fn prepare_session(
     peer: &std::net::SocketAddr,
     parse: impl FnOnce() -> ApiResult<ObjectId>,
 ) -> ApiResult<PreparedSession> {
+    // Refuse new sessions while draining so active uploads finish before a
+    // restart. 503 is transient to the sender, which pauses and resumes.
+    if app
+        .store
+        .resolved_settings(&app.config)
+        .map_err(super::store_unavailable)?
+        .draining
+    {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the server is draining for maintenance; your upload will resume shortly",
+        ));
+    }
     let link = app
         .store
         .upload_link(token)
@@ -925,6 +938,49 @@ mod session_rate_tests {
             uploads: Vec::new(),
             events: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn draining_refuses_new_sessions_with_a_transient_status() {
+        use crate::store::SettingWrite;
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_link(open_link("drain-link"))
+            .unwrap();
+        let session_request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/r/drain-link/session")
+                .header("content-type", "application/json")
+                .extension(ConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    5000,
+                ))))
+                .body(Body::from(
+                    r#"{"package":{"suite":"blake3","root":"00","length":1}}"#,
+                ))
+                .unwrap()
+        };
+        // Not draining: admission proceeds far enough to reject the bad
+        // package (422), not the drain 503.
+        let router = app::router(Arc::clone(&application));
+        let response = router.oneshot(session_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        application
+            .store
+            .put_settings(
+                "admin",
+                &[("draining".to_owned(), SettingWrite::Set("1".to_owned()))],
+            )
+            .unwrap();
+        // Draining: refused before the package is parsed, with a transient
+        // status the sender retries.
+        let router = app::router(Arc::clone(&application));
+        let response = router.oneshot(session_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
