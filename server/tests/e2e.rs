@@ -2192,6 +2192,120 @@ async fn identical_resend_is_deduped_not_suffixed() {
     );
 }
 
+/// Many small distinct ranges of one file, all in flight at once, must
+/// reassemble byte for byte. This drives the parallel accept path: the
+/// worker batches the flooded chunk channel and verifies plus writes the
+/// ranges across scoped threads, so a batch of distinct ranges corrupting
+/// the staged object or the published bytes fails here.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_distinct_ranges_reassemble_byte_for_byte() {
+    let server = start_server().await;
+    let base = &server.base;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let response = client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let response = client
+        .post(format!("{base}/api/admin/links"))
+        .header("x-votport", "1")
+        .json(&json!({ "label": "parallel" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let token = response.json::<Value>().await.unwrap()["link"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut bytes = vec![0u8; 4 * 1024 * 1024];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = (index * 31 % 250) as u8;
+    }
+    let files = [prepare(vec!["parallel.bin"], bytes.clone())];
+    let (announcement, pages, seal) = build_package(&files);
+    let session = client
+        .post(format!("{base}/api/r/{token}/session"))
+        .json(&json!({ "password": "", "package": announcement }))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    client
+        .post(format!("{base}/api/session/{session}/seal"))
+        .body(seal)
+        .send()
+        .await
+        .unwrap();
+    for page in pages {
+        client
+            .post(format!("{base}/api/session/{session}/page"))
+            .body(page)
+            .send()
+            .await
+            .unwrap();
+    }
+    client
+        .post(format!("{base}/api/session/{session}/begin"))
+        .send()
+        .await
+        .unwrap();
+
+    // 512 KiB ranges over a 4 MiB file flood the eight-deep channel, so the
+    // worker sees full batches and accepts distinct ranges in parallel.
+    let file = &files[0];
+    let length = file.bytes.len() as u64;
+    let mut requests = tokio::task::JoinSet::new();
+    let mut offset = 0u64;
+    while offset < length {
+        let want = (512 * 1024u64).min(length - offset);
+        let proof = file.prepared.prove(offset, want).expect("prove");
+        let start = proof.covered_offset() as usize;
+        let end = start + proof.covered_length() as usize;
+        let mut body = proof.proof().to_vec();
+        let proof_len = body.len();
+        body.extend_from_slice(&file.bytes[start..end]);
+        let client = client.clone();
+        let url = format!("{base}/api/session/{session}/chunk?entry=0&offset={start}");
+        requests.spawn(async move {
+            client
+                .post(url)
+                .header("X-Votport-Proof", proof_len.to_string())
+                .body(body)
+                .send()
+                .await
+        });
+        offset = proof.covered_offset() + proof.covered_length();
+    }
+    while let Some(response) = requests.join_next().await {
+        let response = response.expect("chunk task").expect("chunk request");
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    }
+    let response = client
+        .post(format!("{base}/api/session/{session}/finish"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    assert_eq!(
+        std::fs::read(server.receive_dir.join("parallel.bin")).unwrap(),
+        bytes,
+        "the file reassembled from parallel ranges matches the original"
+    );
+}
+
 /// Throughput baseline, run explicitly: `cargo test --test e2e -- --ignored
 /// --nocapture throughput_baseline`. Times local hashing and the full upload
 /// of one 256 MiB object through the real HTTP protocol so optimization work
