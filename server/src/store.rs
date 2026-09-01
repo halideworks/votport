@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension as _};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use vot_sdk::object::ObjectId;
 
 use crate::config::Config;
 
@@ -218,6 +219,35 @@ pub struct Branding {
     pub updated_at: u64,
 }
 
+/// An in-progress upload session, persisted so its VOT staging files can
+/// re-attach after a restart instead of the transfer starting over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistedUploadSession {
+    pub id: String,
+    pub link_id: String,
+    pub tenant: String,
+    pub dest_dir: PathBuf,
+    pub dest_rel: String,
+    pub package: ObjectId,
+    pub max_total_bytes: Option<u64>,
+    pub started_at: u64,
+    pub files: Vec<PersistedUploadFile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistedUploadFile {
+    pub entry: usize,
+    pub display_path: String,
+    pub stored_components: Vec<String>,
+    pub object: ObjectId,
+    pub staging_path: PathBuf,
+    pub journal_path: PathBuf,
+    pub incarnation: [u8; 16],
+    /// Contiguous covered offset from zero; the restart resumes from here.
+    pub prefix_bytes: u64,
+    pub published: bool,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct TenantUsage {
     pub tenant: String,
@@ -333,7 +363,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 17;
+pub(crate) const SCHEMA_VERSION: u64 = 18;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -471,6 +501,41 @@ CREATE TABLE IF NOT EXISTS branding (
     color TEXT NOT NULL DEFAULT '',
     logo_ext TEXT NOT NULL DEFAULT '',
     updated_at INTEGER NOT NULL
+);
+";
+
+// In-progress upload sessions, so a partial transfer can re-attach its VOT
+// staging file after a restart instead of starting over. One session row
+// plus one row per file; per-file `prefix_bytes` is the contiguous covered
+// offset a restart resumes from.
+const UPLOAD_SESSIONS_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS upload_sessions (
+    id TEXT PRIMARY KEY,
+    link_id TEXT NOT NULL,
+    tenant TEXT NOT NULL,
+    dest_dir TEXT NOT NULL,
+    dest_rel TEXT NOT NULL,
+    package_suite INTEGER NOT NULL,
+    package_root TEXT NOT NULL,
+    package_length INTEGER NOT NULL,
+    max_total_bytes INTEGER,
+    started_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS upload_session_files (
+    session_id TEXT NOT NULL,
+    entry INTEGER NOT NULL,
+    display_path TEXT NOT NULL,
+    stored_components TEXT NOT NULL,
+    object_suite INTEGER NOT NULL,
+    object_root TEXT NOT NULL,
+    object_length INTEGER NOT NULL,
+    staging_path TEXT NOT NULL,
+    journal_path TEXT NOT NULL,
+    incarnation TEXT NOT NULL,
+    prefix_bytes INTEGER NOT NULL DEFAULT 0,
+    published INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, entry)
 );
 ";
 
@@ -892,6 +957,11 @@ impl Store {
         if stored < 17 {
             transaction
                 .execute_batch(BRANDING_SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
+        }
+        if stored < 18 {
+            transaction
+                .execute_batch(UPLOAD_SESSIONS_SCHEMA)
                 .map_err(|error| format!("schema: {error}"))?;
         }
         transaction
@@ -1625,6 +1695,190 @@ impl Store {
                 .execute([tenant])
                 .map(|changed| changed > 0)
         })
+    }
+
+    // ------------------------------------------------- upload session resume
+
+    /// Records an in-progress session and its files. Replaces any prior rows
+    /// for the id, so a re-persist after progress is idempotent.
+    pub fn insert_upload_session(&self, session: &PersistedUploadSession) -> Result<(), String> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO upload_sessions
+                 (id, link_id, tenant, dest_dir, dest_rel, package_suite,
+                  package_root, package_length, max_total_bytes, started_at, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    session.id,
+                    session.link_id,
+                    session.tenant,
+                    session.dest_dir.to_string_lossy(),
+                    session.dest_rel,
+                    i64::from(session.package.suite),
+                    hex::encode(session.package.root),
+                    i64::try_from(session.package.length).unwrap_or(i64::MAX),
+                    session
+                        .max_total_bytes
+                        .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+                    i64::try_from(session.started_at).unwrap_or(i64::MAX),
+                    i64::try_from(now_unix()).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM upload_session_files WHERE session_id = ?1",
+                [&session.id],
+            )
+            .map_err(|error| error.to_string())?;
+        for file in &session.files {
+            transaction
+                .execute(
+                    "INSERT INTO upload_session_files
+                     (session_id, entry, display_path, stored_components, object_suite,
+                      object_root, object_length, staging_path, journal_path, incarnation,
+                      prefix_bytes, published)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    rusqlite::params![
+                        session.id,
+                        i64::try_from(file.entry).unwrap_or(i64::MAX),
+                        file.display_path,
+                        serde_json::to_string(&file.stored_components).unwrap_or_default(),
+                        i64::from(file.object.suite),
+                        hex::encode(file.object.root),
+                        i64::try_from(file.object.length).unwrap_or(i64::MAX),
+                        file.staging_path.to_string_lossy(),
+                        file.journal_path.to_string_lossy(),
+                        hex::encode(file.incarnation),
+                        i64::try_from(file.prefix_bytes).unwrap_or(i64::MAX),
+                        i64::from(file.published),
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    /// Updates one file's covered prefix and published flag, the periodic
+    /// checkpoint from the worker. Under-claiming is always safe: the sender
+    /// re-sends from the reported prefix on resume.
+    pub fn update_upload_file_progress(
+        &self,
+        session_id: &str,
+        entry: usize,
+        prefix_bytes: u64,
+        published: bool,
+    ) -> Result<(), String> {
+        self.with(|connection| {
+            connection
+                .prepare_cached(
+                    "UPDATE upload_session_files
+                     SET prefix_bytes = ?3, published = ?4
+                     WHERE session_id = ?1 AND entry = ?2",
+                )?
+                .execute(rusqlite::params![
+                    session_id,
+                    i64::try_from(entry).unwrap_or(i64::MAX),
+                    i64::try_from(prefix_bytes).unwrap_or(i64::MAX),
+                    i64::from(published),
+                ])
+                .map(|_| ())
+        })
+    }
+
+    /// Every persisted session with its files, for boot re-attach.
+    pub fn load_upload_sessions(&self) -> Result<Vec<PersistedUploadSession>, String> {
+        self.with(|connection| {
+            let mut sessions = Vec::new();
+            let mut statement = connection.prepare(
+                "SELECT id, link_id, tenant, dest_dir, dest_rel, package_suite,
+                        package_root, package_length, max_total_bytes, started_at
+                 FROM upload_sessions ORDER BY created_at",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(PersistedUploadSession {
+                    id: row.get(0)?,
+                    link_id: row.get(1)?,
+                    tenant: row.get(2)?,
+                    dest_dir: PathBuf::from(row.get::<_, String>(3)?),
+                    dest_rel: row.get(4)?,
+                    package: object_from_row(row.get(5)?, &row.get::<_, String>(6)?, row.get(7)?)?,
+                    max_total_bytes: row
+                        .get::<_, Option<i64>>(8)?
+                        .map(|value| value.max(0) as u64),
+                    started_at: row.get::<_, i64>(9)?.max(0) as u64,
+                    files: Vec::new(),
+                })
+            })?;
+            for session in rows {
+                sessions.push(session?);
+            }
+            let mut file_statement = connection.prepare(
+                "SELECT entry, display_path, stored_components, object_suite, object_root,
+                        object_length, staging_path, journal_path, incarnation,
+                        prefix_bytes, published
+                 FROM upload_session_files WHERE session_id = ?1 ORDER BY entry",
+            )?;
+            for session in &mut sessions {
+                let files = file_statement.query_map([&session.id], |row| {
+                    let components: Vec<String> =
+                        serde_json::from_str(&row.get::<_, String>(2)?).unwrap_or_default();
+                    let incarnation_hex: String = row.get(8)?;
+                    let incarnation: [u8; 16] = hex::decode(&incarnation_hex)
+                        .ok()
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .ok_or_else(|| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                8,
+                                rusqlite::types::Type::Text,
+                                "incarnation is not 16 bytes".into(),
+                            )
+                        })?;
+                    Ok(PersistedUploadFile {
+                        entry: row.get::<_, i64>(0)?.max(0) as usize,
+                        display_path: row.get(1)?,
+                        stored_components: components,
+                        object: object_from_row(
+                            row.get(3)?,
+                            &row.get::<_, String>(4)?,
+                            row.get(5)?,
+                        )?,
+                        staging_path: PathBuf::from(row.get::<_, String>(6)?),
+                        journal_path: PathBuf::from(row.get::<_, String>(7)?),
+                        incarnation,
+                        prefix_bytes: row.get::<_, i64>(9)?.max(0) as u64,
+                        published: row.get::<_, i64>(10)? != 0,
+                    })
+                })?;
+                for file in files {
+                    session.files.push(file?);
+                }
+            }
+            Ok(sessions)
+        })
+    }
+
+    /// Removes a session and its files, on completion, abort, or a refused
+    /// re-attach.
+    pub fn delete_upload_session(&self, session_id: &str) -> Result<(), String> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM upload_session_files WHERE session_id = ?1",
+                [session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute("DELETE FROM upload_sessions WHERE id = ?1", [session_id])
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     // ----------------------------------------------------------- principals
@@ -3620,6 +3874,25 @@ fn overlay_bool(rows: &HashMap<String, String>, key: &str, env: bool) -> (bool, 
     }
 }
 
+/// Rebuilds an ObjectId from its stored suite, hex root, and length.
+fn object_from_row(suite: i64, root_hex: &str, length: i64) -> rusqlite::Result<ObjectId> {
+    let root: [u8; 32] = hex::decode(root_hex)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                "object root is not 32 bytes".into(),
+            )
+        })?;
+    Ok(ObjectId {
+        suite: u16::try_from(suite).unwrap_or(0),
+        root,
+        length: length.max(0) as u64,
+    })
+}
+
 pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3749,7 +4022,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(schema, "17");
+        assert_eq!(schema, "18");
         assert!(store
             .with(|connection| {
                 connection.query_row(
@@ -6295,9 +6568,9 @@ mod settings_tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         drop(store);
-        assert_eq!(schema_version(directory.path()), "17");
+        assert_eq!(schema_version(directory.path()), "18");
         Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "17");
+        assert_eq!(schema_version(directory.path()), "18");
     }
 
     #[test]
@@ -6374,6 +6647,73 @@ mod settings_tests {
     }
 
     #[test]
+    fn upload_sessions_round_trip_and_v17_gains_the_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        // Simulate a v17 database that predates the resume tables.
+        store
+            .with(|connection| {
+                connection.execute_batch(
+                    "DROP TABLE upload_sessions;
+                     DROP TABLE upload_session_files;
+                     UPDATE meta SET value = '17' WHERE key = 'schema_version';",
+                )
+            })
+            .unwrap();
+        drop(store);
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(schema_version(directory.path()), "18");
+        assert!(store.load_upload_sessions().unwrap().is_empty());
+
+        let session = PersistedUploadSession {
+            id: "abcd1234".to_owned(),
+            link_id: "link-1".to_owned(),
+            tenant: String::new(),
+            dest_dir: PathBuf::from("/received/link-1"),
+            dest_rel: String::new(),
+            package: ObjectId {
+                suite: 1,
+                root: [7u8; 32],
+                length: 100,
+            },
+            max_total_bytes: Some(1000),
+            started_at: 42,
+            files: vec![PersistedUploadFile {
+                entry: 0,
+                display_path: "a.bin".to_owned(),
+                stored_components: vec!["a.bin".to_owned()],
+                object: ObjectId {
+                    suite: 1,
+                    root: [9u8; 32],
+                    length: 100,
+                },
+                staging_path: PathBuf::from("/received/link-1/.vot-1-0-2.stage"),
+                journal_path: PathBuf::from("/received/link-1/.vot-1-0-2.journal"),
+                incarnation: [3u8; 16],
+                prefix_bytes: 0,
+                published: false,
+            }],
+        };
+        store.insert_upload_session(&session).unwrap();
+        store
+            .update_upload_file_progress(&session.id, 0, 64 * 1024, false)
+            .unwrap();
+
+        let loaded = store.load_upload_sessions().unwrap();
+        assert_eq!(loaded.len(), 1);
+        let mut expected = session.clone();
+        expected.files[0].prefix_bytes = 64 * 1024;
+        assert_eq!(loaded[0], expected);
+
+        // Re-inserting the same id replaces its file rows, no duplication.
+        store.insert_upload_session(&session).unwrap();
+        assert_eq!(store.load_upload_sessions().unwrap()[0].files.len(), 1);
+
+        store.delete_upload_session(&session.id).unwrap();
+        assert!(store.load_upload_sessions().unwrap().is_empty());
+    }
+
+    #[test]
     fn v16_database_gains_the_branding_table() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -6388,7 +6728,7 @@ mod settings_tests {
         drop(store);
 
         let reopened = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "17");
+        assert_eq!(schema_version(directory.path()), "18");
         assert!(reopened.branding("acme").unwrap().is_none());
         reopened
             .set_branding(&Branding {
@@ -6421,7 +6761,7 @@ mod settings_tests {
                 .unwrap();
         }
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "17");
+        assert_eq!(schema_version(directory.path()), "18");
         assert!(store.principals_page(50, 0, None).unwrap().0.is_empty());
         assert!(store.principal("nobody").unwrap().is_none());
     }
@@ -6443,7 +6783,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "17");
+        assert_eq!(schema_version(directory.path()), "18");
         assert!(!store.link("", "old-link").unwrap().unwrap().legal_hold);
     }
 
@@ -6485,7 +6825,7 @@ mod settings_tests {
         drop(store);
 
         let reopened = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "17");
+        assert_eq!(schema_version(directory.path()), "18");
         assert_eq!(reopened.tenant_received_bytes("").unwrap(), 9);
     }
 
@@ -6527,7 +6867,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "17");
+        assert_eq!(schema_version(directory.path()), "18");
         let grant = store
             .outbound_grant_by_token_hash("hash-g1")
             .unwrap()
@@ -6579,7 +6919,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "17");
+        assert_eq!(schema_version(directory.path()), "18");
         let grant = store
             .outbound_grant_by_token_hash("hash-g1")
             .unwrap()
@@ -6614,7 +6954,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "17");
+        assert_eq!(schema_version(directory.path()), "18");
         let columns: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('outbound_grants')
@@ -6646,7 +6986,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "17");
+        assert_eq!(schema_version(directory.path()), "18");
         let table_exists: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -6686,7 +7026,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "17");
+        assert_eq!(schema_version(directory.path()), "18");
         let default: Option<String> = connection
             .query_row(
                 "SELECT dflt_value FROM pragma_table_info('outbound_grants')
@@ -6742,7 +7082,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "17");
+        assert_eq!(schema_version(directory.path()), "18");
         let counts: Vec<(String, i64)> = {
             let mut statement = connection
                 .prepare("SELECT id, file_count FROM outbound_grants ORDER BY id")
