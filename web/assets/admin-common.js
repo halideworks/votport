@@ -130,6 +130,19 @@ export function button(text, classes, onClick) {
   return element;
 }
 
+/// Copies text and flips the button label to Copied for a moment.
+export async function copyToClipboard(element, text) {
+  await navigator.clipboard.writeText(text);
+  element.dataset.label ??= element.textContent;
+  element.textContent = 'Copied';
+  setTimeout(() => { element.textContent = element.dataset.label; }, 1500);
+}
+
+/// Sets a role=status line so screen readers hear the outcome of an action.
+export function announce(id, text) {
+  document.getElementById(id).textContent = text;
+}
+
 /// Fills the shared show-once outbound grant URL card on receive/deliver.
 export function showGrantResult(url, protectedGrant = false) {
   const output = document.getElementById('outbound-url');
@@ -139,10 +152,8 @@ export function showGrantResult(url, protectedGrant = false) {
   document.getElementById('outbound-note').textContent =
     `Shown once. Copy it now; this URL cannot be retrieved later.`
     + (protectedGrant ? ' This download is password-protected. Send the password by a separate channel.' : '');
-  document.getElementById('outbound-copy').onclick = async () => {
-    await navigator.clipboard.writeText(url);
-    document.getElementById('outbound-copy').textContent = 'Copied';
-  };
+  const copy = document.getElementById('outbound-copy');
+  copy.onclick = () => copyToClipboard(copy, url);
 }
 
 export function formatWhen(unixSeconds) {

@@ -4,9 +4,11 @@
 import { appendObjectCard } from '/assets/object-card.js';
 import {
   alertModal,
+  announce,
   api,
   button,
   confirmModal,
+  copyToClipboard,
   formatBytes,
   formatDuration,
   formatWhen,
@@ -71,6 +73,7 @@ function renderUpload(link, upload) {
           return;
         await api(`/api/admin/links/${link.id}/uploads/${upload.id}`, { method: 'DELETE' });
         await refreshLinks();
+        announce('links-action-status', 'Transfer record cleared.');
       }),
     );
   }
@@ -99,6 +102,7 @@ function renderUpload(link, upload) {
           throw error;
         }
         await refreshLinks();
+        announce('links-action-status', `Deleted ${existingFiles.length} stored file${existingFiles.length === 1 ? '' : 's'}.`);
       }),
     );
   }
@@ -136,6 +140,7 @@ function renderUpload(link, upload) {
             { method: 'DELETE' },
           );
           await refreshLinks();
+          announce('links-action-status', `Deleted "${file.stored_as}".`);
         }),
       );
     }
@@ -234,8 +239,9 @@ function renderLink(link) {
 
   const actions = document.createElement('div');
   actions.className = 'actions';
+  const copy = button('Copy', 'tiny', () => copyToClipboard(copy, link.url));
   actions.append(
-    button('Copy', 'tiny', () => navigator.clipboard.writeText(link.url)),
+    copy,
     button('QR', 'tiny ghost', async () => {
       qr.hidden = !qr.hidden;
       if (!qr.hidden && !qr.firstChild) {
@@ -251,6 +257,7 @@ function renderLink(link) {
         body: JSON.stringify({ active: !link.active }),
       });
       await refreshLinks();
+      announce('links-action-status', link.active ? 'Request deactivated.' : 'Request reactivated.');
     }),
     button(link.legal_hold ? 'Release hold' : 'Legal hold', 'tiny ghost', async () => {
       if (
@@ -267,6 +274,7 @@ function renderLink(link) {
         body: JSON.stringify({ legal_hold: !link.legal_hold }),
       });
       await refreshLinks();
+      announce('links-action-status', link.legal_hold ? 'Legal hold released.' : 'Legal hold set.');
     }),
   );
   if (!link.legal_hold) {
@@ -282,6 +290,7 @@ function renderLink(link) {
           return;
         await api(`/api/admin/links/${link.id}`, { method: 'DELETE' });
         await refreshLinks();
+        announce('links-action-status', `Request "${link.label}" deleted.`);
       }),
     );
   }
@@ -410,7 +419,7 @@ $('create-form').addEventListener('submit', async (event) => {
     $('new-link-note').textContent = link.has_password
       ? 'Send the access password by a separate channel.'
       : '';
-    $('new-link-copy').onclick = () => navigator.clipboard.writeText(link.url);
+    $('new-link-copy').onclick = () => copyToClipboard($('new-link-copy'), link.url);
     await refreshLinks();
   } catch (error) {
     $('create-error').textContent = error.message;

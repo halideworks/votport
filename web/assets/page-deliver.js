@@ -7,9 +7,11 @@ import {
 import { entryFiles, runUploadBatch } from '/assets/upload-entries.js';
 import {
   alertModal,
+  announce,
   api,
   button,
   confirmModal,
+  copyToClipboard,
   formatBytes,
   formatWhen,
   requireSession,
@@ -240,16 +242,23 @@ function renderGrants() {
             if (!response.url) throw new Error('server did not return a download URL');
             showGrantResult(response.url, grant.has_password);
             await refreshGrants();
+            announce('outbound-grants-status', 'Download address rotated.');
           }),
         );
       }
       actions.append(
         button('Extend 7 days', 'tiny', async () => {
-          await api(`/api/admin/outbound-grants/${grant.id}`, {
+          // Same base as the server: seven days past the later of now and the current expiry.
+          const base = Math.max(grant.expires_at, Math.floor(Date.now() / 1000));
+          const until = formatWhen(base + 7 * 86_400);
+          if (!(await confirmModal('Extend download', `Extend this download until ${until}?`, 'Extend')))
+            return;
+          const { expires_at } = await api(`/api/admin/outbound-grants/${grant.id}`, {
             method: 'PATCH',
             body: JSON.stringify({ extend_days: 7 }),
           });
           await refreshGrants();
+          announce('outbound-grants-status', `Download extended until ${formatWhen(expires_at)}.`);
         }),
         button('Revoke', 'tiny danger', async () => {
           if (
@@ -262,6 +271,7 @@ function renderGrants() {
             return;
           await api(`/api/admin/outbound-grants/${grant.id}`, { method: 'DELETE' });
           await refreshGrants();
+          announce('outbound-grants-status', 'Download revoked.');
         }),
       );
       card.append(actions);
@@ -721,11 +731,7 @@ $('automation-token-form').addEventListener('submit', async (event) => {
     $('automation-token-form').reset();
     $('automation-token-value').value = response.token;
     $('automation-token-result').hidden = false;
-    $('automation-token-copy').textContent = 'Copy token';
-    $('automation-token-copy').onclick = async () => {
-      await navigator.clipboard.writeText(response.token);
-      $('automation-token-copy').textContent = 'Copied';
-    };
+    $('automation-token-copy').onclick = () => copyToClipboard($('automation-token-copy'), response.token);
     await refreshAutomationTokens();
   } catch (requestError) {
     error.textContent = requestError.message;
