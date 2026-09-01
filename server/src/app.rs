@@ -47,6 +47,10 @@ pub struct App {
     pub config: Config,
     pub store: Arc<Store>,
     pub sessions: Sessions,
+    /// Content hash of the served sender assets, so a page loaded before a
+    /// deploy can tell it is stale and reload instead of failing on a changed
+    /// contract.
+    pub web_build: String,
     pub secret: [u8; 32],
     /// Counter for `admin_change_password`, which refuses when tripped.
     /// Reaching that endpoint needs a valid session, so a global bound there
@@ -572,10 +576,12 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         .push_bind
         .map(|address| build_push_state(&config, address))
         .transpose()?;
+    let web_build = web_build(&config.web_root);
     Ok(Arc::new(App {
         store,
         sessions,
         secret,
+        web_build,
         change_password_throttle: LoginThrottle::new(),
         login_throttle: crate::auth::IpThrottle::new(),
         login_permits: Arc::new(tokio::sync::Semaphore::new(VERIFY_PERMITS)),
@@ -724,6 +730,41 @@ fn resume_upload_session(
         )
         .map_err(|error| format!("register session: {error:?}"))?;
     Ok(kept)
+}
+
+/// First 16 hex of the SHA-256 over every .js and .wasm file under
+/// assets/ and assets/vendor/ (sorted by path), or "unknown" when the web
+/// root is missing (tests without one). Computed once at startup: with a
+/// web root served from disk, an edit without a restart keeps the old hash.
+fn web_build(web_root: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let assets = web_root.join("assets");
+    let mut paths = Vec::new();
+    for dir in [assets.clone(), assets.join("vendor")] {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ext = path.extension().and_then(|ext| ext.to_str());
+            if path.is_file() && matches!(ext, Some("js" | "wasm")) {
+                paths.push(path);
+            }
+        }
+    }
+    if paths.is_empty() {
+        return "unknown".to_owned();
+    }
+    paths.sort();
+    let mut hasher = Sha256::new();
+    for path in paths {
+        // Relative to the web root so the same assets hash the same under
+        // any install path.
+        let name = path.strip_prefix(web_root).unwrap_or(&path);
+        hasher.update(name.to_string_lossy().as_bytes());
+        hasher.update(std::fs::read(&path).unwrap_or_default());
+    }
+    hex::encode(hasher.finalize())[..16].to_owned()
 }
 
 /// Remove only VOTPORT-owned outbound staging entries. `symlink_metadata` and
