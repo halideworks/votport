@@ -226,6 +226,10 @@ struct FileState {
     native: Option<NativeFile>,
     published: bool,
     receipt: bool,
+    /// Re-attached after a restart: the staged bytes are re-hashed against
+    /// the announced object before publish, since the resumed coverage is
+    /// trusted bookkeeping rather than verified ranges.
+    rehash: bool,
 }
 
 // One Phase exists per session; the variant size gap is irrelevant here.
@@ -582,6 +586,7 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
                 native: None,
                 published: true,
                 receipt: existing.receipt,
+                rehash: false,
             });
             continue;
         }
@@ -726,6 +731,8 @@ fn forget_session(setup: &WorkerSetup) {
 /// Re-attaches a persisted session after a restart: reopens each unpublished
 /// file's staging from its checkpointed prefix, publishes any file that
 /// prefix already completes, and starts the worker in the receiving phase.
+/// The staging is reopened under the profile it was created with; the
+/// integrity of the resumed bytes is established by the rehash at publish.
 /// Returns the staging and journal paths now owned by the worker. On any
 /// failure nothing runs and the dropped handles remove their staging.
 pub fn resume_worker(
@@ -741,8 +748,8 @@ pub fn resume_worker(
         } else {
             let destination = paths::join_under(&setup.dest_dir, &file.stored_components)?;
             // Only the contiguous prefix is trusted, and only as bookkeeping:
-            // Strict re-hashes the whole staged object at publish, so a
-            // prefix the disk does not actually hold cannot publish.
+            // publish re-hashes the whole staged object (FileState::rehash),
+            // so a prefix the disk does not actually hold cannot publish.
             let runs = (file.prefix_bytes > 0).then_some((0, file.prefix_bytes));
             let native = NativeFile::resume(
                 &file.object,
@@ -750,7 +757,7 @@ pub fn resume_worker(
                 file.staging_path.clone(),
                 file.journal_path.clone(),
                 file.incarnation,
-                CommitProfile::Strict,
+                CommitProfile::Balanced,
                 runs,
             )
             .map_err(|error| format!("{}: {error}", file.display_path))?;
@@ -765,6 +772,7 @@ pub fn resume_worker(
             native,
             published: file.published,
             receipt: file.receipt,
+            rehash: !file.published,
         });
     }
     // A prefix that already covers the object publishes now, as begin does
@@ -905,6 +913,7 @@ fn open_destination_for(
                     native: Some(native),
                     published: false,
                     receipt: false,
+                    rehash: false,
                 });
             }
             Err(error) if error.kind() == vot_sdk_file::ErrorKind::AlreadyExists => {}
@@ -1203,6 +1212,14 @@ fn publish_file_locked(
         .native
         .as_mut()
         .ok_or_else(|| SessionError::internal("file state lost"))?;
+    if file.rehash {
+        staged_object_matches(native.staging_path(), &file.object).map_err(|error| {
+            SessionError::bad(format!(
+                "publish {} refused after resume: {error}; retry the upload",
+                file.display_path
+            ))
+        })?;
+    }
     native.publish().map_err(|error| {
         SessionError::conflict(format!(
             "publish {} failed: {error}; the name may have been taken mid-upload, retry the upload",
@@ -1234,6 +1251,35 @@ fn publish_file_locked(
         destination,
         receipt,
     })
+}
+
+/// Hashes a fully covered staging file and checks it is the announced object.
+/// Runs on a re-attached file before publish: the resumed prefix was
+/// bookkeeping, and this is what makes the published bytes verified.
+fn staged_object_matches(path: &std::path::Path, object: &ObjectId) -> Result<(), String> {
+    let suite = Suite::try_from(object.suite).map_err(|_| "unsupported suite".to_owned())?;
+    let mut input = fs::File::open(path).map_err(|error| format!("open staging: {error}"))?;
+    let mut builder = InMemoryObjectBuilder::new(suite, Some(object.length), object.length)
+        .map_err(|error| format!("object builder: {:?}", error.code()))?;
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let count = input
+            .read(&mut buf)
+            .map_err(|error| format!("read staging: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        builder
+            .update(&buf[..count])
+            .map_err(|error| format!("hash staging: {:?}", error.code()))?;
+    }
+    let prepared = builder
+        .finish()
+        .map_err(|error| format!("hash staging: {:?}", error.code()))?;
+    if prepared.object_id() != object {
+        return Err("staged bytes do not match the announced object".to_owned());
+    }
+    Ok(())
 }
 
 fn handle_finish(
@@ -1426,6 +1472,7 @@ impl PushReceive {
                 native: None,
                 published: true,
                 receipt: existing.receipt,
+                rehash: false,
             });
             let index = inner.entries.len();
             inner.entries.push(PushEntry {
@@ -3351,6 +3398,7 @@ mod parallel_accept_tests {
             native: Some(native),
             published: false,
             receipt: false,
+            rehash: false,
         }];
         let results: Vec<AcceptCore> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..2)

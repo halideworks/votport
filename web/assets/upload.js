@@ -796,6 +796,10 @@ async function runUpload() {
             sentForNote = sent;
             stalledRounds = 0;
             fileSent += step;
+            // Keep the reconciliation baseline current, so a later begin
+            // corrects `sent` by the difference rather than re-adding the
+            // server's prefix on top of what was already counted.
+            counted.set(entry.index, fileSent);
             setMeter(totalBytes ? sent / totalBytes : 1);
             lastSendBps = sendRate(step);
             lastSendAt = performance.now();

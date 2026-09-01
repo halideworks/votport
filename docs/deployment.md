@@ -511,11 +511,12 @@ browser pauses while the server is down, then re-begins on its own). Ranges
 that had landed beyond the contiguous prefix are re-sent, at most the sender's
 in-flight window. A partial that cannot be re-attached (a link deleted while
 down, staging missing or shorter than its checkpoint, or the process killed
-before the checkpoint) is dropped at boot and that file starts over; files
-already published from a multi-file session survive and dedupe on re-send. A
-re-attached file is published under VOT's Strict profile, which re-hashes the
-staged bytes before they become the destination, so a partial altered while
-the server was down cannot publish. Long streaming downloads die with the
+before the checkpoint) is dropped at boot and that file starts over. A file a
+dropped multi-file session had already published stays on disk without an
+upload record, and the re-send lands beside it under a suffixed name. Before a
+re-attached file is published, the staged bytes are re-hashed against the
+announced object, so a partial altered while the server was down cannot
+publish. Long streaming downloads die with the
 process. The compose file sets `stop_grace_period: 5m` so in-flight downloads
 get a window to finish.
 

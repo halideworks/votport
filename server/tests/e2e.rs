@@ -2400,6 +2400,17 @@ async fn post_chunk(
     file: &ClientFile,
     offset: u64,
 ) -> (u16, Value) {
+    post_chunk_entry(client, base, session, 0, file, offset).await
+}
+
+async fn post_chunk_entry(
+    client: &reqwest::Client,
+    base: &str,
+    session: &str,
+    entry: u64,
+    file: &ClientFile,
+    offset: u64,
+) -> (u16, Value) {
     let length = file.bytes.len() as u64;
     let proof = file
         .prepared
@@ -2412,7 +2423,7 @@ async fn post_chunk(
     body.extend_from_slice(&file.bytes[start..end]);
     let response = client
         .post(format!(
-            "{base}/api/session/{session}/chunk?entry=0&offset={start}"
+            "{base}/api/session/{session}/chunk?entry={entry}&offset={start}"
         ))
         .header("X-Votport-Proof", proof_len.to_string())
         .body(body)
@@ -2524,8 +2535,8 @@ async fn upload_session_survives_a_restart() {
 }
 
 /// Staging corrupted while the process was down cannot publish: the resume
-/// trusts the checkpointed prefix only as bookkeeping, and Strict re-hashes
-/// the object at publish.
+/// trusts the checkpointed prefix only as bookkeeping, and publish re-hashes
+/// the staged object first.
 #[tokio::test(flavor = "multi_thread")]
 async fn restart_refuses_corrupted_staging() {
     let server = start_server().await;
@@ -2560,7 +2571,7 @@ async fn restart_refuses_corrupted_staging() {
         200
     );
     // The last range completes coverage and triggers publish, which the
-    // Strict read-back refuses.
+    // rehash refuses.
     let (status, body) = post_chunk(&client, &base, &session, file, 2 * CHUNK).await;
     assert_ne!(status, 200, "{body}");
     assert!(
@@ -2574,6 +2585,64 @@ async fn restart_refuses_corrupted_staging() {
         .await
         .unwrap();
     assert_ne!(finish.status(), 200);
+}
+
+/// A two-file session where the first file published before the restart:
+/// the re-attach skips it, the second file resumes from its prefix, and the
+/// finished upload records both files with receipts.
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_file_session_survives_a_restart_after_one_file_published() {
+    let server = start_server().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let small: Vec<u8> = (0..3 * 1024 * 1024)
+        .map(|index| (index % 239) as u8)
+        .collect();
+    let files = [prepare(vec!["first.bin"], small), twenty_mib()];
+    let (token, session) = open_session(&client, &server.base, "multi", &files).await;
+    let base = server.base.clone();
+    assert_eq!(begin(&client, &base, &session).await.0, 200);
+    // Entry 0 completes and publishes; entry 1 gets its first range only.
+    upload_chunks(&client, &base, &session, 0, &files[0]).await;
+    let receive_dir = server.receive_dir.clone();
+    assert!(receive_dir.join("first.bin").is_file());
+    let (status, progress) = post_chunk_entry(&client, &base, &session, 1, &files[1], 0).await;
+    assert_eq!(status, 200, "{progress}");
+
+    let server = server.restart().await;
+    let base = server.base.clone();
+    let (status, body) = begin(&client, &base, &session).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["entries"][0]["complete"], true);
+    assert_eq!(body["entries"][1]["complete"], false);
+    assert_eq!(body["entries"][1]["covered_bytes"], CHUNK);
+    for offset in [CHUNK, 2 * CHUNK] {
+        let (status, progress) =
+            post_chunk_entry(&client, &base, &session, 1, &files[1], offset).await;
+        assert_eq!(status, 200, "{progress}");
+    }
+    let finish = client
+        .post(format!("{base}/api/session/{session}/finish"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(finish.status(), 200, "{}", finish.text().await.unwrap());
+    assert_eq!(
+        std::fs::read(receive_dir.join("resume.bin")).unwrap(),
+        files[1].bytes
+    );
+    let uploads = server
+        .application
+        .store
+        .uploads_by_id(&token)
+        .unwrap()
+        .unwrap();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].files.len(), 2);
+    assert!(uploads[0].files.iter().all(|file| file.receipt));
+    assert!(staging_files(&receive_dir).is_empty());
 }
 
 /// A staging file shorter than its checkpointed prefix (power loss before
