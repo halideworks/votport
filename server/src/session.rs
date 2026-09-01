@@ -11,7 +11,7 @@ use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use serde::Serialize;
@@ -260,7 +260,17 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
                 let _ = $reply.send(result);
             }};
         }
-        while let Some(cmd) = receiver.blocking_recv() {
+        // A non-chunk command drained while batching chunks waits here for
+        // the next iteration instead of going back on the channel.
+        let mut pending: Option<Cmd> = None;
+        loop {
+            let cmd = match pending.take() {
+                Some(cmd) => cmd,
+                None => match receiver.blocking_recv() {
+                    Some(cmd) => cmd,
+                    None => break,
+                },
+            };
             last_seen = now_unix();
             match cmd {
                 Cmd::Seal {
@@ -305,14 +315,53 @@ pub fn spawn_worker(setup: WorkerSetup, mut receiver: mpsc::Receiver<Cmd>) {
                     reply,
                     _lease,
                 } => {
-                    let result = handle_chunk(&setup, &mut phase, entry, offset, &proof, &data);
-                    match &result {
-                        Ok(progress) if progress.replay => replays += 1,
-                        Ok(progress) if progress.accepted => received += data.len() as u64,
-                        Ok(_) => {}
-                        Err(_) => rejected += 1,
+                    // Drain the rest of the in-flight window so the batch
+                    // verifies and writes in parallel. The first non-chunk
+                    // command ends the batch and runs on the next iteration.
+                    let mut batch = vec![BatchChunk {
+                        entry,
+                        offset,
+                        proof,
+                        data,
+                        reply,
+                        _lease,
+                    }];
+                    while batch.len() < MAX_CHUNK_BATCH {
+                        match receiver.try_recv() {
+                            Ok(Cmd::Chunk {
+                                entry,
+                                offset,
+                                proof,
+                                data,
+                                reply,
+                                _lease,
+                            }) => batch.push(BatchChunk {
+                                entry,
+                                offset,
+                                proof,
+                                data,
+                                reply,
+                                _lease,
+                            }),
+                            Ok(other) => {
+                                pending = Some(other);
+                                break;
+                            }
+                            Err(_) => break,
+                        }
                     }
-                    send_noted!(reply, result);
+                    let outcomes = accept_batch(&setup, &mut phase, &batch);
+                    for (item, outcome) in batch.into_iter().zip(outcomes) {
+                        match &outcome {
+                            Ok(progress) if progress.replay => replays += 1,
+                            Ok(progress) if progress.accepted => {
+                                received += item.data.len() as u64;
+                            }
+                            Ok(_) => {}
+                            Err(_) => rejected += 1,
+                        }
+                        send_noted!(item.reply, outcome);
+                    }
                 }
                 Cmd::Finish { reply, _lease } => {
                     send_noted!(reply, handle_finish(&setup, &mut phase, replays, rejected));
@@ -624,25 +673,53 @@ fn open_destination_for(
     )))
 }
 
-fn handle_chunk(
-    setup: &WorkerSetup,
-    phase: &mut Phase,
+/// One buffered chunk command waiting to be verified and accepted.
+struct BatchChunk {
+    entry: usize,
+    offset: u64,
+    proof: Bytes,
+    data: Bytes,
+    reply: Reply<ChunkProgress>,
+    _lease: SessionLease,
+}
+
+/// The most in-flight chunks the sender keeps (upload.js UPLOADS_IN_FLIGHT),
+/// so a full window verifies and writes at once instead of one at a time.
+const MAX_CHUNK_BATCH: usize = 8;
+
+/// A range's accept result before publication; publication needs `&mut files`
+/// so it happens in the sequential post-pass, not the parallel accept.
+struct AcceptCore {
+    accepted: bool,
+    replay: bool,
+    covered_bytes: u64,
+    total_bytes: u64,
+    complete: bool,
+}
+
+/// Longest a duplicate range waits for the in-flight winner to commit its
+/// one bounded write. A retry after the winner commits classifies as a
+/// replay, which is VOT's documented semantics for a covered range.
+const RANGE_IN_FLIGHT_BUDGET: Duration = Duration::from_secs(2);
+
+/// Verifies and accepts one range against a shared file. Takes `&FileState`
+/// so a batch of ranges runs from as many threads as chunks (accept is
+/// `&self` since ADR-0046). A duplicate range still in flight elsewhere is
+/// retried, never surfaced: the sender's retry logic aborts the whole file
+/// on any non-transient error.
+fn accept_range(
+    files: &[FileState],
     entry: usize,
     offset: u64,
     proof: &[u8],
     data: &[u8],
-) -> Result<ChunkProgress, SessionError> {
-    let Phase::Receiving { files } = phase else {
-        return Err(SessionError::conflict(
-            "chunks are only accepted after begin",
-        ));
-    };
+) -> Result<AcceptCore, SessionError> {
     let file = files
-        .get_mut(entry)
+        .get(entry)
         .ok_or_else(|| SessionError::bad(format!("no entry {entry}")))?;
     if file.published {
         // The file already verified completely; treat retries as replays.
-        return Ok(ChunkProgress {
+        return Ok(AcceptCore {
             accepted: false,
             replay: true,
             covered_bytes: file.object.length,
@@ -658,22 +735,86 @@ fn handle_chunk(
     })?;
     let native = file
         .native
-        .as_mut()
+        .as_ref()
         .ok_or_else(|| SessionError::internal("file state lost"))?;
-    let acceptance = native
-        .accept(&verified)
-        .map_err(|error| SessionError::internal(format!("write failed: {error}")))?;
-    let complete = acceptance.progress.covered_bytes == acceptance.progress.total_bytes;
-    if complete {
-        publish_file(setup, file)?;
-    }
-    Ok(ChunkProgress {
+    let deadline = Instant::now() + RANGE_IN_FLIGHT_BUDGET;
+    let acceptance = loop {
+        match native.accept(&verified) {
+            Ok(acceptance) => break acceptance,
+            Err(error) if error.kind() == vot_sdk_file::ErrorKind::RangeInFlight => {
+                if Instant::now() >= deadline {
+                    return Err(SessionError::internal("range stayed in flight too long"));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => {
+                return Err(SessionError::internal(format!("write failed: {error}")));
+            }
+        }
+    };
+    Ok(AcceptCore {
         accepted: matches!(acceptance.status, RangeStatus::Accepted),
         replay: matches!(acceptance.status, RangeStatus::Replay),
         covered_bytes: acceptance.progress.covered_bytes,
         total_bytes: acceptance.progress.total_bytes,
-        complete,
+        complete: acceptance.progress.covered_bytes == acceptance.progress.total_bytes,
     })
+}
+
+/// Verifies and accepts a batch of chunks in parallel, then publishes any
+/// files a chunk completed. Parallelism is per batch; a shared thread pool
+/// would only matter if scoped-thread churn ever measures.
+// ponytail: scoped threads per batch; add a pool only if churn measures.
+fn accept_batch(
+    setup: &WorkerSetup,
+    phase: &mut Phase,
+    batch: &[BatchChunk],
+) -> Vec<Result<ChunkProgress, SessionError>> {
+    let Phase::Receiving { files } = phase else {
+        return batch
+            .iter()
+            .map(|_| {
+                Err(SessionError::conflict(
+                    "chunks are only accepted after begin",
+                ))
+            })
+            .collect();
+    };
+    // Verify and accept every range against the shared files. Disjoint
+    // ranges of one file, and ranges of different files, all proceed at once.
+    let cores: Vec<Result<AcceptCore, SessionError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = batch
+            .iter()
+            .map(|item| {
+                let files = &*files;
+                scope.spawn(move || {
+                    accept_range(files, item.entry, item.offset, &item.proof, &item.data)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("accept thread panicked"))
+            .collect()
+    });
+    // Publish each completed file once, in order, with exclusive access.
+    batch
+        .iter()
+        .zip(cores)
+        .map(|(item, core)| {
+            let core = core?;
+            if core.complete && !files[item.entry].published {
+                publish_file(setup, &mut files[item.entry])?;
+            }
+            Ok(ChunkProgress {
+                accepted: core.accepted,
+                replay: core.replay,
+                covered_bytes: core.covered_bytes,
+                total_bytes: core.total_bytes,
+                complete: core.complete,
+            })
+        })
+        .collect()
 }
 
 struct Publication {
@@ -2887,5 +3028,74 @@ mod push_tests {
         .is_err());
         assert!(!setup.dest_dir.join("first").exists());
         assert!(!setup.dest_dir.join("second").exists());
+    }
+}
+
+#[cfg(test)]
+mod parallel_accept_tests {
+    use super::*;
+    use vot_sdk::object::{InMemoryObjectBuilder, Suite};
+
+    fn object(data: &[u8]) -> ObjectId {
+        let mut builder = InMemoryObjectBuilder::new(
+            Suite::Blake3Bao64,
+            Some(data.len() as u64),
+            data.len() as u64,
+        )
+        .unwrap();
+        builder.update(data).unwrap();
+        builder.finish().unwrap().object_id().clone()
+    }
+
+    // Two threads accept the same range against one shared file, the shape
+    // accept_batch runs internally. The in-flight duplicate must be absorbed
+    // and replayed, never surfaced as an error: exactly one Accepted and one
+    // Replay. This kills a mutant that drops the RangeInFlight retry (the
+    // loser would error) or misclassifies the replay.
+    #[test]
+    fn concurrent_duplicate_range_accepts_once_and_replays_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = vec![0x5a_u8; 64 * 1024];
+        let object = object(&data);
+        let proof = vot_proof_blake3::prove(&data, 0, data.len() as u64).unwrap();
+        let native = NativeFile::create(
+            &object,
+            directory.path().join("obj"),
+            CommitProfile::Balanced,
+        )
+        .unwrap();
+        let files = vec![FileState {
+            display_path: "obj".to_owned(),
+            stored_components: vec!["obj".to_owned()],
+            object,
+            native: Some(native),
+            published: false,
+            receipt: false,
+        }];
+        let results: Vec<AcceptCore> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let files = &files;
+                    let proof = &proof;
+                    scope.spawn(move || {
+                        accept_range(files, 0, proof.covered_offset, &proof.proof, &proof.data)
+                            .unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(
+            results.iter().filter(|core| core.accepted).count(),
+            1,
+            "exactly one range is accepted"
+        );
+        assert_eq!(
+            results.iter().filter(|core| core.replay).count(),
+            1,
+            "the in-flight duplicate replays after the winner commits"
+        );
+        // A full-object range completes the file for both callers.
+        assert!(results.iter().all(|core| core.complete));
     }
 }

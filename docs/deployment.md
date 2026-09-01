@@ -458,8 +458,12 @@ Explicit file, upload-record, link, and tenant deletion remain available.
 
 Range size is 8 MiB, set by VOT, advertised as `chunk_bytes` on session
 create. The sender keeps eight range PUTs in flight. The upload worker
-verifies those ranges one at a time. That serial verify, not SQLite, is
-what leaves the NIC idle on a fast path.
+drains the in-flight window as one batch and verifies and writes those
+ranges in parallel (VOT's `accept` takes shared access since ADR-0046),
+so a single fast upload is no longer bottlenecked on one-at-a-time verify.
+Measured single-stream upload rose about a quarter (256 MiB baseline,
+1258 to 1580 MiB/s median on the same rig). The native-push receive path
+still verifies serially and is the next candidate.
 
 Do not raise `CHUNK_BYTES` in votport until VOT changes its server verify
 path to support larger ranges; the `aba35a0` pin does not. Any VOT re-pin
