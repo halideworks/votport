@@ -407,12 +407,16 @@ fn spawn_worker_from(
                 }
                 Cmd::Finish { reply, _lease } => {
                     let report = handle_finish(&setup, &mut phase, replays, rejected);
-                    // A finished (or terminally failed) session has nothing
-                    // left to re-attach; drop its resume record.
-                    forget_session(&setup);
+                    // A finished session has nothing left to re-attach; a
+                    // finish refused as early keeps receiving, and its resume
+                    // record with it.
+                    if matches!(phase, Phase::Done) {
+                        forget_session(&setup);
+                    }
                     send_noted!(reply, report);
                 }
                 Cmd::Abort { reply, _lease } => {
+                    commit_partial(&setup, &phase, replays, rejected);
                     record_event(
                         &setup,
                         received,
@@ -454,6 +458,7 @@ fn spawn_worker_from(
             forget_session(&setup);
         }
         if !matches!(phase, Phase::Done) && !suspended {
+            commit_partial(&setup, &phase, replays, rejected);
             record_event(
                 &setup,
                 received,
@@ -735,10 +740,12 @@ fn forget_session(setup: &WorkerSetup) {
 /// integrity of the resumed bytes is established by the rehash at publish.
 /// Returns the staging and journal paths now owned by the worker. On any
 /// failure nothing runs and the dropped handles remove their staging.
+/// `persisted` is updated with any file published here, so a caller that
+/// refuses the resume after a later failure still records those files.
 pub fn resume_worker(
     setup: WorkerSetup,
     receiver: mpsc::Receiver<Cmd>,
-    persisted: &PersistedUploadSession,
+    persisted: &mut PersistedUploadSession,
 ) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::with_capacity(persisted.files.len());
     let mut kept = Vec::new();
@@ -780,13 +787,15 @@ pub fn resume_worker(
     }
     // A prefix that already covers the object publishes now, as begin does
     // for empty objects; the sender only has finish left to call.
-    for file in &mut files {
+    for (file, record) in files.iter_mut().zip(persisted.files.iter_mut()) {
         let complete = file.native.as_ref().is_some_and(|native| {
             let progress = native.progress();
             progress.covered_bytes == progress.total_bytes
         });
         if complete {
             publish_file(&setup, file).map_err(|error| error.message)?;
+            record.published = true;
+            record.receipt = file.receipt;
         }
     }
     spawn_worker_from(setup, receiver, Phase::Receiving { files }, true);
@@ -1315,6 +1324,69 @@ fn handle_finish(
     Ok(report)
 }
 
+/// A session that ends without finishing still leaves its published files
+/// on disk. Record them as a partial upload so retention, dedupe, and the
+/// operator listing see them; without a record they would be orphans.
+fn commit_partial(setup: &WorkerSetup, phase: &Phase, replays: u64, rejected: u64) {
+    let Phase::Receiving { files } = phase else {
+        return;
+    };
+    let records = file_records(setup, files.iter().filter(|file| file.published));
+    if records.is_empty() {
+        return;
+    }
+    let count = records.len();
+    match commit_upload_records(setup, records, replays, rejected, Some("http"), true) {
+        Ok(_) => tracing::info!(
+            target: "audit", event = "upload_partial_recorded", link = %setup.link_id,
+            files = count, "recorded the published files of an unfinished session"
+        ),
+        Err(error) => {
+            tracing::warn!(link = %setup.link_id, error = %error.message, "partial upload record failed")
+        }
+    }
+}
+
+/// Same as [`commit_partial`] for a persisted session the boot resume
+/// refused: its rows still say which files were published.
+pub fn commit_persisted_partial(
+    store: &Arc<Store>,
+    session: &crate::store::PersistedUploadSession,
+) {
+    let records: Vec<FileRecord> = session
+        .files
+        .iter()
+        .filter(|file| file.published)
+        .map(|file| FileRecord {
+            path: file.display_path.clone(),
+            stored_as: stored_rel(&session.dest_rel, &file.stored_components),
+            bytes: file.object.length,
+            suite: suite_name(file.object.suite),
+            root: hex::encode(file.object.root),
+            receipt: file.receipt,
+            deleted: false,
+        })
+        .collect();
+    if records.is_empty() {
+        return;
+    }
+    let upload = UploadRecord {
+        id: crate::auth::random_token(),
+        started_at: session.started_at,
+        completed_at: now_unix(),
+        replayed_chunks: 0,
+        rejected_chunks: 0,
+        transport: Some("http".to_owned()),
+        package_root: hex::encode(session.package.root),
+        total_bytes: records.iter().map(|record| record.bytes).sum(),
+        files: records,
+        partial: true,
+    };
+    if let Err(error) = store.append_upload(&session.tenant, &session.link_id, upload) {
+        tracing::warn!(link = %session.link_id, %error, "partial upload record failed at boot");
+    }
+}
+
 fn commit_upload(
     setup: &WorkerSetup,
     files: &[FileState],
@@ -1324,10 +1396,11 @@ fn commit_upload(
 ) -> Result<FinishReport, SessionError> {
     commit_upload_records(
         setup,
-        file_records(setup, files),
+        file_records(setup, files.iter()),
         replays,
         rejected,
         transport,
+        false,
     )
 }
 
@@ -1337,8 +1410,10 @@ fn commit_upload_records(
     replays: u64,
     rejected: u64,
     transport: Option<&str>,
+    partial: bool,
 ) -> Result<FinishReport, SessionError> {
     let upload = UploadRecord {
+        partial,
         id: crate::auth::random_token(),
         started_at: setup.started_at,
         completed_at: now_unix(),
@@ -1363,9 +1438,11 @@ fn commit_upload_records(
     })
 }
 
-fn file_records(setup: &WorkerSetup, files: &[FileState]) -> Vec<FileRecord> {
+fn file_records<'a>(
+    setup: &WorkerSetup,
+    files: impl Iterator<Item = &'a FileState>,
+) -> Vec<FileRecord> {
     files
-        .iter()
         .map(|file| FileRecord {
             path: file.display_path.clone(),
             stored_as: stored_rel(&setup.dest_rel, &file.stored_components),
@@ -1635,7 +1712,7 @@ impl PushReceive {
         if self.control.is_cancelled() {
             return Err(SessionError::conflict("native push was cancelled"));
         }
-        let report = commit_upload_records(&self.setup, records, 0, 0, Some("push"))?;
+        let report = commit_upload_records(&self.setup, records, 0, 0, Some("push"), false)?;
         publications.disarm();
         self.inner.lock().expect("push receive poisoned").succeeded = true;
         let sid = hex::encode(self.setup.session_id);

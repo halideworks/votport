@@ -60,6 +60,13 @@ function renderUpload(link, upload) {
   transport.className = 'badge';
   transport.textContent = upload.transport === 'push' ? 'native push' : 'http';
   head.append(when, transport);
+  if (upload.partial) {
+    const partial = document.createElement('span');
+    partial.className = 'badge off';
+    partial.title = 'The session ended before every file arrived; only the files that were received are listed.';
+    partial.textContent = 'partial';
+    head.append(partial);
+  }
   if (!link.legal_hold) {
     head.append(
       button('Clear record', 'tiny ghost', async () => {

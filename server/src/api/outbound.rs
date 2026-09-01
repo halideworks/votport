@@ -4487,6 +4487,7 @@ mod tests {
                 legal_hold: false,
                 notify_on_upload: false,
                 uploads: vec![crate::store::UploadRecord {
+                    partial: false,
                     id: "upload".to_owned(),
                     started_at: 1,
                     completed_at: 2,
