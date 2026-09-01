@@ -435,8 +435,9 @@ still travel over HTTP through the reverse proxy. Native push does not change
 Product next, each as its own design first:
 
 * Content dedup when two entries share an object root
-* Scoped automation tokens (they bypass human-rate throttles; they need
-  grants, expiry, and audit)
+* Automation token scopes beyond `POST /api/automation/share` (the tokens
+  themselves exist: per tenant, expiring, revocable, rate limited, refusals
+  audited)
 * Legal hold versus upload retention (a do-not-sweep flag)
 
 Not on the table: Postgres, a second store backend, horizontal replicas, SAML.

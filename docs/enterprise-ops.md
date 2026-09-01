@@ -82,7 +82,7 @@ A security team can put one instance behind their IdP, give each group a namespa
 - Closing the quota TOCTOU.
 - Dashboard rewrite, component library, Kubernetes.
 - Invites or SCIM.
-- Scoped automation tokens (tokens that create links bypass `SessionRate` and human-rate throttles). Own design later.
+- Automation tokens exist (`POST /api/automation/share`, per-tenant, expiring, revocable, rate limited per IP, refusals audited). Scopes beyond that one route are unbuilt.
 - Legal hold versus retention (per-tenant or per-link "do not sweep" flag). Own design later.
 
 ### Engineering constraints
@@ -207,7 +207,7 @@ Apply `require_platform_admin` to:
 - PATCH `/api/admin/tenants/{key}` (plus write)
 - POST `/api/admin/tenants` and DELETE (already write + empty tenant; switch the empty-tenant check to the helper)
 - POST `/api/admin/principals/revoke` and `/unblock` (plus write)
-- GET `/api/admin/backup` (already this gate)
+- GET `/api/admin/backup` (this gate plus the `X-Votport` header, since it writes a snapshot file and an audit row)
 
 `admin_session` already exposes `pages: ["links","audit"]` plus `tenants` and `system` only when `identity.tenant.is_empty() && identity.role == "admin"`. Settings and principals stay on those pages. Named-tenant admins never see System. Default-tenant viewers never see `/tenants` or `/system` and, after PR 1, cannot GET those APIs either.
 
@@ -793,7 +793,7 @@ dbs:
 | POST | `/api/admin/principals/revoke` | platform + write | JSON `{ "subject" }` |
 | POST | `/api/admin/principals/unblock` | platform + write | JSON `{ "subject" }` |
 | DELETE | `/api/admin/tenants/{key}` | platform + write | pin, drop row, purge; Absent+no dir = 404; leftover retry only if dir exists and no default-tenant dest collision |
-| GET | `/api/admin/backup` | `require_platform_admin` | stream + `Content-Length` |
+| GET | `/api/admin/backup` | `require_platform_admin` + `require_admin_write` | stream + `Content-Length` |
 
 No change to public upload routes except default-tenant quota overlay, `Sessions::insert` failing when pinned, and register-then-spawn in `create_session`.
 
@@ -931,7 +931,7 @@ Staged rollout per PR:
 4. SMTP is inert without host/from/to. Do not add `lettre` before that PR.
 5. Principals table fills on the next SSO login; empty list until then. **Do not merge PR 5 before PR 1.**
 6. Tenant purge is a behavior change on DELETE; UI copy must land in the same PR.
-7. Backup streaming is wire-compatible (same magic header, plus `Content-Length`). Clients that already `GET /api/admin/backup` keep working.
+7. Backup streaming is wire-compatible (same magic header, plus `Content-Length`). Since the CSRF gate was added, a client that `GET`s `/api/admin/backup` must send `X-Votport: 1` or it gets 403.
 
 Rollback: revert the PR. Schema v4/v5 tables are additive; a reverted binary that includes the never-downgrade guard from PR 1 will boot on a v4 file only if that binary still understands v4. Therefore the never-downgrade guard and v4 table must land together, and a rollback of PR 1 is "restore a pre-v4 snapshot" or "keep a v4-aware binary". Do not revert only the guard. Do not ship v5 without v4.
 
@@ -956,7 +956,7 @@ Rollback: revert the PR. Schema v4/v5 tables are additive; a reverted binary tha
 
 ## Follow-ons (write-first, not these PRs)
 
-- **Scoped automation tokens.** Tokens that create links bypass `SessionRate` (`api/session_rate.rs`, 20 creates / IP / 10 min) and the human-rate assumptions of `IpThrottle`. They need grants, expiry, and audit. Own design.
+- **Automation token scopes.** Tokens today reach one route, `POST /api/automation/share`, behind their own `SessionRate` (60 / IP / 10 min), with expiry, revocation, and audit of both use and refusal. Per-token grants would matter once a second route accepts them.
 - **Legal hold vs retention.** A per-tenant or per-link "do not sweep" flag when a customer names a case. Own design. Until then, `upload_retention_days = 0` is the hold.
 
 ## References

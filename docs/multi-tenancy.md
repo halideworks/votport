@@ -4,7 +4,7 @@ Status: phases 1-5 shipped (#23 store, #24 audit, #25 SSO, #26 tenants,
 #27 ops polish) plus the multi-page admin (#28). Phases 6+ shipped (settings
 overlay, SMTP, SSO discovery retry, principals/revoke, tenant purge, backup
 streaming). Design: [`enterprise-ops.md`](enterprise-ops.md). Per-link legal
-hold is also shipped. Remaining write-first work is scoped automation tokens.
+hold is also shipped. Automation tokens shipped for one route; per-token scopes remain.
 Each phase landed as its own PR with the standard gate (fmt, clippy -D
 warnings, tests, e2e, docker build) and review.
 
@@ -156,9 +156,9 @@ of scope (see `docs/deployment.md`).
 - Horizontal scaling: one writer (SQLite) is a feature at this scale; if a deploy
   ever outgrows one node, the `Store` struct is the seam (a trait gets introduced
   only when a second backend actually exists).
-- Public API tokens: automation integration is a real enterprise ask, but tokens
-  that can create links bypass the human-rate assumptions of every throttle here;
-  they deserve their own design with scoped grants, not a phase-4 leftover.
+- Public API tokens: `POST /api/automation/share` accepts per-tenant bearer
+  tokens with expiry, revocation, a per-IP rate limit, and audit rows for use
+  and refusal. Scoped grants would matter once a second route accepts them.
 
 ## Deliberately unchanged
 

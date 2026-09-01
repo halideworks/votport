@@ -1488,18 +1488,35 @@ pub async fn automation_share(
     Json(request): Json<AutomationShareRequest>,
 ) -> ApiResult<Response> {
     let ip = super::client_ip(&headers, &peer, &app.config.trusted_proxies);
+    // Refusals are audited so a leaked or revoked token being tried shows up
+    // in the log, not only as a silent 401 to the caller. The rate-limit
+    // branch is deliberately not audited: past the budget each request would
+    // otherwise cost an unauthenticated SQLite write.
+    let refused = |reason: &str| {
+        app.store.audit(
+            "",
+            "",
+            "automation_refused",
+            &ip,
+            &json!({ "reason": reason }),
+        );
+    };
     if !app.automation_rate.allow(&ip) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many automation shares; try again later",
         ));
     }
-    let bearer = automation_bearer(&headers)?;
+    let bearer =
+        automation_bearer(&headers).inspect_err(|_| refused("missing or malformed bearer"))?;
     let token = app
         .store
         .authenticate_automation_token(&hash_token(&bearer), now_unix())
         .map_err(super::store_unavailable)?
-        .ok_or_else(ApiError::unauthorized)?;
+        .ok_or_else(|| {
+            refused("unknown, expired, or revoked token");
+            ApiError::unauthorized()
+        })?;
     let _operation = begin_outbound_operation(&app, &token.tenant)?;
     if !(1..=30).contains(&request.expires_days) {
         return Err(ApiError::new(
@@ -6927,7 +6944,11 @@ mod tests {
         assert!(listed["tokens"][0].get("token_hash").is_none());
         assert!(listed["tokens"][0].get("token").is_none());
 
-        for authorization in [None, Some("Bearer nope")] {
+        for authorization in [
+            None,
+            Some("Bearer nope"),
+            Some("Bearer 00000000000000000000000000000000"),
+        ] {
             let mut request = Request::post("/api/automation/share")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"directory":"project","expires_days":1}"#))
@@ -6952,6 +6973,22 @@ mod tests {
                 StatusCode::UNAUTHORIZED
             );
         }
+        let refusals = app
+            .store
+            .audit_export("", 0, 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.event == "automation_refused")
+            .map(|row| row.detail["reason"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            refusals,
+            [
+                "missing or malformed bearer",
+                "missing or malformed bearer",
+                "unknown, expired, or revoked token"
+            ]
+        );
 
         let share = crate::app::router(app.clone())
             .oneshot(

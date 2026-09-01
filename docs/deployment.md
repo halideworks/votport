@@ -151,7 +151,7 @@ the same deployment backup defeats recovery isolation.
 
 ### Database copy-home
 
-`GET /api/admin/backup` (admin session) streams a consistent snapshot produced
+`GET /api/admin/backup` (admin session plus the `X-Votport: 1` header) streams a consistent snapshot produced
 by SQLite's `VACUUM INTO`, with `Content-Length`. Snapshots land under
 `data/backups/` and are swept after 30 days. Manually:
 
@@ -477,7 +477,9 @@ cargo test --test e2e -- --ignored --nocapture throughput_baseline
 `VOTPORT_MAX_TOTAL_SESSIONS` (default 32) caps concurrent upload sessions
 process-wide; the 33rd sender gets a 429 until one finishes. Worst-case
 queued-body memory rises linearly with it: sessions x 8 in-flight chunks x
-~9 MiB, so 32 sessions bound roughly 2.3 GiB. Size it against available RAM
+~9 MiB, so 32 sessions bound roughly 2.3 GiB. `VOTPORT_MAX_LINK_SESSIONS`
+(default 8) caps sessions per request link the same way: the 9th concurrent
+sender on one link gets a 429. Size both against available RAM
 before raising it for a busy facility.
 
 Static assets under `/assets` are served `no-cache` and answer conditional

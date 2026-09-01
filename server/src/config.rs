@@ -79,6 +79,8 @@ pub struct Config {
     /// Worst-case queued-body memory rises linearly with it: sessions x 8
     /// in-flight chunks x ~9 MiB.
     pub max_total_sessions: usize,
+    /// Cap on concurrent upload sessions per request link.
+    pub max_link_sessions: usize,
     /// Lifetime of admin sessions issued through SSO; the settings overlay
     /// can override it live. Local break-glass sessions keep a fixed 7 days.
     pub sso_session_secs: u64,
@@ -107,6 +109,7 @@ pub struct OidcConfig {
 
 const DEFAULT_MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024 * 1024; // 50 GiB
 const DEFAULT_MAX_TOTAL_SESSIONS: usize = 32;
+const DEFAULT_MAX_LINK_SESSIONS: usize = 8;
 const DEFAULT_SSO_SESSION_SECS: u64 = 7 * 24 * 3600;
 
 /// Shortest admin password this build accepts. Enforced on anything set
@@ -315,18 +318,16 @@ pub fn from_env() -> Result<Config, String> {
         );
     }
 
-    let max_total_sessions = match env::var("VOTPORT_MAX_TOTAL_SESSIONS") {
-        Ok(value) => {
-            let parsed: usize = value
-                .parse()
-                .map_err(|error| format!("VOTPORT_MAX_TOTAL_SESSIONS: {error}"))?;
-            if parsed == 0 {
-                return Err("VOTPORT_MAX_TOTAL_SESSIONS must be at least 1".to_owned());
-            }
-            parsed
-        }
-        Err(_) => DEFAULT_MAX_TOTAL_SESSIONS,
-    };
+    let max_total_sessions = session_cap(
+        "VOTPORT_MAX_TOTAL_SESSIONS",
+        env::var("VOTPORT_MAX_TOTAL_SESSIONS").ok(),
+        DEFAULT_MAX_TOTAL_SESSIONS,
+    )?;
+    let max_link_sessions = session_cap(
+        "VOTPORT_MAX_LINK_SESSIONS",
+        env::var("VOTPORT_MAX_LINK_SESSIONS").ok(),
+        DEFAULT_MAX_LINK_SESSIONS,
+    )?;
 
     let sso_session_secs = match env::var("VOTPORT_SSO_SESSION_SECS") {
         Ok(value) => {
@@ -500,6 +501,7 @@ pub fn from_env() -> Result<Config, String> {
         public_password_login,
         metrics_token,
         max_total_sessions,
+        max_link_sessions,
         sso_session_secs,
         trusted_proxies,
         oidc,
@@ -630,6 +632,35 @@ fn parse_bytes(value: &str) -> Result<u64, String> {
         return Err(format!("{value:?} must be greater than zero"));
     }
     Ok(bytes)
+}
+
+/// A concurrent-session cap from the environment: unset takes the default,
+/// zero is refused because it would deny every upload.
+fn session_cap(name: &str, value: Option<String>, default: usize) -> Result<usize, String> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let parsed: usize = value.parse().map_err(|error| format!("{name}: {error}"))?;
+    if parsed == 0 {
+        return Err(format!("{name} must be at least 1"));
+    }
+    Ok(parsed)
+}
+
+#[cfg(test)]
+mod session_cap_tests {
+    use super::session_cap;
+
+    #[test]
+    fn session_caps_default_and_refuse_zero() {
+        assert_eq!(session_cap("X", None, 8), Ok(8));
+        assert_eq!(session_cap("X", Some("3".to_owned()), 8), Ok(3));
+        assert_eq!(
+            session_cap("X", Some("0".to_owned()), 8),
+            Err("X must be at least 1".to_owned())
+        );
+        assert!(session_cap("X", Some("many".to_owned()), 8).is_err());
+    }
 }
 
 #[cfg(test)]

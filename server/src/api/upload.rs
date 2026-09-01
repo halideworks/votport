@@ -22,11 +22,6 @@ use crate::store::{now_unix, Link};
 
 use super::{client_ip, cookie_attributes, ApiError, ApiResult};
 
-// Worst case memory: max_total_sessions (VOTPORT_MAX_TOTAL_SESSIONS, default
-// 32) x 8 in-flight chunks x ~9 MiB of queued request bodies, plus each
-// worker's pinned merkle trees. Raising the cap raises that ceiling linearly.
-const MAX_SESSIONS_PER_LINK: usize = 8;
-
 /// Cookie carrying proof that this link's password was verified once.
 pub(crate) fn link_cookie_name(link_id: &str) -> String {
     format!("votport_r_{link_id}")
@@ -429,7 +424,7 @@ async fn register_session(
         reserved_bytes: prepared.expected.length,
         max_total_bytes: prepared.max_total,
         max_tenant_sessions: prepared.max_sessions,
-        max_link_sessions: MAX_SESSIONS_PER_LINK,
+        max_link_sessions: app.config.max_link_sessions,
         max_sessions: app.config.max_total_sessions,
         kind,
     };
@@ -1036,7 +1031,7 @@ mod session_rate_tests {
             .insert_link(open_link("full-link"))
             .unwrap();
         let mut receivers = Vec::new();
-        for index in 0..MAX_SESSIONS_PER_LINK {
+        for index in 0..application.config.max_link_sessions {
             let (sender, receiver) = tokio::sync::mpsc::channel(1);
             application
                 .sessions
@@ -1068,7 +1063,10 @@ mod session_rate_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(application.sessions.total(), MAX_SESSIONS_PER_LINK);
+        assert_eq!(
+            application.sessions.total(),
+            application.config.max_link_sessions
+        );
     }
 
     #[tokio::test]
@@ -1425,7 +1423,7 @@ mod push_preflight_tests {
             .insert_link(open_link("link-limited"))
             .unwrap();
         let mut receivers = Vec::new();
-        for index in 0..MAX_SESSIONS_PER_LINK {
+        for index in 0..application.config.max_link_sessions {
             let (sender, receiver) = mpsc::channel(1);
             application
                 .sessions

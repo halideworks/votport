@@ -6397,6 +6397,7 @@ mod settings_tests {
             upload_retention_days: 0,
             metrics_token: None,
             max_total_sessions: 32,
+            max_link_sessions: 8,
             sso_session_secs: 7 * 24 * 3600,
             trusted_proxies: Vec::new(),
             oidc: None,
