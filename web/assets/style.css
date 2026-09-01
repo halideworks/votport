@@ -579,6 +579,11 @@ button.danger:hover:not(:disabled) {
  flex: none;
  white-space: nowrap;
 }
+/* The masthead bar keeps Sign out on the nav row; the nav wraps inside it.
+   Toolbars without a nav (Audit) still wrap as a whole. */
+.bar:has(> .nav) {
+ flex-wrap: nowrap;
+}
 
 /* ---- text utilities ------------------------------------------------------ */
 
@@ -1004,6 +1009,14 @@ button.danger:hover:not(:disabled) {
 }
 .library-folder > button:first-of-type {
  justify-self: start;
+ /* Folder names read like file names, not like button labels. */
+ text-transform: none;
+ letter-spacing: normal;
+ min-width: 0;
+ max-width: 100%;
+ overflow: hidden;
+ text-overflow: ellipsis;
+ white-space: nowrap;
 }
 
 /* ---- modal --------------------------------------------------------------- */
