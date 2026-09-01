@@ -371,7 +371,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 18;
+pub(crate) const SCHEMA_VERSION: u64 = 19;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -408,9 +408,23 @@ CREATE TABLE IF NOT EXISTS files (
     bytes_hi INTEGER NOT NULL,
     bytes_lo INTEGER NOT NULL,
     deleted INTEGER NOT NULL DEFAULT 0,
+    stored_as TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (link_id, upload_index, file_index)
 );
 CREATE INDEX IF NOT EXISTS files_tenant_live ON files(tenant, deleted, bytes_hi, bytes_lo);
+";
+
+// A deduped re-send and a partial record both reference a file another
+// record already counts; byte totals group live rows by path so a physical
+// file counts once. Tables created before v19 gain the column here; the
+// backfill reads the path out of the link's records.
+const FILES_STORED_AS_COLUMN: &str =
+    "ALTER TABLE files ADD COLUMN stored_as TEXT NOT NULL DEFAULT '';";
+const FILES_STORED_AS_BACKFILL: &str = "
+UPDATE files SET stored_as = COALESCE((
+    SELECT json_extract(links.uploads_json,
+        '$[' || files.upload_index || '].files[' || files.file_index || '].stored_as')
+    FROM links WHERE links.id = files.link_id), '');
 ";
 
 const OUTBOUND_GRANTS_SCHEMA: &str = "
@@ -971,6 +985,27 @@ impl Store {
         if stored < 18 {
             transaction
                 .execute_batch(UPLOAD_SESSIONS_SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
+        }
+        if stored < 19 {
+            // Synthetic fixtures from before v7 may lack the table entirely.
+            transaction
+                .execute_batch(FILES_SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
+            let has_column: bool = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = 'stored_as'",
+                    [],
+                    |row| row.get::<_, i64>(0).map(|count| count > 0),
+                )
+                .map_err(|error| format!("schema: {error}"))?;
+            if !has_column {
+                transaction
+                    .execute_batch(FILES_STORED_AS_COLUMN)
+                    .map_err(|error| format!("schema: {error}"))?;
+            }
+            transaction
+                .execute_batch(FILES_STORED_AS_BACKFILL)
                 .map_err(|error| format!("schema: {error}"))?;
         }
         transaction
@@ -2156,8 +2191,12 @@ impl Store {
         self.with(|connection| {
             connection
                 .prepare_cached(
-                    "SELECT COALESCE(SUM(bytes_hi), 0), COALESCE(SUM(bytes_lo), 0) FROM files
-                     WHERE tenant = ?1 AND deleted = 0",
+                    "SELECT COALESCE(SUM(bytes_hi), 0), COALESCE(SUM(bytes_lo), 0) FROM (
+                         SELECT MAX(bytes_hi) AS bytes_hi, bytes_lo FROM files
+                         WHERE tenant = ?1 AND deleted = 0
+                         GROUP BY tenant, CASE WHEN stored_as = ''
+                             THEN link_id || '/' || upload_index || '/' || file_index
+                             ELSE stored_as END)",
                 )?
                 .query_row([tenant], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
@@ -2166,7 +2205,10 @@ impl Store {
         })
     }
 
-    /// Link and live-byte totals for every tenant in one grouped query.
+    /// Link and live-byte totals for every tenant in one grouped query. Both
+    /// byte queries take the bare `bytes_lo` beside `MAX(bytes_hi)`: SQLite
+    /// returns the other columns from the row that won a lone MAX, so the
+    /// pair always comes from one row instead of mixing two.
     pub fn tenant_usage(&self) -> Result<Vec<TenantUsage>, String> {
         self.with(|connection| {
             let mut statement = connection.prepare(
@@ -2176,9 +2218,15 @@ impl Store {
                      UNION SELECT tenant FROM links
                  ), link_counts AS (
                      SELECT tenant, COUNT(*) AS links FROM links GROUP BY tenant
+                 ), live_paths AS (
+                     SELECT tenant, MAX(bytes_hi) AS bytes_hi, bytes_lo
+                     FROM files WHERE deleted = 0
+                     GROUP BY tenant, CASE WHEN stored_as = ''
+                         THEN link_id || '/' || upload_index || '/' || file_index
+                         ELSE stored_as END
                  ), file_bytes AS (
                      SELECT tenant, SUM(bytes_hi) AS bytes_hi, SUM(bytes_lo) AS bytes_lo
-                     FROM files WHERE deleted = 0 GROUP BY tenant
+                     FROM live_paths GROUP BY tenant
                  )
                  SELECT namespaces.tenant, COALESCE(link_counts.links, 0),
                         COALESCE(file_bytes.bytes_hi, 0), COALESCE(file_bytes.bytes_lo, 0)
@@ -3055,8 +3103,8 @@ fn insert_upload_files(
 ) -> rusqlite::Result<()> {
     let mut insert = connection.prepare_cached(
         "INSERT INTO files
-             (link_id, tenant, upload_index, file_index, bytes_hi, bytes_lo, deleted)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (link_id, tenant, upload_index, file_index, bytes_hi, bytes_lo, deleted, stored_as)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
     for (file_index, file) in upload.files.iter().enumerate() {
         let (bytes_hi, bytes_lo) = split_bytes(file.bytes);
@@ -3068,6 +3116,7 @@ fn insert_upload_files(
             bytes_hi,
             bytes_lo,
             file.deleted,
+            file.stored_as,
         ])?;
     }
     Ok(())
@@ -3076,7 +3125,7 @@ fn insert_upload_files(
 fn sync_link_files(connection: &Connection, link: &Link) -> rusqlite::Result<()> {
     let mut existing = {
         let mut statement = connection.prepare_cached(
-            "SELECT upload_index, file_index, bytes_hi, bytes_lo, deleted
+            "SELECT upload_index, file_index, bytes_hi, bytes_lo, deleted, stored_as
              FROM files WHERE link_id = ?1",
         )?;
         let rows = statement.query_map([&link.id], |row| {
@@ -3086,6 +3135,7 @@ fn sync_link_files(connection: &Connection, link: &Link) -> rusqlite::Result<()>
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, bool>(4)?,
+                    row.get::<_, String>(5)?,
                 ),
             ))
         })?;
@@ -3093,11 +3143,12 @@ fn sync_link_files(connection: &Connection, link: &Link) -> rusqlite::Result<()>
     };
     let mut upsert = connection.prepare_cached(
         "INSERT INTO files
-             (link_id, tenant, upload_index, file_index, bytes_hi, bytes_lo, deleted)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             (link_id, tenant, upload_index, file_index, bytes_hi, bytes_lo, deleted, stored_as)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(link_id, upload_index, file_index) DO UPDATE SET
              tenant = excluded.tenant, bytes_hi = excluded.bytes_hi,
-             bytes_lo = excluded.bytes_lo, deleted = excluded.deleted",
+             bytes_lo = excluded.bytes_lo, deleted = excluded.deleted,
+             stored_as = excluded.stored_as",
     )?;
     for (upload_index, upload) in link.uploads.iter().enumerate() {
         for (file_index, file) in upload.files.iter().enumerate() {
@@ -3106,8 +3157,8 @@ fn sync_link_files(connection: &Connection, link: &Link) -> rusqlite::Result<()>
                 i64::try_from(file_index).unwrap_or(i64::MAX),
             );
             let (bytes_hi, bytes_lo) = split_bytes(file.bytes);
-            let value = (bytes_hi, bytes_lo, file.deleted);
-            if existing.remove(&key) == Some(value) {
+            let value = (bytes_hi, bytes_lo, file.deleted, file.stored_as.clone());
+            if existing.remove(&key).as_ref() == Some(&value) {
                 continue;
             }
             upsert.execute(rusqlite::params![
@@ -3118,6 +3169,7 @@ fn sync_link_files(connection: &Connection, link: &Link) -> rusqlite::Result<()>
                 bytes_hi,
                 bytes_lo,
                 file.deleted,
+                file.stored_as,
             ])?;
         }
     }
@@ -4035,7 +4087,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(schema, "18");
+        assert_eq!(schema, SCHEMA_VERSION.to_string());
         assert!(store
             .with(|connection| {
                 connection.query_row(
@@ -5651,6 +5703,137 @@ mod tenant_tests {
         assert_eq!(files, 0);
     }
 
+    /// A deduped re-send or a partial record references a file an earlier
+    /// record already counts; the physical file counts once until every
+    /// record over it is tombstoned.
+    #[test]
+    fn shared_stored_paths_count_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.insert_tenant(test_tenant("acme")).unwrap();
+        let record = |id: &str, files: Vec<FileRecord>| UploadRecord {
+            partial: false,
+            id: id.to_owned(),
+            started_at: 0,
+            completed_at: 0,
+            replayed_chunks: 0,
+            rejected_chunks: 0,
+            transport: None,
+            package_root: "cc".to_owned(),
+            total_bytes: files.iter().map(|file| file.bytes).sum(),
+            files,
+        };
+        let file = |path: &str, bytes: u64| FileRecord {
+            path: path.to_owned(),
+            stored_as: path.to_owned(),
+            bytes,
+            suite: "blake3".to_owned(),
+            root: "00".to_owned(),
+            receipt: true,
+            deleted: false,
+        };
+        let mut link = link_in("acme", "link-1");
+        link.uploads
+            .push(record("partial", vec![file("a.bin", 300)]));
+        store.insert_link(link).unwrap();
+        assert_eq!(store.tenant_received_bytes("acme").unwrap(), 300);
+        // The full re-send records a.bin again beside a new file.
+        store
+            .append_upload(
+                "acme",
+                "link-1",
+                record("full", vec![file("a.bin", 300), file("b.bin", 200)]),
+            )
+            .unwrap();
+        assert_eq!(store.tenant_received_bytes("acme").unwrap(), 500);
+        assert_eq!(store.tenant_usage().unwrap()[1].received_bytes, 500);
+        // Delete file tombstones every record over the path, so the bytes go.
+        store
+            .tombstone_files("acme", "link-1", |file| {
+                file.stored_as == "a.bin" && file.bytes == 300
+            })
+            .unwrap();
+        assert_eq!(store.tenant_received_bytes("acme").unwrap(), 200);
+        let files = store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT COUNT(*) FROM files WHERE deleted = 0 AND stored_as = 'a.bin'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            files, 0,
+            "the matcher tombstones every record over the path"
+        );
+    }
+
+    /// v18 rows carry no path; the v19 backfill reads it from the records so
+    /// a shared file stops double counting on the first boot.
+    #[test]
+    fn v19_backfills_stored_paths_and_dedupes_totals() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.insert_tenant(test_tenant("acme")).unwrap();
+        let file = FileRecord {
+            path: "a.bin".to_owned(),
+            stored_as: "a.bin".to_owned(),
+            bytes: 300,
+            suite: "blake3".to_owned(),
+            root: "00".to_owned(),
+            receipt: true,
+            deleted: false,
+        };
+        let record = |id: &str| UploadRecord {
+            partial: false,
+            id: id.to_owned(),
+            started_at: 0,
+            completed_at: 0,
+            replayed_chunks: 0,
+            rejected_chunks: 0,
+            transport: None,
+            package_root: "cc".to_owned(),
+            total_bytes: 300,
+            files: vec![file.clone()],
+        };
+        let mut link = link_in("acme", "link-1");
+        link.uploads.push(record("one"));
+        link.uploads.push(record("two"));
+        store.insert_link(link).unwrap();
+        // Simulate a v18 database: no path column, so both rows count.
+        store
+            .with(|connection| {
+                connection.execute_batch(
+                    "ALTER TABLE files DROP COLUMN stored_as;
+                     UPDATE meta SET value = '18' WHERE key = 'schema_version';",
+                )
+            })
+            .unwrap();
+        drop(store);
+        let store = Store::open(directory.path()).unwrap();
+        let version: String = store
+            .with(|connection| {
+                connection.query_row(
+                    "SELECT value FROM meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION.to_string());
+        let paths: Vec<String> = store
+            .with(|connection| {
+                let mut statement =
+                    connection.prepare("SELECT stored_as FROM files ORDER BY upload_index")?;
+                let rows = statement.query_map([], |row| row.get(0))?;
+                rows.collect()
+            })
+            .unwrap();
+        assert_eq!(paths, ["a.bin", "a.bin"]);
+        assert_eq!(store.tenant_received_bytes("acme").unwrap(), 300);
+    }
+
     #[test]
     fn received_bytes_preserve_u64_and_saturate_aggregate() {
         let directory = tempfile::tempdir().unwrap();
@@ -6590,9 +6773,9 @@ mod settings_tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         drop(store);
-        assert_eq!(schema_version(directory.path()), "18");
+        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
         Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "18");
+        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
     }
 
     #[test]
@@ -6684,7 +6867,7 @@ mod settings_tests {
             .unwrap();
         drop(store);
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "18");
+        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
         assert!(store.load_upload_sessions().unwrap().is_empty());
 
         let session = PersistedUploadSession {
@@ -6753,7 +6936,7 @@ mod settings_tests {
         drop(store);
 
         let reopened = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "18");
+        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
         assert!(reopened.branding("acme").unwrap().is_none());
         reopened
             .set_branding(&Branding {
@@ -6786,7 +6969,7 @@ mod settings_tests {
                 .unwrap();
         }
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "18");
+        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
         assert!(store.principals_page(50, 0, None).unwrap().0.is_empty());
         assert!(store.principal("nobody").unwrap().is_none());
     }
@@ -6808,7 +6991,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "18");
+        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
         assert!(!store.link("", "old-link").unwrap().unwrap().legal_hold);
     }
 
@@ -6851,7 +7034,7 @@ mod settings_tests {
         drop(store);
 
         let reopened = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "18");
+        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
         assert_eq!(reopened.tenant_received_bytes("").unwrap(), 9);
     }
 
@@ -6893,7 +7076,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "18");
+        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
         let grant = store
             .outbound_grant_by_token_hash("hash-g1")
             .unwrap()
@@ -6945,7 +7128,7 @@ mod settings_tests {
         }
 
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), "18");
+        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
         let grant = store
             .outbound_grant_by_token_hash("hash-g1")
             .unwrap()
@@ -6980,7 +7163,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "18");
+        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
         let columns: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('outbound_grants')
@@ -7012,7 +7195,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "18");
+        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
         let table_exists: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -7052,7 +7235,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "18");
+        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
         let default: Option<String> = connection
             .query_row(
                 "SELECT dflt_value FROM pragma_table_info('outbound_grants')
@@ -7108,7 +7291,7 @@ mod settings_tests {
 
         drop(Store::open(directory.path()).unwrap());
         let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), "18");
+        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
         let counts: Vec<(String, i64)> = {
             let mut statement = connection
                 .prepare("SELECT id, file_count FROM outbound_grants ORDER BY id")
