@@ -13,7 +13,7 @@ shipped. Later hardening added per-link legal hold in schema v6, the schema-v7
 exact-byte files projection, atomic announced-byte/session reservations, and
 reserved tenant storage. See [`multi-tenancy.md`](multi-tenancy.md) for current
 behavior. The remaining follow-on is scoped automation tokens. VOT is pinned at
-`b14cc41`; upstream PR #391 adds the holder-dialed push engine, while votport
+`aba35a0`; upstream PR #391 adds the holder-dialed push engine, while votport
 currently ships only the feature-off listener identity from native-push PR 1.
 See the README roadmap for what that pin does and does not change.
 
