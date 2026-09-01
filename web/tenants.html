@@ -66,15 +66,17 @@
       <div id="tenants"></div>
 
       <h2>Principals</h2>
-      <p class="muted">
-        SSO users who have signed in. Revoke kicks current sessions and refuses
-        SSO until unblocked. Lasting revoke is IdP group removal.
-      </p>
-      <label
-        >Search principals
-        <input id="principal-search" type="search" maxlength="100" placeholder="Subject" />
-      </label>
-      <p id="principal-count" class="muted" aria-live="polite"></p>
+      <div class="card">
+        <p class="muted">
+          SSO users who have signed in. Revoke kicks current sessions and refuses
+          SSO until unblocked. Lasting revoke is IdP group removal.
+        </p>
+        <label
+          >Search principals
+          <input id="principal-search" type="search" maxlength="100" placeholder="Subject" />
+        </label>
+        <p id="principal-count" class="muted" aria-live="polite"></p>
+      </div>
       <div id="principals"></div>
       <button id="principal-load-more" type="button" hidden>Load more</button>
       <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
