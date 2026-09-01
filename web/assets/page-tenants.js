@@ -5,6 +5,7 @@ import {
   alertModal,
   api,
   button,
+  colorPair,
   confirmModal,
   formatBytes,
   formatWhen,
@@ -137,12 +138,21 @@ function brandingForm(tenant) {
   colorLabel.textContent = 'Accent color';
   const colorInput = document.createElement('input');
   colorInput.type = 'color';
-  colorLabel.append(colorInput);
-  // type=color always holds a value; the flag records whether one is meant.
-  let colorSet = false;
-  colorInput.addEventListener('input', () => {
-    colorSet = true;
-  });
+  colorInput.setAttribute('aria-label', 'Pick accent color');
+  const hexInput = document.createElement('input');
+  hexInput.type = 'text';
+  hexInput.setAttribute('aria-label', 'Accent color hex');
+  hexInput.className = 'mono';
+  hexInput.placeholder = 'none';
+  hexInput.pattern = '#[0-9a-fA-F]{6}';
+  hexInput.maxLength = 7;
+  hexInput.autocomplete = 'off';
+  hexInput.spellcheck = false;
+  const pair = document.createElement('div');
+  pair.className = 'color-pair';
+  pair.append(colorInput, hexInput);
+  colorLabel.append(pair);
+  const accent = colorPair(colorInput, hexInput);
 
   const logoLabel = document.createElement('label');
   logoLabel.textContent = 'Logo (PNG, JPEG, or SVG, 512 KiB max)';
@@ -165,10 +175,7 @@ function brandingForm(tenant) {
   const load = async () => {
     const branding = await api(`/api/admin/branding/${key}`);
     nameInput.value = branding.name || '';
-    if (branding.color) {
-      colorInput.value = branding.color;
-      colorSet = true;
-    }
+    accent.set(branding.color || '');
     logoLabel.firstChild.textContent = branding.has_logo
       ? 'Logo (uploaded; choose a file to replace)'
       : 'Logo (PNG, JPEG, or SVG, 512 KiB max)';
@@ -189,7 +196,7 @@ function brandingForm(tenant) {
         method: 'PUT',
         body: JSON.stringify({
           name: nameInput.value,
-          color: colorSet ? colorInput.value : '',
+          color: accent.get(),
         }),
       });
     } catch (requestError) {
@@ -203,10 +210,7 @@ function brandingForm(tenant) {
   const actions = document.createElement('div');
   actions.className = 'actions';
   actions.append(
-    button('Clear color', 'ghost tiny', async () => {
-      colorSet = false;
-      colorInput.value = '#000000';
-    }),
+    button('No accent', 'ghost tiny', async () => accent.set('')),
     button('Upload logo', 'tiny', async () => {
       const file = logoInput.files?.[0];
       if (!file) throw new Error('Choose a logo file first.');
@@ -233,7 +237,6 @@ function brandingForm(tenant) {
         return;
       await api(`/api/admin/branding/${key}`, { method: 'DELETE' });
       form.reset();
-      colorSet = false;
       await load();
     }),
   );

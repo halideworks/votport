@@ -22,6 +22,7 @@ export default [
         TextDecoder: 'readonly',
         URLSearchParams: 'readonly',
         Worker: 'readonly',
+        IntersectionObserver: 'readonly',
         console: 'readonly',
         // Worker context (hash-worker.js).
         self: 'readonly',

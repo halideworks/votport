@@ -154,3 +154,22 @@ export function formatDuration(seconds) {
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
   return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
 }
+
+/// Keeps a color picker and a hex text input in step. get() is the lowercase
+/// #rrggbb value, or '' when the text input is blank or not a color.
+export function colorPair(picker, hex) {
+  const valid = () => /^#[0-9a-f]{6}$/i.test(hex.value.trim());
+  picker.addEventListener('input', () => {
+    hex.value = picker.value;
+  });
+  hex.addEventListener('input', () => {
+    if (valid()) picker.value = hex.value.trim().toLowerCase();
+  });
+  return {
+    get: () => (valid() ? hex.value.trim().toLowerCase() : ''),
+    set: (value) => {
+      hex.value = value || '';
+      if (value) picker.value = value;
+    },
+  };
+}
