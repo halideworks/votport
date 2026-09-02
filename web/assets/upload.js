@@ -4,6 +4,7 @@
 import { applyBranding } from '/assets/branding.js';
 import { appendObjectCard, copyToClipboard, formatBytes } from '/assets/object-card.js';
 import { entryFiles } from '/assets/upload-entries.js';
+import { segments } from '/assets/hash-plan.js';
 import init, {
   ObjectId,
   PackageBuilder,
@@ -52,9 +53,20 @@ const LOOKAHEAD = 2;
 // ------------------------------------------------------------- hash workers
 // Hashing and the merkle trees live in workers so the page stays responsive
 // and hashing genuinely overlaps upload bookkeeping. Each file's tree stays
-// in the worker that hashed it, which also serves its range proofs. The pool
-// hashes up to LOOKAHEAD+1 files in parallel — the lookahead gate already
-// caps how many files may be ahead of the upload cursor.
+// in the worker that owns it, which also serves its range proofs. A large
+// file is hashed as segments across the whole pool and assembled on its
+// owner; the lookahead gate caps how many files may be ahead of the upload
+// cursor, not how many workers one file may use.
+
+// Measured 2026-09-02 on a 20-core desktop hashing 256 MiB per worker:
+// Firefox 157, 326, 545 MiB/s at 1, 2, 4 workers (flat beyond), Chromium
+// 691 to 3336 MiB/s at 1 to 8. One worker is left for the page.
+const MAX_WORKERS = 8;
+// Below this a file hashes in one piece; splitting costs a read pipeline per
+// worker and a join, worth it only when the file dwarfs that.
+const PARALLEL_MIN_BYTES = 64 * 1024 * 1024;
+const MIN_SEGMENT_BYTES = 16 * 1024 * 1024;
+const PROOF_LEAF_BYTES = 65536;
 
 let hashWorkers = [];
 const workerByPath = new Map(); // path -> the worker holding its tree
@@ -62,7 +74,7 @@ const workerRequests = new Map(); // req -> {resolve, reject, onStep}
 let nextRequest = 0;
 
 function startWorkers() {
-  const count = Math.min(LOOKAHEAD + 1, Math.max(1, (navigator.hardwareConcurrency || 2) - 1));
+  const count = Math.min(MAX_WORKERS, Math.max(1, (navigator.hardwareConcurrency || 2) - 1));
   hashWorkers = Array.from({ length: count }, () => {
     const worker = new Worker('/assets/hash-worker.js', { type: 'module' });
     worker.onmessage = ({ data }) => {
@@ -86,13 +98,15 @@ function startWorkers() {
   });
 }
 
-// 'hash' pins the file's tree to a worker; 'prove' and 'drop' follow it.
+// 'hash' and 'assemble' pin the file's tree to a worker; 'prove' and 'drop'
+// follow it. 'leaves' is one segment's work and pins nothing.
 function workerFor(message, index) {
-  if (message.op === 'hash') {
+  if (message.op === 'hash' || message.op === 'assemble') {
     const worker = hashWorkers[index % hashWorkers.length];
     workerByPath.set(message.key, worker);
     return worker;
   }
+  if (message.op === 'leaves') return hashWorkers[index % hashWorkers.length];
   return workerByPath.get(message.key);
 }
 
@@ -714,11 +728,26 @@ async function runUpload() {
       checkCancelled();
       await waitWorkersReady();
       try {
-        done = await workerCall({ op: 'hash', key: path, file }, index, (step) => {
+        const onStep = (step) => {
           lastHashBps = hashRate(step);
           lastHashAt = performance.now();
           renderNote();
-        });
+        };
+        const plan = file.size >= PARALLEL_MIN_BYTES
+          ? segments(file.size, PROOF_LEAF_BYTES, hashWorkers.length, MIN_SEGMENT_BYTES)
+          : [[0, file.size]];
+        if (plan.length < 2) {
+          done = await workerCall({ op: 'hash', key: path, file }, index, onStep);
+        } else {
+          // Every worker hashes one segment at once; the owner joins the
+          // leaves into the tree it will prove ranges from.
+          const leaves = await Promise.all(plan.map(([start, end], segment) =>
+            workerCall({ op: 'leaves', key: path, file, start, end }, index + segment, onStep)));
+          done = await workerCall(
+            { op: 'assemble', key: path, length: file.size, leaves },
+            index,
+          );
+        }
         break;
       } catch (error) {
         if (error.cancelled || !error.paused) throw error;

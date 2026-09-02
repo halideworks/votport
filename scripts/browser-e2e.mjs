@@ -41,8 +41,10 @@ for (const file of outboundFiles) fs.writeFileSync(path.join(dir, file.name), fi
 const folder = path.join(dir, "folder-pick");
 fs.mkdirSync(path.join(folder, "nested"), { recursive: true });
 fs.writeFileSync(path.join(folder, "nested", "folder-nested.txt"), "nested folder deliverable\n");
-// Multiple server-sized ranges exercise the bounded parallel upload path.
-const big = Buffer.alloc(40 * 1024 * 1024 + 99);
+// Multiple server-sized ranges exercise the bounded parallel upload path, and
+// a file over 64 MiB is hashed as segments across the worker pool, so the
+// server verifies ranges proved from an assembled tree.
+const big = Buffer.alloc(96 * 1024 * 1024 + 99);
 for (let i = 0; i < big.length; i += 1) big[i] = (i * 7) % 253;
 fs.writeFileSync(path.join(dir, "archive.tar"), big);
 
