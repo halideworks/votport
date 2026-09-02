@@ -12,6 +12,14 @@ export function formatBytes(bytes) {
   return `${value >= 100 || exponent === 0 ? Math.round(value) : value.toFixed(1)} ${units[exponent]}`;
 }
 
+/// Copies text and flips the button label to Copied for a moment.
+export async function copyToClipboard(element, text) {
+  await navigator.clipboard.writeText(text);
+  element.dataset.label ??= element.textContent;
+  element.textContent = 'Copied';
+  setTimeout(() => { element.textContent = element.dataset.label; }, 1500);
+}
+
 export function identityLine(file) {
   return `${file.suite}:${file.root}`;
 }

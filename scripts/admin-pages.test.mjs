@@ -95,7 +95,7 @@ test('list actions announce their outcome and copy buttons confirm', () => {
   // Every clipboard write goes through copyToClipboard so the button flips to Copied.
   assert.doesNotMatch(receiveScript, /navigator\.clipboard/);
   assert.doesNotMatch(deliverScript, /navigator\.clipboard/);
-  assert.match(commonScript, /export async function copyToClipboard/);
+  assert.match(commonScript, /export \{ copyToClipboard \}/);
 });
 
 const send = await readFile(new URL('../web/send.html', import.meta.url), 'utf8');

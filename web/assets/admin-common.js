@@ -1,5 +1,10 @@
 // Shared helpers for the multi-page admin. VOTPORT PROPRIETARY LICENSE.
 
+// Copying text with a Copied flash lives with the shared public helpers so
+// public pages need not import this admin module for it.
+import { copyToClipboard } from '/assets/object-card.js';
+export { copyToClipboard };
+
 export async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: {
@@ -130,13 +135,6 @@ export function button(text, classes, onClick) {
   return element;
 }
 
-/// Copies text and flips the button label to Copied for a moment.
-export async function copyToClipboard(element, text) {
-  await navigator.clipboard.writeText(text);
-  element.dataset.label ??= element.textContent;
-  element.textContent = 'Copied';
-  setTimeout(() => { element.textContent = element.dataset.label; }, 1500);
-}
 
 /// Sets a role=status line so screen readers hear the outcome of an action.
 export function announce(id, text) {

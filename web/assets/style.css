@@ -362,6 +362,21 @@ section > h2 {
   text-align: left;
  }
 }
+/* The resume card leads the sender page when a transfer is held. */
+.resume-card {
+ margin-bottom: 1.1rem;
+}
+.resume-card > h2 {
+ color: var(--ok);
+}
+.resume-card > p:first-of-type {
+ font-size: 0.95rem;
+ color: var(--text);
+}
+.resume-card > button.link {
+ margin-top: 0.2rem;
+}
+
 /* A completed transfer earns the one green in the palette. */
 .card.ok {
  border-color: rgba(95, 212, 162, 0.25);
@@ -532,7 +547,8 @@ button.ghost:hover:not(:disabled) {
  transform: none;
  box-shadow: none;
 }
-button.tiny {
+button.tiny,
+.actions a.button.tiny {
  padding: 0.3rem 0.7rem;
  font-size: 0.62rem;
 }
@@ -887,6 +903,39 @@ button.danger:hover:not(:disabled) {
 }
 .files li.done .status {
  color: var(--ok);
+}
+.files li .state {
+ flex: none;
+ margin-left: auto;
+}
+.files li[data-state="verified"] .state {
+ border-color: var(--ok);
+ color: var(--ok);
+}
+.files li[data-state="hashing"] .state,
+.files li[data-state="sending"] .state {
+ border-color: var(--progress);
+ color: var(--progress);
+}
+/* Per-file progress while that file's ranges move. */
+.files li .row-meter {
+ flex-basis: 100%;
+ height: 3px;
+ border-radius: 99px;
+ background: rgba(255, 255, 255, 0.08);
+ overflow: hidden;
+}
+.files li .row-meter > div {
+ height: 100%;
+ background: var(--progress);
+ transition: width 0.15s linear;
+}
+#done-summary {
+ margin: 0 0 0.35rem;
+ color: var(--text);
+}
+.done-actions {
+ margin-bottom: 1rem;
 }
 /* Full object ids wrap onto their own line under the file row. */
 .files li {
