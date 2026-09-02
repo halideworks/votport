@@ -2,7 +2,7 @@
 
 // Copying text with a Copied flash lives with the shared public helpers so
 // public pages need not import this admin module for it.
-import { copyToClipboard, formatBytes } from '/assets/object-card.js';
+import { copyToClipboard, formatBytes, formatDuration } from '/assets/object-card.js';
 import { createUndoQueue } from '/assets/undo.js';
 export { copyToClipboard };
 
@@ -261,7 +261,7 @@ export function alertModal(message) {
   dialog.showModal();
 }
 
-export { formatBytes };
+export { formatBytes, formatDuration };
 
 /// Action button whose handler, sync or async, reports failures via the
 /// shared modal.
@@ -362,12 +362,6 @@ export function showGrantResult(url, protectedGrant = false) {
 
 export function formatWhen(unixSeconds) {
   return new Date(unixSeconds * 1000).toLocaleString();
-}
-
-export function formatDuration(seconds) {
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
-  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
 }
 
 /// Keeps a color picker and a hex text input in step. get() is the lowercase
