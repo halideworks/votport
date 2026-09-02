@@ -1,5 +1,5 @@
 server/target/
-web/assets/vendor/
+web/assets/vendor
 data/
 node_modules/
 .env
