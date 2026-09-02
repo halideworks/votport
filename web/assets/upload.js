@@ -67,6 +67,10 @@ const MAX_WORKERS = 8;
 const PARALLEL_MIN_BYTES = 64 * 1024 * 1024;
 const MIN_SEGMENT_BYTES = 16 * 1024 * 1024;
 const PROOF_LEAF_BYTES = 65536;
+// One file at a time takes the whole pool; the others in the lookahead hash
+// in one piece, so live read buffers stay at pool size plus two, not three
+// times the pool.
+let parallelHashing = false;
 
 let hashWorkers = [];
 const workerByPath = new Map(); // path -> the worker holding its tree
@@ -87,9 +91,10 @@ function startWorkers() {
       workerRequests.delete(data.req);
       if (data.error !== undefined) {
         // A failed prove means the tree was not on that worker yet — a
-        // recovery straggler, retried as a pause. Hash failures are real.
+        // recovery straggler, retried as a pause. Hash, leaves, and assemble
+        // failures are real: the file changed or could not be read.
         const error = new Error(data.error);
-        if (pending.op !== 'hash') error.paused = true;
+        if (pending.op === 'prove') error.paused = true;
         pending.reject(error);
       } else pending.resolve(data.done);
     };
@@ -733,7 +738,7 @@ async function runUpload() {
           lastHashAt = performance.now();
           renderNote();
         };
-        const plan = file.size >= PARALLEL_MIN_BYTES
+        const plan = file.size >= PARALLEL_MIN_BYTES && !parallelHashing
           ? segments(file.size, PROOF_LEAF_BYTES, hashWorkers.length, MIN_SEGMENT_BYTES)
           : [[0, file.size]];
         if (plan.length < 2) {
@@ -741,12 +746,17 @@ async function runUpload() {
         } else {
           // Every worker hashes one segment at once; the owner joins the
           // leaves into the tree it will prove ranges from.
-          const leaves = await Promise.all(plan.map(([start, end], segment) =>
-            workerCall({ op: 'leaves', key: path, file, start, end }, index + segment, onStep)));
-          done = await workerCall(
-            { op: 'assemble', key: path, length: file.size, leaves },
-            index,
-          );
+          parallelHashing = true;
+          try {
+            const leaves = await Promise.all(plan.map(([start, end], segment) =>
+              workerCall({ op: 'leaves', key: path, file, start, end }, index + segment, onStep)));
+            done = await workerCall(
+              { op: 'assemble', key: path, length: file.size, leaves },
+              index,
+            );
+          } finally {
+            parallelHashing = false;
+          }
         }
         break;
       } catch (error) {

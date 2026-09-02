@@ -39,4 +39,6 @@ test('a large file is hashed as leaf-aligned segments across the pool and assemb
   assert.match(worker, /proofLeavesAt\(Suite\.Blake3Bao64, BigInt\(offset\), bytes, BigInt\(file\.size\)\)/);
   assert.match(worker, /PreparedObject\.fromProofLeaves\(/);
   assert.match(script, /const MAX_WORKERS = 8;/);
+  assert.match(script, /if \(pending\.op === 'prove'\) error\.paused = true;/);
+  assert.match(script, /&& !parallelHashing/);
 });
