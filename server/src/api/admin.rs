@@ -375,8 +375,8 @@ pub struct StatusQuery {
     since: Option<u64>,
 }
 
-/// The Receive page's status strip: what is arriving now, what landed today,
-/// room on the receive volume, and whether the box is draining or unwell.
+/// The Receive and Deliver status strips: what is arriving now, what landed
+/// today, what is stored, what is being served, and room on both volumes.
 pub async fn admin_status(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -392,29 +392,37 @@ pub async fn admin_status(
         .store
         .uploads_since(&identity.tenant, since)
         .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    let disk = rustix::fs::statvfs(&app.config.receive_dir)
-        .ok()
-        .map(|stat| {
+    let disk_of = |root: &std::path::Path| {
+        rustix::fs::statvfs(root).ok().map(|stat| {
             json!({
                 "free_bytes": stat.f_bavail.saturating_mul(stat.f_frsize),
                 "total_bytes": stat.f_blocks.saturating_mul(stat.f_frsize),
             })
-        });
-    let draining = app
+        })
+    };
+    let (stored_files, stored_bytes) = app
         .store
-        .resolved_settings(&app.config)
-        .map(|settings| settings.draining)
-        .unwrap_or(false);
-    let healthy = crate::app::check_health(&app).is_ok();
+        .tenant_stored(&identity.tenant)
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let now = now_unix();
+    let (open_grants, downloads) = app
+        .store
+        .outbound_summary(&identity.tenant, now)
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(json!({
-        "now": now_unix(),
+        "now": now,
         "sessions_active": receiving.len(),
         "bytes_in_flight": bytes_in_flight,
         "receiving": receiving,
         "today": { "uploads": today_uploads, "bytes": today_bytes, "since": since },
-        "disk": disk,
-        "draining": draining,
-        "healthy": healthy,
+        "stored": { "files": stored_files, "bytes": stored_bytes },
+        "disk": disk_of(&app.config.receive_dir),
+        "outbound": {
+            "active": app.sessions.active_outbound_for_tenant(&identity.tenant),
+            "open_grants": open_grants,
+            "downloads": downloads,
+            "disk": disk_of(&app.config.outbound_dir),
+        },
     })))
 }
 

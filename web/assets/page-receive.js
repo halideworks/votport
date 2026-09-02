@@ -3,6 +3,7 @@
 
 import { appendObjectCard } from '/assets/object-card.js';
 import { narrate, summarize, timelineJson } from '/assets/timeline.js';
+import { startStatusPoll } from '/assets/status-strip.js';
 import {
   alertModal,
   announce,
@@ -331,28 +332,8 @@ function applyReceiving(card, transfers, now = null) {
 // Polls fast while something is arriving, slowly otherwise, never while the
 // tab is hidden. The links list re-renders only when the set of receiving
 // links changes, so a finished transfer's record appears without a click.
-let statusTimer = null;
 let receivingKey = null;
-function startOfToday() {
-  const day = new Date();
-  day.setHours(0, 0, 0, 0);
-  return Math.floor(day.getTime() / 1000);
-}
-async function refreshStatus() {
-  clearTimeout(statusTimer);
-  if (document.hidden) return;
-  let status;
-  try {
-    status = await api(`/api/admin/status?since=${startOfToday()}`);
-  } catch (error) {
-    // The session expired under an open tab: the reload lands on sign-in.
-    if (error.status === 401) {
-      window.location.reload();
-      return;
-    }
-    statusTimer = setTimeout(refreshStatus, 30_000);
-    return;
-  }
+function renderStatus(status) {
   const strip = $('status-strip');
   strip.hidden = false;
   $('stat-active').textContent = String(status.sessions_active);
@@ -363,12 +344,9 @@ async function refreshStatus() {
   $('stat-today-detail').textContent = status.today.uploads
     ? `received · ${formatBytes(status.today.bytes)}`
     : 'received';
+  $('stat-stored').textContent = formatBytes(status.stored.bytes);
+  $('stat-stored-detail').textContent = `${status.stored.files} received file${status.stored.files === 1 ? '' : 's'} on disk`;
   $('stat-disk').textContent = status.disk ? formatBytes(status.disk.free_bytes) : '–';
-  $('stat-drain').textContent = status.draining ? 'on' : 'off';
-  const health = $('stat-health');
-  health.textContent = status.healthy ? 'healthy' : 'unhealthy';
-  health.className = `badge ${status.healthy ? 'on' : 'danger'}`;
-  strip.classList.toggle('draining', Boolean(status.draining));
 
   const byLink = new Map();
   for (const transfer of status.receiving) {
@@ -379,22 +357,14 @@ async function refreshStatus() {
     applyReceiving(card, byLink.get(card.dataset.linkId) || [], status.now);
   }
   // A transfer starting or finishing changes what the list should show. The
-  // first poll only records the set; a list the operator has paged through
-  // or is loading is left alone.
+  // first poll only records the set; a refresh in flight defers the change
+  // to the next tick, and a list the operator paged through is left alone.
   const key = [...byLink.keys()].sort().join(',');
   if (receivingKey !== null && key !== receivingKey) {
-    // A refresh in flight defers the change to the next tick; a list the
-    // operator paged through is left as it is.
-    if (linksBusy) return scheduleStatus(status);
+    if (linksBusy) return;
     if (!linksExpanded) refreshLinksSafe({ fromPoll: true });
   }
   receivingKey = key;
-  scheduleStatus(status);
-}
-
-function scheduleStatus(status) {
-  clearTimeout(statusTimer);
-  statusTimer = setTimeout(refreshStatus, status.sessions_active ? 4_000 : 30_000);
 }
 
 function renderLink(link) {
@@ -755,8 +725,5 @@ $('links-load-more').addEventListener('click', async () => {
 await requireSession();
 $('links-query').value = linksFilter.search;
 await refreshLinks();
-refreshStatus();
-document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) refreshStatus();
-});
+startStatusPoll({ render: renderStatus, active: (status) => status.sessions_active > 0 });
 revealHash();

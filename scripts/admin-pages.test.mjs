@@ -124,11 +124,15 @@ test('a stale sender tab reloads when the server reports a new web build', () =>
 });
 
 test('receive page carries the status strip and polls the status endpoint', () => {
-  for (const id of ['status-strip', 'stat-active', 'stat-today', 'stat-disk', 'stat-drain', 'stat-health']) {
+  for (const id of ['status-strip', 'stat-active', 'stat-today', 'stat-stored', 'stat-disk']) {
     assert.match(receive, new RegExp(`id="${id}"`), `${id} present`);
   }
-  assert.match(receiveScript, /\/api\/admin\/status\?since=/);
-  assert.match(receiveScript, /visibilitychange/);
+  for (const id of ['status-strip', 'stat-active', 'stat-open', 'stat-downloads', 'stat-disk']) {
+    assert.match(deliver, new RegExp(`id="${id}"`), `deliver ${id} present`);
+  }
+  assert.doesNotMatch(receive, /stat-drain|stat-health/);
+  assert.match(receiveScript, /startStatusPoll\(/);
+  assert.match(deliverScript, /startStatusPoll\(/);
   assert.match(receiveScript, /receiving-now/);
   assert.match(receiveScript, /How receiving works/);
   assert.match(deliverScript, /How delivering works/);

@@ -18,6 +18,7 @@ import {
   revealHash,
   showGrantResult,
 } from '/assets/admin-common.js';
+import { startStatusPoll } from '/assets/status-strip.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -898,6 +899,19 @@ async function revealGrant() {
 }
 window.addEventListener('hashchange', () => { revealGrant().catch(() => {}); });
 
+function renderStatus(status) {
+  const outbound = status.outbound;
+  $('status-strip').hidden = false;
+  $('stat-active').textContent = String(outbound.active);
+  $('stat-active-detail').textContent = outbound.active
+    ? `recipient${outbound.active === 1 ? '' : 's'} downloading now`
+    : 'nothing being served';
+  $('stat-open').textContent = String(outbound.open_grants);
+  $('stat-downloads').textContent = String(outbound.downloads);
+  $('stat-disk').textContent = outbound.disk ? formatBytes(outbound.disk.free_bytes) : '–';
+}
+
 await requireSession();
 await Promise.all([refreshGrants(), refreshLibrary(), refreshAutomationTokens()]);
+startStatusPoll({ render: renderStatus, active: (status) => status.outbound.active > 0 });
 await revealGrant();

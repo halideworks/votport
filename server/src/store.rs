@@ -1254,6 +1254,56 @@ impl Store {
         })
     }
 
+    /// Live received files in one tenant namespace (count, bytes), a physical
+    /// file counted once however many records reference it.
+    pub fn tenant_stored(&self, tenant: &str) -> Result<(u64, u64), String> {
+        self.with(|connection| {
+            connection
+                .prepare_cached(
+                    "WITH live_paths AS (
+                         SELECT MAX(bytes_hi) AS bytes_hi, bytes_lo
+                         FROM files WHERE tenant = ?1 AND deleted = 0
+                         GROUP BY CASE WHEN stored_as = ''
+                             THEN link_id || '/' || upload_index || '/' || file_index
+                             ELSE stored_as END
+                     )
+                     SELECT COUNT(*), COALESCE(SUM(bytes_hi), 0), COALESCE(SUM(bytes_lo), 0)
+                     FROM live_paths",
+                )?
+                .query_row(rusqlite::params![tenant], |row| {
+                    let count: i64 = row.get(0)?;
+                    Ok((
+                        u64::try_from(count).unwrap_or(0),
+                        combine_byte_sums(row.get(1)?, row.get(2)?),
+                    ))
+                })
+        })
+    }
+
+    /// Issued downloads in one tenant namespace: links still usable now and
+    /// downloads served across every link.
+    pub fn outbound_summary(&self, tenant: &str, now: u64) -> Result<(u64, u64), String> {
+        self.with(|connection| {
+            connection
+                .prepare_cached(
+                    "SELECT COALESCE(SUM(revoked_at IS NULL AND expires_at > ?2), 0),
+                            COALESCE(SUM(downloads), 0)
+                     FROM outbound_grants WHERE tenant = ?1",
+                )?
+                .query_row(
+                    rusqlite::params![tenant, i64::try_from(now).unwrap_or(i64::MAX)],
+                    |row| {
+                        let open: i64 = row.get(0)?;
+                        let downloads: i64 = row.get(1)?;
+                        Ok((
+                            u64::try_from(open).unwrap_or(0),
+                            u64::try_from(downloads).unwrap_or(0),
+                        ))
+                    },
+                )
+        })
+    }
+
     /// Uploads completed at or after `since` in one tenant namespace (count,
     /// bytes), partial records excluded. Polled, so the statement is cached
     /// and the tenant filter keeps links_tenant_created in play.

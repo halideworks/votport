@@ -31,6 +31,29 @@
       </div>
 
       <h1>Deliver files</h1>
+
+      <section id="status-strip" class="status-strip" aria-label="Status" hidden>
+        <div class="stat">
+          <span class="stat-label">Active downloads</span>
+          <strong id="stat-active">0</strong>
+          <span id="stat-active-detail" class="muted">nothing being served</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Open links</span>
+          <strong id="stat-open">0</strong>
+          <span class="muted">usable now</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Downloads</span>
+          <strong id="stat-downloads">0</strong>
+          <span class="muted">served in total</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Disk free</span>
+          <strong id="stat-disk">&ndash;</strong>
+          <span class="muted">library root</span>
+        </div>
+      </section>
       <section class="card" aria-labelledby="deliver-title">
         <h2 id="deliver-title">Create download link</h2>
         <form id="deliver-upload-form">
