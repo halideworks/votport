@@ -2,6 +2,7 @@
 // VOTPORT PROPRIETARY LICENSE.
 
 import { appendObjectCard } from '/assets/object-card.js';
+import { narrate, summarize, timelineJson } from '/assets/timeline.js';
 import {
   alertModal,
   announce,
@@ -44,22 +45,84 @@ async function issueReceivedGrant(link, upload, fileIndex, file) {
   showGrantResult(url, response.grant?.has_password);
 }
 
-function logSentence(event) {
-  const file = event.path ?? 'a file';
-  switch (event.kind) {
-    case 'opened': return 'Session opened, manifest verified';
-    case 'reattached': return `Re-attached after a restart, ${event.count ?? 0} file${event.count === 1 ? '' : 's'} already published`;
-    case 'published': return `${file} published with its receipt`
-      + (event.bytes !== undefined ? ` · ${formatBytes(event.bytes)}` : '')
-      + (event.secs ? ` in ${formatDuration(event.secs)}` : '');
-    case 'quiet': return `Sender was quiet for ${formatDuration(event.secs ?? 0)}`;
-    case 'finished': return `Finished${event.count ? ` · ${event.count} re-sent chunk${event.count === 1 ? '' : 's'}` : ''}`;
-    case 'cancelled': return 'Cancelled by the sender';
-    case 'interrupted': return 'Session went idle and expired';
-    case 'dropped': return 'Resume refused after a restart; published files kept';
-    case 'elided': return `${event.count} more events not kept`;
-    default: return event.kind;
+// The transfer timeline: summary figures and one line per log event, in
+// the shared dialog. Everything shown is read from the record.
+function openTimeline(link, upload) {
+  const dialog = $('timeline');
+  const summary = summarize(upload);
+  $('timeline-kicker').textContent = link.label;
+  $('timeline-title').textContent = `Transfer on ${formatWhen(upload.started_at || upload.completed_at)}`;
+  const meta = [
+    `${summary.files} file${summary.files === 1 ? '' : 's'}`,
+    formatBytes(summary.bytes),
+    summary.transport === 'push' ? 'native push' : 'http',
+    summary.outcome === 'finished' ? `finished ${formatWhen(upload.completed_at)}` : summary.outcome,
+  ];
+  $('timeline-meta').textContent = meta.join(' · ');
+  const stats = $('timeline-stats');
+  stats.replaceChildren();
+  const cell = (label, value, note) => {
+    const box = document.createElement('div');
+    box.className = 'stat';
+    const head = document.createElement('span');
+    head.className = 'stat-label';
+    head.textContent = label;
+    const strong = document.createElement('strong');
+    strong.textContent = value;
+    box.append(head, strong);
+    if (note) {
+      const small = document.createElement('span');
+      small.className = 'muted';
+      small.textContent = note;
+      box.append(small);
+    }
+    return box;
+  };
+  stats.append(
+    cell('Duration', summary.duration === null ? '–' : formatDuration(summary.duration)),
+    cell('Average rate', summary.average === null ? '–' : `${formatBytes(summary.average)}/s`,
+      summary.peak === null ? undefined : `peak ${formatBytes(summary.peak)}/s`),
+    cell('Pauses', summary.pauses ? formatDuration(summary.pauses) : 'none',
+      summary.restarts ? `${summary.restarts} restart${summary.restarts === 1 ? '' : 's'}` : undefined),
+    cell('Re-sent chunks', String(summary.resent), `${summary.rejected} rejected`),
+  );
+  const events = $('timeline-events');
+  events.replaceChildren();
+  for (const event of upload.log || []) {
+    const row = document.createElement('li');
+    row.dataset.kind = event.kind;
+    const when = document.createElement('span');
+    when.className = 'when mono';
+    when.textContent = new Date(event.at * 1000).toLocaleTimeString();
+    const text = document.createElement('span');
+    const line = narrate(event);
+    text.textContent = line.text;
+    row.append(when, text);
+    if (line.detail) {
+      const detail = document.createElement('span');
+      detail.className = 'detail';
+      detail.textContent = line.detail;
+      row.append(detail);
+    }
+    events.append(row);
   }
+  if (!events.firstChild) {
+    const row = document.createElement('li');
+    row.textContent = 'This transfer predates the timeline; only its record is known.';
+    events.append(row);
+  }
+  const download = $('timeline-download');
+  download.onclick = () => {
+    const blob = new window.Blob([timelineJson(link, upload)], { type: 'application/json' });
+    const url = window.URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `votport-transfer-${upload.id}.json`;
+    anchor.click();
+    setTimeout(() => window.URL.revokeObjectURL(url), 1000);
+  };
+  $('timeline-audit').href = `/audit?q=${encodeURIComponent(link.id)}`;
+  dialog.showModal();
 }
 
 // Actions inside an undo window, keyed by what they change. The renderer
@@ -109,30 +172,7 @@ function renderUpload(link, upload) {
   transport.className = 'badge';
   transport.textContent = upload.transport === 'push' ? 'native push' : 'http';
   head.append(when, transport);
-  // The log, ship's-log style: one line per event, facts rendered as words.
-  if (upload.log?.length) {
-    const log = document.createElement('div');
-    log.className = 'transfer-log';
-    log.hidden = true;
-    head.append(
-      button('Log', 'tiny ghost', () => {
-        log.hidden = !log.hidden;
-        if (!log.hidden && !log.firstChild) {
-          for (const event of upload.log) {
-            const line = document.createElement('div');
-            const at = document.createElement('span');
-            at.className = 'mono muted';
-            at.textContent = new Date(event.at * 1000).toLocaleTimeString();
-            const text = document.createElement('span');
-            text.textContent = logSentence(event);
-            line.append(at, text);
-            log.append(line);
-          }
-        }
-      }),
-    );
-    logBox = log;
-  }
+  head.append(button('Timeline', 'tiny ghost', () => openTimeline(link, upload)));
   if (upload.partial) {
     const partial = document.createElement('span');
     partial.className = 'badge off';
@@ -234,7 +274,6 @@ function renderUpload(link, upload) {
   root.className = 'mono muted file-id';
   root.textContent = `package ${upload.package_root}`;
   item.append(root);
-  if (logBox) item.append(logBox);
   return item;
 }
 

@@ -115,6 +115,24 @@
       <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
     </div>
 
+    <dialog id="timeline" class="modal timeline">
+      <form method="dialog">
+        <div class="timeline-head">
+          <div>
+            <p id="timeline-kicker" class="stat-label"></p>
+            <h2 id="timeline-title">Transfer</h2>
+            <p id="timeline-meta" class="muted"></p>
+          </div>
+          <button value="close" class="ghost tiny" id="timeline-close">Close</button>
+        </div>
+        <div id="timeline-stats" class="timeline-stats"></div>
+        <ol id="timeline-events" class="timeline-events"></ol>
+        <div class="modal-actions timeline-actions">
+          <button type="button" class="ghost tiny" id="timeline-download">Download timeline JSON</button>
+          <a id="timeline-audit" class="button tiny ghost" href="/audit">Open audit rows</a>
+        </div>
+      </form>
+    </dialog>
     <dialog id="confirm" class="modal">
       <form method="dialog">
         <h2 id="confirm-title">Confirm</h2>
