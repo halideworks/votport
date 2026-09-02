@@ -737,6 +737,7 @@ button.danger:hover:not(:disabled) {
 .modal .timeline-head p {
  margin: 0;
  font-size: 0.8rem;
+ color: var(--muted);
 }
 .modal .timeline-head .stat-label {
  font-size: 0.6rem;
@@ -754,12 +755,12 @@ button.danger:hover:not(:disabled) {
 .timeline-events {
  list-style: none;
  margin: 0 0 1rem;
- padding: 0;
+ /* Overflow clips at the padding box: this keeps the dots inside it. */
+ padding: 0 0 0 0.3rem;
  max-height: 40vh;
  overflow-y: auto;
 }
-/* The spine and its dots sit inside the row, so the scroll box clips none of
-   them; each row draws its own segment. */
+/* Each row draws its own spine segment; the dot straddles it. */
 .timeline-events li {
  position: relative;
  display: grid;
@@ -772,7 +773,7 @@ button.danger:hover:not(:disabled) {
 .timeline-events li::before {
  content: "";
  position: absolute;
- left: 0.15rem;
+ left: -0.3rem;
  top: 0.85rem;
  width: 0.5rem;
  height: 0.5rem;
