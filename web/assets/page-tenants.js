@@ -503,7 +503,7 @@ $('principal-load-more').addEventListener('click', () =>
 // The list loads alongside the session check, one round trip for both.
 // The page itself is hidden from non-platform admins by the nav; direct
 // navigation gets bounced to their home.
-const [session] = await Promise.all([requireSession(), refreshTenants()]);
+const [session] = await Promise.all([requireSession(), refreshTenants().catch(() => {})]);
 if (!session.pages.includes('tenants')) {
   window.location.replace('/receive');
 }

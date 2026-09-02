@@ -441,16 +441,16 @@ pub async fn admin_status(
     // not there. One stat per live file, off the runtime thread.
     // ponytail: every poll stats every live file; cache the sweep once a
     // tenant holds tens of thousands of records.
-    let live = app
-        .store
-        .tenant_live_files(&identity.tenant)
-        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let stored = {
         let app = Arc::clone(&app);
         let tenant = identity.tenant.clone();
-        tokio::task::spawn_blocking(move || stored_on_disk(&app, &tenant, &live))
-            .await
-            .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        tokio::task::spawn_blocking(move || {
+            let live = app.store.tenant_live_files(&tenant)?;
+            Ok::<_, String>(stored_on_disk(&app, &tenant, &live))
+        })
+        .await
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
     };
     let now = now_unix();
     // Downloads in flight are keyed by the grant's hex token hash, a colon,

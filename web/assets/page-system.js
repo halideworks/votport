@@ -697,6 +697,7 @@ for (const section of document.querySelectorAll('.settings-group[id]')) observer
 
 // Settings load alongside the session check, one round trip for both.
 const settingsReady = api('/api/admin/settings');
+settingsReady.catch(() => {});
 const session = await requireSession();
 if (!session.pages.includes('system')) {
   window.location.replace('/receive');
