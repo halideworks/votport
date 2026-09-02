@@ -43,20 +43,17 @@ async function reloadIfServerUpdated() {
 const picked = new Map(); // relative path -> File
 let uploading = false;
 let cancelled = false;
+let allowHidden = true; // the server's VOTPORT_ALLOW_HIDDEN, from the link info
+let maxEntries = 20000; // the server's package entry cap, from the link info
 let controller = null; // aborts in-flight requests when the sender cancels
-
-// Hash this many files ahead of the one being uploaded; they hash in parallel
-// across the worker pool, and the gate keeps the finished merkle trees pinned
-// in worker memory bounded.
-const LOOKAHEAD = 2;
 
 // ------------------------------------------------------------- hash workers
 // Hashing and the merkle trees live in workers so the page stays responsive
 // and hashing genuinely overlaps upload bookkeeping. Each file's tree stays
 // in the worker that owns it, which also serves its range proofs. A large
 // file is hashed as segments across the whole pool and assembled on its
-// owner; the lookahead gate caps how many files may be ahead of the upload
-// cursor, not how many workers one file may use.
+// owner. Every tree of a drop stays pinned until the drop finishes, since
+// one package announces them all.
 
 // Measured 2026-09-02 on a 20-core desktop hashing 256 MiB per worker:
 // Firefox 157, 326, 545 MiB/s at 1, 2, 4 workers (flat beyond), Chromium
@@ -67,9 +64,9 @@ const MAX_WORKERS = 8;
 const PARALLEL_MIN_BYTES = 64 * 1024 * 1024;
 const MIN_SEGMENT_BYTES = 16 * 1024 * 1024;
 const PROOF_LEAF_BYTES = 65536;
-// One file at a time takes the whole pool; the other file in the lookahead
-// hashes in one piece, so live read buffers stay at pool size plus one, not
-// twice the pool.
+// One file at a time takes the whole pool for segments while the other
+// lanes keep hashing whole files, so live read buffers can reach twice the
+// pool size.
 let parallelHashing = false;
 
 let hashWorkers = [];
@@ -157,7 +154,6 @@ class Paused extends Error {
 // before its next prove and re-begins from the server's covered_bytes.
 const WORKER_RESTART_CAP = 3;
 let workerRestarts = 0;
-let sendCursor = null; // path sendOne is currently on, if not in workerByPath
 let recovering = false;
 let readySignal = null; // promise owned by the recovery round in flight
 let workerFatal = null; // set once the restart cap fires; every pause turns fatal
@@ -175,13 +171,12 @@ async function recoverWorkers() {
     return;
   }
   if (workerRestarts >= WORKER_RESTART_CAP) {
-    workerFatal = new Error('Verification stopped. Try sending again.');
+    workerFatal = new Error('Verification stopped. Try sending again');
     stopWorkers(workerFatal);
     return;
   }
   recovering = true;
   const paths = [...workerByPath.keys()];
-  if (sendCursor && !paths.includes(sendCursor)) paths.push(sendCursor);
   // In-flight calls reject with Paused so their owners retry instead of
   // treating the death as a cancel.
   stopWorkers(new Paused());
@@ -191,10 +186,14 @@ async function recoverWorkers() {
   startWorkers();
   setPhase('Preparing');
   try {
+    // Delivered files released their trees, so only the ones still to send
+    // are here; spread them over the fresh pool like the first pass did.
+    let index = 0;
     for (const path of paths) {
       const file = picked.get(path);
       if (!file) continue;
-      await workerCall({ op: 'hash', key: path, file });
+      await workerCall({ op: 'hash', key: path, file }, index);
+      index += 1;
     }
   } catch (error) {
     // Another death mid-recovery: its owner retries through the normal pause
@@ -307,6 +306,14 @@ document.addEventListener('visibilitychange', () => {
   if (!hashWorkers.length) recoverWorkers();
 });
 
+// " The one already delivered is kept." or " The N already delivered are kept."
+function keptPhrase(count) {
+  if (!count) return '';
+  return count === 1
+    ? ' The one already delivered is kept.'
+    : ` The ${count} already delivered are kept.`;
+}
+
 function fail(message) {
   $('upload-error').textContent = message;
   $('upload-error').hidden = false;
@@ -317,7 +324,7 @@ function fail(message) {
 // before hashing starts. The server re-checks everything.
 
 const FORBIDDEN = new RegExp(
-  '[\\x00-\\x1f/\\\\<>:"|?*\\u200c\\u200d\\u202a-\\u202e\\u2066-\\u2069\\ufeff]',
+  '[\\x00-\\x1f/\\\\<>:"|?*~\\u200c\\u200d\\u202a-\\u202e\\u2066-\\u2069\\ufeff]',
   'u',
 );
 const utf8 = new TextEncoder();
@@ -339,10 +346,20 @@ function validateComponent(component) {
     return 'name is empty or longer than 255 bytes';
   }
   if (FORBIDDEN.test(component)) {
-    return 'name contains a character that does not travel well (\\ / < > : " | ? * or control characters)';
+    return 'name contains a character that does not travel well (\\ / < > : " | ? * ~ or control characters)';
   }
   if (component.endsWith('.') || component.endsWith(' ')) {
     return 'name may not end with a dot or space';
+  }
+  if (component.startsWith('.')) {
+    // Mirrors paths::admit_component so a refusal costs nothing hashed.
+    if (!allowHidden) return 'hidden names (starting with a dot) are not accepted here';
+    if (/[^\x00-\x7f]/.test(component)) return 'non-ASCII hidden names are reserved';
+    if (/^\.vot-tenants\.stage$/i.test(component)
+      || /^\.vot-push-[0-9a-f]{32}$/.test(component)
+      || /^\.vot-.*\.(stage|journal)$/.test(component)) {
+      return 'this name is reserved for the server';
+    }
   }
   const compatibility = component.normalize('NFKC');
   if (compatibility === '.' || compatibility === '..') return 'name is a directory reference';
@@ -353,6 +370,11 @@ function validateComponent(component) {
     return `"${stem}" is a reserved device name on Windows`;
   }
   return null;
+}
+
+// Same folding as pathKeyBytes, as a string, for the pick-time collision check.
+function pathKeyString(components) {
+  return components.map((component) => fold(component).replace(/[. ]+$/, '')).join('\0');
 }
 
 function pathKeyBytes(components) {
@@ -384,6 +406,10 @@ function addFiles(files) {
 
 function addNamed(pairs) {
   if (uploading) return;
+  // Validate the whole batch before touching `picked`, so a refusal leaves
+  // the selection, its rows, and the collision keys consistent.
+  const keys = new Map(pickedKeys);
+  const accepted = [];
   for (const { path, file } of pairs) {
     const components = path.split('/').filter(Boolean);
     for (const component of components) {
@@ -393,28 +419,48 @@ function addNamed(pairs) {
         return;
       }
     }
-    picked.set(components.join('/'), file);
+    const joined = components.join('/');
+    // One package holds the whole drop, so two names that fold to the same
+    // key would be refused at the manifest; catch it before hashing.
+    const key = pathKeyString(components);
+    const other = keys.get(key);
+    if (other !== undefined && other !== joined) {
+      fail(`"${other}" and "${joined}" collide once case is folded; rename one`);
+      return;
+    }
+    keys.set(key, joined);
+    accepted.push([joined, file]);
   }
+  for (const [joined, file] of accepted) picked.set(joined, file);
   $('upload-error').hidden = true;
   renderPicked();
 }
 
 // path -> its list row, so per-chunk status updates skip the O(files) scan.
 let rows = new Map();
+// folded path key -> path, rebuilt with the rows, for the collision check.
+let pickedKeys = new Map();
 let sizeLimitError = false;
 
 function sizeLimitMessage(total) {
-  if (maxBytes === null || total <= maxBytes) return null;
-  return `Selected files total ${formatBytes(total)} exceeds this link's ${formatBytes(maxBytes)} limit. Clear the selection and choose fewer files.`;
+  if (maxBytes !== null && total > maxBytes) {
+    return `Selected files total ${formatBytes(total)} exceeds this link's ${formatBytes(maxBytes)} limit. Clear the selection and choose fewer files.`;
+  }
+  if (picked.size > maxEntries) {
+    return `${picked.size} files selected; a drop holds up to ${maxEntries.toLocaleString()} files. Clear the selection and send it in parts.`;
+  }
+  return null;
 }
 
 function renderPicked() {
   const list = $('file-list');
   list.replaceChildren();
   rows = new Map();
+  pickedKeys = new Map();
   let total = 0;
   for (const [path, file] of picked) {
     total += file.size;
+    pickedKeys.set(pathKeyString(path.split('/')), path);
     const item = document.createElement('li');
     item.dataset.path = path;
     const name = document.createElement('span');
@@ -777,28 +823,25 @@ async function runUpload() {
       || /unknown or expired session/.test(error.message || '');
   }
 
-  async function sendOne(item) {
-    // One VOT package per file. A package root is a hash over every entry it
-    // contains, so a batch package cannot be announced until the last file is
-    // hashed — which is precisely what would prevent overlapping hashing with
-    // uploading. Per file, each package is announced the moment its own file
-    // is ready, and anything already delivered stays delivered if a later
-    // file fails.
-    const { summary, pages, seal } = buildPackage([item]);
+  async function sendDrop(items) {
+    // One VOT package for the whole drop: one session, one upload record, one
+    // notification, and files already published stay published if a later
+    // one fails (the server records them as a partial upload and dedupes
+    // them on the next send). buildPackage sorts items into manifest order,
+    // so entry.index addresses items directly.
+    const { summary, pages, seal } = buildPackage(items);
     const packageId = summary.objectId;
     const rootHex = hex(packageId.root);
     const suite = packageId.suite === Suite.Blake3Bao64 ? 'blake3' : 'sha256';
-    sendCursor = item.path;
     // Hashing is done; this is the session announce, seal, and pages.
-    setStatus(item.path, 'Opening');
+    for (const item of items) setStatus(item.path, 'Opening');
 
-    // Re-attach to an interrupted session for this exact file. The root is
-    // part of the match, so a file edited since the interruption starts over
-    // rather than failing deep inside range verification.
+    // Re-attach to an interrupted session for this exact drop. The package
+    // root covers every file's bytes and path, so a file edited or added
+    // since the interruption starts over rather than failing deep inside
+    // range verification.
     const saved = loadResume();
-    const resume = saved && saved.root === rootHex && saved.path === item.path
-      ? saved
-      : null;
+    const resume = saved && saved.root === rootHex ? saved : null;
     let sessionId = resume?.session || null;
     if (sessionId) {
       // Keep the interrupted run's chunk grid: a different chunk size would
@@ -822,7 +865,12 @@ async function runUpload() {
         if (sessionId) {
           try {
             ({ entries } = await postWithRetry(`/api/session/${sessionId}/begin`, {}));
-            setStatus(item.path, 'Continuing');
+            for (const item of items) {
+              // A row already marked delivered keeps that mark.
+              if (!rows.get(item.path)?.classList.contains('done')) {
+                setStatus(item.path, 'Continuing');
+              }
+            }
           } catch (error) {
             if (error.cancelled || error.paused) throw error;
             // Session swept or server restarted: fall through and create a
@@ -848,8 +896,8 @@ async function runUpload() {
           // on how far the transfer got, so nothing needs saving per chunk.
           saveResume({
             session: sessionId,
-            path: item.path,
-            size: item.file.size,
+            files: items.length,
+            size: totalBytes,
             root: rootHex,
             chunk: chunkBytes,
           });
@@ -868,6 +916,7 @@ async function runUpload() {
 
         rangePostSeen ||= entries.some((entry) => !entry.complete);
         for (const entry of entries) {
+          const item = items[entry.index];
           // covered_bytes is the server's contiguous verified prefix, so it is
           // safe to restart from even when chunks landed out of order.
           const already = entry.complete
@@ -882,9 +931,14 @@ async function runUpload() {
           }
           if (entry.complete) {
             setMeter(totalBytes ? sent / totalBytes : 1);
+            markDelivered(item);
             continue;
           }
           let fileSent = already;
+          // A delivered entry released its tree; if a later begin reports it
+          // incomplete after all (a kill inside the checkpoint window), hash
+          // it again rather than proving against nothing.
+          if (!workerByPath.has(item.path)) await hashOne([item.path, item.file], entry.index);
           await uploadEntryChunks(sessionId, entry.index, item, BigInt(already), (step) => {
             sent += step;
             sentForNote = sent;
@@ -905,6 +959,9 @@ async function runUpload() {
               item.file.size ? fileSent / item.file.size : 1,
             );
           });
+          // Every range was verified on arrival and the last one published
+          // the file, so it is delivered even if the drop stops here.
+          markDelivered(item);
         }
         let report;
         try {
@@ -920,18 +977,13 @@ async function runUpload() {
         }
         delivered.push(...report.files);
         clearResume();
-        workerByPath.get(item.path)?.postMessage({ op: 'drop', key: item.path }); // frees the tree
-        sendCursor = null;
-        setStatus(item.path, 'delivered \u2713', true);
         return;
       } catch (error) {
         // Only a deliberate cancel throws the session away. A network failure
         // or dead worker pauses and retries this same session; the partially
         // written bytes stay on the server until it goes idle.
         if (error.cancelled) {
-          fetch(`/api/session/${sessionId}/abort`, { method: 'POST' }).catch(() => {});
-          clearResume();
-          sendCursor = null;
+          await abortSession(sessionId);
           throw error;
         }
         if (error.paused || error.rebegin) {
@@ -940,50 +992,72 @@ async function runUpload() {
           if (workerFatal) throw workerFatal;
           stalledRounds += 1;
           if (stalledRounds > 100) {
-            throw new Error(
-              'Transfer kept pausing. Reselect the same files to resume where this stopped.',
-            );
+            throw new Error('Transfer kept pausing');
           }
           continue;
         }
-        sendCursor = null;
+        if (error.status === 422 || error.status === 409) {
+          // Refused for good: abort so the server records what did publish
+          // now (a swept session would only do so after the idle timeout)
+          // and the next send dedupes it instead of landing suffixed copies.
+          await abortSession(sessionId);
+        }
         throw error;
       }
     }
   }
 
+  // Awaited, so a re-send within one round trip finds the partial record
+  // the abort writes rather than landing suffixed copies.
+  async function abortSession(sessionId) {
+    if (sessionId) {
+      // Bounded: a cancel pressed on a dead line must not hang on this.
+      await fetch(`/api/session/${sessionId}/abort`, {
+        method: 'POST',
+        keepalive: true,
+        // Chrome before 103 lacks the helper; a throw here would replace
+        // the error being handled and skip clearResume.
+        signal: globalThis.AbortSignal?.timeout?.(5000),
+      }).catch(() => {});
+    }
+    clearResume();
+  }
+
+  // A delivered file's tree is no longer needed for proofs, and dropping it
+  // keeps a worker-death recovery from re-hashing files already landed.
+  function markDelivered(item) {
+    setStatus(item.path, 'delivered \u2713', true);
+    const worker = workerByPath.get(item.path);
+    if (worker) {
+      worker.postMessage({ op: 'drop', key: item.path });
+      workerByPath.delete(item.path);
+    }
+  }
+
   setPhase('Preparing');
-  $('progress-note').textContent = 'verifying the first file locally';
+  $('progress-note').textContent = 'verifying files locally';
   setMeter(0);
 
-  // Hashing runs ahead of uploading by up to LOOKAHEAD files, and those files
-  // hash in parallel across the worker pool. The gate keeps hashing from
-  // running further ahead than that and pinning many finished merkle trees in
-  // worker memory at once.
-  const uploaded = files.map(() => {
-    let release;
-    return { promise: new Promise((resolve) => { release = resolve; }), release };
-  });
-  const hashes = files.map((entry, index) => {
-    const gate = index >= LOOKAHEAD ? uploaded[index - LOOKAHEAD].promise : Promise.resolve();
-    return gate.then(() => hashOne(entry, index));
-  });
-  // Each is awaited in order below; this only stops the ones after a failure
-  // from being reported as unhandled rejections.
-  hashes.forEach((promise) => { promise.catch(() => {}); });
-
-  for (let index = 0; index < files.length; index += 1) {
-    const item = await hashes[index];
-    try {
-      await sendOne(item);
-    } catch (error) {
-      if (delivered.length) {
-        error.message += ` (${delivered.length} file(s) already delivered and kept)`;
-      }
-      throw error;
+  // The package root covers every file, so the drop cannot be announced
+  // until the last file is hashed. Files hash in parallel, one lane per
+  // worker; the lane number pins each file's tree to that lane's worker.
+  // ponytail: hashing no longer overlaps sending, so hash time adds to wall
+  // time (a tenth or less on typical client links); batch packages by bytes
+  // if a measurement shows it on the wire.
+  const items = new Array(files.length);
+  let next = 0;
+  const lane = async (laneIndex) => {
+    for (;;) {
+      const index = next;
+      next += 1;
+      if (index >= files.length) return;
+      items[index] = await hashOne(files[index], laneIndex);
     }
-    uploaded[index].release();
-  }
+  };
+  await Promise.all(
+    Array.from({ length: Math.max(1, hashWorkers.length) }, (_, laneIndex) => lane(laneIndex)),
+  );
+  await sendDrop(items);
   showDone({ files: delivered });
 }
 
@@ -1025,12 +1099,9 @@ $('cancel').addEventListener('click', () => {
   // Delivered rows are marked .done in the staged list as each file lands;
   // #done-list only exists after the whole transfer finishes.
   const delivered = $('file-list').querySelectorAll('.done').length;
-  const kept = delivered === 1
-    ? 'The one already delivered is kept.'
-    : `The ${delivered} already delivered are kept.`;
   $('confirm-cancel-detail').textContent = delivered
-    ? `The file in progress is discarded. ${kept}`
-    : 'The file in progress is discarded. Nothing already delivered is affected.';
+    ? `Files still in progress are discarded.${keptPhrase(delivered)}`
+    : 'Files still in progress are discarded. Nothing already delivered is affected.';
   $('confirm-cancel').showModal();
 });
 
@@ -1151,15 +1222,18 @@ $('upload-form').addEventListener('submit', async (event) => {
       || error.status === 410
       || /unknown or expired session/.test(error.message);
     if (expired) clearResume();
-    // A refused range or publish is not a network story; say what it means.
+    // A refusal is not a network story: the server said why, and whether
+    // anything landed decides the advice.
     const unverified = error.status === 422 || error.status === 409;
+    const kept = $('file-list').querySelectorAll('.done').length;
+    const keptNote = keptPhrase(kept);
     fail(error.cancelled
       ? error.message
       : unverified
-        ? 'This file could not be verified. Try sending it again.'
+        ? `${error.message}.${keptNote} ${kept ? 'Fix the rest and send them again.' : 'Nothing was delivered; fix the selection and send again.'}`
         : expired
-          ? `${error.message}. The partial transfer was discarded, reselect the same files to send them again from the start.`
-          : `${error.message}. Reselect the same files to resume where this stopped.`);
+          ? `${error.message}.${keptNote} The partial transfer was discarded, reselect the same files to send them again from the start.`
+          : `${error.message}.${keptNote} Reselect the same files to resume where this stopped.`);
     $('progress-card').hidden = true;
     $('send').disabled = false;
     $('clear-files').disabled = false;
@@ -1167,7 +1241,6 @@ $('upload-form').addEventListener('submit', async (event) => {
   } finally {
     uploading = false;
     controller = null;
-    sendCursor = null;
     stopWorkers();
     releaseWakeLock();
   }
@@ -1180,9 +1253,9 @@ function showResumeNote() {
     note.hidden = true;
     return;
   }
-  $('resume-detail').textContent = Number.isFinite(saved.size)
+  $('resume-detail').textContent = saved.path
     ? `${formatBytes(saved.size)} of "${saved.path}" is held on the server.`
-    : `"${saved.path}" is held on the server.`;
+    : `A ${saved.files === 1 ? 'file' : `${saved.files}-file drop`} of ${formatBytes(saved.size)} is held on the server.`;
   note.hidden = false;
 }
 
@@ -1227,6 +1300,8 @@ $('resume-discard').addEventListener('click', () => {
   $('subtitle').textContent = 'Files are verified on receipt.';
   applyBranding(info.branding, `/api/r/${token}/logo`);
   chunkBytes = info.chunk_bytes || chunkBytes;
+  allowHidden = info.allow_hidden !== false;
+  maxEntries = info.max_entries || maxEntries;
   maxBytes = Number.isFinite(info.max_bytes) ? info.max_bytes : null;
   webBuild = info.web_build || null;
   try {

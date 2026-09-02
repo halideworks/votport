@@ -32,13 +32,13 @@ Object identity is already on every completed upload. `server/src/store.rs` `Fil
 | `receipt` | Whether `<stored_as>.vot-receipt` was written |
 | `deleted` | Tombstone after admin or retention delete |
 
-`UploadRecord.package_root` is the hex root of the verified package manifest. The sender in `upload.js` `sendOne` builds **one VOT package per file**, so a listing row has both a file object id and a package root. They are different hashes (the package hashes its entries). The product card is the **file object**, not the package.
+`UploadRecord.package_root` is the hex root of the verified package manifest. The sender in `upload.js` `sendDrop` builds **one VOT package per drop** (every selected file as one entry each), so a listing row has both a file object id and the drop's package root. They are different hashes (the package hashes its entries). The product card is the **file object**, not the package.
 
 `server/src/api/admin.rs` `FileView` is that record plus a live `exists` boolean. `GET /api/admin/links` also returns `receipt_key: app.signer.public_hex`. `FinishReport.files` in `session.rs` `handle_finish` is `Vec<FileRecord>`, so the sender's `#done-list` already receives `suite`, `root`, `bytes`, `receipt`, `path`.
 
 Receipts are already the right evidence. `ReceiptSigner::write_sidecar` (`server/src/receipt.rs`) writes canonical vot-receipt CBOR, ed25519-signed, `SubjectKind::Object`, `AssuranceLevel::Published`, `CommitProfile::Balanced`. The crate cap is `decode_authenticated` rejecting input longer than 65_536 bytes. The e2e `receipts_are_written_and_files_are_manageable` already round-trips `decode_authenticated` plus `verify_ed25519` against `listing["receipt_key"]`.
 
-The sender already hashes in module workers with vot-wasm SIMD (`hash-worker.js` `ObjectBuilder(Suite.Blake3Bao64, ...)`), keeps eight range POSTs in flight (`UPLOADS_IN_FLIGHT = 8`), and hashes two files ahead (`LOOKAHEAD = 2`). Resume is keyed on **package** root plus path, not the file object id. In `upload.js` `sendOne`, `rootHex` is `hex(packageId.root)` from `buildPackage([item]).summary.objectId`; `saveResume` / `loadResume` use `votport-resume-${token}` and match `saved.root === rootHex && saved.path === item.path`. `item.objectId` (the file object) is never written to the resume record. Per-file packages make the two move together when the bytes change, so behavior is correct; the label is package root. Do not retarget `saved.root` in this slice. `CHUNK_BYTES` is 8 MiB in `session.rs` and is advertised as `chunk_bytes` on `GET /api/r/{token}` and session create. Do not raise it.
+The sender already hashes in module workers with vot-wasm SIMD (`hash-worker.js` `ObjectBuilder(Suite.Blake3Bao64, ...)`), keeps eight range POSTs in flight (`UPLOADS_IN_FLIGHT = 8`), and hashes every file of a drop across the pool before announcing the package. Resume is keyed on the **package** root alone, not a file object id. In `upload.js` `sendDrop`, `rootHex` is `hex(packageId.root)` from `buildPackage(items).summary.objectId`; `saveResume` / `loadResume` use `votport-resume-${token}` and match `saved.root === rootHex`. The record carries `files` and `size` for the resume note. The package root covers every entry's path and bytes, so any edit to the selection produces a new root and a fresh session; `item.objectId` is never written to the record. `CHUNK_BYTES` is 8 MiB in `session.rs` and is advertised as `chunk_bytes` on `GET /api/r/{token}` and session create. Do not raise it.
 
 Admin QR of the request URL already exists (`GET /api/admin/links/{id}/qr`, toggled from `page-links.js`). The sender does not need a QR of the link.
 
@@ -352,7 +352,7 @@ sequenceDiagram
 
 ### Sender progress UX
 
-All of this is `web/request.html` copy plus `web/assets/upload.js` control flow. No protocol change. `saveResume` / `loadResume` / `clearResume` stay keyed on **package** root plus path (`saved.root` is `hex(packageId.root)`). Schema frozen: do not retarget `saved.root` at `item.objectId`.
+All of this is `web/request.html` copy plus `web/assets/upload.js` control flow. No protocol change. `saveResume` / `loadResume` / `clearResume` stay keyed on the **package** root (`saved.root` is `hex(packageId.root)`); the per-file `path` key went away with the one-package-per-drop sender. Do not retarget `saved.root` at `item.objectId`.
 
 #### One verb, two rates, two phases
 

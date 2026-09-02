@@ -79,6 +79,10 @@ pub async fn link_info(
         "usable": usable,
         "max_bytes": effective_cap(&app, &link),
         "chunk_bytes": session::CHUNK_BYTES,
+        // The sender refuses dotfiles before hashing when this is off; the
+        // server re-checks at begin.
+        "allow_hidden": app.config.allow_hidden,
+        "max_entries": session::MAX_ENTRIES,
         "push": app.push.is_some(),
         "web_build": app.web_build,
     })))
@@ -865,11 +869,11 @@ pub async fn upload_finish(
         // good; the session slot itself is reclaimed by the idle sweep.
         tracing::error!(%error, session = %sid.get(..8).unwrap_or(&sid), "upload completion bookkeeping failed");
     }
-    // A finished session that moved bytes is not churn: the web sender opens
-    // one session per file, and a package of many small files would otherwise
-    // stall on the per-address creation limit after twenty of them. Refunded
-    // after the slot is released above, and never for a session that finished
-    // on already-delivered files, which costs the sender nothing.
+    // A finished session that moved bytes is not churn: a sender shipping
+    // many drops in a row would otherwise stall on the per-address creation
+    // limit after twenty of them. Refunded after the slot is released above,
+    // and never for a session that finished on already-delivered files,
+    // which costs the sender nothing.
     if report.received > 0 {
         app.session_rate
             .refund(&client_ip(&headers, &peer, &app.config.trusted_proxies));

@@ -25,8 +25,20 @@ test('the shipped card carries proof the sender can copy', () => {
   assert.match(page, /id="copy-proof" class="tiny"/);
   assert.match(script, /delivered to \$\{window\.location\.host\}, verified on receipt/);
   assert.match(script, /copyToClipboard\(copy, proof\)/);
-  // One package per file: no single "package root" is claimed for the shipment.
-  assert.doesNotMatch(script, /packageRootHex/);
+  // One package per drop: the selection is announced as one session, the
+  // resume record is keyed on that package root alone, and every entry is
+  // addressed by its manifest index.
+  assert.match(script, /buildPackage\(items\)/);
+  assert.doesNotMatch(script, /buildPackage\(\[item\]\)/);
+  assert.match(script, /saved && saved\.root === rootHex \? saved : null/);
+  assert.match(script, /const item = items\[entry\.index\]/);
+  assert.match(script, /hidden names \(starting with a dot\) are not accepted here/);
+  assert.match(script, /maxEntries = info\.max_entries \|\| maxEntries/);
+  assert.match(script, /collide once case is folded; rename one/);
+  assert.match(script, /workerByPath\.delete\(item\.path\)/);
+  assert.match(script, /if \(!workerByPath\.has\(item\.path\)\) await hashOne\(/);
+  assert.match(script, /await abortSession\(sessionId\)/);
+  assert.match(script, /signal: globalThis\.AbortSignal\?\.timeout\?\.\(5000\)/);
   // The done list keeps the shape the browser e2e reads.
   assert.match(script, /status: formatBytes\(file\.bytes\) \+ \(file\.receipt \? ' · receipt ✓' : ''\)/);
 });
