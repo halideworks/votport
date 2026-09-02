@@ -536,6 +536,7 @@ mod tests {
             String::new(),
             "upload-label".to_owned(),
             FinishReport {
+                received: 0,
                 upload_id: "upload-id".to_owned(),
                 files,
             },
@@ -753,6 +754,7 @@ mod tests {
             String::new(),
             "label".to_owned(),
             FinishReport {
+                received: 0,
                 upload_id: "up-1".to_owned(),
                 files: Vec::new(),
             },
@@ -786,6 +788,7 @@ mod tests {
             String::new(),
             "smtp-label".to_owned(),
             FinishReport {
+                received: 0,
                 upload_id: "up-smtp".to_owned(),
                 files: Vec::new(),
             },

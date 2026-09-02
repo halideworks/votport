@@ -4598,16 +4598,19 @@ async fn finished_sessions_do_not_count_against_the_creation_limit() {
         .cookie_store(true)
         .build()
         .unwrap();
-    let files = [prepare(vec!["small.bin"], vec![7u8; 1024])];
+    let mut files = [prepare(vec!["small.bin"], vec![0u8; 1024])];
     let (token, first) = open_session(&client, &base, "many small", &files).await;
     let mut session = first;
-    for round in 0..22 {
+    for round in 0..22u8 {
         assert_eq!(
             begin(&client, &base, &session).await.0,
             200,
             "round {round}"
         );
         upload_chunks(&client, &base, &session, 0, &files[0]).await;
+        // Distinct content each round: a session that finishes on a file the
+        // link already holds transfers nothing and earns no refund.
+        files = [prepare(vec!["small.bin"], vec![round + 1; 1024])];
         let status = client
             .post(format!("{base}/api/session/{session}/finish"))
             .send()
@@ -4647,4 +4650,68 @@ async fn finished_sessions_do_not_count_against_the_creation_limit() {
                 .unwrap();
         }
     }
+}
+
+/// Re-sending an already-delivered file dedupes at begin and finishes without
+/// transferring bytes; that round keeps its creation budget, so a holder of a
+/// no-password link cannot loop free finishes to spam records and notices.
+#[tokio::test]
+async fn dedupe_rounds_still_consume_creation_budget() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let files = [prepare(vec!["same.bin"], vec![5u8; 1024])];
+    let (token, mut session) = open_session(&client, &base, "same file", &files).await;
+    let mut refused = None;
+    for round in 0..21 {
+        assert_eq!(
+            begin(&client, &base, &session).await.0,
+            200,
+            "round {round}"
+        );
+        upload_chunks(&client, &base, &session, 0, &files[0]).await;
+        let status = client
+            .post(format!("{base}/api/session/{session}/finish"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16();
+        assert_eq!(status, 200, "finish in round {round}");
+        let response = client
+            .post(format!("{base}/api/r/{token}/session"))
+            .json(&json!({ "password": "", "package": build_package(&files).0 }))
+            .send()
+            .await
+            .unwrap();
+        if response.status().as_u16() == 429 {
+            refused = Some(round);
+            break;
+        }
+        session = response.json::<Value>().await.unwrap()["session"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (_, pages, seal) = build_package(&files);
+        client
+            .post(format!("{base}/api/session/{session}/seal"))
+            .body(seal)
+            .send()
+            .await
+            .unwrap();
+        for page in pages {
+            client
+                .post(format!("{base}/api/session/{session}/page"))
+                .body(page)
+                .send()
+                .await
+                .unwrap();
+        }
+    }
+    // Round 0 transferred the file and was refunded; the twenty dedupe
+    // rounds after it were not.
+    assert_eq!(refused, Some(20), "{refused:?}");
 }

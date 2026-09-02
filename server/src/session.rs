@@ -136,6 +136,10 @@ pub struct ChunkProgress {
 pub struct FinishReport {
     pub upload_id: String,
     pub files: Vec<FileRecord>,
+    /// Bytes this session accepted, for the creation-limit refund: a session
+    /// that finished on already-delivered files hands nothing back.
+    #[serde(skip)]
+    pub received: u64,
 }
 
 /// Everything a worker needs that outlives one request.
@@ -406,7 +410,7 @@ fn spawn_worker_from(
                     }
                 }
                 Cmd::Finish { reply, _lease } => {
-                    let report = handle_finish(&setup, &mut phase, replays, rejected);
+                    let report = handle_finish(&setup, &mut phase, replays, rejected, received);
                     // A finished session has nothing left to re-attach; a
                     // finish refused as early keeps receiving, and its resume
                     // record with it.
@@ -1318,6 +1322,7 @@ fn handle_finish(
     phase: &mut Phase,
     replays: u64,
     rejected: u64,
+    received: u64,
 ) -> Result<FinishReport, SessionError> {
     let Phase::Receiving { files } = phase else {
         return Err(SessionError::conflict("nothing to finish in this state"));
@@ -1328,7 +1333,8 @@ fn handle_finish(
             file.display_path
         )));
     }
-    let report = commit_upload(setup, files, replays, rejected, Some("http"))?;
+    let mut report = commit_upload(setup, files, replays, rejected, Some("http"))?;
+    report.received = received;
     *phase = Phase::Done;
     Ok(report)
 }
@@ -1444,6 +1450,7 @@ fn commit_upload_records(
     Ok(FinishReport {
         upload_id,
         files: records,
+        received: 0,
     })
 }
 
@@ -3073,6 +3080,7 @@ mod pin_tests {
             Instant::now() - std::time::Duration::from_secs(2);
         assert!(reply
             .send(Ok(FinishReport {
+                received: 0,
                 upload_id: "upload".to_owned(),
                 files: Vec::new(),
             }))
