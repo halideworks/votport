@@ -144,3 +144,15 @@ test('every admin page mounts the masthead search and results deep-link into the
   assert.match(receiveScript, /revealHash\(\)/);
   assert.match(deliverScript, /revealHash\(\)/);
 });
+
+test('non-destructive receive actions use undo toasts, destructive ones keep the modal', () => {
+  const clearRecord = receiveScript.slice(receiveScript.indexOf("button('Clear record'"), receiveScript.indexOf("button('Delete stored files'"));
+  assert.match(clearRecord, /deferred\(/);
+  assert.match(receiveScript, /await undoable\(/);
+  assert.doesNotMatch(clearRecord, /confirmModal\(/);
+  const deleteFiles = receiveScript.slice(receiveScript.indexOf("button('Delete stored files'"), receiveScript.indexOf("button('Delete stored files'") + 600);
+  assert.match(deleteFiles, /confirmModal\(/);
+  assert.match(receiveScript, /keepalive: true/);
+  assert.match(commonScript, /pagehide/);
+  assert.match(commonScript, /createUndoQueue\(/);
+});

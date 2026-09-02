@@ -678,6 +678,42 @@ button.danger:hover:not(:disabled) {
  background: var(--panel);
 }
 
+/* ---- undo toasts ---------------------------------------------------------- */
+.toast-stack {
+ position: fixed;
+ left: 50%;
+ bottom: max(1.25rem, env(safe-area-inset-bottom));
+ transform: translateX(-50%);
+ display: flex;
+ flex-direction: column;
+ gap: 0.5rem;
+ z-index: 40;
+ width: min(26rem, calc(100vw - 2rem));
+ pointer-events: none;
+}
+.toast {
+ display: flex;
+ align-items: center;
+ justify-content: space-between;
+ gap: 1rem;
+ padding: 0.7rem 1rem;
+ background: var(--bg);
+ border: 1px solid var(--border-active);
+ border-radius: 0.85rem;
+ box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+ font-size: 0.82rem;
+ color: var(--text);
+ pointer-events: auto;
+}
+.toast button.link {
+ flex: none;
+ font-weight: 700;
+ text-transform: uppercase;
+ letter-spacing: 0.1em;
+ font-size: 0.62rem;
+ color: var(--progress);
+}
+
 /* ---- receive status strip ------------------------------------------------ */
 .status-strip {
  display: grid;
@@ -1733,4 +1769,50 @@ details.deployment .settings-status {
  .audit-subject {
   grid-column: 1 / -1;
  }
+}
+
+/* ---- motion ----------------------------------------------------------------
+   Transform and opacity only, short, and none at all when the viewer asked
+   for reduced motion. */
+@media (prefers-reduced-motion: no-preference) {
+ .toast {
+  animation: toast-in 0.2s ease-out;
+ }
+ .toast.leaving {
+  animation: toast-out 0.2s ease-in forwards;
+ }
+ .receiving-now > span::before {
+  animation: pulse 1.6s ease-in-out infinite;
+ }
+ .revealed {
+  animation: reveal 0.9s ease-out;
+ }
+ .nav a,
+ .settings-nav a,
+ .badge,
+ .files li .state {
+  transition: color 0.15s ease, background-color 0.15s ease, border-color 0.15s ease;
+ }
+ details > *:not(summary) {
+  animation: fade-in 0.2s ease-out;
+ }
+}
+@keyframes toast-in {
+ from { opacity: 0; transform: translateY(0.5rem); }
+ to { opacity: 1; transform: none; }
+}
+@keyframes toast-out {
+ to { opacity: 0; transform: translateY(0.5rem); }
+}
+@keyframes fade-in {
+ from { opacity: 0; }
+ to { opacity: 1; }
+}
+@keyframes pulse {
+ 0%, 100% { opacity: 1; transform: scale(1); }
+ 50% { opacity: 0.45; transform: scale(0.8); }
+}
+@keyframes reveal {
+ from { box-shadow: 0 0 0 6px rgba(56, 189, 248, 0.35); }
+ to { box-shadow: 0 0 0 1px var(--progress); }
 }
