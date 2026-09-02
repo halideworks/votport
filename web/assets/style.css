@@ -595,11 +595,6 @@ button.danger:hover:not(:disabled) {
  flex: none;
  white-space: nowrap;
 }
-/* The masthead bar keeps Sign out on the nav row; the nav wraps inside it.
-   Toolbars without a nav (Audit) still wrap as a whole. */
-.bar:has(> .nav) {
- flex-wrap: nowrap;
-}
 
 /* ---- text utilities ------------------------------------------------------ */
 
@@ -1232,6 +1227,10 @@ details summary:focus-visible {
 .nav a.active {
  color: var(--text);
 }
+/* Sign out sits on the brand row, so the nav row is only the nav. */
+.hero-brand #logout {
+ margin-left: auto;
+}
 
 /* ---- system settings page ------------------------------------------------ */
 
@@ -1277,6 +1276,48 @@ details summary:focus-visible {
   border-left-color: var(--progress);
  }
 }
+/* Phones: one row of underline tabs that scrolls sideways instead of
+   wrapping, bled to the sheet edge with a fade at the far end. */
+@media (max-width: 640px) {
+ .nav,
+ .settings-nav {
+  flex-wrap: nowrap;
+  gap: 0 1.25rem;
+  margin: 0 -1.5rem;
+  padding: 0 1.5rem;
+  overflow-x: auto;
+  scrollbar-width: none;
+  border-bottom: 1px solid var(--border);
+  mask-image: linear-gradient(to right, #000 calc(100% - 2rem), transparent);
+ }
+ .nav::-webkit-scrollbar,
+ .settings-nav::-webkit-scrollbar {
+  display: none;
+ }
+ .nav a,
+ .settings-nav a {
+  flex: none;
+  padding: 0.6rem 0 0.55rem;
+  margin-bottom: -1px;
+  border-left: 0;
+  border-bottom: 2px solid transparent;
+  white-space: nowrap;
+ }
+ .nav a.active,
+ .settings-nav a.active {
+  border-bottom-color: var(--progress);
+ }
+ .bar:has(> .nav) {
+  margin-bottom: 1.25rem;
+ }
+ .masthead:has(+ .bar > .nav) {
+  margin-bottom: 0.25rem;
+ }
+ .settings-nav {
+  margin-bottom: 0.75rem;
+ }
+}
+
 .settings-main {
  min-width: 0;
 }
