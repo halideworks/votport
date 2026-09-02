@@ -417,7 +417,12 @@ $('quotas-form').addEventListener('submit', async (event) => {
 });
 
 const accent = colorPair($('branding-color'), $('branding-color-hex'));
-$('branding-color-clear').addEventListener('click', () => accent.set(''));
+// No accent stored means recipient pages use the stock colour; the picker
+// shows that colour so the reset reads as a return to the default.
+$('branding-color-clear').addEventListener('click', () => {
+  accent.set('');
+  $('branding-color').value = '#38bdf8';
+});
 
 async function fillBranding() {
   const branding = await api('/api/admin/branding/default');

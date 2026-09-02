@@ -7,6 +7,10 @@ const $ = (id) => document.getElementById(id);
 const PAGE_SIZE = 250;
 const INITIAL_CURSOR = '18446744073709551615';
 let beforeRowid = INITIAL_CURSOR;
+// Oldest first walks forward from rowid 0 with after_rowid; newest first
+// walks back from the top with before_rowid.
+let order = 'newest';
+let afterRowid = '0';
 let loadedRows = 0;
 let loading = false;
 // A search result deep-links here with the phrase in the query string.
@@ -90,7 +94,9 @@ async function load(reset = false) {
   $('refresh').disabled = true;
   $('load-more').disabled = true;
   if (reset) {
+    order = $('audit-order').value;
     beforeRowid = INITIAL_CURSOR;
+    afterRowid = '0';
     loadedRows = 0;
     $('audit-log').replaceChildren();
     $('audit-event-options').replaceChildren();
@@ -99,7 +105,12 @@ async function load(reset = false) {
   // text rather than JSON.
   try {
     const query = new URLSearchParams({ limit: String(PAGE_SIZE), ...appliedFilters });
-    query.set('before_rowid', beforeRowid);
+    if (order === 'oldest') {
+      query.set('since', '0');
+      query.set('after_rowid', afterRowid);
+    } else {
+      query.set('before_rowid', beforeRowid);
+    }
     const response = await fetch(`/api/admin/audit?${query}`, {
       credentials: 'same-origin',
     });
@@ -114,7 +125,11 @@ async function load(reset = false) {
     addEvents(rows);
     for (const row of rows) container.append(renderRow(row));
     loadedRows += rows.length;
-    if (rows.length) beforeRowid = String(rows[rows.length - 1].rowid);
+    if (rows.length) {
+      const last = String(rows[rows.length - 1].rowid);
+      if (order === 'oldest') afterRowid = last;
+      else beforeRowid = last;
+    }
     $('audit-range').textContent = `${loadedRows} rows loaded`;
     $('load-more').hidden = rows.length < PAGE_SIZE;
   } finally {
@@ -141,6 +156,10 @@ $('audit-filters').addEventListener('submit', (event) => {
   event.preventDefault();
   appliedFilters = formFilters();
   updateExport();
+  load(true).catch(showLoadError);
+});
+
+$('audit-order').addEventListener('change', () => {
   load(true).catch(showLoadError);
 });
 

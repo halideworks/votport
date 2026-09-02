@@ -164,6 +164,9 @@ function mountSearch(session) {
 /// list that holds it has rendered. Search results deep-link this way.
 export function revealHash({ scroll = true } = {}) {
   const id = window.location.hash.slice(1);
+  // Only list cards are revealed; a settings section fragment on System is
+  // plain navigation and gets no outline.
+  if (id && !/^(link|grant)-/.test(id)) return false;
   for (const previous of document.querySelectorAll('.revealed')) {
     if (previous.id !== id) previous.classList.remove('revealed');
   }

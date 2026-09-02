@@ -1624,6 +1624,22 @@ details summary:focus-visible {
 .brand-actions button {
  white-space: nowrap;
 }
+/* The theme switch is a quiet word, not a control competing with Sign out. */
+.brand-actions .theme-toggle {
+ padding: 0.3rem 0.5rem;
+ font-size: 0.62rem;
+ font-weight: 600;
+ letter-spacing: 0.1em;
+ text-transform: uppercase;
+ color: var(--muted);
+ border: 0;
+ background: none;
+ box-shadow: none;
+}
+.brand-actions .theme-toggle:hover {
+ color: var(--text);
+ transform: none;
+}
 /* The narrowest phones cannot fit the wordmark and both pills on one line;
    the pills drop to their own line, still at the right edge. */
 @media (max-width: 360px) {
