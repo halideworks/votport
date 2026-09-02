@@ -107,7 +107,7 @@ pub struct App {
     /// Every session worker reports here when it ends without publishing.
     pub session_ended: tokio::sync::mpsc::UnboundedSender<session::SessionEnded>,
     /// Taken once by [`upload_ended_notifier`].
-    pub(crate) session_ended_rx:
+    pub session_ended_rx:
         Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<session::SessionEnded>>>,
     pub(crate) push_tickets: Mutex<HashMap<[u8; 16], PushTicket>>,
     /// A process-wide maintenance lock: an operator click and the scheduler

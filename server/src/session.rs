@@ -473,7 +473,7 @@ fn spawn_worker_from(
                         if matches!(phase, Phase::Done) {
                             record_event(
                                 &setup,
-                                received,
+                                already + received,
                                 last_seen,
                                 "rejected",
                                 error.message.clone(),
@@ -600,7 +600,7 @@ fn spawn_worker_from(
                     commit_partial(&setup, &phase, replays, rejected, &log);
                     record_event(
                         &setup,
-                        received,
+                        already + received,
                         last_seen,
                         "cancelled",
                         "cancelled by the sender".to_owned(),
@@ -643,7 +643,7 @@ fn spawn_worker_from(
             commit_partial(&setup, &phase, replays, rejected, &log);
             record_event(
                 &setup,
-                received,
+                already + received,
                 last_seen,
                 "interrupted",
                 last_error.unwrap_or_else(|| {

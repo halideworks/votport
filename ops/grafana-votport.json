@@ -324,7 +324,7 @@
     {
       "type": "timeseries",
       "title": "Upload sessions ended by outcome",
-      "description": "Rate of session ends by fixed outcome; rejected and interrupted are the ones the failure webhook reports.",
+      "description": "Rate of session ends by fixed outcome; the failure webhook reports rejected ends and interrupted ends that had received bytes.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 46 },
       "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
