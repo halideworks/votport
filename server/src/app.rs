@@ -722,6 +722,7 @@ fn resume_upload_session(
         signer: Arc::clone(signer),
         session_id,
         started_at: session.started_at,
+        quiet_after_secs: session::quiet_after_secs(config.session_idle_secs),
     };
     let (sender, receiver) = tokio::sync::mpsc::channel(8);
     let kept = session::resume_worker(setup, receiver, session)?;
@@ -1950,6 +1951,7 @@ mod push_tests {
             signer: Arc::clone(&application.signer),
             session_id: [79; 16],
             started_at: crate::store::now_unix(),
+            quiet_after_secs: 5,
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let (seams, stale_handle) = session::push_seams(
@@ -2940,6 +2942,7 @@ mod retention_tests {
             notify_on_upload: false,
             uploads: vec![UploadRecord {
                 partial: false,
+                log: Vec::new(),
                 id: "upload".to_owned(),
                 started_at: 0,
                 completed_at: 1,

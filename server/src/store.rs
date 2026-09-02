@@ -84,6 +84,26 @@ pub struct UploadRecord {
     /// dedupe, and the operator instead of lingering on disk unrecorded.
     #[serde(default)]
     pub partial: bool,
+    /// What happened during the transfer, as facts; the admin page renders
+    /// the sentences. Capped at LOG_CAP entries by the writer.
+    #[serde(default)]
+    pub log: Vec<LogEvent>,
+}
+
+/// One transfer log entry. `kind` is one of opened, reattached, published,
+/// quiet, finished, cancelled, interrupted, dropped, elided.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LogEvent {
+    pub at: u64,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -5175,6 +5195,7 @@ mod tests {
         for index in 0..3 {
             link.uploads.push(UploadRecord {
                 partial: false,
+                log: Vec::new(),
                 id: format!("up-{index}"),
                 started_at: 1,
                 completed_at: 2,
@@ -5205,6 +5226,7 @@ mod tests {
         let mut link = test_link("link-1");
         link.uploads.push(UploadRecord {
             partial: false,
+            log: Vec::new(),
             id: "up-1".to_owned(),
             started_at: 1,
             completed_at: 2,
@@ -5333,6 +5355,7 @@ mod tests {
         let mut link = test_link("root");
         link.uploads.push(UploadRecord {
             partial: false,
+            log: Vec::new(),
             id: "upload".to_owned(),
             started_at: 0,
             completed_at: 1,
@@ -5688,6 +5711,7 @@ mod tenant_tests {
         };
         link.uploads.push(UploadRecord {
             partial: false,
+            log: Vec::new(),
             id: "up".to_owned(),
             started_at: 0,
             completed_at: 0,
@@ -5753,6 +5777,7 @@ mod tenant_tests {
         store.insert_tenant(test_tenant("acme")).unwrap();
         let record = |id: &str, files: Vec<FileRecord>| UploadRecord {
             partial: false,
+            log: Vec::new(),
             id: id.to_owned(),
             started_at: 0,
             completed_at: 0,
@@ -5827,6 +5852,7 @@ mod tenant_tests {
         };
         let record = |id: &str| UploadRecord {
             partial: false,
+            log: Vec::new(),
             id: id.to_owned(),
             started_at: 0,
             completed_at: 0,
@@ -5915,6 +5941,7 @@ mod tenant_tests {
         let mut link = link_in("acme", "large");
         link.uploads.push(UploadRecord {
             partial: false,
+            log: Vec::new(),
             id: "up".to_owned(),
             started_at: 0,
             completed_at: 0,
@@ -5954,6 +5981,7 @@ mod tenant_tests {
                 "large",
                 UploadRecord {
                     partial: false,
+                    log: Vec::new(),
                     id: "second".to_owned(),
                     started_at: u64::MAX,
                     completed_at: u64::MAX,
@@ -6051,6 +6079,7 @@ mod tenant_tests {
         };
         link.uploads.push(UploadRecord {
             partial: false,
+            log: Vec::new(),
             id: "up".to_owned(),
             started_at: 0,
             completed_at: 0,
@@ -6086,6 +6115,7 @@ mod tenant_tests {
                 "link",
                 UploadRecord {
                     partial: false,
+                    log: Vec::new(),
                     id: "new".to_owned(),
                     started_at: 0,
                     completed_at: 0,
@@ -7075,6 +7105,7 @@ mod settings_tests {
         let mut link = test_link("old-link");
         link.uploads.push(UploadRecord {
             partial: false,
+            log: Vec::new(),
             id: "up".to_owned(),
             started_at: 0,
             completed_at: 1,

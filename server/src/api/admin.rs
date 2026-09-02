@@ -2089,6 +2089,7 @@ struct UploadView {
     total_bytes: u64,
     files: Vec<FileView>,
     partial: bool,
+    log: Vec<crate::store::LogEvent>,
 }
 
 #[derive(Serialize)]
@@ -2176,6 +2177,7 @@ fn link_view(app: &App, link: Link, base: &str) -> LinkView {
             package_root: upload.package_root,
             total_bytes: upload.total_bytes,
             partial: upload.partial,
+            log: upload.log,
         })
         .collect();
     LinkView {
@@ -3183,6 +3185,7 @@ mod handler_tests {
                 notify_on_upload: false,
                 uploads: vec![UploadRecord {
                     partial: false,
+                    log: Vec::new(),
                     id: "upload".to_owned(),
                     started_at: 0,
                     completed_at: 1,
@@ -3401,6 +3404,7 @@ mod handler_tests {
                 notify_on_upload: false,
                 uploads: vec![crate::store::UploadRecord {
                     partial: false,
+                    log: Vec::new(),
                     id: "upload".to_owned(),
                     started_at: 0,
                     completed_at: 1,

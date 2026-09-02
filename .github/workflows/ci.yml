@@ -1,8 +1,15 @@
 name: ci
 
 on:
+  # A squash merge lands the tree the pull request already ran, so a push to
+  # main only re-runs when it changes what the caches key on.
   push:
     branches: [main]
+    paths:
+      - server/Cargo.toml
+      - server/Cargo.lock
+      - package-lock.json
+      - Dockerfile
   pull_request:
 
 permissions:

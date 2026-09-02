@@ -2657,6 +2657,69 @@ async fn multi_file_session_survives_a_restart_after_one_file_published() {
     assert!(staging_files(&receive_dir).is_empty());
 }
 
+/// The transfer log records what happened: opened, each file published with
+/// its timing, a quiet gap longer than a tenth of the idle timeout, finished.
+#[tokio::test(flavor = "multi_thread")]
+async fn transfer_log_records_publishes_and_quiet_gaps() {
+    // Idle timeout 50 s makes the quiet threshold 5 s.
+    let server = start_server_custom(64 * 1024 * 1024, false, 50, 32).await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let small: Vec<u8> = (0..1024 * 1024).map(|index| (index % 227) as u8).collect();
+    let files = [
+        prepare(vec!["first.bin"], small.clone()),
+        prepare(vec!["second.bin"], small),
+    ];
+    let (token, session) = open_session(&client, &server.base, "log", &files).await;
+    let base = server.base.clone();
+    assert_eq!(begin(&client, &base, &session).await.0, 200);
+    upload_chunks(&client, &base, &session, 0, &files[0]).await;
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    upload_chunks(&client, &base, &session, 1, &files[1]).await;
+    let finish = client
+        .post(format!("{base}/api/session/{session}/finish"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(finish.status(), 200);
+    let uploads = server
+        .application
+        .store
+        .uploads_by_id(&token)
+        .unwrap()
+        .unwrap();
+    let log = &uploads[0].log;
+    let kinds: Vec<&str> = log.iter().map(|event| event.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        ["opened", "published", "quiet", "published", "finished"],
+        "{log:?}"
+    );
+    assert_eq!(log[1].path.as_deref(), Some("first.bin"));
+    assert_eq!(log[1].bytes, Some(1024 * 1024));
+    assert!(log[2].secs.unwrap() >= 5, "{log:?}");
+    assert!(log[3].path.is_some(), "{log:?}");
+    assert_eq!(log[4].count, Some(0));
+    // The admin view carries the log for the Receive page.
+    let links = client
+        .get(format!("{base}/api/admin/links"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let link = links["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == json!(token))
+        .unwrap();
+    assert_eq!(link["uploads"][0]["log"].as_array().unwrap().len(), 5);
+}
+
 /// A session abandoned after one file published leaves a partial record, so
 /// the file is visible to the operator and a re-send dedupes it instead of
 /// landing beside it with a suffix.
@@ -2699,6 +2762,11 @@ async fn abandoned_session_records_its_published_files_as_partial() {
     assert_eq!(uploads[0].files[0].stored_as, "first.bin");
     assert!(uploads[0].files[0].receipt);
     assert_eq!(uploads[0].total_bytes, files[0].bytes.len() as u64);
+    // The partial record's log ends with the reason the session ended.
+    assert_eq!(
+        uploads[0].log.last().map(|event| event.kind.as_str()),
+        Some("cancelled")
+    );
 
     // The operator listing carries the flag.
     let links = client

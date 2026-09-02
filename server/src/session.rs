@@ -24,7 +24,8 @@ use vot_sdk_file::{CommitProfile, NativeFile, RangeStatus};
 
 use crate::paths;
 use crate::store::{
-    now_unix, FileRecord, PersistedUploadFile, PersistedUploadSession, Store, UploadRecord,
+    now_unix, FileRecord, LogEvent, PersistedUploadFile, PersistedUploadSession, Store,
+    UploadRecord,
 };
 
 pub const MAX_SEAL_BYTES: usize = 1024 * 1024;
@@ -159,6 +160,92 @@ pub struct WorkerSetup {
     pub session_id: [u8; 16],
     /// When the session was created, for duration/rate feedback.
     pub started_at: u64,
+    /// A gap between sender commands at least this long is logged as quiet.
+    pub quiet_after_secs: u64,
+}
+
+/// The transfer log grows one event per file; a huge package would otherwise
+/// write thousands of entries into the link's JSON.
+const LOG_CAP: usize = 200;
+
+/// Quiet threshold from the idle timeout: a tenth of it, at least five
+/// seconds, so a test with a short timeout can provoke one.
+pub fn quiet_after_secs(session_idle_secs: u64) -> u64 {
+    if session_idle_secs == 0 {
+        return 60;
+    }
+    (session_idle_secs / 10).max(5)
+}
+
+#[derive(Default)]
+struct TransferLog {
+    events: Vec<LogEvent>,
+    elided: u64,
+}
+
+impl TransferLog {
+    fn push(&mut self, event: LogEvent) {
+        if self.events.len() >= LOG_CAP {
+            self.elided += 1;
+            return;
+        }
+        self.events.push(event);
+    }
+
+    fn plain(at: u64, kind: &str, count: Option<u64>) -> LogEvent {
+        LogEvent {
+            at,
+            kind: kind.to_owned(),
+            path: None,
+            bytes: None,
+            secs: None,
+            count,
+        }
+    }
+
+    /// The outcome survives the cap: a record must not end on "published"
+    /// when the session finished.
+    fn terminal(&mut self, at: u64, kind: &str, count: Option<u64>) {
+        self.events.push(Self::plain(at, kind, count));
+    }
+
+    /// The events with the elided tail, for a record. Not consuming: a
+    /// failed commit retries with the same log.
+    fn snapshot(&self) -> Vec<LogEvent> {
+        let mut events = self.events.clone();
+        if self.elided > 0 {
+            events.push(Self::plain(now_unix(), "elided", Some(self.elided)));
+        }
+        events
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_event_survives_the_cap_and_the_tail_is_counted() {
+        let mut log = TransferLog::default();
+        for _ in 0..(LOG_CAP + 30) {
+            log.push(TransferLog::plain(1, "published", None));
+        }
+        log.terminal(2, "finished", Some(0));
+        let events = log.snapshot();
+        assert_eq!(events.len(), LOG_CAP + 2);
+        assert_eq!(events[LOG_CAP].kind, "finished");
+        assert_eq!(events[LOG_CAP + 1].kind, "elided");
+        assert_eq!(events[LOG_CAP + 1].count, Some(30));
+        // Not consuming: a failed commit retries with the same log.
+        assert_eq!(log.snapshot().len(), LOG_CAP + 2);
+    }
+
+    #[test]
+    fn quiet_threshold() {
+        assert_eq!(quiet_after_secs(0), 60);
+        assert_eq!(quiet_after_secs(20), 5);
+        assert_eq!(quiet_after_secs(600), 60);
+    }
 }
 
 /// Shared control for one native-push admission and its eventual connection.
@@ -230,6 +317,8 @@ struct FileState {
     native: Option<NativeFile>,
     published: bool,
     receipt: bool,
+    /// When this file's first range was accepted, for the publish timing.
+    first_range_at: Option<u64>,
     /// Re-attached after a restart: the staged bytes are re-hashed against
     /// the announced object before publish, since the resumed coverage is
     /// trusted bookkeeping rather than verified ranges.
@@ -280,6 +369,21 @@ fn spawn_worker_from(
         // after that (the idle sweep), so stamping the event with now_unix()
         // there would date a five-minute failure two days late.
         let mut last_seen = now_unix();
+        let mut log = TransferLog::default();
+        if resumed {
+            let published = match &phase {
+                Phase::Receiving { files } => files.iter().filter(|f| f.published).count(),
+                _ => 0,
+            };
+            log.push(TransferLog::plain(
+                now_unix(),
+                "reattached",
+                Some(published as u64),
+            ));
+        }
+        // A resumed worker's first wait measures uptime, not sender silence.
+        let mut heard = !resumed;
+        let mut opened = resumed;
         // Remembers the error message, then hands the result to the sender.
         macro_rules! send_noted {
             ($reply:expr, $result:expr) => {{
@@ -294,17 +398,33 @@ fn spawn_worker_from(
         // the next iteration instead of going back on the channel.
         let mut pending: Option<Cmd> = None;
         loop {
-            let cmd = match pending.take() {
-                Some(cmd) => cmd,
+            // Quiet is measured only across a real wait on the channel; a
+            // command carried over from a batch drain waited on the server.
+            let waiting_since = now_unix();
+            let (cmd, waited) = match pending.take() {
+                Some(cmd) => (cmd, false),
                 None => match receiver.blocking_recv() {
-                    Some(cmd) => cmd,
+                    Some(cmd) => (cmd, true),
                     None => {
                         dropped = true;
                         break;
                     }
                 },
             };
-            last_seen = now_unix();
+            let arrived = now_unix();
+            let silent = arrived.saturating_sub(waiting_since);
+            if waited && heard && silent >= setup.quiet_after_secs {
+                log.push(LogEvent {
+                    at: arrived,
+                    kind: "quiet".to_owned(),
+                    path: None,
+                    bytes: None,
+                    secs: Some(silent),
+                    count: None,
+                });
+            }
+            heard = true;
+            last_seen = arrived;
             match cmd {
                 Cmd::Seal {
                     bytes,
@@ -322,6 +442,10 @@ fn spawn_worker_from(
                 }
                 Cmd::Begin { reply, _lease } => {
                     let result = handle_begin(&setup, &mut phase);
+                    if result.is_ok() && !opened {
+                        log.push(TransferLog::plain(now_unix(), "opened", None));
+                        opened = true;
+                    }
                     rebegin = false;
                     // A failed begin has consumed the pages: the phase is
                     // already Done, the worker exits below, and the exit-time
@@ -384,7 +508,35 @@ fn spawn_worker_from(
                             Err(_) => break,
                         }
                     }
+                    let entries: Vec<usize> = batch.iter().map(|item| item.entry).collect();
+                    let published_before: Vec<bool> = match &phase {
+                        Phase::Receiving { files } => files.iter().map(|f| f.published).collect(),
+                        _ => Vec::new(),
+                    };
                     let outcomes = accept_batch(&setup, &mut phase, &batch);
+                    if let Phase::Receiving { files } = &mut phase {
+                        let now = now_unix();
+                        for (entry, outcome) in entries.iter().zip(&outcomes) {
+                            if matches!(outcome, Ok(progress) if progress.accepted) {
+                                if let Some(file) = files.get_mut(*entry) {
+                                    file.first_range_at.get_or_insert(now);
+                                }
+                            }
+                        }
+                        for (index, file) in files.iter().enumerate() {
+                            let was = published_before.get(index).copied().unwrap_or(false);
+                            if file.published && !was {
+                                log.push(LogEvent {
+                                    at: now,
+                                    kind: "published".to_owned(),
+                                    path: Some(file.display_path.clone()),
+                                    bytes: Some(file.object.length),
+                                    secs: file.first_range_at.map(|from| now.saturating_sub(from)),
+                                    count: None,
+                                });
+                            }
+                        }
+                    }
                     let received_before = received;
                     for (item, outcome) in batch.into_iter().zip(outcomes) {
                         let outcome = outcome.map(|mut progress| {
@@ -410,7 +562,8 @@ fn spawn_worker_from(
                     }
                 }
                 Cmd::Finish { reply, _lease } => {
-                    let report = handle_finish(&setup, &mut phase, replays, rejected, received);
+                    let report =
+                        handle_finish(&setup, &mut phase, replays, rejected, received, &log);
                     // A finished session has nothing left to re-attach; a
                     // finish refused as early keeps receiving, and its resume
                     // record with it.
@@ -420,7 +573,8 @@ fn spawn_worker_from(
                     send_noted!(reply, report);
                 }
                 Cmd::Abort { reply, _lease } => {
-                    commit_partial(&setup, &phase, replays, rejected);
+                    log.terminal(now_unix(), "cancelled", None);
+                    commit_partial(&setup, &phase, replays, rejected, &log);
                     record_event(
                         &setup,
                         received,
@@ -462,7 +616,8 @@ fn spawn_worker_from(
             forget_session(&setup);
         }
         if !matches!(phase, Phase::Done) && !suspended {
-            commit_partial(&setup, &phase, replays, rejected);
+            log.terminal(last_seen, "interrupted", None);
+            commit_partial(&setup, &phase, replays, rejected, &log);
             record_event(
                 &setup,
                 received,
@@ -595,6 +750,7 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
                 native: None,
                 published: true,
                 receipt: existing.receipt,
+                first_range_at: None,
                 rehash: false,
             });
             continue;
@@ -786,6 +942,7 @@ pub fn resume_worker(
             // A file resumed from a zero prefix receives every byte through
             // verify_range like a fresh session; only a trusted prefix needs
             // the rehash.
+            first_range_at: None,
             rehash: !file.published && file.prefix_bytes > 0,
         });
     }
@@ -929,6 +1086,7 @@ fn open_destination_for(
                     native: Some(native),
                     published: false,
                     receipt: false,
+                    first_range_at: None,
                     rehash: false,
                 });
             }
@@ -1323,6 +1481,7 @@ fn handle_finish(
     replays: u64,
     rejected: u64,
     received: u64,
+    log: &TransferLog,
 ) -> Result<FinishReport, SessionError> {
     let Phase::Receiving { files } = phase else {
         return Err(SessionError::conflict("nothing to finish in this state"));
@@ -1333,7 +1492,11 @@ fn handle_finish(
             file.display_path
         )));
     }
-    let mut report = commit_upload(setup, files, replays, rejected, Some("http"))?;
+    // The outcome joins the record only when the commit succeeds: a failed
+    // finish is retried against the same log.
+    let mut events = log.snapshot();
+    events.push(TransferLog::plain(now_unix(), "finished", Some(replays)));
+    let mut report = commit_upload(setup, files, replays, rejected, Some("http"), events)?;
     report.received = received;
     *phase = Phase::Done;
     Ok(report)
@@ -1342,7 +1505,13 @@ fn handle_finish(
 /// A session that ends without finishing still leaves its published files
 /// on disk. Record them as a partial upload so retention, dedupe, and the
 /// operator listing see them; without a record they would be orphans.
-fn commit_partial(setup: &WorkerSetup, phase: &Phase, replays: u64, rejected: u64) {
+fn commit_partial(
+    setup: &WorkerSetup,
+    phase: &Phase,
+    replays: u64,
+    rejected: u64,
+    log: &TransferLog,
+) {
     let Phase::Receiving { files } = phase else {
         return;
     };
@@ -1351,7 +1520,16 @@ fn commit_partial(setup: &WorkerSetup, phase: &Phase, replays: u64, rejected: u6
         return;
     }
     let count = records.len();
-    match commit_upload_records(setup, records, replays, rejected, Some("http"), true) {
+    let events = log.snapshot();
+    match commit_upload_records(
+        setup,
+        records,
+        replays,
+        rejected,
+        Some("http"),
+        true,
+        events,
+    ) {
         Ok(_) => tracing::info!(
             target: "audit", event = "upload_partial_recorded", link = %setup.link_id,
             files = count, "recorded the published files of an unfinished session"
@@ -1396,6 +1574,14 @@ pub fn commit_persisted_partial(
         total_bytes: records.iter().map(|record| record.bytes).sum(),
         files: records,
         partial: true,
+        log: vec![LogEvent {
+            at: now_unix(),
+            kind: "dropped".to_owned(),
+            path: None,
+            bytes: None,
+            secs: None,
+            count: None,
+        }],
     };
     if let Err(error) = store.append_upload(&session.tenant, &session.link_id, upload) {
         tracing::warn!(link = %session.link_id, %error, "partial upload record failed at boot");
@@ -1408,6 +1594,7 @@ fn commit_upload(
     replays: u64,
     rejected: u64,
     transport: Option<&str>,
+    log: Vec<LogEvent>,
 ) -> Result<FinishReport, SessionError> {
     commit_upload_records(
         setup,
@@ -1416,6 +1603,7 @@ fn commit_upload(
         rejected,
         transport,
         false,
+        log,
     )
 }
 
@@ -1426,9 +1614,11 @@ fn commit_upload_records(
     rejected: u64,
     transport: Option<&str>,
     partial: bool,
+    log: Vec<LogEvent>,
 ) -> Result<FinishReport, SessionError> {
     let upload = UploadRecord {
         partial,
+        log,
         id: crate::auth::random_token(),
         started_at: setup.started_at,
         completed_at: now_unix(),
@@ -1578,6 +1768,7 @@ impl PushReceive {
                 native: None,
                 published: true,
                 receipt: existing.receipt,
+                first_range_at: None,
                 rehash: false,
             });
             let index = inner.entries.len();
@@ -1728,7 +1919,8 @@ impl PushReceive {
         if self.control.is_cancelled() {
             return Err(SessionError::conflict("native push was cancelled"));
         }
-        let report = commit_upload_records(&self.setup, records, 0, 0, Some("push"), false)?;
+        let report =
+            commit_upload_records(&self.setup, records, 0, 0, Some("push"), false, Vec::new())?;
         publications.disarm();
         self.inner.lock().expect("push receive poisoned").succeeded = true;
         let sid = hex::encode(self.setup.session_id);
@@ -3165,6 +3357,7 @@ mod push_tests {
             signer: Arc::clone(&app.signer),
             session_id: [7; 16],
             started_at: 1,
+            quiet_after_secs: 5,
         }
     }
 
@@ -3505,6 +3698,7 @@ mod parallel_accept_tests {
             native: Some(native),
             published: false,
             receipt: false,
+            first_range_at: None,
             rehash: false,
         }];
         let results: Vec<AcceptCore> = std::thread::scope(|scope| {
