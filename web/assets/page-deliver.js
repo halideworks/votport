@@ -889,4 +889,9 @@ $('deliver-form').addEventListener('submit', async (event) => {
 
 await requireSession();
 await Promise.all([refreshGrants(), refreshLibrary(), refreshAutomationTokens()]);
-revealHash();
+// A search result may name a grant past the first page: page forward until
+// it is on the page. ponytail: bounded at ten pages; a grant lookup by id
+// is the upgrade if issued downloads ever run to thousands.
+for (let pages = 0; !revealHash() && grantHasMore && pages < 10; pages += 1) {
+  await refreshGrants(false);
+}

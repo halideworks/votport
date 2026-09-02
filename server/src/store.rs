@@ -1403,7 +1403,8 @@ impl Store {
                  FROM links
                  WHERE tenant = ?1
                    AND (?2 = '' OR lower(label) LIKE '%' || ?2 || '%' ESCAPE '\\'
-                        OR lower(dest) LIKE '%' || ?2 || '%' ESCAPE '\\')
+                        OR lower(dest) LIKE '%' || ?2 || '%' ESCAPE '\\'
+                        OR id LIKE '%' || ?2 || '%' ESCAPE '\\')
                    AND (?3 = 'all'
                         OR (?3 = 'open' AND active != 0
                             AND (expires_at IS NULL OR expires_at > ?4))

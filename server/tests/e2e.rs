@@ -5104,6 +5104,19 @@ async fn search_finds_requests_files_downloads_and_audit_rows() {
     let hit = search("day1xheat").await;
     assert!(hit["files"].as_array().unwrap().is_empty());
 
+    // The request list filter also takes the id, which is how a search
+    // result deep-links to a card however old it is.
+    let by_id: Value = client
+        .get(format!("{base}/api/admin/links?search={token}&limit=5"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(by_id["links"].as_array().unwrap().len(), 1, "{by_id:?}");
+    assert_eq!(by_id["links"][0]["id"], json!(token));
+
     // A deleted file drops out of the results.
     let links: Value = client
         .get(format!("{base}/api/admin/links"))

@@ -105,15 +105,15 @@ function mountSearch(session) {
     if (ticket !== latest) return;
     results.replaceChildren();
     if (pages.includes('receive')) {
-      // The phrase rides along as the list filter so a card past the first
-      // page of fifty is still on the page that opens.
+      // The id rides along as the list filter so the card is the one row on
+      // the page that opens, however far down the list it would be.
       group('Requests', hit.requests, (row) => ({
-        href: `/receive?search=${encodeURIComponent(row.label)}#link-${row.id}`,
+        href: `/receive?search=${row.id}#link-${row.id}`,
         primary: row.label,
         secondary: `${row.active ? 'open' : 'off'} · to /${row.dest || ''} · ${formatWhen(row.created_at)}`,
       }));
       group('Received files', hit.files, (row) => ({
-        href: `/receive?search=${encodeURIComponent(row.link_label)}#link-${row.link_id}`,
+        href: `/receive?search=${row.link_id}#link-${row.link_id}`,
         primary: row.path,
         secondary: `${formatBytes(row.bytes)} · ${row.link_label} · ${formatWhen(row.completed_at)}`,
       }));
@@ -163,12 +163,16 @@ function mountSearch(session) {
 /// list that holds it has rendered. Search results deep-link this way.
 export function revealHash({ scroll = true } = {}) {
   const id = window.location.hash.slice(1);
-  if (!id) return;
+  if (!id) return false;
+  for (const previous of document.querySelectorAll('.revealed')) {
+    if (previous.id !== id) previous.classList.remove('revealed');
+  }
   const target = document.getElementById(id);
-  if (!target) return;
+  if (!target) return false;
   if (scroll) target.scrollIntoView({ block: 'center' });
   target.classList.add('revealed');
   target.querySelector('details')?.setAttribute('open', '');
+  return true;
 }
 
 const NAV_ITEMS = [
