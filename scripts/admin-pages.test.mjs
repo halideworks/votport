@@ -177,6 +177,12 @@ test('every page applies the saved theme before paint and admin pages carry the 
   const css = await readFile(new URL('../web/assets/style.css', import.meta.url), 'utf8');
   assert.match(css, /:root\[data-theme="light"\]/);
   assert.match(css, /prefers-color-scheme: light/);
+  // The forced block and the system-preference block must carry the same
+  // tokens, or a theme edit drifts between the two ways of reaching light.
+  const forcedBlock = css.match(/:root\[data-theme="light"\] \{([^}]*)\}/)[1];
+  const systemBlock = css.match(/:root:not\(\[data-theme="dark"\]\) \{([^}]*)\}/)[1];
+  const tokens = (block) => block.split('\n').map((line) => line.trim()).filter(Boolean).join('\n');
+  assert.equal(tokens(forcedBlock), tokens(systemBlock));
   // Fills, rules, and shadows read tokens; only the painting keeps raw black.
   const afterTokens = css.slice(css.indexOf('::selection'));
   assert.doesNotMatch(afterTokens, /rgba\(255, 255, 255, 0\.(02|03|05|06|08|1|12|25)\)/);
