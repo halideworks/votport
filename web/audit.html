@@ -21,7 +21,7 @@
           </div>
           <span class="wordmark">VOTPort</span>
           <div class="brand-actions">
-            <button id="theme-toggle" class="ghost tiny" aria-label="Switch theme"></button>
+            <button id="theme-toggle" class="link theme-toggle" aria-label="Switch theme"></button>
             <button id="logout" class="ghost tiny">Sign out</button>
           </div>
         </div>
@@ -46,6 +46,12 @@
           <label>Event
             <input id="audit-event" maxlength="100" autocomplete="off" list="audit-event-options" placeholder="exact event" />
             <datalist id="audit-event-options"></datalist>
+          </label>
+          <label>Order
+            <select id="audit-order">
+              <option value="newest">Newest first</option>
+              <option value="oldest">Oldest first</option>
+            </select>
           </label>
         </div>
         <button type="submit">Apply</button>

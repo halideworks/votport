@@ -1,7 +1,7 @@
 // votport system page: credentials, backups, verification key, overlay settings.
 // VOTPORT PROPRIETARY LICENSE.
 
-import { api, colorPair, confirmModal, formatBytes, formatWhen, requireSession } from '/assets/admin-common.js';
+import { api, colorPair, confirmModal, defaultAccent, formatBytes, formatWhen, requireSession } from '/assets/admin-common.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -417,7 +417,12 @@ $('quotas-form').addEventListener('submit', async (event) => {
 });
 
 const accent = colorPair($('branding-color'), $('branding-color-hex'));
-$('branding-color-clear').addEventListener('click', () => accent.set(''));
+// No accent stored means recipient pages use the stock colour; the picker
+// shows that colour so the reset reads as a return to the default.
+$('branding-color-clear').addEventListener('click', () => {
+  accent.set('');
+  $('branding-color').value = defaultAccent();
+});
 
 async function fillBranding() {
   const branding = await api('/api/admin/branding/default');

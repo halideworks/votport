@@ -188,3 +188,12 @@ test('every page applies the saved theme before paint and admin pages carry the 
   assert.doesNotMatch(afterTokens, /rgba\(255, 255, 255, 0\.(02|03|05|06|08|1|12|25)\)/);
   assert.doesNotMatch(afterTokens, /rgba\(0, 0, 0, 0\.(3|45)\)/);
 });
+
+test('the audit log can be read oldest first, the theme switch is a quiet link, and settings sections are not outlined', async () => {
+  assert.match(audit, /id="audit-order"/);
+  const auditScript = await readFile(new URL('../web/assets/page-audit.js', import.meta.url), 'utf8');
+  assert.match(auditScript, /after_rowid/);
+  assert.match(receive, /id="theme-toggle" class="link theme-toggle"/);
+  assert.match(commonScript, /\^\(link\|grant\)-/);
+  assert.match(system, /Reset to default/);
+});
