@@ -6,6 +6,7 @@ import {
   api,
   button,
   colorPair,
+  defaultAccent,
   confirmModal,
   formatBytes,
   formatWhen,
@@ -227,7 +228,10 @@ function brandingForm(tenant) {
       await api(`/api/admin/branding/${key}/logo`, { method: 'DELETE' });
       await load();
     }),
-    button('No accent', 'link', async () => accent.set('')),
+    button('Reset to default', 'link', () => {
+      accent.set('');
+      colorInput.value = defaultAccent();
+    }),
     button('Remove branding', 'danger', async () => {
       if (
         !(await confirmModal(

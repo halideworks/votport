@@ -390,6 +390,13 @@ export function formatWhen(unixSeconds) {
   return new Date(unixSeconds * 1000).toLocaleString();
 }
 
+/// The stock accent for the current theme, read from the stylesheet, so a
+/// reset shows the colour recipients will actually see.
+export function defaultAccent() {
+  const value = window.getComputedStyle(document.documentElement).getPropertyValue('--progress').trim();
+  return /^#[0-9a-f]{6}$/i.test(value) ? value : '#38bdf8';
+}
+
 /// Keeps a color picker and a hex text input in step. get() is the lowercase
 /// #rrggbb value, or '' when the text input is blank or not a color.
 export function colorPair(picker, hex) {

@@ -7,9 +7,11 @@ const $ = (id) => document.getElementById(id);
 const PAGE_SIZE = 250;
 const INITIAL_CURSOR = '18446744073709551615';
 let beforeRowid = INITIAL_CURSOR;
-// Oldest first walks forward from rowid 0 with after_rowid; newest first
+// Oldest first walks forward with the server's (at, rowid) keyset cursor:
+// since is the last row's second and after_rowid its rowid. Newest first
 // walks back from the top with before_rowid.
 let order = 'newest';
+let sinceAt = '0';
 let afterRowid = '0';
 let loadedRows = 0;
 let loading = false;
@@ -96,6 +98,7 @@ async function load(reset = false) {
   if (reset) {
     order = $('audit-order').value;
     beforeRowid = INITIAL_CURSOR;
+    sinceAt = '0';
     afterRowid = '0';
     loadedRows = 0;
     $('audit-log').replaceChildren();
@@ -106,7 +109,7 @@ async function load(reset = false) {
   try {
     const query = new URLSearchParams({ limit: String(PAGE_SIZE), ...appliedFilters });
     if (order === 'oldest') {
-      query.set('since', '0');
+      query.set('since', sinceAt);
       query.set('after_rowid', afterRowid);
     } else {
       query.set('before_rowid', beforeRowid);
@@ -126,9 +129,13 @@ async function load(reset = false) {
     for (const row of rows) container.append(renderRow(row));
     loadedRows += rows.length;
     if (rows.length) {
-      const last = String(rows[rows.length - 1].rowid);
-      if (order === 'oldest') afterRowid = last;
-      else beforeRowid = last;
+      const last = rows[rows.length - 1];
+      if (order === 'oldest') {
+        sinceAt = String(last.at);
+        afterRowid = String(last.rowid);
+      } else {
+        beforeRowid = String(last.rowid);
+      }
     }
     $('audit-range').textContent = `${loadedRows} rows loaded`;
     $('load-more').hidden = rows.length < PAGE_SIZE;

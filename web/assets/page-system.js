@@ -1,7 +1,7 @@
 // votport system page: credentials, backups, verification key, overlay settings.
 // VOTPORT PROPRIETARY LICENSE.
 
-import { api, colorPair, confirmModal, formatBytes, formatWhen, requireSession } from '/assets/admin-common.js';
+import { api, colorPair, confirmModal, defaultAccent, formatBytes, formatWhen, requireSession } from '/assets/admin-common.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -421,7 +421,7 @@ const accent = colorPair($('branding-color'), $('branding-color-hex'));
 // shows that colour so the reset reads as a return to the default.
 $('branding-color-clear').addEventListener('click', () => {
   accent.set('');
-  $('branding-color').value = '#38bdf8';
+  $('branding-color').value = defaultAccent();
 });
 
 async function fillBranding() {
