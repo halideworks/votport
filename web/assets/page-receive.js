@@ -13,6 +13,7 @@ import {
   formatDuration,
   formatWhen,
   requireSession,
+  revealHash,
   showGrantResult,
 } from '/assets/admin-common.js';
 
@@ -214,7 +215,8 @@ let linksCursor = null;
 let linksBusy = false;
 // Load more was used: a background refresh would collapse the list.
 let linksExpanded = false;
-let linksFilter = { search: '', status: '' };
+// A search result deep-links with the request's id as the list filter.
+let linksFilter = { search: new URLSearchParams(window.location.search).get('search') || '', status: '' };
 
 /// Three-step primer shown in place of an empty list.
 function teachingEmptyState(title, steps) {
@@ -332,6 +334,7 @@ function scheduleStatus(status) {
 function renderLink(link) {
   const card = document.createElement('div');
   card.className = 'card link-item';
+  card.id = `link-${link.id}`;
 
   const head = document.createElement('div');
   head.className = 'head';
@@ -581,6 +584,8 @@ async function refreshLinksInner({ append, fromPoll }) {
     : null;
   $('links-load-more').hidden = !linksCursor;
   $('links-error').hidden = true;
+  // A re-render (the status poll, an action) keeps the deep-linked card marked.
+  revealHash({ scroll: false });
 }
 
 async function refreshLinksSafe(options = {}) {
@@ -637,8 +642,10 @@ $('links-load-more').addEventListener('click', async () => {
 });
 
 await requireSession();
+$('links-query').value = linksFilter.search;
 await refreshLinks();
 refreshStatus();
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) refreshStatus();
 });
+revealHash();

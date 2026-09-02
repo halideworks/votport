@@ -418,6 +418,60 @@ pub async fn admin_status(
     })))
 }
 
+#[derive(Deserialize)]
+pub struct SearchQuery {
+    q: Option<String>,
+}
+
+/// The masthead search: requests, downloads, received files, and audit rows
+/// matching a phrase, five of each, scoped like the pages that show them.
+pub async fn admin_search(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Query(query): Query<SearchQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_operator(&app, &headers)?;
+    let phrase = query.q.unwrap_or_default();
+    let phrase = phrase.trim();
+    let length = phrase.chars().count();
+    if !(2..=200).contains(&length) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "search needs between 2 and 200 characters",
+        ));
+    }
+    let results = app
+        .store
+        .search(&identity.tenant, phrase, 5)
+        .map_err(super::store_unavailable)?;
+    // The audit trail follows the Audit page's rule: a named tenant sees its
+    // own rows, the default tenant sees everything.
+    let audit = app
+        .store
+        .audit_recent_filtered(
+            &identity.tenant,
+            0,
+            5,
+            AuditFilters {
+                event: None,
+                query: Some(phrase),
+            },
+        )
+        .map_err(super::store_unavailable)?;
+    Ok(Json(json!({
+        "requests": results.requests,
+        "downloads": results.downloads,
+        "files": results.files,
+        "audit": audit.iter().map(|row| json!({
+            "rowid": row.rowid,
+            "at": row.at,
+            "event": row.event,
+            "subject": row.subject,
+            "actor": row.actor,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
 pub async fn admin_session(
     State(app): State<Arc<App>>,
     headers: HeaderMap,

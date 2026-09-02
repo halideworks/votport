@@ -1320,6 +1320,81 @@ details summary:focus-visible {
 .nav a.active {
  color: var(--text);
 }
+/* Masthead search beside the nav; results drop over the page. */
+.global-search {
+ position: relative;
+ flex: 0 1 22rem;
+ margin-left: auto;
+ min-width: 0;
+}
+.global-search input[type="search"] {
+ width: 100%;
+ padding: 0.45rem 0.8rem;
+ font-size: 0.8rem;
+ border-radius: 999px;
+}
+.search-results {
+ position: absolute;
+ top: calc(100% + 0.4rem);
+ right: 0;
+ width: min(28rem, 92vw);
+ max-height: 24rem;
+ overflow-y: auto;
+ z-index: 30;
+ padding: 0.4rem;
+ background: var(--sheet);
+ border: 1px solid var(--border-active);
+ border-radius: 0.85rem;
+ box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+}
+.search-group {
+ padding: 0.5rem 0.75rem 0.25rem;
+ font-size: 0.6rem;
+ font-weight: 700;
+ text-transform: uppercase;
+ letter-spacing: 0.1em;
+ color: var(--muted);
+}
+.search-row {
+ display: flex;
+ flex-direction: column;
+ gap: 0.1rem;
+ padding: 0.45rem 0.75rem;
+ border-radius: 0.5rem;
+ color: var(--text);
+ text-decoration: none;
+ font-size: 0.82rem;
+}
+.search-row > span:first-child {
+ overflow: hidden;
+ text-overflow: ellipsis;
+ white-space: nowrap;
+}
+.search-row .muted {
+ font-size: 0.72rem;
+}
+.search-row:hover,
+.search-row:focus-visible {
+ background: var(--panel-hover);
+ outline: none;
+}
+/* The card a search result landed on. */
+.revealed {
+ border-color: var(--progress);
+ box-shadow: 0 0 0 1px var(--progress);
+}
+@media (max-width: 640px) {
+ .global-search {
+  flex: 1 0 100%;
+  margin: 0.75rem 0 0;
+ }
+ .search-results {
+  right: auto;
+  left: 0;
+  width: 100%;
+ }
+}
+
 /* Sign out sits on the brand row, so the nav row is only the nav. */
 .hero-brand #logout {
  margin-left: auto;

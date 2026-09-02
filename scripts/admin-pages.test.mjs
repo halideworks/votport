@@ -133,3 +133,14 @@ test('receive page carries the status strip and polls the status endpoint', () =
   assert.match(receiveScript, /How receiving works/);
   assert.match(deliverScript, /How delivering works/);
 });
+
+test('every admin page mounts the masthead search and results deep-link into their lists', () => {
+  for (const [name, html] of [['receive', receive], ['deliver', deliver], ['audit', audit], ['tenants', tenants], ['system', system]]) {
+    assert.match(html, /id="global-search-input"/, `${name} has the search box`);
+    assert.match(html, /id="global-search-results"/, `${name} has the results panel`);
+  }
+  assert.match(receiveScript, /card\.id = `link-\$\{link\.id\}`/);
+  assert.match(deliverScript, /card\.id = `grant-\$\{grant\.id\}`/);
+  assert.match(receiveScript, /revealHash\(\)/);
+  assert.match(deliverScript, /revealHash\(\)/);
+});

@@ -15,6 +15,7 @@ import {
   formatBytes,
   formatWhen,
   requireSession,
+  revealHash,
   showGrantResult,
 } from '/assets/admin-common.js';
 
@@ -140,6 +141,7 @@ function renderGrants() {
   for (const grant of grants) {
     const card = document.createElement('div');
     card.className = 'card link-item';
+    card.id = `grant-${grant.id}`;
     const head = document.createElement('div');
     head.className = 'head';
     const title = document.createElement('h3');
@@ -885,5 +887,17 @@ $('deliver-form').addEventListener('submit', async (event) => {
   await submitDeliverGrant({}, $('deliver-submit'));
 });
 
+// A search result may name a grant past the first page: page forward until
+// it is on the page. ponytail: bounded at ten pages; a grant lookup by id
+// is the upgrade if issued downloads ever run to thousands.
+async function revealGrant() {
+  if (!window.location.hash.startsWith('#grant-')) return;
+  for (let pages = 0; !revealHash() && grantHasMore && pages < 10; pages += 1) {
+    await refreshGrants(false);
+  }
+}
+window.addEventListener('hashchange', () => { revealGrant().catch(() => {}); });
+
 await requireSession();
 await Promise.all([refreshGrants(), refreshLibrary(), refreshAutomationTokens()]);
+await revealGrant();

@@ -1281,6 +1281,99 @@ impl Store {
         })
     }
 
+    /// Global search across one tenant: requests by label, destination, or
+    /// id; downloads by label or file name; received files by path. Each
+    /// group is capped at `limit`, newest first. Paths live inside each
+    /// link's upload JSON, so the file group walks the tenant's links.
+    // ponytail: the file group parses every upload record in the tenant per
+    // keystroke; a path column on `files` or FTS5 is the upgrade once a
+    // tenant holds tens of thousands of records.
+    pub fn search(&self, tenant: &str, query: &str, limit: u64) -> Result<SearchResults, String> {
+        let needle = format!("%{}%", escape_like(&query.to_lowercase()));
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with(|connection| {
+            let requests = connection
+                .prepare_cached(
+                    "SELECT id, label, dest, active, expires_at, created_at
+                     FROM links
+                     WHERE tenant = ?1
+                       AND (lower(label) LIKE ?2 ESCAPE '\\'
+                            OR lower(dest) LIKE ?2 ESCAPE '\\'
+                            OR id LIKE ?2 ESCAPE '\\')
+                     ORDER BY created_at DESC LIMIT ?3",
+                )?
+                .query_map(rusqlite::params![tenant, needle, limit], |row| {
+                    let expires_at: Option<i64> = row.get(4)?;
+                    Ok(SearchRequest {
+                        id: row.get(0)?,
+                        label: row.get(1)?,
+                        dest: row.get(2)?,
+                        active: row.get::<_, i64>(3)? != 0,
+                        expires_at: expires_at.and_then(|at| u64::try_from(at).ok()),
+                        created_at: row
+                            .get::<_, i64>(5)
+                            .map(|at| u64::try_from(at).unwrap_or(0))?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let downloads = connection
+                .prepare_cached(
+                    "SELECT id, label, name, created_at, revoked_at IS NOT NULL
+                     FROM outbound_grants
+                     WHERE tenant = ?1
+                       AND (lower(label) LIKE ?2 ESCAPE '\\'
+                            OR lower(name) LIKE ?2 ESCAPE '\\')
+                     ORDER BY created_at DESC LIMIT ?3",
+                )?
+                .query_map(rusqlite::params![tenant, needle, limit], |row| {
+                    Ok(SearchDownload {
+                        id: row.get(0)?,
+                        label: row.get(1)?,
+                        name: row.get(2)?,
+                        created_at: row
+                            .get::<_, i64>(3)
+                            .map(|at| u64::try_from(at).unwrap_or(0))?,
+                        revoked: row.get::<_, i64>(4)? != 0,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let files = connection
+                .prepare_cached(
+                    "SELECT links.id, links.label,
+                            json_extract(upload.value, '$.id'),
+                            json_extract(file.value, '$.path'),
+                            json_extract(file.value, '$.bytes'),
+                            json_extract(upload.value, '$.completed_at')
+                     FROM links, json_each(links.uploads_json) AS upload,
+                          json_each(upload.value, '$.files') AS file
+                     WHERE links.tenant = ?1
+                       AND COALESCE(json_extract(file.value, '$.deleted'), 0) = 0
+                       AND lower(json_extract(file.value, '$.path')) LIKE ?2 ESCAPE '\\'
+                     ORDER BY json_extract(upload.value, '$.completed_at') DESC LIMIT ?3",
+                )?
+                .query_map(rusqlite::params![tenant, needle, limit], |row| {
+                    Ok(SearchFile {
+                        link_id: row.get(0)?,
+                        link_label: row.get(1)?,
+                        upload_id: row.get(2)?,
+                        path: row.get(3)?,
+                        bytes: row
+                            .get::<_, i64>(4)
+                            .map(|n| u64::try_from(n).unwrap_or(0))?,
+                        completed_at: row
+                            .get::<_, i64>(5)
+                            .map(|at| u64::try_from(at).unwrap_or(0))?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(SearchResults {
+                requests,
+                downloads,
+                files,
+            })
+        })
+    }
+
     pub fn links_page(
         &self,
         tenant: &str,
@@ -1310,7 +1403,8 @@ impl Store {
                  FROM links
                  WHERE tenant = ?1
                    AND (?2 = '' OR lower(label) LIKE '%' || ?2 || '%' ESCAPE '\\'
-                        OR lower(dest) LIKE '%' || ?2 || '%' ESCAPE '\\')
+                        OR lower(dest) LIKE '%' || ?2 || '%' ESCAPE '\\'
+                        OR id = ?2)
                    AND (?3 = 'all'
                         OR (?3 = 'open' AND active != 0
                             AND (expires_at IS NULL OR expires_at > ?4))
@@ -3498,6 +3592,42 @@ pub struct AuditRow {
     pub event: String,
     pub subject: String,
     pub detail: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SearchResults {
+    pub requests: Vec<SearchRequest>,
+    pub downloads: Vec<SearchDownload>,
+    pub files: Vec<SearchFile>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SearchRequest {
+    pub id: String,
+    pub label: String,
+    pub dest: String,
+    pub active: bool,
+    pub expires_at: Option<u64>,
+    pub created_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SearchDownload {
+    pub id: String,
+    pub label: String,
+    pub name: String,
+    pub created_at: u64,
+    pub revoked: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SearchFile {
+    pub link_id: String,
+    pub link_label: String,
+    pub upload_id: String,
+    pub path: String,
+    pub bytes: u64,
+    pub completed_at: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -6461,7 +6591,8 @@ mod phase4_review_tests {
                      SELECT id FROM links
                      WHERE tenant = ?1
                        AND (?2 = '' OR lower(label) LIKE '%' || ?2 || '%' ESCAPE '\\'
-                            OR lower(dest) LIKE '%' || ?2 || '%' ESCAPE '\\')
+                            OR lower(dest) LIKE '%' || ?2 || '%' ESCAPE '\\'
+                            OR id = ?2)
                        AND (?3 = 'all'
                             OR (?3 = 'open' AND active != 0
                                 AND (expires_at IS NULL OR expires_at > ?4))
