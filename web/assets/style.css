@@ -43,7 +43,6 @@
  --shadow-deep: rgba(0, 0, 0, 0.5);
  --backdrop: rgb(0 0 0 / 60%);
  --selection: rgba(56, 189, 248, 0.3);
- --reveal-glow: rgba(56, 189, 248, 0.35);
  font-size: 16px;
  color-scheme: dark;
 }
@@ -81,7 +80,6 @@
  --shadow-deep: rgba(15, 23, 42, 0.22);
  --backdrop: rgb(15 23 42 / 40%);
  --selection: rgba(3, 105, 161, 0.25);
- --reveal-glow: rgba(3, 105, 161, 0.3);
  color-scheme: light;
 }
 @media (prefers-color-scheme: light) {
@@ -115,7 +113,6 @@
   --shadow-deep: rgba(15, 23, 42, 0.22);
   --backdrop: rgb(15 23 42 / 40%);
   --selection: rgba(3, 105, 161, 0.25);
-  --reveal-glow: rgba(3, 105, 161, 0.3);
   color-scheme: light;
  }
 }
@@ -1594,11 +1591,7 @@ details summary:focus-visible {
  background: var(--panel-hover);
  outline: none;
 }
-/* The card a search result landed on. */
-.revealed {
- border-color: var(--progress);
- box-shadow: 0 0 0 1px var(--progress);
-}
+
 @media (max-width: 640px) {
  .global-search {
   flex: 1 0 100%;
@@ -1995,9 +1988,6 @@ details.deployment .settings-status {
  .receiving-now > span::before {
   animation: pulse 1.6s ease-in-out infinite;
  }
- .revealed {
-  animation: reveal 0.9s ease-out;
- }
  .nav a,
  .settings-nav a,
  .badge,
@@ -2022,8 +2012,4 @@ details.deployment .settings-status {
 @keyframes pulse {
  0%, 100% { opacity: 1; transform: scale(1); }
  50% { opacity: 0.45; transform: scale(0.8); }
-}
-@keyframes reveal {
- from { box-shadow: 0 0 0 6px var(--reveal-glow); }
- to { box-shadow: 0 0 0 1px var(--progress); }
 }
