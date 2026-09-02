@@ -2418,21 +2418,7 @@ impl Store {
 
     /// Bytes received-and-not-deleted across a tenant's links.
     pub fn tenant_received_bytes(&self, tenant: &str) -> Result<u64, String> {
-        self.with(|connection| {
-            connection
-                .prepare_cached(
-                    "SELECT COALESCE(SUM(bytes_hi), 0), COALESCE(SUM(bytes_lo), 0) FROM (
-                         SELECT MAX(bytes_hi) AS bytes_hi, bytes_lo FROM files
-                         WHERE tenant = ?1 AND deleted = 0
-                         GROUP BY tenant, CASE WHEN stored_as = ''
-                             THEN link_id || '/' || upload_index || '/' || file_index
-                             ELSE stored_as END)",
-                )?
-                .query_row([tenant], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-                })
-                .map(|(hi, lo)| combine_byte_sums(hi, lo))
-        })
+        self.tenant_stored(tenant).map(|(_, bytes)| bytes)
     }
 
     /// Link and live-byte totals for every tenant in one grouped query. Both
@@ -4389,6 +4375,32 @@ mod tests {
         let grant = test_outbound_grant("g1", "acme", 3);
         store.insert_outbound_grant(grant.clone()).unwrap();
         assert_eq!(store.outbound_grants("acme").unwrap(), vec![grant]);
+    }
+
+    #[test]
+    fn outbound_summary_counts_open_links_deliveries_and_active_downloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let open = test_outbound_grant("open", "acme", 1);
+        let mut used = test_outbound_grant("used", "acme", 1);
+        used.downloads = 2;
+        used.max_downloads = Some(2);
+        let mut revoked = test_outbound_grant("gone", "acme", 1);
+        revoked.revoked_at = Some(5);
+        let other = test_outbound_grant("other", "beta", 1);
+        for grant in [open.clone(), used, revoked, other] {
+            store.insert_outbound_grant(grant).unwrap();
+        }
+        // The status handler keeps the part of each in-flight key before the
+        // first colon: the grant's token hash.
+        let active = vec![open.token_hash.clone(), "hash-other".to_owned()];
+        let summary = store.outbound_summary("acme", 10, &active).unwrap();
+        assert_eq!(summary.open_grants, 1, "used and revoked are not open");
+        assert_eq!(summary.deliveries, 2);
+        assert_eq!(summary.active, 1, "the other tenant's download is not ours");
+        let expired = store.outbound_summary("acme", 25, &[]).unwrap();
+        assert_eq!(expired.open_grants, 0);
+        assert_eq!(expired.active, 0);
     }
 
     #[test]

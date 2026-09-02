@@ -375,6 +375,18 @@ pub struct StatusQuery {
     since: Option<u64>,
 }
 
+/// Downloads in flight are keyed by the grant's hex token hash, a colon, and
+/// one or two stream segments; the part before the first colon is the grant,
+/// so one recipient with several streams open counts once.
+fn active_grant_hashes<'a>(keys: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut hashes: Vec<String> = keys
+        .map(|key| key.split_once(':').map_or(key, |(hash, _)| hash).to_owned())
+        .collect();
+    hashes.sort();
+    hashes.dedup();
+    hashes
+}
+
 /// The Receive and Deliver status strips: what is arriving now, what landed
 /// today, what is stored, what is being served, and room on both volumes.
 pub async fn admin_status(
@@ -405,25 +417,15 @@ pub async fn admin_status(
         .tenant_stored(&identity.tenant)
         .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let now = now_unix();
-    // Downloads in flight are keyed by grant token hash plus a stream
-    // suffix; the tenant's share is counted by grant, so one recipient with
-    // several streams open is one active download.
-    let active_hashes: Vec<String> = {
+    // Downloads in flight are keyed by the grant's hex token hash, a colon,
+    // and one or two stream segments; the tenant's share is counted by
+    // grant, so one recipient with several streams open is one download.
+    let active_hashes = {
         let active = app
             .outbound_active
             .lock()
             .expect("outbound active poisoned");
-        let mut hashes: Vec<String> = active
-            .iter()
-            .map(|key| {
-                key.rsplit_once(':')
-                    .map_or(key.as_str(), |(hash, _)| hash)
-                    .to_owned()
-            })
-            .collect();
-        hashes.sort();
-        hashes.dedup();
-        hashes
+        active_grant_hashes(active.iter().map(String::as_str))
     };
     let outbound = app
         .store
@@ -7015,6 +7017,20 @@ mod notification_and_limit_tests {
         assert_eq!(
             body["error"],
             "Delivered 0 of 1 configured notification channels"
+        );
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::active_grant_hashes;
+
+    #[test]
+    fn in_flight_keys_collapse_to_their_grant() {
+        let keys = ["abc:0", "abc:batch", "abc:1:lease-token", "def:bundle"];
+        assert_eq!(
+            active_grant_hashes(keys.iter().copied()),
+            vec!["abc".to_owned(), "def".to_owned()]
         );
     }
 }
