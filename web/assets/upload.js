@@ -67,9 +67,9 @@ const MAX_WORKERS = 8;
 const PARALLEL_MIN_BYTES = 64 * 1024 * 1024;
 const MIN_SEGMENT_BYTES = 16 * 1024 * 1024;
 const PROOF_LEAF_BYTES = 65536;
-// One file at a time takes the whole pool; the others in the lookahead hash
-// in one piece, so live read buffers stay at pool size plus two, not three
-// times the pool.
+// One file at a time takes the whole pool; the other file in the lookahead
+// hashes in one piece, so live read buffers stay at pool size plus one, not
+// twice the pool.
 let parallelHashing = false;
 
 let hashWorkers = [];
