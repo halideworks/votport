@@ -531,6 +531,14 @@ mod tests {
     }
 
     fn ended(outcome: &str, notify: bool) -> crate::session::SessionEnded {
+        ended_with(outcome, notify, 7)
+    }
+
+    fn ended_with(
+        outcome: &str,
+        notify: bool,
+        received_bytes: u64,
+    ) -> crate::session::SessionEnded {
         crate::session::SessionEnded {
             tenant: String::new(),
             link_id: "link-1".to_owned(),
@@ -541,7 +549,7 @@ mod tests {
                 started_at: 10,
                 outcome: outcome.to_owned(),
                 detail: "session went idle".to_owned(),
-                received_bytes: 7,
+                received_bytes,
                 expected_bytes: 9,
                 replayed_chunks: 0,
                 rejected_chunks: 0,
@@ -570,7 +578,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn notifier_skips_cancelled_and_unsubscribed_sessions() {
         let (application, _directory, rx, thread) = webhook_app();
-        for skipped in [ended("cancelled", true), ended("interrupted", false)] {
+        for skipped in [
+            ended("cancelled", true),
+            ended("interrupted", false),
+            ended_with("interrupted", true, 0),
+        ] {
             application.session_ended.send(skipped).unwrap();
         }
         application

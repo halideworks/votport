@@ -564,9 +564,23 @@ pub async fn upload_ended_notifier(app: Arc<App>) {
         return;
     };
     while let Some(ended) = receiver.recv().await {
-        if ended.notify && ended.event.outcome != "cancelled" {
+        if ended.notify && ended_notifies(&ended.event) {
             tokio::spawn(crate::notify::upload_ended(Arc::clone(&app), ended));
         }
+    }
+}
+
+/// Which session ends are worth a notification: a begin refused outright,
+/// or a transfer that stopped after bytes had arrived. A cancel is the
+/// sender's choice, and an interrupted session with nothing received is
+/// churn (a retried create that orphaned its first session, a create
+/// refused mid-flight, an idle session swept) that the link's event list
+/// already keeps.
+fn ended_notifies(event: &crate::store::SessionEvent) -> bool {
+    match event.outcome.as_str() {
+        "rejected" => true,
+        "interrupted" => event.received_bytes > 0,
+        _ => false,
     }
 }
 
@@ -2660,6 +2674,35 @@ mod push_metrics_tests {
 #[cfg(test)]
 mod transfer_metrics_tests {
     use super::*;
+
+    #[test]
+    fn ended_notifies_only_rejections_and_interrupted_transfers_with_bytes() {
+        let event = |outcome: &str, received_bytes: u64| crate::store::SessionEvent {
+            at: 2,
+            started_at: 1,
+            outcome: outcome.to_owned(),
+            detail: String::new(),
+            received_bytes,
+            expected_bytes: 10,
+            replayed_chunks: 0,
+            rejected_chunks: 0,
+        };
+        for (outcome, received, expected) in [
+            ("rejected", 0, true),
+            ("rejected", 5, true),
+            ("interrupted", 0, false),
+            ("interrupted", 1, true),
+            ("cancelled", 5, false),
+            ("published", 5, false),
+            ("", 5, false),
+        ] {
+            assert_eq!(
+                ended_notifies(&event(outcome, received)),
+                expected,
+                "{outcome} {received}"
+            );
+        }
+    }
 
     #[test]
     fn outcome_table_is_fixed() {
