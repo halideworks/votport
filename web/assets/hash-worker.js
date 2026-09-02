@@ -49,7 +49,7 @@ self.onmessage = async ({ data: message }) => {
         const bytes = new Uint8Array(await pending);
         const next = offset + bytes.length;
         pending = next < end ? readSlice(file, next, end) : null;
-        parts.push(proofLeavesAt(Suite.Blake3Bao64, BigInt(offset), bytes));
+        parts.push(proofLeavesAt(Suite.Blake3Bao64, BigInt(offset), bytes, BigInt(file.size)));
         offset = next;
         postMessage({ req, step: bytes.length });
       }
