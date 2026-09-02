@@ -4586,3 +4586,65 @@ async fn run_load(
     }
     Ok(())
 }
+
+/// The web sender opens one session per file; the per-address creation
+/// limit is twenty per window, so a finished session must hand its budget
+/// back or a package of many small files stalls after the twentieth.
+#[tokio::test]
+async fn finished_sessions_do_not_count_against_the_creation_limit() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let files = [prepare(vec!["small.bin"], vec![7u8; 1024])];
+    let (token, first) = open_session(&client, &base, "many small", &files).await;
+    let mut session = first;
+    for round in 0..22 {
+        assert_eq!(
+            begin(&client, &base, &session).await.0,
+            200,
+            "round {round}"
+        );
+        upload_chunks(&client, &base, &session, 0, &files[0]).await;
+        let status = client
+            .post(format!("{base}/api/session/{session}/finish"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16();
+        assert_eq!(status, 200, "finish in round {round}");
+        let response = client
+            .post(format!("{base}/api/r/{token}/session"))
+            .json(&json!({ "password": "", "package": build_package(&files).0 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "create after round {round}"
+        );
+        session = response.json::<Value>().await.unwrap()["session"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (_, pages, seal) = build_package(&files);
+        client
+            .post(format!("{base}/api/session/{session}/seal"))
+            .body(seal)
+            .send()
+            .await
+            .unwrap();
+        for page in pages {
+            client
+                .post(format!("{base}/api/session/{session}/page"))
+                .body(page)
+                .send()
+                .await
+                .unwrap();
+        }
+    }
+}

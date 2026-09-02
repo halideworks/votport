@@ -830,10 +830,17 @@ pub async fn upload_chunk(
 
 pub async fn upload_finish(
     State(app): State<Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
     Path(sid): Path<String>,
 ) -> ApiResult<Json<session::FinishReport>> {
     let link_id = app.sessions.link_id(&sid);
     let report = dispatch(&app, &sid, |reply, _lease| Cmd::Finish { reply, _lease }).await?;
+    // A finished session is not churn: the web sender opens one session per
+    // file, and a package of many small files would otherwise stall on the
+    // per-address creation limit after twenty of them.
+    app.session_rate
+        .refund(&client_ip(&headers, &peer, &app.config.trusted_proxies));
     #[cfg(test)]
     app.sessions.wait_finish_stall().await;
     let runtime = tokio::runtime::Handle::current();
@@ -1142,6 +1149,10 @@ mod session_rate_tests {
             router
                 .oneshot(
                     Request::post("/api/session/session/finish")
+                        .extension(ConnectInfo(std::net::SocketAddr::from((
+                            [127, 0, 0, 1],
+                            4000,
+                        ))))
                         .body(Body::empty())
                         .unwrap(),
                 )
