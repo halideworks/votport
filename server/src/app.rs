@@ -104,6 +104,11 @@ pub struct App {
     pub push: Option<PushState>,
     pub(crate) push_metrics: PushMetrics,
     pub(crate) request_metrics: RequestMetrics,
+    /// Every session worker reports here when it ends without publishing.
+    pub session_ended: tokio::sync::mpsc::UnboundedSender<session::SessionEnded>,
+    /// Taken once by [`upload_ended_notifier`].
+    pub(crate) session_ended_rx:
+        Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<session::SessionEnded>>>,
     pub(crate) push_tickets: Mutex<HashMap<[u8; 16], PushTicket>>,
     /// A process-wide maintenance lock: an operator click and the scheduler
     /// must never produce two snapshots or apply two restores concurrently.
@@ -176,6 +181,139 @@ const REQUEST_LATENCY_BUCKETS_NS: [u64; 7] = [
     u64::MAX,
 ];
 const REQUEST_LATENCY_BUCKET_LABELS: [&str; 7] = ["0.01", "0.05", "0.1", "0.5", "1", "5", "+Inf"];
+
+const TRANSFER_OUTCOMES: [&str; 4] = ["published", "rejected", "cancelled", "interrupted"];
+const UPLOAD_BYTES_BUCKETS: [u64; 7] = [
+    1 << 20,
+    16 << 20,
+    256 << 20,
+    1 << 30,
+    4 << 30,
+    16 << 30,
+    u64::MAX,
+];
+const UPLOAD_BYTES_BUCKET_LABELS: [&str; 7] = [
+    "1048576",
+    "16777216",
+    "268435456",
+    "1073741824",
+    "4294967296",
+    "17179869184",
+    "+Inf",
+];
+const UPLOAD_DURATION_BUCKETS_S: [u64; 7] = [1, 10, 60, 600, 3600, 21600, u64::MAX];
+const UPLOAD_DURATION_BUCKET_LABELS: [&str; 7] = ["1", "10", "60", "600", "3600", "21600", "+Inf"];
+
+fn transfer_outcome_index(outcome: &str) -> Option<usize> {
+    TRANSFER_OUTCOMES.iter().position(|known| *known == outcome)
+}
+
+/// Cumulative bucket increments: every bucket whose bound holds the value.
+fn observe_bucketed(buckets: &[AtomicU64; 7], bounds: [u64; 7], value: u64) {
+    for (bucket, bound) in buckets.iter().zip(bounds) {
+        if value <= bound {
+            bucket.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn write_histogram(
+    body: &mut String,
+    name: &str,
+    help: &str,
+    buckets: &[AtomicU64; 7],
+    labels: [&str; 7],
+    sum: f64,
+) {
+    let _ = writeln!(body, "# HELP {name} {help}\n# TYPE {name} histogram");
+    for (bucket, label) in buckets.iter().zip(labels) {
+        let _ = writeln!(
+            body,
+            "{name}_bucket{{le=\"{label}\"}} {}",
+            bucket.load(Ordering::Relaxed)
+        );
+    }
+    let _ = writeln!(
+        body,
+        "{name}_count {}\n{name}_sum {sum}",
+        buckets[6].load(Ordering::Relaxed)
+    );
+}
+
+/// Upload session outcomes and the size and duration of published uploads.
+/// A static because the session worker is an OS thread with no `App`.
+pub(crate) struct TransferMetrics {
+    ended: [AtomicU64; 4],
+    bytes_buckets: [AtomicU64; 7],
+    bytes_sum: AtomicU64,
+    duration_buckets: [AtomicU64; 7],
+    duration_sum_s: AtomicU64,
+}
+
+pub(crate) static TRANSFERS: TransferMetrics = TransferMetrics::new();
+
+impl TransferMetrics {
+    const fn new() -> Self {
+        Self {
+            ended: [const { AtomicU64::new(0) }; 4],
+            bytes_buckets: [const { AtomicU64::new(0) }; 7],
+            bytes_sum: AtomicU64::new(0),
+            duration_buckets: [const { AtomicU64::new(0) }; 7],
+            duration_sum_s: AtomicU64::new(0),
+        }
+    }
+
+    /// Counts a session end; an outcome outside the fixed table is dropped
+    /// rather than opening a new series.
+    pub(crate) fn ended(&self, outcome: &str) {
+        if let Some(index) = transfer_outcome_index(outcome) {
+            self.ended[index].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn published(&self, bytes: u64, seconds: u64) {
+        self.ended("published");
+        self.bytes_sum.fetch_add(bytes, Ordering::Relaxed);
+        observe_bucketed(&self.bytes_buckets, UPLOAD_BYTES_BUCKETS, bytes);
+        self.duration_sum_s.fetch_add(seconds, Ordering::Relaxed);
+        observe_bucketed(&self.duration_buckets, UPLOAD_DURATION_BUCKETS_S, seconds);
+    }
+
+    #[cfg(test)]
+    fn ended_count(&self, outcome: &str) -> u64 {
+        transfer_outcome_index(outcome).map_or(0, |index| self.ended[index].load(Ordering::Relaxed))
+    }
+
+    fn prometheus(&self) -> String {
+        let mut body = String::from(
+            "# HELP votport_upload_sessions_ended_total Upload sessions ended by fixed outcome.\n# TYPE votport_upload_sessions_ended_total counter\n",
+        );
+        for (index, outcome) in TRANSFER_OUTCOMES.iter().enumerate() {
+            let _ = writeln!(
+                body,
+                "votport_upload_sessions_ended_total{{outcome=\"{outcome}\"}} {}",
+                self.ended[index].load(Ordering::Relaxed)
+            );
+        }
+        write_histogram(
+            &mut body,
+            "votport_upload_bytes",
+            "Bytes per published upload.",
+            &self.bytes_buckets,
+            UPLOAD_BYTES_BUCKET_LABELS,
+            self.bytes_sum.load(Ordering::Relaxed) as f64,
+        );
+        write_histogram(
+            &mut body,
+            "votport_upload_duration_seconds",
+            "Seconds from session creation to publication.",
+            &self.duration_buckets,
+            UPLOAD_DURATION_BUCKET_LABELS,
+            self.duration_sum_s.load(Ordering::Relaxed) as f64,
+        );
+        body
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct RequestMetrics {
@@ -403,8 +541,33 @@ pub(crate) fn upload_completed(
             crate::notify::uploaded(app, link.tenant, link.label, report).await;
         });
     }
-    app.sessions.remove(session_id);
+    let started_at = app
+        .sessions
+        .remove(session_id)
+        .map_or(now_unix(), |handle| handle.started_at);
+    TRANSFERS.published(
+        report.files.iter().map(|file| file.bytes).sum::<u64>(),
+        now_unix().saturating_sub(started_at),
+    );
     remove_push_ticket(app, session_id);
+}
+
+/// Drains the session-ended channel and sends the failure notification for
+/// links that asked for one. Spawned once at startup; a second call returns.
+pub async fn upload_ended_notifier(app: Arc<App>) {
+    let Some(mut receiver) = app
+        .session_ended_rx
+        .lock()
+        .expect("notifier poisoned")
+        .take()
+    else {
+        return;
+    };
+    while let Some(ended) = receiver.recv().await {
+        if ended.notify && ended.event.outcome != "cancelled" {
+            tokio::spawn(crate::notify::upload_ended(Arc::clone(&app), ended));
+        }
+    }
 }
 
 const SSO_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
@@ -568,7 +731,8 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     // staging; every other staging file from a crash or kill has no live
     // session to sweep it, so remove those once at startup.
     let sessions = Sessions::new();
-    let kept = resume_upload_sessions(&config, &store, &signer, &sessions);
+    let (session_ended, session_ended_rx) = tokio::sync::mpsc::unbounded_channel();
+    let kept = resume_upload_sessions(&config, &store, &signer, &sessions, &session_ended);
     crate::paths::clean_staging(&config.receive_dir, &kept);
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -610,6 +774,8 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         push,
         push_metrics: PushMetrics::default(),
         request_metrics: RequestMetrics::default(),
+        session_ended,
+        session_ended_rx: Mutex::new(Some(session_ended_rx)),
         push_tickets: Mutex::new(HashMap::new()),
         backup_lock: Arc::new(tokio::sync::Mutex::new(())),
         shutdown: Arc::new(tokio::sync::Notify::new()),
@@ -657,6 +823,7 @@ fn resume_upload_sessions(
     store: &Arc<Store>,
     signer: &Arc<crate::receipt::ReceiptSigner>,
     sessions: &Sessions,
+    ended: &tokio::sync::mpsc::UnboundedSender<session::SessionEnded>,
 ) -> HashSet<std::path::PathBuf> {
     let persisted = match store.load_upload_sessions() {
         Ok(persisted) => persisted,
@@ -668,7 +835,7 @@ fn resume_upload_sessions(
     let mut kept = HashSet::new();
     for mut session in persisted {
         let session_tag = session.id.get(..8).unwrap_or(&session.id).to_owned();
-        match resume_upload_session(config, store, signer, sessions, &mut session) {
+        match resume_upload_session(config, store, signer, sessions, ended, &mut session) {
             Ok(paths) => {
                 tracing::info!(
                     target: "audit", event = "upload_session_resumed", link = %session.link_id,
@@ -698,6 +865,7 @@ fn resume_upload_session(
     store: &Arc<Store>,
     signer: &Arc<crate::receipt::ReceiptSigner>,
     sessions: &Sessions,
+    ended: &tokio::sync::mpsc::UnboundedSender<session::SessionEnded>,
     session: &mut crate::store::PersistedUploadSession,
 ) -> Result<Vec<std::path::PathBuf>, String> {
     let link = store
@@ -723,6 +891,7 @@ fn resume_upload_session(
         session_id,
         started_at: session.started_at,
         quiet_after_secs: session::quiet_after_secs(config.session_idle_secs),
+        ended: ended.clone(),
     };
     let (sender, receiver) = tokio::sync::mpsc::channel(8);
     let (kept, already) = session::resume_worker(setup, receiver, session)?;
@@ -1959,6 +2128,7 @@ mod push_tests {
             session_id: [79; 16],
             started_at: crate::store::now_unix(),
             quiet_after_secs: 5,
+            ended: application.session_ended.clone(),
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let (seams, stale_handle) = session::push_seams(
@@ -2443,6 +2613,24 @@ fn metrics_text(app: &App) -> Result<String, String> {
         "# TYPE votport_audit_insert_failures_total counter\nvotport_audit_insert_failures_total {}\n",
         crate::store::AUDIT_INSERT_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
     );
+    let _ = write!(
+        body,
+        "# TYPE votport_upload_bytes_in_flight gauge\nvotport_upload_bytes_in_flight {}\n",
+        app.sessions.bytes_in_flight()
+    );
+    body.push_str("# TYPE votport_disk_free_bytes gauge\n# TYPE votport_disk_total_bytes gauge\n");
+    for (volume, root) in [
+        ("receive", &app.config.receive_dir),
+        ("outbound", &app.config.outbound_dir),
+    ] {
+        if let Some((free, total)) = crate::api::admin::disk_of(root) {
+            let _ = write!(
+                body,
+                "votport_disk_free_bytes{{volume=\"{volume}\"}} {free}\nvotport_disk_total_bytes{{volume=\"{volume}\"}} {total}\n"
+            );
+        }
+    }
+    body.push_str(&TRANSFERS.prometheus());
     body.push_str(&app.request_metrics.prometheus());
     Ok(body)
 }
@@ -2466,6 +2654,55 @@ mod push_metrics_tests {
         assert_eq!(PushRefusalReason::Capability.label(), "capability");
         assert_eq!(PushRefusalReason::Expired.label(), "expired");
         assert_eq!(PushRefusalReason::Spent.label(), "spent");
+    }
+}
+
+#[cfg(test)]
+mod transfer_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn outcome_table_is_fixed() {
+        for (index, outcome) in TRANSFER_OUTCOMES.iter().enumerate() {
+            assert_eq!(transfer_outcome_index(outcome), Some(index));
+        }
+        assert_eq!(transfer_outcome_index("exploded"), None);
+        assert_eq!(transfer_outcome_index(""), None);
+    }
+
+    #[test]
+    fn transfer_metrics_keep_fixed_series_and_cumulative_buckets() {
+        let metrics = TransferMetrics::new();
+        metrics.ended("rejected");
+        metrics.ended("interrupted");
+        metrics.ended("interrupted");
+        metrics.ended("exploded");
+        metrics.published(2 << 20, 5);
+        metrics.published(3 << 30, 700);
+        assert_eq!(metrics.ended_count("published"), 2);
+        assert_eq!(metrics.ended_count("rejected"), 1);
+        assert_eq!(metrics.ended_count("cancelled"), 0);
+        assert_eq!(metrics.ended_count("interrupted"), 2);
+        assert_eq!(metrics.ended_count("exploded"), 0);
+        let loads = |buckets: &[AtomicU64; 7]| {
+            buckets
+                .iter()
+                .map(|bucket| bucket.load(Ordering::Relaxed))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(loads(&metrics.bytes_buckets), [0, 1, 1, 1, 2, 2, 2]);
+        assert_eq!(loads(&metrics.duration_buckets), [0, 1, 1, 1, 2, 2, 2]);
+        let text = metrics.prometheus();
+        assert!(text.contains("votport_upload_sessions_ended_total{outcome=\"interrupted\"} 2\n"));
+        assert!(text.contains("votport_upload_bytes_bucket{le=\"1048576\"} 0\n"));
+        assert!(text.contains("votport_upload_bytes_bucket{le=\"+Inf\"} 2\n"));
+        assert!(text.contains(&format!(
+            "votport_upload_bytes_sum {}\n",
+            (2u64 << 20) + (3 << 30)
+        )));
+        assert!(text.contains("votport_upload_duration_seconds_count 2\n"));
+        assert!(text.contains("votport_upload_duration_seconds_sum 705\n"));
+        assert_eq!(text.matches("_bucket{").count(), 14);
     }
 }
 

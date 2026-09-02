@@ -534,6 +534,7 @@ pub async fn create_session(
         session_id: session_bytes,
         started_at: now_unix(),
         quiet_after_secs: session::quiet_after_secs(app.config.session_idle_secs),
+        ended: app.session_ended.clone(),
     };
     // Depth matches the client's chunk concurrency so handlers rarely block
     // on send. Register the sender before the worker can create_dir_all.
@@ -619,6 +620,7 @@ pub async fn create_push_session(
         session_id: session_bytes,
         started_at: now_unix(),
         quiet_after_secs: session::quiet_after_secs(app.config.session_idle_secs),
+        ended: app.session_ended.clone(),
     };
     let (sender, _receiver) = mpsc::channel(1);
     register_session(
@@ -1553,6 +1555,19 @@ mod push_preflight_tests {
                 .outcome,
             "cancelled"
         );
+        let ended = application
+            .session_ended_rx
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .try_recv()
+            .unwrap();
+        assert_eq!(
+            (ended.link_id.as_str(), ended.event.outcome.as_str()),
+            ("quota", "cancelled")
+        );
+        assert_eq!(ended.event.expected_bytes, 7);
         assert_eq!(
             post_push(application, "quota", request_body(&holder, 4))
                 .await

@@ -171,6 +171,42 @@ pub async fn test_saved(app: Arc<App>) -> Result<NotificationReport, String> {
     .await)
 }
 
+/// Notifies that an upload session ended without publishing: rejected at
+/// begin, or interrupted by a disconnect, expiry, or terminal error.
+pub async fn upload_ended(app: Arc<App>, ended: crate::session::SessionEnded) {
+    let event = &ended.event;
+    let title = format!(
+        "{}: upload {} for \"{}\"",
+        title_brand(&app, &ended.tenant),
+        event.outcome,
+        ended.label
+    );
+    let body = format!(
+        "{}\n{} of {} bytes received",
+        event.detail, event.received_bytes, event.expected_bytes
+    );
+    let payload = json!({
+        "event": "upload_failed",
+        "label": ended.label,
+        "link_id": ended.link_id,
+        "outcome": event.outcome,
+        "detail": event.detail,
+        "received_bytes": event.received_bytes,
+        "expected_bytes": event.expected_bytes,
+        "started_at": event.started_at,
+        "ended_at": event.at,
+    });
+    send_all(
+        app,
+        title,
+        body,
+        payload,
+        "upload_failed",
+        Some(&ended.link_id),
+    )
+    .await;
+}
+
 async fn send_all(
     app: Arc<App>,
     title: String,
@@ -492,6 +528,62 @@ mod tests {
         ] {
             assert!(!request.contains(secret), "{secret}: {request}");
         }
+    }
+
+    fn ended(outcome: &str, notify: bool) -> crate::session::SessionEnded {
+        crate::session::SessionEnded {
+            tenant: String::new(),
+            link_id: "link-1".to_owned(),
+            label: "shoot".to_owned(),
+            notify,
+            event: crate::store::SessionEvent {
+                at: 20,
+                started_at: 10,
+                outcome: outcome.to_owned(),
+                detail: "session went idle".to_owned(),
+                received_bytes: 7,
+                expected_bytes: 9,
+                replayed_chunks: 0,
+                rejected_chunks: 0,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_ended_sends_failure_webhook_without_secrets() {
+        let (application, _directory, rx, thread) = webhook_app();
+        upload_ended(application, ended("interrupted", true)).await;
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let payload = request_json(&request);
+        assert_eq!(payload["event"], "upload_failed");
+        assert_eq!(payload["outcome"], "interrupted");
+        assert_eq!(payload["label"], "shoot");
+        assert_eq!(payload["link_id"], "link-1");
+        assert_eq!(payload["received_bytes"], 7);
+        assert_eq!(payload["expected_bytes"], 9);
+        assert_eq!(payload["ended_at"], 20);
+        assert_no_secrets(&request);
+        thread.join().unwrap();
+    }
+
+    // Multi-threaded: the blocking recv below must not starve the notifier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn notifier_skips_cancelled_and_unsubscribed_sessions() {
+        let (application, _directory, rx, thread) = webhook_app();
+        for skipped in [ended("cancelled", true), ended("interrupted", false)] {
+            application.session_ended.send(skipped).unwrap();
+        }
+        application
+            .session_ended
+            .send(ended("rejected", true))
+            .unwrap();
+        let notifier = tokio::spawn(crate::app::upload_ended_notifier(Arc::clone(&application)));
+        let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(request_json(&request)["outcome"], "rejected");
+        thread.join().unwrap();
+        notifier.abort();
+        // A second notifier finds the receiver taken and returns at once.
+        crate::app::upload_ended_notifier(application).await;
     }
 
     #[tokio::test]

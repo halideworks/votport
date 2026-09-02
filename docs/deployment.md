@@ -438,6 +438,12 @@ class, in-flight handlers, and a time-to-response-headers histogram with 10ms
 through 5s and `+Inf` buckets; streamed body transfer time is excluded. Outbound
 library uploads also have a fixed-cardinality
 `votport_http_outbound_upload_duration_seconds` histogram with no route labels.
+Transfers are covered by `votport_upload_sessions_ended_total` with a fixed
+`outcome` label (`published`, `rejected`, `cancelled`, `interrupted`), the
+`votport_upload_bytes` and `votport_upload_duration_seconds` histograms over
+published uploads (1 MiB through 16 GiB, and 1s through 6h), the
+`votport_upload_bytes_in_flight` gauge, and `votport_disk_free_bytes` and
+`votport_disk_total_bytes` per `volume` (`receive`, `outbound`).
 Request metrics never include paths, tenants, addresses,
 methods, or tokens. Set `VOTPORT_METRICS_TOKEN` to require a bearer token, and
 scrape it over an internal interface only.

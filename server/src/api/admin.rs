@@ -375,6 +375,16 @@ pub struct StatusQuery {
     since: Option<u64>,
 }
 
+/// Free and total bytes on the volume holding `root`.
+pub(crate) fn disk_of(root: &std::path::Path) -> Option<(u64, u64)> {
+    rustix::fs::statvfs(root).ok().map(|stat| {
+        (
+            stat.f_bavail.saturating_mul(stat.f_frsize),
+            stat.f_blocks.saturating_mul(stat.f_frsize),
+        )
+    })
+}
+
 /// Splits a tenant's live file records into what is on disk and what is not.
 /// A record with no stored path (from before it was tracked) cannot be
 /// checked and counts as present.
@@ -429,12 +439,7 @@ pub async fn admin_status(
         .uploads_since(&identity.tenant, since)
         .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let disk_of = |root: &std::path::Path| {
-        rustix::fs::statvfs(root).ok().map(|stat| {
-            json!({
-                "free_bytes": stat.f_bavail.saturating_mul(stat.f_frsize),
-                "total_bytes": stat.f_blocks.saturating_mul(stat.f_frsize),
-            })
-        })
+        disk_of(root).map(|(free, total)| json!({ "free_bytes": free, "total_bytes": total }))
     };
     // Stored means on disk: a record whose file was moved or deleted outside
     // votport is reported apart, so the strip never claims bytes that are
