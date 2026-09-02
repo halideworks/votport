@@ -26,9 +26,10 @@ export function startStatusPoll({ render, active = () => false }) {
     try {
       status = await api(`/api/admin/status?since=${startOfToday()}`);
     } catch (error) {
-      // The session expired under an open tab: the reload lands on sign-in.
+      // The session expired under an open tab: go to sign-in, the same move
+      // requireSession makes, so the two never fight over the page.
       if (error.status === 401) {
-        window.location.reload();
+        window.location.replace('/');
         return;
       }
       schedule(null);

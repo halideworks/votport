@@ -345,7 +345,12 @@ function renderStatus(status) {
     ? `received · ${formatBytes(status.today.bytes)}`
     : 'received';
   $('stat-stored').textContent = formatBytes(status.stored.bytes);
-  $('stat-stored-detail').textContent = `${status.stored.files} received file${status.stored.files === 1 ? '' : 's'} on disk`;
+  const stored = status.stored;
+  let detail = `${stored.files} received file${stored.files === 1 ? '' : 's'} on disk`;
+  if (stored.missing_files) {
+    detail += ` · ${stored.missing_files} record${stored.missing_files === 1 ? '' : 's'} (${formatBytes(stored.missing_bytes)}) not on disk`;
+  }
+  $('stat-stored-detail').textContent = detail;
   $('stat-disk').textContent = status.disk ? formatBytes(status.disk.free_bytes) : '–';
 
   const byLink = new Map();
@@ -722,8 +727,10 @@ $('links-load-more').addEventListener('click', async () => {
   loadMore.disabled = false;
 });
 
-await requireSession();
+// The session check, the list, and the strip go out together; each is one
+// round trip, and none of them needs the others to have answered first.
+const sessionReady = requireSession();
 $('links-query').value = linksFilter.search;
-await refreshLinks();
 startStatusPoll({ render: renderStatus, active: (status) => status.sessions_active > 0 });
+await Promise.all([sessionReady, refreshLinksSafe()]);
 revealHash();

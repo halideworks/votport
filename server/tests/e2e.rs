@@ -4909,6 +4909,21 @@ async fn status_reports_receiving_sessions_and_the_days_uploads() {
         json!(2 * 1024 * 1024),
         "{status:?}"
     );
+    assert_eq!(status["stored"]["missing_files"], json!(0));
+    // A file moved out from under votport is a record, not stored bytes.
+    std::fs::remove_file(server.receive_dir.join("status.bin")).unwrap();
+    let status: Value = client
+        .get(format!("{base}/api/admin/status?since=0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["stored"]["files"], json!(0), "{status:?}");
+    assert_eq!(status["stored"]["bytes"], json!(0));
+    assert_eq!(status["stored"]["missing_files"], json!(1));
+    assert_eq!(status["stored"]["missing_bytes"], json!(2 * 1024 * 1024));
     // An issued download shows as open and, once fetched, as served.
     client
         .post(format!(

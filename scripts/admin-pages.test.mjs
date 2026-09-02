@@ -204,3 +204,25 @@ test('the audit log can be read oldest first, the theme switch is a quiet link, 
   assert.match(commonScript, /\^\(link\|grant\)-/);
   assert.match(system, /Reset to default/);
 });
+
+test('admin pages preload their module graph and fetch data alongside the session check', async () => {
+  // The preload list must be the page's whole import graph, or the browser
+  // discovers the missing module one round trip late.
+  const graph = async (entry) => {
+    const seen = new Set();
+    const walk = async (file) => {
+      if (seen.has(file)) return;
+      seen.add(file);
+      const source = await readFile(new URL(`../web/assets/${file}`, import.meta.url), 'utf8');
+      for (const [, dep] of source.matchAll(/from '(?:\/assets\/|\.\/)([\w-]+\.js)'/g)) await walk(dep);
+    };
+    await walk(entry);
+    return [...seen].sort();
+  };
+  for (const [name, html] of [['receive', receive], ['deliver', deliver], ['tenants', tenants], ['audit', audit], ['system', system]]) {
+    const preloads = [...html.matchAll(/rel="modulepreload" href="\/assets\/([\w-]+\.js)"/g)].map((m) => m[1]).sort();
+    assert.deepEqual(preloads, await graph(`page-${name}.js`), `${name} preloads its import graph`);
+  }
+  assert.match(receiveScript, /Promise\.all\(\[sessionReady, refreshLinksSafe\(\)\]\)/);
+  assert.match(deliverScript, /Promise\.all\(\[requireSession\(\), refreshGrants\(\)/);
+});

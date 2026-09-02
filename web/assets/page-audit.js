@@ -182,10 +182,10 @@ $('load-more').addEventListener('click', () => {
   load().catch(showLoadError);
 });
 
-const session = await requireSession();
+$('audit-query').value = initialQuery;
+updateExport();
+// The first page loads alongside the session check, one round trip for both.
+const [session] = await Promise.all([requireSession(), load(true).catch(showLoadError)]);
 if (!session.pages.includes('audit')) {
   window.location.replace('/receive');
 }
-$('audit-query').value = initialQuery;
-updateExport();
-await load(true).catch(showLoadError);

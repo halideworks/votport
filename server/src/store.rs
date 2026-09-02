@@ -1254,6 +1254,29 @@ impl Store {
         })
     }
 
+    /// Every live received file in one tenant namespace as (stored_as, bytes),
+    /// a physical file listed once however many records reference it. A
+    /// record from before stored_as was tracked comes back with an empty path.
+    pub fn tenant_live_files(&self, tenant: &str) -> Result<Vec<(String, u64)>, String> {
+        self.with(|connection| {
+            connection
+                .prepare_cached(
+                    "SELECT stored_as, MAX(bytes_hi) AS bytes_hi, bytes_lo
+                     FROM files WHERE tenant = ?1 AND deleted = 0
+                     GROUP BY CASE WHEN stored_as = ''
+                         THEN link_id || '/' || upload_index || '/' || file_index
+                         ELSE stored_as END",
+                )?
+                .query_map(rusqlite::params![tenant], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        combine_byte_sums(row.get(1)?, row.get(2)?),
+                    ))
+                })?
+                .collect()
+        })
+    }
+
     /// Live received files in one tenant namespace (count, bytes), a physical
     /// file counted once however many records reference it.
     pub fn tenant_stored(&self, tenant: &str) -> Result<(u64, u64), String> {

@@ -500,11 +500,11 @@ $('principal-search').addEventListener('input', () => {
 $('principal-load-more').addEventListener('click', () =>
   refreshPrincipals().catch((error) => alertModal(error.message)),
 );
-const session = await requireSession();
+// The list loads alongside the session check, one round trip for both.
 // The page itself is hidden from non-platform admins by the nav; direct
 // navigation gets bounced to their home.
+const [session] = await Promise.all([requireSession(), refreshTenants().catch(() => {})]);
 if (!session.pages.includes('tenants')) {
   window.location.replace('/receive');
 }
-await refreshTenants();
 await refreshPrincipals(true);

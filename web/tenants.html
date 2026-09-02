@@ -11,6 +11,11 @@
     <link rel="icon" type="image/png" href="/assets/favicon.png" />
     <link rel="stylesheet" href="/assets/style.css" />
     <script src="/assets/theme.js"></script>
+    <!-- The whole module graph fetches at once instead of one import level per round trip. -->
+    <link rel="modulepreload" href="/assets/page-tenants.js" />
+    <link rel="modulepreload" href="/assets/admin-common.js" />
+    <link rel="modulepreload" href="/assets/object-card.js" />
+    <link rel="modulepreload" href="/assets/undo.js" />
   </head>
   <body>
     <div class="sheet">

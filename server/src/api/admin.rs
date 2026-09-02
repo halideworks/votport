@@ -375,6 +375,30 @@ pub struct StatusQuery {
     since: Option<u64>,
 }
 
+/// Splits a tenant's live file records into what is on disk and what is not.
+/// A record with no stored path (from before it was tracked) cannot be
+/// checked and counts as present.
+fn stored_on_disk(app: &App, tenant: &str, live: &[(String, u64)]) -> serde_json::Value {
+    let (mut files, mut bytes, mut missing_files, mut missing_bytes) = (0u64, 0u64, 0u64, 0u64);
+    for (stored_as, size) in live {
+        let present = stored_as.is_empty()
+            || stored_path(app, tenant, stored_as).is_some_and(|path| path.is_file());
+        if present {
+            files += 1;
+            bytes = bytes.saturating_add(*size);
+        } else {
+            missing_files += 1;
+            missing_bytes = missing_bytes.saturating_add(*size);
+        }
+    }
+    json!({
+        "files": files,
+        "bytes": bytes,
+        "missing_files": missing_files,
+        "missing_bytes": missing_bytes,
+    })
+}
+
 /// Downloads in flight are keyed by the grant's hex token hash, a colon, and
 /// one or two stream segments; the part before the first colon is the grant,
 /// so one recipient with several streams open counts once.
@@ -412,10 +436,22 @@ pub async fn admin_status(
             })
         })
     };
-    let (stored_files, stored_bytes) = app
-        .store
-        .tenant_stored(&identity.tenant)
-        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    // Stored means on disk: a record whose file was moved or deleted outside
+    // votport is reported apart, so the strip never claims bytes that are
+    // not there. One stat per live file, off the runtime thread.
+    // ponytail: every poll stats every live file; cache the sweep once a
+    // tenant holds tens of thousands of records.
+    let stored = {
+        let app = Arc::clone(&app);
+        let tenant = identity.tenant.clone();
+        tokio::task::spawn_blocking(move || {
+            let live = app.store.tenant_live_files(&tenant)?;
+            Ok::<_, String>(stored_on_disk(&app, &tenant, &live))
+        })
+        .await
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
+    };
     let now = now_unix();
     // Downloads in flight are keyed by the grant's hex token hash, a colon,
     // and one or two stream segments; the tenant's share is counted by
@@ -437,7 +473,7 @@ pub async fn admin_status(
         "bytes_in_flight": bytes_in_flight,
         "receiving": receiving,
         "today": { "uploads": today_uploads, "bytes": today_bytes, "since": since },
-        "stored": { "files": stored_files, "bytes": stored_bytes },
+        "stored": stored,
         "disk": disk_of(&app.config.receive_dir),
         "outbound": {
             "active": outbound.active,
