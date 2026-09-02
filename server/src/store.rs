@@ -1285,6 +1285,9 @@ impl Store {
     /// id; downloads by label or file name; received files by path. Each
     /// group is capped at `limit`, newest first. Paths live inside each
     /// link's upload JSON, so the file group walks the tenant's links.
+    // ponytail: the file group parses every upload record in the tenant per
+    // keystroke; a path column on `files` or FTS5 is the upgrade once a
+    // tenant holds tens of thousands of records.
     pub fn search(&self, tenant: &str, query: &str, limit: u64) -> Result<SearchResults, String> {
         let needle = format!("%{}%", escape_like(&query.to_lowercase()));
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
@@ -1344,6 +1347,7 @@ impl Store {
                      FROM links, json_each(links.uploads_json) AS upload,
                           json_each(upload.value, '$.files') AS file
                      WHERE links.tenant = ?1
+                       AND COALESCE(json_extract(file.value, '$.deleted'), 0) = 0
                        AND lower(json_extract(file.value, '$.path')) LIKE ?2 ESCAPE '\\'
                      ORDER BY json_extract(upload.value, '$.completed_at') DESC LIMIT ?3",
                 )?

@@ -47,9 +47,17 @@ function mountSearch(session) {
   const input = document.getElementById('global-search-input');
   const results = document.getElementById('global-search-results');
   if (!form || !input || !results) return;
+  // The endpoint is operator-only; an audit-only session gets no box.
+  const pages = session.pages || [];
+  if (!pages.includes('receive') && !pages.includes('deliver')) {
+    form.hidden = true;
+    return;
+  }
   let timer = null;
   let latest = 0;
-  const close = () => { results.hidden = true; results.replaceChildren(); };
+  // Closing also retires any request still in flight so it cannot reopen
+  // the panel with stale rows.
+  const close = () => { latest += 1; results.hidden = true; results.replaceChildren(); };
   const group = (title, rows, render) => {
     if (!rows.length) return;
     const heading = document.createElement('div');
@@ -77,12 +85,18 @@ function mountSearch(session) {
     let hit;
     try {
       hit = await api(`/api/admin/search?q=${encodeURIComponent(phrase)}`);
-    } catch {
+    } catch (error) {
+      if (ticket !== latest) return;
+      results.replaceChildren();
+      const failed = document.createElement('div');
+      failed.className = 'search-group';
+      failed.textContent = `Search failed: ${error.message}`;
+      results.append(failed);
+      results.hidden = false;
       return;
     }
     if (ticket !== latest) return;
     results.replaceChildren();
-    const pages = session.pages || [];
     if (pages.includes('receive')) {
       group('Requests', hit.requests, (row) => ({
         href: `/receive#link-${row.id}`,
@@ -132,18 +146,18 @@ function mountSearch(session) {
     else run();
   });
   document.addEventListener('click', (event) => {
-    if (!form.contains(event.target)) results.hidden = true;
+    if (!form.contains(event.target)) close();
   });
 }
 
 /// Scrolls to and highlights the card named by the location hash, once the
 /// list that holds it has rendered. Search results deep-link this way.
-export function revealHash() {
+export function revealHash({ scroll = true } = {}) {
   const id = window.location.hash.slice(1);
   if (!id) return;
   const target = document.getElementById(id);
   if (!target) return;
-  target.scrollIntoView({ block: 'center' });
+  if (scroll) target.scrollIntoView({ block: 'center' });
   target.classList.add('revealed');
   target.querySelector('details')?.setAttribute('open', '');
 }

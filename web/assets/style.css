@@ -1321,9 +1321,6 @@ details summary:focus-visible {
  color: var(--text);
 }
 /* Masthead search beside the nav; results drop over the page. */
-.bar:has(> .nav) {
- align-items: center;
-}
 .global-search {
  position: relative;
  flex: 0 1 22rem;

@@ -5104,6 +5104,39 @@ async fn search_finds_requests_files_downloads_and_audit_rows() {
     let hit = search("day1xheat").await;
     assert!(hit["files"].as_array().unwrap().is_empty());
 
+    // A deleted file drops out of the results.
+    let links: Value = client
+        .get(format!("{base}/api/admin/links"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let link = links["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|link| link["id"] == json!(token))
+        .unwrap();
+    let upload_id = link["uploads"][0]["id"].as_str().unwrap();
+    let deleted = client
+        .delete(format!(
+            "{base}/api/admin/links/{token}/uploads/{upload_id}/files/0"
+        ))
+        .header("x-votport", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted.status().as_u16(),
+        200,
+        "{}",
+        deleted.text().await.unwrap()
+    );
+    let hit = search("heat-03").await;
+    assert!(hit["files"].as_array().unwrap().is_empty(), "{hit:?}");
+
     let short = client
         .get(format!("{base}/api/admin/search?q=a"))
         .send()

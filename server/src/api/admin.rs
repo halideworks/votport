@@ -433,7 +433,8 @@ pub async fn admin_search(
     let identity = require_operator(&app, &headers)?;
     let phrase = query.q.unwrap_or_default();
     let phrase = phrase.trim();
-    if phrase.chars().count() < 2 || phrase.len() > 200 {
+    let length = phrase.chars().count();
+    if !(2..=200).contains(&length) {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "search needs between 2 and 200 characters",
