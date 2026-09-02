@@ -725,7 +725,7 @@ button.danger:hover:not(:disabled) {
  gap: 1rem;
  margin-bottom: 1rem;
 }
-.timeline-head h2 {
+.modal .timeline-head h2 {
  margin: 0.15rem 0 0.25rem;
  font-family: "Instrument Serif", Georgia, serif;
  font-size: 1.5rem;
@@ -734,9 +734,13 @@ button.danger:hover:not(:disabled) {
  text-transform: none;
  color: var(--text);
 }
-.timeline-head .muted {
+.modal .timeline-head p {
  margin: 0;
  font-size: 0.8rem;
+}
+.modal .timeline-head .stat-label {
+ font-size: 0.6rem;
+ color: var(--muted);
 }
 .timeline-stats {
  display: grid;
@@ -753,20 +757,22 @@ button.danger:hover:not(:disabled) {
  padding: 0;
  max-height: 40vh;
  overflow-y: auto;
- border-left: 1px solid var(--border-active);
 }
+/* The spine and its dots sit inside the row, so the scroll box clips none of
+   them; each row draws its own segment. */
 .timeline-events li {
  position: relative;
  display: grid;
  grid-template-columns: 5.5rem minmax(0, 1fr);
  gap: 0.15rem 0.75rem;
- padding: 0.45rem 0 0.45rem 1rem;
+ padding: 0.45rem 0 0.45rem 1.25rem;
  font-size: 0.82rem;
+ border-left: 1px solid var(--border-active);
 }
 .timeline-events li::before {
  content: "";
  position: absolute;
- left: -0.3rem;
+ left: 0.15rem;
  top: 0.85rem;
  width: 0.5rem;
  height: 0.5rem;
@@ -798,13 +804,13 @@ button.danger:hover:not(:disabled) {
 .timeline-actions {
  justify-content: flex-start;
 }
+.modal .timeline-actions button.tiny,
 .timeline-actions a.button.tiny {
  padding: 0.3rem 0.7rem;
  font-size: 0.62rem;
  font-weight: 700;
  letter-spacing: 0.1em;
  text-transform: uppercase;
- border-radius: 999px;
 }
 @media (max-width: 640px) {
  .timeline-stats {
@@ -943,7 +949,6 @@ button.danger:hover:not(:disabled) {
  min-width: 0;
  overflow-wrap: anywhere;
 }
-
 
 .qr {
  margin-bottom: 1.1rem;
@@ -1425,7 +1430,6 @@ details summary:focus-visible {
  background: rgba(255, 255, 255, 0.12);
  border-radius: 2px;
 }
-
 
 /* ---- admin nav ------------------------------------------------------------ */
 .nav {
