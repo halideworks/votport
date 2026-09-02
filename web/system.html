@@ -10,6 +10,7 @@
     <title>VOTPort &middot; System</title>
     <link rel="icon" type="image/png" href="/assets/favicon.png" />
     <link rel="stylesheet" href="/assets/style.css" />
+    <script src="/assets/theme.js"></script>
   </head>
   <body>
     <div class="sheet">
@@ -19,7 +20,10 @@
             <img src="/assets/pommern_ship_white.png?v=70fc77f19116a72e" alt="" />
           </div>
           <span class="wordmark">VOTPort</span>
-          <button id="logout" class="ghost tiny">Sign out</button>
+          <div class="brand-actions">
+            <button id="theme-toggle" class="ghost tiny" aria-label="Switch theme"></button>
+            <button id="logout" class="ghost tiny">Sign out</button>
+          </div>
         </div>
         <select id="tenant-switcher" aria-label="Tenant" hidden></select>
       </header>

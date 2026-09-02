@@ -40,7 +40,7 @@ test('receive and deliver pages keep transfer concerns separate', () => {
 
 test('issued request status filter uses the shared form control styling', () => {
   assert.match(receive, /<div class="grid">[\s\S]*id="links-status"/);
-  assert.match(style, /input,\s*\.card select\s*\{[\s\S]*display: block;[\s\S]*width: 100%;[\s\S]*background: rgba\(255, 255, 255, 0\.03\);/);
+  assert.match(style, /input,\s*\.card select\s*\{[\s\S]*display: block;[\s\S]*width: 100%;[\s\S]*background: var\(--ink-3\);/);
   assert.match(style, /input:focus,\s*\.card select:focus\s*\{[\s\S]*border-color: var\(--border-active\);/);
   assert.doesNotMatch(style, /^select\s*\{/m);
 });
@@ -164,4 +164,27 @@ test('each transfer opens a timeline dialog built from the record', () => {
   assert.match(receiveScript, /button\('Timeline'/);
   assert.match(receiveScript, /from '\/assets\/timeline\.js'/);
   assert.doesNotMatch(receiveScript, /transfer-log/);
+});
+
+test('every page applies the saved theme before paint and admin pages carry the toggle', async () => {
+  for (const name of ['index', 'receive', 'deliver', 'tenants', 'audit', 'system', 'send', 'request', 'verify']) {
+    const html = await readFile(new URL(`../web/${name}.html`, import.meta.url), 'utf8');
+    assert.match(html, /<script src="\/assets\/theme\.js"><\/script>/, `${name} loads theme.js`);
+  }
+  for (const html of [receive, deliver, tenants, audit, system]) {
+    assert.match(html, /id="theme-toggle"/);
+  }
+  const css = await readFile(new URL('../web/assets/style.css', import.meta.url), 'utf8');
+  assert.match(css, /:root\[data-theme="light"\]/);
+  assert.match(css, /prefers-color-scheme: light/);
+  // The forced block and the system-preference block must carry the same
+  // tokens, or a theme edit drifts between the two ways of reaching light.
+  const forcedBlock = css.match(/:root\[data-theme="light"\] \{([^}]*)\}/)[1];
+  const systemBlock = css.match(/:root:not\(\[data-theme="dark"\]\) \{([^}]*)\}/)[1];
+  const tokens = (block) => block.split('\n').map((line) => line.trim()).filter(Boolean).join('\n');
+  assert.equal(tokens(forcedBlock), tokens(systemBlock));
+  // Fills, rules, and shadows read tokens; only the painting keeps raw black.
+  const afterTokens = css.slice(css.indexOf('::selection'));
+  assert.doesNotMatch(afterTokens, /rgba\(255, 255, 255, 0\.(02|03|05|06|08|1|12|25)\)/);
+  assert.doesNotMatch(afterTokens, /rgba\(0, 0, 0, 0\.(3|45)\)/);
 });

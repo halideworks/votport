@@ -176,6 +176,29 @@ export function revealHash({ scroll = true } = {}) {
   return true;
 }
 
+// The theme toggle names the theme it switches to; the saved choice wins
+// over the system setting.
+function mountThemeToggle() {
+  const toggle = document.getElementById('theme-toggle');
+  if (!toggle) return;
+  const media = window.matchMedia('(prefers-color-scheme: light)');
+  const current = () => document.documentElement.dataset.theme || (media.matches ? 'light' : 'dark');
+  const label = () => {
+    const next = current() === 'light' ? 'dark' : 'light';
+    toggle.textContent = next === 'dark' ? 'Dark' : 'Light';
+    toggle.setAttribute('aria-label', `Switch to ${next} theme`);
+  };
+  toggle.addEventListener('click', () => {
+    const next = current() === 'light' ? 'dark' : 'light';
+    document.documentElement.dataset.theme = next;
+    try { window.localStorage.setItem('votport-theme', next); } catch { /* storage blocked */ }
+    label();
+  });
+  media.addEventListener('change', label);
+  label();
+}
+mountThemeToggle();
+
 const NAV_ITEMS = [
   ['receive', '/receive', 'Receive'],
   ['deliver', '/deliver', 'Deliver'],

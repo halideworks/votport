@@ -3,7 +3,7 @@
  * Brand-heritage split layout: the Pommern (1903) painting as a hero panel on
  * the left, a deep-navy frosted ingest sheet on the right. Instrument Serif
  * wordmark, Plus Jakarta Sans body, JetBrains Mono for numbers. Committed
- * dark navy — one palette, no light mode.
+ * dark navy by default; a light theme swaps the tokens, the painting stays dark.
  *
  * Every id and class here is load-bearing: the pages' modules bind them.
  * Rename nothing without grepping web/assets/*.js first.
@@ -29,12 +29,99 @@
  --progress: #38bdf8;
  --ok: #5fd4a2;
  --danger: #f0928d;
+ /* Ink: the foreground colour at low alpha, for fills and rules. */
+ --ink-2: rgba(255, 255, 255, 0.02);
+ --ink-3: rgba(255, 255, 255, 0.03);
+ --ink-5: rgba(255, 255, 255, 0.05);
+ --ink-6: rgba(255, 255, 255, 0.06);
+ --ink-8: rgba(255, 255, 255, 0.08);
+ --ink-10: rgba(255, 255, 255, 0.1);
+ --ink-12: rgba(255, 255, 255, 0.12);
+ --ink-25: rgba(255, 255, 255, 0.25);
+ --shadow: rgba(0, 0, 0, 0.45);
+ --shadow-soft: rgba(0, 0, 0, 0.3);
+ --shadow-deep: rgba(0, 0, 0, 0.5);
+ --backdrop: rgb(0 0 0 / 60%);
+ --selection: rgba(56, 189, 248, 0.3);
+ --reveal-glow: rgba(56, 189, 248, 0.35);
  font-size: 16px;
  color-scheme: dark;
 }
 
+/* Light theme: the same tokens on a pale ground. The painting panel and the
+   navy logo square keep their dark treatment, so those colours are fixed
+   where they are used, not here. */
+:root[data-theme="light"] {
+ --bg: #f4f6f9;
+ --bg-deep: #e8ecf1;
+ --sheet: rgba(247, 249, 251, 0.94);
+ --panel: rgba(15, 23, 42, 0.03);
+ --panel-hover: rgba(15, 23, 42, 0.05);
+ --border: rgba(15, 23, 42, 0.1);
+ --border-faint: rgba(15, 23, 42, 0.06);
+ --border-active: rgba(15, 23, 42, 0.3);
+ --text: #0b141e;
+ --text-soft: #334155;
+ --muted: #5b6776;
+ --btn-bg: #0b141e;
+ --btn-text: #ffffff;
+ --progress: #0369a1;
+ --ok: #166534;
+ --danger: #b91c1c;
+ --ink-2: rgba(15, 23, 42, 0.02);
+ --ink-3: rgba(15, 23, 42, 0.03);
+ --ink-5: rgba(15, 23, 42, 0.05);
+ --ink-6: rgba(15, 23, 42, 0.06);
+ --ink-8: rgba(15, 23, 42, 0.08);
+ --ink-10: rgba(15, 23, 42, 0.1);
+ --ink-12: rgba(15, 23, 42, 0.12);
+ --ink-25: rgba(15, 23, 42, 0.25);
+ --shadow: rgba(15, 23, 42, 0.18);
+ --shadow-soft: rgba(15, 23, 42, 0.12);
+ --shadow-deep: rgba(15, 23, 42, 0.22);
+ --backdrop: rgb(15 23 42 / 40%);
+ --selection: rgba(3, 105, 161, 0.25);
+ --reveal-glow: rgba(3, 105, 161, 0.3);
+ color-scheme: light;
+}
+@media (prefers-color-scheme: light) {
+ :root:not([data-theme="dark"]) {
+  --bg: #f4f6f9;
+  --bg-deep: #e8ecf1;
+  --sheet: rgba(247, 249, 251, 0.94);
+  --panel: rgba(15, 23, 42, 0.03);
+  --panel-hover: rgba(15, 23, 42, 0.05);
+  --border: rgba(15, 23, 42, 0.1);
+  --border-faint: rgba(15, 23, 42, 0.06);
+  --border-active: rgba(15, 23, 42, 0.3);
+  --text: #0b141e;
+  --text-soft: #334155;
+  --muted: #5b6776;
+  --btn-bg: #0b141e;
+  --btn-text: #ffffff;
+  --progress: #0369a1;
+  --ok: #166534;
+  --danger: #b91c1c;
+  --ink-2: rgba(15, 23, 42, 0.02);
+  --ink-3: rgba(15, 23, 42, 0.03);
+  --ink-5: rgba(15, 23, 42, 0.05);
+  --ink-6: rgba(15, 23, 42, 0.06);
+  --ink-8: rgba(15, 23, 42, 0.08);
+  --ink-10: rgba(15, 23, 42, 0.1);
+  --ink-12: rgba(15, 23, 42, 0.12);
+  --ink-25: rgba(15, 23, 42, 0.25);
+  --shadow: rgba(15, 23, 42, 0.18);
+  --shadow-soft: rgba(15, 23, 42, 0.12);
+  --shadow-deep: rgba(15, 23, 42, 0.22);
+  --backdrop: rgb(15 23 42 / 40%);
+  --selection: rgba(3, 105, 161, 0.25);
+  --reveal-glow: rgba(3, 105, 161, 0.3);
+  color-scheme: light;
+ }
+}
+
 ::selection {
- background: rgba(56, 189, 248, 0.3);
+ background: var(--selection);
 }
 
 * {
@@ -138,8 +225,12 @@ body {
  font-family: "Instrument Serif", Georgia, serif;
  font-weight: 400;
  font-size: 2.1rem;
- color: #ffffff;
+ color: var(--text);
  letter-spacing: 0;
+}
+/* On the painting the brand is always white, whatever the theme. */
+.hero .wordmark {
+ color: #ffffff;
 }
 
 @media (min-width: 768px) {
@@ -187,8 +278,8 @@ body {
  background: var(--sheet);
  backdrop-filter: blur(32px);
  -webkit-backdrop-filter: blur(32px);
- border-top: 1px solid rgba(255, 255, 255, 0.1);
- box-shadow: 0 -10px 40px rgba(0, 0, 0, 0.5);
+ border-top: 1px solid var(--ink-10);
+ box-shadow: 0 -10px 40px var(--shadow-deep);
  overflow-y: auto;
  /* Fill the viewport below the hero so the centered layout has room. */
  min-height: calc(100vh - 14.5rem);
@@ -212,7 +303,7 @@ body {
  width: 2.25rem;
  height: 0.25rem;
  border-radius: 99px;
- background: rgba(255, 255, 255, 0.25);
+ background: var(--ink-25);
  margin: 0 auto 1rem;
  flex: none;
 }
@@ -293,12 +384,12 @@ section > h2 {
 }
 
 .sheet-foot {
+ color: var(--muted);
  margin-top: auto;
  padding-top: 1.25rem;
  text-align: center;
  font-size: 0.69rem;
  letter-spacing: 0.03em;
- color: #64748b;
  user-select: none;
 }
 
@@ -379,7 +470,7 @@ section > h2 {
 
 /* A completed transfer earns the one green in the palette. */
 .card.ok {
- border-color: rgba(95, 212, 162, 0.25);
+ border-color: color-mix(in srgb, var(--ok) 25%, transparent);
 }
 .card.ok > h2 {
  color: var(--ok);
@@ -421,7 +512,7 @@ input,
  padding: 0.55rem 0.7rem;
  border-radius: 0.6rem;
  border: 1px solid var(--border);
- background: rgba(255, 255, 255, 0.03);
+ background: var(--ink-3);
  color: var(--text);
  font-family: inherit;
  /* 16px minimum: below that iOS Safari zooms the page on focus. */
@@ -434,7 +525,7 @@ input:focus,
 .card select:focus {
  outline: none;
  border-color: var(--border-active);
- background: rgba(255, 255, 255, 0.05);
+ background: var(--ink-5);
 }
 input::placeholder {
  color: var(--muted);
@@ -468,7 +559,7 @@ input[type="file"]:focus-visible {
 button {
  padding: 0.8rem 1.25rem;
  border-radius: 0.75rem;
- border: 1px solid rgba(255, 255, 255, 0.25);
+ border: 1px solid var(--ink-25);
  background: var(--btn-bg);
  color: var(--btn-text);
  font-family: inherit;
@@ -477,7 +568,7 @@ button {
  letter-spacing: 0.14em;
  text-transform: uppercase;
  cursor: pointer;
- box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+ box-shadow: 0 4px 16px var(--shadow-soft);
  transition:
   transform 0.15s cubic-bezier(0.16, 1, 0.3, 1),
   box-shadow 0.15s,
@@ -486,7 +577,7 @@ button {
 }
 button:hover:not(:disabled) {
  transform: translateY(-1px);
- box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+ box-shadow: 0 8px 24px var(--shadow);
 }
 button:active:not(:disabled) {
  transform: scale(0.985);
@@ -617,7 +708,7 @@ button.danger:hover:not(:disabled) {
 
 /* Addresses to copy sit in a field-shaped well, not as running text. */
 .card > p.mono {
- background: rgba(255, 255, 255, 0.03);
+ background: var(--ink-3);
  border: 1px solid var(--border);
  border-radius: 0.6rem;
  padding: 0.55rem 0.7rem;
@@ -636,7 +727,7 @@ button.danger:hover:not(:disabled) {
  gap: 0.55rem;
  flex-wrap: wrap;
  padding: 0.7rem 1.25rem;
- background: rgba(255, 255, 255, 0.03);
+ background: var(--ink-3);
  border-bottom: 1px solid var(--border-faint);
 }
 .link-item .head h3 {
@@ -700,7 +791,7 @@ button.danger:hover:not(:disabled) {
  background: var(--bg);
  border: 1px solid var(--border-active);
  border-radius: 0.85rem;
- box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+ box-shadow: 0 18px 40px var(--shadow);
  font-size: 0.82rem;
  color: var(--text);
  pointer-events: auto;
@@ -993,7 +1084,7 @@ button.danger:hover:not(:disabled) {
 .drop {
  border: 1px dashed var(--border);
  border-radius: 1rem;
- background: rgba(255, 255, 255, 0.02);
+ background: var(--ink-2);
  text-align: center;
  padding: 1.9rem 1rem;
  margin-bottom: 1.1rem;
@@ -1071,7 +1162,7 @@ button.danger:hover:not(:disabled) {
 .drop:hover,
 .drop.hover {
  border-color: var(--border-active);
- background: rgba(255, 255, 255, 0.05);
+ background: var(--ink-5);
  color: var(--text-soft);
 }
 
@@ -1157,7 +1248,7 @@ button.danger:hover:not(:disabled) {
  flex-basis: 100%;
  height: 3px;
  border-radius: 99px;
- background: rgba(255, 255, 255, 0.08);
+ background: var(--ink-8);
  overflow: hidden;
 }
 .files li .row-meter > div {
@@ -1195,7 +1286,7 @@ button.danger:hover:not(:disabled) {
 .meter {
  height: 4px;
  border-radius: 99px;
- background: rgba(255, 255, 255, 0.08);
+ background: var(--ink-8);
  overflow: hidden;
 }
 #meter-fill {
@@ -1222,7 +1313,7 @@ button.danger:hover:not(:disabled) {
  justify-content: space-between;
  padding-top: 0.85rem;
  margin: 0 0 1rem;
- border-top: 1px solid rgba(255, 255, 255, 0.06);
+ border-top: 1px solid var(--ink-6);
 }
 
 .progress-actions {
@@ -1385,7 +1476,7 @@ button.danger:hover:not(:disabled) {
  width: calc(100% - 2rem);
 }
 .modal::backdrop {
- background: rgb(0 0 0 / 60%);
+ background: var(--backdrop);
  backdrop-filter: blur(4px);
 }
 .modal form {
@@ -1428,7 +1519,7 @@ details summary:focus-visible {
  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
- background: rgba(255, 255, 255, 0.12);
+ background: var(--ink-12);
  border-radius: 2px;
 }
 
@@ -1473,7 +1564,7 @@ details summary:focus-visible {
  background: var(--sheet);
  border: 1px solid var(--border-active);
  border-radius: 0.85rem;
- box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+ box-shadow: 0 18px 40px var(--shadow);
 }
 .search-group {
  padding: 0.5rem 0.75rem 0.25rem;
@@ -1524,10 +1615,25 @@ details summary:focus-visible {
 }
 
 /* Sign out sits on the brand row, so the nav row is only the nav. */
-.hero-brand #logout {
- margin-left: auto;
+.brand-actions {
+ display: flex;
+ gap: 0.4rem;
  flex: none;
+ margin-left: auto;
+}
+.brand-actions button {
  white-space: nowrap;
+}
+/* The narrowest phones cannot fit the wordmark and both pills on one line;
+   the pills drop to their own line, still at the right edge. */
+@media (max-width: 360px) {
+ .masthead .hero-brand {
+  flex-wrap: wrap;
+ }
+ .brand-actions {
+  flex-basis: 100%;
+  justify-content: flex-end;
+ }
 }
 
 /* ---- system settings page ------------------------------------------------ */
@@ -1792,7 +1898,7 @@ details.deployment .settings-status {
  padding: 0.4rem 2rem 0.4rem 0.7rem;
  border-radius: 0.6rem;
  border: 1px solid var(--border);
- background: rgba(255, 255, 255, 0.03);
+ background: var(--ink-3);
  color: var(--text-soft);
  font-family: inherit;
  /* 16px minimum, as for every other control: iOS Safari zooms below it. */
@@ -1905,6 +2011,6 @@ details.deployment .settings-status {
  50% { opacity: 0.45; transform: scale(0.8); }
 }
 @keyframes reveal {
- from { box-shadow: 0 0 0 6px rgba(56, 189, 248, 0.35); }
+ from { box-shadow: 0 0 0 6px var(--reveal-glow); }
  to { box-shadow: 0 0 0 1px var(--progress); }
 }
