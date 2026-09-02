@@ -122,3 +122,14 @@ test('a stale sender tab reloads when the server reports a new web build', () =>
   // A finish refused as early is a 422; rebegin must key on that status.
   assert.match(uploadScript, /error\.status === 422 && \/not fully received\//);
 });
+
+test('receive page carries the status strip and polls the status endpoint', () => {
+  for (const id of ['status-strip', 'stat-active', 'stat-today', 'stat-disk', 'stat-drain', 'stat-health']) {
+    assert.match(receive, new RegExp(`id="${id}"`), `${id} present`);
+  }
+  assert.match(receiveScript, /\/api\/admin\/status\?since=/);
+  assert.match(receiveScript, /visibilitychange/);
+  assert.match(receiveScript, /receiving-now/);
+  assert.match(receiveScript, /How receiving works/);
+  assert.match(deliverScript, /How delivering works/);
+});

@@ -25,6 +25,29 @@
       <h1>Receive files</h1>
       <p id="receive-dir" class="mono muted"></p>
 
+      <section id="status-strip" class="status-strip" aria-label="Status" hidden>
+        <div class="stat">
+          <span class="stat-label">Active transfers</span>
+          <strong id="stat-active">0</strong>
+          <span id="stat-active-detail" class="muted">nothing in flight</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Today</span>
+          <strong id="stat-today">0</strong>
+          <span id="stat-today-detail" class="muted">received</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Disk free</span>
+          <strong id="stat-disk">&ndash;</strong>
+          <span class="muted">receive root</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Drain</span>
+          <strong id="stat-drain">off</strong>
+          <span id="stat-health" class="badge on">healthy</span>
+        </div>
+      </section>
+
       <form id="create-form" class="card">
         <h2>New transfer request</h2>
         <div class="grid">

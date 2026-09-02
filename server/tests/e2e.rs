@@ -2481,6 +2481,10 @@ async fn upload_session_survives_a_restart() {
         .unwrap();
     let files = [twenty_mib()];
     let file = &files[0];
+    let now_before_restart = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let (token, session) = open_session(&client, &server.base, "restart", &files).await;
     let base = server.base.clone();
     assert_eq!(begin(&client, &base, &session).await.0, 200);
@@ -2496,12 +2500,38 @@ async fn upload_session_survives_a_restart() {
     let receive_dir = server.receive_dir.clone();
     assert_eq!(staging_files(&receive_dir).len(), 2, "staging and journal");
 
+    let before_restart = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let server = server.restart().await;
     let base = server.base.clone();
     assert_eq!(
         staging_files(&receive_dir).len(),
         2,
         "re-attached staging survives the boot sweep"
+    );
+    // The admin's live view spans the restart: the covered prefix counts as
+    // received and the start time is the original one.
+    let status: Value = client
+        .get(format!("{base}/api/admin/status?since=0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["sessions_active"], json!(1), "{status:?}");
+    assert_eq!(
+        status["receiving"][0]["received"],
+        json!(CHUNK),
+        "{status:?}"
+    );
+    let started_at = status["receiving"][0]["started_at"].as_u64().unwrap();
+    assert!(
+        started_at >= now_before_restart && started_at <= before_restart,
+        "start is the original, not the boot: {status:?}"
     );
     // The retried in-flight range is accepted and flagged: the session was
     // re-attached and the sender must begin again.
@@ -4782,4 +4812,183 @@ async fn dedupe_rounds_still_consume_creation_budget() {
     // Round 0 transferred the file and was refunded; the twenty dedupe
     // rounds after it were not.
     assert_eq!(refused, Some(20), "{refused:?}");
+}
+
+/// The Receive page's status strip: a session that has accepted bytes shows
+/// up as receiving on the status endpoint and on its link, and a finished
+/// upload counts toward the day.
+#[tokio::test]
+async fn status_reports_receiving_sessions_and_the_days_uploads() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let bytes: Vec<u8> = (0..2 * 1024 * 1024)
+        .map(|index| (index % 253) as u8)
+        .collect();
+    let files = [prepare(vec!["status.bin"], bytes)];
+    let (token, session) = open_session(&client, &base, "status strip", &files).await;
+    assert_eq!(begin(&client, &base, &session).await.0, 200);
+    let (status, progress) = post_chunk_entry(&client, &base, &session, 0, &files[0], 0).await;
+    assert_eq!(status, 200, "{progress:?}");
+    assert!(progress["received"].as_u64().unwrap() > 0, "{progress:?}");
+
+    let status: Value = client
+        .get(format!("{base}/api/admin/status?since=0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["sessions_active"], json!(1), "{status:?}");
+    assert!(
+        status["bytes_in_flight"].as_u64().unwrap() > 0,
+        "{status:?}"
+    );
+    assert_eq!(
+        status["receiving"][0]["link_id"].as_str(),
+        Some(token.as_str())
+    );
+    assert_eq!(status["receiving"][0]["transport"], json!("http"));
+    assert!(status["receiving"][0]["total"].as_u64().unwrap() >= 2 * 1024 * 1024);
+    assert_eq!(status["today"]["uploads"], json!(0));
+    assert!(
+        status["disk"]["free_bytes"].as_u64().unwrap() > 0,
+        "{status:?}"
+    );
+    assert_eq!(status["draining"], json!(false));
+    assert_eq!(status["healthy"], json!(true));
+
+    let links: Value = client
+        .get(format!("{base}/api/admin/links"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let link = links["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|link| link["id"] == json!(token))
+        .unwrap();
+    assert_eq!(link["receiving"].as_array().unwrap().len(), 1, "{link:?}");
+    assert!(link["receiving"][0]["received"].as_u64().unwrap() > 0);
+
+    upload_chunks(&client, &base, &session, 0, &files[0]).await;
+    let finish = client
+        .post(format!("{base}/api/session/{session}/finish"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(finish.status().as_u16(), 200);
+    let status: Value = client
+        .get(format!("{base}/api/admin/status?since=0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["sessions_active"], json!(0), "{status:?}");
+    assert_eq!(status["today"]["uploads"], json!(1), "{status:?}");
+    assert_eq!(
+        status["today"]["bytes"],
+        json!(2 * 1024 * 1024),
+        "{status:?}"
+    );
+    // A day boundary in the future counts nothing.
+    let status: Value = client
+        .get(format!("{base}/api/admin/status?since=4102444800"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["today"]["uploads"], json!(0));
+}
+
+/// The status view is the operator's tenant only, like the request list.
+#[tokio::test]
+async fn status_is_scoped_to_the_operators_tenant() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    client
+        .post(format!("{base}/api/admin/login"))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    let response = client
+        .post(format!("{base}/api/admin/tenants"))
+        .header("X-Votport", "1")
+        .json(&json!({ "key": "acme", "label": "acme" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let response = client
+        .post(format!("{base}/api/admin/tenant"))
+        .header("X-Votport", "1")
+        .json(&json!({ "tenant": "acme" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let token = client
+        .post(format!("{base}/api/admin/links"))
+        .header("X-Votport", "1")
+        .json(&json!({ "label": "acme inbox", "dest": "" }))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["link"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let files = [prepare(vec!["acme.bin"], vec![3u8; 64 * 1024])];
+    let session = open_session_on(&client, &base, &token, &files).await;
+    assert_eq!(begin(&client, &base, &session).await.0, 200);
+    let (status, _) = post_chunk_entry(&client, &base, &session, 0, &files[0], 0).await;
+    assert_eq!(status, 200);
+
+    let inside: Value = client
+        .get(format!("{base}/api/admin/status?since=0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(inside["sessions_active"], json!(1), "{inside:?}");
+
+    let response = client
+        .post(format!("{base}/api/admin/tenant"))
+        .header("X-Votport", "1")
+        .json(&json!({ "tenant": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let outside: Value = client
+        .get(format!("{base}/api/admin/status?since=0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(outside["sessions_active"], json!(0), "{outside:?}");
+    assert_eq!(outside["receiving"].as_array().unwrap().len(), 0);
 }

@@ -725,7 +725,7 @@ fn resume_upload_session(
         quiet_after_secs: session::quiet_after_secs(config.session_idle_secs),
     };
     let (sender, receiver) = tokio::sync::mpsc::channel(8);
-    let kept = session::resume_worker(setup, receiver, session)?;
+    let (kept, already) = session::resume_worker(setup, receiver, session)?;
     sessions
         .insert_resumed(
             session.id.clone(),
@@ -735,6 +735,7 @@ fn resume_upload_session(
             sender,
         )
         .map_err(|error| format!("register session: {error:?}"))?;
+    sessions.seed_resumed(&session.id, session.started_at, already);
     Ok(kept)
 }
 
@@ -1384,6 +1385,15 @@ fn publish_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> 
     }
 }
 
+/// The store and both storage roots answer; what /healthz and the admin
+/// status strip report.
+pub(crate) fn check_health(app: &App) -> Result<(), String> {
+    app.store
+        .health_check()
+        .and_then(|()| health_probe(&app.config.receive_dir, "receive"))
+        .and_then(|()| health_probe(&app.config.outbound_dir, "outbound"))
+}
+
 fn health_probe(root: &std::path::Path, label: &str) -> Result<(), String> {
     let path = root.join(format!(
         ".votport-health-{label}-{}",
@@ -1411,12 +1421,7 @@ fn health_probe(root: &std::path::Path, label: &str) -> Result<(), String> {
 }
 
 async fn healthz(State(app): State<Arc<App>>) -> Response {
-    let result = app
-        .store
-        .health_check()
-        .and_then(|()| health_probe(&app.config.receive_dir, "receive"))
-        .and_then(|()| health_probe(&app.config.outbound_dir, "outbound"));
-    if let Err(error) = result {
+    if let Err(error) = check_health(&app) {
         tracing::error!(%error, "health check failed");
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -1639,6 +1644,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/admin/login", post(api::admin_login))
         .route("/api/admin/logout", post(api::admin_logout))
         .route("/api/admin/session", get(api::admin_session))
+        .route("/api/admin/status", get(api::admin_status))
         .route("/api/admin/audit", get(api::admin_audit_export))
         .route("/api/admin/holdings", get(api::holdings))
         .route("/api/admin/backup", get(api::backup_database))

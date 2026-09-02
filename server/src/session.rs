@@ -127,6 +127,8 @@ pub struct ChunkProgress {
     pub covered_bytes: u64,
     pub total_bytes: u64,
     pub complete: bool,
+    /// Bytes the whole session has accepted so far, for the admin's live view.
+    pub received: u64,
     /// The session was re-attached after a restart and its coverage restarted
     /// from the checkpointed prefix: the sender must call begin again to
     /// learn where to resume. Cleared by the next begin.
@@ -344,14 +346,17 @@ enum Phase {
 /// sender, then passes the receiver here so the thread cannot touch disk
 /// before the session is in the map.
 pub fn spawn_worker(setup: WorkerSetup, receiver: mpsc::Receiver<Cmd>) {
-    spawn_worker_from(setup, receiver, Phase::AwaitSeal, false);
+    spawn_worker_from(setup, receiver, Phase::AwaitSeal, false, 0);
 }
 
+/// `already` is what a re-attached session had covered before the restart,
+/// so the byte count reported to the admin spans the whole transfer.
 fn spawn_worker_from(
     setup: WorkerSetup,
     mut receiver: mpsc::Receiver<Cmd>,
     mut phase: Phase,
     resumed: bool,
+    already: u64,
 ) {
     std::thread::spawn(move || {
         // Feedback for the admin: bytes newly accepted this session and the
@@ -551,6 +556,10 @@ fn spawn_worker_from(
                             Ok(_) => {}
                             Err(_) => rejected += 1,
                         }
+                        let outcome = outcome.map(|mut progress| {
+                            progress.received = already + received;
+                            progress
+                        });
                         send_noted!(item.reply, outcome);
                     }
                     // Checkpoint covered progress on a byte or time threshold,
@@ -906,7 +915,7 @@ pub fn resume_worker(
     setup: WorkerSetup,
     receiver: mpsc::Receiver<Cmd>,
     persisted: &mut PersistedUploadSession,
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<(Vec<PathBuf>, u64), String> {
     let mut files = Vec::with_capacity(persisted.files.len());
     let mut kept = Vec::new();
     for file in &persisted.files {
@@ -959,8 +968,19 @@ pub fn resume_worker(
             record.receipt = file.receipt;
         }
     }
-    spawn_worker_from(setup, receiver, Phase::Receiving { files }, true);
-    Ok(kept)
+    let already: u64 = persisted
+        .files
+        .iter()
+        .map(|file| {
+            if file.published {
+                file.object.length
+            } else {
+                file.prefix_bytes
+            }
+        })
+        .sum();
+    spawn_worker_from(setup, receiver, Phase::Receiving { files }, true, already);
+    Ok((kept, already))
 }
 
 fn entry_infos(setup: &WorkerSetup, files: &[FileState]) -> Vec<EntryInfo> {
@@ -1246,6 +1266,7 @@ fn accept_batch(
                 covered_bytes: core.covered_bytes,
                 total_bytes: core.total_bytes,
                 complete: core.complete,
+                received: 0,
                 rebegin: false,
             })
         })
@@ -1726,10 +1747,11 @@ impl PushReceive {
                 .compare_exchange(previous, now, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
-            let _ = self
-                .app
+            let id = hex::encode(self.setup.session_id);
+            let _ = self.app.sessions.mark_active(&id);
+            self.app
                 .sessions
-                .mark_active(&hex::encode(self.setup.session_id));
+                .set_received(&id, self.received.load(Ordering::Relaxed));
         }
     }
 
@@ -2454,12 +2476,26 @@ pub struct SessionHandle {
     pub reserved_bytes: u64,
     pub sender: mpsc::Sender<Cmd>,
     pub kind: SessionKind,
+    pub started_at: u64,
     activity: Arc<SessionActivity>,
 }
 
 struct SessionActivity {
     in_flight: AtomicUsize,
     last_active: Mutex<Instant>,
+    /// Bytes accepted so far, published by the chunk handler for the admin's
+    /// live view; never read on the transfer path.
+    received: AtomicU64,
+}
+
+/// One session in progress, as the admin pages show it.
+#[derive(Clone, Debug, Serialize)]
+pub struct ActiveTransfer {
+    pub link_id: String,
+    pub transport: &'static str,
+    pub received: u64,
+    pub total: u64,
+    pub started_at: u64,
 }
 
 pub struct SessionCommand {
@@ -2794,9 +2830,11 @@ impl Sessions {
                 reserved_bytes,
                 sender,
                 kind,
+                started_at: now_unix(),
                 activity: Arc::new(SessionActivity {
                     in_flight: AtomicUsize::new(0),
                     last_active: Mutex::new(Instant::now()),
+                    received: AtomicU64::new(0),
                 }),
             },
         );
@@ -2964,6 +3002,51 @@ impl Sessions {
             .values()
             .filter(|handle| matches!(&handle.kind, SessionKind::Push(_)))
             .count()
+    }
+
+    /// Records the session's accepted byte count for the live view. Chunk
+    /// replies land out of order, so only a larger count moves it.
+    pub fn set_received(&self, id: &str, bytes: u64) {
+        if let Some(handle) = self.inner.lock().expect("sessions poisoned").map.get(id) {
+            handle.activity.received.fetch_max(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// A re-attached session keeps its original start and the bytes it had
+    /// covered before the restart.
+    pub fn seed_resumed(&self, id: &str, started_at: u64, received: u64) {
+        if let Some(handle) = self
+            .inner
+            .lock()
+            .expect("sessions poisoned")
+            .map
+            .get_mut(id)
+        {
+            handle.started_at = started_at;
+            handle.activity.received.store(received, Ordering::Relaxed);
+        }
+    }
+
+    /// Sessions in progress for one tenant namespace, newest first.
+    pub fn active_transfers(&self, tenant: &str) -> Vec<ActiveTransfer> {
+        let inner = self.inner.lock().expect("sessions poisoned");
+        let mut transfers: Vec<ActiveTransfer> = inner
+            .map
+            .values()
+            .filter(|handle| handle.tenant == tenant)
+            .map(|handle| ActiveTransfer {
+                link_id: handle.link_id.clone(),
+                transport: match &handle.kind {
+                    SessionKind::Push(_) => "push",
+                    _ => "http",
+                },
+                received: handle.activity.received.load(Ordering::Relaxed),
+                total: handle.reserved_bytes,
+                started_at: handle.started_at,
+            })
+            .collect();
+        transfers.sort_by_key(|transfer| std::cmp::Reverse(transfer.started_at));
+        transfers
     }
 
     pub fn active_for_link(&self, link_id: &str) -> usize {

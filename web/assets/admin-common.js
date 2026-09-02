@@ -18,7 +18,9 @@ export async function api(path, options = {}) {
   let body = null;
   try { body = await response.json(); } catch { /* non-JSON error page */ }
   if (!response.ok) {
-    throw new Error(body?.error || `request failed (${response.status})`);
+    const error = new Error(body?.error || `request failed (${response.status})`);
+    error.status = response.status;
+    throw error;
   }
   return body;
 }
