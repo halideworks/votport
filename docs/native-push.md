@@ -1,7 +1,7 @@
 # Native push: VOT QUIC receive path
 
 Status: Native push and its operator surface are implemented, 2026-08-29. VOT ADR-0045 (push, the holder dials)
-landed upstream in PR #391 at `aba35a0aeb8a51abd8e7fde2e3b00285e1a4d29e`.
+landed upstream in PR #391 at `f12042adf0204a43073bd72f64c4547dfdb49bbe`.
 
 ## Overview
 
@@ -448,7 +448,7 @@ want one public port, and changes nothing in votport.
 
 - Cloudflare in front of VOTDock: raw QUIC needs Spectrum UDP or a direct
   address. Decide before VOTDock's topology is fixed.
-- VOT `aba35a0` parses the CLI push address as a numeric `SocketAddr`. DNS
+- VOT `f12042a` parses the CLI push address as a numeric `SocketAddr`. DNS
   resolution remains the library caller's responsibility until upstream adds
   hostname resolution to the CLI.
 
