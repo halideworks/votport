@@ -183,7 +183,11 @@ function mountThemeToggle() {
   if (!toggle) return;
   const media = window.matchMedia('(prefers-color-scheme: light)');
   const current = () => document.documentElement.dataset.theme || (media.matches ? 'light' : 'dark');
-  const label = () => { toggle.textContent = current() === 'light' ? 'Dark' : 'Light'; };
+  const label = () => {
+    const next = current() === 'light' ? 'dark' : 'light';
+    toggle.textContent = next === 'dark' ? 'Dark' : 'Light';
+    toggle.setAttribute('aria-label', `Switch to ${next} theme`);
+  };
   toggle.addEventListener('click', () => {
     const next = current() === 'light' ? 'dark' : 'light';
     document.documentElement.dataset.theme = next;

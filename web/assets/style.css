@@ -48,8 +48,9 @@
  color-scheme: dark;
 }
 
-/* Light theme: the same tokens on a pale ground. The painting panel keeps
-   its own dark treatment, so its text colours are fixed below, not here. */
+/* Light theme: the same tokens on a pale ground. The painting panel and the
+   navy logo square keep their dark treatment, so those colours are fixed
+   where they are used, not here. */
 :root[data-theme="light"] {
  --bg: #f4f6f9;
  --bg-deep: #e8ecf1;
@@ -65,7 +66,7 @@
  --btn-bg: #0b141e;
  --btn-text: #ffffff;
  --progress: #0369a1;
- --ok: #15803d;
+ --ok: #166534;
  --danger: #b91c1c;
  --ink-2: rgba(15, 23, 42, 0.02);
  --ink-3: rgba(15, 23, 42, 0.03);
@@ -99,7 +100,7 @@
   --btn-bg: #0b141e;
   --btn-text: #ffffff;
   --progress: #0369a1;
-  --ok: #15803d;
+  --ok: #166534;
   --danger: #b91c1c;
   --ink-2: rgba(15, 23, 42, 0.02);
   --ink-3: rgba(15, 23, 42, 0.03);
@@ -383,12 +384,12 @@ section > h2 {
 }
 
 .sheet-foot {
+ color: var(--muted);
  margin-top: auto;
  padding-top: 1.25rem;
  text-align: center;
  font-size: 0.69rem;
  letter-spacing: 0.03em;
- color: #64748b;
  user-select: none;
 }
 
@@ -469,7 +470,7 @@ section > h2 {
 
 /* A completed transfer earns the one green in the palette. */
 .card.ok {
- border-color: rgba(95, 212, 162, 0.25);
+ border-color: color-mix(in srgb, var(--ok) 25%, transparent);
 }
 .card.ok > h2 {
  color: var(--ok);
@@ -1614,10 +1615,17 @@ details summary:focus-visible {
 }
 
 /* Sign out sits on the brand row, so the nav row is only the nav. */
-.hero-brand #logout {
- margin-left: auto;
+.hero-brand #logout,
+.hero-brand #theme-toggle {
  flex: none;
  white-space: nowrap;
+}
+.hero-brand #theme-toggle {
+ margin-left: auto;
+}
+/* Public pages have no toggle, so Sign out keeps the right edge on its own. */
+.hero-brand #logout:first-of-type {
+ margin-left: auto;
 }
 
 /* ---- system settings page ------------------------------------------------ */
