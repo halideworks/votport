@@ -727,6 +727,8 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     std::fs::create_dir_all(&config.outbound_dir)
         .map_err(|error| format!("create {}: {error}", config.outbound_dir.display()))?;
     crate::paths::tighten_dir(&config.outbound_dir);
+    crate::paths::probe_landing_dir(&config.receive_dir, "VOTPORT_RECEIVE_DIR", true)?;
+    crate::paths::probe_landing_dir(&config.outbound_dir, "VOTPORT_OUTBOUND_DIR", false)?;
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
     crate::paths::tighten_private_dir(&config.data_dir).map_err(|error| error.to_string())?;
