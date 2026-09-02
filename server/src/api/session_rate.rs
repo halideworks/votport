@@ -3,7 +3,8 @@
 //! Password checks already throttle per IP, but a holder of a no-password
 //! link could otherwise churn sessions to the global cap and evict the
 //! sessions of legitimate senders. This caps session *creation* per client
-//! IP well above human use.
+//! IP; a session that finishes hands its budget back, so a sender shipping
+//! one file per session is limited only by abandoned sessions.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -72,6 +73,15 @@ impl SessionRate {
         entries.push(now);
         true
     }
+
+    /// Hands back one creation: the session finished, so it is no longer
+    /// churn against the capacity limit.
+    pub fn refund(&self, ip: &str) {
+        let mut attempts = self.attempts.lock().expect("session rate poisoned");
+        if let Some(entries) = attempts.get_mut(ip) {
+            entries.pop();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -87,6 +97,21 @@ mod tests {
         assert!(!rate.allow("10.0.0.1"));
         // Other IPs are unaffected.
         assert!(rate.allow("10.0.0.2"));
+    }
+
+    #[test]
+    fn a_finished_session_hands_its_budget_back() {
+        let rate = SessionRate::with_limit(2);
+        for _ in 0..10 {
+            assert!(rate.allow("10.0.0.1"));
+            rate.refund("10.0.0.1");
+        }
+        assert!(rate.allow("10.0.0.1"));
+        assert!(rate.allow("10.0.0.1"));
+        assert!(!rate.allow("10.0.0.1"));
+        // Refunding an untracked address is a no-op.
+        rate.refund("10.0.0.9");
+        assert!(!rate.allow("10.0.0.1"));
     }
 
     #[test]

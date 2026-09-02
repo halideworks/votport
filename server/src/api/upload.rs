@@ -830,6 +830,8 @@ pub async fn upload_chunk(
 
 pub async fn upload_finish(
     State(app): State<Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
     Path(sid): Path<String>,
 ) -> ApiResult<Json<session::FinishReport>> {
     let link_id = app.sessions.link_id(&sid);
@@ -857,6 +859,15 @@ pub async fn upload_finish(
         // A panic here loses the completion audit row and notification for
         // good; the session slot itself is reclaimed by the idle sweep.
         tracing::error!(%error, session = %sid.get(..8).unwrap_or(&sid), "upload completion bookkeeping failed");
+    }
+    // A finished session that moved bytes is not churn: the web sender opens
+    // one session per file, and a package of many small files would otherwise
+    // stall on the per-address creation limit after twenty of them. Refunded
+    // after the slot is released above, and never for a session that finished
+    // on already-delivered files, which costs the sender nothing.
+    if report.received > 0 {
+        app.session_rate
+            .refund(&client_ip(&headers, &peer, &app.config.trusted_proxies));
     }
     Ok(Json(report))
 }
@@ -1131,6 +1142,7 @@ mod session_rate_tests {
             };
             reply
                 .send(Ok(session::FinishReport {
+                    received: 0,
                     upload_id: "upload".to_owned(),
                     files: Vec::new(),
                 }))
@@ -1142,6 +1154,10 @@ mod session_rate_tests {
             router
                 .oneshot(
                     Request::post("/api/session/session/finish")
+                        .extension(ConnectInfo(std::net::SocketAddr::from((
+                            [127, 0, 0, 1],
+                            4000,
+                        ))))
                         .body(Body::empty())
                         .unwrap(),
                 )
