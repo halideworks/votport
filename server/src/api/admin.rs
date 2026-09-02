@@ -405,9 +405,29 @@ pub async fn admin_status(
         .tenant_stored(&identity.tenant)
         .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let now = now_unix();
-    let (open_grants, downloads) = app
+    // Downloads in flight are keyed by grant token hash plus a stream
+    // suffix; the tenant's share is counted by grant, so one recipient with
+    // several streams open is one active download.
+    let active_hashes: Vec<String> = {
+        let active = app
+            .outbound_active
+            .lock()
+            .expect("outbound active poisoned");
+        let mut hashes: Vec<String> = active
+            .iter()
+            .map(|key| {
+                key.rsplit_once(':')
+                    .map_or(key.as_str(), |(hash, _)| hash)
+                    .to_owned()
+            })
+            .collect();
+        hashes.sort();
+        hashes.dedup();
+        hashes
+    };
+    let outbound = app
         .store
-        .outbound_summary(&identity.tenant, now)
+        .outbound_summary(&identity.tenant, now, &active_hashes)
         .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(json!({
         "now": now,
@@ -418,9 +438,9 @@ pub async fn admin_status(
         "stored": { "files": stored_files, "bytes": stored_bytes },
         "disk": disk_of(&app.config.receive_dir),
         "outbound": {
-            "active": app.sessions.active_outbound_for_tenant(&identity.tenant),
-            "open_grants": open_grants,
-            "downloads": downloads,
+            "active": outbound.active,
+            "open_grants": outbound.open_grants,
+            "deliveries": outbound.deliveries,
             "disk": disk_of(&app.config.outbound_dir),
         },
     })))

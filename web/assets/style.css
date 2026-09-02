@@ -956,9 +956,6 @@ button.danger:hover:not(:disabled) {
  font-size: 0.6rem;
  margin-top: 0.2rem;
 }
-.status-strip.draining #stat-drain {
- color: var(--danger);
-}
 .badge.danger {
  border-color: var(--danger);
  color: var(--danger);

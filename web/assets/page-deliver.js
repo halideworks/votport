@@ -907,7 +907,7 @@ function renderStatus(status) {
     ? `recipient${outbound.active === 1 ? '' : 's'} downloading now`
     : 'nothing being served';
   $('stat-open').textContent = String(outbound.open_grants);
-  $('stat-downloads').textContent = String(outbound.downloads);
+  $('stat-deliveries').textContent = String(outbound.deliveries);
   $('stat-disk').textContent = outbound.disk ? formatBytes(outbound.disk.free_bytes) : '–';
 }
 

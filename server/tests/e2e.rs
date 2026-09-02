@@ -4942,7 +4942,7 @@ async fn status_reports_receiving_sessions_and_the_days_uploads() {
         .await
         .unwrap();
     assert_eq!(status["outbound"]["open_grants"], json!(1), "{status:?}");
-    assert_eq!(status["outbound"]["downloads"], json!(0));
+    assert_eq!(status["outbound"]["deliveries"], json!(0));
     let grant_token = grant["url"]
         .as_str()
         .unwrap()
@@ -4964,7 +4964,7 @@ async fn status_reports_receiving_sessions_and_the_days_uploads() {
         .json()
         .await
         .unwrap();
-    assert_eq!(status["outbound"]["downloads"], json!(1), "{status:?}");
+    assert_eq!(status["outbound"]["deliveries"], json!(1), "{status:?}");
     // A day boundary in the future counts nothing.
     let status: Value = client
         .get(format!("{base}/api/admin/status?since=4102444800"))

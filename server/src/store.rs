@@ -1280,25 +1280,37 @@ impl Store {
         })
     }
 
-    /// Issued downloads in one tenant namespace: links still usable now and
-    /// downloads served across every link.
-    pub fn outbound_summary(&self, tenant: &str, now: u64) -> Result<(u64, u64), String> {
+    /// Issued downloads in one tenant namespace: links usable now (not
+    /// revoked, not expired, not exhausted), complete deliveries in total,
+    /// and how many of `active_hashes` (token hashes with a download in
+    /// flight) belong to this tenant.
+    pub fn outbound_summary(
+        &self,
+        tenant: &str,
+        now: u64,
+        active_hashes: &[String],
+    ) -> Result<OutboundSummary, String> {
+        let hashes = serde_json::to_string(active_hashes).unwrap_or_else(|_| "[]".to_owned());
         self.with(|connection| {
             connection
                 .prepare_cached(
-                    "SELECT COALESCE(SUM(revoked_at IS NULL AND expires_at > ?2), 0),
-                            COALESCE(SUM(downloads), 0)
+                    "SELECT COALESCE(SUM(revoked_at IS NULL AND expires_at > ?2
+                                         AND (max_downloads IS NULL OR downloads < max_downloads)), 0),
+                            COALESCE(SUM(downloads), 0),
+                            COALESCE(SUM(token_hash IN (SELECT value FROM json_each(?3))), 0)
                      FROM outbound_grants WHERE tenant = ?1",
                 )?
                 .query_row(
-                    rusqlite::params![tenant, i64::try_from(now).unwrap_or(i64::MAX)],
+                    rusqlite::params![tenant, i64::try_from(now).unwrap_or(i64::MAX), hashes],
                     |row| {
                         let open: i64 = row.get(0)?;
-                        let downloads: i64 = row.get(1)?;
-                        Ok((
-                            u64::try_from(open).unwrap_or(0),
-                            u64::try_from(downloads).unwrap_or(0),
-                        ))
+                        let deliveries: i64 = row.get(1)?;
+                        let active: i64 = row.get(2)?;
+                        Ok(OutboundSummary {
+                            open_grants: u64::try_from(open).unwrap_or(0),
+                            deliveries: u64::try_from(deliveries).unwrap_or(0),
+                            active: u64::try_from(active).unwrap_or(0),
+                        })
                     },
                 )
         })
@@ -3642,6 +3654,15 @@ pub struct AuditRow {
     pub event: String,
     pub subject: String,
     pub detail: serde_json::Value,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OutboundSummary {
+    pub open_grants: u64,
+    /// The grant-level counter: a multi-file link counts once every file
+    /// has been fetched, the same figure the Deliver list shows.
+    pub deliveries: u64,
+    pub active: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
