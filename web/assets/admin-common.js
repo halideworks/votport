@@ -160,21 +160,18 @@ function mountSearch(session) {
   });
 }
 
-/// Scrolls to and highlights the card named by the location hash, once the
-/// list that holds it has rendered. Search results deep-link this way.
+/// Scrolls to the card named by the location hash and opens its details,
+/// once the list that holds it has rendered. Search results deep-link this
+/// way; the card is not marked, arriving at it is the signal.
 export function revealHash({ scroll = true } = {}) {
   const id = window.location.hash.slice(1);
   // Only list cards are revealed; a settings section fragment on System is
-  // plain navigation and gets no outline.
+  // plain navigation.
   if (id && !/^(link|grant)-/.test(id)) return false;
-  for (const previous of document.querySelectorAll('.revealed')) {
-    if (previous.id !== id) previous.classList.remove('revealed');
-  }
   if (!id) return false;
   const target = document.getElementById(id);
   if (!target) return false;
   if (scroll) target.scrollIntoView({ block: 'center' });
-  target.classList.add('revealed');
   target.querySelector('details')?.setAttribute('open', '');
   return true;
 }
