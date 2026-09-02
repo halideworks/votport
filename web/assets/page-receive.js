@@ -13,6 +13,7 @@ import {
   formatDuration,
   formatWhen,
   requireSession,
+  revealHash,
   showGrantResult,
 } from '/assets/admin-common.js';
 
@@ -332,6 +333,7 @@ function scheduleStatus(status) {
 function renderLink(link) {
   const card = document.createElement('div');
   card.className = 'card link-item';
+  card.id = `link-${link.id}`;
 
   const head = document.createElement('div');
   head.className = 'head';
@@ -642,3 +644,4 @@ refreshStatus();
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) refreshStatus();
 });
+revealHash();

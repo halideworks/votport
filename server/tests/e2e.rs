@@ -4992,3 +4992,146 @@ async fn status_is_scoped_to_the_operators_tenant() {
     assert_eq!(outside["sessions_active"], json!(0), "{outside:?}");
     assert_eq!(outside["receiving"].as_array().unwrap().len(), 0);
 }
+
+/// The masthead search finds a request by label, a received file by path, a
+/// download by file name, and an audit row by subject, five of each, in the
+/// operator's tenant only; LIKE wildcards in the phrase are literal.
+#[tokio::test]
+async fn search_finds_requests_files_downloads_and_audit_rows() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let files = [prepare(vec!["heats", "day1_heat-03.mov"], vec![9u8; 4096])];
+    let (token, session) = open_session(&client, &base, "Backstroke masters", &files).await;
+    assert_eq!(begin(&client, &base, &session).await.0, 200);
+    upload_chunks(&client, &base, &session, 0, &files[0]).await;
+    assert_eq!(
+        client
+            .post(format!("{base}/api/session/{session}/finish"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+    client
+        .post(format!(
+            "{base}/api/admin/outbound-files?path=press/poster.pdf"
+        ))
+        .header("x-votport", "1")
+        .body(vec![1u8; 512])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let grant = client
+        .post(format!("{base}/api/admin/outbound-grants"))
+        .header("x-votport", "1")
+        .json(&json!({ "paths": ["press/poster.pdf"], "expires_days": 1, "label": "Press kit" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+
+    let search = |q: &str| {
+        let client = client.clone();
+        let base = base.clone();
+        let q = q.to_owned();
+        async move {
+            client
+                .get(format!("{base}/api/admin/search"))
+                .query(&[("q", q)])
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let hit = search("backstroke").await;
+    assert_eq!(hit["requests"][0]["id"], json!(token), "{hit:?}");
+    assert_eq!(hit["requests"][0]["label"], json!("Backstroke masters"));
+    assert!(hit["files"].as_array().unwrap().is_empty(), "{hit:?}");
+
+    let hit = search("heat-03").await;
+    assert_eq!(
+        hit["files"][0]["path"],
+        json!("heats/day1_heat-03.mov"),
+        "{hit:?}"
+    );
+    assert_eq!(hit["files"][0]["link_id"], json!(token));
+    assert_eq!(hit["files"][0]["bytes"], json!(4096));
+    assert!(hit["requests"].as_array().unwrap().is_empty());
+
+    let hit = search("poster").await;
+    assert_eq!(
+        hit["downloads"][0]["name"],
+        json!("press/poster.pdf"),
+        "{hit:?}"
+    );
+    assert_eq!(hit["downloads"][0]["label"], json!("Press kit"));
+    assert!(grant["url"].as_str().is_some());
+
+    // The link id is an audit subject.
+    let hit = search(&token[..12]).await;
+    assert!(
+        hit["audit"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["subject"] == json!(token)),
+        "{hit:?}"
+    );
+    assert_eq!(hit["requests"][0]["id"], json!(token));
+
+    // A wildcard in the phrase matches literally, not everything.
+    let hit = search("%%").await;
+    assert!(hit["requests"].as_array().unwrap().is_empty(), "{hit:?}");
+    assert!(hit["files"].as_array().unwrap().is_empty(), "{hit:?}");
+    // An underscore in the path is literal too.
+    let hit = search("day1_heat").await;
+    assert_eq!(hit["files"].as_array().unwrap().len(), 1);
+    let hit = search("day1xheat").await;
+    assert!(hit["files"].as_array().unwrap().is_empty());
+
+    let short = client
+        .get(format!("{base}/api/admin/search?q=a"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(short.status().as_u16(), 422);
+
+    // Another tenant's operator sees none of it.
+    let response = client
+        .post(format!("{base}/api/admin/tenants"))
+        .header("X-Votport", "1")
+        .json(&json!({ "key": "acme", "label": "acme" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let response = client
+        .post(format!("{base}/api/admin/tenant"))
+        .header("X-Votport", "1")
+        .json(&json!({ "tenant": "acme" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let hit = search("backstroke").await;
+    assert!(hit["requests"].as_array().unwrap().is_empty(), "{hit:?}");
+    let hit = search("heat-03").await;
+    assert!(hit["files"].as_array().unwrap().is_empty(), "{hit:?}");
+    let hit = search("poster").await;
+    assert!(hit["downloads"].as_array().unwrap().is_empty(), "{hit:?}");
+}

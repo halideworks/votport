@@ -2,7 +2,7 @@
 
 // Copying text with a Copied flash lives with the shared public helpers so
 // public pages need not import this admin module for it.
-import { copyToClipboard } from '/assets/object-card.js';
+import { copyToClipboard, formatBytes } from '/assets/object-card.js';
 export { copyToClipboard };
 
 export async function api(path, options = {}) {
@@ -35,7 +35,117 @@ export async function requireSession() {
     return new Promise(() => {}); // never resolves; page is leaving
   }
   buildNav(session);
+  mountSearch(session);
   return session;
+}
+
+// Masthead search: one request, results grouped by what they are, each row
+// a link into the page that owns it. Opens on typing, closes on Escape or a
+// click elsewhere; Enter follows the first row.
+function mountSearch(session) {
+  const form = document.getElementById('global-search');
+  const input = document.getElementById('global-search-input');
+  const results = document.getElementById('global-search-results');
+  if (!form || !input || !results) return;
+  let timer = null;
+  let latest = 0;
+  const close = () => { results.hidden = true; results.replaceChildren(); };
+  const group = (title, rows, render) => {
+    if (!rows.length) return;
+    const heading = document.createElement('div');
+    heading.className = 'search-group';
+    heading.textContent = title;
+    results.append(heading);
+    for (const row of rows) {
+      const link = document.createElement('a');
+      link.className = 'search-row';
+      const { href, primary, secondary } = render(row);
+      link.href = href;
+      const main = document.createElement('span');
+      main.textContent = primary;
+      const meta = document.createElement('span');
+      meta.className = 'muted';
+      meta.textContent = secondary;
+      link.append(main, meta);
+      results.append(link);
+    }
+  };
+  const run = async () => {
+    const phrase = input.value.trim();
+    if (phrase.length < 2) { close(); return; }
+    const ticket = ++latest;
+    let hit;
+    try {
+      hit = await api(`/api/admin/search?q=${encodeURIComponent(phrase)}`);
+    } catch {
+      return;
+    }
+    if (ticket !== latest) return;
+    results.replaceChildren();
+    const pages = session.pages || [];
+    if (pages.includes('receive')) {
+      group('Requests', hit.requests, (row) => ({
+        href: `/receive#link-${row.id}`,
+        primary: row.label,
+        secondary: `${row.active ? 'open' : 'off'} · to /${row.dest || ''} · ${formatWhen(row.created_at)}`,
+      }));
+      group('Received files', hit.files, (row) => ({
+        href: `/receive#link-${row.link_id}`,
+        primary: row.path,
+        secondary: `${formatBytes(row.bytes)} · ${row.link_label} · ${formatWhen(row.completed_at)}`,
+      }));
+    }
+    if (pages.includes('deliver')) {
+      group('Downloads', hit.downloads, (row) => ({
+        href: `/deliver#grant-${row.id}`,
+        primary: row.label || row.name,
+        secondary: `${row.name} · ${row.revoked ? 'revoked' : 'issued'} ${formatWhen(row.created_at)}`,
+      }));
+    }
+    if (pages.includes('audit')) {
+      group('Audit', hit.audit, (row) => ({
+        href: `/audit?q=${encodeURIComponent(phrase)}`,
+        primary: `${row.event} · ${row.subject}`,
+        secondary: `${row.actor || 'system'} · ${formatWhen(row.at)}`,
+      }));
+    }
+    if (!results.firstChild) {
+      const none = document.createElement('div');
+      none.className = 'search-group';
+      none.textContent = 'Nothing matches';
+      results.append(none);
+    }
+    results.hidden = false;
+  };
+  input.addEventListener('input', () => {
+    clearTimeout(timer);
+    timer = setTimeout(run, 180);
+  });
+  input.addEventListener('focus', () => { if (results.firstChild) results.hidden = false; });
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') { close(); input.blur(); }
+  });
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const first = results.querySelector('a');
+    if (first && !results.hidden) first.click();
+    else run();
+  });
+  document.addEventListener('click', (event) => {
+    if (!form.contains(event.target)) results.hidden = true;
+  });
+}
+
+/// Scrolls to and highlights the card named by the location hash, once the
+/// list that holds it has rendered. Search results deep-link this way.
+export function revealHash() {
+  const id = window.location.hash.slice(1);
+  if (!id) return;
+  const target = document.getElementById(id);
+  if (!target) return;
+  target.scrollIntoView({ block: 'center' });
+  target.classList.add('revealed');
+  target.querySelector('details')?.setAttribute('open', '');
 }
 
 const NAV_ITEMS = [
@@ -123,7 +233,7 @@ export function alertModal(message) {
   dialog.showModal();
 }
 
-export { formatBytes } from '/assets/object-card.js';
+export { formatBytes };
 
 /// Action button whose handler, sync or async, reports failures via the
 /// shared modal.

@@ -9,7 +9,9 @@ const INITIAL_CURSOR = '18446744073709551615';
 let beforeRowid = INITIAL_CURSOR;
 let loadedRows = 0;
 let loading = false;
-let appliedFilters = { q: '', event: '' };
+// A search result deep-links here with the phrase in the query string.
+const initialQuery = new URLSearchParams(window.location.search).get('q') || '';
+let appliedFilters = { q: initialQuery, event: '' };
 
 function formFilters() {
   return {
@@ -158,5 +160,6 @@ const session = await requireSession();
 if (!session.pages.includes('audit')) {
   window.location.replace('/receive');
 }
+$('audit-query').value = initialQuery;
 updateExport();
 await load(true).catch(showLoadError);

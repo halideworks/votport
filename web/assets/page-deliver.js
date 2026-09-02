@@ -15,6 +15,7 @@ import {
   formatBytes,
   formatWhen,
   requireSession,
+  revealHash,
   showGrantResult,
 } from '/assets/admin-common.js';
 
@@ -140,6 +141,7 @@ function renderGrants() {
   for (const grant of grants) {
     const card = document.createElement('div');
     card.className = 'card link-item';
+    card.id = `grant-${grant.id}`;
     const head = document.createElement('div');
     head.className = 'head';
     const title = document.createElement('h3');
@@ -887,3 +889,4 @@ $('deliver-form').addEventListener('submit', async (event) => {
 
 await requireSession();
 await Promise.all([refreshGrants(), refreshLibrary(), refreshAutomationTokens()]);
+revealHash();
