@@ -119,9 +119,21 @@ function renderGrants() {
     : '0 issued downloads.';
   $('outbound-grants-load-more').hidden = !grantHasMore;
   if (!grants.length) {
-    const empty = document.createElement('p');
-    empty.className = 'muted';
-    empty.textContent = 'No downloads issued.';
+    const empty = document.createElement('div');
+    empty.className = 'empty-teach';
+    const heading = document.createElement('h3');
+    heading.textContent = 'How delivering works';
+    const steps = document.createElement('ol');
+    for (const text of [
+      'Add files to the library, or pick ones that already arrived.',
+      'Issue a download link, with a password or expiry if you like.',
+      'Recipients download verified files; each download is recorded here.',
+    ]) {
+      const item = document.createElement('li');
+      item.textContent = text;
+      steps.append(item);
+    }
+    empty.append(heading, steps);
     container.append(empty);
     return;
   }

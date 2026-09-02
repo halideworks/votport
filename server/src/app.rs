@@ -1384,7 +1384,7 @@ fn publish_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> 
     }
 }
 
-fn health_probe(root: &std::path::Path, label: &str) -> Result<(), String> {
+pub(crate) fn health_probe(root: &std::path::Path, label: &str) -> Result<(), String> {
     let path = root.join(format!(
         ".votport-health-{label}-{}",
         crate::auth::random_token()
@@ -1639,6 +1639,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/admin/login", post(api::admin_login))
         .route("/api/admin/logout", post(api::admin_logout))
         .route("/api/admin/session", get(api::admin_session))
+        .route("/api/admin/status", get(api::admin_status))
         .route("/api/admin/audit", get(api::admin_audit_export))
         .route("/api/admin/holdings", get(api::holdings))
         .route("/api/admin/backup", get(api::backup_database))

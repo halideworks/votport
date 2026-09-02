@@ -4783,3 +4783,102 @@ async fn dedupe_rounds_still_consume_creation_budget() {
     // rounds after it were not.
     assert_eq!(refused, Some(20), "{refused:?}");
 }
+
+/// The Receive page's status strip: a session that has accepted bytes shows
+/// up as receiving on the status endpoint and on its link, and a finished
+/// upload counts toward the day.
+#[tokio::test]
+async fn status_reports_receiving_sessions_and_the_days_uploads() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let bytes: Vec<u8> = (0..2 * 1024 * 1024)
+        .map(|index| (index % 253) as u8)
+        .collect();
+    let files = [prepare(vec!["status.bin"], bytes)];
+    let (token, session) = open_session(&client, &base, "status strip", &files).await;
+    assert_eq!(begin(&client, &base, &session).await.0, 200);
+    let (status, progress) = post_chunk_entry(&client, &base, &session, 0, &files[0], 0).await;
+    assert_eq!(status, 200, "{progress:?}");
+    assert!(progress["received"].as_u64().unwrap() > 0, "{progress:?}");
+
+    let status: Value = client
+        .get(format!("{base}/api/admin/status?since=0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["sessions_active"], json!(1), "{status:?}");
+    assert!(
+        status["bytes_in_flight"].as_u64().unwrap() > 0,
+        "{status:?}"
+    );
+    assert_eq!(
+        status["receiving"][0]["link_id"].as_str(),
+        Some(token.as_str())
+    );
+    assert_eq!(status["receiving"][0]["transport"], json!("http"));
+    assert!(status["receiving"][0]["total"].as_u64().unwrap() >= 2 * 1024 * 1024);
+    assert_eq!(status["today"]["uploads"], json!(0));
+    assert!(
+        status["disk"]["free_bytes"].as_u64().unwrap() > 0,
+        "{status:?}"
+    );
+    assert_eq!(status["draining"], json!(false));
+    assert_eq!(status["healthy"], json!(true));
+
+    let links: Value = client
+        .get(format!("{base}/api/admin/links"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let link = links["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|link| link["id"] == json!(token))
+        .unwrap();
+    assert_eq!(link["receiving"].as_array().unwrap().len(), 1, "{link:?}");
+    assert!(link["receiving"][0]["received"].as_u64().unwrap() > 0);
+
+    upload_chunks(&client, &base, &session, 0, &files[0]).await;
+    let finish = client
+        .post(format!("{base}/api/session/{session}/finish"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(finish.status().as_u16(), 200);
+    let status: Value = client
+        .get(format!("{base}/api/admin/status?since=0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["sessions_active"], json!(0), "{status:?}");
+    assert_eq!(status["today"]["uploads"], json!(1), "{status:?}");
+    assert_eq!(
+        status["today"]["bytes"],
+        json!(2 * 1024 * 1024),
+        "{status:?}"
+    );
+    // A day boundary in the future counts nothing.
+    let status: Value = client
+        .get(format!("{base}/api/admin/status?since=4102444800"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["today"]["uploads"], json!(0));
+}

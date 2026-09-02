@@ -213,6 +213,101 @@ const LINKS_PAGE_SIZE = 50;
 let linksCursor = null;
 let linksFilter = { search: '', status: '' };
 
+/// Three-step primer shown in place of an empty list.
+function teachingEmptyState(title, steps) {
+  const box = document.createElement('div');
+  box.className = 'empty-teach';
+  const heading = document.createElement('h3');
+  heading.textContent = title;
+  const list = document.createElement('ol');
+  for (const step of steps) {
+    const item = document.createElement('li');
+    item.textContent = step;
+    list.append(item);
+  }
+  box.append(heading, list);
+  return box;
+}
+
+// Live "Receiving now" line on a request card, from the status poll.
+function applyReceiving(card, transfers) {
+  const line = card.querySelector('.receiving-now');
+  if (!line) return;
+  if (!transfers.length) {
+    line.hidden = true;
+    return;
+  }
+  const now = Date.now() / 1000;
+  line.replaceChildren();
+  for (const transfer of transfers) {
+    const row = document.createElement('span');
+    const elapsed = Math.max(1, now - transfer.started_at);
+    const parts = [
+      `Receiving now · ${formatBytes(transfer.received)} of ${formatBytes(transfer.total)}`,
+      `${formatBytes(Math.round(transfer.received / elapsed))}/s`,
+      `sender started ${new Date(transfer.started_at * 1000).toLocaleTimeString([], { timeStyle: 'short' })}`,
+    ];
+    if (transfer.transport === 'push') parts.push('native push');
+    row.textContent = parts.join(' · ');
+    line.append(row);
+  }
+  line.hidden = false;
+}
+
+// Polls fast while something is arriving, slowly otherwise, never while the
+// tab is hidden. The links list re-renders only when the set of receiving
+// links changes, so a finished transfer's record appears without a click.
+let statusTimer = null;
+let receivingKey = '';
+function startOfToday() {
+  const day = new Date();
+  day.setHours(0, 0, 0, 0);
+  return Math.floor(day.getTime() / 1000);
+}
+async function refreshStatus() {
+  clearTimeout(statusTimer);
+  if (document.hidden) return;
+  let status;
+  try {
+    status = await api(`/api/admin/status?since=${startOfToday()}`);
+  } catch {
+    statusTimer = setTimeout(refreshStatus, 30_000);
+    return;
+  }
+  const strip = $('status-strip');
+  strip.hidden = false;
+  $('stat-active').textContent = String(status.sessions_active);
+  $('stat-active-detail').textContent = status.sessions_active
+    ? `${formatBytes(status.bytes_in_flight)} in flight`
+    : 'nothing in flight';
+  $('stat-today').textContent = String(status.today.uploads);
+  $('stat-today-detail').textContent = status.today.uploads
+    ? `received · ${formatBytes(status.today.bytes)}`
+    : 'received';
+  $('stat-disk').textContent = status.disk ? formatBytes(status.disk.free_bytes) : '–';
+  $('stat-drain').textContent = status.draining ? 'on' : 'off';
+  const health = $('stat-health');
+  health.textContent = status.healthy ? 'healthy' : 'unhealthy';
+  health.className = `badge ${status.healthy ? 'on' : 'danger'}`;
+  strip.classList.toggle('draining', Boolean(status.draining));
+
+  const byLink = new Map();
+  for (const transfer of status.receiving) {
+    if (!byLink.has(transfer.link_id)) byLink.set(transfer.link_id, []);
+    byLink.get(transfer.link_id).push(transfer);
+  }
+  for (const card of $('links').querySelectorAll('[data-link-id]')) {
+    applyReceiving(card, byLink.get(card.dataset.linkId) || []);
+  }
+  const key = [...byLink.keys()].sort().join(',');
+  if (key !== receivingKey) {
+    const changed = receivingKey !== '' || key !== '';
+    receivingKey = key;
+    if (changed) refreshLinksSafe();
+  }
+  statusTimer = setTimeout(refreshStatus, status.sessions_active ? 4_000 : 30_000);
+}
+
 function renderLink(link) {
   const card = document.createElement('div');
   card.className = 'card link-item';
@@ -254,6 +349,13 @@ function renderLink(link) {
   if (link.max_bytes) parts.push(`limit ${formatBytes(link.max_bytes)}`);
   meta.textContent = parts.join(' · ');
   card.append(meta);
+  // Filled in by the status poll while a sender is shipping into this link.
+  const receiving = document.createElement('p');
+  receiving.className = 'receiving-now';
+  receiving.hidden = true;
+  card.dataset.linkId = link.id;
+  card.append(receiving);
+  applyReceiving(card, link.receiving || []);
   const notify = document.createElement('label');
   notify.className = 'toggle muted';
   const notifyInput = document.createElement('input');
@@ -417,12 +519,18 @@ async function refreshLinks({ append = false } = {}) {
   $('receive-dir').textContent = `Receive root ${receive_dir}`;
   const container = $('links');
   if (!append && !links.length) {
-    const empty = document.createElement('p');
-    empty.className = 'muted';
-    empty.textContent = linksFilter.search || linksFilter.status
-      ? 'No matching requests.'
-      : 'No requests issued.';
-    container.append(empty);
+    if (linksFilter.search || linksFilter.status) {
+      const empty = document.createElement('p');
+      empty.className = 'muted';
+      empty.textContent = 'No matching requests.';
+      container.append(empty);
+    } else {
+      container.append(teachingEmptyState('How receiving works', [
+        'Issue a request above and choose where its files should land.',
+        'Send the link to whoever has the files.',
+        'Files arrive verified, each with a receipt, and appear here.',
+      ]));
+    }
   } else {
     for (const link of links) {
       container.append(renderLink(link));
@@ -492,3 +600,7 @@ $('links-load-more').addEventListener('click', async () => {
 
 await requireSession();
 await refreshLinks();
+refreshStatus();
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) refreshStatus();
+});

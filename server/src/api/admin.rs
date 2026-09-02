@@ -368,6 +368,60 @@ fn validate_audit_filter(value: Option<String>, name: &str) -> ApiResult<Option<
     }
 }
 
+#[derive(Deserialize)]
+pub struct StatusQuery {
+    /// Start of the operator's day in unix seconds; the client knows its
+    /// timezone, the server does not.
+    since: Option<u64>,
+}
+
+/// The Receive page's status strip: what is arriving now, what landed today,
+/// room on the receive volume, and whether the box is draining or unwell.
+pub async fn admin_status(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Query(query): Query<StatusQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_operator(&app, &headers)?;
+    let receiving = app.sessions.active_transfers(&identity.tenant);
+    let bytes_in_flight: u64 = receiving.iter().map(|transfer| transfer.received).sum();
+    let since = query
+        .since
+        .unwrap_or_else(|| now_unix().saturating_sub(86_400));
+    let (today_uploads, today_bytes) = app
+        .store
+        .uploads_since(&identity.tenant, since)
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let disk = rustix::fs::statvfs(&app.config.receive_dir)
+        .ok()
+        .map(|stat| {
+            json!({
+                "free_bytes": stat.f_bavail.saturating_mul(stat.f_frsize),
+                "total_bytes": stat.f_blocks.saturating_mul(stat.f_frsize),
+            })
+        });
+    let draining = app
+        .store
+        .resolved_settings(&app.config)
+        .map(|settings| settings.draining)
+        .unwrap_or(false);
+    let healthy = app
+        .store
+        .health_check()
+        .and_then(|()| crate::app::health_probe(&app.config.receive_dir, "receive"))
+        .and_then(|()| crate::app::health_probe(&app.config.outbound_dir, "outbound"))
+        .is_ok();
+    Ok(Json(json!({
+        "sessions_active": receiving.len(),
+        "bytes_in_flight": bytes_in_flight,
+        "receiving": receiving,
+        "today": { "uploads": today_uploads, "bytes": today_bytes, "since": since },
+        "disk": disk,
+        "draining": draining,
+        "healthy": healthy,
+    })))
+}
+
 pub async fn admin_session(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -2075,6 +2129,8 @@ struct LinkView {
     usable: bool,
     uploads: Vec<UploadView>,
     events: Vec<crate::store::SessionEvent>,
+    /// Sessions receiving into this link right now.
+    receiving: Vec<crate::session::ActiveTransfer>,
 }
 
 #[derive(Serialize)]
@@ -2180,9 +2236,16 @@ fn link_view(app: &App, link: Link, base: &str) -> LinkView {
             log: upload.log,
         })
         .collect();
+    let receiving = app
+        .sessions
+        .active_transfers(&tenant)
+        .into_iter()
+        .filter(|transfer| transfer.link_id == link.id)
+        .collect();
     LinkView {
         url: format!("{base}/r/{}", link.id),
         usable,
+        receiving,
         id: link.id,
         label: link.label,
         dest: link.dest,

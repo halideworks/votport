@@ -827,6 +827,7 @@ pub async fn upload_chunk(
         _lease,
     })
     .await?;
+    app.sessions.set_received(&sid, progress.received);
     Ok(Json(progress))
 }
 
