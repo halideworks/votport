@@ -5116,6 +5116,22 @@ async fn search_finds_requests_files_downloads_and_audit_rows() {
         .unwrap();
     assert_eq!(by_id["links"].as_array().unwrap().len(), 1, "{by_id:?}");
     assert_eq!(by_id["links"][0]["id"], json!(token));
+    // A fragment of an id is not an id: the list filter matches it exactly.
+    let by_fragment: Value = client
+        .get(format!(
+            "{base}/api/admin/links?search={}&limit=5",
+            &token[..12]
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        by_fragment["links"].as_array().unwrap().is_empty(),
+        "{by_fragment:?}"
+    );
 
     // A deleted file drops out of the results.
     let links: Value = client
