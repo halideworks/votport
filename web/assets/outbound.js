@@ -436,6 +436,44 @@ async function loadMetadata() {
     const only = metadataFiles[0];
     separateButton.onclick = () => { window.location.assign(only.download_url); };
   }
+  const fetchBlock = $('vot-fetch');
+  fetchBlock.hidden = !body.fetch;
+  if (body.fetch) {
+    // The page mints with the recipient's cookie, so a password-gated grant
+    // works here where a copied curl would not; the secret key never leaves
+    // the recipient's machine.
+    $('vot-fetch-form').onsubmit = async (event) => {
+      event.preventDefault();
+      const error = $('vot-fetch-error');
+      const command = $('vot-fetch-command');
+      error.hidden = true;
+      command.hidden = true;
+      try {
+        const response = await fetch(body.fetch.mint_url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ holder_key: $('vot-fetch-key').value.trim() }),
+        });
+        if (!response.ok) {
+          const detail = await response.json().catch(() => ({}));
+          throw new Error(detail.error || `Mint refused (${response.status}).`);
+        }
+        const minted = await response.json();
+        command.textContent = [
+          `echo '${minted.capability}' | base64 -d > fetch-token.cbor`,
+          'export HOLDER_SECRET=ed25519-secret:<hex of your secret key>',
+          'VOT_FETCH_CAPABILITY=fetch-token.cbor VOT_FETCH_HOLDER_KEY=env:HOLDER_SECRET \\',
+          `VOT_FETCH_SERVE_IDENTITY=${minted.certificate_digest} \\`,
+          `vot fetch ${minted.address} ./delivery-bundle ${minted.package_root}`,
+          `# token good until ${new Date(minted.expires_at * 1000).toLocaleString()}`,
+        ].join('\n');
+        command.hidden = false;
+      } catch (failure) {
+        error.textContent = failure.message || 'Could not mint a fetch token.';
+        error.hidden = false;
+      }
+    };
+  }
   $('title').textContent = body.label || 'Verified download';
   applyBranding(body.branding, `/api/s/${encodeURIComponent(token)}/logo`);
   $('status').textContent = availability(body);

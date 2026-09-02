@@ -102,6 +102,10 @@ pub struct App {
     pub sso_config: Option<crate::config::OidcConfig>,
     pub sso_client: SsoSlot,
     pub push: Option<PushState>,
+    /// The VOT serve listener for Deliver over QUIC, when bound.
+    pub serve: Option<crate::api::serve::ServeState>,
+    pub serve_rate: crate::api::session_rate::SessionRate,
+    pub(crate) serve_metrics: crate::api::serve::ServeMetrics,
     pub(crate) push_metrics: PushMetrics,
     pub(crate) request_metrics: RequestMetrics,
     /// Every session worker reports here when it ends without publishing.
@@ -758,6 +762,10 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         .push_bind
         .map(|address| build_push_state(&config, address))
         .transpose()?;
+    let serve = config
+        .serve_bind
+        .map(|address| build_serve_state(&config, address))
+        .transpose()?;
     let web_build = web_build(&config.web_root);
     Ok(Arc::new(App {
         store,
@@ -775,6 +783,8 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         // Twenty admitted sessions can each use VOT's eight default rails;
         // leave room for refused or retried rails in the same ten-minute window.
         push_rate: crate::api::session_rate::SessionRate::with_limit(200),
+        // The same arithmetic as push: twenty fetches at eight rails each.
+        serve_rate: crate::api::session_rate::SessionRate::with_limit(200),
         outbound_rate: crate::api::session_rate::SessionRate::with_limit(2000),
         automation_rate: crate::api::session_rate::SessionRate::with_limit(60),
         outbound_active: Mutex::new(HashSet::new()),
@@ -788,6 +798,8 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         sso_config: config.oidc.clone(),
         sso_client: SsoSlot::new(),
         push,
+        serve,
+        serve_metrics: crate::api::serve::ServeMetrics::default(),
         push_metrics: PushMetrics::default(),
         request_metrics: RequestMetrics::default(),
         session_ended,
@@ -1241,6 +1253,59 @@ fn build_push_state(config: &Config, address: std::net::SocketAddr) -> Result<Pu
         audience,
         certificate_digest,
     })
+}
+
+/// The serve twin of [`build_push_state`]: the same certificate, issuer, and
+/// audience on a second port, so one identity pins both directions.
+fn build_serve_state(
+    config: &Config,
+    address: std::net::SocketAddr,
+) -> Result<crate::api::serve::ServeState, String> {
+    let (certificate, key) = push_credentials(config)?;
+    let credentials = vot_cli::Credentials::Files { certificate, key };
+    let (listener, certificate_digest) = vot_cli::bind_serve_listener(address, &credentials)
+        .map_err(|error| format!("bind VOT serve listener: {error:?}"))?;
+    let issuer = load_push_issuer(&config.data_dir)?;
+    let address = config
+        .serve_advertise
+        .clone()
+        .unwrap_or_else(|| listener.local_address().to_string());
+    let audience = push_audience(config.public_url.as_deref(), &address)?;
+    tracing::info!(
+        address = %listener.local_address(),
+        certificate_digest = %hex::encode(certificate_digest),
+        "VOT serve listener bound"
+    );
+    Ok(crate::api::serve::ServeState {
+        listener: Mutex::new(listener),
+        issuer,
+        address,
+        audience,
+        certificate_digest,
+        registry: Arc::new(crate::api::serve::ServeRegistry::default()),
+    })
+}
+
+/// Starts the process-lifetime VOT serve when Deliver over QUIC is enabled.
+pub fn start_serve(app: Arc<App>) {
+    if app.serve.is_none() {
+        return;
+    }
+    let runtime = tokio::runtime::Handle::current();
+    std::thread::Builder::new()
+        .name("votport-serve".to_owned())
+        .spawn(move || {
+            let serve = app.serve.as_ref().expect("serve state disappeared");
+            // Capabilities minted before a restart are honoured after it.
+            crate::api::serve::warm(&app, serve);
+            let listener = serve.listener.lock().expect("serve listener poisoned");
+            if let Err(error) = vot_cli::serve_on(&listener, |presentation| {
+                crate::api::serve::admit_fetch(&app, presentation, &runtime)
+            }) {
+                tracing::error!(?error, "VOT serve stopped");
+            }
+        })
+        .expect("spawn VOT serve");
 }
 
 fn push_audience(public_url: Option<&str>, address: &str) -> Result<String, String> {
@@ -1945,6 +2010,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/s/{token}", get(api::outbound_metadata))
         .route("/api/s/{token}/logo", get(api::outbound_logo))
         .route("/api/s/{token}/verify", post(api::verify_outbound_password))
+        .route("/api/s/{token}/fetch", post(api::serve::mint_fetch))
         .route("/api/s/{token}/bundle", get(api::outbound::outbound_bundle))
         .route("/api/s/{token}/batch", get(api::outbound::outbound_batch))
         .route("/api/automation/share", post(api::automation_share))
@@ -2004,6 +2070,7 @@ async fn push_identity(State(app): State<Arc<App>>) -> Response {
         "address": push.address,
         "certificate_digest": hex::encode(push.certificate_digest),
         "issuer_public_key": hex::encode(push.issuer.verifying_key().to_bytes()),
+        "serve_address": app.serve.as_ref().map(|serve| serve.address.clone()),
     }))
     .into_response()
 }
@@ -2619,6 +2686,25 @@ fn metrics_text(app: &App) -> Result<String, String> {
             app.push_metrics.refusals(reason)
         );
     }
+    let serving = app
+        .serve
+        .as_ref()
+        .map_or(0, |serve| serve.registry.active_sessions());
+    let _ = write!(
+        body,
+        "# TYPE votport_serve_sessions_active gauge\nvotport_serve_sessions_active {serving}\n# TYPE votport_serve_bytes_total counter\nvotport_serve_bytes_total {}\n# TYPE votport_serve_deliveries_total counter\nvotport_serve_deliveries_total {}\n",
+        app.serve_metrics.bytes(),
+        app.serve_metrics.deliveries()
+    );
+    body.push_str("# TYPE votport_serve_refused_total counter\n");
+    for reason in crate::api::serve::ServeRefusalReason::ALL {
+        let _ = writeln!(
+            body,
+            "votport_serve_refused_total{{reason=\"{}\"}} {}",
+            reason.label(),
+            app.serve_metrics.refusals(reason)
+        );
+    }
     let _ = write!(
         body,
         "# TYPE votport_audit_rows gauge\nvotport_audit_rows {}\n",
@@ -3091,6 +3177,7 @@ pub async fn session_sweeper(app: Arc<App>) {
             _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                 app.sessions.sweep(idle);
                 sweep_push_tickets(&app);
+                crate::api::serve::prune(&app);
             }
             _ = day.tick() => {
                 // Skip this tick rather than sweep on guessed settings: a

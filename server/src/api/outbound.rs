@@ -729,7 +729,10 @@ fn library_root(app: &App, tenant: &str) -> PathBuf {
     }
 }
 
-fn begin_outbound_operation<'a>(app: &'a App, tenant: &str) -> ApiResult<OutboundOperation<'a>> {
+pub(crate) fn begin_outbound_operation<'a>(
+    app: &'a App,
+    tenant: &str,
+) -> ApiResult<OutboundOperation<'a>> {
     let operation = app
         .sessions
         .try_begin_outbound(tenant)
@@ -2375,6 +2378,13 @@ pub async fn outbound_metadata(
             "download_url": format!("/api/s/{token}/file"),
             "bundle_url": format!("/api/s/{token}/bundle"),
             "batch_url": format!("/api/s/{token}/batch"),
+            // Present only when the VOT serve listener is bound: where a VOT
+            // client dials and where it mints its capability.
+            "fetch": app.serve.as_ref().map(|serve| json!({
+                "address": serve.address,
+                "certificate_digest": hex::encode(serve.certificate_digest),
+                "mint_url": format!("/api/s/{token}/fetch"),
+            })),
             "total_bytes": if grant.files.is_empty() {
                 grant.bytes
             } else {
@@ -3235,7 +3245,7 @@ pub async fn outbound_bundle(
     Ok(response)
 }
 
-fn active_grant(app: &App, token: &str) -> ApiResult<OutboundGrant> {
+pub(crate) fn active_grant(app: &App, token: &str) -> ApiResult<OutboundGrant> {
     if !valid_token(token) {
         return Err(ApiError::not_found());
     }
@@ -3378,7 +3388,11 @@ fn grant_authorized(app: &App, grant: &OutboundGrant, headers: &HeaderMap) -> bo
         )
 }
 
-fn require_grant_access(app: &App, grant: &OutboundGrant, headers: &HeaderMap) -> ApiResult<()> {
+pub(crate) fn require_grant_access(
+    app: &App,
+    grant: &OutboundGrant,
+    headers: &HeaderMap,
+) -> ApiResult<()> {
     if grant_authorized(app, grant, headers) {
         Ok(())
     } else {
@@ -3588,11 +3602,11 @@ fn validate_max_downloads(max_downloads: Option<u64>) -> ApiResult<()> {
     Ok(())
 }
 
-struct Source {
-    path: PathBuf,
-    object: ObjectId,
-    name: String,
-    receipt: Option<Vec<u8>>,
+pub(crate) struct Source {
+    pub(crate) path: PathBuf,
+    pub(crate) object: ObjectId,
+    pub(crate) name: String,
+    pub(crate) receipt: Option<Vec<u8>>,
 }
 
 fn read_source_receipt(source: &Source) -> io::Result<Vec<u8>> {
@@ -3750,7 +3764,7 @@ fn source_info_indexed(app: &App, grant: &OutboundGrant, index: usize) -> ApiRes
     source_info_indexed_with_file(app, grant, index, None)
 }
 
-fn source_info_indexed_with_file(
+pub(crate) fn source_info_indexed_with_file(
     app: &App,
     grant: &OutboundGrant,
     index: usize,
@@ -3942,7 +3956,7 @@ fn public_automation_token(token: &AutomationToken) -> serde_json::Value {
     })
 }
 
-struct ActiveDownload {
+pub(crate) struct ActiveDownload {
     app: Arc<App>,
     key: String,
 }
@@ -3952,7 +3966,7 @@ impl ActiveDownload {
         Self::claim_with_grant(app, key, grant)
     }
 
-    fn claim_with_grant(app: Arc<App>, key: &str, grant: &str) -> ApiResult<Self> {
+    pub(crate) fn claim_with_grant(app: Arc<App>, key: &str, grant: &str) -> ApiResult<Self> {
         let mut active = app
             .outbound_active
             .lock()

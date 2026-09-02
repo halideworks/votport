@@ -5200,6 +5200,8 @@ mod ops_tests {
             push_certificate: None,
             push_private_key: None,
             push_advertise: None,
+            serve_bind: None,
+            serve_advertise: None,
             data_dir: std::path::PathBuf::from("/nonexistent"),
             receive_dir: std::path::PathBuf::from("/nonexistent"),
             outbound_dir: std::path::PathBuf::from("/nonexistent"),

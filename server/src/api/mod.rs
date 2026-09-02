@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod outbound;
+pub mod serve;
 pub mod session_rate;
 pub mod sso;
 pub mod upload;
@@ -304,6 +305,8 @@ pub(crate) mod testing {
             push_certificate: None,
             push_private_key: None,
             push_advertise: None,
+            serve_bind: None,
+            serve_advertise: None,
             data_dir: directory.join("data"),
             receive_dir: directory.join("received"),
             outbound_dir: directory.join("outbound"),

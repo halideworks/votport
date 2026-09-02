@@ -17,6 +17,11 @@ pub struct Config {
     pub push_private_key: Option<PathBuf>,
     /// Public host and port native senders dial.
     pub push_advertise: Option<String>,
+    /// UDP address the VOT serve listener binds; off when unset. Shares the
+    /// push certificate and issuer key.
+    pub serve_bind: Option<SocketAddr>,
+    /// Public host and port VOT fetch clients dial.
+    pub serve_advertise: Option<String>,
     /// Directory holding votport state (votport.db, secret).
     pub data_dir: PathBuf,
     /// Root directory received files are published into.
@@ -294,6 +299,23 @@ pub fn from_env() -> Result<Config, String> {
             )
         })
         .transpose()?;
+    let serve_bind = optional("VOTPORT_SERVE_BIND")
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|error| format!("VOTPORT_SERVE_BIND is not a socket address: {error}"))
+        })
+        .transpose()?;
+    let serve_advertise = serve_bind
+        .map(|bind| {
+            listener_address(
+                "SERVE",
+                optional("VOTPORT_SERVE_ADVERTISE"),
+                public_url.as_deref(),
+                bind,
+            )
+        })
+        .transpose()?;
 
     let max_upload_bytes = match env::var("VOTPORT_MAX_UPLOAD_BYTES") {
         Ok(value) => {
@@ -472,6 +494,8 @@ pub fn from_env() -> Result<Config, String> {
         push_certificate,
         push_private_key,
         push_advertise,
+        serve_bind,
+        serve_advertise,
         data_dir,
         receive_dir,
         outbound_dir,
@@ -541,21 +565,36 @@ fn push_address(
     public_url: Option<&str>,
     bind: SocketAddr,
 ) -> Result<String, String> {
+    listener_address("PUSH", explicit, public_url, bind)
+}
+
+/// The advertised address for a UDP listener named by `kind` (`PUSH` or
+/// `SERVE`), so an error names the knob the operator set.
+fn listener_address(
+    kind: &str,
+    explicit: Option<String>,
+    public_url: Option<&str>,
+    bind: SocketAddr,
+) -> Result<String, String> {
     if bind.port() == 0 {
-        return Err("VOTPORT_PUSH_BIND port must be greater than zero".to_owned());
+        return Err(format!(
+            "VOTPORT_{kind}_BIND port must be greater than zero"
+        ));
     }
     let address = if let Some(address) = explicit {
         address
     } else {
         let public_url = public_url.ok_or_else(|| {
-            "set VOTPORT_PUSH_ADVERTISE or VOTPORT_PUBLIC_URL when VOTPORT_PUSH_BIND is set"
-                .to_owned()
+            format!("set VOTPORT_{kind}_ADVERTISE or VOTPORT_PUBLIC_URL when VOTPORT_{kind}_BIND is set")
         })?;
         let parsed = reqwest::Url::parse(public_url).map_err(|error| {
-            format!("VOTPORT_PUBLIC_URL cannot supply the push address: {error}")
+            format!(
+                "VOTPORT_PUBLIC_URL cannot supply the {} address: {error}",
+                kind.to_ascii_lowercase()
+            )
         })?;
         let host = parsed.host_str().ok_or_else(|| {
-            "VOTPORT_PUBLIC_URL has no host; set VOTPORT_PUSH_ADVERTISE".to_owned()
+            format!("VOTPORT_PUBLIC_URL has no host; set VOTPORT_{kind}_ADVERTISE")
         })?;
         if host.starts_with('[') {
             format!("{host}:{}", bind.port())
@@ -566,10 +605,10 @@ fn push_address(
         }
     };
     if address.contains(['/', '\\']) {
-        return Err("VOTPORT_PUSH_ADVERTISE must be host:port".to_owned());
+        return Err(format!("VOTPORT_{kind}_ADVERTISE must be host:port"));
     }
     let parsed = reqwest::Url::parse(&format!("vot://{address}"))
-        .map_err(|error| format!("VOTPORT_PUSH_ADVERTISE is not host:port: {error}"))?;
+        .map_err(|error| format!("VOTPORT_{kind}_ADVERTISE is not host:port: {error}"))?;
     if parsed.host_str().is_none()
         || parsed.port().is_none_or(|port| port == 0)
         || !parsed.username().is_empty()
@@ -578,7 +617,7 @@ fn push_address(
         || parsed.query().is_some()
         || parsed.fragment().is_some()
     {
-        return Err("VOTPORT_PUSH_ADVERTISE must be host:port".to_owned());
+        return Err(format!("VOTPORT_{kind}_ADVERTISE must be host:port"));
     }
     Ok(address)
 }
