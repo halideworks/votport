@@ -375,8 +375,20 @@ pub struct StatusQuery {
     since: Option<u64>,
 }
 
-/// The Receive page's status strip: what is arriving now, what landed today,
-/// room on the receive volume, and whether the box is draining or unwell.
+/// Downloads in flight are keyed by the grant's hex token hash, a colon, and
+/// one or two stream segments; the part before the first colon is the grant,
+/// so one recipient with several streams open counts once.
+fn active_grant_hashes<'a>(keys: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut hashes: Vec<String> = keys
+        .map(|key| key.split_once(':').map_or(key, |(hash, _)| hash).to_owned())
+        .collect();
+    hashes.sort();
+    hashes.dedup();
+    hashes
+}
+
+/// The Receive and Deliver status strips: what is arriving now, what landed
+/// today, what is stored, what is being served, and room on both volumes.
 pub async fn admin_status(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -392,29 +404,47 @@ pub async fn admin_status(
         .store
         .uploads_since(&identity.tenant, since)
         .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    let disk = rustix::fs::statvfs(&app.config.receive_dir)
-        .ok()
-        .map(|stat| {
+    let disk_of = |root: &std::path::Path| {
+        rustix::fs::statvfs(root).ok().map(|stat| {
             json!({
                 "free_bytes": stat.f_bavail.saturating_mul(stat.f_frsize),
                 "total_bytes": stat.f_blocks.saturating_mul(stat.f_frsize),
             })
-        });
-    let draining = app
+        })
+    };
+    let (stored_files, stored_bytes) = app
         .store
-        .resolved_settings(&app.config)
-        .map(|settings| settings.draining)
-        .unwrap_or(false);
-    let healthy = crate::app::check_health(&app).is_ok();
+        .tenant_stored(&identity.tenant)
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let now = now_unix();
+    // Downloads in flight are keyed by the grant's hex token hash, a colon,
+    // and one or two stream segments; the tenant's share is counted by
+    // grant, so one recipient with several streams open is one download.
+    let active_hashes = {
+        let active = app
+            .outbound_active
+            .lock()
+            .expect("outbound active poisoned");
+        active_grant_hashes(active.iter().map(String::as_str))
+    };
+    let outbound = app
+        .store
+        .outbound_summary(&identity.tenant, now, &active_hashes)
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(json!({
-        "now": now_unix(),
+        "now": now,
         "sessions_active": receiving.len(),
         "bytes_in_flight": bytes_in_flight,
         "receiving": receiving,
         "today": { "uploads": today_uploads, "bytes": today_bytes, "since": since },
-        "disk": disk,
-        "draining": draining,
-        "healthy": healthy,
+        "stored": { "files": stored_files, "bytes": stored_bytes },
+        "disk": disk_of(&app.config.receive_dir),
+        "outbound": {
+            "active": outbound.active,
+            "open_grants": outbound.open_grants,
+            "deliveries": outbound.deliveries,
+            "disk": disk_of(&app.config.outbound_dir),
+        },
     })))
 }
 
@@ -6987,6 +7017,20 @@ mod notification_and_limit_tests {
         assert_eq!(
             body["error"],
             "Delivered 0 of 1 configured notification channels"
+        );
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::active_grant_hashes;
+
+    #[test]
+    fn in_flight_keys_collapse_to_their_grant() {
+        let keys = ["abc:0", "abc:batch", "abc:1:lease-token", "def:bundle"];
+        assert_eq!(
+            active_grant_hashes(keys.iter().copied()),
+            vec!["abc".to_owned(), "def".to_owned()]
         );
     }
 }

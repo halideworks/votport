@@ -4859,8 +4859,10 @@ async fn status_reports_receiving_sessions_and_the_days_uploads() {
         status["disk"]["free_bytes"].as_u64().unwrap() > 0,
         "{status:?}"
     );
-    assert_eq!(status["draining"], json!(false));
-    assert_eq!(status["healthy"], json!(true));
+    assert_eq!(status["stored"]["files"], json!(0), "{status:?}");
+    assert_eq!(status["outbound"]["active"], json!(0));
+    assert_eq!(status["outbound"]["open_grants"], json!(0));
+    assert!(status["outbound"]["disk"]["free_bytes"].as_u64().unwrap() > 0);
 
     let links: Value = client
         .get(format!("{base}/api/admin/links"))
@@ -4901,6 +4903,68 @@ async fn status_reports_receiving_sessions_and_the_days_uploads() {
         json!(2 * 1024 * 1024),
         "{status:?}"
     );
+    assert_eq!(status["stored"]["files"], json!(1), "{status:?}");
+    assert_eq!(
+        status["stored"]["bytes"],
+        json!(2 * 1024 * 1024),
+        "{status:?}"
+    );
+    // An issued download shows as open and, once fetched, as served.
+    client
+        .post(format!(
+            "{base}/api/admin/outbound-files?path=strip/poster.pdf"
+        ))
+        .header("x-votport", "1")
+        .body(vec![1u8; 256])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let grant: Value = client
+        .post(format!("{base}/api/admin/outbound-grants"))
+        .header("x-votport", "1")
+        .json(&json!({ "paths": ["strip/poster.pdf"], "expires_days": 1 }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let status: Value = client
+        .get(format!("{base}/api/admin/status?since=0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["outbound"]["open_grants"], json!(1), "{status:?}");
+    assert_eq!(status["outbound"]["deliveries"], json!(0));
+    let grant_token = grant["url"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let fetched = client
+        .get(format!("{base}/api/s/{grant_token}/files/0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fetched.status().as_u16(), 200);
+    let status: Value = client
+        .get(format!("{base}/api/admin/status?since=0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["outbound"]["deliveries"], json!(1), "{status:?}");
     // A day boundary in the future counts nothing.
     let status: Value = client
         .get(format!("{base}/api/admin/status?since=4102444800"))

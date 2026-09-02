@@ -123,12 +123,19 @@ test('a stale sender tab reloads when the server reports a new web build', () =>
   assert.match(uploadScript, /error\.status === 422 && \/not fully received\//);
 });
 
-test('receive page carries the status strip and polls the status endpoint', () => {
-  for (const id of ['status-strip', 'stat-active', 'stat-today', 'stat-disk', 'stat-drain', 'stat-health']) {
+test('receive page carries the status strip and polls the status endpoint', async () => {
+  for (const id of ['status-strip', 'stat-active', 'stat-today', 'stat-stored', 'stat-disk']) {
     assert.match(receive, new RegExp(`id="${id}"`), `${id} present`);
   }
-  assert.match(receiveScript, /\/api\/admin\/status\?since=/);
-  assert.match(receiveScript, /visibilitychange/);
+  for (const id of ['status-strip', 'stat-active', 'stat-open', 'stat-deliveries', 'stat-disk']) {
+    assert.match(deliver, new RegExp(`id="${id}"`), `deliver ${id} present`);
+  }
+  assert.doesNotMatch(receive, /stat-drain|stat-health/);
+  assert.match(receiveScript, /startStatusPoll\(/);
+  assert.match(deliverScript, /startStatusPoll\(/);
+  const poll = await readFile(new URL('../web/assets/status-strip.js', import.meta.url), 'utf8');
+  assert.match(poll, /\/api\/admin\/status\?since=/);
+  assert.match(poll, /visibilitychange/);
   assert.match(receiveScript, /receiving-now/);
   assert.match(receiveScript, /How receiving works/);
   assert.match(deliverScript, /How delivering works/);

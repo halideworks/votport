@@ -1254,6 +1254,68 @@ impl Store {
         })
     }
 
+    /// Live received files in one tenant namespace (count, bytes), a physical
+    /// file counted once however many records reference it.
+    pub fn tenant_stored(&self, tenant: &str) -> Result<(u64, u64), String> {
+        self.with(|connection| {
+            connection
+                .prepare_cached(
+                    "WITH live_paths AS (
+                         SELECT MAX(bytes_hi) AS bytes_hi, bytes_lo
+                         FROM files WHERE tenant = ?1 AND deleted = 0
+                         GROUP BY CASE WHEN stored_as = ''
+                             THEN link_id || '/' || upload_index || '/' || file_index
+                             ELSE stored_as END
+                     )
+                     SELECT COUNT(*), COALESCE(SUM(bytes_hi), 0), COALESCE(SUM(bytes_lo), 0)
+                     FROM live_paths",
+                )?
+                .query_row(rusqlite::params![tenant], |row| {
+                    let count: i64 = row.get(0)?;
+                    Ok((
+                        u64::try_from(count).unwrap_or(0),
+                        combine_byte_sums(row.get(1)?, row.get(2)?),
+                    ))
+                })
+        })
+    }
+
+    /// Issued downloads in one tenant namespace: links usable now (not
+    /// revoked, not expired, not exhausted), complete deliveries in total,
+    /// and how many of `active_hashes` (token hashes with a download in
+    /// flight) belong to this tenant.
+    pub fn outbound_summary(
+        &self,
+        tenant: &str,
+        now: u64,
+        active_hashes: &[String],
+    ) -> Result<OutboundSummary, String> {
+        let hashes = serde_json::to_string(active_hashes).unwrap_or_else(|_| "[]".to_owned());
+        self.with(|connection| {
+            connection
+                .prepare_cached(
+                    "SELECT COALESCE(SUM(revoked_at IS NULL AND expires_at > ?2
+                                         AND (max_downloads IS NULL OR downloads < max_downloads)), 0),
+                            COALESCE(SUM(downloads), 0),
+                            COALESCE(SUM(token_hash IN (SELECT value FROM json_each(?3))), 0)
+                     FROM outbound_grants WHERE tenant = ?1",
+                )?
+                .query_row(
+                    rusqlite::params![tenant, i64::try_from(now).unwrap_or(i64::MAX), hashes],
+                    |row| {
+                        let open: i64 = row.get(0)?;
+                        let deliveries: i64 = row.get(1)?;
+                        let active: i64 = row.get(2)?;
+                        Ok(OutboundSummary {
+                            open_grants: u64::try_from(open).unwrap_or(0),
+                            deliveries: u64::try_from(deliveries).unwrap_or(0),
+                            active: u64::try_from(active).unwrap_or(0),
+                        })
+                    },
+                )
+        })
+    }
+
     /// Uploads completed at or after `since` in one tenant namespace (count,
     /// bytes), partial records excluded. Polled, so the statement is cached
     /// and the tenant filter keeps links_tenant_created in play.
@@ -2356,21 +2418,7 @@ impl Store {
 
     /// Bytes received-and-not-deleted across a tenant's links.
     pub fn tenant_received_bytes(&self, tenant: &str) -> Result<u64, String> {
-        self.with(|connection| {
-            connection
-                .prepare_cached(
-                    "SELECT COALESCE(SUM(bytes_hi), 0), COALESCE(SUM(bytes_lo), 0) FROM (
-                         SELECT MAX(bytes_hi) AS bytes_hi, bytes_lo FROM files
-                         WHERE tenant = ?1 AND deleted = 0
-                         GROUP BY tenant, CASE WHEN stored_as = ''
-                             THEN link_id || '/' || upload_index || '/' || file_index
-                             ELSE stored_as END)",
-                )?
-                .query_row([tenant], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-                })
-                .map(|(hi, lo)| combine_byte_sums(hi, lo))
-        })
+        self.tenant_stored(tenant).map(|(_, bytes)| bytes)
     }
 
     /// Link and live-byte totals for every tenant in one grouped query. Both
@@ -3594,6 +3642,15 @@ pub struct AuditRow {
     pub detail: serde_json::Value,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OutboundSummary {
+    pub open_grants: u64,
+    /// The grant-level counter: a multi-file link counts once every file
+    /// has been fetched, the same figure the Deliver list shows.
+    pub deliveries: u64,
+    pub active: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct SearchResults {
     pub requests: Vec<SearchRequest>,
@@ -4318,6 +4375,32 @@ mod tests {
         let grant = test_outbound_grant("g1", "acme", 3);
         store.insert_outbound_grant(grant.clone()).unwrap();
         assert_eq!(store.outbound_grants("acme").unwrap(), vec![grant]);
+    }
+
+    #[test]
+    fn outbound_summary_counts_open_links_deliveries_and_active_downloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let open = test_outbound_grant("open", "acme", 1);
+        let mut used = test_outbound_grant("used", "acme", 1);
+        used.downloads = 2;
+        used.max_downloads = Some(2);
+        let mut revoked = test_outbound_grant("gone", "acme", 1);
+        revoked.revoked_at = Some(5);
+        let other = test_outbound_grant("other", "beta", 1);
+        for grant in [open.clone(), used, revoked, other] {
+            store.insert_outbound_grant(grant).unwrap();
+        }
+        // The status handler keeps the part of each in-flight key before the
+        // first colon: the grant's token hash.
+        let active = vec![open.token_hash.clone(), "hash-other".to_owned()];
+        let summary = store.outbound_summary("acme", 10, &active).unwrap();
+        assert_eq!(summary.open_grants, 1, "used and revoked are not open");
+        assert_eq!(summary.deliveries, 2);
+        assert_eq!(summary.active, 1, "the other tenant's download is not ours");
+        let expired = store.outbound_summary("acme", 25, &[]).unwrap();
+        assert_eq!(expired.open_grants, 0);
+        assert_eq!(expired.active, 0);
     }
 
     #[test]
