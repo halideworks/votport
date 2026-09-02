@@ -234,7 +234,7 @@ function teachingEmptyState(title, steps) {
 
 // Live "Receiving now" line on a request card, from the status poll. `now`
 // is the server's clock, the same one that stamped started_at.
-function applyReceiving(card, transfers, now) {
+function applyReceiving(card, transfers, now = null) {
   const line = card.querySelector('.receiving-now');
   if (!line) return;
   if (!transfers.length) {
@@ -244,12 +244,15 @@ function applyReceiving(card, transfers, now) {
   line.replaceChildren();
   for (const transfer of transfers) {
     const row = document.createElement('span');
-    const elapsed = Math.max(1, now - transfer.started_at);
     const parts = [
       `Receiving now · ${formatBytes(transfer.received)} of ${formatBytes(transfer.total)}`,
-      `${formatBytes(Math.round(transfer.received / elapsed))}/s`,
-      `sender started ${new Date(transfer.started_at * 1000).toLocaleTimeString([], { timeStyle: 'short' })}`,
     ];
+    // The rate needs the server's clock; the first render waits for the poll.
+    if (now !== null) {
+      const elapsed = Math.max(1, now - transfer.started_at);
+      parts.push(`${formatBytes(Math.round(transfer.received / elapsed))}/s`);
+    }
+    parts.push(`sender started ${new Date(transfer.started_at * 1000).toLocaleTimeString([], { timeStyle: 'short' })}`);
     if (transfer.transport === 'push') parts.push('native push');
     row.textContent = parts.join(' · ');
     line.append(row);
@@ -275,7 +278,7 @@ async function refreshStatus() {
     status = await api(`/api/admin/status?since=${startOfToday()}`);
   } catch (error) {
     // The session expired under an open tab: the reload lands on sign-in.
-    if (/\(401\)/.test(error.message)) {
+    if (error.status === 401) {
       window.location.reload();
       return;
     }
@@ -365,7 +368,7 @@ function renderLink(link) {
   receiving.hidden = true;
   card.dataset.linkId = link.id;
   card.append(receiving);
-  applyReceiving(card, link.receiving || [], Date.now() / 1000);
+  applyReceiving(card, link.receiving || []);
   const notify = document.createElement('label');
   notify.className = 'toggle muted';
   const notifyInput = document.createElement('input');
@@ -508,6 +511,15 @@ function renderLink(link) {
 }
 
 async function refreshLinks({ append = false, fromPoll = false } = {}) {
+  linksBusy = true;
+  try {
+    await refreshLinksInner({ append, fromPoll });
+  } finally {
+    linksBusy = false;
+  }
+}
+
+async function refreshLinksInner({ append, fromPoll }) {
   if (append) {
     linksExpanded = true;
   } else {
@@ -564,15 +576,11 @@ async function refreshLinks({ append = false, fromPoll = false } = {}) {
 }
 
 async function refreshLinksSafe(options = {}) {
-  if (linksBusy) return;
-  linksBusy = true;
   try {
     await refreshLinks(options);
   } catch (error) {
     $('links-error').textContent = error.message;
     $('links-error').hidden = false;
-  } finally {
-    linksBusy = false;
   }
 }
 
