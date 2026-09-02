@@ -2013,5 +2013,3 @@ details.deployment .settings-status {
  0%, 100% { opacity: 1; transform: scale(1); }
  50% { opacity: 0.45; transform: scale(0.8); }
 }
- to { box-shadow: 0 0 0 1px var(--progress); }
-}

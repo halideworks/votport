@@ -670,7 +670,7 @@ async function refreshLinksInner({ append, fromPoll }) {
     : null;
   $('links-load-more').hidden = !linksCursor;
   $('links-error').hidden = true;
-  // A re-render (the status poll, an action) keeps the deep-linked card marked.
+  // A re-render (the status poll, an action) keeps the deep-linked card open.
   revealHash({ scroll: false });
 }
 
