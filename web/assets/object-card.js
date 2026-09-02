@@ -67,3 +67,10 @@ export function appendObjectCard(parent, file, options = {}) {
   parent.append(row);
   return row;
 }
+
+/// Whole seconds as a short duration: 45s, 2m 40s, 1h 5m.
+export function formatDuration(seconds) {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+}

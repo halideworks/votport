@@ -153,7 +153,6 @@ async function deferred({ text, mark, unmark, commit }) {
 
 function renderUpload(link, upload) {
   const item = document.createElement('li');
-  let logBox = null;
   // A hold being released is still a hold until the window closes.
   const held = link.legal_hold || pendingLinks.get(link.id)?.legal_hold === false;
 

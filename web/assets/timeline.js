@@ -4,6 +4,8 @@
 // Pure functions over the record the admin API returns, so the Receive
 // page's timeline view and its tests share one reading of the log.
 
+import { formatBytes, formatDuration } from './object-card.js';
+
 /// Summary figures for one upload record. Every number comes from the
 /// record itself; nothing is estimated.
 export function summarize(upload) {
@@ -55,10 +57,10 @@ export function narrate(event) {
     case 'published': return {
       text: `${event.path ?? 'a file'} published with its receipt`,
       detail: event.bytes !== undefined
-        ? `${formatSize(event.bytes)}${event.secs ? ` in ${formatSecs(event.secs)} · ${formatSize(Math.round(event.bytes / event.secs))}/s` : ''}`
+        ? `${formatBytes(event.bytes)}${event.secs ? ` in ${formatDuration(event.secs)} · ${formatBytes(Math.round(event.bytes / event.secs))}/s` : ''}`
         : undefined,
     };
-    case 'quiet': return { text: `Sender went quiet for ${formatSecs(event.secs ?? 0)}` };
+    case 'quiet': return { text: `Sender went quiet for ${formatDuration(event.secs ?? 0)}` };
     case 'finished': return {
       text: 'Finished, package root recorded',
       detail: count ? `${plural(count, 're-sent chunk')}` : undefined,
@@ -92,19 +94,4 @@ export function timelineJson(link, upload) {
     summary: summarize(upload),
     events: upload.log || [],
   }, null, 2);
-}
-
-export function formatSecs(seconds) {
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
-  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
-}
-
-export function formatSize(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  const units = ['KiB', 'MiB', 'GiB', 'TiB'];
-  let value = bytes / 1024;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
-  return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
 }

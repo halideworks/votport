@@ -115,7 +115,7 @@
       <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
     </div>
 
-    <dialog id="timeline" class="modal timeline">
+    <dialog id="timeline" class="modal timeline" aria-labelledby="timeline-title">
       <form method="dialog">
         <div class="timeline-head">
           <div>
@@ -126,7 +126,7 @@
           <button value="close" class="ghost tiny" id="timeline-close">Close</button>
         </div>
         <div id="timeline-stats" class="timeline-stats"></div>
-        <ol id="timeline-events" class="timeline-events"></ol>
+        <ol id="timeline-events" class="timeline-events" tabindex="0"></ol>
         <div class="modal-actions timeline-actions">
           <button type="button" class="ghost tiny" id="timeline-download">Download timeline JSON</button>
           <a id="timeline-audit" class="button tiny ghost" href="/audit">Open audit rows</a>
