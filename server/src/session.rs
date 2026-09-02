@@ -346,14 +346,17 @@ enum Phase {
 /// sender, then passes the receiver here so the thread cannot touch disk
 /// before the session is in the map.
 pub fn spawn_worker(setup: WorkerSetup, receiver: mpsc::Receiver<Cmd>) {
-    spawn_worker_from(setup, receiver, Phase::AwaitSeal, false);
+    spawn_worker_from(setup, receiver, Phase::AwaitSeal, false, 0);
 }
 
+/// `already` is what a re-attached session had covered before the restart,
+/// so the byte count reported to the admin spans the whole transfer.
 fn spawn_worker_from(
     setup: WorkerSetup,
     mut receiver: mpsc::Receiver<Cmd>,
     mut phase: Phase,
     resumed: bool,
+    already: u64,
 ) {
     std::thread::spawn(move || {
         // Feedback for the admin: bytes newly accepted this session and the
@@ -554,7 +557,7 @@ fn spawn_worker_from(
                             Err(_) => rejected += 1,
                         }
                         let outcome = outcome.map(|mut progress| {
-                            progress.received = received;
+                            progress.received = already + received;
                             progress
                         });
                         send_noted!(item.reply, outcome);
@@ -912,7 +915,7 @@ pub fn resume_worker(
     setup: WorkerSetup,
     receiver: mpsc::Receiver<Cmd>,
     persisted: &mut PersistedUploadSession,
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<(Vec<PathBuf>, u64), String> {
     let mut files = Vec::with_capacity(persisted.files.len());
     let mut kept = Vec::new();
     for file in &persisted.files {
@@ -965,8 +968,19 @@ pub fn resume_worker(
             record.receipt = file.receipt;
         }
     }
-    spawn_worker_from(setup, receiver, Phase::Receiving { files }, true);
-    Ok(kept)
+    let already: u64 = persisted
+        .files
+        .iter()
+        .map(|file| {
+            if file.published {
+                file.object.length
+            } else {
+                file.prefix_bytes
+            }
+        })
+        .sum();
+    spawn_worker_from(setup, receiver, Phase::Receiving { files }, true, already);
+    Ok((kept, already))
 }
 
 fn entry_infos(setup: &WorkerSetup, files: &[FileState]) -> Vec<EntryInfo> {
@@ -2990,20 +3004,36 @@ impl Sessions {
             .count()
     }
 
-    /// Records the session's accepted byte count for the live view.
+    /// Records the session's accepted byte count for the live view. Chunk
+    /// replies land out of order, so only a larger count moves it.
     pub fn set_received(&self, id: &str, bytes: u64) {
         if let Some(handle) = self.inner.lock().expect("sessions poisoned").map.get(id) {
-            handle.activity.received.store(bytes, Ordering::Relaxed);
+            handle.activity.received.fetch_max(bytes, Ordering::Relaxed);
         }
     }
 
-    /// Sessions in progress, newest first; an empty tenant means every tenant.
+    /// A re-attached session keeps its original start and the bytes it had
+    /// covered before the restart.
+    pub fn seed_resumed(&self, id: &str, started_at: u64, received: u64) {
+        if let Some(handle) = self
+            .inner
+            .lock()
+            .expect("sessions poisoned")
+            .map
+            .get_mut(id)
+        {
+            handle.started_at = started_at;
+            handle.activity.received.store(received, Ordering::Relaxed);
+        }
+    }
+
+    /// Sessions in progress for one tenant namespace, newest first.
     pub fn active_transfers(&self, tenant: &str) -> Vec<ActiveTransfer> {
         let inner = self.inner.lock().expect("sessions poisoned");
         let mut transfers: Vec<ActiveTransfer> = inner
             .map
             .values()
-            .filter(|handle| tenant.is_empty() || handle.tenant == tenant)
+            .filter(|handle| handle.tenant == tenant)
             .map(|handle| ActiveTransfer {
                 link_id: handle.link_id.clone(),
                 transport: match &handle.kind {

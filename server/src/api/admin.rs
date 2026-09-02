@@ -405,13 +405,9 @@ pub async fn admin_status(
         .resolved_settings(&app.config)
         .map(|settings| settings.draining)
         .unwrap_or(false);
-    let healthy = app
-        .store
-        .health_check()
-        .and_then(|()| crate::app::health_probe(&app.config.receive_dir, "receive"))
-        .and_then(|()| crate::app::health_probe(&app.config.outbound_dir, "outbound"))
-        .is_ok();
+    let healthy = crate::app::check_health(&app).is_ok();
     Ok(Json(json!({
+        "now": now_unix(),
         "sessions_active": receiving.len(),
         "bytes_in_flight": bytes_in_flight,
         "receiving": receiving,
@@ -2203,7 +2199,12 @@ pub(crate) fn stored_path(app: &App, tenant: &str, stored_as: &str) -> Option<st
     paths::join_under(&app.config.receive_dir, &components).ok()
 }
 
-fn link_view(app: &App, link: Link, base: &str) -> LinkView {
+fn link_view(
+    app: &App,
+    link: Link,
+    base: &str,
+    transfers: &[crate::session::ActiveTransfer],
+) -> LinkView {
     let usable = link.usable_now();
     let tenant = link.tenant.clone();
     let uploads = link
@@ -2236,11 +2237,10 @@ fn link_view(app: &App, link: Link, base: &str) -> LinkView {
             log: upload.log,
         })
         .collect();
-    let receiving = app
-        .sessions
-        .active_transfers(&tenant)
-        .into_iter()
+    let receiving = transfers
+        .iter()
         .filter(|transfer| transfer.link_id == link.id)
+        .cloned()
         .collect();
     LinkView {
         url: format!("{base}/r/{}", link.id),
@@ -2313,10 +2313,11 @@ pub async fn list_links(
                 now_unix(),
             )
             .map_err(super::store_unavailable)?;
+        let transfers = app.sessions.active_transfers(&identity.tenant);
         let links: Vec<LinkView> = page
             .links
             .into_iter()
-            .map(|link| link_view(&app, link, &base))
+            .map(|link| link_view(&app, link, &base, &transfers))
             .collect();
         return Ok(Json(json!({
             "links": links,
@@ -2325,12 +2326,13 @@ pub async fn list_links(
             "next_cursor": page.next_cursor,
         })));
     }
+    let transfers = app.sessions.active_transfers(&identity.tenant);
     let links: Vec<LinkView> = app
         .store
         .links(&identity.tenant)
         .map_err(super::store_unavailable)?
         .into_iter()
-        .map(|link| link_view(&app, link, &base))
+        .map(|link| link_view(&app, link, &base, &transfers))
         .collect();
     Ok(Json(json!({
         "links": links,
@@ -2445,7 +2447,7 @@ pub async fn create_link(
         events: Vec::new(),
     };
     let base = base_url(&app, &headers);
-    let view = link_view(&app, link.clone(), &base);
+    let view = link_view(&app, link.clone(), &base, &[]);
     app.store.insert_link(link).map_err(|error| match error {
         crate::store::InsertLinkError::NamedTenantGone => ApiError::new(
             StatusCode::GONE,
@@ -3262,6 +3264,7 @@ mod handler_tests {
                 events: Vec::new(),
             },
             "http://localhost",
+            &[],
         );
         let json = serde_json::to_value(view).unwrap();
         assert_eq!(json["uploads"][0]["transport"], "http");

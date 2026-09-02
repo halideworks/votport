@@ -211,6 +211,9 @@ function renderUpload(link, upload) {
 
 const LINKS_PAGE_SIZE = 50;
 let linksCursor = null;
+let linksBusy = false;
+// Load more was used: a background refresh would collapse the list.
+let linksExpanded = false;
 let linksFilter = { search: '', status: '' };
 
 /// Three-step primer shown in place of an empty list.
@@ -229,15 +232,15 @@ function teachingEmptyState(title, steps) {
   return box;
 }
 
-// Live "Receiving now" line on a request card, from the status poll.
-function applyReceiving(card, transfers) {
+// Live "Receiving now" line on a request card, from the status poll. `now`
+// is the server's clock, the same one that stamped started_at.
+function applyReceiving(card, transfers, now) {
   const line = card.querySelector('.receiving-now');
   if (!line) return;
   if (!transfers.length) {
     line.hidden = true;
     return;
   }
-  const now = Date.now() / 1000;
   line.replaceChildren();
   for (const transfer of transfers) {
     const row = document.createElement('span');
@@ -258,7 +261,7 @@ function applyReceiving(card, transfers) {
 // tab is hidden. The links list re-renders only when the set of receiving
 // links changes, so a finished transfer's record appears without a click.
 let statusTimer = null;
-let receivingKey = '';
+let receivingKey = null;
 function startOfToday() {
   const day = new Date();
   day.setHours(0, 0, 0, 0);
@@ -270,7 +273,12 @@ async function refreshStatus() {
   let status;
   try {
     status = await api(`/api/admin/status?since=${startOfToday()}`);
-  } catch {
+  } catch (error) {
+    // The session expired under an open tab: the reload lands on sign-in.
+    if (/\(401\)/.test(error.message)) {
+      window.location.reload();
+      return;
+    }
     statusTimer = setTimeout(refreshStatus, 30_000);
     return;
   }
@@ -297,14 +305,16 @@ async function refreshStatus() {
     byLink.get(transfer.link_id).push(transfer);
   }
   for (const card of $('links').querySelectorAll('[data-link-id]')) {
-    applyReceiving(card, byLink.get(card.dataset.linkId) || []);
+    applyReceiving(card, byLink.get(card.dataset.linkId) || [], status.now);
   }
+  // A transfer starting or finishing changes what the list should show. The
+  // first poll only records the set; a list the operator has paged through
+  // or is loading is left alone.
   const key = [...byLink.keys()].sort().join(',');
-  if (key !== receivingKey) {
-    const changed = receivingKey !== '' || key !== '';
-    receivingKey = key;
-    if (changed) refreshLinksSafe();
+  if (receivingKey !== null && key !== receivingKey && !linksBusy && !linksExpanded) {
+    refreshLinksSafe({ fromPoll: true });
   }
+  receivingKey = key;
   statusTimer = setTimeout(refreshStatus, status.sessions_active ? 4_000 : 30_000);
 }
 
@@ -355,7 +365,7 @@ function renderLink(link) {
   receiving.hidden = true;
   card.dataset.linkId = link.id;
   card.append(receiving);
-  applyReceiving(card, link.receiving || []);
+  applyReceiving(card, link.receiving || [], Date.now() / 1000);
   const notify = document.createElement('label');
   notify.className = 'toggle muted';
   const notifyInput = document.createElement('input');
@@ -497,12 +507,19 @@ function renderLink(link) {
   return card;
 }
 
-async function refreshLinks({ append = false } = {}) {
-  if (!append) {
-    linksFilter = {
-      search: $('links-query').value.trim(),
-      status: $('links-status').value,
-    };
+async function refreshLinks({ append = false, fromPoll = false } = {}) {
+  if (append) {
+    linksExpanded = true;
+  } else {
+    // A poll-driven refresh keeps the submitted filter; unsubmitted text in
+    // the search box stays where it is.
+    if (!fromPoll) {
+      linksFilter = {
+        search: $('links-query').value.trim(),
+        status: $('links-status').value,
+      };
+    }
+    linksExpanded = false;
     linksCursor = null;
     $('links').replaceChildren();
     $('links-load-more').hidden = true;
@@ -547,11 +564,15 @@ async function refreshLinks({ append = false } = {}) {
 }
 
 async function refreshLinksSafe(options = {}) {
+  if (linksBusy) return;
+  linksBusy = true;
   try {
     await refreshLinks(options);
   } catch (error) {
     $('links-error').textContent = error.message;
     $('links-error').hidden = false;
+  } finally {
+    linksBusy = false;
   }
 }
 

@@ -1254,26 +1254,30 @@ impl Store {
         })
     }
 
-    /// Uploads completed at or after `since` (count, bytes), partial records
-    /// excluded; an empty tenant counts every tenant.
+    /// Uploads completed at or after `since` in one tenant namespace (count,
+    /// bytes), partial records excluded. Polled, so the statement is cached
+    /// and the tenant filter keeps links_tenant_created in play.
     pub fn uploads_since(&self, tenant: &str, since: u64) -> Result<(u64, u64), String> {
         self.with(|connection| {
-            connection.query_row(
-                "SELECT COUNT(*), COALESCE(SUM(json_extract(upload.value, '$.total_bytes')), 0)
+            connection
+                .prepare_cached(
+                    "SELECT COUNT(*), COALESCE(SUM(json_extract(upload.value, '$.total_bytes')), 0)
                  FROM links, json_each(links.uploads_json) AS upload
-                 WHERE (?1 = '' OR links.tenant = ?1)
+                 WHERE links.tenant = ?1
                    AND json_extract(upload.value, '$.completed_at') >= ?2
                    AND COALESCE(json_extract(upload.value, '$.partial'), 0) = 0",
-                rusqlite::params![tenant, i64::try_from(since).unwrap_or(i64::MAX)],
-                |row| {
-                    let count: i64 = row.get(0)?;
-                    let bytes: i64 = row.get(1)?;
-                    Ok((
-                        u64::try_from(count).unwrap_or(0),
-                        u64::try_from(bytes).unwrap_or(0),
-                    ))
-                },
-            )
+                )?
+                .query_row(
+                    rusqlite::params![tenant, i64::try_from(since).unwrap_or(i64::MAX)],
+                    |row| {
+                        let count: i64 = row.get(0)?;
+                        let bytes: i64 = row.get(1)?;
+                        Ok((
+                            u64::try_from(count).unwrap_or(0),
+                            u64::try_from(bytes).unwrap_or(0),
+                        ))
+                    },
+                )
         })
     }
 

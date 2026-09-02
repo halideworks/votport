@@ -2481,6 +2481,10 @@ async fn upload_session_survives_a_restart() {
         .unwrap();
     let files = [twenty_mib()];
     let file = &files[0];
+    let now_before_restart = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let (token, session) = open_session(&client, &server.base, "restart", &files).await;
     let base = server.base.clone();
     assert_eq!(begin(&client, &base, &session).await.0, 200);
@@ -2502,6 +2506,27 @@ async fn upload_session_survives_a_restart() {
         staging_files(&receive_dir).len(),
         2,
         "re-attached staging survives the boot sweep"
+    );
+    // The admin's live view spans the restart: the covered prefix counts as
+    // received and the start time is the original one.
+    let status: Value = client
+        .get(format!("{base}/api/admin/status?since=0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["sessions_active"], json!(1), "{status:?}");
+    assert_eq!(
+        status["receiving"][0]["received"],
+        json!(CHUNK),
+        "{status:?}"
+    );
+    assert!(
+        status["receiving"][0]["started_at"].as_u64().unwrap() <= status["now"].as_u64().unwrap()
+            && status["receiving"][0]["started_at"].as_u64().unwrap() >= now_before_restart,
+        "{status:?}"
     );
     // The retried in-flight range is accepted and flagged: the session was
     // re-attached and the sender must begin again.
