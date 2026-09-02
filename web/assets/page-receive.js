@@ -215,7 +215,8 @@ let linksCursor = null;
 let linksBusy = false;
 // Load more was used: a background refresh would collapse the list.
 let linksExpanded = false;
-let linksFilter = { search: '', status: '' };
+// A search result deep-links with the request's label as the list filter.
+let linksFilter = { search: new URLSearchParams(window.location.search).get('search') || '', status: '' };
 
 /// Three-step primer shown in place of an empty list.
 function teachingEmptyState(title, steps) {
@@ -641,6 +642,7 @@ $('links-load-more').addEventListener('click', async () => {
 });
 
 await requireSession();
+$('links-query').value = linksFilter.search;
 await refreshLinks();
 refreshStatus();
 document.addEventListener('visibilitychange', () => {

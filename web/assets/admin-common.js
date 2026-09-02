@@ -57,7 +57,14 @@ function mountSearch(session) {
   let latest = 0;
   // Closing also retires any request still in flight so it cannot reopen
   // the panel with stale rows.
-  const close = () => { latest += 1; results.hidden = true; results.replaceChildren(); };
+  const close = () => {
+    clearTimeout(timer);
+    latest += 1;
+    results.hidden = true;
+    results.replaceChildren();
+  };
+  // A row on the page already open is a fragment change, not a load.
+  window.addEventListener('hashchange', () => { close(); revealHash(); });
   const group = (title, rows, render) => {
     if (!rows.length) return;
     const heading = document.createElement('div');
@@ -98,13 +105,15 @@ function mountSearch(session) {
     if (ticket !== latest) return;
     results.replaceChildren();
     if (pages.includes('receive')) {
+      // The phrase rides along as the list filter so a card past the first
+      // page of fifty is still on the page that opens.
       group('Requests', hit.requests, (row) => ({
-        href: `/receive#link-${row.id}`,
+        href: `/receive?search=${encodeURIComponent(row.label)}#link-${row.id}`,
         primary: row.label,
         secondary: `${row.active ? 'open' : 'off'} · to /${row.dest || ''} · ${formatWhen(row.created_at)}`,
       }));
       group('Received files', hit.files, (row) => ({
-        href: `/receive#link-${row.link_id}`,
+        href: `/receive?search=${encodeURIComponent(row.link_label)}#link-${row.link_id}`,
         primary: row.path,
         secondary: `${formatBytes(row.bytes)} · ${row.link_label} · ${formatWhen(row.completed_at)}`,
       }));
