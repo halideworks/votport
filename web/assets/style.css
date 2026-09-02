@@ -1230,6 +1230,8 @@ details summary:focus-visible {
 /* Sign out sits on the brand row, so the nav row is only the nav. */
 .hero-brand #logout {
  margin-left: auto;
+ flex: none;
+ white-space: nowrap;
 }
 
 /* ---- system settings page ------------------------------------------------ */
@@ -1288,7 +1290,12 @@ details summary:focus-visible {
   overflow-x: auto;
   scrollbar-width: none;
   border-bottom: 1px solid var(--border);
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 2rem), transparent);
   mask-image: linear-gradient(to right, #000 calc(100% - 2rem), transparent);
+ }
+ /* A flex item shrink-wraps; the rule and the fade must span the bar. */
+ .nav {
+  flex: 1;
  }
  .nav::-webkit-scrollbar,
  .settings-nav::-webkit-scrollbar {
@@ -1298,10 +1305,11 @@ details summary:focus-visible {
  .settings-nav a {
   flex: none;
   padding: 0.6rem 0 0.55rem;
-  margin-bottom: -1px;
   border-left: 0;
   border-bottom: 2px solid transparent;
   white-space: nowrap;
+  /* The strip clips overflow, so the focus ring draws inside the link. */
+  outline-offset: -2px;
  }
  .nav a.active,
  .settings-nav a.active {
