@@ -716,6 +716,24 @@ button.danger:hover:not(:disabled) {
  overflow-wrap: anywhere;
 }
 
+/* Transfer log under an upload: time column, then the sentence. */
+.transfer-log {
+ margin: 0.5rem 0 0.25rem 0.9rem;
+ padding-left: 0.9rem;
+ border-left: 2px solid var(--border);
+ font-size: 0.74rem;
+ color: var(--text-soft);
+}
+.transfer-log > div {
+ display: flex;
+ gap: 0.8rem;
+ padding: 0.15rem 0;
+}
+.transfer-log > div > .mono {
+ flex: none;
+ font-size: 0.68rem;
+}
+
 .qr {
  margin-bottom: 1.1rem;
 }

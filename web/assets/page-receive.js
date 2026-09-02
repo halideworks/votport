@@ -42,8 +42,27 @@ async function issueReceivedGrant(link, upload, fileIndex, file) {
   showGrantResult(url, response.grant?.has_password);
 }
 
+function logSentence(event) {
+  const file = event.path ?? 'a file';
+  switch (event.kind) {
+    case 'opened': return 'Session opened, manifest verified';
+    case 'reattached': return `Re-attached after a restart, ${event.count ?? 0} file${event.count === 1 ? '' : 's'} already published`;
+    case 'published': return `${file} published with its receipt`
+      + (event.bytes !== undefined ? ` · ${formatBytes(event.bytes)}` : '')
+      + (event.secs ? ` in ${formatDuration(event.secs)}` : '');
+    case 'quiet': return `Sender was quiet for ${formatDuration(event.secs ?? 0)}`;
+    case 'finished': return `Finished${event.count ? ` · ${event.count} re-sent chunk${event.count === 1 ? '' : 's'}` : ''}`;
+    case 'cancelled': return 'Cancelled by the sender';
+    case 'interrupted': return 'Session went idle and expired';
+    case 'dropped': return 'Resume refused after a restart; published files kept';
+    case 'elided': return `${event.count} more events not kept`;
+    default: return event.kind;
+  }
+}
+
 function renderUpload(link, upload) {
   const item = document.createElement('li');
+  let logBox = null;
 
   const head = document.createElement('div');
   head.className = 'upload-head';
@@ -60,6 +79,30 @@ function renderUpload(link, upload) {
   transport.className = 'badge';
   transport.textContent = upload.transport === 'push' ? 'native push' : 'http';
   head.append(when, transport);
+  // The log, ship's-log style: one line per event, facts rendered as words.
+  if (upload.log?.length) {
+    const log = document.createElement('div');
+    log.className = 'transfer-log';
+    log.hidden = true;
+    head.append(
+      button('Log', 'tiny ghost', () => {
+        log.hidden = !log.hidden;
+        if (!log.hidden && !log.firstChild) {
+          for (const event of upload.log) {
+            const line = document.createElement('div');
+            const at = document.createElement('span');
+            at.className = 'mono muted';
+            at.textContent = new Date(event.at * 1000).toLocaleTimeString();
+            const text = document.createElement('span');
+            text.textContent = logSentence(event);
+            line.append(at, text);
+            log.append(line);
+          }
+        }
+      }),
+    );
+    logBox = log;
+  }
   if (upload.partial) {
     const partial = document.createElement('span');
     partial.className = 'badge off';
@@ -162,6 +205,7 @@ function renderUpload(link, upload) {
   root.className = 'mono muted file-id';
   root.textContent = `package ${upload.package_root}`;
   item.append(root);
+  if (logBox) item.append(logBox);
   return item;
 }
 

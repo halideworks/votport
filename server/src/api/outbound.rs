@@ -4626,6 +4626,7 @@ mod tests {
                 notify_on_upload: false,
                 uploads: vec![crate::store::UploadRecord {
                     partial: false,
+                    log: Vec::new(),
                     id: "upload".to_owned(),
                     started_at: 1,
                     completed_at: 2,

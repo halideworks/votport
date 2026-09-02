@@ -123,14 +123,15 @@ export function alertModal(message) {
 
 export { formatBytes } from '/assets/object-card.js';
 
-/// Action button whose async handler reports failures via the shared modal.
+/// Action button whose handler, sync or async, reports failures via the
+/// shared modal.
 export function button(text, classes, onClick) {
   const element = document.createElement('button');
   element.type = 'button';
   element.className = classes;
   element.textContent = text;
   element.addEventListener('click', () => {
-    onClick().catch?.((error) => alertModal(error.message));
+    Promise.resolve().then(onClick).catch((error) => alertModal(error.message));
   });
   return element;
 }
