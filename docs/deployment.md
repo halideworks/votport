@@ -25,6 +25,27 @@ Caddyfile.example           reverse-proxy template
 The container runs as uid 1000; all three mounted volumes must be writable by
 it.
 
+### Network filesystems
+
+`/received` and `/outbound` can be NFS mounts, which is how a facility lands
+uploads on its storage directly. VOT publishes a received file by fsyncing a
+staging file next to the destination, hard-linking it into place, checking
+the link by device and inode, and fsyncing the directory, and it refuses a
+parent that is a symlink, group- or world-writable, or owned by another uid.
+The outbound library publishes with the same hard link and refuses a
+symlinked root but has no owner or mode rule. So both volumes must be the
+real directory (not a symlink to it) on an export that supports `link(2)`,
+and `/received` must also map the container's uid 1000 to itself (no
+`all_squash` or `anonuid` onto a different id, and matching NFSv4 idmapping)
+and let the server hold the directory at 0755. votport probes both
+directories at boot with a staging file, a hard link, and a directory fsync,
+checks for `/received` that the file it created is owned by its own uid, and
+refuses to start with the failing step in the message instead of failing
+every upload later. SMB and CIFS mounts fail that probe on most servers (no
+hard links, synthesized ownership, unstable inodes) and are not supported as
+landing directories. A slow mount shows up as `/healthz` latency, since the
+health probe creates a file in both roots on every call.
+
 ## Quick start
 
 ```sh
