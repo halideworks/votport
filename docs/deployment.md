@@ -54,7 +54,9 @@ floating tag such as `latest` for a deployment.
 ## Admin pages and deliveries
 
 The admin UI has separate **Receive** and **Deliver** pages. Receive issues
-request links; each link can opt in to notification when a receive completes.
+request links; each link can opt in to notification when a receive completes
+or fails (a refused request, or a transfer that stopped after bytes arrived; a
+sender's cancel does not notify).
 Deliver issues links for one or more outbound files; each delivery link can opt
 in to notification on its first download and when the delivery completes.
 
@@ -438,6 +440,12 @@ class, in-flight handlers, and a time-to-response-headers histogram with 10ms
 through 5s and `+Inf` buckets; streamed body transfer time is excluded. Outbound
 library uploads also have a fixed-cardinality
 `votport_http_outbound_upload_duration_seconds` histogram with no route labels.
+Transfers are covered by `votport_upload_sessions_ended_total` with a fixed
+`outcome` label (`published`, `rejected`, `cancelled`, `interrupted`), the
+`votport_upload_bytes` and `votport_upload_duration_seconds` histograms over
+published uploads (1 MiB through 16 GiB, and 1s through 6h), the
+`votport_upload_bytes_in_flight` gauge, and `votport_disk_free_bytes` and
+`votport_disk_total_bytes` per `volume` (`receive`, `outbound`).
 Request metrics never include paths, tenants, addresses,
 methods, or tokens. Set `VOTPORT_METRICS_TOKEN` to require a bearer token, and
 scrape it over an internal interface only.

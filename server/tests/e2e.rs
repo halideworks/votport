@@ -3104,6 +3104,53 @@ async fn restart_drops_a_truncated_staging_session() {
     );
 }
 
+/// The end event of a re-attached session counts the bytes accepted before
+/// the restart, not only the bytes this boot saw.
+#[tokio::test(flavor = "multi_thread")]
+async fn resumed_session_end_counts_bytes_from_before_the_restart() {
+    let server = start_server().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let files = [twenty_mib()];
+    let (_token, session) = open_session(&client, &server.base, "resumed-end", &files).await;
+    let base = server.base.clone();
+    assert_eq!(begin(&client, &base, &session).await.0, 200);
+    assert_eq!(
+        post_chunk(&client, &base, &session, &files[0], 0).await.0,
+        200
+    );
+
+    let server = server.restart().await;
+    let base = server.base.clone();
+    let link_id = server.application.sessions.link_id(&session).unwrap();
+    let abort = client
+        .post(format!("{base}/api/session/{session}/abort"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(abort.status(), 200);
+
+    let mut ended_rx = server
+        .application
+        .session_ended_rx
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap();
+    let ended = ended_rx.recv().await.unwrap();
+    assert_eq!(ended.event.outcome, "cancelled");
+    assert_eq!(ended.event.received_bytes, CHUNK);
+    let link = server
+        .application
+        .store
+        .link_by_id(&link_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(link.events.last().unwrap().received_bytes, CHUNK);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_distinct_ranges_reassemble_byte_for_byte() {
     let server = start_server().await;

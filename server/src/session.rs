@@ -164,6 +164,20 @@ pub struct WorkerSetup {
     pub started_at: u64,
     /// A gap between sender commands at least this long is logged as quiet.
     pub quiet_after_secs: u64,
+    /// Where an ended session reports for the failure notification.
+    pub ended: mpsc::UnboundedSender<SessionEnded>,
+}
+
+/// A session that ended without publishing, as handed to the notifier.
+#[derive(Clone, Debug)]
+pub struct SessionEnded {
+    pub tenant: String,
+    pub link_id: String,
+    pub label: String,
+    /// The link's notify-on-upload switch, read in the same write that
+    /// recorded the event.
+    pub notify: bool,
+    pub event: crate::store::SessionEvent,
 }
 
 /// The transfer log grows one event per file; a huge package would otherwise
@@ -459,7 +473,7 @@ fn spawn_worker_from(
                         if matches!(phase, Phase::Done) {
                             record_event(
                                 &setup,
-                                received,
+                                already + received,
                                 last_seen,
                                 "rejected",
                                 error.message.clone(),
@@ -586,7 +600,7 @@ fn spawn_worker_from(
                     commit_partial(&setup, &phase, replays, rejected, &log);
                     record_event(
                         &setup,
-                        received,
+                        already + received,
                         last_seen,
                         "cancelled",
                         "cancelled by the sender".to_owned(),
@@ -629,7 +643,7 @@ fn spawn_worker_from(
             commit_partial(&setup, &phase, replays, rejected, &log);
             record_event(
                 &setup,
-                received,
+                already + received,
                 last_seen,
                 "interrupted",
                 last_error.unwrap_or_else(|| {
@@ -2358,15 +2372,26 @@ fn record_event(
             "expected_bytes": event.expected_bytes
         }),
     );
+    crate::app::TRANSFERS.ended(outcome);
+    let mut ended = SessionEnded {
+        tenant: setup.tenant.clone(),
+        link_id: setup.link_id.clone(),
+        label: String::new(),
+        notify: false,
+        event: event.clone(),
+    };
     let _ = setup
         .store
         .update_link(&setup.tenant, &setup.link_id, |link| {
+            ended.label = link.label.clone();
+            ended.notify = link.notify_on_upload;
             link.events.push(event);
             if link.events.len() > EVENTS_KEPT {
                 let excess = link.events.len() - EVENTS_KEPT;
                 link.events.drain(..excess);
             }
         });
+    let _ = setup.ended.send(ended);
 }
 
 /// Records a native-push ticket that ended before it opened a VOT session.
@@ -2986,8 +3011,19 @@ impl Sessions {
         })
     }
 
-    pub fn remove(&self, id: &str) {
-        self.inner.lock().expect("sessions poisoned").map.remove(id);
+    pub fn remove(&self, id: &str) -> Option<SessionHandle> {
+        self.inner.lock().expect("sessions poisoned").map.remove(id)
+    }
+
+    /// Bytes accepted so far by every live session, for the metrics gauge.
+    pub fn bytes_in_flight(&self) -> u64 {
+        self.inner
+            .lock()
+            .expect("sessions poisoned")
+            .map
+            .values()
+            .map(|handle| handle.activity.received.load(Ordering::Relaxed))
+            .sum()
     }
 
     pub fn total(&self) -> usize {
@@ -3441,6 +3477,7 @@ mod push_tests {
             session_id: [7; 16],
             started_at: 1,
             quiet_after_secs: 5,
+            ended: mpsc::unbounded_channel().0,
         }
     }
 
