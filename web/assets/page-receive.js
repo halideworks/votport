@@ -15,6 +15,7 @@ import {
   requireSession,
   revealHash,
   showGrantResult,
+  undoable,
 } from '/assets/admin-common.js';
 
 const $ = (id) => document.getElementById(id);
@@ -61,9 +62,37 @@ function logSentence(event) {
   }
 }
 
+// Actions inside an undo window, keyed by what they change. The renderer
+// reads these so any refresh (the status poll, another action) shows the
+// pending state; the server hears about it when the window closes.
+const pendingClears = new Set();
+const pendingLinks = new Map();
+// Cards whose transfer list is open, so a re-render does not collapse them.
+const openLinks = new Set();
+
+// Records a pending change, re-renders, and opens the undo window. Undo and
+// commit both drop the record and re-render, so the list always matches
+// either the server or the pending intent, never a detached node.
+async function deferred({ text, mark, unmark, commit }) {
+  mark();
+  await refreshLinksSafe();
+  try {
+    await undoable({
+      text,
+      restore: () => { unmark(); refreshLinksSafe(); },
+      commit,
+    });
+  } finally {
+    unmark();
+  }
+  await refreshLinksSafe();
+}
+
 function renderUpload(link, upload) {
   const item = document.createElement('li');
   let logBox = null;
+  // A hold being released is still a hold until the window closes.
+  const held = link.legal_hold || pendingLinks.get(link.id)?.legal_hold === false;
 
   const head = document.createElement('div');
   head.className = 'upload-head';
@@ -111,25 +140,24 @@ function renderUpload(link, upload) {
     partial.textContent = 'partial';
     head.append(partial);
   }
-  if (!link.legal_hold) {
+  if (!held) {
     head.append(
-      button('Clear record', 'tiny ghost', async () => {
-        if (
-          !(await confirmModal(
-            'Clear record',
-            'Remove this transfer from the history? Files on disk stay.',
-            'Clear',
-          ))
-        )
-          return;
-        await api(`/api/admin/links/${link.id}/uploads/${upload.id}`, { method: 'DELETE' });
-        await refreshLinks();
-        announce('links-action-status', 'Transfer record cleared.');
-      }),
+      // Files on disk stay, so this needs an undo window, not a modal.
+      button('Clear record', 'tiny ghost', () => deferred({
+        text: 'Transfer record cleared.',
+        mark: () => pendingClears.add(upload.id),
+        unmark: () => pendingClears.delete(upload.id),
+        commit: async () => {
+          await api(`/api/admin/links/${link.id}/uploads/${upload.id}`, {
+            method: 'DELETE',
+            keepalive: true,
+          });
+        },
+      })),
     );
   }
   const existingFiles = upload.files.filter((file) => file.exists);
-  if (!link.legal_hold && existingFiles.length) {
+  if (!held && existingFiles.length) {
     head.append(
       button('Delete stored files', 'tiny danger', async () => {
         if (
@@ -175,7 +203,7 @@ function renderUpload(link, upload) {
     if (file.exists && file.receipt) {
       extras.push(button('Send', 'tiny', () => issueReceivedGrant(link, upload, index, file)));
     }
-    if (file.exists && !link.legal_hold) {
+    if (file.exists && !held) {
       extras.push(
         button('Delete file', 'tiny danger', async () => {
           if (
@@ -332,6 +360,17 @@ function scheduleStatus(status) {
 }
 
 function renderLink(link) {
+  // A change inside its undo window shows as if the server had it.
+  const pending = pendingLinks.get(link.id);
+  if (pending) {
+    const expired = link.expires_at && Date.now() / 1000 >= link.expires_at;
+    link = { ...link, ...pending };
+    if (pending.active !== undefined) link.usable = pending.active && !expired;
+  }
+  // A record being cleared is gone from the count and total as well.
+  if (pendingClears.size) {
+    link = { ...link, uploads: link.uploads.filter((upload) => !pendingClears.has(upload.id)) };
+  }
   const card = document.createElement('div');
   card.className = 'card link-item';
   card.id = `link-${link.id}`;
@@ -428,30 +467,47 @@ function renderLink(link) {
         qr.append(image);
       }
     }),
-    button(link.active ? 'Deactivate' : 'Reactivate', 'tiny ghost', async () => {
-      await api(`/api/admin/links/${link.id}`, {
-        method: 'POST',
-        body: JSON.stringify({ active: !link.active }),
+    button(link.active ? 'Deactivate' : 'Reactivate', 'tiny ghost', (control) => {
+      if (pending) return;
+      control.disabled = true;
+      return deferred({
+        text: link.active ? 'Request deactivated.' : 'Request reactivated.',
+        mark: () => pendingLinks.set(link.id, { active: !link.active }),
+        unmark: () => pendingLinks.delete(link.id),
+        commit: async () => {
+          await api(`/api/admin/links/${link.id}`, {
+            method: 'POST',
+            body: JSON.stringify({ active: !link.active }),
+            keepalive: true,
+          });
+        },
       });
-      await refreshLinks();
-      announce('links-action-status', link.active ? 'Request deactivated.' : 'Request reactivated.');
     }),
-    button(link.legal_hold ? 'Release hold' : 'Legal hold', 'tiny ghost', async () => {
-      if (
-        link.legal_hold &&
-        !(await confirmModal(
-          'Release legal hold',
-          'Release this hold? Automatic retention may delete expired files.',
-          'Release hold',
-        ))
-      )
+    button(link.legal_hold ? 'Release hold' : 'Legal hold', 'tiny ghost', async (control) => {
+      if (pending) return;
+      if (!link.legal_hold) {
+        await api(`/api/admin/links/${link.id}`, {
+          method: 'POST',
+          body: JSON.stringify({ legal_hold: true }),
+        });
+        await refreshLinks();
+        announce('links-action-status', 'Legal hold set.');
         return;
-      await api(`/api/admin/links/${link.id}`, {
-        method: 'POST',
-        body: JSON.stringify({ legal_hold: !link.legal_hold }),
+      }
+      // Releasing lets retention run, so it waits for the undo window.
+      control.disabled = true;
+      await deferred({
+        text: 'Legal hold released.',
+        mark: () => pendingLinks.set(link.id, { legal_hold: false }),
+        unmark: () => pendingLinks.delete(link.id),
+        commit: async () => {
+          await api(`/api/admin/links/${link.id}`, {
+            method: 'POST',
+            body: JSON.stringify({ legal_hold: false }),
+            keepalive: true,
+          });
+        },
       });
-      await refreshLinks();
-      announce('links-action-status', link.legal_hold ? 'Legal hold released.' : 'Legal hold set.');
     }),
   );
   if (!link.legal_hold) {
@@ -471,10 +527,22 @@ function renderLink(link) {
       }),
     );
   }
+  // Inside an undo window only Copy stays live; disabled buttons leave the
+  // tab order as well as the pointer.
+  if (pending) {
+    for (const control of actions.querySelectorAll('button')) {
+      if (control !== copy) control.disabled = true;
+    }
+  }
   card.append(actions, qr);
 
   if (link.uploads.length) {
     const details = document.createElement('details');
+    details.open = openLinks.has(link.id);
+    details.addEventListener('toggle', () => {
+      if (details.open) openLinks.add(link.id);
+      else openLinks.delete(link.id);
+    });
     const summary = document.createElement('summary');
     const total = link.uploads.reduce((sum, up) => sum + up.total_bytes, 0);
     summary.textContent =
@@ -492,6 +560,11 @@ function renderLink(link) {
 
   if (link.events?.length) {
     const details = document.createElement('details');
+    details.open = openLinks.has(`${link.id}:events`);
+    details.addEventListener('toggle', () => {
+      if (details.open) openLinks.add(`${link.id}:events`);
+      else openLinks.delete(`${link.id}:events`);
+    });
     const summary = document.createElement('summary');
     summary.textContent = `${link.events.length} incomplete session${link.events.length === 1 ? '' : 's'}`;
     details.append(summary);

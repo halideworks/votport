@@ -3,6 +3,7 @@
 // Copying text with a Copied flash lives with the shared public helpers so
 // public pages need not import this admin module for it.
 import { copyToClipboard, formatBytes } from '/assets/object-card.js';
+import { createUndoQueue } from '/assets/undo.js';
 export { copyToClipboard };
 
 export async function api(path, options = {}) {
@@ -270,7 +271,9 @@ export function button(text, classes, onClick) {
   element.className = classes;
   element.textContent = text;
   element.addEventListener('click', () => {
-    Promise.resolve().then(onClick).catch((error) => alertModal(error.message));
+    Promise.resolve()
+      .then(() => onClick(element))
+      .catch((error) => alertModal(error.message));
   });
   return element;
 }
@@ -279,6 +282,69 @@ export function button(text, classes, onClick) {
 /// Sets a role=status line so screen readers hear the outcome of an action.
 export function announce(id, text) {
   document.getElementById(id).textContent = text;
+}
+
+// Undo toasts: the page changes at once, the server call waits six seconds
+// for an Undo, and a tab closed inside the window commits with keepalive.
+const undoQueue = createUndoQueue();
+window.addEventListener('pagehide', () => { undoQueue.flush(); });
+
+// Created up front so the live region exists before the first toast lands
+// in it; a region created and filled in one task is not announced.
+function toastStack() {
+  let stack = document.getElementById('toast-stack');
+  if (!stack) {
+    stack = document.createElement('div');
+    stack.id = 'toast-stack';
+    stack.className = 'toast-stack';
+    stack.setAttribute('role', 'status');
+    stack.setAttribute('aria-atomic', 'false');
+    document.body.append(stack);
+  }
+  return stack;
+}
+toastStack();
+
+/// Shows `text` with an Undo button. `commit` runs when the window closes
+/// (pass fetch options with keepalive so it survives unload); `restore`
+/// runs on Undo. Resolves with whether it committed, once settled.
+export function undoable({ text, commit, restore = () => {} }) {
+  const stack = toastStack();
+  const toast = document.createElement('div');
+  toast.className = 'toast';
+  const label = document.createElement('span');
+  label.textContent = text;
+  const undo = document.createElement('button');
+  undo.type = 'button';
+  undo.className = 'link';
+  undo.textContent = 'Undo';
+  toast.append(label, undo);
+  stack.append(toast);
+  return new Promise((resolve, reject) => {
+    let failure = null;
+    const handle = undoQueue.add({
+      commit: async () => {
+        try {
+          await commit();
+        } catch (error) {
+          failure = error;
+        }
+      },
+      restore,
+      onSettled: (committed) => {
+        toast.classList.add('leaving');
+        setTimeout(() => toast.remove(), 250);
+        if (failure) {
+          // The server refused: put the page back before reporting it.
+          restore();
+          reject(failure);
+        } else {
+          resolve(committed);
+        }
+      },
+    });
+    undo.addEventListener('click', () => handle.undo());
+  });
 }
 
 /// Fills the shared show-once outbound grant URL card on receive/deliver.
