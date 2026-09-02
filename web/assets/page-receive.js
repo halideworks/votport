@@ -314,10 +314,18 @@ async function refreshStatus() {
   // first poll only records the set; a list the operator has paged through
   // or is loading is left alone.
   const key = [...byLink.keys()].sort().join(',');
-  if (receivingKey !== null && key !== receivingKey && !linksBusy && !linksExpanded) {
-    refreshLinksSafe({ fromPoll: true });
+  if (receivingKey !== null && key !== receivingKey) {
+    // A refresh in flight defers the change to the next tick; a list the
+    // operator paged through is left as it is.
+    if (linksBusy) return scheduleStatus(status);
+    if (!linksExpanded) refreshLinksSafe({ fromPoll: true });
   }
   receivingKey = key;
+  scheduleStatus(status);
+}
+
+function scheduleStatus(status) {
+  clearTimeout(statusTimer);
   statusTimer = setTimeout(refreshStatus, status.sessions_active ? 4_000 : 30_000);
 }
 
@@ -576,6 +584,7 @@ async function refreshLinksInner({ append, fromPoll }) {
 }
 
 async function refreshLinksSafe(options = {}) {
+  if (linksBusy) return;
   try {
     await refreshLinks(options);
   } catch (error) {
