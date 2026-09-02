@@ -1615,17 +1615,25 @@ details summary:focus-visible {
 }
 
 /* Sign out sits on the brand row, so the nav row is only the nav. */
-.hero-brand #logout,
-.hero-brand #theme-toggle {
+.brand-actions {
+ display: flex;
+ gap: 0.4rem;
  flex: none;
+ margin-left: auto;
+}
+.brand-actions button {
  white-space: nowrap;
 }
-.hero-brand #theme-toggle {
- margin-left: auto;
-}
-/* Public pages have no toggle, so Sign out keeps the right edge on its own. */
-.hero-brand #logout:first-of-type {
- margin-left: auto;
+/* The narrowest phones cannot fit the wordmark and both pills on one line;
+   the pills drop to their own line, still at the right edge. */
+@media (max-width: 360px) {
+ .masthead .hero-brand {
+  flex-wrap: wrap;
+ }
+ .brand-actions {
+  flex-basis: 100%;
+  justify-content: flex-end;
+ }
 }
 
 /* ---- system settings page ------------------------------------------------ */
