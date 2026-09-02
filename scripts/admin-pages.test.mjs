@@ -25,7 +25,7 @@ test('receive and deliver pages keep transfer concerns separate', () => {
   assert.match(deliver, /page-deliver\.js/);
   assert.match(deliver, /deliver-notify-on-download[^>]+name="notify_on_download"[^>]+type="checkbox"/);
   assert.doesNotMatch(deliver, /deliver-notify-on-download[^>]+checked/);
-  assert.match(receive, /Notify when an upload completes/);
+  assert.match(receive, /Notify when an upload completes or fails/);
   assert.match(deliver, /Notify on first download and delivery completion/);
   assert.doesNotMatch(deliver, /create-notify-on-upload|links-filter/);
   assert.match(commonScript, /\['receive', '\/receive', 'Receive'\]/);

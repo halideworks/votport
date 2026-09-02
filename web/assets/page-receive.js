@@ -452,7 +452,7 @@ function renderLink(link) {
       notifyInput.disabled = false;
     }
   });
-  notify.append(notifyInput, document.createTextNode(' Notify when an upload completes'));
+  notify.append(notifyInput, document.createTextNode(' Notify when an upload completes or fails'));
   card.append(notify);
   if (link.legal_hold) {
     const holdNote = document.createElement('p');

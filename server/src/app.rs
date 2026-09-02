@@ -105,7 +105,7 @@ pub struct App {
     pub(crate) push_metrics: PushMetrics,
     pub(crate) request_metrics: RequestMetrics,
     /// Every session worker reports here when it ends without publishing.
-    pub session_ended: tokio::sync::mpsc::UnboundedSender<session::SessionEnded>,
+    pub(crate) session_ended: tokio::sync::mpsc::UnboundedSender<session::SessionEnded>,
     /// Taken once by [`upload_ended_notifier`].
     pub session_ended_rx:
         Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<session::SessionEnded>>>,

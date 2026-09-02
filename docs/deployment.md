@@ -54,7 +54,9 @@ floating tag such as `latest` for a deployment.
 ## Admin pages and deliveries
 
 The admin UI has separate **Receive** and **Deliver** pages. Receive issues
-request links; each link can opt in to notification when a receive completes.
+request links; each link can opt in to notification when a receive completes
+or fails (a refused request, or a transfer that stopped after bytes arrived; a
+sender's cancel does not notify).
 Deliver issues links for one or more outbound files; each delivery link can opt
 in to notification on its first download and when the delivery completes.
 

@@ -270,7 +270,7 @@ hashed, verified range by range, independent of every proxy in between.
 1. Open the site, sign in (password and, if configured, SSO).
 2. **Receive:** issue a request (label, optional destination, password, expiry,
    size cap). Enable its optional notification policy to be notified when a
-   receive completes. Copy the URL or show a QR code.
+   receive completes or fails. Copy the URL or show a QR code.
 3. When files arrive, **Receive** lists uploads as object cards: stored path,
    size, and a click-to-copy identity line (`suite:64-hex root`) per file,
    plus whether the file is still on disk and whether its receipt sidecar
