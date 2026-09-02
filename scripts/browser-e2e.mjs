@@ -120,9 +120,16 @@ console.log(
   "uploaded:",
   (await page.textContent("#done-list")).trim().replace(/\s+/g, " "),
 );
-const ids = await page.$$eval("#done-list .file-id", (els) =>
-  els.map((el) => el.textContent),
+// Done cards come back in manifest order (folded path key), not selection
+// order, so look the small file's identity up by name.
+const cards = await page.$$eval("#done-list li", (els) =>
+  els.map((el) => ({
+    name: el.querySelector("span")?.textContent ?? "",
+    id: el.querySelector(".file-id").textContent,
+  })),
 );
+const ids = cards.map((card) => card.id);
+const pdfId = cards.find((card) => card.name.includes("Résumé Draft.pdf"))?.id;
 if (
   ids.length !== 2 ||
   ids.some((id) => !/^[a-z0-9]+:[0-9a-f]{64}$/.test(id))
@@ -166,10 +173,10 @@ const verdict = await check.json();
 if (!check.ok || !verdict.ok) {
   throw new Error(`verify failed: ${check.status} ${JSON.stringify(verdict)}`);
 }
-if (`${verdict.suite}:${verdict.root}` !== ids[0]) {
-  throw new Error(`verify root mismatch: ${JSON.stringify(verdict)}`);
+if (!pdfId || `${verdict.suite}:${verdict.root}` !== pdfId) {
+  throw new Error(`verify root mismatch: ${JSON.stringify({ verdict, cards })}`);
 }
-console.log("verified:", ids[0]);
+console.log("verified:", pdfId);
 
 // The /verify page itself: slot UI, sidecar-only, full match, mismatch.
 const stored = path.join(receiveDir, dest);

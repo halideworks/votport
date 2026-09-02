@@ -4,7 +4,7 @@
 //! link could otherwise churn sessions to the global cap and evict the
 //! sessions of legitimate senders. This caps session *creation* per client
 //! IP; a session that finishes hands its budget back, so a sender shipping
-//! one file per session is limited only by abandoned sessions.
+//! drop after drop is limited only by abandoned sessions.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
