@@ -204,3 +204,13 @@ test('the audit log can be read oldest first, the theme switch is a quiet link, 
   assert.match(commonScript, /\^\(link\|grant\)-/);
   assert.match(system, /Reset to default/);
 });
+
+test('admin pages preload their module graph and fetch data alongside the session check', () => {
+  for (const [name, html] of [['receive', receive], ['deliver', deliver], ['tenants', tenants], ['audit', audit], ['system', system]]) {
+    const preloads = (html.match(/rel="modulepreload"/g) || []).length;
+    assert.ok(preloads >= 4, `${name} preloads ${preloads} modules`);
+    assert.match(html, /modulepreload" href="\/assets\/admin-common\.js"/, `${name} preloads admin-common`);
+  }
+  assert.match(receiveScript, /Promise\.all\(\[sessionReady, refreshLinksSafe\(\)\]\)/);
+  assert.match(deliverScript, /Promise\.all\(\[requireSession\(\), refreshGrants\(\)/);
+});

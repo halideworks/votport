@@ -911,7 +911,7 @@ function renderStatus(status) {
   $('stat-disk').textContent = outbound.disk ? formatBytes(outbound.disk.free_bytes) : '–';
 }
 
-await requireSession();
-await Promise.all([refreshGrants(), refreshLibrary(), refreshAutomationTokens()]);
+// The session check and every list go out together; each is one round trip.
 startStatusPoll({ render: renderStatus, active: (status) => status.outbound.active > 0 });
+await Promise.all([requireSession(), refreshGrants(), refreshLibrary(), refreshAutomationTokens()]);
 await revealGrant();

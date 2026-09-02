@@ -695,12 +695,14 @@ const observer = new IntersectionObserver(
 );
 for (const section of document.querySelectorAll('.settings-group[id]')) observer.observe(section);
 
+// Settings load alongside the session check, one round trip for both.
+const settingsReady = api('/api/admin/settings');
 const session = await requireSession();
 if (!session.pages.includes('system')) {
   window.location.replace('/receive');
 }
 try {
-  fillSettings(await api('/api/admin/settings'));
+  fillSettings(await settingsReady);
   setNotifyActions(true);
   setSmtpActions(true);
 } catch (error) {
