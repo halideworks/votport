@@ -134,6 +134,8 @@ the row so env applies again. Details: [`docs/deployment.md`](docs/deployment.md
 | `VOTPORT_BIND` | `0.0.0.0:8080` | Listen address inside the container. |
 | `VOTPORT_PUSH_BIND` | off | UDP address for native VOT pushes. Setting it enables the listener; leave unset to keep native push disabled. |
 | `VOTPORT_PUSH_ADVERTISE` | derived | `host:port` that native senders dial. Defaults to the host in `VOTPORT_PUBLIC_URL` and the push bind port. Set it when the public UDP address differs. |
+| `VOTPORT_SERVE_BIND` | unset | UDP address for serving Deliver grants to VOT clients over QUIC; off when unset. Same certificate and issuer key as push. |
+| `VOTPORT_SERVE_ADVERTISE` | derived | `host:port` that VOT fetch clients dial, on the same rules as `VOTPORT_PUSH_ADVERTISE`. |
 | `VOTPORT_PUSH_CERT` / `VOTPORT_PUSH_KEY` | generated | PEM certificate and private key for native push. Set both together to use those paths in place, or leave both unset for a persistent self-signed pair under `VOTPORT_DATA_DIR`. |
 | `VOTPORT_DATA_DIR` | `/data` | State: `votport.db` (links, upload records; legacy `state.json` is imported once) and the cookie secret. |
 | `VOTPORT_RECEIVE_DIR` | `/received` | Root folder received files are published into. |
@@ -327,7 +329,7 @@ publishes each file the moment its coverage is complete.
 
 That serial verify is what leaves headroom on a fast NIC. Raising the range
 size or verifying in parallel needs VOT changes on the server verify path;
-the VOT pin at `f12042a` does not include them. Do not raise `CHUNK_BYTES`
+the VOT pin at `d3c18a4` does not include them. Do not raise `CHUNK_BYTES`
 in votport ahead of that work.
 
 Measure on this box:
@@ -426,7 +428,7 @@ does not publish partial files.
 
 ## Roadmap
 
-VOT is pinned at `f12042adf0204a43073bd72f64c4547dfdb49bbe` (includes upstream PR #391, plus ADR-0046 parallel range acceptance and ADR-0047 receiver re-attach).
+VOT is pinned at `d3c18a46ba5c9108091c9639151c40cd34d95fd3` (includes upstream PR #391, plus ADR-0046 parallel range acceptance and ADR-0047 receiver re-attach).
 That pin adds the holder-dialed push engine, and votport's native push receive
 path is shipped but disabled unless `VOTPORT_PUSH_BIND` is set. Browser uploads
 still travel over HTTP through the reverse proxy. Native push does not change

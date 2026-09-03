@@ -124,6 +124,31 @@ directory, or back up and rotate configured external files separately. The
 Rotating the certificate changes the identity and requires senders to pin the
 new digest.
 
+### Deliver over VOT QUIC
+
+Set `VOTPORT_SERVE_BIND` (and `VOTPORT_SERVE_ADVERTISE`, on the same rules as
+the push pair) to serve Deliver grants to VOT clients over QUIC. The serve
+listener is a second UDP port that presents the same certificate and signs
+capabilities with the same `push-issuer.key`, so one digest pins both
+directions; map and allow the port exactly as for push. A recipient page for
+a grant then shows a "Fetch with the VOT client" block, `GET /api/s/{token}`
+carries a `fetch` object (address, certificate digest, mint URL), and
+`POST /api/s/{token}/fetch` with the recipient's ed25519 public key mints a
+capability for the grant's package good for an hour or until the grant
+expires. Each minted capability reserves one delivery against
+`max_downloads` until it is delivered or expires, so the cap bounds copies
+rather than counting them after the fact; a fetch session is refused when
+the grant is revoked, expired, or exhausted, and a completed fetch counts
+as one delivery however many rails carried it. A fetch holds one download
+slot for all its rails, under the same per-grant and global caps as HTTP
+downloads, and the VOT listener itself answers at most eight sessions at
+once, so one eight-rail fetch fills it and a second waits. The first mint
+for a grant builds its VOT package under `data/outbound.manifests/<grant>/`
+and reads every byte of its files once to prepare the server, so the first
+mint of a large grant takes about 1.4 seconds per gigabyte; later sessions
+cost nothing extra, and a restart rebuilds the servers for every live
+capability before it accepts.
+
 The sender presents the link password only to the HTTPS preflight,
 `POST /api/r/{token}/push`, which admits the exact package root and length and
 returns a capability, advertised address, certificate digest, and expiry. The
@@ -495,7 +520,7 @@ Measured single-stream upload rose about a quarter (256 MiB baseline,
 still verifies serially and is the next candidate.
 
 Do not raise `CHUNK_BYTES` in votport until VOT changes its server verify
-path to support larger ranges; the `f12042a` pin does not. Any VOT re-pin
+path to support larger ranges; the `d3c18a4` pin does not. Any VOT re-pin
 moves the VOT dependencies and Dockerfile `ARG` together, then relocks
 Cargo.lock. Measure with:
 

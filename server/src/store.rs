@@ -106,6 +106,16 @@ pub struct LogEvent {
     pub count: Option<u64>,
 }
 
+/// A fetch capability minted for a grant. See the manifests schema.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FetchTicket {
+    pub token_id: String,
+    pub grant_id: String,
+    pub manifest_root: String,
+    pub expires_at: u64,
+    pub delivered_at: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct OutboundGrant {
     pub id: String,
@@ -396,7 +406,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 20;
+pub(crate) const SCHEMA_VERSION: u64 = 21;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -450,6 +460,27 @@ UPDATE files SET stored_as = COALESCE((
     SELECT json_extract(links.uploads_json,
         '$[' || files.upload_index || '].files[' || files.file_index || '].stored_as')
     FROM links WHERE links.id = files.link_id), '');
+";
+
+/// A grant's VOT package root, and the capabilities minted for it. A root
+/// is a function of the files, so two grants over one file set share it;
+/// the ticket, keyed by the capability's token id, is what names a grant
+/// at admission. `delivered_at` closes a ticket's reservation against
+/// `max_downloads`.
+const OUTBOUND_GRANT_MANIFESTS_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS outbound_grant_manifests (
+        grant_id TEXT PRIMARY KEY,
+        manifest_root TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS outbound_fetch_tickets (
+        token_id TEXT PRIMARY KEY,
+        grant_id TEXT NOT NULL,
+        manifest_root TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        delivered_at INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS outbound_fetch_tickets_grant ON outbound_fetch_tickets(grant_id, expires_at);
 ";
 
 // Tokens issued before v20 carry no folder scope; the column is nullable.
@@ -1053,6 +1084,14 @@ impl Store {
                     .execute_batch(AUTOMATION_TOKEN_DIRECTORY_SCHEMA)
                     .map_err(|error| format!("schema: {error}"))?;
             }
+        }
+        if stored < 21 {
+            // A grant's manifest root, recorded when its package is first
+            // built for a VOT fetch. Grants from before have no row and get
+            // one at their first mint; nothing to backfill.
+            transaction
+                .execute_batch(OUTBOUND_GRANT_MANIFESTS_SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
         }
         transaction
             .execute(
@@ -2663,6 +2702,163 @@ impl Store {
         })
     }
 
+    /// The manifest root recorded for a grant's VOT package, if one was built.
+    pub fn outbound_grant_manifest_root(&self, grant_id: &str) -> Result<Option<String>, String> {
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT manifest_root FROM outbound_grant_manifests WHERE grant_id = ?1",
+                    [grant_id],
+                    |row| row.get(0),
+                )
+                .optional()
+        })
+    }
+
+    pub fn put_outbound_grant_manifest(
+        &self,
+        grant_id: &str,
+        manifest_root: &str,
+        now: u64,
+    ) -> Result<(), String> {
+        self.with(|connection| {
+            connection
+                .execute(
+                    "INSERT INTO outbound_grant_manifests (grant_id, manifest_root, created_at)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(grant_id) DO UPDATE SET manifest_root = excluded.manifest_root,
+                                                         created_at = excluded.created_at",
+                    rusqlite::params![grant_id, manifest_root, now as i64],
+                )
+                .map(|_| ())
+        })
+    }
+
+    /// One grant by id, for fetch admission through its ticket.
+    pub fn outbound_grant_by_id(&self, id: &str) -> Result<Option<OutboundGrant>, String> {
+        self.with(|connection| {
+            connection
+                .prepare_cached(
+                    "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
+                            name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
+                            expires_at, revoked_at, downloads, max_downloads, notify_on_download, first_download_at,
+                            last_download_at,
+                            files_json
+                     FROM outbound_grants WHERE id = ?1",
+                )?
+                .query_row([id], map_outbound_grant)
+                .optional()
+                .and_then(|grant| {
+                    grant
+                        .map(|mut grant| {
+                            overlay_outbound_file_counters(connection, &mut grant)?;
+                            Ok(grant)
+                        })
+                        .transpose()
+                })
+        })
+    }
+
+    /// Records a minted fetch capability against its grant, only if the
+    /// deliveries recorded plus the tickets still live and undelivered leave
+    /// room under `max_downloads`. One statement, so two mints racing for
+    /// the last delivery cannot both reserve it. Returns whether it did.
+    pub fn put_fetch_ticket(
+        &self,
+        ticket: &FetchTicket,
+        downloads: u64,
+        max_downloads: Option<u64>,
+        now: u64,
+    ) -> Result<bool, String> {
+        self.with(|connection| {
+            connection
+                .execute(
+                    "INSERT INTO outbound_fetch_tickets (token_id, grant_id, manifest_root, expires_at, delivered_at)
+                     SELECT ?1, ?2, ?3, ?4, NULL
+                     WHERE ?6 IS NULL
+                        OR ?5 + (SELECT COUNT(*) FROM outbound_fetch_tickets
+                                 WHERE grant_id = ?2 AND expires_at > ?7 AND delivered_at IS NULL) < ?6",
+                    rusqlite::params![
+                        ticket.token_id,
+                        ticket.grant_id,
+                        ticket.manifest_root,
+                        ticket.expires_at as i64,
+                        downloads as i64,
+                        max_downloads.map(|max| max as i64),
+                        now as i64
+                    ],
+                )
+                .map(|changed| changed == 1)
+        })
+    }
+
+    pub fn fetch_ticket(&self, token_id: &str) -> Result<Option<FetchTicket>, String> {
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT token_id, grant_id, manifest_root, expires_at, delivered_at
+                     FROM outbound_fetch_tickets WHERE token_id = ?1",
+                    [token_id],
+                    map_fetch_ticket,
+                )
+                .optional()
+        })
+    }
+
+    /// Tickets not yet expired, delivered or not: a capability is good for
+    /// its whole window, so a restart warms servers for these and the
+    /// registry keeps their state.
+    pub fn unexpired_fetch_tickets(&self, now: u64) -> Result<Vec<FetchTicket>, String> {
+        self.with(|connection| {
+            connection
+                .prepare_cached(
+                    "SELECT token_id, grant_id, manifest_root, expires_at, delivered_at
+                     FROM outbound_fetch_tickets WHERE expires_at > ?1",
+                )?
+                .query_map([now as i64], map_fetch_ticket)?
+                .collect()
+        })
+    }
+
+    /// Manifest roots of grants still open: what the serve registry keeps a
+    /// server for.
+    pub fn servable_manifest_roots(&self, now: u64) -> Result<Vec<String>, String> {
+        self.with(|connection| {
+            connection
+                .prepare_cached(
+                    "SELECT m.manifest_root FROM outbound_grant_manifests m
+                     JOIN outbound_grants g ON g.id = m.grant_id
+                     WHERE g.revoked_at IS NULL AND g.expires_at > ?1
+                       AND (g.max_downloads IS NULL OR g.downloads < g.max_downloads)",
+                )?
+                .query_map([now as i64], |row| row.get(0))?
+                .collect()
+        })
+    }
+
+    pub fn mark_fetch_delivered(&self, token_id: &str, now: u64) -> Result<(), String> {
+        self.with(|connection| {
+            connection
+                .execute(
+                    "UPDATE outbound_fetch_tickets SET delivered_at = ?2
+                     WHERE token_id = ?1 AND delivered_at IS NULL",
+                    rusqlite::params![token_id, now as i64],
+                )
+                .map(|_| ())
+        })
+    }
+
+    /// Drops tickets expired for more than a day; the audit log keeps the
+    /// mint and the delivery.
+    pub fn prune_fetch_tickets(&self, before: u64) -> Result<usize, String> {
+        self.with(|connection| {
+            connection.execute(
+                "DELETE FROM outbound_fetch_tickets WHERE expires_at < ?1",
+                [before as i64],
+            )
+        })
+    }
+
     /// Looks up one outbound file without parsing the full manifest.
     pub fn outbound_grant_file_by_token_hash(
         &self,
@@ -3514,6 +3710,16 @@ fn row_to_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<Link> {
         notify_on_upload: row.get::<_, i64>("notify_on_upload")? != 0,
         uploads: parse_json(&uploads_json, 11)?,
         events: parse_json(&events_json, 12)?,
+    })
+}
+
+fn map_fetch_ticket(row: &rusqlite::Row<'_>) -> rusqlite::Result<FetchTicket> {
+    Ok(FetchTicket {
+        token_id: row.get(0)?,
+        grant_id: row.get(1)?,
+        manifest_root: row.get(2)?,
+        expires_at: row.get::<_, i64>(3)?.max(0) as u64,
+        delivered_at: row.get::<_, Option<i64>>(4)?.map(|at| at.max(0) as u64),
     })
 }
 
@@ -6935,6 +7141,8 @@ mod settings_tests {
             push_certificate: None,
             push_private_key: None,
             push_advertise: None,
+            serve_bind: None,
+            serve_advertise: None,
             data_dir: std::path::PathBuf::from("/nonexistent"),
             receive_dir: std::path::PathBuf::from("/nonexistent"),
             outbound_dir: std::path::PathBuf::from("/nonexistent"),

@@ -114,6 +114,10 @@ async fn start_server_in(
         push_certificate: None,
         push_private_key: None,
         push_advertise: None,
+        // The serve listener rides with push in tests: same certificate,
+        // same issuer, a second port.
+        serve_bind: enable_push.then(|| "127.0.0.1:0".parse().unwrap()),
+        serve_advertise: None,
         data_dir: data.path().to_path_buf(),
         receive_dir: received.path().to_path_buf(),
         outbound_dir: data.path().join("outbound"),
@@ -151,6 +155,7 @@ async fn start_server_in(
     let application = app::build(config).expect("app builds");
     if enable_push {
         app::start_push_receiver(Arc::clone(&application));
+        app::start_serve(Arc::clone(&application));
     }
     let router = app::router(Arc::clone(&application));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5322,4 +5327,306 @@ async fn search_finds_requests_files_downloads_and_audit_rows() {
     assert!(hit["files"].as_array().unwrap().is_empty(), "{hit:?}");
     let hit = search("poster").await;
     assert!(hit["downloads"].as_array().unwrap().is_empty(), "{hit:?}");
+}
+
+/// Deliver over VOT QUIC: a library grant is minted a fetch capability and
+/// fetched with the VOT client over the serve listener, and the fetch counts
+/// as one delivery however many rails carried it. The only test that sets
+/// the VOT fetch environment, which is process-wide.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_library_grant_is_fetched_over_vot_quic_and_counted_once() {
+    let server = start_server_custom(64 * 1024 * 1024, true, 600, 32).await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    client
+        .post(format!("{}/api/admin/login", server.base))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let mut big = vec![0u8; 700_000];
+    for (index, byte) in big.iter_mut().enumerate() {
+        *byte = (index * 7 % 251) as u8;
+    }
+    for (path, bytes) in [
+        ("grade/reel.bin", big.clone()),
+        ("grade/notes.txt", b"notes".to_vec()),
+    ] {
+        client
+            .post(format!(
+                "{}/api/admin/outbound-files?path={path}",
+                server.base
+            ))
+            .header("x-votport", "1")
+            .body(bytes)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+    let grant = client
+        .post(format!("{}/api/admin/outbound-grants", server.base))
+        .header("x-votport", "1")
+        .json(&json!({ "paths": ["grade/reel.bin", "grade/notes.txt"], "expires_days": 1, "max_downloads": 1 }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let token = grant["url"]
+        .as_str()
+        .and_then(|url| url.rsplit('/').next())
+        .unwrap()
+        .to_owned();
+
+    // The recipient sees where to dial once the listener is bound.
+    let recipient = reqwest::Client::new();
+    let metadata = recipient
+        .get(format!("{}/api/s/{token}", server.base))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let fetch = &metadata["fetch"];
+    assert_eq!(fetch["mint_url"], format!("/api/s/{token}/fetch"));
+    let address: SocketAddr = fetch["address"].as_str().unwrap().parse().unwrap();
+    let identity: [u8; 32] = hex::decode(fetch["certificate_digest"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+    let holder = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+    let refused = recipient
+        .post(format!("{}/api/s/{token}/fetch", server.base))
+        .json(&json!({ "holder_key": "not hex" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let minted = recipient
+        .post(format!("{}/api/s/{token}/fetch", server.base))
+        .json(&json!({ "holder_key": hex::encode(holder.verifying_key().to_bytes()) }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    // The one capability reserves the one allowed delivery: a second mint
+    // is refused before anything is fetched.
+    let reserved = recipient
+        .post(format!("{}/api/s/{token}/fetch", server.base))
+        .json(&json!({ "holder_key": hex::encode(holder.verifying_key().to_bytes()) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reserved.status(), reqwest::StatusCode::NOT_FOUND);
+    let root: [u8; 32] = hex::decode(minted["package_root"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert_eq!(minted["address"], fetch["address"]);
+    assert!(minted["expires_at"].as_u64().unwrap() > 0);
+    let capability = base64::prelude::BASE64_STANDARD
+        .decode(minted["capability"].as_str().unwrap())
+        .unwrap();
+
+    let scratch = tempfile::tempdir().unwrap();
+    let token_path = scratch.path().join("fetch-token.cbor");
+    std::fs::write(&token_path, &capability).unwrap();
+    let key_path = scratch.path().join("holder.key");
+    std::fs::write(
+        &key_path,
+        format!("ed25519-secret:{}", hex::encode(holder.to_bytes())),
+    )
+    .unwrap();
+    std::env::set_var("VOT_FETCH_CAPABILITY", &token_path);
+    std::env::set_var("VOT_FETCH_HOLDER_KEY", &key_path);
+    std::env::set_var("VOT_FETCH_SERVE_IDENTITY", hex::encode(identity));
+    let bundle = scratch.path().join("fetched");
+    let fetched = tokio::task::spawn_blocking(move || {
+        vot_cli::fetch_bundle(address, &bundle, Some(root)).map(|summary| (summary, bundle))
+    })
+    .await
+    .unwrap();
+    for name in [
+        "VOT_FETCH_CAPABILITY",
+        "VOT_FETCH_HOLDER_KEY",
+        "VOT_FETCH_SERVE_IDENTITY",
+    ] {
+        std::env::remove_var(name);
+    }
+    let (summary, bundle) = fetched.expect("the fetch completed");
+    assert_eq!(summary.root, root);
+    // Both objects landed, byte for byte, under their roots.
+    let objects: Vec<Vec<u8>> = std::fs::read_dir(bundle.join("objects"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|kind| kind == "obj"))
+        .map(|entry| std::fs::read(entry.path()).unwrap())
+        .collect();
+    assert_eq!(objects.len(), 2);
+    assert!(objects.contains(&big));
+    assert!(objects.iter().any(|bytes| bytes == b"notes"));
+
+    // One delivery, recorded off the session thread; the grant is then
+    // exhausted, so a second mint is refused.
+    let mut downloads = 0;
+    for _ in 0..100 {
+        let metadata = recipient
+            .get(format!("{}/api/s/{token}", server.base))
+            .send()
+            .await
+            .unwrap();
+        if metadata.status() == reqwest::StatusCode::NOT_FOUND {
+            downloads = 1;
+            break;
+        }
+        downloads = metadata.json::<Value>().await.unwrap()["downloads"]
+            .as_u64()
+            .unwrap();
+        if downloads >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(downloads, 1, "the fetch was not counted as one delivery");
+    let again = recipient
+        .post(format!("{}/api/s/{token}/fetch", server.base))
+        .json(&json!({ "holder_key": hex::encode(holder.verifying_key().to_bytes()) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // The counter moves after the delivery record and two more store
+    // writes on the same blocking task; poll it as the gauge is polled.
+    let mut delivered_metric = false;
+    for _ in 0..100 {
+        let metrics = recipient
+            .get(format!("{}/metrics", server.base))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        if metrics.contains("votport_serve_deliveries_total 1\n") {
+            assert!(metrics.contains("votport_serve_refused_total{reason=\"closed\"} 0\n"));
+            delivered_metric = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(delivered_metric, "the delivery never reached the counter");
+    // The crossing that counted the delivery may come from a session that
+    // is not the last to end; the gauge reaches zero shortly after.
+    let mut active_zero = false;
+    for _ in 0..100 {
+        let metrics = recipient
+            .get(format!("{}/metrics", server.base))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        if metrics.contains("votport_serve_sessions_active 0\n") {
+            active_zero = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(active_zero, "fetch sessions still counted as active");
+
+    // A second grant over the same files shares the package root and is
+    // still its own grant: its mint succeeds and its fetch is counted to it.
+    let twin = client
+        .post(format!("{}/api/admin/outbound-grants", server.base))
+        .header("x-votport", "1")
+        .json(&json!({ "paths": ["grade/reel.bin", "grade/notes.txt"], "expires_days": 1 }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let twin_token = twin["url"]
+        .as_str()
+        .and_then(|url| url.rsplit('/').next())
+        .unwrap()
+        .to_owned();
+    let twin_minted = recipient
+        .post(format!("{}/api/s/{twin_token}/fetch", server.base))
+        .json(&json!({ "holder_key": hex::encode(holder.verifying_key().to_bytes()) }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(
+        twin_minted["package_root"], minted["package_root"],
+        "same files, same root"
+    );
+    std::fs::write(
+        &token_path,
+        base64::prelude::BASE64_STANDARD
+            .decode(twin_minted["capability"].as_str().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    std::env::set_var("VOT_FETCH_CAPABILITY", &token_path);
+    std::env::set_var("VOT_FETCH_HOLDER_KEY", &key_path);
+    std::env::set_var("VOT_FETCH_SERVE_IDENTITY", hex::encode(identity));
+    let twin_bundle = scratch.path().join("twin-fetched");
+    let twin_fetched = tokio::task::spawn_blocking(move || {
+        vot_cli::fetch_bundle(address, &twin_bundle, Some(root))
+    })
+    .await
+    .unwrap();
+    for name in [
+        "VOT_FETCH_CAPABILITY",
+        "VOT_FETCH_HOLDER_KEY",
+        "VOT_FETCH_SERVE_IDENTITY",
+    ] {
+        std::env::remove_var(name);
+    }
+    assert_eq!(twin_fetched.expect("the twin fetch completed").root, root);
+    let mut twin_downloads = 0;
+    for _ in 0..100 {
+        let metadata = recipient
+            .get(format!("{}/api/s/{twin_token}", server.base))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        twin_downloads = metadata["downloads"].as_u64().unwrap();
+        if twin_downloads >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        twin_downloads, 1,
+        "the twin's fetch was not counted to the twin"
+    );
 }

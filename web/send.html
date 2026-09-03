@@ -64,6 +64,16 @@
         </span>
         <a href="#manifest" class="link-action">Pick files individually</a>
       </div>
+      <details id="vot-fetch" hidden>
+        <summary>Fetch with the VOT client</summary>
+        <p class="muted">Faster on long or lossy links, verified as it lands. Paste the public half of an ed25519 key pair you hold to mint a one-hour token bound to it, then run the commands. The fetch writes a verified bundle directory (objects by root); unpacking it under file names takes a package receipt, which a later release will issue with the token.</p>
+        <form id="vot-fetch-form" class="inline-form">
+          <label>Your ed25519 public key (hex) <input id="vot-fetch-key" name="holder_key" class="mono" autocomplete="off" spellcheck="false" required pattern="[0-9a-fA-F]{64}"></label>
+          <button type="submit" class="ghost">Mint token</button>
+        </form>
+        <p id="vot-fetch-error" class="error" role="alert" hidden></p>
+        <pre id="vot-fetch-command" class="mono" hidden></pre>
+      </details>
     </div>
 
     <div class="card ok" id="manifest">
