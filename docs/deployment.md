@@ -520,13 +520,32 @@ Measured single-stream upload rose about a quarter (256 MiB baseline,
 still verifies serially and is the next candidate.
 
 Do not raise `CHUNK_BYTES` in votport until VOT changes its server verify
-path to support larger ranges; the `d3c18a4` pin does not. Any VOT re-pin
+path to support larger ranges; the `8789fc97` pin does not. Any VOT re-pin
 moves the VOT dependencies and Dockerfile `ARG` together, then relocks
 Cargo.lock. Measure with:
 
 ```sh
 cargo test --test e2e -- --ignored --nocapture throughput_baseline
 ```
+
+### UDP socket buffers (QUIC push and deliver)
+
+The VOT QUIC paths (native-push receive, deliver-over-QUIC serve) ask the
+kernel for a 16 MiB receive and 8 MiB send socket buffer. Linux caps those at
+`net.core.rmem_max` / `net.core.wmem_max`, which default to about 208 KiB; VOT
+logs a warning and runs with the smaller buffer, which drops packets at
+multi-Gbps rates. These limits are host-global, not per-container, so raise
+them on the Docker host rather than in the container:
+
+```sh
+# /etc/sysctl.d/99-votport-quic.conf
+net.core.rmem_max = 16777216
+net.core.wmem_max = 8388608
+# apply: sudo sysctl --system
+```
+
+Only needed when `VOTPORT_PUSH_BIND` or `VOTPORT_SERVE_BIND` is set; the HTTP
+upload and download paths do not use these sockets.
 
 `VOTPORT_MAX_TOTAL_SESSIONS` (default 32) caps concurrent upload sessions
 process-wide; the 33rd sender gets a 429 until one finishes. Worst-case
