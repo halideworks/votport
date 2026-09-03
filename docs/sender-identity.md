@@ -652,7 +652,7 @@ iOS pass is a manual gate on PR 3 (lock screen mid-send). Chromium `scripts/brow
 - `server/src/store.rs` (`FileRecord`, `UploadRecord`)
 - `server/tests/e2e.rs` `receipts_are_written_and_files_are_manageable`
 - `scripts/browser-e2e.mjs`
-- vot-receipt at pin `d3c18a46ba5c9108091c9639151c40cd34d95fd3`: `decode_authenticated`, `verify_ed25519`, 65_536 byte cap
+- vot-receipt at pin `8789fc974e6ecc1237dcaed68c4e4bd9b6c77c34`: `decode_authenticated`, `verify_ed25519`, 65_536 byte cap
 - `docs/enterprise-ops.md`, `docs/deployment.md` (8 MiB ceiling), `README.md` Receipts section
 - `HANDOFF.md` load-bearing ids note: grep before renaming
 

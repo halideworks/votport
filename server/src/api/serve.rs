@@ -151,12 +151,11 @@ impl Drop for SessionHold {
     }
 }
 
-/// The servers assembled this process by package root, the bytes each
-/// capability's sessions have taken, and the slots fetches hold.
+/// The servers assembled this process by package root and the slots fetches
+/// hold.
 #[derive(Default)]
 pub(crate) struct ServeRegistry {
     servers: Mutex<HashMap<[u8; 32], Arc<vot_cli::BundleServer>>>,
-    served: Mutex<HashMap<[u8; 16], u64>>,
     slots: Mutex<HashMap<[u8; 16], FetchSlot>>,
 }
 
@@ -167,25 +166,6 @@ impl ServeRegistry {
             .expect("serve registry poisoned")
             .get(&root)
             .cloned()
-    }
-
-    /// Adds `bytes` to what `token` has taken and says whether that crossed
-    /// `length` just now. The count stays until the fetch's last session
-    /// ends, so a token counts one delivery however many rails carried it
-    /// and however far past the length their pages and proofs run.
-    fn credit(&self, token: [u8; 16], bytes: u64, length: u64) -> bool {
-        let mut served = self.served.lock().expect("serve registry poisoned");
-        let total = served.entry(token).or_insert(0);
-        let before = *total;
-        *total = total.saturating_add(bytes);
-        !delivery_reached(before, length) && delivery_reached(*total, length)
-    }
-
-    fn forget(&self, token: [u8; 16]) {
-        self.served
-            .lock()
-            .expect("serve registry poisoned")
-            .remove(&token);
     }
 
     /// Takes the fetch's slot on its first session, counts every later one.
@@ -202,17 +182,14 @@ impl ServeRegistry {
         Ok(())
     }
 
-    /// Releases one session of a fetch; the last one returns the slot and
-    /// closes the byte count, so a later fetch on the same token starts
-    /// fresh.
+    /// Releases one session of a fetch; the last one returns the slot, so a
+    /// later fetch on the same token starts fresh.
     fn release_slot(&self, token: [u8; 16]) {
         let mut slots = self.slots.lock().expect("serve registry poisoned");
         if let Some(slot) = slots.get_mut(&token) {
             slot.sessions = slot.sessions.saturating_sub(1);
             if slot.sessions == 0 {
                 slots.remove(&token);
-                drop(slots);
-                self.forget(token);
             }
         }
     }
@@ -227,34 +204,14 @@ impl ServeRegistry {
             .sum()
     }
 
-    /// Keeps servers for `roots` and byte counts for `tokens` or for a
-    /// fetch with a session still running: a long fetch outlives its
-    /// capability's window and must keep its count to the end. Slots are
-    /// released by their sessions, never here.
-    fn retain(&self, roots: &HashSet<[u8; 32]>, tokens: &HashSet<[u8; 16]>) {
+    /// Keeps servers for `roots`. Slots are released by their sessions, never
+    /// here.
+    fn retain(&self, roots: &HashSet<[u8; 32]>) {
         self.servers
             .lock()
             .expect("serve registry poisoned")
             .retain(|root, _| roots.contains(root));
-        let running: HashSet<[u8; 16]> = self
-            .slots
-            .lock()
-            .expect("serve registry poisoned")
-            .keys()
-            .copied()
-            .collect();
-        self.served
-            .lock()
-            .expect("serve registry poisoned")
-            .retain(|token, _| tokens.contains(token) || running.contains(token));
     }
-}
-
-/// A delivery is counted when a token's sessions have taken at least the
-/// package's bytes. Served bytes include pages and proofs, so this trips a
-/// little early, which errs toward counting a delivery that happened.
-pub(crate) fn delivery_reached(served: u64, length: u64) -> bool {
-    length > 0 && served >= length
 }
 
 /// Everything the serve listener retains for the process lifetime.
@@ -675,23 +632,19 @@ pub(crate) fn warm(app: &Arc<App>, serve: &ServeState) {
     }
 }
 
-/// Drops servers of grants no longer open, fetch state of expired tickets,
-/// and tickets long expired. Called from the session sweeper. Servers are
-/// kept by the grant's state rather than by tickets, so a server built at
-/// mint survives the moment before its ticket is written and a delivered
-/// token can fetch again inside its window.
+/// Drops servers of grants no longer open and tickets long expired. Called
+/// from the session sweeper. Servers are kept by the grant's state rather than
+/// by tickets, so a server built at mint survives the moment before its ticket
+/// is written and a delivered token can fetch again inside its window.
 pub(crate) fn prune(app: &App) {
     let Some(serve) = app.serve.as_ref() else {
         return;
     };
     let now = now_unix();
-    let (tickets, servable) = match (
-        app.store.unexpired_fetch_tickets(now),
-        app.store.servable_manifest_roots(now),
-    ) {
-        (Ok(tickets), Ok(servable)) => (tickets, servable),
-        (Err(error), _) | (_, Err(error)) => {
-            tracing::warn!(%error, "fetch tickets unavailable; registry kept");
+    let servable = match app.store.servable_manifest_roots(now) {
+        Ok(servable) => servable,
+        Err(error) => {
+            tracing::warn!(%error, "servable roots unavailable; registry kept");
             return;
         }
     };
@@ -699,11 +652,7 @@ pub(crate) fn prune(app: &App) {
         .iter()
         .filter_map(|root| decode_root(root))
         .collect();
-    let tokens: HashSet<[u8; 16]> = tickets
-        .iter()
-        .filter_map(|ticket| decode_token(&ticket.token_id))
-        .collect();
-    serve.registry.retain(&roots, &tokens);
+    serve.registry.retain(&roots);
     if let Err(error) = app
         .store
         .prune_fetch_tickets(now.saturating_sub(TICKET_RETENTION_SECS))
@@ -713,10 +662,6 @@ pub(crate) fn prune(app: &App) {
 }
 
 fn decode_root(hex: &str) -> Option<[u8; 32]> {
-    hex::decode(hex).ok()?.try_into().ok()
-}
-
-fn decode_token(hex: &str) -> Option<[u8; 16]> {
     hex::decode(hex).ok()?.try_into().ok()
 }
 
@@ -951,7 +896,6 @@ pub(crate) fn admit_fetch(
         };
         let app = Arc::clone(app);
         let runtime = runtime.clone();
-        let length = server.package().logical_length;
         let grant_id = grant.id.clone();
         let tenant = grant.tenant.clone();
         let token_hash = grant.token_hash.clone();
@@ -959,11 +903,10 @@ pub(crate) fn admit_fetch(
         let file_count = grant.files.len().max(1);
         Box::new(move |report: vot_cli::ServeReport| {
             // Runs on the session's own thread: bookkeeping only, the store
-            // write goes to the blocking pool. Credit before release: the
-            // last release forgets the count, and this session's bytes
-            // belong in it.
-            let serve = app.serve.as_ref().expect("serve state disappeared");
-            let delivered = serve.registry.credit(token, report.served_bytes, length);
+            // write goes to the blocking pool. A final-cursor report is the
+            // fetch's completion acknowledgement; the primary session carries
+            // it and the rails do not, so exactly one report records delivery.
+            let delivered = report.objects != 0 && report.cursor == Some(report.objects);
             drop(hold);
             app.serve_metrics
                 .bytes_total
@@ -1140,34 +1083,6 @@ mod tests {
     }
 
     #[test]
-    fn a_delivery_is_reached_at_the_package_length_and_never_for_an_empty_one() {
-        assert!(!delivery_reached(0, 10));
-        assert!(!delivery_reached(9, 10));
-        assert!(delivery_reached(10, 10));
-        assert!(delivery_reached(11, 10));
-        assert!(!delivery_reached(0, 0));
-        assert!(!delivery_reached(5, 0));
-    }
-
-    #[test]
-    fn a_token_counts_one_delivery_across_its_rails() {
-        let registry = ServeRegistry::default();
-        assert!(!registry.credit([1; 16], 4, 10));
-        assert!(!registry.credit([1; 16], 5, 10));
-        assert!(
-            registry.credit([1; 16], 1, 10),
-            "the third rail crossed the length"
-        );
-        // Pages and proofs run past the length; a later rail must not
-        // cross again, however many bytes it carried.
-        assert!(!registry.credit([1; 16], 30, 10));
-        assert!(!registry.credit([1; 16], 1, 10));
-        // Forgotten when the fetch ends: a new fetch on the token counts.
-        registry.forget([1; 16]);
-        assert!(registry.credit([1; 16], 10, 10));
-    }
-
-    #[test]
     fn a_grant_is_open_only_while_live_and_unexhausted() {
         let grant = |revoked: Option<u64>, expires_at: u64, downloads: u64, max: Option<u64>| {
             OutboundGrant {
@@ -1307,27 +1222,21 @@ mod tests {
     }
 
     #[test]
-    fn a_running_fetch_keeps_its_slot_and_count_past_its_ticket() {
+    fn a_running_fetch_keeps_its_slot_past_its_ticket() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
         let registry = Arc::new(ServeRegistry::default());
         registry.claim_slot(&app, [1; 16], "hash").unwrap();
         registry.claim_slot(&app, [1; 16], "hash").unwrap();
         assert_eq!(registry.active_sessions(), 2);
-        assert!(!registry.credit([1; 16], 60, 100));
-        // No ticket names the token, but a session still runs: kept.
-        registry.retain(&HashSet::new(), &HashSet::new());
+        // No ticket names the token, but a session still runs: the sweep
+        // evicts servers, never slots.
+        registry.retain(&HashSet::new());
         assert_eq!(registry.active_sessions(), 2);
-        assert!(
-            registry.credit([1; 16], 40, 100),
-            "the count survived the sweep and crossed"
-        );
-        // The observer credits, then releases; the last release forgets.
         registry.release_slot([1; 16]);
-        assert!(registry.served.lock().unwrap().contains_key(&[1; 16]));
+        assert_eq!(registry.active_sessions(), 1);
         registry.release_slot([1; 16]);
         assert_eq!(registry.active_sessions(), 0);
-        assert!(!registry.served.lock().unwrap().contains_key(&[1; 16]));
         assert!(
             app.outbound_active.lock().unwrap().is_empty(),
             "the download slot returned with the last session"
@@ -1342,16 +1251,5 @@ mod tests {
         });
         assert_eq!(registry.active_sessions(), 0);
         assert!(app.outbound_active.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn the_registry_keeps_only_what_live_tickets_need() {
-        let registry = ServeRegistry::default();
-        registry.credit([1; 16], 1, 10);
-        registry.credit([2; 16], 1, 10);
-        registry.retain(&HashSet::new(), &HashSet::from([[2; 16]]));
-        let served = registry.served.lock().unwrap();
-        assert!(!served.contains_key(&[1; 16]));
-        assert!(served.contains_key(&[2; 16]));
     }
 }

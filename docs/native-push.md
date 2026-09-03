@@ -1,7 +1,7 @@
 # Native push: VOT QUIC receive path
 
 Status: Native push and its operator surface are implemented, 2026-08-29. VOT ADR-0045 (push, the holder dials)
-landed upstream in PR #391 at `d3c18a46ba5c9108091c9639151c40cd34d95fd3`.
+landed upstream in PR #391 at `8789fc974e6ecc1237dcaed68c4e4bd9b6c77c34`.
 
 ## Overview
 
