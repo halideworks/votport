@@ -1,7 +1,7 @@
 # Deliver over QUIC, the replication agent, and the road to votdock
 
 Status: V1 and V2 landed upstream (VOT #401, #402), P1 and P2 in votport,
-2026-09-02; votport pins VOT at `d3c18a46ba5c9108091c9639151c40cd34d95fd3`.
+2026-09-02; votport pins VOT at `8789fc974e6ecc1237dcaed68c4e4bd9b6c77c34`.
 P3, the agent, and phase W remain.
 
 | Field | Value |
@@ -160,18 +160,17 @@ runs per session, which is what gives early revocation:
    reason and detail.
 5. Claim the fetch's download slot (one per capability, however many
    rails) and return the registry's `Arc<BundleServer>` with an observer
-   that credits the session's bytes to the token.
+   that records delivery when the session's final-cursor GOAWAY
+   acknowledges every object (ADR-0050).
 
 ### Serve registry
 
 `ServeRegistry` in `server/src/api/serve.rs`: root to `Arc<BundleServer>`,
 built at mint (and warmed at start for every live ticket, so a restart
-honours capabilities minted before it), plus the bytes each token's
-sessions have taken and the slot each fetch holds. `BundleServer::service`
-is `&self`, so one server answers every session for that root. The session
-sweeper keeps servers for grants still open, drops byte counts of expired
-tickets unless a session of that fetch is still running, and deletes tickets
-expired for more than a day. A slot is released by its sessions: the
+honours capabilities minted before it), plus the slot each fetch holds.
+`BundleServer::service` is `&self`, so one server answers every session for
+that root. The session sweeper keeps servers for grants still open and
+deletes tickets expired for more than a day. A slot is released by its sessions: the
 observer owns a hold that releases on drop, so an admission the seam
 discards before serving releases too.
 
@@ -227,13 +226,14 @@ command with the token filled in, next to the HTTP buttons, when
 `max_downloads` is a client-delivery control: it applies to outside-facing
 grants (`/s/{token}`), never to an agent fetching the tenant's own uploads.
 The HTTP path counts a download per request. Over QUIC a completed fetch
-sends no GOAWAY (the cursor is only sent on a cancel), and every rail is its
-own session, so the registry sums each capability's served bytes across its
-sessions and counts one delivery when the sum reaches the package's logical
-length, once per fetch (the count stays until the fetch's last session
-ends, so pages and proofs running past the length cannot count again);
-served bytes include pages and proofs, so this trips a little early, which
-errs toward counting a delivery that happened. `max_downloads` is enforced
+sends a final-cursor GOAWAY, the receiver's completion acknowledgement
+(ADR-0050), and the serve reports that cursor at session end. Every rail is
+its own session, but only the primary carries the final cursor, so the
+registry counts one delivery: the one session whose report cursor equals its
+object count. A cursor short of the object count, or none at all, records
+nothing. The native `vot fetch` and `vot pull` clients send this
+acknowledgement; the browser WebTransport client (phase W) must send it too
+for its downloads to count. `max_downloads` is enforced
 twice: a mint reserves a delivery in the same statement that records its
 ticket, refusing when deliveries plus live undelivered tickets leave no
 room, and admission refuses an exhausted grant. Minting is recorded as an

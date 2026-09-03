@@ -428,7 +428,7 @@ does not publish partial files.
 
 ## Roadmap
 
-VOT is pinned at `d3c18a46ba5c9108091c9639151c40cd34d95fd3` (includes upstream PR #391, plus ADR-0046 parallel range acceptance and ADR-0047 receiver re-attach).
+VOT is pinned at `8789fc974e6ecc1237dcaed68c4e4bd9b6c77c34` (includes upstream PR #391, plus ADR-0046 parallel range acceptance and ADR-0047 receiver re-attach).
 That pin adds the holder-dialed push engine, and votport's native push receive
 path is shipped but disabled unless `VOTPORT_PUSH_BIND` is set. Browser uploads
 still travel over HTTP through the reverse proxy. Native push does not change
