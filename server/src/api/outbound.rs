@@ -335,6 +335,20 @@ pub async fn upload_outbound_file(
     let identity = admin::require_operator(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
     let _operation = begin_outbound_operation(&app, &identity.tenant)?;
+    // A file under an active grant is being served; replacing it would make
+    // that grant's VOT package fail to assemble. Refuse both paths as delete
+    // does, before draining the body.
+    let relative = query.path.trim_matches('/').replace('\\', "/");
+    if app
+        .store
+        .has_active_library_grant(&identity.tenant, &relative, now_unix())
+        .map_err(super::store_unavailable)?
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "outbound file is referenced by an active grant",
+        ));
+    }
     if headers.contains_key(header::CONTENT_RANGE) || headers.contains_key(OUTBOUND_UPLOAD_ID) {
         return upload_outbound_chunk(Arc::clone(&app), identity, headers, query.path, body).await;
     }

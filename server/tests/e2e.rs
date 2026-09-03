@@ -5387,6 +5387,25 @@ async fn a_library_grant_is_fetched_over_vot_quic_and_counted_once() {
         .unwrap()
         .to_owned();
 
+    // A file under an active grant refuses re-upload: replacing it would
+    // break the grant's VOT package.
+    let blocked = client
+        .post(format!(
+            "{}/api/admin/outbound-files?path=grade/reel.bin",
+            server.base
+        ))
+        .header("x-votport", "1")
+        .body(vec![9u8; 1000])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), reqwest::StatusCode::CONFLICT);
+    let detail = blocked.json::<Value>().await.unwrap();
+    assert_eq!(
+        detail["error"], "outbound file is referenced by an active grant",
+        "the active-grant guard did not fire; got {detail}"
+    );
+
     // The recipient sees where to dial once the listener is bound.
     let recipient = reqwest::Client::new();
     let metadata = recipient

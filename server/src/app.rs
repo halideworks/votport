@@ -1055,9 +1055,23 @@ fn active_catalog_names(keys: Vec<(String, String, u64)>) -> HashSet<String> {
             };
             let bytes = hex::decode(root).ok()?;
             let root = <[u8; 32]>::try_from(bytes).ok().map(hex::encode)?;
-            Some(format!("{suite}-{root}-{length}.vot-catalog"))
+            Some([
+                format!("{suite}-{root}-{length}.vot-catalog"),
+                format!("{suite}-{root}-{length}.leaves"),
+            ])
         })
+        .flatten()
         .collect()
+}
+
+fn canonical_proof_name(name: &str) -> bool {
+    canonical_catalog_name(name) || canonical_leaf_name(name)
+}
+
+/// A serve's proof-leaf cache file, `<suite>-<root>-<length>.leaves`.
+fn canonical_leaf_name(name: &str) -> bool {
+    name.strip_suffix(".leaves")
+        .is_some_and(|stem| canonical_catalog_name(&format!("{stem}.vot-catalog")))
 }
 
 fn canonical_catalog_name(name: &str) -> bool {
@@ -1094,7 +1108,7 @@ fn owned_catalog_stage_name(name: &str) -> bool {
     let Some((catalog, token)) = name.rsplit_once(".stage-") else {
         return false;
     };
-    canonical_catalog_name(catalog)
+    canonical_proof_name(catalog)
         && token.len() == 32
         && token
             .bytes()
@@ -1132,7 +1146,7 @@ fn prune_outbound_proofs(root: &std::path::Path, keys: &HashSet<String>) {
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if !canonical_catalog_name(&name) || keys.contains(&name) {
+        if !canonical_proof_name(&name) || keys.contains(&name) {
             continue;
         }
         if let Ok(meta) = std::fs::symlink_metadata(&path) {
@@ -1157,6 +1171,11 @@ mod outbound_stage_tests {
         let active_root = "00".repeat(32);
         let active = format!("1-{active_root}-10.vot-catalog");
         let stale = format!("2-{}-11.vot-catalog", "11".repeat(32));
+        // A leaf cache prunes by the same key as its catalog.
+        let active_leaves = format!("1-{active_root}-10.leaves");
+        let stale_leaves = format!("2-{}-11.leaves", "11".repeat(32));
+        std::fs::write(root.join(&active_leaves), b"leaves").unwrap();
+        std::fs::write(root.join(&stale_leaves), b"leaves").unwrap();
         let foreign =
             "1-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-12.vot-catalog";
         std::fs::write(root.join(&active), b"active").unwrap();
@@ -1167,6 +1186,9 @@ mod outbound_stage_tests {
         std::fs::write(&foreign_stage, b"operator").unwrap();
         let owned_stage = root.join(format!(".{active}.stage-{}", "aa".repeat(16)));
         std::fs::write(&owned_stage, b"owned").unwrap();
+        // A leaf cache's own stage is also swept.
+        let leaf_stage = root.join(format!(".{active_leaves}.stage-{}", "dd".repeat(16)));
+        std::fs::write(&leaf_stage, b"leaf-stage").unwrap();
         #[cfg(unix)]
         {
             let stage_link = root.join(format!(".{active}.stage-{}", "bb".repeat(16)));
@@ -1183,11 +1205,20 @@ mod outbound_stage_tests {
 
         assert!(root.join(&active).exists());
         assert!(!root.join(stale).exists());
+        assert!(
+            root.join(&active_leaves).exists(),
+            "an active grant's leaves are kept"
+        );
+        assert!(
+            !root.join(&stale_leaves).exists(),
+            "a stale grant's leaves are pruned"
+        );
         assert!(root.join(foreign).exists());
         assert!(root.join("operator.txt").exists());
         clean_outbound_proof_stages(directory.path());
         assert!(foreign_stage.exists());
         assert!(!owned_stage.exists());
+        assert!(!leaf_stage.exists(), "a leaf cache stage is swept");
         #[cfg(unix)]
         assert!(std::fs::symlink_metadata(
             root.join(format!("2-{}-12.vot-catalog", "22".repeat(32)))
@@ -1296,8 +1327,15 @@ pub fn start_serve(app: Arc<App>) {
         .name("votport-serve".to_owned())
         .spawn(move || {
             let serve = app.serve.as_ref().expect("serve state disappeared");
-            // Capabilities minted before a restart are honoured after it.
-            crate::api::serve::warm(&app, serve);
+            // Warm the servers for capabilities minted before this restart
+            // off the accept thread, so a cold grant's read does not delay
+            // the listener; a fetch that arrives first is refused unknown
+            // until its server lands.
+            let warming = Arc::clone(&app);
+            runtime.spawn_blocking(move || {
+                let serve = warming.serve.as_ref().expect("serve state disappeared");
+                crate::api::serve::warm(&warming, serve);
+            });
             let listener = serve.listener.lock().expect("serve listener poisoned");
             if let Err(error) = vot_cli::serve_on(&listener, |presentation| {
                 crate::api::serve::admit_fetch(&app, presentation, &runtime)
