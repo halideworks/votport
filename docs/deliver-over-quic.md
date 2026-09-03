@@ -1,8 +1,9 @@
 # Deliver over QUIC, the replication agent, and the road to votdock
 
 Status: V1 and V2 landed upstream (VOT #401, #402), P1 and P2 in votport,
-2026-09-02; votport pins VOT at `8789fc974e6ecc1237dcaed68c4e4bd9b6c77c34`.
-P3, the agent, and phase W remain.
+2026-09-02; votport pins VOT at `5e287bea4edda0d4dca0af85b20992bc0e50eda1`,
+which adds ADR-0051, the fetch window of up to sixteen objects. P3, the
+agent, and phase W remain.
 
 | Field | Value |
 | --- | --- |
@@ -231,7 +232,11 @@ sends a final-cursor GOAWAY, the receiver's completion acknowledgement
 its own session, but only the primary carries the final cursor, so the
 registry counts one delivery: the one session whose report cursor equals its
 object count. A cursor short of the object count, or none at all, records
-nothing. The native `vot fetch` and `vot pull` clients send this
+nothing. An unacknowledged fetch therefore never consumes a delivery: a
+client that never sends the final cursor can fetch for the whole capability
+window and, once its ticket expires, mint again, without touching
+`max_downloads`, which is a client-delivery control and not a security
+boundary. The native `vot fetch` and `vot pull` clients send this
 acknowledgement; the browser WebTransport client (phase W) must send it too
 for its downloads to count. `max_downloads` is enforced
 twice: a mint reserves a delivery in the same statement that records its

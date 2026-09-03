@@ -520,7 +520,7 @@ Measured single-stream upload rose about a quarter (256 MiB baseline,
 still verifies serially and is the next candidate.
 
 Do not raise `CHUNK_BYTES` in votport until VOT changes its server verify
-path to support larger ranges; the `8789fc97` pin does not. Any VOT re-pin
+path to support larger ranges; the `5e287bea` pin does not. Any VOT re-pin
 moves the VOT dependencies and Dockerfile `ARG` together, then relocks
 Cargo.lock. Measure with:
 
