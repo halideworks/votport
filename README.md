@@ -329,7 +329,7 @@ publishes each file the moment its coverage is complete.
 
 That serial verify is what leaves headroom on a fast NIC. Raising the range
 size or verifying in parallel needs VOT changes on the server verify path;
-the VOT pin at `d3c18a4` does not include them. Do not raise `CHUNK_BYTES`
+the VOT pin at `5e287be` does not include them. Do not raise `CHUNK_BYTES`
 in votport ahead of that work.
 
 Measure on this box:
@@ -428,7 +428,7 @@ does not publish partial files.
 
 ## Roadmap
 
-VOT is pinned at `8789fc974e6ecc1237dcaed68c4e4bd9b6c77c34` (includes upstream PR #391, plus ADR-0046 parallel range acceptance and ADR-0047 receiver re-attach).
+VOT is pinned at `5e287bea4edda0d4dca0af85b20992bc0e50eda1` (includes upstream PR #391, plus ADR-0046 parallel range acceptance, ADR-0047 receiver re-attach, and ADR-0051, the fetch window of up to sixteen objects).
 That pin adds the holder-dialed push engine, and votport's native push receive
 path is shipped but disabled unless `VOTPORT_PUSH_BIND` is set. Browser uploads
 still travel over HTTP through the reverse proxy. Native push does not change
