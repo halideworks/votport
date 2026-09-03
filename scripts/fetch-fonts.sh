@@ -6,7 +6,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-FAMILIES='family=Instrument+Serif:ital@0;1&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500'
+FAMILIES='family=Libre+Caslon+Display&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500'
 FONT_CSS="$(mktemp)"
 trap 'rm -f "$FONT_CSS"' EXIT
 
@@ -48,7 +48,7 @@ if len(out) == 0:
 
 open('web/assets/fonts.css', 'w').write(
     "// Self-hosted Google Fonts (latin subsets), OFL 1.1:\n"
-    "// Instrument Serif, Plus Jakarta Sans, JetBrains Mono.\n"
+    "// Libre Caslon Display, Plus Jakarta Sans, JetBrains Mono.\n"
     "// Regenerate with scripts/fetch-fonts.sh if weights change.\n"
     + "\n".join(out) + "\n"
 )
