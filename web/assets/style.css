@@ -1,7 +1,7 @@
 /* votport UI. VOTPORT PROPRIETARY LICENSE.
  *
  * Brand-heritage split layout: the Pommern (1903) painting as a hero panel on
- * the left, a deep-navy frosted ingest sheet on the right. Instrument Serif
+ * the left, a deep-navy frosted ingest sheet on the right. Libre Caslon Display
  * wordmark, Plus Jakarta Sans body, JetBrains Mono for numbers. Committed
  * dark navy by default; a light theme swaps the tokens, the painting stays dark.
  *
@@ -219,7 +219,7 @@ body {
 }
 
 .wordmark {
- font-family: "Instrument Serif", Georgia, serif;
+ font-family: "Libre Caslon Display", Georgia, serif;
  font-weight: 400;
  font-size: 2.1rem;
  color: var(--text);
@@ -343,7 +343,7 @@ body:has(#dashboard:not([hidden])) .sheet {
 }
 .masthead h1 {
  margin: 0;
- font-family: "Instrument Serif", Georgia, serif;
+ font-family: "Libre Caslon Display", Georgia, serif;
  font-size: 1.8rem;
  font-weight: 400;
  letter-spacing: 0;
@@ -815,7 +815,7 @@ button.danger:hover:not(:disabled) {
 }
 .modal .timeline-head h2 {
  margin: 0.15rem 0 0.25rem;
- font-family: "Instrument Serif", Georgia, serif;
+ font-family: "Libre Caslon Display", Georgia, serif;
  font-size: 1.5rem;
  font-weight: 400;
  letter-spacing: 0;
@@ -991,7 +991,7 @@ button.danger:hover:not(:disabled) {
 }
 .empty-teach h3 {
  margin: 0 0 0.6rem;
- font-family: "Instrument Serif", Georgia, serif;
+ font-family: "Libre Caslon Display", Georgia, serif;
  font-weight: 400;
  font-size: 1.25rem;
  color: var(--text);
