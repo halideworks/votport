@@ -24,7 +24,7 @@ use axum::Json;
 use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::json;
-use vot_sdk::object::ObjectId;
+use vot_sdk::object::{proof_leaves_at, ObjectId, Suite, PROOF_LEAF_SIZE};
 use vot_sdk::package::{PackageBuilder, PackageEntry};
 
 use super::outbound::{
@@ -50,8 +50,11 @@ const CAPABILITY_TTL_SECS: u64 = 3600;
 const TICKET_RETENTION_SECS: u64 = 86_400;
 
 /// Manifest builds and server assembly run one at a time: a build replaces
-/// a directory another build may be reading, and assembly reads whole
-/// files. ponytail: one process-wide lock; shard per grant if mints queue.
+/// a directory another build may be reading. With a warm leaf cache the
+/// critical section is a sample and a few milliseconds; the first mint of a
+/// grant reads its files under this lock to compute the leaves.
+/// ponytail: one process-wide lock; shard per grant if cold first mints
+/// queue behind each other.
 static BUILDS: Mutex<()> = Mutex::new(());
 
 fn page_name(index: u64) -> String {
@@ -414,6 +417,157 @@ pub(crate) fn manifest_directory(app: &App, grant_id: &str) -> PathBuf {
     app.config.data_dir.join(MANIFESTS_DIRECTORY).join(grant_id)
 }
 
+/// The proof directory a grant's leaves are cached in, beside its catalogs.
+fn proof_root(app: &App) -> PathBuf {
+    app.config.data_dir.join("outbound.proofs")
+}
+
+/// Where an object's proof leaves are cached, named as its catalog is.
+fn leaf_cache_path(proof_root: &Path, object: &ObjectId) -> PathBuf {
+    proof_root.join(format!(
+        "{}-{}-{}.leaves",
+        object.suite,
+        hex::encode(object.root),
+        object.length
+    ))
+}
+
+/// Reads an object's cached leaves, or `None` for anything a serve will not
+/// prepare from: no cache, a header that names another object, or a count
+/// that cannot describe the object. Never an error; the object is read
+/// instead. The `VOTLEAF` layout upstream keeps crate-private, so the
+/// cache interoperates if that writer is ever exposed.
+fn read_leaves(proof_root: &Path, object: &ObjectId) -> Option<Vec<[u8; 32]>> {
+    let bytes = std::fs::read(leaf_cache_path(proof_root, object)).ok()?;
+    let header = 8 + 1 + 8 + 8;
+    if bytes.len() < header
+        || &bytes[..8] != b"VOTLEAF\x01"
+        || bytes[8] != u8::try_from(object.suite).ok()?
+    {
+        return None;
+    }
+    let length = u64::from_le_bytes(bytes[9..17].try_into().ok()?);
+    let count = u64::from_le_bytes(bytes[17..25].try_into().ok()?);
+    if length != object.length || count != object.length.div_ceil(PROOF_LEAF_SIZE) {
+        return None;
+    }
+    let count = usize::try_from(count).ok()?;
+    if bytes.len() != header + count * 32 {
+        return None;
+    }
+    Some(
+        bytes[header..]
+            .chunks_exact(32)
+            .map(|leaf| leaf.try_into().expect("32 bytes"))
+            .collect(),
+    )
+}
+
+/// Writes an object's leaves to the cache, staged and renamed so a reader
+/// never sees a short file. Best effort: a serve without the cache still
+/// works by reading the object.
+fn write_leaves(proof_root: &Path, object: &ObjectId, leaves: &[[u8; 32]]) {
+    let destination = leaf_cache_path(proof_root, object);
+    let stage = destination.with_file_name(format!(
+        ".{}.stage-{}",
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("leaves"),
+        crate::auth::random_token()
+    ));
+    let mut bytes = Vec::with_capacity(25 + leaves.len() * 32);
+    bytes.extend_from_slice(b"VOTLEAF\x01");
+    bytes.push(u8::try_from(object.suite).unwrap_or(0));
+    bytes.extend_from_slice(&object.length.to_le_bytes());
+    bytes.extend_from_slice(&(leaves.len() as u64).to_le_bytes());
+    for leaf in leaves {
+        bytes.extend_from_slice(leaf);
+    }
+    let written = std::fs::create_dir_all(proof_root)
+        .and_then(|()| std::fs::write(&stage, &bytes))
+        .and_then(|()| std::fs::File::open(&stage).and_then(|file| file.sync_all()))
+        .and_then(|()| std::fs::rename(&stage, &destination));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&stage);
+    }
+}
+
+/// Computes an object's proof leaves by reading the file across the pool.
+/// A serve otherwise reads every byte on one thread (about 1.4 s per GiB);
+/// this reads leaf-aligned ranges in parallel, which is what makes the
+/// first fetch of a large grant fast. Returns `None` on any read failure,
+/// which leaves the serve to read the object and say why.
+fn compute_leaves(path: &Path, suite: Suite, length: u64) -> Option<Vec<[u8; 32]>> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let leaf = PROOF_LEAF_SIZE;
+    let total = length.div_ceil(leaf);
+    let workers = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .min(8)
+        .min(usize::try_from(total).unwrap_or(1))
+        .max(1);
+    let per = total.div_ceil(workers as u64);
+    let ranges: Vec<(u64, u64)> = (0..workers as u64)
+        .map(|w| {
+            let start = (w * per).min(total) * leaf;
+            let end = (((w + 1) * per).min(total) * leaf).min(length);
+            (start, end)
+        })
+        .filter(|(start, end)| start < end)
+        .collect();
+    let parts: Vec<Option<Vec<[u8; 32]>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = ranges
+            .iter()
+            .map(|&(start, end)| {
+                scope.spawn(move || -> Option<Vec<[u8; 32]>> {
+                    // Streamed in 16-leaf steps so memory stays bounded
+                    // however large the object, never the whole range.
+                    let step = 16 * leaf;
+                    let mut file = std::fs::File::open(path).ok()?;
+                    file.seek(SeekFrom::Start(start)).ok()?;
+                    let mut leaves = Vec::new();
+                    let mut offset = start;
+                    let mut buf = vec![0u8; usize::try_from(step).ok()?];
+                    while offset < end {
+                        let take = usize::try_from((end - offset).min(step)).ok()?;
+                        file.read_exact(&mut buf[..take]).ok()?;
+                        leaves.extend(proof_leaves_at(suite, offset, &buf[..take], length).ok()?);
+                        offset += take as u64;
+                    }
+                    Some(leaves)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().ok()?)
+            .collect()
+    });
+    let mut leaves = Vec::with_capacity(total as usize);
+    for part in parts {
+        leaves.extend(part?);
+    }
+    (leaves.len() as u64 == total).then_some(leaves)
+}
+
+/// An object's leaves for `assemble`: from the cache, or computed in
+/// parallel and cached. `None` for an object of one leaf or less, which
+/// `assemble` reads whatever leaves accompany it.
+fn ensure_leaves(proof_root: &Path, object: &ObjectId, path: &Path) -> Option<Vec<[u8; 32]>> {
+    if object.length <= PROOF_LEAF_SIZE {
+        return None;
+    }
+    if let Some(leaves) = read_leaves(proof_root, object) {
+        return Some(leaves);
+    }
+    let suite = Suite::try_from(object.suite).ok()?;
+    let leaves = compute_leaves(path, suite, object.length)?;
+    write_leaves(proof_root, object, &leaves);
+    Some(leaves)
+}
+
 /// The grant's manifest root and its server, building either that is
 /// missing. Runs on the blocking pool: assembling reads every byte of a
 /// file it has no leaves for.
@@ -452,23 +606,34 @@ pub(crate) fn ensure_server(
     if let Some(server) = serve.registry.server(root) {
         return Ok((root, server));
     }
+    let proofs = proof_root(app);
     let mut sources = BTreeMap::new();
     for entry in &entries {
-        // ponytail: no leaves yet, so the first assembly reads every byte
-        // (about 1.4 s per GiB); P2 hands in the leaves hashed at grant
-        // creation.
+        // From the cache or computed in parallel and cached, so the first
+        // fetch of a large grant samples the files instead of reading them.
         sources.insert(
             entry.object.root,
             vot_cli::ServedSource {
                 path: entry.path.clone(),
-                leaves: None,
+                leaves: ensure_leaves(&proofs, &entry.object, &entry.path),
             },
         );
     }
-    let server = Arc::new(
-        vot_cli::BundleServer::assemble(&directory, sources)
-            .map_err(|error| ApiError::internal(format!("assemble grant server: {error:?}")))?,
-    );
+    let server = match vot_cli::BundleServer::assemble(&directory, sources) {
+        Ok(server) => Arc::new(server),
+        Err(error) => {
+            // A leaf cache that no longer describes its object (bit rot the
+            // length and count checks miss) fails assembly with a root
+            // mismatch. Drop the caches so the next mint recomputes them
+            // rather than failing forever on the same bad bytes.
+            for entry in &entries {
+                let _ = std::fs::remove_file(leaf_cache_path(&proofs, &entry.object));
+            }
+            return Err(ApiError::internal(format!(
+                "assemble grant server: {error:?}"
+            )));
+        }
+    };
     serve
         .registry
         .servers
@@ -479,9 +644,10 @@ pub(crate) fn ensure_server(
 }
 
 /// Assembles a server for every unexpired ticket, so capabilities minted
-/// before a restart are honoured after it. Called on the serve thread
-/// before it accepts; a grant that fails to build is logged and its
-/// tickets refuse.
+/// before a restart are honoured after it. Runs off the accept thread so a
+/// cold grant's read does not delay the listener; a fetch that arrives
+/// before its grant is warmed is refused unknown until its server lands. A
+/// grant that fails to build is logged and its tickets refuse.
 pub(crate) fn warm(app: &Arc<App>, serve: &ServeState) {
     let tickets = match app.store.unexpired_fetch_tickets(now_unix()) {
         Ok(tickets) => tickets,
@@ -739,8 +905,9 @@ pub(crate) fn admit_fetch(
         return refuse(app, ServeRefusalReason::Closed, peer);
     }
     let Some(server) = serve.registry.server(root) else {
-        // Warmed at start and built at mint; absent only when a build
-        // failed, which the log names.
+        // Built at mint and warmed off-thread after a restart, so a server
+        // can be briefly absent for a valid ticket while warming, or absent
+        // because a build failed; both refuse unknown, both are in the log.
         return refuse(app, ServeRefusalReason::Unknown, peer);
     };
     let verifying_key = serve.issuer.verifying_key();
@@ -876,6 +1043,101 @@ pub(crate) fn admit_fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "timing, run with --ignored --nocapture"]
+    fn bench_parallel_vs_serial_leaves() {
+        use std::io::Read as _;
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("big.bin");
+        let length = 512 * PROOF_LEAF_SIZE * 16; // 512 MiB
+        let bytes: Vec<u8> = (0..length).map(|index| (index % 251) as u8).collect();
+        std::fs::write(&source, &bytes).unwrap();
+        drop(bytes);
+
+        let serial_start = std::time::Instant::now();
+        let mut builder =
+            vot_sdk::object::InMemoryObjectBuilder::new(Suite::Blake3Bao64, Some(length), length)
+                .unwrap();
+        let mut file = std::fs::File::open(&source).unwrap();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let read = file.read(&mut buf).unwrap();
+            if read == 0 {
+                break;
+            }
+            builder.update(&buf[..read]).unwrap();
+        }
+        let _ = builder.finish().unwrap();
+        let serial = serial_start.elapsed();
+
+        let parallel_start = std::time::Instant::now();
+        let leaves = compute_leaves(&source, Suite::Blake3Bao64, length).unwrap();
+        let parallel = parallel_start.elapsed();
+        assert_eq!(leaves.len() as u64, length.div_ceil(PROOF_LEAF_SIZE));
+
+        let gib = length as f64 / (1024.0 * 1024.0 * 1024.0);
+        eprintln!(
+            "leaves for {gib:.2} GiB: serial {:.3}s ({:.0} ms/GiB), parallel {:.3}s ({:.0} ms/GiB), {:.1}x",
+            serial.as_secs_f64(),
+            serial.as_secs_f64() / gib * 1000.0,
+            parallel.as_secs_f64(),
+            parallel.as_secs_f64() / gib * 1000.0,
+            serial.as_secs_f64() / parallel.as_secs_f64(),
+        );
+    }
+
+    #[test]
+    fn leaves_computed_in_parallel_match_the_cache_and_serve_after_the_object_moves() {
+        // A file over one leaf, not a multiple of the leaf size, so the last
+        // segment is a partial leaf and the parallel split is exercised.
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("reel.bin");
+        let length = PROOF_LEAF_SIZE * 3 + 1234;
+        let bytes: Vec<u8> = (0..length).map(|index| (index % 251) as u8).collect();
+        std::fs::write(&source, &bytes).unwrap();
+        let object = {
+            let mut builder = vot_sdk::object::InMemoryObjectBuilder::new(
+                Suite::Blake3Bao64,
+                Some(length),
+                length,
+            )
+            .unwrap();
+            builder.update(&bytes).unwrap();
+            builder.finish().unwrap().object_id().clone()
+        };
+        let computed = compute_leaves(&source, Suite::Blake3Bao64, length).unwrap();
+        assert_eq!(computed.len() as u64, length.div_ceil(PROOF_LEAF_SIZE));
+
+        let proofs = directory.path().join("outbound.proofs");
+        // First call computes and caches; a truncated source afterward still
+        // serves, because the cache carries the leaves.
+        let first = ensure_leaves(&proofs, &object, &source).unwrap();
+        assert_eq!(first, computed);
+        assert!(read_leaves(&proofs, &object).is_some());
+        std::fs::write(&source, b"gone").unwrap();
+        assert_eq!(
+            ensure_leaves(&proofs, &object, &source),
+            Some(computed.clone())
+        );
+
+        // A cache present but naming another length is ignored: write the
+        // computed leaves under the object's name but with a header claiming
+        // one more leaf, and read_leaves refuses it.
+        let mut corrupt = std::fs::read(leaf_cache_path(&proofs, &object)).unwrap();
+        corrupt[17..25].copy_from_slice(&(computed.len() as u64 + 1).to_le_bytes());
+        std::fs::write(leaf_cache_path(&proofs, &object), &corrupt).unwrap();
+        assert!(read_leaves(&proofs, &object).is_none());
+        // Restore the good cache for later reads.
+        write_leaves(&proofs, &object, &computed);
+        // One leaf or less has no tree to hand in.
+        let small = ObjectId {
+            suite: 1,
+            root: [0; 32],
+            length: PROOF_LEAF_SIZE,
+        };
+        assert!(ensure_leaves(&proofs, &small, &source).is_none());
+    }
 
     #[test]
     fn a_delivery_is_reached_at_the_package_length_and_never_for_an_empty_one() {

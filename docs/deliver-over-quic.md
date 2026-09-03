@@ -1,12 +1,12 @@
 # Deliver over QUIC, the replication agent, and the road to votdock
 
-Status: V1 and V2 landed upstream (VOT #401, #402) and P1 in votport,
+Status: V1 and V2 landed upstream (VOT #401, #402), P1 and P2 in votport,
 2026-09-02; votport pins VOT at `d3c18a46ba5c9108091c9639151c40cd34d95fd3`.
-P2, P3, the agent, and phase W remain.
+P3, the agent, and phase W remain.
 
 | Field | Value |
 | --- | --- |
-| Status | V1 and V2 merged upstream (VOT #401, #402); P1 implemented in votport |
+| Status | V1 and V2 merged upstream (VOT #401, #402); P1 and P2 in votport |
 | Date | 2026-09-02 |
 | Continues | `docs/native-push.md` (the receive direction of the same carrier) |
 | Audience | David, and the next session |
@@ -191,15 +191,18 @@ A grant needs a manifest and a package root. Library grants store an empty
   differs from the upload's.
 - Objects resolve through the code that already resolves downloads:
   `source_info_indexed_with_file` for library files and received files.
-- Leaves (P2, not yet landed): `hash_library_file` reads every byte at
-  grant time; emit leaves with `proof_leaves_at` there and store them in
-  `outbound.proofs` as `<suite>-<root>-<length>.leaves`. Received files get
-  leaves lazily at first serve until VOT change 4 lands, cached the same
-  way. The registry hands the leaves to `BundleServer::assemble` as each
-  `ServedSource`. P1 passes no leaves and reads the files at assembly.
-- The mutation rule: a library file under an active grant must not be
-  replaced. Deletion already refuses with 409 on an active grant; the
-  library upload path needs the same guard.
+- Leaves (P2, landed): `ensure_leaves` returns each object's proof leaves
+  from a cache in `outbound.proofs` named `<suite>-<root>-<length>.leaves`,
+  or computes them by reading the file across the pool in leaf-aligned
+  ranges and caching them, so `assemble` samples two groups per file. The
+  intended design was to capture the leaves during `hash_library_file`'s
+  existing full read at grant time (free I/O), but `InMemoryPreparedObject`
+  exposes no `proof_leaves()`, so the shipped design re-reads the file at
+  the first assemble instead; it caches, so a grant reads its files once.
+  A corrupt cache is dropped on an assemble mismatch so the next mint
+  recomputes.
+- The mutation rule (landed): a library file under an active grant must not
+  be replaced. Both deletion and upload refuse with 409 on an active grant.
 
 ### Recipient protocol
 
@@ -378,7 +381,7 @@ This is phase W, after P1, and is its own design once V1 is in.
 | V3 | VOT | `proof_cache::write` public; leaves on publish |
 | V4 | VOT | `fetch_bundle_with(FetchOptions)`; per-peer cap |
 | P1 | votport | Repin to V1 plus V2; serve listener, registry, admission, manifest at grant creation, schema 21, `/api/s/{token}/fetch`, accounting, audit, metrics, recipient page command |
-| P2 | votport | Leaves at grant hashing and lazy leaves for received files; library upload guard on active grants |
+| P2 (done) | votport | Proof leaves cached and computed in parallel; upload guard on active grants |
 | P3 | votport | Publications and replicas tables, feed and ack endpoints, `replicate` token scope, admin replica state, backfill |
 | A1 | votport | `agent/` crate with the directory target; run on loopback against the live box |
 | A2 | votport | S3 and R2 target; run one agent on a VM near an R2 bucket against erebus |
@@ -405,8 +408,8 @@ visible result and the one to measure.
 - The serve seam's shape is a guess until the upstream review; the fallback
   bundle directory keeps P1 possible without V2.
 - Two UDP ports and one certificate: rotating the cert re-pins both.
-- A large open grant set with lazy leaves means the first fetch of a
-  received upload pays the hash; the leaves-on-publish change removes it.
+- The first fetch of a grant pays a parallel read to compute its leaves;
+  every fetch and restart after reads the tiny cache.
 - The agent holds W rails of receiver budget (up to about 1.7 GB at eight)
   per fetch; concurrency defaults to one fetch at a time until measured.
 
