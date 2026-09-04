@@ -1,7 +1,7 @@
 # Native push: VOT QUIC receive path
 
 Status: Native push and its operator surface are implemented, 2026-08-29. VOT ADR-0045 (push, the holder dials)
-landed upstream in PR #391 at `5e287bea4edda0d4dca0af85b20992bc0e50eda1`.
+landed upstream in PR #391 at `296174a794c58352b08c622d6ccdda5cb73122f2`.
 
 ## Overview
 
@@ -322,7 +322,10 @@ the seams:
 - Sender-side knobs (`VOT_FETCH_RAILS`, `VOT_DATAGRAM_FEC`, `VOT_INITIAL_CWND`,
   `VOT_PREFIX_DUP`) are the sender's. Receiver-side, VOT b14 supplies the
   `VOT_FETCH_PROVERS` default; votport does not set or re-expose it. The
-  remaining receiver settings stay at VOT defaults until a measurement asks.
+  minimum prover count is one, since a fetch with no prover books no
+  coverage, and `VOT_STALL_MS` is the stall budget after which a session is
+  given up on (default 30000 ms, about a 140 KB/s floor). The remaining
+  receiver settings stay at VOT defaults until a measurement asks.
 
 ## API / Interface Changes
 
@@ -448,7 +451,7 @@ want one public port, and changes nothing in votport.
 
 - Cloudflare in front of VOTDock: raw QUIC needs Spectrum UDP or a direct
   address. Decide before VOTDock's topology is fixed.
-- VOT `d3c18a4` parses the CLI push address as a numeric `SocketAddr`. DNS
+- VOT `296174a` parses the CLI push address as a numeric `SocketAddr`. DNS
   resolution remains the library caller's responsibility until upstream adds
   hostname resolution to the CLI.
 
