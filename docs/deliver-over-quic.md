@@ -1,10 +1,11 @@
 # Deliver over QUIC, the replication agent, and the road to votdock
 
 Status: V1 and V2 landed upstream (VOT #401, #402), P1 and P2 in votport,
-2026-09-02; votport pins VOT at `296174a794c58352b08c622d6ccdda5cb73122f2`,
+2026-09-02; votport pins VOT at `26ccd14b54d37177cec47e7ce86b99f0bc985b5c`,
 which adds ADR-0051, the fetch window of up to sixteen objects, the
-concurrent sink gate (#406), settled-work fetch progress (#405), and
-admit-before-handout on a rail (#407). P3, the agent, and phase W remain.
+concurrent sink gate (#406), settled-work fetch progress (#405),
+admit-before-handout on a rail (#407), and completion syncs on a per-plan
+flusher (#408, ADR-0052). P3, the agent, and phase W remain.
 
 | Field | Value |
 | --- | --- |
