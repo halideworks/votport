@@ -235,6 +235,35 @@ Plain files under `/received` and `/outbound`. Any file-level backup tool works
 `/outbound/.vot-tenants.stage/<tenant>`. Back both volumes up together with a
 database snapshot so records and bytes stay consistent with each other.
 
+### ZFS receive and download volumes
+
+Measured on erebus (OpenZFS 2.2.2, mirrored NVMe, `recordsize=128K`,
+`compression=lz4`, `sync=standard`, `zfs_dirty_data_max` 4 GiB): one buffered
+writer into one file lands 0.86 GiB/s, eight concurrent writers into one file
+3.19 GiB/s, one writer with `O_DIRECT` 2.37 GiB/s, and an fsync every 64 MiB
+costs nothing for a single stream. VOT writes each verified bundle with one
+`pwrite` per prover and syncs each object once at completion (plus every
+64 MiB during a large object), so the eight-writer figure is the one a fetch
+can reach and the fsync pattern is what the volume has to absorb.
+
+Three settings decide the number on a media volume:
+
+- `zfs_dirty_data_max` (module parameter, default 10% of RAM capped at 4 GiB).
+  Once dirty data reaches it the write throttle engages and an fsync issued at
+  that moment waits for a transaction group to drain; on the test pool that
+  showed as single reps of 13 to 50 seconds for a 4 GiB object. Raise it above
+  the largest object the volume receives, or expect that wait once per object
+  of that size.
+- `compression` on a dataset that holds compressed media and EXR: lz4 tries
+  every record and stores an incompressible one unchanged, so it buys nothing
+  there; measure a fetch with it off before deciding, since the test pool
+  above ran with it on.
+- `sync=disabled` removes every wait for the ZIL and also removes the
+  durability VOT's receipts promise: a receipt says the bytes were synced,
+  and under `sync=disabled` they were not. Do not use it on a volume that
+  holds the only copy. Whether a SLOG device helps this write pattern was not
+  measured; measure before buying one.
+
 ### Restore
 
 The System page's Restore action validates the selected archive, stages it,
@@ -520,7 +549,7 @@ Measured single-stream upload rose about a quarter (256 MiB baseline,
 still verifies serially and is the next candidate.
 
 Do not raise `CHUNK_BYTES` in votport until VOT changes its server verify
-path to support larger ranges; the `5e287bea` pin does not. Any VOT re-pin
+path to support larger ranges; the `296174a7` pin does not. Any VOT re-pin
 moves the VOT dependencies and Dockerfile `ARG` together, then relocks
 Cargo.lock. Measure with:
 
