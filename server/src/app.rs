@@ -878,7 +878,7 @@ fn resume_upload_sessions(
                 // (resume_worker fails before spawn; insert_resumed cannot
                 // fail at boot with unbounded caps and empty pins), so no
                 // worker will write a second partial record for these files.
-                session::commit_persisted_partial(store, &session);
+                session::commit_persisted_interruption(store, ended, &session, &error);
                 if let Err(error) = store.delete_upload_session(&session.id) {
                     tracing::warn!(session_tag = %session_tag, %error, "delete upload session failed");
                 }

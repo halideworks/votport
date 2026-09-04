@@ -3061,7 +3061,8 @@ async fn backup_restores_through_a_restart() {
 
 /// A staging file shorter than its checkpointed prefix (power loss before
 /// the data reached disk) is refused at boot: the record and staging go,
-/// and the sender starts a fresh session.
+/// the link gets an interrupted event with the bytes that had arrived (so the
+/// failure is counted and notified), and the sender starts a fresh session.
 #[tokio::test(flavor = "multi_thread")]
 async fn restart_drops_a_truncated_staging_session() {
     let server = start_server().await;
@@ -3072,6 +3073,11 @@ async fn restart_drops_a_truncated_staging_session() {
     let files = [twenty_mib()];
     let file = &files[0];
     let (token, session) = open_session(&client, &server.base, "truncated", &files).await;
+    server
+        .application
+        .store
+        .update_link("", &token, |link| link.notify_on_upload = true)
+        .unwrap();
     let base = server.base.clone();
     assert_eq!(begin(&client, &base, &session).await.0, 200);
     assert_eq!(post_chunk(&client, &base, &session, file, 0).await.0, 200);
@@ -3100,6 +3106,29 @@ async fn restart_drops_a_truncated_staging_session() {
         staging_files(&receive_dir).is_empty(),
         "refused staging is swept"
     );
+    let link = server
+        .application
+        .store
+        .link_by_id(&token)
+        .unwrap()
+        .unwrap();
+    let event = link.events.last().unwrap();
+    assert_eq!(event.outcome, "interrupted");
+    assert_eq!(event.received_bytes, CHUNK);
+    assert!(event.detail.starts_with("resume after restart failed: "));
+    let ended = server
+        .application
+        .session_ended_rx
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .try_recv()
+        .unwrap();
+    assert!(ended.notify);
+    assert_eq!(ended.event.outcome, event.outcome);
+    assert_eq!(ended.event.received_bytes, event.received_bytes);
+    assert_eq!(ended.event.detail, event.detail);
     assert_eq!(begin(&client, &base, &session).await.0, 404);
     // A fresh session over the same link completes normally.
     run_upload(&client, &base, &token, "", &files).await;

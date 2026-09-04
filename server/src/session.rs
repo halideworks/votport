@@ -982,7 +982,13 @@ pub fn resume_worker(
             record.receipt = file.receipt;
         }
     }
-    let already: u64 = persisted
+    let already = persisted_received(persisted);
+    spawn_worker_from(setup, receiver, Phase::Receiving { files }, true, already);
+    Ok((kept, already))
+}
+
+fn persisted_received(session: &PersistedUploadSession) -> u64 {
+    session
         .files
         .iter()
         .map(|file| {
@@ -992,9 +998,7 @@ pub fn resume_worker(
                 file.prefix_bytes
             }
         })
-        .sum();
-    spawn_worker_from(setup, receiver, Phase::Receiving { files }, true, already);
-    Ok((kept, already))
+        .sum()
 }
 
 fn entry_infos(setup: &WorkerSetup, files: &[FileState]) -> Vec<EntryInfo> {
@@ -1575,11 +1579,13 @@ fn commit_partial(
     }
 }
 
-/// Same as [`commit_partial`] for a persisted session the boot resume
-/// refused: its rows still say which files were published.
-pub fn commit_persisted_partial(
+/// Records a persisted session the boot resume refused, including any files
+/// it had already published.
+pub fn commit_persisted_interruption(
     store: &Arc<Store>,
+    ended: &mpsc::UnboundedSender<SessionEnded>,
     session: &crate::store::PersistedUploadSession,
+    detail: &str,
 ) {
     let records: Vec<FileRecord> = session
         .files
@@ -1595,32 +1601,44 @@ pub fn commit_persisted_partial(
             deleted: false,
         })
         .collect();
-    if records.is_empty() {
-        return;
+    let at = now_unix();
+    if !records.is_empty() {
+        let upload = UploadRecord {
+            id: crate::auth::random_token(),
+            started_at: session.started_at,
+            completed_at: at,
+            replayed_chunks: 0,
+            rejected_chunks: 0,
+            transport: Some("http".to_owned()),
+            package_root: hex::encode(session.package.root),
+            total_bytes: records.iter().map(|record| record.bytes).sum(),
+            files: records,
+            partial: true,
+            log: vec![LogEvent {
+                at,
+                kind: "dropped".to_owned(),
+                path: None,
+                bytes: None,
+                secs: None,
+                count: None,
+            }],
+        };
+        if let Err(error) = store.append_upload(&session.tenant, &session.link_id, upload) {
+            tracing::warn!(link = %session.link_id, %error, "partial upload record failed at boot");
+        }
     }
-    let upload = UploadRecord {
-        id: crate::auth::random_token(),
+    let received = persisted_received(session);
+    let event = crate::store::SessionEvent {
+        at,
         started_at: session.started_at,
-        completed_at: now_unix(),
+        outcome: "interrupted".to_owned(),
+        detail: format!("resume after restart failed: {detail}"),
+        received_bytes: received,
+        expected_bytes: session.package.length,
         replayed_chunks: 0,
         rejected_chunks: 0,
-        transport: Some("http".to_owned()),
-        package_root: hex::encode(session.package.root),
-        total_bytes: records.iter().map(|record| record.bytes).sum(),
-        files: records,
-        partial: true,
-        log: vec![LogEvent {
-            at: now_unix(),
-            kind: "dropped".to_owned(),
-            path: None,
-            bytes: None,
-            secs: None,
-            count: None,
-        }],
     };
-    if let Err(error) = store.append_upload(&session.tenant, &session.link_id, upload) {
-        tracing::warn!(link = %session.link_id, %error, "partial upload record failed at boot");
-    }
+    record_session_event(store, ended, &session.tenant, &session.link_id, event);
 }
 
 fn commit_upload(
@@ -2355,43 +2373,57 @@ fn record_event(
         replayed_chunks: replays,
         rejected_chunks: rejected,
     };
+    record_session_event(
+        &setup.store,
+        &setup.ended,
+        &setup.tenant,
+        &setup.link_id,
+        event,
+    );
+}
+
+fn record_session_event(
+    store: &Arc<Store>,
+    ended_sender: &mpsc::UnboundedSender<SessionEnded>,
+    tenant: &str,
+    link_id: &str,
+    event: crate::store::SessionEvent,
+) {
     tracing::warn!(
-        target: "audit", event = "upload_session_ended", link = %setup.link_id,
+        target: "audit", event = "upload_session_ended", link = %link_id,
         outcome = %event.outcome, detail = %event.detail,
         received_bytes = event.received_bytes, expected_bytes = event.expected_bytes,
         "upload session ended without completing"
     );
-    setup.store.audit(
-        &setup.tenant,
+    store.audit(
+        tenant,
         "",
         "upload_session_ended",
-        &setup.link_id,
+        link_id,
         &serde_json::json!({
             "outcome": event.outcome,
             "received_bytes": event.received_bytes,
             "expected_bytes": event.expected_bytes
         }),
     );
-    crate::app::TRANSFERS.ended(outcome);
+    crate::app::TRANSFERS.ended(&event.outcome);
     let mut ended = SessionEnded {
-        tenant: setup.tenant.clone(),
-        link_id: setup.link_id.clone(),
+        tenant: tenant.to_owned(),
+        link_id: link_id.to_owned(),
         label: String::new(),
         notify: false,
         event: event.clone(),
     };
-    let _ = setup
-        .store
-        .update_link(&setup.tenant, &setup.link_id, |link| {
-            ended.label = link.label.clone();
-            ended.notify = link.notify_on_upload;
-            link.events.push(event);
-            if link.events.len() > EVENTS_KEPT {
-                let excess = link.events.len() - EVENTS_KEPT;
-                link.events.drain(..excess);
-            }
-        });
-    let _ = setup.ended.send(ended);
+    let _ = store.update_link(tenant, link_id, |link| {
+        ended.label = link.label.clone();
+        ended.notify = link.notify_on_upload;
+        link.events.push(event);
+        if link.events.len() > EVENTS_KEPT {
+            let excess = link.events.len() - EVENTS_KEPT;
+            link.events.drain(..excess);
+        }
+    });
+    let _ = ended_sender.send(ended);
 }
 
 /// Records a native-push ticket that ended before it opened a VOT session.
