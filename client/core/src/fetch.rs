@@ -32,6 +32,10 @@ use crate::send_push::{probe_any, Probe};
 /// Rails dialled at once. Matches the push default until the listener cap lands.
 const FETCH_RAILS: usize = 4;
 
+/// The resume store vot-cli writes inside a bundle while fetching and removes
+/// once the bundle is whole. Its presence means a fetch owns the stage.
+const RESUME_STORE: &str = "resume.vot";
+
 /// The outcome of an attempted fetch.
 pub enum Outcome {
     /// The delivery was fetched and materialized.
@@ -137,21 +141,36 @@ pub fn try_fetch(
     let identity = decode_digest(&mint.certificate_digest)?;
     let pin = decode_digest(&mint.package_root)?;
 
-    // Fetch into a bundle staged beside the destination, so the objects land on
-    // the same filesystem the files will.
+    // Fetch into a stable bundle staged beside the destination, so the objects
+    // land on the same filesystem the files will and a re-run resumes it. The
+    // stage is keyed by the package root, so the same delivery resumes even
+    // under a fresh capability after the old one expired. vot-cli keeps a
+    // resume store in the stage until the bundle is whole and resumes from a
+    // partial one; the stage is kept on failure for that resume and removed
+    // once the files materialized.
     // ponytail: the bundle is a full second copy on disk; fetch-to-loose or a
     // hardlink materialize is the upgrade when a large sequence needs it.
+    // ponytail: a stable stage name is what makes resume possible, but two
+    // receives of the same delivery into the same destination running at once
+    // now share it and can clear each other's bundle (a failed transfer, not
+    // lost data: materialize never overwrites an existing file). A lock would
+    // close it, at the cost of a stale lock blocking every retry after a crash;
+    // the CLI is one receive per process, so this stays a documented edge.
     let staging_parent = dest
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(staging_parent)?;
-    let bundle_home = tempfile::Builder::new()
-        .prefix(".votport-fetch-")
-        .tempdir_in(staging_parent)?;
-    let bundle = bundle_home.path().join("bundle");
+    let stage = staging_parent.join(format!(".vot-fetch-{}.bundle", hex::encode(pin)));
 
-    fetch_bundle_with(
+    // A bundle a prior fetch finished but materialize did not clear would make
+    // vot-cli refuse the stage (a non-empty dir with no resume store); remove
+    // only that exact shape, never a fetch in progress or resuming.
+    if stage_is_stale_complete(&stage) {
+        fs::remove_dir_all(&stage)?;
+    }
+
+    if let Err(error) = fetch_bundle_with(
         FetchOptions {
             address: reachable,
             holder: Some(holder),
@@ -162,11 +181,52 @@ pub fn try_fetch(
             extensions: BTreeSet::new(),
             progress: None,
         },
-        &bundle,
-    )?;
+        &stage,
+    ) {
+        // A stage no retry can resume (no store, or a corrupt one) would refuse
+        // every retry, and each retry mints a fresh ticket against the download
+        // cap. Clear it so the next attempt starts clean; a transport failure
+        // leaves a valid store and the stage is kept for resume.
+        if stage_unresumable(&error) {
+            let _ = fs::remove_dir_all(&stage);
+        }
+        return Err(error.into());
+    }
 
-    let received = materialize(&bundle, dest, observer)?;
+    let received = materialize(&stage, dest, observer)?;
+    // The files are on disk and verified; a failure to clear the stage must not
+    // fail the receive. A leftover whole bundle is removed on the next run.
+    let _ = fs::remove_dir_all(&stage);
     Ok(Outcome::Fetched(received))
+}
+
+/// Whether `stage` holds a bundle a prior fetch finished but a materialize did
+/// not clear: no resume store, and every object the manifest names present at
+/// its full length. vot-cli keeps the resume store until the bundle is whole,
+/// so any in-progress or resuming fetch has it and is never seen as stale; a
+/// stage with no readable manifest, or a short or missing object, is left for
+/// vot-cli to resume rather than removed.
+fn stage_is_stale_complete(stage: &Path) -> bool {
+    if stage.join(RESUME_STORE).exists() {
+        return false;
+    }
+    let Ok(entries) = read_manifest(stage) else {
+        return false;
+    };
+    let objects = stage.join("objects");
+    entries.iter().all(|entry| {
+        fs::metadata(objects.join(object_name(&entry.root)))
+            .map(|meta| meta.len() == entry.length)
+            .unwrap_or(false)
+    })
+}
+
+/// Whether a failed fetch left the stage in a state no retry can resume, so it
+/// should be cleared rather than kept: an incomplete bundle with no resume
+/// store (vot-cli refuses it), or a store vot-cli cannot resume from. Every
+/// other failure, a dropped transport above all, leaves a valid store.
+fn stage_unresumable(error: &VotError) -> bool {
+    matches!(error, VotError::DestinationExists | VotError::InvalidBundle)
 }
 
 /// Copies each object a fetched bundle holds to its loose path, re-hashing to
@@ -248,7 +308,9 @@ fn base64_decode(value: &str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::object_name;
+    use super::*;
+    use crate::entries::admit;
+    use crate::package::build;
 
     #[test]
     fn object_name_is_the_hex_root_with_an_obj_suffix() {
@@ -259,5 +321,89 @@ mod tests {
         assert_eq!(name.len(), 64 + ".obj".len());
         assert!(name.starts_with("ab00"), "{name}");
         assert!(name.ends_with("01.obj"), "{name}");
+    }
+
+    /// Builds a real manifest under `stage` and writes each object at its full
+    /// length. The stale check reads only object lengths, so zero-filled files
+    /// of the right size stand in for the fetched bytes.
+    fn whole_bundle(stage: &Path) {
+        let source = tempfile::tempdir().unwrap();
+        let big = source.path().join("big.bin");
+        let note = source.path().join("note.txt");
+        fs::write(&big, vec![7u8; 200_000]).unwrap();
+        fs::write(&note, b"a small note").unwrap();
+        let entries = vec![
+            admit("big.bin", big, false).unwrap(),
+            admit("note.txt", note, false).unwrap(),
+        ];
+        build(entries, stage).expect("built the manifest");
+        let objects = stage.join("objects");
+        fs::create_dir_all(&objects).unwrap();
+        for entry in read_manifest(stage).unwrap() {
+            fs::write(
+                objects.join(object_name(&entry.root)),
+                vec![0u8; entry.length as usize],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_whole_bundle_with_no_resume_store_is_stale() {
+        let home = tempfile::tempdir().unwrap();
+        let stage = home.path().join("s");
+        whole_bundle(&stage);
+        assert!(
+            stage_is_stale_complete(&stage),
+            "a finished bundle no materialize cleared is removable"
+        );
+    }
+
+    #[test]
+    fn a_resume_store_keeps_a_whole_bundle() {
+        let home = tempfile::tempdir().unwrap();
+        let stage = home.path().join("s");
+        whole_bundle(&stage);
+        fs::write(stage.join(RESUME_STORE), b"in progress").unwrap();
+        assert!(
+            !stage_is_stale_complete(&stage),
+            "a fetch owns any stage that still has a resume store"
+        );
+    }
+
+    #[test]
+    fn a_short_object_is_not_stale() {
+        let home = tempfile::tempdir().unwrap();
+        let stage = home.path().join("s");
+        whole_bundle(&stage);
+        let objects = stage.join("objects");
+        let first = &read_manifest(&stage).unwrap()[0];
+        fs::write(
+            objects.join(object_name(&first.root)),
+            vec![0u8; first.length as usize - 1],
+        )
+        .unwrap();
+        assert!(
+            !stage_is_stale_complete(&stage),
+            "a partial object means the fetch is not whole"
+        );
+    }
+
+    #[test]
+    fn a_stage_without_a_manifest_is_not_stale() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(
+            !stage_is_stale_complete(home.path()),
+            "no readable manifest is left for vot-cli, not removed"
+        );
+    }
+
+    #[test]
+    fn only_stage_integrity_errors_clear_the_stage() {
+        assert!(stage_unresumable(&VotError::DestinationExists));
+        assert!(stage_unresumable(&VotError::InvalidBundle));
+        // A transport or identity failure leaves a resumable store; the stage
+        // is kept so the next attempt resumes rather than refetching.
+        assert!(!stage_unresumable(&VotError::ServeIdentityMismatch));
     }
 }

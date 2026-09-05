@@ -43,7 +43,10 @@ fn a_delivery_is_fetched_over_quic_and_materialized() {
     let token = common::deliver(&server.base, &files, None, None);
     let state = tempfile::tempdir().unwrap();
     let device = Device::load_or_create_in(state.path()).expect("a device key");
-    let dest = tempfile::tempdir().unwrap();
+    // The destination sits under a controlled parent, so the assertion below can
+    // check that the fetch stage staged beside it was cleaned up.
+    let home = tempfile::tempdir().unwrap();
+    let dest = home.path().join("out");
 
     let received = receive_over_fetch(
         &server.base,
@@ -52,17 +55,33 @@ fn a_delivery_is_fetched_over_quic_and_materialized() {
             password: None,
         },
         &device,
-        dest.path(),
+        &dest,
         &mut Silent,
     )
     .expect("the delivery fetches over quic");
     assert_eq!(received.files.len(), files.len(), "every file materialized");
 
     for (name, expected) in &files {
-        let path = dest.path().join(name);
+        let path = dest.join(name);
         let bytes = std::fs::read(&path).unwrap_or_else(|_| panic!("{name} was not fetched"));
         assert_eq!(&bytes, expected, "{name} bytes differ");
     }
+
+    // The fetch stages the bundle beside the destination and removes it once the
+    // files are materialized; nothing hidden lingers.
+    let leftover = std::fs::read_dir(home.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".vot-fetch-")
+        });
+    assert!(
+        leftover.is_none(),
+        "the fetch stage was cleaned up, found {leftover:?}"
+    );
 
     // A second fetch into the same directory is refused before a ticket is
     // minted, so a refused receive does not burn the delivery's download cap.
@@ -73,7 +92,7 @@ fn a_delivery_is_fetched_over_quic_and_materialized() {
             password: None,
         },
         &device,
-        dest.path(),
+        &dest,
         &mut Silent,
     );
     assert!(
