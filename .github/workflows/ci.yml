@@ -92,6 +92,15 @@ jobs:
         working-directory: client
         run: VOTPORT_BIN="$GITHUB_WORKSPACE/server/target/debug/votport" cargo test
 
+      # The shells build only on their own machines, so the FFI surface is
+      # checked here: the bindgen reads the built library and fails on a
+      # surface the Swift generator cannot express.
+      - name: Generate the Swift bindings
+        working-directory: client
+        run: |
+          cargo build -p votport-client-core
+          cargo run -p uniffi-bindgen -- generate --library target/debug/libvotport_client_core.so --language swift --out-dir target/bindings
+
   client-windows:
     # The client carries a QUIC push carrier, so it builds BoringSSL through
     # bindgen and nasm. This job proves it compiles and its tests build on

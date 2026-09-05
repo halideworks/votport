@@ -7,6 +7,11 @@ rust-version = "1.97"
 description = "Cross-platform core for the votport desktop client"
 publish = false
 
+# The shells link the core as a static library (macOS XCFramework) or a
+# shared one (Windows DLL); the CLI links the rlib.
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
 [dependencies]
 vot-cli = { git = "https://github.com/halideworks/VOT", rev = "0a129ea8b7ef47578b956f3c70a8274bf623cb79", default-features = false, features = ["wire"] }
 vot-object = { git = "https://github.com/halideworks/VOT", rev = "0a129ea8b7ef47578b956f3c70a8274bf623cb79" }
@@ -20,6 +25,9 @@ base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 thiserror = "2"
+# Pinned to the release uniffi-bindgen-cs (the Windows shell's C# generator)
+# targets; the Swift generator ships inside uniffi itself.
+uniffi = "0.31.0"
 tempfile = "3"
 
 [dev-dependencies]

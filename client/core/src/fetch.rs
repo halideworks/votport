@@ -24,8 +24,8 @@ use vot_cli::{fetch_bundle_with, parse_rendezvous, Error as VotError, FetchOptio
 use crate::api::Client;
 use crate::error::{Error, Result};
 use crate::identity::Device;
-use crate::package::read_manifest;
-use crate::progress::{Event, Observer};
+use crate::package::{package_path_string, read_manifest};
+use crate::progress::{Event, Observer, PlannedFile};
 use crate::receive::{local_path, local_path_of, write_verified, Delivery, Received, Resumed};
 use crate::send_push::{probe_any, Probe};
 
@@ -245,6 +245,17 @@ fn materialize(bundle: &Path, dest: &Path, observer: &mut dyn Observer) -> Resul
             return Err(Error::Exists { path: path.clone() });
         }
     }
+    observer.event(Event::Planned {
+        files: entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| PlannedFile {
+                index,
+                path: package_path_string(&entry.path),
+                bytes: entry.length,
+            })
+            .collect(),
+    });
 
     fs::create_dir_all(dest)?;
     let mut files = Vec::with_capacity(planned.len());

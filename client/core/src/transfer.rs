@@ -6,7 +6,7 @@
 //! network that will not carry QUIC falls back to the HTTP session path the
 //! web sender uses.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
 
@@ -14,7 +14,7 @@ use crate::api::{Client, FinishReport, LinkInfo};
 use crate::error::{Error, Result};
 use crate::identity::Device;
 use crate::package::{self, Prepared};
-use crate::progress::Observer;
+use crate::progress::{Event, Observer, PlannedFile};
 use crate::send_push::Outcome;
 use crate::{entries, send_http, send_push};
 
@@ -30,6 +30,79 @@ pub struct Drop {
 pub struct Selected {
     pub relative: String,
     pub source: PathBuf,
+}
+
+/// Collects the files under `path` into selections, as a Finder or Explorer
+/// drop would: a file keeps its own name; a folder keeps its name as the top
+/// component. Symlinks are refused as an argument and skipped inside a folder,
+/// matching the manifest build's refusal of them.
+///
+/// # Errors
+/// A symlink argument, a nameless folder, or a read failure.
+pub fn collect(path: &Path, out: &mut Vec<Selected>) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        // A symlink arg would otherwise be neither file nor dir and yield
+        // nothing silently.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "symlinks are not sent",
+        ));
+    }
+    if metadata.is_file() {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        out.push(Selected {
+            relative: name,
+            source: path.to_path_buf(),
+        });
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        // `.` and `..` have no file name; canonicalize so the folder keeps its
+        // real name instead of flattening into the drop root.
+        let top = match path.file_name() {
+            Some(name) => name.to_string_lossy().into_owned(),
+            None => std::fs::canonicalize(path)?
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "the folder has no name")
+                })?,
+        };
+        walk(path, &top, out)?;
+    }
+    Ok(())
+}
+
+/// Recursively adds files under `dir`, each relative to `prefix`.
+fn walk(dir: &Path, prefix: &str, out: &mut Vec<Selected>) -> std::io::Result<()> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    entries.sort();
+    for entry in entries {
+        let metadata = std::fs::symlink_metadata(&entry)?;
+        let name = entry
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let relative = format!("{prefix}/{name}");
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            walk(&entry, &relative, out)?;
+        } else if metadata.is_file() {
+            out.push(Selected {
+                relative,
+                source: entry,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// How a drop was sent.
@@ -120,6 +193,22 @@ fn prepare(base: &str, drop: Drop) -> Result<Ready> {
     })
 }
 
+/// Announces the files the send will move, in begin order.
+fn announce(prepared: &Prepared, observer: &mut dyn Observer) {
+    observer.event(Event::Planned {
+        files: prepared
+            .objects
+            .iter()
+            .enumerate()
+            .map(|(index, object)| PlannedFile {
+                index,
+                path: object.path.clone(),
+                bytes: object.length,
+            })
+            .collect(),
+    });
+}
+
 /// Sends `drop` to the votport at `base`, preferring push when the link offers
 /// it and the receiver's carrier answers a probe, falling back to HTTP.
 ///
@@ -128,6 +217,7 @@ fn prepare(base: &str, drop: Drop) -> Result<Ready> {
 /// oversized drop, a build failure, or a transport error.
 pub fn send(base: &str, drop: Drop, device: &Device, observer: &mut dyn Observer) -> Result<Sent> {
     let ready = prepare(base, drop)?;
+    announce(&ready.prepared, observer);
     if ready.info.push {
         match send_push::try_push(
             &ready.client,
@@ -162,6 +252,7 @@ pub fn send(base: &str, drop: Drop, device: &Device, observer: &mut dyn Observer
 /// The same as [`send`], minus the push path.
 pub fn send_http(base: &str, drop: Drop, observer: &mut dyn Observer) -> Result<FinishReport> {
     let ready = prepare(base, drop)?;
+    announce(&ready.prepared, observer);
     send_http::send(
         &ready.client,
         &ready.token,

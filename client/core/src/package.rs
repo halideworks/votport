@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use vot_cli::{build_manifest_from, PackageSummary, ServedSource};
-use vot_manifest::{decode_page, decode_seal, EntryKind, PackagePath, StorageRef};
+use vot_manifest::{decode_page, decode_seal, Component, EntryKind, PackagePath, StorageRef};
 use vot_object::{ObjectBuilder, PreparedObject, Suite};
 
 use crate::entries::Entry;
@@ -30,6 +30,19 @@ pub struct StoredEntry {
     pub path: PackagePath,
     pub root: [u8; 32],
     pub length: u64,
+}
+
+/// A package path as the `/`-joined string a view shows; a non-UTF-8
+/// component is shown lossily.
+#[must_use]
+pub fn package_path_string(path: &PackagePath) -> String {
+    path.iter()
+        .map(|component| match component {
+            Component::Text(text) => text.clone(),
+            Component::Bytes(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Reads the file entries a bundle's manifest names, in canonical order.
@@ -76,6 +89,8 @@ fn manifest_page_path(directory: &Path, index: u64) -> PathBuf {
 /// One object a drop stores, in canonical (begin) order.
 #[derive(Debug, Clone)]
 pub struct PreparedEntry {
+    /// The package-relative path, joined with `/`.
+    pub path: String,
     pub root: [u8; 32],
     pub length: u64,
     /// A file holding the object's bytes, for the one-group case and for a
@@ -165,6 +180,7 @@ pub fn build(entries: Vec<Entry>, manifest_root: &Path) -> Result<Prepared> {
                 Error::Other("a manifest entry named an object with no source".to_owned())
             })?;
             objects.push(PreparedEntry {
+                path: package_path_string(&entry.path),
                 root: object.root,
                 length: object.length,
                 source: served_source.path.clone(),

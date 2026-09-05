@@ -3,9 +3,22 @@
 //! The CLI prints it; a shell forwards it to its UI. Keeping every tick on one
 //! observer means there is one place that knows what a transfer is doing.
 
+/// One file a transfer will move, announced before its first byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedFile {
+    /// The index the later ticks for this file carry.
+    pub index: usize,
+    /// The package-relative path.
+    pub path: String,
+    pub bytes: u64,
+}
+
 /// Something worth reporting during a send.
 #[derive(Debug, Clone)]
 pub enum Event {
+    /// The files the transfer will move, in index order, with their sizes, so
+    /// a view can name and size every later tick and sum the whole.
+    Planned { files: Vec<PlannedFile> },
     /// The upload session was created and named.
     SessionCreated { session: String },
     /// A chunk was accepted; `covered` of `total` bytes of the entry are in.

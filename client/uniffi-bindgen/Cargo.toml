@@ -1,0 +1,11 @@
+[package]
+name = "uniffi-bindgen"
+version = "0.1.0"
+edition = "2021"
+license-file = "../../LICENSE"
+rust-version = "1.97"
+description = "Generates the shells' bindings from the built core; pinned with the core's uniffi"
+publish = false
+
+[dependencies]
+uniffi = { version = "0.31.0", features = ["cli"] }

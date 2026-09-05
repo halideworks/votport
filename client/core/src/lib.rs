@@ -10,6 +10,7 @@ pub mod api;
 pub mod entries;
 pub mod error;
 pub mod fetch;
+pub mod ffi;
 pub mod identity;
 pub mod package;
 pub mod progress;
@@ -18,8 +19,11 @@ pub mod send_http;
 pub mod send_push;
 pub mod transfer;
 
+uniffi::setup_scaffolding!();
+
+pub use api::split_link;
 pub use error::{Error, Result};
 pub use fetch::receive_over_fetch;
 pub use identity::Device;
-pub use receive::{receive, receive_over_http, Delivery, Received};
-pub use transfer::{send, send_http as send_over_http, Drop, Selected, Sent};
+pub use receive::{receive, receive_over_http, receive_with_device_or_http, Delivery, Received};
+pub use transfer::{collect, send, send_http as send_over_http, Drop, Selected, Sent};
