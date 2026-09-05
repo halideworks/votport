@@ -14,6 +14,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, File};
+use std::io::{Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -25,7 +26,7 @@ use crate::error::{Error, Result};
 use crate::identity::Device;
 use crate::package::read_manifest;
 use crate::progress::{Event, Observer};
-use crate::receive::{local_path, local_path_of, write_verified, Delivery, Received};
+use crate::receive::{local_path, local_path_of, write_verified, Delivery, Received, Resumed};
 use crate::send_push::{probe_any, Probe};
 
 /// Rails dialled at once. Matches the push default until the listener cap lands.
@@ -189,10 +190,23 @@ fn materialize(bundle: &Path, dest: &Path, observer: &mut dyn Observer) -> Resul
     let mut files = Vec::with_capacity(planned.len());
     for (index, (path, root, length)) in planned.into_iter().enumerate() {
         let object = objects.join(object_name(&root));
-        let mut source = File::open(&object).map_err(|source| Error::Read {
-            path: object.clone(),
-            source,
-        })?;
+        let mut source = |offset: u64| -> Result<Resumed> {
+            let mut file = File::open(&object).map_err(|source| Error::Read {
+                path: object.clone(),
+                source,
+            })?;
+            if offset > 0 {
+                file.seek(SeekFrom::Start(offset))
+                    .map_err(|source| Error::Read {
+                        path: object.clone(),
+                        source,
+                    })?;
+            }
+            Ok(Resumed {
+                reader: Box::new(file),
+                start: offset,
+            })
+        };
         write_verified(
             &mut source,
             &path,

@@ -7,7 +7,7 @@ mod common;
 
 use std::path::PathBuf;
 
-use votport_client_core::progress::Silent;
+use votport_client_core::progress::{Event, Silent};
 use votport_client_core::{receive_over_http, Delivery, Error};
 
 #[test]
@@ -109,5 +109,59 @@ fn a_password_delivery_needs_the_password() {
         std::fs::read(dest.path().join("secret.txt")).unwrap(),
         note,
         "the delivered bytes match"
+    );
+}
+
+#[test]
+fn an_interrupted_download_resumes_from_the_partial() {
+    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
+        eprintln!("VOTPORT_BIN unset; skipping the HTTP resume e2e");
+        return;
+    };
+    let server = common::start_server(&bin, &[]);
+
+    // A multi-group file, and a partial already on disk from a prior
+    // interrupted attempt. The prefix is deliberately not group-aligned, so the
+    // resume exercises a byte-exact range append, not only a group boundary.
+    const PREFIX: usize = 5 * 1024 * 1024 + 12345;
+    let movie: Vec<u8> = (0..8u32 * 1024 * 1024).map(|index| index as u8).collect();
+    let files: Vec<(&str, Vec<u8>)> = vec![("movie.bin", movie.clone())];
+    let token = common::deliver(&server.base, &files, None);
+
+    let dest = tempfile::tempdir().unwrap();
+    // The temporary a receive resumes is a hidden `.vot-<name>.journal`.
+    std::fs::write(dest.path().join(".vot-movie.bin.journal"), &movie[..PREFIX]).unwrap();
+
+    // Record progress so the test can prove the download resumed rather than
+    // restarting from zero.
+    let mut received_marks: Vec<u64> = Vec::new();
+    {
+        let mut observer = |event: Event| {
+            if let Event::Downloading { received, .. } = event {
+                received_marks.push(received);
+            }
+        };
+        receive_over_http(
+            &server.base,
+            Delivery {
+                token,
+                password: None,
+            },
+            dest.path(),
+            &mut observer,
+        )
+        .expect("the interrupted download resumes and completes");
+    }
+
+    let landed = std::fs::read(dest.path().join("movie.bin")).unwrap();
+    assert_eq!(landed, movie, "the resumed file is byte-identical");
+
+    // The first progress mark is past the prefix, so the download continued
+    // from the partial; a full re-download would report the first chunk near
+    // zero, well under the prefix.
+    let first = *received_marks.first().expect("a Downloading event");
+    assert!(
+        first > PREFIX as u64,
+        "resumed from {PREFIX}, but the first mark was {first}"
     );
 }
