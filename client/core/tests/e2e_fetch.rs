@@ -40,7 +40,7 @@ fn a_delivery_is_fetched_over_quic_and_materialized() {
         ("empty.bin", Vec::new()),
     ];
 
-    let token = common::deliver(&server.base, &files, None);
+    let token = common::deliver(&server.base, &files, None, None);
     let state = tempfile::tempdir().unwrap();
     let device = Device::load_or_create_in(state.path()).expect("a device key");
     let dest = tempfile::tempdir().unwrap();
@@ -80,4 +80,63 @@ fn a_delivery_is_fetched_over_quic_and_materialized() {
         matches!(again, Err(Error::Exists { .. })),
         "a second fetch into the same directory is refused, got {again:?}"
     );
+}
+
+#[test]
+fn a_refused_fetch_does_not_burn_a_download_ticket() {
+    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
+        eprintln!("VOTPORT_BIN unset; skipping the fetch ticket-burn e2e");
+        return;
+    };
+    let serve_port = common::free_port();
+    let server = common::start_server(
+        &bin,
+        &[
+            ("VOTPORT_SERVE_BIND", format!("127.0.0.1:{serve_port}")),
+            ("VOTPORT_SERVE_ADVERTISE", format!("localhost:{serve_port}")),
+        ],
+    );
+
+    // One deliverable, and a delivery that serves exactly one download.
+    let note = b"one shot".to_vec();
+    let files: Vec<(&str, Vec<u8>)> = vec![("once.bin", note.clone())];
+    let token = common::deliver(&server.base, &files, None, Some(1));
+
+    let state = tempfile::tempdir().unwrap();
+    let device = Device::load_or_create_in(state.path()).expect("a device key");
+
+    // A destination that already holds the file. The fetch must refuse here
+    // before minting, so the single download ticket is not spent.
+    let occupied = tempfile::tempdir().unwrap();
+    std::fs::write(occupied.path().join("once.bin"), b"in the way").unwrap();
+    let refused = receive_over_fetch(
+        &server.base,
+        Delivery {
+            token: token.clone(),
+            password: None,
+        },
+        &device,
+        occupied.path(),
+        &mut Silent,
+    );
+    assert!(
+        matches!(refused, Err(Error::Exists { .. })),
+        "the fetch is refused before minting, got {refused:?}"
+    );
+
+    // The ticket was not spent, so a fetch into a fresh directory still works.
+    let fresh = tempfile::tempdir().unwrap();
+    let received = receive_over_fetch(
+        &server.base,
+        Delivery {
+            token,
+            password: None,
+        },
+        &device,
+        fresh.path(),
+        &mut Silent,
+    )
+    .expect("the one remaining download is still available");
+    assert_eq!(received.files.len(), 1);
+    assert_eq!(std::fs::read(fresh.path().join("once.bin")).unwrap(), note);
 }

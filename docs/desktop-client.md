@@ -1,11 +1,16 @@
 # The desktop client: native apps on one Rust core
 
-Status: design, 2026-09-04. The VOT seams in "VOT changes" landed in
+Status: in progress, 2026-09-05. The VOT seams in "VOT changes" landed in
 vot-cli at pin `0a129ea` (`build_manifest`, `build_manifest_from`,
 `push_from`, `fetch_bundle_with`, `probe_serve`, the proof-cache accessors,
 and the wire build on the platform-native CI job); the listener session cap
-is a separate follow-on. Nothing under `client/` exists yet; the shells
-come after the core and CLI move bytes end to end against a local votport.
+is a separate follow-on. The core and CLI now move bytes end to end: C1 send
+over HTTP and QUIC push (#183, #184), C2 receive over HTTP and QUIC fetch
+(#185, #186), and C7 within-object resume over HTTP (#187) have landed. Next
+are the native shells (C4 macOS SwiftUI, C5 Windows WinUI 3) on their target
+machines, and the core follow-ons: the client journal with `votport status`
+(which also gives multi-file resume), QUIC bundle-refetch resume, and watch
+folders.
 
 | Field | Value |
 | --- | --- |
