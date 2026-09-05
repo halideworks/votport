@@ -264,7 +264,7 @@ Value is `app.signer.public_hex`, the same string `list_links` already returns a
 
 `suite` from existing `session::suite_name(receipt.suite_id)`. `root` is `hex::encode(receipt.subject_digest)` (64 lowercase hex). `length` is `receipt.subject_length`. The verify page maps `bytes: result.length` before `appendObjectCard`; the helper never reads `length`.
 
-`vot-receipt` at pin `26ccd14` exposes `SubjectKind` / `AssuranceLevel` / `CommitProfile` as `repr(u8)` with no serde aliases and no `Display`. Do not `format!("{:?}", …)` (`Object` / `Published` / `Balanced`). Explicit match, and tests for the strings:
+`vot-receipt` at pin `0a129ea` exposes `SubjectKind` / `AssuranceLevel` / `CommitProfile` as `repr(u8)` with no serde aliases and no `Display`. Do not `format!("{:?}", …)` (`Object` / `Published` / `Balanced`). Explicit match, and tests for the strings:
 
 | Rust | JSON |
 | --- | --- |
@@ -652,7 +652,7 @@ iOS pass is a manual gate on PR 3 (lock screen mid-send). Chromium `scripts/brow
 - `server/src/store.rs` (`FileRecord`, `UploadRecord`)
 - `server/tests/e2e.rs` `receipts_are_written_and_files_are_manageable`
 - `scripts/browser-e2e.mjs`
-- vot-receipt at pin `26ccd14b54d37177cec47e7ce86b99f0bc985b5c`: `decode_authenticated`, `verify_ed25519`, 65_536 byte cap
+- vot-receipt at pin `0a129ea8b7ef47578b956f3c70a8274bf623cb79`: `decode_authenticated`, `verify_ed25519`, 65_536 byte cap
 - `docs/enterprise-ops.md`, `docs/deployment.md` (8 MiB ceiling), `README.md` Receipts section
 - `HANDOFF.md` load-bearing ids note: grep before renaming
 
