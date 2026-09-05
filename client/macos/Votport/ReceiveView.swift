@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import VotportCore
 
 struct ReceiveView: View {
     @StateObject private var model = ReceiveModel()
@@ -24,26 +25,17 @@ struct ReceiveView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer()
-                Button("Receive") { model.start() }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(!model.canStart)
+                if model.running {
+                    Button("Cancel") { model.cancel() }
+                } else {
+                    Button("Receive") { model.start() }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!model.canStart)
+                }
             }
 
-            List(model.files) { file in
-                HStack {
-                    Text(file.path)
-                        .font(.system(.body, design: .monospaced))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Spacer()
-                    ProgressView(value: Double(file.received), total: Double(max(file.bytes, 1)))
-                        .frame(width: 140)
-                        .tint(file.verified ? Tokens.ok : Tokens.progress)
-                    Text(file.verified ? "verified" : "\(file.received) / \(file.bytes)")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(file.verified ? Tokens.ok : Tokens.muted)
-                        .frame(width: 150, alignment: .trailing)
-                }
+            List(model.view?.files ?? [], id: \.index) { file in
+                FileRowView(file: file)
             }
             .scrollContentBackground(.hidden)
             .background(Tokens.panel)
@@ -60,20 +52,25 @@ struct ReceiveView: View {
 
     @ViewBuilder
     private var status: some View {
-        switch model.phase {
-        case .idle:
+        switch model.view?.phase {
+        case nil:
             Text("Paste a delivery link and choose where its files land.")
                 .foregroundStyle(Tokens.muted)
-        case .running:
+        case .preparing:
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)
-                Text("Receiving")
+                Text("Preparing")
             }
-        case .done(let files):
-            Text("Done: \(files) file(s) received and verified.")
+        case .transferring:
+            TransferStatus(view: model.view!)
+        case .done:
+            Text("Done: \(model.view!.files.count) file(s) received and verified.")
                 .foregroundStyle(Tokens.ok)
-        case .failed(let message):
-            Text(message)
+        case .cancelled:
+            Text("Cancelled. Receive again to continue.")
+                .foregroundStyle(Tokens.muted)
+        case .failed:
+            Text(model.view!.message ?? "Failed")
                 .foregroundStyle(Tokens.danger)
                 .textSelection(.enabled)
         }
@@ -87,6 +84,91 @@ struct ReceiveView: View {
         panel.prompt = "Receive Here"
         if panel.runModal() == .OK {
             model.destination = panel.url
+        }
+    }
+}
+
+/// One file of the transfer list, drawn from the core's row.
+struct FileRowView: View {
+    let file: FileView
+
+    var body: some View {
+        HStack {
+            Text(file.path)
+                .font(.system(.body, design: .monospaced))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer()
+            ProgressView(value: Double(file.moved), total: Double(max(file.bytes, 1)))
+                .frame(width: 140)
+                .tint(file.state == .verified ? Tokens.ok : Tokens.progress)
+            Text(label)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(file.state == .verified ? Tokens.ok : Tokens.muted)
+                .frame(width: 150, alignment: .trailing)
+        }
+    }
+
+    private var label: String {
+        switch file.state {
+        case .waiting: return Format.bytes(file.bytes)
+        case .moving: return "\(Format.bytes(file.moved)) of \(Format.bytes(file.bytes))"
+        case .landed: return "landed"
+        case .verified: return "verified"
+        }
+    }
+}
+
+/// The moving-bytes line: the transport, the rate, and the ETA once the core
+/// is willing to state one.
+struct TransferStatus: View {
+    let view: TransferView
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ProgressView().controlSize(.small)
+            Text(line)
+                .monospacedDigit()
+        }
+    }
+
+    private var line: String {
+        var parts = ["Receiving"]
+        if let transport = view.transport {
+            parts.append("over \(Format.transport(transport))")
+        }
+        if let total = view.totalBytes {
+            parts.append("\(Format.bytes(view.movedBytes)) of \(Format.bytes(total))")
+        }
+        if let rate = view.rateBytesPerSecond {
+            parts.append("\(Format.bytes(rate))/s")
+        }
+        if let eta = view.etaSeconds {
+            parts.append("about \(Format.seconds(eta)) left")
+        }
+        return parts.joined(separator: ", ")
+    }
+}
+
+/// Number formatting for the screen. Units and words only; every value comes
+/// from the core.
+enum Format {
+    static func bytes(_ value: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(clamping: value), countStyle: .file)
+    }
+
+    static func seconds(_ value: UInt64) -> String {
+        let formatter = DateComponentsFormatter()
+        formatter.allowedUnits = value >= 3600 ? [.hour, .minute] : [.minute, .second]
+        formatter.unitsStyle = .short
+        return formatter.string(from: TimeInterval(value)) ?? "\(value) s"
+    }
+
+    static func transport(_ transport: Transport) -> String {
+        switch transport {
+        case .push: return "QUIC push"
+        case .fetch: return "QUIC fetch"
+        case .http: return "HTTP"
         }
     }
 }

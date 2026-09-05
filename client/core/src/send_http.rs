@@ -11,7 +11,7 @@ use std::io::{Read, Seek, SeekFrom};
 use crate::api::{Client, EntryInfo, FinishReport, PackageAnnouncement};
 use crate::error::{Error, Result};
 use crate::package::Prepared;
-use crate::progress::{Event, Observer};
+use crate::progress::{Event, Observer, Transport};
 
 /// Sends a prepared drop to `token` over the HTTP session protocol.
 ///
@@ -38,6 +38,7 @@ pub fn send(
     observer.event(Event::SessionCreated {
         session: session.clone(),
     });
+    observer.event(Event::Transport(Transport::Http));
 
     let result = drive(client, &session, created.chunk_bytes, prepared, observer);
     if result.is_err() {
@@ -118,6 +119,9 @@ fn send_entries(
     observer: &mut dyn Observer,
 ) -> Result<Outcome> {
     for info in entries {
+        if observer.cancelled() {
+            return Err(Error::Cancelled);
+        }
         if info.complete {
             observer.event(Event::EntryComplete {
                 index: info.index,
@@ -163,6 +167,9 @@ fn send_entries(
                 path: object.source.clone(),
                 source,
             })?;
+            if observer.cancelled() {
+                return Err(Error::Cancelled);
+            }
             let progress = client.chunk(session, info.index, offset, cover.proof(), &data)?;
             if progress.rebegin {
                 return Ok(Outcome::Rebegin);

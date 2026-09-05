@@ -23,10 +23,22 @@ prompt (the CLI is not asked), so a headless test reaches the server over
 an ssh reverse tunnel on loopback; and `Votport --receive <link> <dir>
 --snapshot <png>` drives a receive from the command line and writes the
 window's own rendering, since screen capture over ssh needs a permission
-grant at the Mac. Next: the Finder drop target and Send, the sidebar, the
-menu bar item, notifications, the `votport://` scheme, then the Windows
-shell (C5) and the core follow-ons: the client journal with `votport
-status` (which also gives multi-file resume) and watch folders.
+grant at the Mac. The FFI now hands a shell a `TransferView` computed in
+Rust (phase, transport, per-file rows and states, bytes, a rate over a
+five-second window, an ETA once the rate has held ten seconds) through a
+`TransferListener`, with a `Transfer` handle for cancel; the QUIC paths
+report carrier bytes through vot-cli's progress callback. A cancel takes
+effect per chunk and per file over HTTP; over QUIC it is honoured only
+before the push preflight or the fetch ticket, since vot-cli drops the
+resume store once a bundle is whole and a stop after that would discard a
+complete download (threading vot-cli's `CancellationHandle` through its
+options is the VOT change that makes a mid-carrier cancel possible). A
+one-second ticker re-measures the rate while nothing arrives, so a stall
+reads as a rate falling to zero. Next: the Finder drop target
+and Send, the sidebar, the menu bar item, notifications, the `votport://`
+scheme, then the Windows shell (C5) and the core follow-ons: the client
+journal with `votport status` (which also gives multi-file resume) and
+watch folders.
 
 | Field | Value |
 | --- | --- |

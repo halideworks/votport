@@ -22,7 +22,7 @@ use crate::entries::admit;
 use crate::error::{Error, Result};
 use crate::fetch::{try_fetch, Outcome};
 use crate::identity::Device;
-use crate::progress::{Event, Observer, PlannedFile};
+use crate::progress::{Event, Observer, PlannedFile, Transport};
 
 /// A delivery to fetch: the token from the share link and its password, if any.
 pub struct Delivery {
@@ -151,10 +151,15 @@ pub fn receive_over_http(
             .collect(),
     });
 
+    observer.event(Event::Transport(Transport::Http));
+
     fs::create_dir_all(dest)?;
     let cookie = cookie.as_deref();
     let mut files = Vec::with_capacity(planned.len());
     for (index, (file, path, root)) in planned.into_iter().enumerate() {
+        if observer.cancelled() {
+            return Err(Error::Cancelled);
+        }
         let mut source = |offset: u64| -> Result<Resumed> {
             let (response, start) = client.download(&file.download_url, cookie, offset)?;
             Ok(Resumed {
@@ -386,6 +391,10 @@ fn hash_copy(
     let mut buffer = vec![0u8; READ_CHUNK];
     let mut received = base;
     loop {
+        // A cancel keeps the partial for the next run to resume.
+        if observer.cancelled() {
+            return Err(Error::Cancelled);
+        }
         let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;

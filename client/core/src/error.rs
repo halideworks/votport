@@ -81,6 +81,11 @@ pub enum Error {
     #[error("{path} already exists; receive into a directory that does not hold it")]
     Exists { path: PathBuf },
 
+    /// The caller asked the transfer to stop. Whatever landed stays; a partial
+    /// file is kept for the next run to resume.
+    #[error("the transfer was cancelled")]
+    Cancelled,
+
     #[error("filesystem error: {0}")]
     Io(#[from] std::io::Error),
 

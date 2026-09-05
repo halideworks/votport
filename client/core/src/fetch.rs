@@ -25,7 +25,7 @@ use crate::api::Client;
 use crate::error::{Error, Result};
 use crate::identity::Device;
 use crate::package::{package_path_string, read_manifest};
-use crate::progress::{Event, Observer, PlannedFile};
+use crate::progress::{with_progress, Event, Observer, PlannedFile, Transport, PROGRESS_QUANTUM};
 use crate::receive::{local_path, local_path_of, write_verified, Delivery, Received, Resumed};
 use crate::send_push::{probe_any, Probe};
 
@@ -128,6 +128,9 @@ pub fn try_fetch(
         Probe::Mismatch => return Err(Error::Package(VotError::ServeIdentityMismatch)),
     };
 
+    if observer.cancelled() {
+        return Err(Error::Cancelled);
+    }
     // The serve answered, so mint a capability and commit to the fetch.
     let mint = client.mint_fetch(&delivery.token, &device.holder_key_hex(), cookie.as_deref())?;
     let capability = base64_decode(&mint.capability)?;
@@ -170,19 +173,42 @@ pub fn try_fetch(
         fs::remove_dir_all(&stage)?;
     }
 
-    if let Err(error) = fetch_bundle_with(
-        FetchOptions {
-            address: reachable,
-            holder: Some(holder),
-            serve_identity: Some(identity),
-            pin: Some(pin),
-            rails: FETCH_RAILS,
-            provers: None,
-            extensions: BTreeSet::new(),
-            progress: None,
-        },
-        &stage,
-    ) {
+    // The delivery's own file list, so a screen has rows while the carrier
+    // moves the bundle; materialize announces the manifest's list after.
+    observer.event(Event::Planned {
+        files: metadata
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| PlannedFile {
+                index,
+                path: file.name.clone(),
+                bytes: file.bytes,
+            })
+            .collect(),
+    });
+    observer.event(Event::Transport(Transport::Fetch));
+    // ponytail: once the ticket is minted a cancel is not honoured: vot-cli
+    // removes the resume store when the bundle is whole, so stopping after
+    // that would discard a complete download and mint a fresh ticket on the
+    // next run. Threading vot-cli's CancellationHandle through FetchOptions
+    // is the VOT change that makes a mid-fetch cancel possible.
+    let fetched = with_progress(observer, |progress| {
+        fetch_bundle_with(
+            FetchOptions {
+                address: reachable,
+                holder: Some(holder),
+                serve_identity: Some(identity),
+                pin: Some(pin),
+                rails: FETCH_RAILS,
+                provers: None,
+                extensions: BTreeSet::new(),
+                progress: Some((PROGRESS_QUANTUM, progress)),
+            },
+            &stage,
+        )
+    });
+    if let Err(error) = fetched {
         // A stage no retry can resume (no store, or a corrupt one) would refuse
         // every retry, and each retry mints a fresh ticket against the download
         // cap. Clear it so the next attempt starts clean; a transport failure
