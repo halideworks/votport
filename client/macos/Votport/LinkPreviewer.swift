@@ -10,6 +10,12 @@ final class LinkPreviewer: ObservableObject {
     @Published private(set) var checking = false
     private var pending: DispatchWorkItem?
     private var current = ""
+    /// The kind of link the screen takes; the other kind is named as such.
+    private let expect: LinkKind
+
+    init(expect: LinkKind) {
+        self.expect = expect
+    }
 
     /// Typing pauses this long before the core is asked.
     private static let settle: TimeInterval = 0.4
@@ -25,9 +31,10 @@ final class LinkPreviewer: ObservableObject {
             return
         }
         checking = true
+        let expect = self.expect
         let work = DispatchWorkItem { [weak self] in
             let thread = Thread {
-                let result = VotportCore.inspect(link: trimmed)
+                let result = VotportCore.inspect(link: trimmed, expect: expect)
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated { self?.deliver(result, for: trimmed) }
                 }

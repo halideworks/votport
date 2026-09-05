@@ -11,6 +11,8 @@ public sealed class LinkPreviewer
     private readonly DispatcherQueue dispatcher = DispatcherQueue.GetForCurrentThread();
     private readonly DispatcherQueueTimer timer;
     private readonly Action changed;
+    /// The kind of link the page takes; the other kind is named as such.
+    private readonly LinkKind expect;
     private string current = "";
 
     internal LinkPreview? Preview { get; private set; }
@@ -20,8 +22,9 @@ public sealed class LinkPreviewer
 
     /// `changed` runs on the UI thread whenever the preview or its checking
     /// state changes.
-    public LinkPreviewer(Action changed)
+    internal LinkPreviewer(LinkKind expect, Action changed)
     {
+        this.expect = expect;
         this.changed = changed;
         timer = dispatcher.CreateTimer();
         // Typing pauses this long before the core is asked.
@@ -52,7 +55,7 @@ public sealed class LinkPreviewer
         var thread = new Thread(() =>
         {
             LinkPreview? result = null;
-            try { result = VotportClientCoreMethods.Inspect(link); }
+            try { result = VotportClientCoreMethods.Inspect(link, expect); }
             catch (Exception e)
             {
                 // inspect never fails by contract; a binding mismatch would.

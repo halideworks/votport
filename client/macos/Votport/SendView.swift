@@ -6,7 +6,7 @@ import UniformTypeIdentifiers
 /// the clipboard, a request link, and one primary action.
 struct SendView: View {
     @EnvironmentObject private var store: TransferStore
-    @StateObject private var previewer = LinkPreviewer()
+    @StateObject private var previewer = LinkPreviewer(expect: .request)
     @State private var link = ""
     @State private var password = ""
     @State private var paths: [String] = []
@@ -15,7 +15,7 @@ struct SendView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("SEND")
-                .font(.caption.weight(.semibold))
+                .font(Type.label)
                 .tracking(1.5)
                 .foregroundStyle(Tokens.muted)
 
@@ -24,7 +24,7 @@ struct SendView: View {
                 .onChange(of: link) { _, value in previewer.update(value) }
             if let line = PreviewLine.text(previewer) {
                 Text(line)
-                    .font(.callout)
+                    .font(Type.callout)
                     .foregroundStyle(PreviewLine.isProblem(previewer) ? Tokens.danger : Tokens.muted)
             }
             if previewer.needsPassword {
@@ -72,7 +72,7 @@ struct SendView: View {
             } else {
                 List(paths, id: \.self) { path in
                     Text(path)
-                        .font(.system(.body, design: .monospaced))
+                        .font(Type.monoBody)
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }

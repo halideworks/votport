@@ -12,7 +12,7 @@ struct TransfersView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("TRANSFERS")
-                .font(.caption.weight(.semibold))
+                .font(Type.label)
                 .tracking(1.5)
                 .foregroundStyle(Tokens.muted)
             if store.items.isEmpty {
@@ -56,7 +56,7 @@ struct TransferCard: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Text(Format.statusLine(item))
-                        .font(.caption.monospacedDigit())
+                        .font(Type.caption.monospacedDigit())
                         .foregroundStyle(statusColor)
                 }
                 Spacer()
@@ -94,7 +94,7 @@ struct TransferCard: View {
                 if expanded {
                     if let detail = view.detail {
                         Text(detail)
-                            .font(.caption)
+                            .font(Type.caption)
                             .foregroundStyle(Tokens.muted)
                             .textSelection(.enabled)
                     }
@@ -127,7 +127,7 @@ struct FileRowView: View {
     var body: some View {
         HStack {
             Text(file.path)
-                .font(.system(.callout, design: .monospaced))
+                .font(Type.monoCallout)
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer()
@@ -135,7 +135,7 @@ struct FileRowView: View {
                 .frame(width: 120)
                 .tint(file.state == .verified ? Tokens.ok : Tokens.progress)
             Text(Format.fileLabel(file))
-                .font(.caption.monospacedDigit())
+                .font(Type.caption.monospacedDigit())
                 .foregroundStyle(file.state == .verified ? Tokens.ok : Tokens.muted)
                 .frame(width: 150, alignment: .trailing)
         }

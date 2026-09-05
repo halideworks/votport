@@ -2,6 +2,8 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Windows.Storage.Pickers;
 
+using uniffi.votport_client_core;
+
 namespace Votport;
 
 /// The recipient page is the destination picker: a delivery link, a
@@ -14,13 +16,18 @@ public sealed partial class ReceivePage : Page
     public ReceivePage()
     {
         InitializeComponent();
-        previewer = new LinkPreviewer(Refresh);
+        // The preview line's brush is assigned in code, so a theme flip
+        // repaints it here rather than through ThemeResource.
+        ActualThemeChanged += (_, _) => Refresh();
+        previewer = new LinkPreviewer(LinkKind.Delivery, Refresh);
         folder = Settings.ReceiveFolder;
         LinkBox.TextChanged += (_, _) => previewer.Update(LinkBox.Text);
         if (TransferStore.Shared.PrefillReceive is string link)
         {
             LinkBox.Text = link;
             TransferStore.Shared.PrefillReceive = null;
+            // Set before the box is loaded, so no TextChanged fires for it.
+            previewer.Update(link);
         }
         Refresh();
     }
@@ -31,7 +38,7 @@ public sealed partial class ReceivePage : Page
         var line = previewer.Line();
         PreviewText.Text = line ?? "";
         PreviewText.Visibility = line is null ? Visibility.Collapsed : Visibility.Visible;
-        PreviewText.Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources[previewer.IsProblem ? "VotDangerBrush" : "VotMutedBrush"];
+        PreviewText.Foreground = Theme.Brush(this, previewer.IsProblem ? "VotDanger" : "VotMuted");
         PasswordBox.Visibility = previewer.NeedsPassword ? Visibility.Visible : Visibility.Collapsed;
         ReceiveButton.IsEnabled = folder.Length > 0 && previewer.Ready;
     }

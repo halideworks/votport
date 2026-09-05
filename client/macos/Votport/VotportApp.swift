@@ -1,5 +1,8 @@
+import OSLog
 import SwiftUI
 import VotportCore
+
+private let launchLog = Logger(subsystem: "com.halideworks.votport", category: "launch")
 
 @main
 struct VotportApp: App {
@@ -62,6 +65,7 @@ struct MainWindow: View {
         }
         .background(Tokens.bg)
         .foregroundStyle(Tokens.text)
+        .font(Type.body)
         .onAppear {
             if Launch.done || store.items.contains(where: \.interrupted) {
                 section = .transfers
@@ -115,6 +119,11 @@ struct MenuBarContent: View {
 /// screen never shows one, and a headless run still has to move bytes.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // The bundled families register through ATSApplicationFontsPath; a
+        // headless run reads this line to know the type resolved.
+        let families = NSFontManager.shared.availableFontFamilies
+        launchLog.notice(
+            "fonts: sans \(families.contains(Type.sansFamily)) mono \(families.contains(Type.monoFamily))")
         MainActor.assumeIsolated {
             TransferStore.shared.loadPending()
             _ = Launch.startFromArguments(store: .shared)

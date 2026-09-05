@@ -132,7 +132,7 @@ fn inspect(args: &[String]) -> Result<(), String> {
     let [link] = args else {
         return Err("inspect takes one link".to_owned());
     };
-    let preview = votport_client_core::ffi::inspect(link.clone());
+    let preview = votport_client_core::ffi::inspect(link.clone(), None);
     let files: Vec<serde_json::Value> = preview
         .files
         .iter()

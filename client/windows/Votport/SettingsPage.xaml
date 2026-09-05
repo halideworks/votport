@@ -10,6 +10,8 @@
       <Button x:Name="ClearButton" Content="Clear" Click="Clear_Click" />
     </StackPanel>
     <ToggleSwitch x:Name="NotifySwitch" Header="Notify when a transfer ends" Toggled="Notify_Toggled" />
+    <ToggleSwitch x:Name="TraySwitch" Header="Keep running in the tray when the window is closed" Toggled="Tray_Toggled" />
+    <ToggleSwitch x:Name="StartSwitch" Header="Start with Windows, minimized to the tray" Toggled="Start_Toggled" />
     <TextBlock x:Name="CoreText" Foreground="{ThemeResource VotMutedBrush}" />
   </StackPanel>
 </Page>

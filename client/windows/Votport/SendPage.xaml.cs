@@ -5,6 +5,8 @@ using Windows.ApplicationModel.DataTransfer;
 using Windows.Storage;
 using Windows.Storage.Pickers;
 
+using uniffi.votport_client_core;
+
 namespace Votport;
 
 /// The sender page is the drop target: files and folders from Explorer or
@@ -17,7 +19,10 @@ public sealed partial class SendPage : Page
     public SendPage()
     {
         InitializeComponent();
-        previewer = new LinkPreviewer(Refresh);
+        // The preview line's brush is assigned in code, so a theme flip
+        // repaints it here rather than through ThemeResource.
+        ActualThemeChanged += (_, _) => Refresh();
+        previewer = new LinkPreviewer(LinkKind.Request, Refresh);
         Paths.ItemsSource = paths;
         paths.CollectionChanged += (_, _) => Refresh();
         LinkBox.TextChanged += (_, _) => previewer.Update(LinkBox.Text);
@@ -25,6 +30,8 @@ public sealed partial class SendPage : Page
         {
             LinkBox.Text = link;
             TransferStore.Shared.PrefillSend = null;
+            // Set before the box is loaded, so no TextChanged fires for it.
+            previewer.Update(link);
         }
         Refresh();
     }
@@ -38,7 +45,7 @@ public sealed partial class SendPage : Page
         var line = previewer.Line();
         PreviewText.Text = line ?? "";
         PreviewText.Visibility = line is null ? Visibility.Collapsed : Visibility.Visible;
-        PreviewText.Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources[previewer.IsProblem ? "VotDangerBrush" : "VotMutedBrush"];
+        PreviewText.Foreground = Theme.Brush(this, previewer.IsProblem ? "VotDanger" : "VotMuted");
         PasswordBox.Visibility = previewer.NeedsPassword ? Visibility.Visible : Visibility.Collapsed;
         SendButton.IsEnabled = any && previewer.Ready;
     }

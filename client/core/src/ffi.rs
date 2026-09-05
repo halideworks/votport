@@ -288,15 +288,17 @@ pub struct LinkPreview {
 /// Reads what `link` is with the two unauthenticated GETs the transfer
 /// paths start with. Nothing is verified, minted, or reserved: a preview
 /// spends nothing on the server. Never fails: a link that cannot be used
-/// comes back with `problem` set, so a screen shows it under the field.
+/// comes back with `problem` set, so a screen shows it under the field. A
+/// screen that takes one kind of link passes it as `expect`, so a delivery
+/// link pasted into Send is named as such rather than previewed.
 /// Blocks for the round trip: about two minutes against a host that never
 /// connects (the connect timeout inside the retry budget), and with no bound
 /// against one that connects and never answers, since the client sets no
 /// read timeout (a transfer's reads are long by design). A shell runs it off
 /// its main thread and ignores a result for a link the field no longer holds.
 #[uniffi::export]
-pub fn inspect(link: String) -> LinkPreview {
-    match preview(&link) {
+pub fn inspect(link: String, expect: Option<LinkKind>) -> LinkPreview {
+    match preview(&link, expect) {
         Ok(preview) => preview,
         Err(error) => LinkPreview {
             kind: split_link(&link).ok().map(|link| link.kind),
@@ -314,8 +316,11 @@ pub fn inspect(link: String) -> LinkPreview {
     }
 }
 
-fn preview(link: &str) -> std::result::Result<LinkPreview, Error> {
-    let link = split_link(link)?;
+fn preview(link: &str, expect: Option<LinkKind>) -> std::result::Result<LinkPreview, Error> {
+    let link = match expect {
+        Some(kind) => split_link_as(link, kind)?,
+        None => split_link(link)?,
+    };
     let client = crate::api::Client::new(&link.base)?;
     if link.kind == LinkKind::Delivery {
         let metadata = client.outbound_metadata(&link.token, None)?;

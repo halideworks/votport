@@ -16,6 +16,10 @@ targets:
     platform: macOS
     sources:
       - Votport
+      # The OFL fonts, copied as a folder into Resources/fonts.
+      - path: ../design/fonts
+        type: folder
+        buildPhase: resources
     dependencies:
       - package: VotportCore
     info:
@@ -25,6 +29,7 @@ targets:
         CFBundleDisplayName: votport
         LSMinimumSystemVersion: "14.0"
         NSHighResolutionCapable: true
+        ATSApplicationFontsPath: fonts
         # The web pages' "Open in the votport app" links.
         CFBundleURLTypes:
           - CFBundleURLName: com.halideworks.votport.link

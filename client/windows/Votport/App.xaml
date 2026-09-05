@@ -8,6 +8,10 @@
         <!-- Generated from client/design/tokens.json; both theme blocks. -->
         <ResourceDictionary Source="ms-appx:///Tokens.xaml" />
       </ResourceDictionary.MergedDictionaries>
+      <!-- The votport type, bundled under the OFL; the system families
+           stand in until the file resolves. -->
+      <FontFamily x:Key="VotSansFont">ms-appx:///Assets/Fonts/PlusJakartaSans-Variable.ttf#Plus Jakarta Sans, Segoe UI Variable, Segoe UI</FontFamily>
+      <FontFamily x:Key="VotMonoFont">ms-appx:///Assets/Fonts/JetBrainsMono-Variable.ttf#JetBrains Mono, Cascadia Mono, Consolas</FontFamily>
       <Style x:Key="SectionLabel" TargetType="TextBlock">
         <Setter Property="FontSize" Value="11" />
         <Setter Property="FontWeight" Value="SemiBold" />
@@ -16,7 +20,7 @@
         <Setter Property="Margin" Value="0,0,0,12" />
       </Style>
       <Style x:Key="Mono" TargetType="TextBlock">
-        <Setter Property="FontFamily" Value="Cascadia Mono, Consolas" />
+        <Setter Property="FontFamily" Value="{StaticResource VotMonoFont}" />
         <Setter Property="TextTrimming" Value="CharacterEllipsis" />
       </Style>
     </ResourceDictionary>

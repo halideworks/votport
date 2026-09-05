@@ -22,7 +22,37 @@ public sealed partial class MainWindow : Window
             tray.SetTip(count == 0 ? "votport" : $"votport, {count} active");
         };
         Nav.SelectedItem = Nav.MenuItems[0];
+        ExtendsContentIntoTitleBar = true;
+        SetTitleBar(TitleBar);
+        PaintCaptionButtons();
+        if (Content is FrameworkElement root) root.ActualThemeChanged += (_, _) => PaintCaptionButtons();
+        // Closing hides to the tray when the setting says so; Quit in the
+        // tray menu is the way out then, and a running transfer carries on.
+        AppWindow.Closing += (_, args) =>
+        {
+            if (!Settings.CloseToTray) return;
+            args.Cancel = true;
+            AppWindow.Hide();
+        };
         Closed += (_, _) => tray.Dispose();
+    }
+
+    /// The system caption buttons sit on the app's own title bar, so they
+    /// take the theme's colours from the generated token dictionary.
+    private void PaintCaptionButtons()
+    {
+        if (Content is not FrameworkElement root) return;
+        var bar = AppWindow.TitleBar;
+        var dark = root.ActualTheme != ElementTheme.Light;
+        var muted = Theme.Color(root, "VotMuted");
+        var text = Theme.Color(root, "VotText");
+        var hoverBackground = dark ? Windows.UI.Color.FromArgb(0x14, 255, 255, 255) : Windows.UI.Color.FromArgb(0x14, 0x0F, 0x17, 0x2A);
+        bar.ButtonBackgroundColor = Microsoft.UI.Colors.Transparent;
+        bar.ButtonInactiveBackgroundColor = Microsoft.UI.Colors.Transparent;
+        bar.ButtonHoverBackgroundColor = hoverBackground;
+        bar.ButtonForegroundColor = muted;
+        bar.ButtonInactiveForegroundColor = muted;
+        bar.ButtonHoverForegroundColor = text;
     }
 
     /// Brings the window to the front, restoring it when minimized, which
