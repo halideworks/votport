@@ -93,6 +93,10 @@ pub enum Error {
     #[error("the transfer was cancelled")]
     Cancelled,
 
+    /// A resume named a transfer the journal does not hold.
+    #[error("no journalled transfer {id}")]
+    UnknownTransfer { id: String },
+
     /// The destination's filesystem cannot hold the delivery.
     #[error("{path} has {available} bytes free; the delivery needs {needed}")]
     NoSpace {
@@ -173,6 +177,7 @@ impl Error {
                 name_of_path(path)
             ),
             Self::Cancelled => "Cancelled.".to_owned(),
+            Self::UnknownTransfer { .. } => "That transfer is no longer on record.".to_owned(),
             Self::NoSpace {
                 needed, available, ..
             } => format!(
@@ -191,6 +196,36 @@ impl Error {
                 "The transfer could not continue.".to_owned()
             }
         }
+    }
+}
+
+impl Error {
+    /// Whether trying the same transfer again later could end differently:
+    /// the network, the server, the disk, a missing password, a file in the
+    /// way. A refusal of the input itself (a bad or closed link, a refused
+    /// or oversized drop) fails the same way every time and is not worth
+    /// keeping for a resume.
+    #[must_use]
+    pub fn worth_retrying(&self) -> bool {
+        !matches!(
+            self,
+            // A closed, expired, or unknown link, or a drop the server will
+            // not take at any size, answers the same way every time.
+            Self::Server {
+                status: 404 | 410 | 413,
+                ..
+            } | Self::BadLink { .. }
+                | Self::WrongLink { .. }
+                | Self::LinkUnusable { .. }
+                | Self::Empty
+                | Self::Rejected { .. }
+                | Self::TooManyEntries { .. }
+                | Self::TooLarge { .. }
+                | Self::UnknownSuite { .. }
+                | Self::BadName { .. }
+                | Self::UnknownTransfer { .. }
+                | Self::Cancelled
+        )
     }
 }
 
@@ -321,6 +356,35 @@ mod tests {
         for (error, expected) in cases {
             assert_eq!(error.headline(), expected, "{error}");
         }
+    }
+
+    #[test]
+    fn only_a_transfer_that_could_go_differently_is_worth_retrying() {
+        assert!(Error::PasswordRequired.worth_retrying());
+        assert!(Error::Exists {
+            path: PathBuf::from("/dest/reel.mov")
+        }
+        .worth_retrying());
+        assert!(Error::Http {
+            url: "x".into(),
+            source: reqwest::blocking::get("http://[::1]:1/").unwrap_err(),
+        }
+        .worth_retrying());
+        assert!(Error::Server {
+            status: 401,
+            what: "verify".into(),
+            body: String::new()
+        }
+        .worth_retrying());
+        assert!(!Error::Server {
+            status: 404,
+            what: "delivery metadata".into(),
+            body: String::new()
+        }
+        .worth_retrying());
+        assert!(!Error::Cancelled.worth_retrying());
+        assert!(!Error::Empty.worth_retrying());
+        assert!(!Error::BadLink { link: "x".into() }.worth_retrying());
     }
 
     #[test]

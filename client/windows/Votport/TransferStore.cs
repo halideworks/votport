@@ -17,7 +17,7 @@ public sealed class TransferItem : INotifyPropertyChanged
     /// What the user pointed at: the dropped paths or the destination folder.
     public string Subject { get; init; } = "";
     public string Link { get; init; } = "";
-    public DateTime Started { get; } = DateTime.Now;
+    public DateTime Started { get; init; } = DateTime.Now;
     private string[] landed = Array.Empty<string>();
 
     public string[] Landed
@@ -29,6 +29,39 @@ public sealed class TransferItem : INotifyPropertyChanged
     private TransferView? view;
     private bool running = true;
     private bool expanded;
+    private bool interrupted;
+    private bool journalled;
+
+    /// The journal id, once the core recorded the transfer.
+    public string? JournalId { get; set; }
+    private bool needsPassword;
+
+    /// The entry was started with a password the journal does not keep, or
+    /// failed for the lack of one.
+    public bool NeedsPassword
+    {
+        get => needsPassword;
+        set { needsPassword = value; Changed(); Changed(nameof(ShowPassword)); }
+    }
+
+    /// A transfer the journal held at launch, cut by a quit or a failure and
+    /// not yet resumed.
+    public bool Interrupted
+    {
+        get => interrupted;
+        set { interrupted = value; Changed(); Changed(nameof(Status)); Changed(nameof(ResumeLabel)); }
+    }
+
+    /// The core still holds the entry, so Retry or Resume can run it again.
+    public bool Journalled
+    {
+        get => journalled;
+        set { journalled = value; Changed(); Changed(nameof(CanResume)); Changed(nameof(ShowPassword)); }
+    }
+
+    public bool CanResume => !running && journalled;
+    public bool ShowPassword => CanResume && NeedsPassword;
+    public string ResumeLabel => interrupted ? "Resume" : "Retry";
 
     public bool Expanded
     {
@@ -45,7 +78,7 @@ public sealed class TransferItem : INotifyPropertyChanged
     public bool Running
     {
         get => running;
-        set { running = value; Changed(); Changed(nameof(NotRunning)); }
+        set { running = value; Changed(); Changed(nameof(NotRunning)); Changed(nameof(CanResume)); Changed(nameof(ShowPassword)); Changed(nameof(CanReveal)); }
     }
 
     public bool NotRunning => !running;
@@ -101,8 +134,7 @@ public sealed class TransferStore
 
     public void Send(string link, string? password, string[] paths)
     {
-        var subject = paths.Length == 1 ? System.IO.Path.GetFileName(paths[0]) : $"{paths.Length} items";
-        var item = Start(TransferItem.Kinds.Send, subject, link);
+        var item = Start(TransferItem.Kinds.Send, Subject(paths), link);
         Run(item, (transfer, listener) =>
         {
             try { VotportClientCoreMethods.Send(link, password, paths, transfer, listener); }
@@ -124,14 +156,66 @@ public sealed class TransferStore
         });
     }
 
+    /// Lists the transfers the journal held over from an earlier run, as
+    /// interrupted cards. Called once at launch.
+    public void LoadPending()
+    {
+        foreach (var entry in VotportClientCoreMethods.Pending())
+        {
+            var kind = entry.Kind == Kind.Send ? TransferItem.Kinds.Send : TransferItem.Kinds.Receive;
+            var subject = kind == TransferItem.Kinds.Send ? Subject(entry.Paths) : entry.Dest ?? "";
+            // Oldest first from the journal into a newest-first list.
+            Items.Insert(0, new TransferItem
+            {
+                Kind = kind,
+                Subject = subject,
+                Link = entry.Link,
+                JournalId = entry.Id,
+                NeedsPassword = entry.NeedsPassword,
+                Started = DateTimeOffset.FromUnixTimeSeconds((long)entry.StartedUnix).LocalDateTime,
+                Running = false,
+                Interrupted = true,
+                Journalled = true,
+            });
+        }
+    }
+
+    /// Runs a journalled transfer again under its id, with the password
+    /// supplied afresh when the entry needs one.
+    public void Resume(TransferItem item, string? password)
+    {
+        if (!item.CanResume || item.JournalId is not string id) return;
+        item.Running = true;
+        item.Interrupted = false;
+        item.View = null;
+        item.Landed = Array.Empty<string>();
+        ActiveChanged?.Invoke(ActiveCount);
+        Run(item, (transfer, listener) =>
+        {
+            try
+            {
+                var report = VotportClientCoreMethods.Resume(id, password, transfer, listener);
+                return report is ResumeReport.Received received ? received.V1.Files : Array.Empty<string>();
+            }
+            catch (VotportException) { return Array.Empty<string>(); }
+        });
+    }
+
+    private static string Subject(string[] paths) =>
+        paths.Length == 1 ? System.IO.Path.GetFileName(paths[0]) : $"{paths.Length} items";
+
     public void Cancel(TransferItem item)
     {
         if (handles.TryGetValue(item.Id, out var transfer)) transfer.Cancel();
     }
 
+    /// Drops a finished or interrupted transfer from the list, and from the
+    /// journal, so it is not offered again.
     public void Remove(TransferItem item)
     {
-        if (!item.Running) Items.Remove(item);
+        if (item.Running) return;
+        if (item.JournalId is string id) VotportClientCoreMethods.Forget(id);
+        Items.Remove(item);
     }
 
     private TransferItem Start(TransferItem.Kinds kind, string subject, string link)
@@ -179,6 +263,14 @@ public sealed class TransferStore
     {
         item.Running = false;
         item.Landed = landed;
+        if (handles.TryGetValue(item.Id, out var handle))
+        {
+            item.JournalId = handle.JournalId();
+            // The core keeps the entry only for a failure worth trying again,
+            // and says whether the next run must ask for a password.
+            item.Journalled = handle.JournalKept();
+            item.NeedsPassword = handle.JournalNeedsPassword();
+        }
         handles.Remove(item.Id);
         ActiveChanged?.Invoke(ActiveCount);
         Notifier.TransferEnded(item);
@@ -302,6 +394,7 @@ public static class Format
         var view = item.View;
         // No view at all means the core never answered (a panic or a load
         // failure the crash log names), which is the shell's failure to show.
+        if (item.Interrupted) return "Interrupted before it finished";
         if (view is null) return item.Running ? "Starting" : "Failed";
         var verb = item.Kind == TransferItem.Kinds.Send ? "Sending" : "Receiving";
         switch (view.Phase)

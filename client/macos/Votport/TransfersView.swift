@@ -44,6 +44,7 @@ struct TransferCard: View {
     let item: TransferItem
     let expanded: Bool
     let toggle: () -> Void
+    @State private var password = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -62,6 +63,18 @@ struct TransferCard: View {
                 if item.running {
                     Button("Cancel") { store.cancel(item.id) }
                 } else {
+                    if item.canResume {
+                        if item.needsPassword {
+                            SecureField("Password", text: $password)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 160)
+                        }
+                        Button(item.interrupted ? "Resume" : "Retry") {
+                            store.resume(item.id, password: password.isEmpty ? nil : password)
+                            password = ""
+                        }
+                        .disabled(item.needsPassword && password.isEmpty)
+                    }
                     if item.kind == .receive, !item.landed.isEmpty {
                         Button("Reveal in Finder") {
                             NSWorkspace.shared.activateFileViewerSelecting(
@@ -161,6 +174,7 @@ enum Format {
     }
 
     static func statusLine(_ item: TransferItem) -> String {
+        if item.interrupted { return "Interrupted before it finished" }
         guard let view = item.view else { return "Starting" }
         let verb = item.kind == .send ? "Sending" : "Receiving"
         switch view.phase {

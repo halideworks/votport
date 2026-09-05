@@ -43,6 +43,17 @@ public sealed partial class TransfersPage : Page
         if ((sender as FrameworkElement)?.DataContext is TransferItem item) TransferStore.Shared.Cancel(item);
     }
 
+    private void Resume_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not TransferItem item) return;
+        // The password box sits beside the button in the same panel.
+        var box = ((sender as FrameworkElement)?.Parent as Panel)?.Children.OfType<PasswordBox>().FirstOrDefault();
+        var password = box is null || box.Password.Length == 0 ? null : box.Password;
+        if (item.NeedsPassword && password is null) return;
+        if (box is not null) box.Password = "";
+        TransferStore.Shared.Resume(item, password);
+    }
+
     private void Reveal_Click(object sender, RoutedEventArgs e)
     {
         if ((sender as FrameworkElement)?.DataContext is TransferItem item && item.Landed.Length > 0)
