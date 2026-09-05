@@ -25,6 +25,11 @@ targets:
         CFBundleDisplayName: votport
         LSMinimumSystemVersion: "14.0"
         NSHighResolutionCapable: true
+        # The web pages' "Open in the votport app" links.
+        CFBundleURLTypes:
+          - CFBundleURLName: com.halideworks.votport.link
+            CFBundleURLSchemes: [votport]
+            CFBundleTypeRole: Viewer
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.halideworks.votport

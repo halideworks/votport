@@ -9,6 +9,7 @@
   "scripts": {
     "lint": "eslint web/assets/*.js",
     "test": "node --test scripts/*.test.mjs",
+    "design:tokens": "node scripts/design-tokens.mjs",
     "browser:e2e": "node scripts/browser-e2e.mjs"
   },
   "devDependencies": {
