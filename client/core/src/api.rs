@@ -111,6 +111,43 @@ pub struct FinishReport {
     pub files: Vec<FileRecord>,
 }
 
+/// The receiver's push endpoint, from `GET /api/push-identity`, for the probe
+/// a client runs before it reserves anything.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PushIdentity {
+    pub address: String,
+    pub certificate_digest: String,
+}
+
+/// The package a push preflight announces: suite 1, the root, the length, and
+/// the entry count.
+#[derive(Debug, Clone, Serialize)]
+pub struct PushPackageAnnouncement {
+    pub suite: u64,
+    pub root: String,
+    pub length: u64,
+    pub entries: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct CreatePushRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    password: Option<&'a str>,
+    holder_key: String,
+    package: PushPackageAnnouncement,
+}
+
+/// What a push preflight mints: the session, the capability to present, the
+/// address to dial, the certificate digest to pin, and the expiry.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PushPreflight {
+    pub session: String,
+    pub capability: String,
+    pub address: String,
+    pub certificate_digest: String,
+    pub expires_at: u64,
+}
+
 impl Client {
     /// A client for `base` (the origin, e.g. `https://drop.example`).
     ///
@@ -283,6 +320,38 @@ impl Client {
     pub fn abort(&self, session: &str) {
         let url = self.url(&format!("/api/session/{session}/abort"));
         let _ = self.http.post(&url).send();
+    }
+
+    /// `GET /api/push-identity`: the receiver's push address and certificate
+    /// digest, so a client can probe the carrier before it reserves anything.
+    ///
+    /// # Errors
+    /// A network failure, or a non-success status (404 when push is off).
+    pub fn push_identity(&self) -> Result<PushIdentity> {
+        let url = self.url("/api/push-identity");
+        self.run("push identity", true, || self.http.get(&url))
+    }
+
+    /// `POST /api/r/{token}/push`: reserves a push session and mints a
+    /// capability for `holder_key`.
+    ///
+    /// # Errors
+    /// A network failure or a non-success status.
+    pub fn create_push_session(
+        &self,
+        token: &str,
+        password: Option<&str>,
+        holder_key: &str,
+        package: PushPackageAnnouncement,
+    ) -> Result<PushPreflight> {
+        let url = self.url(&format!("/api/r/{token}/push"));
+        self.run("create push session", false, || {
+            self.http.post(&url).json(&CreatePushRequest {
+                password,
+                holder_key: holder_key.to_owned(),
+                package: package.clone(),
+            })
+        })
     }
 }
 
