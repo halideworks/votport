@@ -9,7 +9,8 @@ use std::process::ExitCode;
 
 use votport_client_core::progress::{Event, Observer};
 use votport_client_core::{
-    collect, receive_with_device_or_http, split_link, Delivery, Device, Drop, Sent, Transport,
+    collect, receive_with_device_or_http, split_link_as, Delivery, Device, Drop, LinkKind, Sent,
+    Transport,
 };
 
 fn main() -> ExitCode {
@@ -27,6 +28,7 @@ fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("send") => send(&args[1..]),
         Some("receive") => receive(&args[1..]),
+        Some("inspect") => inspect(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             Ok(())
@@ -39,6 +41,7 @@ fn print_usage() {
     eprintln!(
         "votport send <link> <path>...      [--password <p>] [--json]\n\
          votport receive <link> <dir>       [--password <p>] [--json]\n\
+         votport inspect <link>\n\
          \n\
          send's <link> is a request URL, e.g. https://drop.example/r/TOKEN;\n\
          each <path> is a file or folder, and a folder keeps its name.\n\
@@ -72,7 +75,8 @@ fn send(args: &[String]) -> Result<(), String> {
     if paths.is_empty() {
         return Err("send needs at least one file or folder".to_owned());
     }
-    let (base, token) = split_link(&link).map_err(|error| error.to_string())?;
+    let link = split_link_as(&link, LinkKind::Request).map_err(|error| error.to_string())?;
+    let (base, token) = (link.base, link.token);
 
     let mut files = Vec::new();
     for path in &paths {
@@ -119,6 +123,36 @@ fn send(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Prints what a link is as one JSON object, spending nothing on the server.
+fn inspect(args: &[String]) -> Result<(), String> {
+    let [link] = args else {
+        return Err("inspect takes one link".to_owned());
+    };
+    let preview = votport_client_core::ffi::inspect(link.clone());
+    let files: Vec<serde_json::Value> = preview
+        .files
+        .iter()
+        .map(|file| serde_json::json!({ "path": file.path, "bytes": file.bytes }))
+        .collect();
+    println!(
+        "{}",
+        serde_json::json!({
+            "kind": preview.kind.map(|kind| format!("{kind:?}").to_lowercase()),
+            "problem": preview.problem,
+            "detail": preview.detail,
+            "label": preview.label,
+            "needs_password": preview.needs_password,
+            "usable": preview.usable,
+            "quic": preview.quic,
+            "max_bytes": preview.max_bytes,
+            "max_entries": preview.max_entries,
+            "total_bytes": preview.total_bytes,
+            "files": files,
+        })
+    );
+    Ok(())
+}
+
 fn receive(args: &[String]) -> Result<(), String> {
     let mut link: Option<String> = None;
     let mut dir: Option<String> = None;
@@ -143,7 +177,8 @@ fn receive(args: &[String]) -> Result<(), String> {
 
     let link = link.ok_or("receive needs a delivery link and a directory")?;
     let dir = dir.ok_or("receive needs a directory to land the files in")?;
-    let (base, token) = split_link(&link).map_err(|error| error.to_string())?;
+    let link = split_link_as(&link, LinkKind::Delivery).map_err(|error| error.to_string())?;
+    let (base, token) = (link.base, link.token);
 
     let delivery = Delivery { token, password };
     let mut observer = CliObserver { json };
@@ -176,7 +211,12 @@ impl Observer for CliObserver {
     fn event(&mut self, event: Event) {
         if self.json {
             let line = match &event {
-                Event::Planned { files } => {
+                Event::Selected { files } | Event::Planned { files } => {
+                    let name = if matches!(event, Event::Selected { .. }) {
+                        "selected"
+                    } else {
+                        "planned"
+                    };
                     let files: Vec<String> = files
                         .iter()
                         .map(|file| {
@@ -186,7 +226,7 @@ impl Observer for CliObserver {
                             )
                         })
                         .collect();
-                    format!("{{\"event\":\"planned\",\"files\":[{}]}}", files.join(","))
+                    format!("{{\"event\":{name:?},\"files\":[{}]}}", files.join(","))
                 }
                 Event::Transport(transport) => {
                     format!("{{\"event\":\"transport\",\"via\":{:?}}}", transport_name(*transport))
@@ -218,7 +258,7 @@ impl Observer for CliObserver {
         }
         match event {
             Event::Transport(_) | Event::Bytes { .. } => {}
-            Event::Planned { .. } => {}
+            Event::Selected { .. } | Event::Planned { .. } => {}
             Event::SessionCreated { .. } => {}
             Event::Chunk { .. } => {}
             Event::EntryComplete { path, .. } => println!("  sent {path}"),

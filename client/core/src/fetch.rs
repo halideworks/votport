@@ -26,7 +26,9 @@ use crate::error::{Error, Result};
 use crate::identity::Device;
 use crate::package::{package_path_string, read_manifest};
 use crate::progress::{with_progress, Event, Observer, PlannedFile, Transport, PROGRESS_QUANTUM};
-use crate::receive::{local_path, local_path_of, write_verified, Delivery, Received, Resumed};
+use crate::receive::{
+    local_path, local_path_of, require_space, write_verified, Delivery, Received, Resumed,
+};
 use crate::send_push::{probe_any, Probe};
 
 /// Rails dialled at once. Matches the push default until the listener cap lands.
@@ -63,7 +65,8 @@ pub fn receive_over_fetch(
     match try_fetch(&client, &delivery, device, dest, observer)? {
         Outcome::Fetched(received) => Ok(received),
         Outcome::Unreachable => Err(Error::Other(
-            "the delivery does not serve a QUIC fetch".to_owned(),
+            "the delivery does not serve a QUIC fetch, or the destination cannot stage one"
+                .to_owned(),
         )),
     }
 }
@@ -117,6 +120,26 @@ pub fn try_fetch(
             return Err(Error::Exists { path });
         }
     }
+    // The bundle is staged beside the destination and then copied into it,
+    // so a fetch needs room for two copies until the stage is cleared. A
+    // destination with room for one still fits over HTTP, which stages
+    // nothing, so that is a fallback rather than a refusal.
+    // ponytail: a stage a prior fetch left is not credited against the two
+    // copies, so a nearly complete resume on a tight destination goes over
+    // HTTP instead. vot-cli pre-sizes objects sparsely, so a stage's lengths
+    // say nothing, and allocated blocks are unreliable too (ZFS compresses
+    // and delays allocation; Windows reports none). A VOT accessor for the
+    // resume store's verified coverage is the upgrade.
+    // The stage's filesystem is the one asked, which is the destination's
+    // parent: for a destination that is itself a mount root the two differ.
+    let staging_parent = dest
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let total: u64 = metadata.files.iter().map(|file| file.bytes).sum();
+    if require_space(staging_parent, total.saturating_mul(2)).is_err() {
+        return Ok(Outcome::Unreachable);
+    }
 
     let probe_digest = decode_digest(&endpoint.certificate_digest)?;
     let Ok(addresses) = parse_rendezvous(&endpoint.address) else {
@@ -159,10 +182,6 @@ pub fn try_fetch(
     // lost data: materialize never overwrites an existing file). A lock would
     // close it, at the cost of a stale lock blocking every retry after a crash;
     // the CLI is one receive per process, so this stays a documented edge.
-    let staging_parent = dest
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(staging_parent)?;
     let stage = staging_parent.join(format!(".vot-fetch-{}.bundle", hex::encode(pin)));
 

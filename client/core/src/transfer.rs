@@ -126,8 +126,11 @@ struct Ready {
     _staging: TempDir,
 }
 
-/// Inspects the link, validates the drop, and builds the manifest.
-fn prepare(base: &str, drop: Drop) -> Result<Ready> {
+/// Inspects the link, validates the drop, and builds the manifest. The files
+/// are announced to `observer` before the hash pass, in selection order, so a
+/// screen lists them while hashing runs; the manifest's canonical order is
+/// announced again once it is built.
+fn prepare(base: &str, drop: Drop, observer: &mut dyn Observer) -> Result<Ready> {
     let client = Client::new(base)?;
     let info = client.link_info(&drop.token)?;
     if !info.usable {
@@ -162,13 +165,20 @@ fn prepare(base: &str, drop: Drop) -> Result<Ready> {
     // Refuse an oversized drop before hashing, as the web sender does; the
     // server would otherwise refuse it at begin after the whole hash.
     let mut total: u64 = 0;
-    for entry in &admitted {
-        total += std::fs::symlink_metadata(&entry.source)
+    let mut selected = Vec::with_capacity(admitted.len());
+    for (index, entry) in admitted.iter().enumerate() {
+        let bytes = std::fs::symlink_metadata(&entry.source)
             .map_err(|source| Error::Read {
                 path: entry.source.clone(),
                 source,
             })?
             .len();
+        total += bytes;
+        selected.push(PlannedFile {
+            index,
+            path: package::package_path_string(&entry.path),
+            bytes,
+        });
     }
     if total > info.max_bytes {
         return Err(Error::TooLarge {
@@ -176,6 +186,7 @@ fn prepare(base: &str, drop: Drop) -> Result<Ready> {
             limit: info.max_bytes,
         });
     }
+    observer.event(Event::Selected { files: selected });
 
     let staging: TempDir = tempfile::Builder::new()
         .prefix("votport-manifest-")
@@ -216,7 +227,7 @@ fn announce(prepared: &Prepared, observer: &mut dyn Observer) {
 /// An unusable or password-protected link, a refused file, an empty or
 /// oversized drop, a build failure, or a transport error.
 pub fn send(base: &str, drop: Drop, device: &Device, observer: &mut dyn Observer) -> Result<Sent> {
-    let ready = prepare(base, drop)?;
+    let ready = prepare(base, drop, observer)?;
     announce(&ready.prepared, observer);
     if ready.info.push {
         match send_push::try_push(
@@ -251,7 +262,7 @@ pub fn send(base: &str, drop: Drop, device: &Device, observer: &mut dyn Observer
 /// # Errors
 /// The same as [`send`], minus the push path.
 pub fn send_http(base: &str, drop: Drop, observer: &mut dyn Observer) -> Result<FinishReport> {
-    let ready = prepare(base, drop)?;
+    let ready = prepare(base, drop, observer)?;
     announce(&ready.prepared, observer);
     send_http::send(
         &ready.client,

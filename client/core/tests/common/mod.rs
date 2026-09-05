@@ -110,6 +110,31 @@ pub fn create_link(base: &str) -> String {
     body["link"]["id"].as_str().expect("a link id").to_owned()
 }
 
+/// Closes the request link `token`, so it no longer accepts drops.
+pub fn close_link(base: &str, token: &str) {
+    let admin = reqwest::blocking::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let login = admin
+        .post(format!("{base}/api/admin/login"))
+        .json(&serde_json::json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .unwrap();
+    assert!(login.status().is_success(), "admin login failed");
+    let closed = admin
+        .patch(format!("{base}/api/admin/links/{token}"))
+        .header("X-Votport", "1")
+        .json(&serde_json::json!({ "active": false }))
+        .send()
+        .unwrap();
+    assert!(
+        closed.status().is_success(),
+        "close link failed: {}",
+        closed.status()
+    );
+}
+
 /// Uploads `files` into the outbound library and creates a delivery grant over
 /// them, returning the delivery token parsed from its `/s/{token}` url. Each
 /// pair is a library-relative path (which may nest) and its bytes. `password`

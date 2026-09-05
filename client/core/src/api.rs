@@ -630,16 +630,39 @@ fn json<T: for<'de> Deserialize<'de>>(
     })
 }
 
-/// Splits a request or delivery link into its origin and token. Accepts
-/// `/r/<token>` and `/api/r/<token>` (send), `/s/<token>` and
+/// Which way a link moves bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum LinkKind {
+    /// A request link (`/r/<token>`): the app sends to it.
+    Request,
+    /// A delivery link (`/s/<token>`): the app receives from it.
+    Delivery,
+}
+
+/// A parsed votport link: the origin to talk to, what the link is, and its
+/// token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub base: String,
+    pub kind: LinkKind,
+    pub token: String,
+}
+
+/// Splits a request or delivery link into its origin, kind, and token.
+/// Accepts `/r/<token>` and `/api/r/<token>` (send), `/s/<token>` and
 /// `/api/s/<token>` (receive), with or without a trailing path, query, or
 /// fragment.
 ///
 /// # Errors
 /// A link with none of those markers, or an empty origin or token.
-pub fn split_link(link: &str) -> Result<(String, String)> {
+pub fn split_link(link: &str) -> Result<Link> {
     let trimmed = link.split(['?', '#']).next().unwrap_or(link);
-    for marker in ["/api/r/", "/r/", "/api/s/", "/s/"] {
+    for (marker, kind) in [
+        ("/api/r/", LinkKind::Request),
+        ("/r/", LinkKind::Request),
+        ("/api/s/", LinkKind::Delivery),
+        ("/s/", LinkKind::Delivery),
+    ] {
         if let Some(index) = trimmed.find(marker) {
             let base = &trimmed[..index];
             let rest = &trimmed[index + marker.len()..];
@@ -647,7 +670,11 @@ pub fn split_link(link: &str) -> Result<(String, String)> {
             if base.is_empty() || token.is_empty() {
                 break;
             }
-            return Ok((base.to_owned(), token.to_owned()));
+            return Ok(Link {
+                base: base.to_owned(),
+                kind,
+                token: token.to_owned(),
+            });
         }
     }
     Err(Error::BadLink {
@@ -655,48 +682,113 @@ pub fn split_link(link: &str) -> Result<(String, String)> {
     })
 }
 
+/// [`split_link`], refusing a link of the other kind with a message that
+/// names the screen it belongs to.
+///
+/// # Errors
+/// As [`split_link`], or a link of the wrong kind.
+pub fn split_link_as(link: &str, kind: LinkKind) -> Result<Link> {
+    let parsed = split_link(link)?;
+    if parsed.kind != kind {
+        return Err(Error::WrongLink {
+            link: link.to_owned(),
+            kind: parsed.kind,
+        });
+    }
+    Ok(parsed)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::split_link;
+    use super::{split_link, split_link_as, LinkKind};
+    use crate::error::Error;
 
     #[test]
     fn splits_request_links_into_origin_and_token() {
+        use LinkKind::{Delivery, Request};
         let cases = [
-            ("https://drop.example/r/ABC", "https://drop.example", "ABC"),
+            (
+                "https://drop.example/r/ABC",
+                "https://drop.example",
+                Request,
+                "ABC",
+            ),
             (
                 "https://drop.example/api/r/XYZ",
                 "https://drop.example",
+                Request,
                 "XYZ",
             ),
-            ("https://drop.example/r/ABC/", "https://drop.example", "ABC"),
+            (
+                "https://drop.example/r/ABC/",
+                "https://drop.example",
+                Request,
+                "ABC",
+            ),
             (
                 "https://drop.example/r/ABC?x=1#f",
                 "https://drop.example",
+                Request,
                 "ABC",
             ),
             (
                 "http://127.0.0.1:8080/r/tok",
                 "http://127.0.0.1:8080",
+                Request,
                 "tok",
             ),
-            ("https://drop.example/s/DEL", "https://drop.example", "DEL"),
+            (
+                "https://drop.example/s/DEL",
+                "https://drop.example",
+                Delivery,
+                "DEL",
+            ),
             (
                 "https://drop.example/api/s/DEL",
                 "https://drop.example",
+                Delivery,
                 "DEL",
             ),
             (
                 "https://drop.example/s/DEL/?x=1",
                 "https://drop.example",
+                Delivery,
                 "DEL",
             ),
+            // The first marker wins, so a host or path that happens to hold
+            // the other letter does not change the kind.
+            (
+                "https://s.example/r/ABC/s/x",
+                "https://s.example",
+                Request,
+                "ABC",
+            ),
         ];
-        for (link, base, token) in cases {
-            let (got_base, got_token) = split_link(link).expect(link);
-            assert_eq!(got_base, base, "{link}");
-            assert_eq!(got_token, token, "{link}");
+        for (link, base, kind, token) in cases {
+            let got = split_link(link).expect(link);
+            assert_eq!(
+                (got.base.as_str(), got.kind, got.token.as_str()),
+                (base, kind, token),
+                "{link}"
+            );
         }
         assert!(split_link("https://drop.example/verify").is_err());
         assert!(split_link("not a url").is_err());
+    }
+
+    #[test]
+    fn a_link_of_the_other_kind_is_refused_by_name() {
+        let wrong = split_link_as("https://drop.example/s/DEL", LinkKind::Request);
+        assert!(
+            matches!(
+                wrong,
+                Err(Error::WrongLink {
+                    kind: LinkKind::Delivery,
+                    ..
+                })
+            ),
+            "{wrong:?}"
+        );
+        assert!(split_link_as("https://drop.example/r/ABC", LinkKind::Request).is_ok());
     }
 }

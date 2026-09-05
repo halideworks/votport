@@ -2738,6 +2738,7 @@ dependencies = [
 name = "votport-client"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "votport-client-core",
 ]
 
@@ -2747,6 +2748,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
+ "fs4",
  "hex",
  "rand 0.8.8",
  "reqwest",

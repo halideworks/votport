@@ -174,7 +174,7 @@ enum Format {
         case .cancelled:
             return "Cancelled"
         case .failed:
-            return view.message ?? "Failed"
+            return view.headline ?? "Failed"
         }
     }
 

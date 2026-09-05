@@ -312,7 +312,7 @@ public static class Format
             case Phase.Cancelled:
                 return "Cancelled";
             default:
-                return view.Message ?? "Failed";
+                return view.Headline ?? "Failed";
         }
     }
 }
