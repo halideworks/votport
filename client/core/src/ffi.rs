@@ -21,6 +21,7 @@ use crate::api::{split_link, split_link_as, LinkKind};
 use crate::error::{human_bytes, human_seconds, Error};
 use crate::identity::Device;
 use crate::journal;
+use crate::port;
 use crate::progress::{Event, Observer, Transport};
 use crate::receive::{receive_with_device_or_http, Delivery};
 use crate::transfer::{self, Drop, Selected};
@@ -450,6 +451,108 @@ fn preview(link: &str, expect: Option<LinkKind>) -> std::result::Result<LinkPrev
             line: None,
         })
     }
+}
+
+/// The port the operator is signed in to, from the stored session, without
+/// a round trip. `None` when nobody is signed in.
+#[uniffi::export]
+pub fn port() -> Option<port::Port> {
+    port::current()
+}
+
+/// Signs in to the votport at `base` with the admin password. Blocks for
+/// the round trips; a shell runs it off its main thread.
+///
+/// # Errors
+/// A base that is not an origin, a wrong password, too many tries, or an
+/// unreachable server.
+#[uniffi::export]
+pub fn sign_in(base: String, password: String) -> std::result::Result<port::Port, Error> {
+    port::sign_in(&base, &password)
+}
+
+/// Asks the server whether the stored session still holds; a session it no
+/// longer honours is dropped and `None` comes back. Blocks for the round
+/// trip, and through the retry budget while the server restarts; a shell
+/// runs it off its main thread.
+///
+/// # Errors
+/// An unreachable server.
+#[uniffi::export]
+pub fn check_port() -> std::result::Result<Option<port::Port>, Error> {
+    port::check()
+}
+
+/// Ends the session and forgets it.
+#[uniffi::export]
+pub fn sign_out() {
+    port::sign_out();
+}
+
+/// The port's open request links.
+///
+/// # Errors
+/// Not signed in, or an unreachable server.
+#[uniffi::export]
+pub fn requests() -> std::result::Result<Vec<port::RequestLink>, Error> {
+    port::requests()
+}
+
+/// Issues a request link on the port.
+///
+/// # Errors
+/// Not signed in, a refused spec, or an unreachable server.
+#[uniffi::export]
+pub fn issue_request(spec: port::RequestSpec) -> std::result::Result<port::RequestLink, Error> {
+    port::issue_request(spec)
+}
+
+/// Closes a request link.
+///
+/// # Errors
+/// Not signed in, or an unreachable server.
+#[uniffi::export]
+pub fn close_request(id: String) -> std::result::Result<(), Error> {
+    port::close_request(&id)
+}
+
+/// The port's deliveries.
+///
+/// # Errors
+/// Not signed in, or an unreachable server.
+#[uniffi::export]
+pub fn deliveries() -> std::result::Result<Vec<port::Delivery>, Error> {
+    port::deliveries()
+}
+
+/// Revokes a delivery.
+///
+/// # Errors
+/// Not signed in, or an unreachable server.
+#[uniffi::export]
+pub fn revoke_delivery(id: String) -> std::result::Result<(), Error> {
+    port::revoke_delivery(&id)
+}
+
+/// One directory of the port's library (`""` for the root).
+///
+/// # Errors
+/// Not signed in, a refused directory, or an unreachable server.
+#[uniffi::export]
+pub fn library(directory: String) -> std::result::Result<port::Library, Error> {
+    port::library(&directory)
+}
+
+/// Issues a delivery of library files; the reply carries the one link the
+/// server ever shows for it.
+///
+/// # Errors
+/// Not signed in, a refused spec, or an unreachable server.
+#[uniffi::export]
+pub fn issue_delivery(
+    spec: port::DeliverySpec,
+) -> std::result::Result<port::IssuedDelivery, Error> {
+    port::issue_delivery(spec)
 }
 
 /// The core's version, so a shell can show what it links.

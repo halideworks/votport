@@ -14,6 +14,7 @@ pub mod ffi;
 pub mod identity;
 pub mod journal;
 pub mod package;
+pub mod port;
 pub mod progress;
 pub mod receive;
 pub mod send_http;

@@ -101,8 +101,8 @@ impl Device {
 /// The bytes are written to a per-process sibling temp file and renamed into
 /// place, so an interrupted write never leaves a short `path` for the next run
 /// to reject, and two concurrent first-time writers do not share a temp.
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    let temp = path.with_extension(format!("key.{}.tmp", std::process::id()));
+pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
     #[cfg(unix)]
     {
         use std::io::Write;

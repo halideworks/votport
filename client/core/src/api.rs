@@ -535,6 +535,105 @@ impl Client {
     }
 }
 
+/// The admin session cookie's name, as the server sets it.
+const ADMIN_COOKIE: &str = "votport_admin";
+
+impl Client {
+    /// `POST /api/admin/login`: the admin session cookie (`name=value`) for
+    /// `password`. Never retried: the server counts every attempt against
+    /// the caller's address.
+    ///
+    /// # Errors
+    /// [`Error::WrongPassword`] on a refusal, a network failure, or another
+    /// non-success status (429 after too many refusals).
+    pub fn admin_login(&self, password: &str) -> Result<String> {
+        let url = self.url("/api/admin/login");
+        let response = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "password": password }))
+            .send()
+            .map_err(|source| Error::Http {
+                url: "sign in".to_owned(),
+                source,
+            })?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(Error::WrongPassword);
+        }
+        if !status.is_success() {
+            return Err(Error::Server {
+                status: status.as_u16(),
+                what: "sign in".to_owned(),
+                body: response.text().unwrap_or_default(),
+            });
+        }
+        set_cookie(&response, ADMIN_COOKIE)
+            .ok_or_else(|| Error::Other("the sign-in set no session cookie".to_owned()))
+    }
+
+    /// An admin `GET` under the session `cookie`, parsed as JSON.
+    ///
+    /// # Errors
+    /// [`Error::NotSignedIn`] when the server no longer honours the session,
+    /// a network failure, or another non-success status.
+    pub fn admin_get<T: for<'de> Deserialize<'de>>(&self, path: &str, cookie: &str) -> Result<T> {
+        let url = self.url(path);
+        self.run(path, true, || {
+            with_cookie(self.http.get(&url), Some(cookie))
+        })
+        .map_err(signed_out)
+    }
+
+    /// An admin mutation under the session `cookie`, with the `X-Votport`
+    /// header the server requires on every non-GET, parsed as JSON. Not
+    /// retried: a replay could create a second link or grant.
+    ///
+    /// # Errors
+    /// As [`Client::admin_get`].
+    pub fn admin_send<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        cookie: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<T> {
+        let url = self.url(path);
+        let mut request =
+            with_cookie(self.http.request(method, &url), Some(cookie)).header("X-Votport", "1");
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request.send().map_err(|source| Error::Http {
+            url: path.to_owned(),
+            source,
+        })?;
+        json(response, path).map_err(signed_out)
+    }
+}
+
+/// A 401 on an admin call means the session is gone.
+fn signed_out(error: Error) -> Error {
+    match error {
+        Error::Server { status: 401, .. } => Error::NotSignedIn,
+        other => other,
+    }
+}
+
+/// The `name=value` of the `Set-Cookie` named `name`, when the response
+/// carries one.
+fn set_cookie(response: &reqwest::blocking::Response, name: &str) -> Option<String> {
+    response
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| value.split(';').next())
+        .map(str::trim)
+        .find(|pair| pair.starts_with(name) && pair[name.len()..].starts_with('='))
+        .map(str::to_owned)
+}
+
 /// Attaches `cookie` (a `name=value`) as the request's `Cookie` header, or
 /// leaves the request untouched when there is none.
 fn with_cookie(
