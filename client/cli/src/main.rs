@@ -44,6 +44,7 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("revoke-delivery") => revoke_delivery(&args[1..]),
         Some("library") => library(&args[1..]),
         Some("issue-delivery") => issue_delivery(&args[1..]),
+        Some("watch") => watch(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             Ok(())
@@ -69,6 +70,8 @@ fn print_usage() {
          votport revoke-delivery <id>\n\
          votport library [<dir>]            [--json]\n\
          votport issue-delivery <label> <path>... [--password <p>] [--expires-days <n>] [--max-downloads <n>] [--json]\n\
+         votport watch add <dir> <link>     [--password <p>]\n\
+         votport watch list | remove <id> | run [--json]\n\
          \n\
          send's <link> is a request URL, e.g. https://drop.example/r/TOKEN;\n\
          each <path> is a file or folder, and a folder keeps its name.\n\
@@ -637,4 +640,93 @@ fn issue_delivery(args: &[String]) -> Result<(), String> {
         println!("{}", issued.url);
     }
     Ok(())
+}
+
+/// `votport watch add <dir> <link> [--password <p>]`, `watch list`,
+/// `watch remove <id>`, and `watch run`, which scans every watched folder
+/// and ships each settled drop in turn until interrupted.
+fn watch(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("add") => {
+            let (options, positional, json) = parse(&args[1..], &["--password"])?;
+            let [dir, link] = positional.as_slice() else {
+                return Err("watch add takes a folder and a request link".to_owned());
+            };
+            let added = votport_client_core::watch::add_watch(
+                dir,
+                link,
+                options.get("--password").cloned(),
+            )
+            .map_err(human)?;
+            if json {
+                println!("{}", watch_json(&added));
+            } else {
+                println!("{}  {}  {}", added.id, added.dir, added.link);
+            }
+            Ok(())
+        }
+        Some("list") => {
+            let (_, _, json) = parse(&args[1..], &[])?;
+            for item in votport_client_core::watch::watches() {
+                if json {
+                    println!("{}", watch_json(&item));
+                } else {
+                    println!("{}  {}  {}", item.id, item.dir, item.link);
+                }
+            }
+            Ok(())
+        }
+        Some("remove") => {
+            let [_, id] = args else {
+                return Err("watch remove takes a watch id".to_owned());
+            };
+            votport_client_core::watch::remove_watch(id).map_err(human)
+        }
+        Some("run") => {
+            let (_, _, json) = parse(&args[1..], &[])?;
+            if votport_client_core::watch::watches().is_empty() {
+                return Err("no watched folders; add one with `votport watch add`".to_owned());
+            }
+            struct Ship {
+                json: bool,
+            }
+            impl votport_client_core::watch::WatchListener for Ship {
+                fn ready(&self, watch_id: String, path: String) {
+                    // ponytail: one drop at a time on the watcher's thread;
+                    // a pool when a facility drops faster than it ships.
+                    let listener = std::sync::Arc::new(ViewPrinter { json: self.json });
+                    let transfer = votport_client_core::ffi::Transfer::new();
+                    match votport_client_core::ffi::ship(watch_id, path.clone(), transfer, listener)
+                    {
+                        Ok(report) if self.json => println!(
+                            "{}",
+                            serde_json::json!({ "event": "shipped", "path": path, "files": report.files, "parked": report.parked, "park_problem": report.park_problem })
+                        ),
+                        Ok(report) => match report.park_problem {
+                            Some(problem) => println!(
+                                "shipped {path}: {} file(s), left in place: {problem}",
+                                report.files
+                            ),
+                            None => println!("shipped {path}: {} file(s)", report.files),
+                        },
+                        Err(error) if self.json => println!(
+                            "{}",
+                            serde_json::json!({ "event": "failed", "path": path, "headline": error.headline(), "detail": error.to_string() })
+                        ),
+                        Err(error) => eprintln!("{path}: {}", human(error)),
+                    }
+                }
+            }
+            let _watcher =
+                votport_client_core::watch::watch_all(std::sync::Arc::new(Ship { json }));
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        }
+        _ => Err("watch takes add, list, remove, or run".to_owned()),
+    }
+}
+
+fn watch_json(item: &votport_client_core::watch::Watch) -> serde_json::Value {
+    serde_json::json!({ "id": item.id, "dir": item.dir, "link": item.link, "has_password": item.has_password })
 }

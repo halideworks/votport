@@ -52,6 +52,11 @@ pub enum Error {
     #[error("the admin password was refused")]
     WrongPassword,
 
+    /// A one-path send of a path that is already shipping: a watch drop and
+    /// a Resume of it, or a double-click on Ship.
+    #[error("{path} is already shipping")]
+    AlreadyShipping { path: String },
+
     #[error("nothing to send: no files were selected")]
     Empty,
 
@@ -148,6 +153,9 @@ impl Error {
             Self::Rebegin => "The server restarted. Send again to continue.".to_owned(),
             Self::NotSignedIn => "Sign in to your votport first.".to_owned(),
             Self::WrongPassword => "That password is wrong.".to_owned(),
+            Self::AlreadyShipping { path } => {
+                format!("{} is already shipping.", name_of(path))
+            }
             Self::BadLink { .. } => "That is not a votport link.".to_owned(),
             Self::WrongLink { kind, .. } => match kind {
                 crate::api::LinkKind::Delivery => {
@@ -241,6 +249,7 @@ impl Error {
                 | Self::UnknownTransfer { .. }
                 | Self::NotSignedIn
                 | Self::WrongPassword
+                | Self::AlreadyShipping { .. }
                 | Self::Cancelled
         )
     }
@@ -388,6 +397,12 @@ mod tests {
                 "The server is busy with that. Try again in a moment.",
             ),
             (Error::NotSignedIn, "Sign in to your votport first."),
+            (
+                Error::AlreadyShipping {
+                    path: "/drops/reel.mov".into(),
+                },
+                "\"reel.mov\" is already shipping.",
+            ),
             (Error::WrongPassword, "That password is wrong."),
             (
                 Error::Rejected {
@@ -457,6 +472,8 @@ mod tests {
         .worth_retrying());
         assert!(!Error::Cancelled.worth_retrying());
         assert!(!Error::Empty.worth_retrying());
+        assert!(!Error::AlreadyShipping { path: "x".into() }.worth_retrying());
+        assert!(!Error::NotSignedIn.worth_retrying());
         assert!(!Error::BadLink { link: "x".into() }.worth_retrying());
     }
 

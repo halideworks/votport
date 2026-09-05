@@ -176,7 +176,31 @@ server's own reason ("Label must be 1..=200 characters."). The CLI gains `signin
 `issue-request`, `close-request`, `deliveries`, `revoke-delivery`,
 `library`, and `issue-delivery`. SSO sign-in still needs the three server
 touches under "The shells" and is not in the core yet. The shells do not
-draw any of this yet.
+draw any of this yet. Watch folders (phase C6) are in the core and the CLI
+as well (`watch.rs`): the list of watches lives in `watches.json` under
+the state directory (a folder, a request link, and the link's password
+when it has one, since an unattended send must hold it); a watcher thread
+scans every watched folder every two seconds and hands the listener each
+top-level file or folder whose fingerprint (entry count, total bytes,
+newest change) has held still for ten seconds, once; the caller ships it
+with `ship`, which runs the ordinary journalled send and then moves the
+drop into the folder's `shipped` subfolder, so the folder is its own
+ledger. Dotfiles, `shipped`, and a folder with nothing in it yet are
+skipped; a drop that fails stays put with its failed card and Retry, and
+is handed over again only if it changes. One drop ships at a time per
+path, and a drop that shipped but could not be moved aside is reported
+as shipped with the reason; at the next launch the watcher hands it over
+again, and the server's dedupe on a known package root makes that second
+send short. A watch send cut by a quit leaves its journal entry, offered as
+Resume like any other; the drop also settles again at the next launch,
+and whichever runs first holds the path (a one-path send claims it while
+it runs), so the other fails at once (`Error::AlreadyShipping`, not kept in the
+journal) instead of uploading beside it, and `ship` forgets the cut
+entry before it sends afresh. `votport watch add | list | remove | run` manage and run them
+from a terminal. The core also gained Pause: `Transfer::pause` stops a
+transfer like cancel but keeps the journal entry, the view ends in a
+`Paused` phase ("Paused, 120 MB of 300 MB"), and Resume picks it up from
+the partial.
 
 | Field | Value |
 | --- | --- |

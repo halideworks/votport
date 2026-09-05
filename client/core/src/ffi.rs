@@ -25,6 +25,7 @@ use crate::port;
 use crate::progress::{Event, Observer, Transport};
 use crate::receive::{receive_with_device_or_http, Delivery};
 use crate::transfer::{self, Drop, Selected};
+use crate::watch;
 
 /// Where a transfer is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -37,6 +38,9 @@ pub enum Phase {
     Done,
     Failed,
     Cancelled,
+    /// Stopped by the person with the journal entry kept, so Resume picks
+    /// it up where the partial left off.
+    Paused,
 }
 
 /// Where one file is. Over a QUIC path files stay `Waiting` while the carrier
@@ -144,6 +148,7 @@ pub trait TransferListener: Send + Sync {
 #[derive(Debug, Default, uniffi::Object)]
 pub struct Transfer {
     cancelled: AtomicBool,
+    paused: AtomicBool,
     journal_id: Mutex<Option<String>>,
     journal_kept: AtomicBool,
     journal_needs_password: AtomicBool,
@@ -164,6 +169,17 @@ impl Transfer {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Stops the transfer like [`Transfer::cancel`] but keeps its journal
+    /// entry, so the card ends as Paused with Resume rather than Cancelled.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Release);
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
     }
 
     /// The journal id of the transfer this handle ran, once it was recorded,
@@ -202,7 +218,8 @@ impl Transfer {
     /// failure that could go differently next time, and marked as needing
     /// a password when that is what was missing.
     fn settle(&self, entry: &journal::Entry, error: Option<&Error>) {
-        let kept = error.is_some_and(Error::worth_retrying);
+        let paused = matches!(error, Some(Error::Cancelled)) && self.is_paused();
+        let kept = paused || error.is_some_and(Error::worth_retrying);
         let missing_password = matches!(error, Some(Error::PasswordRequired));
         if kept {
             if missing_password {
@@ -555,6 +572,80 @@ pub fn issue_delivery(
     port::issue_delivery(spec)
 }
 
+/// The watched folders.
+#[uniffi::export]
+pub fn watches() -> Vec<watch::Watch> {
+    watch::watches()
+}
+
+/// Watches `dir`: its settled drops ship to the request `link`.
+///
+/// # Errors
+/// A `dir` that is not a folder, or a link that is not a request link.
+#[uniffi::export]
+pub fn add_watch(
+    dir: String,
+    link: String,
+    password: Option<String>,
+) -> std::result::Result<watch::Watch, Error> {
+    watch::add_watch(&dir, &link, password)
+}
+
+/// Stops watching; nothing in the folder changes.
+///
+/// # Errors
+/// A write failure.
+#[uniffi::export]
+pub fn remove_watch(id: String) -> std::result::Result<(), Error> {
+    watch::remove_watch(&id)
+}
+
+/// What a watch ship did.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ShipReport {
+    pub files: u64,
+    /// The drop moved into the folder's `shipped` subfolder.
+    pub parked: bool,
+    /// Why it could not be moved, when it could not. The send itself ended
+    /// well; the drop stays in the folder and ships again at the next
+    /// launch, which the server's dedupe on a known root keeps short.
+    pub park_problem: Option<String>,
+}
+
+/// Ships one settled drop of a watched folder, as [`send`] would, and moves
+/// it into the folder's `shipped` subfolder when the send ends well. One
+/// ship per path at a time: a second call for a path still shipping fails
+/// at once. A journal entry an earlier cut send left for the same path is
+/// forgotten first, since this send starts afresh. A drop that fails stays
+/// where it is with its journal entry, so a Retry runs it again; ponytail:
+/// a retried drop is not moved afterwards.
+///
+/// # Errors
+/// An unknown watch, a path already shipping, or anything [`send`] can
+/// fail with.
+#[uniffi::export]
+pub fn ship(
+    watch_id: String,
+    path: String,
+    transfer: Arc<Transfer>,
+    listener: Arc<dyn TransferListener>,
+) -> std::result::Result<ShipReport, Error> {
+    let (link, password) = watch::credentials(&watch_id)?;
+    // Claimed here and released before the send claims it again: a Resume
+    // holding the path makes this fail now, before the forget below.
+    {
+        let _flight = watch::single_flight(&path)?;
+        journal::forget_send_of(&path);
+    }
+    let report = send(link, password, vec![path.clone()], transfer, listener)?;
+    let parked = watch::park(Path::new(&path));
+    Ok(ShipReport {
+        files: report.files,
+        parked: parked.is_ok(),
+        park_problem: parked.err().map(|error| error.headline()),
+    })
+}
+
 /// The core's version, so a shell can show what it links.
 #[uniffi::export]
 pub fn core_version() -> String {
@@ -592,6 +683,12 @@ fn run_send(
     let handle = Arc::clone(&transfer);
     let mut forward = Forward::new(journal::Kind::Send, transfer, listener);
     let result = (|| {
+        // A one-path send holds its path while it runs, so a watch ship and
+        // a Resume of the same drop never upload it side by side.
+        let _flight = match entry.paths.as_slice() {
+            [only] => Some(watch::single_flight(only)?),
+            _ => None,
+        };
         let link = split_link_as(&entry.link, LinkKind::Request)?;
         let mut files: Vec<Selected> = Vec::new();
         for path in &entry.paths {
@@ -936,15 +1033,24 @@ impl Model {
                 }
             }
             Phase::Cancelled => "Cancelled".to_owned(),
+            Phase::Paused => match view.total_bytes {
+                Some(total) => format!(
+                    "Paused, {} of {}",
+                    human_bytes(view.moved_bytes),
+                    human_bytes(total)
+                ),
+                None => "Paused".to_owned(),
+            },
             Phase::Failed => view.headline.clone().unwrap_or_else(|| "Failed".to_owned()),
         }
     }
 
     /// Ends the transfer: the phase from the outcome, with a headline and the
     /// error's detail on a failure.
-    fn end(&mut self, error: Option<&Error>) {
+    fn end(&mut self, error: Option<&Error>, paused: bool) {
         self.view.phase = match error {
             None => Phase::Done,
+            Some(Error::Cancelled) if paused => Phase::Paused,
             Some(Error::Cancelled) => Phase::Cancelled,
             Some(error) => {
                 self.view.headline = Some(error.headline());
@@ -1023,7 +1129,7 @@ impl Forward {
         let mut model = model
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        model.end(error);
+        model.end(error, self.transfer.is_paused());
         self.push(&mut model, Instant::now());
     }
 }
@@ -1181,7 +1287,7 @@ mod tests {
         assert_eq!(model.view.rate_bytes_per_second, Some(0));
         assert_eq!(model.view.eta_seconds, None);
         assert!(model.rate_since.is_none(), "holding restarts after a stall");
-        model.end(None);
+        model.end(None, false);
         assert_eq!(model.view.phase, Phase::Done);
         assert_eq!(model.view.rate_bytes_per_second, None);
     }
@@ -1213,7 +1319,7 @@ mod tests {
             t0,
         );
         model.apply(Event::Finished { files: 1 }, t0);
-        model.end(None);
+        model.end(None, false);
         let view = model.snapshot();
         assert_eq!(view.status, "Shipped and verified, 1 file");
         assert_eq!(view.rate_text, None);
@@ -1226,11 +1332,15 @@ mod tests {
         let view = model.snapshot();
         assert!(view.status.starts_with("Receiving, "), "{}", view.status);
         assert_eq!(view.route.as_deref(), Some("Standard route (HTTP)"));
-        model.end(None);
+        model.end(None, false);
         assert_eq!(model.snapshot().status, "Landed and verified, 2 files");
-        model.end(Some(&Error::Cancelled));
+        model.end(Some(&Error::Cancelled), false);
         assert_eq!(model.snapshot().status, "Cancelled");
-        model.end(Some(&Error::PasswordRequired));
+        model.end(Some(&Error::Cancelled), true);
+        let view = model.snapshot();
+        assert_eq!(view.phase, Phase::Paused);
+        assert_eq!(view.status, "Paused, 0 bytes of 3 bytes");
+        model.end(Some(&Error::PasswordRequired), false);
         assert_eq!(model.snapshot().status, "This link needs a password.");
     }
 
@@ -1295,14 +1405,42 @@ mod tests {
         assert_eq!(empty.with_line().line, None);
     }
 
+    /// The journal is process-wide; this test points it at a temporary
+    /// directory, which only the Linux arm of `state_dir` reads.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_paused_transfer_keeps_its_journal_entry_and_a_cancelled_one_does_not() {
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_DATA_HOME", state.path());
+        let entry = journal::record(
+            journal::Kind::Send,
+            "https://d/r/t",
+            vec!["/drops/a".to_owned()],
+            None,
+            false,
+        );
+        let transfer = Transfer::new();
+        transfer.pause();
+        assert!(transfer.is_cancelled() && transfer.is_paused());
+        transfer.settle(&entry, Some(&Error::Cancelled));
+        assert!(transfer.journal_kept());
+        assert!(journal::get(&entry.id).is_ok(), "kept for Resume");
+
+        let plain = Transfer::new();
+        plain.cancel();
+        plain.settle(&entry, Some(&Error::Cancelled));
+        assert!(!plain.journal_kept());
+        assert!(journal::get(&entry.id).is_err(), "a plain cancel forgets");
+    }
+
     #[test]
     fn end_maps_the_outcome_to_a_phase_with_the_headline_and_detail() {
         let mut model = Model::new(journal::Kind::Send);
-        model.end(Some(&Error::Cancelled));
+        model.end(Some(&Error::Cancelled), false);
         assert_eq!(model.view.phase, Phase::Cancelled);
         assert_eq!((model.view.headline, model.view.detail), (None, None));
         let mut model = Model::new(journal::Kind::Send);
-        model.end(Some(&Error::PasswordRequired));
+        model.end(Some(&Error::PasswordRequired), false);
         assert_eq!(model.view.phase, Phase::Failed);
         assert_eq!(
             model.view.headline.as_deref(),
