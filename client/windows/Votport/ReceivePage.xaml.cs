@@ -9,12 +9,14 @@ namespace Votport;
 public sealed partial class ReceivePage : Page
 {
     private string folder = "";
+    private readonly LinkPreviewer previewer;
 
     public ReceivePage()
     {
         InitializeComponent();
+        previewer = new LinkPreviewer(Refresh);
         folder = Settings.ReceiveFolder;
-        LinkBox.TextChanged += (_, _) => Refresh();
+        LinkBox.TextChanged += (_, _) => previewer.Update(LinkBox.Text);
         if (TransferStore.Shared.PrefillReceive is string link)
         {
             LinkBox.Text = link;
@@ -26,7 +28,12 @@ public sealed partial class ReceivePage : Page
     private void Refresh()
     {
         FolderText.Text = folder.Length == 0 ? "No folder chosen" : folder;
-        ReceiveButton.IsEnabled = folder.Length > 0 && LinkBox.Text.Length > 0;
+        var line = previewer.Line();
+        PreviewText.Text = line ?? "";
+        PreviewText.Visibility = line is null ? Visibility.Collapsed : Visibility.Visible;
+        PreviewText.Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources[previewer.IsProblem ? "VotDangerBrush" : "VotMutedBrush"];
+        PasswordBox.Visibility = previewer.NeedsPassword ? Visibility.Visible : Visibility.Collapsed;
+        ReceiveButton.IsEnabled = folder.Length > 0 && previewer.Ready;
     }
 
     private async void ChooseFolder_Click(object sender, RoutedEventArgs e)

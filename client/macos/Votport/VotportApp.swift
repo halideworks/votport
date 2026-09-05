@@ -62,7 +62,6 @@ struct MainWindow: View {
         }
         .background(Tokens.bg)
         .foregroundStyle(Tokens.text)
-        .preferredColorScheme(.dark)
         .onAppear {
             if Launch.done {
                 section = .transfers

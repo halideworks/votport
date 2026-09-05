@@ -79,7 +79,18 @@ for the staged bundle and the copy, so a destination that fits only once
 goes over HTTP), and ends a failed transfer with a one-sentence
 `headline` for the person and the full error as `detail`. Hash progress
 itself is a VOT change (`build_manifest_from` collects and hashes with
-no callback).
+no callback). Both shells draw that preview: a pasted link is checked
+off the UI thread after typing settles, the line under the field names
+the label, the size or the cap, and the QUIC offer, the password field
+appears only when the link needs one, and the primary button is enabled
+only for a usable link, with the core's sentence shown for one that is
+not. A failed card shows the headline, and the detail behind the
+expand. The Windows card gets Show in Explorer beside the Mac's Reveal
+in Finder. Both apps follow the system theme: `scripts/design-tokens.mjs`
+now also writes `Tokens.swift` (dynamic colours from both blocks) and
+`Tokens.xaml` (theme dictionaries read through `ThemeResource`), and a
+node test fails when any of the three generated files is stale. The Mac
+expand animation follows reduce motion.
 
 | Field | Value |
 | --- | --- |

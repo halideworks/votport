@@ -10,6 +10,6 @@
       <Button x:Name="ClearButton" Content="Clear" Click="Clear_Click" />
     </StackPanel>
     <ToggleSwitch x:Name="NotifySwitch" Header="Notify when a transfer ends" Toggled="Notify_Toggled" />
-    <TextBlock x:Name="CoreText" Foreground="{StaticResource VotMutedBrush}" />
+    <TextBlock x:Name="CoreText" Foreground="{ThemeResource VotMutedBrush}" />
   </StackPanel>
 </Page>

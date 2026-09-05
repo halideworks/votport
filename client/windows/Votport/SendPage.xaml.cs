@@ -12,18 +12,21 @@ namespace Votport;
 public sealed partial class SendPage : Page
 {
     private readonly ObservableCollection<string> paths = new();
+    private readonly LinkPreviewer previewer;
 
     public SendPage()
     {
         InitializeComponent();
+        previewer = new LinkPreviewer(Refresh);
         Paths.ItemsSource = paths;
         paths.CollectionChanged += (_, _) => Refresh();
-        LinkBox.TextChanged += (_, _) => Refresh();
+        LinkBox.TextChanged += (_, _) => previewer.Update(LinkBox.Text);
         if (TransferStore.Shared.PrefillSend is string link)
         {
             LinkBox.Text = link;
             TransferStore.Shared.PrefillSend = null;
         }
+        Refresh();
     }
 
     private void Refresh()
@@ -32,7 +35,12 @@ public sealed partial class SendPage : Page
         Empty.Visibility = any ? Visibility.Collapsed : Visibility.Visible;
         Paths.Visibility = any ? Visibility.Visible : Visibility.Collapsed;
         ClearButton.Visibility = any ? Visibility.Visible : Visibility.Collapsed;
-        SendButton.IsEnabled = any && LinkBox.Text.Length > 0;
+        var line = previewer.Line();
+        PreviewText.Text = line ?? "";
+        PreviewText.Visibility = line is null ? Visibility.Collapsed : Visibility.Visible;
+        PreviewText.Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources[previewer.IsProblem ? "VotDangerBrush" : "VotMutedBrush"];
+        PasswordBox.Visibility = previewer.NeedsPassword ? Visibility.Visible : Visibility.Collapsed;
+        SendButton.IsEnabled = any && previewer.Ready;
     }
 
     private void Add(IEnumerable<IStorageItem> items)
@@ -86,6 +94,7 @@ public sealed partial class SendPage : Page
         var password = PasswordBox.Password.Length == 0 ? null : PasswordBox.Password;
         TransferStore.Shared.Send(LinkBox.Text, password, paths.ToArray());
         paths.Clear();
+        PasswordBox.Password = "";
         App.Window?.Show("transfers");
     }
 }
