@@ -46,9 +46,25 @@ presses Send or Receive). Launch-time
 work runs from the app delegate, since a locked screen never shows a
 window. `scripts/design-tokens.mjs` generates `client/design/tokens.json`
 from the web stylesheet. Next: the "Open in the app" links on the web
-pages, the Windows shell (C5), and the core follow-ons: the client journal
-with `votport status` (which also gives multi-file resume) and watch
-folders.
+pages and the core follow-ons: the client journal with `votport status`
+(which also gives multi-file resume) and watch folders. The Windows shell
+(C5) in `client/windows` is a WinUI 3 app on the Windows App SDK with the
+same four sections: Send with drop from Explorer, a file and folder
+picker, and clipboard paste; Receive; Transfers drawing the same
+`TransferView` through a dispatcher-queue hop; Settings in the registry.
+It consumes the core as a DLL with the C# bindings `build-core.ps1`
+generates through `uniffi-bindgen-cs`. The tray icon is the shell's own
+notification-area API on a hidden message window (the third-party WinUI
+tray library crashed the XAML runtime), toasts go through the app
+notification manager, the `votport:` protocol is in the MSIX manifest and
+registered for the user by an unpackaged build, and one instance handles
+every activation. `dotnet build` alone builds it, and with
+`WindowsPackageType=MSIX` produces an unsigned package; no Visual Studio
+workload is needed. On tr-desktop it received the 300 MB delivery
+byte-identical from the `--receive` launch argument, started into the
+console session by a scheduled task, with the screen locked. Both apps
+stay unsigned until the Developer ID and the code-signing certificate
+land.
 
 | Field | Value |
 | --- | --- |
@@ -521,7 +537,7 @@ Windows (`client/windows`): WinUI 3 on the Windows App SDK, C#, Mica
 backdrop, the same four sections, drop from Explorer, a tray icon with
 the active transfers, toast notifications, the `votport:` protocol
 registered by the MSIX manifest, MSIX packaging with a code-signing
-certificate. Minimum Windows 10 22H2. The core ships as a DLL with the
+certificate. Minimum Windows 10 22H2 (the SDK's build floor is 10.0.19041). The core ships as a DLL with the
 generated C# bindings.
 
 CLI (`client/cli`): `votport send <link> <path>...`, `votport receive

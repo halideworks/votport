@@ -18,3 +18,6 @@ client/macos/Votport/Info.plist
 client/macos/VotportCore/VotportCoreFFI.xcframework/
 client/macos/VotportCore/Sources/VotportCore/*.swift
 client/macos/build/
+client/windows/Votport/Generated/
+client/windows/Votport/bin/
+client/windows/Votport/obj/

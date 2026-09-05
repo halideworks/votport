@@ -1,0 +1,15 @@
+<Page x:Class="Votport.SettingsPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <StackPanel Spacing="12">
+    <TextBlock Text="SETTINGS" Style="{StaticResource SectionLabel}" />
+    <TextBlock Text="Receive into" />
+    <StackPanel Orientation="Horizontal" Spacing="8">
+      <TextBlock x:Name="FolderText" Style="{StaticResource Mono}" VerticalAlignment="Center" MaxWidth="420" />
+      <Button Content="Choose" Click="Choose_Click" />
+      <Button x:Name="ClearButton" Content="Clear" Click="Clear_Click" />
+    </StackPanel>
+    <ToggleSwitch x:Name="NotifySwitch" Header="Notify when a transfer ends" Toggled="Notify_Toggled" />
+    <TextBlock x:Name="CoreText" Foreground="{StaticResource VotMutedBrush}" />
+  </StackPanel>
+</Page>
