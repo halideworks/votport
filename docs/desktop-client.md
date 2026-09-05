@@ -551,8 +551,10 @@ switching follows the admin session's tenant.
 ### votport server changes
 
 - The recipient page and the sender page get an "Open in the votport app"
-  link (`votport://r/{token}`, `votport://s/{token}`) shown when the page
-  detects a desktop platform; nothing else on the server changes for
+  link (`votport://r/{token}?base={origin}`, `votport://s/{token}?base={origin}`,
+  the origin being the page's own, since a custom scheme carries no
+  referrer) shown when the page detects a desktop platform; the app only
+  prefills its screen from it. Nothing else on the server changes for
   version one. Push and serve are already there; erebus needs the UDP
   ports mapped and advertised for either QUIC path to be live (both
   listeners are unbound in production today).

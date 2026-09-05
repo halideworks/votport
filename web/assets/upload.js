@@ -219,6 +219,18 @@ function checkCancelled() {
   if (cancelled) throw new Cancelled();
 }
 
+// Offers the desktop app the same link: `votport://<kind>/<token>?base=<origin>`,
+// which the app prefills and the user confirms. Phones have no app.
+function offerApp(kind) {
+  if (/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)) return;
+  const link = document.getElementById('open-in-app-link');
+  if (!link) return;
+  link.href = `votport://${kind}/${encodeURIComponent(token)}?base=${encodeURIComponent(window.location.origin)}`;
+  link.hidden = false;
+  const holder = document.getElementById('open-in-app');
+  if (holder) holder.hidden = false;
+}
+
 // A record of the session currently in flight, so an interrupted transfer can
 // re-attach to it instead of re-sending bytes the server already verified.
 // Cleared on success and on cancel, kept on failure — failure is the case it
@@ -1297,6 +1309,7 @@ $('resume-discard').addEventListener('click', () => {
     return;
   }
   $('title').textContent = info.label;
+  offerApp('r');
   $('subtitle').textContent = 'Files are verified on receipt.';
   applyBranding(info.branding, `/api/r/${token}/logo`);
   chunkBytes = info.chunk_bytes || chunkBytes;

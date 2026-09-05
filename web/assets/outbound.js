@@ -480,6 +480,18 @@ async function loadMetadata() {
   $('receipt-key').textContent = body.receipt_key;
   $('receipt-key').title = body.receipt_key;
   $('download-content').hidden = false;
+  offerApp('s');
+}
+// Offers the desktop app the same link: `votport://<kind>/<token>?base=<origin>`,
+// which the app prefills and the user confirms. Phones have no app.
+function offerApp(kind) {
+  if (/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)) return;
+  const link = document.getElementById('open-in-app-link');
+  if (!link) return;
+  link.href = `votport://${kind}/${encodeURIComponent(token)}?base=${encodeURIComponent(window.location.origin)}`;
+  link.hidden = false;
+  const holder = document.getElementById('open-in-app');
+  if (holder) holder.hidden = false;
 }
 
 $('separate-download-start').addEventListener('click', startAnchorDownloads);
