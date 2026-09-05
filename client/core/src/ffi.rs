@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::api::split_link;
+use crate::api::{split_link, split_link_as, LinkKind};
 use crate::error::Error;
 use crate::identity::Device;
 use crate::progress::{Event, Observer, Transport};
@@ -77,8 +77,10 @@ pub struct TransferView {
     pub rate_bytes_per_second: Option<u64>,
     /// Seconds left, shown only once the rate has held for a while.
     pub eta_seconds: Option<u64>,
-    /// The core's message when `phase` is `Failed`.
-    pub message: Option<String>,
+    /// One plain sentence for the person when `phase` is `Failed`.
+    pub headline: Option<String>,
+    /// The full error text behind the headline, for a detail line or a log.
+    pub detail: Option<String>,
 }
 
 /// What a send did.
@@ -126,6 +128,131 @@ impl Transfer {
     }
 }
 
+/// One file a delivery holds, as its page lists it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PreviewFile {
+    pub path: String,
+    pub bytes: u64,
+}
+
+/// What a link is, read before anything is sent, minted, or reserved, so a
+/// screen can show what a pasted link does and ask for a password only when
+/// one is needed.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LinkPreview {
+    /// What the link is, once it parsed as one.
+    pub kind: Option<LinkKind>,
+    /// Why the link cannot be used as pasted, as one sentence for the
+    /// person: not a votport link, closed, unreachable. `None` when it can.
+    pub problem: Option<String>,
+    /// The full error text behind `problem`.
+    pub detail: Option<String>,
+    /// The operator's label for the link, when the server shares one. A
+    /// password delivery shares nothing until it is verified.
+    pub label: Option<String>,
+    pub needs_password: bool,
+    /// Whether the link can be used as pasted: a request that still accepts
+    /// drops, a delivery the server answered for. False whenever `problem`
+    /// is set.
+    pub usable: bool,
+    /// The server offers a QUIC path: a push listener for a request, a fetch
+    /// endpoint for a delivery. Whether the network carries it is decided by
+    /// the transfer's probe. `None` until a password delivery is verified,
+    /// since the server withholds everything before then.
+    pub quic: Option<bool>,
+    /// The largest drop a request link accepts.
+    pub max_bytes: Option<u64>,
+    /// The most files a request link accepts.
+    pub max_entries: Option<u64>,
+    /// A delivery's files, empty until a password delivery is verified.
+    pub files: Vec<PreviewFile>,
+    /// The sum of `files`, when they are known.
+    pub total_bytes: Option<u64>,
+}
+
+/// Reads what `link` is with the two unauthenticated GETs the transfer
+/// paths start with. Nothing is verified, minted, or reserved: a preview
+/// spends nothing on the server. Never fails: a link that cannot be used
+/// comes back with `problem` set, so a screen shows it under the field.
+/// Blocks for the round trip: about two minutes against a host that never
+/// connects (the connect timeout inside the retry budget), and with no bound
+/// against one that connects and never answers, since the client sets no
+/// read timeout (a transfer's reads are long by design). A shell runs it off
+/// its main thread and ignores a result for a link the field no longer holds.
+#[uniffi::export]
+pub fn inspect(link: String) -> LinkPreview {
+    match preview(&link) {
+        Ok(preview) => preview,
+        Err(error) => LinkPreview {
+            kind: split_link(&link).ok().map(|link| link.kind),
+            problem: Some(error.headline()),
+            detail: Some(error.to_string()),
+            label: None,
+            needs_password: false,
+            usable: false,
+            quic: None,
+            max_bytes: None,
+            max_entries: None,
+            files: Vec::new(),
+            total_bytes: None,
+        },
+    }
+}
+
+fn preview(link: &str) -> std::result::Result<LinkPreview, Error> {
+    let link = split_link(link)?;
+    let client = crate::api::Client::new(&link.base)?;
+    if link.kind == LinkKind::Delivery {
+        let metadata = client.outbound_metadata(&link.token, None)?;
+        // Before the password is proven the server answers with the gate
+        // alone, so nothing else in the reply is known.
+        let known = metadata.authorized || !metadata.has_password;
+        let files: Vec<PreviewFile> = if known {
+            metadata
+                .files
+                .iter()
+                .map(|file| PreviewFile {
+                    path: file.name.clone(),
+                    bytes: file.bytes,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(LinkPreview {
+            kind: Some(LinkKind::Delivery),
+            problem: None,
+            detail: None,
+            label: metadata.label,
+            needs_password: !known,
+            usable: true,
+            quic: known.then_some(metadata.fetch.is_some()),
+            max_bytes: None,
+            max_entries: None,
+            total_bytes: known.then(|| files.iter().map(|file| file.bytes).sum()),
+            files,
+        })
+    } else {
+        let info = client.link_info(&link.token)?;
+        let closed = (!info.usable).then(|| Error::LinkUnusable {
+            token: link.token.clone(),
+        });
+        Ok(LinkPreview {
+            kind: Some(LinkKind::Request),
+            problem: closed.as_ref().map(Error::headline),
+            detail: closed.as_ref().map(ToString::to_string),
+            label: info.label,
+            needs_password: info.needs_password && !info.authorized,
+            usable: info.usable,
+            quic: Some(info.push),
+            max_bytes: Some(info.max_bytes),
+            max_entries: Some(info.max_entries as u64),
+            files: Vec::new(),
+            total_bytes: None,
+        })
+    }
+}
+
 /// The core's version, so a shell can show what it links.
 #[uniffi::export]
 pub fn core_version() -> String {
@@ -148,7 +275,7 @@ pub fn send(
 ) -> std::result::Result<SendReport, Error> {
     let mut forward = Forward::new(transfer, listener);
     let result = (|| {
-        let (base, token) = split_link(&link)?;
+        let link = split_link_as(&link, LinkKind::Request)?;
         let mut files: Vec<Selected> = Vec::new();
         for path in &paths {
             transfer::collect(Path::new(path), &mut files).map_err(|source| Error::Read {
@@ -157,23 +284,25 @@ pub fn send(
             })?;
         }
         let drop = Drop {
-            token,
+            token: link.token,
             password,
             files,
         };
         let device = Device::load_or_create()?;
-        Ok(match transfer::send(&base, drop, &device, &mut forward)? {
-            transfer::Sent::Push { files } => SendReport {
-                transport: Transport::Push,
-                files: files as u64,
-                upload_id: None,
+        Ok(
+            match transfer::send(&link.base, drop, &device, &mut forward)? {
+                transfer::Sent::Push { files } => SendReport {
+                    transport: Transport::Push,
+                    files: files as u64,
+                    upload_id: None,
+                },
+                transfer::Sent::Http(report) => SendReport {
+                    transport: Transport::Http,
+                    files: report.files.len() as u64,
+                    upload_id: Some(report.upload_id),
+                },
             },
-            transfer::Sent::Http(report) => SendReport {
-                transport: Transport::Http,
-                files: report.files.len() as u64,
-                upload_id: Some(report.upload_id),
-            },
-        })
+        )
     })();
     forward.finish(result.as_ref().err());
     result
@@ -197,10 +326,13 @@ pub fn receive(
 ) -> std::result::Result<ReceiveReport, Error> {
     let mut forward = Forward::new(transfer, listener);
     let result = (|| {
-        let (base, token) = split_link(&link)?;
-        let delivery = Delivery { token, password };
+        let link = split_link_as(&link, LinkKind::Delivery)?;
+        let delivery = Delivery {
+            token: link.token,
+            password,
+        };
         let received =
-            receive_with_device_or_http(&base, delivery, Path::new(&dest), &mut forward)?;
+            receive_with_device_or_http(&link.base, delivery, Path::new(&dest), &mut forward)?;
         Ok(ReceiveReport {
             files: received
                 .files
@@ -248,7 +380,8 @@ impl Model {
                 total_bytes: None,
                 rate_bytes_per_second: None,
                 eta_seconds: None,
-                message: None,
+                headline: None,
+                detail: None,
             },
             planned_total: None,
             carrier_bytes: false,
@@ -262,7 +395,7 @@ impl Model {
     fn apply(&mut self, event: Event, now: Instant) -> bool {
         let before = self.view.phase;
         match event {
-            Event::Planned { files } => {
+            Event::Selected { files } | Event::Planned { files } => {
                 self.view.files = files
                     .into_iter()
                     .map(|file| FileView {
@@ -398,14 +531,15 @@ impl Model {
         }
     }
 
-    /// Ends the transfer: the phase from the outcome, with the core's message
-    /// on a failure.
+    /// Ends the transfer: the phase from the outcome, with a headline and the
+    /// error's detail on a failure.
     fn end(&mut self, error: Option<&Error>) {
         self.view.phase = match error {
             None => Phase::Done,
             Some(Error::Cancelled) => Phase::Cancelled,
             Some(error) => {
-                self.view.message = Some(error.to_string());
+                self.view.headline = Some(error.headline());
+                self.view.detail = Some(error.to_string());
                 Phase::Failed
             }
         };
@@ -640,16 +774,20 @@ mod tests {
     }
 
     #[test]
-    fn end_maps_the_outcome_to_a_phase_with_the_message() {
+    fn end_maps_the_outcome_to_a_phase_with_the_headline_and_detail() {
         let mut model = Model::new();
         model.end(Some(&Error::Cancelled));
         assert_eq!(model.view.phase, Phase::Cancelled);
-        assert_eq!(model.view.message, None);
+        assert_eq!((model.view.headline, model.view.detail), (None, None));
         let mut model = Model::new();
         model.end(Some(&Error::PasswordRequired));
         assert_eq!(model.view.phase, Phase::Failed);
         assert_eq!(
-            model.view.message.as_deref(),
+            model.view.headline.as_deref(),
+            Some("This link needs a password.")
+        );
+        assert_eq!(
+            model.view.detail.as_deref(),
             Some("this link needs a password")
         );
     }

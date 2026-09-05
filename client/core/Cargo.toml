@@ -29,6 +29,9 @@ thiserror = "2"
 # targets; the Swift generator ships inside uniffi itself.
 uniffi = "0.31.0"
 tempfile = "3"
+# Free space at a destination before a receive commits; already in the
+# tree through vot-platform-fs.
+fs4 = "1"
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "cookies", "rustls-tls"] }

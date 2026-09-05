@@ -33,6 +33,10 @@ pub enum Event {
     /// Bytes a QUIC carrier moved so far, and the package length when the
     /// fetch knows it (a push never does).
     Bytes { moved: u64, total: Option<u64> },
+    /// The files a send selected, in selection order, announced before the
+    /// hash pass so a list exists while hashing runs. Superseded by
+    /// [`Event::Planned`], whose indices are the ones later ticks carry.
+    Selected { files: Vec<PlannedFile> },
     /// The files the transfer will move, in index order, with their sizes, so
     /// a view can name and size every later tick and sum the whole.
     Planned { files: Vec<PlannedFile> },

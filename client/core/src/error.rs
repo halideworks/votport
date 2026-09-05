@@ -31,6 +31,13 @@ pub enum Error {
     #[error("{link:?} is not a votport link (expected .../r/TOKEN or .../s/TOKEN)")]
     BadLink { link: String },
 
+    /// A delivery link pasted where a request link goes, or the reverse.
+    #[error("{link:?} is a {} link", match kind { crate::api::LinkKind::Request => "request", crate::api::LinkKind::Delivery => "delivery" })]
+    WrongLink {
+        link: String,
+        kind: crate::api::LinkKind,
+    },
+
     #[error("the link at {token} is not usable for a drop")]
     LinkUnusable { token: String },
 
@@ -86,6 +93,14 @@ pub enum Error {
     #[error("the transfer was cancelled")]
     Cancelled,
 
+    /// The destination's filesystem cannot hold the delivery.
+    #[error("{path} has {available} bytes free; the delivery needs {needed}")]
+    NoSpace {
+        path: PathBuf,
+        needed: u64,
+        available: u64,
+    },
+
     #[error("filesystem error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -97,6 +112,128 @@ pub enum Error {
 
     #[error("{0}")]
     Other(String),
+}
+
+impl Error {
+    /// One short sentence for a person, without protocol words. The full
+    /// text of the error (`to_string`) is the detail behind it.
+    #[must_use]
+    pub fn headline(&self) -> String {
+        match self {
+            Self::Http { .. } => "Could not reach the server.".to_owned(),
+            Self::Server { status, .. } => match status {
+                401 | 403 => "The password was not accepted.".to_owned(),
+                404 | 410 => "This link is closed or has expired.".to_owned(),
+                413 => "The drop is larger than this link accepts.".to_owned(),
+                429 => "Too many tries. Wait a minute and try again.".to_owned(),
+                _ => "The server refused the transfer.".to_owned(),
+            },
+            Self::Rebegin => "The server restarted. Send again to continue.".to_owned(),
+            Self::BadLink { .. } => "That is not a votport link.".to_owned(),
+            Self::WrongLink { kind, .. } => match kind {
+                crate::api::LinkKind::Delivery => {
+                    "That is a delivery link. Paste it into Receive.".to_owned()
+                }
+                crate::api::LinkKind::Request => {
+                    "That is a request link. Paste it into Send.".to_owned()
+                }
+            },
+            Self::LinkUnusable { .. } => "This link is closed.".to_owned(),
+            Self::PasswordRequired => "This link needs a password.".to_owned(),
+            Self::Empty => "Nothing was selected.".to_owned(),
+            Self::Rejected { count, first } => {
+                if *count == 1 {
+                    format!("{} cannot be sent: {}.", name_of(&first.path), first.reason)
+                } else {
+                    format!(
+                        "{count} files cannot be sent. First: {} ({}).",
+                        name_of(&first.path),
+                        first.reason
+                    )
+                }
+            }
+            Self::TooManyEntries { limit } => {
+                format!("This link accepts at most {limit} files.")
+            }
+            Self::TooLarge { limit, .. } => {
+                format!("This link accepts at most {}.", human_bytes(*limit))
+            }
+            Self::Read { path, .. } => format!("{} could not be read.", name_of_path(path)),
+            Self::Verify { path, .. } => {
+                format!("{} did not verify. Receive it again.", name_of_path(path))
+            }
+            Self::UnknownSuite { .. } => {
+                "This delivery is in a format this app cannot receive.".to_owned()
+            }
+            Self::BadName { name, .. } => {
+                format!("This delivery names {name:?}, which cannot be written here.")
+            }
+            Self::Exists { path } => format!(
+                "{} is already in that folder. Choose an empty one.",
+                name_of_path(path)
+            ),
+            Self::Cancelled => "Cancelled.".to_owned(),
+            Self::NoSpace {
+                needed, available, ..
+            } => format!(
+                "Not enough space: {} needed, {} free.",
+                human_bytes(*needed),
+                human_bytes(*available)
+            ),
+            Self::Io(_) => "A file could not be written.".to_owned(),
+            Self::Package(vot_cli::Error::SourceMutation) => {
+                "A file changed while it was being read. Send it again.".to_owned()
+            }
+            Self::Package(vot_cli::Error::ServeIdentityMismatch) => {
+                "The server did not prove its identity.".to_owned()
+            }
+            Self::Package(_) | Self::Object(_) | Self::Other(_) => {
+                "The transfer could not continue.".to_owned()
+            }
+        }
+    }
+}
+
+fn name_of(path: &str) -> String {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    format!("{name:?}")
+}
+
+fn name_of_path(path: &std::path::Path) -> String {
+    match path.file_name() {
+        Some(name) => format!("{:?}", name.to_string_lossy()),
+        None => format!("{:?}", path.display().to_string()),
+    }
+}
+
+/// `1.5 GB`-style text for a headline. Decimal units, as Finder and the web
+/// pages show them.
+#[must_use]
+pub fn human_bytes(value: u64) -> String {
+    const UNITS: [&str; 5] = ["bytes", "KB", "MB", "GB", "TB"];
+    let mut amount = value as f64;
+    let mut unit = 0;
+    while amount >= 1000.0 && unit < UNITS.len() - 1 {
+        amount /= 1000.0;
+        unit += 1;
+    }
+    // `{:.0}` rounds 999.5 and above to 1000, which the loop left one unit
+    // short; carry it.
+    if unit < UNITS.len() - 1 && amount >= 999.5 {
+        amount /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        if value == 1 {
+            "1 byte".to_owned()
+        } else {
+            format!("{value} bytes")
+        }
+    } else if amount >= 99.95 {
+        format!("{amount:.0} {}", UNITS[unit])
+    } else {
+        format!("{amount:.1} {}", UNITS[unit])
+    }
 }
 
 impl From<vot_cli::Error> for Error {
@@ -112,3 +249,94 @@ impl From<vot_object::Error> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_headline_is_one_plain_sentence() {
+        let cases: Vec<(Error, &str)> = vec![
+            (
+                Error::Server {
+                    status: 404,
+                    what: "link info".into(),
+                    body: String::new(),
+                },
+                "This link is closed or has expired.",
+            ),
+            (
+                Error::Server {
+                    status: 401,
+                    what: "verify".into(),
+                    body: String::new(),
+                },
+                "The password was not accepted.",
+            ),
+            (
+                Error::Server {
+                    status: 500,
+                    what: "begin".into(),
+                    body: "proof rejected".into(),
+                },
+                "The server refused the transfer.",
+            ),
+            (
+                Error::Rejected {
+                    count: 1,
+                    first: crate::entries::Rejected {
+                        path: "shots/.DS_Store".into(),
+                        reason: "hidden files are not accepted".into(),
+                    },
+                },
+                "\".DS_Store\" cannot be sent: hidden files are not accepted.",
+            ),
+            (
+                Error::TooLarge {
+                    total: 5_000_000_000,
+                    limit: 2_500_000_000,
+                },
+                "This link accepts at most 2.5 GB.",
+            ),
+            (
+                Error::Exists {
+                    path: PathBuf::from("/dest/reel.mov"),
+                },
+                "\"reel.mov\" is already in that folder. Choose an empty one.",
+            ),
+            (
+                Error::NoSpace {
+                    path: PathBuf::from("/dest"),
+                    needed: 120_000_000_000,
+                    available: 8_000_000_000,
+                },
+                "Not enough space: 120 GB needed, 8.0 GB free.",
+            ),
+            (Error::Cancelled, "Cancelled."),
+            (
+                Error::Other("chunk too large".into()),
+                "The transfer could not continue.",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.headline(), expected, "{error}");
+        }
+    }
+
+    #[test]
+    fn human_bytes_rounds_the_way_a_person_reads() {
+        assert_eq!(human_bytes(0), "0 bytes");
+        assert_eq!(human_bytes(1), "1 byte");
+        assert_eq!(human_bytes(999), "999 bytes");
+        assert_eq!(human_bytes(1_000), "1.0 KB");
+        assert_eq!(human_bytes(99_950), "100 KB");
+        assert_eq!(human_bytes(999_499), "999 KB");
+        assert_eq!(human_bytes(999_500), "1.0 MB");
+        assert_eq!(human_bytes(999_950), "1.0 MB");
+        assert_eq!(human_bytes(999_500_000), "1.0 GB");
+        assert_eq!(human_bytes(1_536_000), "1.5 MB");
+        assert_eq!(human_bytes(999_999_999), "1.0 GB");
+        assert_eq!(human_bytes(250_000_000_000), "250 GB");
+        assert_eq!(human_bytes(999_999_999_999_999), "1000 TB");
+    }
+}

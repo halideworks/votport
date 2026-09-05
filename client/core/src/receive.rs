@@ -138,6 +138,8 @@ pub fn receive_over_http(
             return Err(Error::Exists { path: path.clone() });
         }
     }
+    let needed: u64 = planned.iter().map(|(file, _, _)| file.bytes).sum();
+    require_space(dest, needed)?;
 
     observer.event(Event::Planned {
         files: planned
@@ -184,6 +186,47 @@ pub fn receive_over_http(
     }
     observer.event(Event::Finished { files: files.len() });
     Ok(Received { files })
+}
+
+/// Refuses a receive whose files cannot fit at `dest`, before any byte or
+/// ticket is spent. `dest` may not exist yet; the nearest existing ancestor
+/// is asked, since that is the filesystem the files land on.
+///
+/// # Errors
+/// [`Error::NoSpace`] when the free space is below `needed`.
+pub(crate) fn require_space(dest: &Path, needed: u64) -> Result<()> {
+    let Some(available) = available_space(dest) else {
+        // No existing ancestor answered (an unmounted volume, say); the write
+        // itself will report what is wrong.
+        return Ok(());
+    };
+    if available < needed {
+        return Err(Error::NoSpace {
+            path: dest.to_path_buf(),
+            needed,
+            available,
+        });
+    }
+    Ok(())
+}
+
+/// Free bytes on the filesystem holding `path`, or its nearest existing
+/// ancestor.
+fn available_space(path: &Path) -> Option<u64> {
+    let mut probe = Some(path);
+    while let Some(candidate) = probe {
+        // A relative name's parent is the empty path: the working directory.
+        let candidate = if candidate.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            candidate
+        };
+        if candidate.exists() {
+            return fs4::available_space(candidate).ok();
+        }
+        probe = candidate.parent();
+    }
+    None
 }
 
 /// A byte source positioned to resume at a requested offset, with the offset

@@ -21,7 +21,7 @@ pub mod transfer;
 
 uniffi::setup_scaffolding!();
 
-pub use api::split_link;
+pub use api::{split_link, split_link_as, Link, LinkKind};
 pub use error::{Error, Result};
 pub use fetch::receive_over_fetch;
 pub use identity::Device;

@@ -64,7 +64,22 @@ workload is needed. On tr-desktop it received the 300 MB delivery
 byte-identical from the `--receive` launch argument, started into the
 console session by a scheduled task, with the screen locked. Both apps
 stay unsigned until the Developer ID and the code-signing certificate
-land.
+land. The core now previews a pasted link before anything moves
+(`inspect` in `ffi.rs`: kind, label, whether a password is needed, the
+QUIC offer, a request's caps, a delivery's files and total, from the two
+unauthenticated GETs alone, so a preview reserves nothing; it never
+throws, a link that cannot be used comes back with a one-sentence
+`problem`, and a password delivery reports nothing but the gate until it
+is verified), refuses a link of the wrong kind by name, announces a
+send's files before the hash pass (`Event::Selected`, a `selected` line
+in the CLI's JSON, superseded by `planned` in canonical order once the
+manifest is built) so the list is visible while hashing runs, checks the
+destination's free space before a receive commits (a fetch needs room
+for the staged bundle and the copy, so a destination that fits only once
+goes over HTTP), and ends a failed transfer with a one-sentence
+`headline` for the person and the full error as `detail`. Hash progress
+itself is a VOT change (`build_manifest_from` collects and hashes with
+no callback).
 
 | Field | Value |
 | --- | --- |
