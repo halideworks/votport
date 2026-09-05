@@ -1,22 +1,27 @@
-//! The receive path: pull a votport delivery to a local directory over HTTP.
+//! The receive path: pull a votport delivery to a local directory.
 //!
-//! A delivery is a grant the operator published. The receiver reads its
-//! metadata, proves a password if one is set, then downloads each file while
-//! hashing its bytes; a file lands only after its bytes hash to the root the
-//! delivery announced. The announced name is a server value joined to a local
-//! directory, so it is validated as an entry name before any byte is written,
-//! which is the one place a bad name could escape the destination.
+//! A delivery is a grant the operator published. [`receive`] prefers a QUIC
+//! fetch (in `fetch.rs`) and falls back to the HTTP path here. The HTTP path
+//! reads the delivery's metadata, proves a password if one is set, then
+//! downloads each file while hashing its bytes; a file lands only after its
+//! bytes hash to the root the delivery announced. The announced name is a
+//! server value joined to a local directory, so it is validated as an entry
+//! name before any byte is written, which is the one place a bad name could
+//! escape the destination. The temp-then-rename and existence guards are
+//! shared with the fetch path through [`write_verified`] and [`local_path_of`].
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use vot_manifest::Component;
+use vot_manifest::{Component, PackagePath};
 use vot_object::{ObjectBuilder, Suite};
 
-use crate::api::{Client, OutboundFile};
+use crate::api::Client;
 use crate::entries::admit;
 use crate::error::{Error, Result};
+use crate::fetch::{try_fetch, Outcome};
+use crate::identity::Device;
 use crate::progress::{Event, Observer};
 
 /// A delivery to fetch: the token from the share link and its password, if any.
@@ -38,13 +43,32 @@ const BLAKE3: &str = "blake3";
 /// How much of a download is read at once before it is hashed and written.
 const READ_CHUNK: usize = 64 * 1024;
 
-/// Fetches `delivery` from `base` into `dest`, verifying every file.
+/// Fetches `delivery` from `base` into `dest`, over QUIC when the delivery
+/// offers a fetch endpoint and the serve answers, over HTTP otherwise.
+///
+/// # Errors
+/// As [`receive_over_http`], plus a fetch failure once a fetch is committed.
+pub fn receive(
+    base: &str,
+    delivery: Delivery,
+    device: &Device,
+    dest: &Path,
+    observer: &mut dyn Observer,
+) -> Result<Received> {
+    let client = Client::new(base)?;
+    match try_fetch(&client, &delivery, device, dest, observer)? {
+        Outcome::Fetched(received) => Ok(received),
+        Outcome::Unreachable => receive_over_http(base, delivery, dest, observer),
+    }
+}
+
+/// Fetches `delivery` from `base` into `dest` over HTTP, verifying every file.
 ///
 /// # Errors
 /// A network failure, a missing or wrong password, a delivery whose suite the
 /// client does not fetch, a name that would escape `dest`, a read or write
 /// failure, or a file whose bytes do not hash to its announced root.
-pub fn receive(
+pub fn receive_over_http(
     base: &str,
     delivery: Delivery,
     dest: &Path,
@@ -101,7 +125,16 @@ pub fn receive(
     let cookie = cookie.as_deref();
     let mut files = Vec::with_capacity(planned.len());
     for (index, (file, path, root)) in planned.into_iter().enumerate() {
-        download_verified(&client, file, &path, root, cookie, index, observer)?;
+        let mut response = client.download(&file.download_url, cookie)?;
+        write_verified(
+            &mut response,
+            &path,
+            root,
+            &file.root,
+            file.bytes,
+            index,
+            observer,
+        )?;
         observer.event(Event::FileVerified {
             index,
             path: path.display().to_string(),
@@ -112,14 +145,15 @@ pub fn receive(
     Ok(Received { files })
 }
 
-/// Downloads one file to `destination`, hashing as it writes, and lands it
-/// only if its bytes hash to the announced root.
-fn download_verified(
-    client: &Client,
-    file: &OutboundFile,
+/// Streams `reader` into `destination`, hashing as it writes, and lands it
+/// only if its `total` bytes hash to the announced root. The byte source is
+/// abstract: an HTTP download for a receive, an object file for a fetch.
+pub(crate) fn write_verified(
+    reader: &mut dyn Read,
     destination: &Path,
     announced: [u8; 32],
-    cookie: Option<&str>,
+    announced_hex: &str,
+    total: u64,
     index: usize,
     observer: &mut dyn Observer,
 ) -> Result<()> {
@@ -127,31 +161,22 @@ fn download_verified(
         fs::create_dir_all(parent)?;
     }
 
-    let mut response = client.download(&file.download_url, cookie)?;
-
     // Write to a sibling temporary and rename on success, so a failed or
-    // unverified download never leaves a partial file at the real name. Every
+    // unverified stream never leaves a partial file at the real name. Every
     // failure path from here removes the temporary.
     let temporary = destination.with_extension(format!("part.{}", std::process::id()));
     let landed = (|| -> Result<()> {
-        let mut builder = ObjectBuilder::new(Suite::Blake3Bao64, Some(file.bytes))?;
+        let mut builder = ObjectBuilder::new(Suite::Blake3Bao64, Some(total))?;
         let mut sink = File::create(&temporary).map_err(|source| Error::Read {
             path: temporary.clone(),
             source,
         })?;
-        stream_into(
-            &mut response,
-            &mut builder,
-            &mut sink,
-            file,
-            index,
-            observer,
-        )?;
+        hash_copy(reader, &mut builder, &mut sink, total, index, observer)?;
         sink.sync_all()?;
         // The handle must close before the rename: Windows refuses to rename
         // a file that is still open.
         drop(sink);
-        verify_and_rename(builder, destination, announced, &file.root, &temporary)
+        verify_and_rename(builder, destination, announced, announced_hex, &temporary)
     })();
     if landed.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -196,19 +221,19 @@ fn root_matches(got: &[u8; 32], announced: &[u8; 32]) -> bool {
     got == announced
 }
 
-/// Reads the response body in chunks, feeding each to the hasher and the file.
-fn stream_into(
-    response: &mut reqwest::blocking::Response,
+/// Reads `reader` in chunks, feeding each to the hasher and the file.
+fn hash_copy(
+    reader: &mut dyn Read,
     builder: &mut ObjectBuilder,
     sink: &mut File,
-    file: &OutboundFile,
+    total: u64,
     index: usize,
     observer: &mut dyn Observer,
 ) -> Result<()> {
     let mut buffer = vec![0u8; READ_CHUNK];
     let mut received = 0u64;
     loop {
-        let read = response.read(&mut buffer)?;
+        let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -219,7 +244,7 @@ fn stream_into(
         observer.event(Event::Downloading {
             index,
             received,
-            total: file.bytes,
+            total,
         });
     }
     Ok(())
@@ -229,7 +254,7 @@ fn stream_into(
 /// escape it. The name is validated as an entry (no `..`, no separators in a
 /// component, no reserved or non-portable shape) with hidden names allowed, so
 /// a delivered dotfile lands while a traversal cannot.
-fn local_path(dest: &Path, name: &str) -> Result<PathBuf> {
+pub(crate) fn local_path(dest: &Path, name: &str) -> Result<PathBuf> {
     let entry = admit(name, PathBuf::new(), true).map_err(|rejected| Error::BadName {
         name: name.to_owned(),
         reason: rejected.reason,
@@ -246,6 +271,24 @@ fn local_path(dest: &Path, name: &str) -> Result<PathBuf> {
         }
     }
     Ok(path)
+}
+
+/// Joins a bundle manifest's package path to `dest`, refused the same way as a
+/// delivery-announced name. A fetched manifest was built with the portable
+/// profile but not votport's own name policy, so it is re-checked here.
+pub(crate) fn local_path_of(dest: &Path, path: &PackagePath) -> Result<PathBuf> {
+    let mut parts = Vec::new();
+    for component in path.iter() {
+        match component {
+            Component::Text(text) => parts.push(text.clone()),
+            Component::Bytes(_) => {
+                return Err(Error::Other(
+                    "the bundle named a file whose path is not valid UTF-8".to_owned(),
+                ))
+            }
+        }
+    }
+    local_path(dest, &parts.join("/"))
 }
 
 fn decode_root(hex_root: &str) -> Result<[u8; 32]> {

@@ -8,7 +8,7 @@ mod common;
 use std::path::PathBuf;
 
 use votport_client_core::progress::Silent;
-use votport_client_core::{receive, Delivery, Error};
+use votport_client_core::{receive_over_http, Delivery, Error};
 
 #[test]
 fn a_delivery_is_received_and_verified_into_a_local_directory() {
@@ -37,7 +37,8 @@ fn a_delivery_is_received_and_verified_into_a_local_directory() {
         token: token.clone(),
         password: None,
     };
-    let received = receive(&server.base, delivery, dest.path(), &mut Silent).expect("received");
+    let received =
+        receive_over_http(&server.base, delivery, dest.path(), &mut Silent).expect("received");
     assert_eq!(received.files.len(), files.len(), "every file landed");
 
     for (name, expected) in &files {
@@ -48,7 +49,7 @@ fn a_delivery_is_received_and_verified_into_a_local_directory() {
 
     // Receiving the same delivery into the same directory refuses rather than
     // overwriting the files already there.
-    let again = receive(
+    let again = receive_over_http(
         &server.base,
         Delivery {
             token,
@@ -77,7 +78,7 @@ fn a_password_delivery_needs_the_password() {
 
     // Without the password the receive stops before any byte is written.
     let dest = tempfile::tempdir().unwrap();
-    let refused = receive(
+    let refused = receive_over_http(
         &server.base,
         Delivery {
             token: token.clone(),
@@ -93,7 +94,7 @@ fn a_password_delivery_needs_the_password() {
 
     // With it, the file lands and verifies.
     let dest = tempfile::tempdir().unwrap();
-    let received = receive(
+    let received = receive_over_http(
         &server.base,
         Delivery {
             token,

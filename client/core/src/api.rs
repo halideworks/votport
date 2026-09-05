@@ -161,6 +161,14 @@ pub struct OutboundFile {
     pub download_url: String,
 }
 
+/// Where a delivery's QUIC fetch dials, present in the metadata only when the
+/// server's serve listener is bound.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FetchEndpoint {
+    pub address: String,
+    pub certificate_digest: String,
+}
+
 /// What `GET /api/s/{token}` tells a receiver about a delivery. A
 /// password-gated delivery reports only `has_password`/`authorized` until the
 /// receiver verifies; then a second read carries the files.
@@ -173,11 +181,30 @@ pub struct OutboundMetadata {
     pub label: Option<String>,
     #[serde(default)]
     pub files: Vec<OutboundFile>,
+    /// The QUIC fetch endpoint, when the server serves; absent otherwise.
+    #[serde(default)]
+    pub fetch: Option<FetchEndpoint>,
 }
 
 #[derive(Debug, Serialize)]
 struct VerifyOutboundRequest<'a> {
     password: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct FetchRequest<'a> {
+    holder_key: &'a str,
+}
+
+/// What a fetch mint returns: the capability to present, where to dial, the
+/// certificate to pin, and the package root the fetch must land on.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FetchMint {
+    pub capability: String,
+    pub address: String,
+    pub certificate_digest: String,
+    pub package_root: String,
+    pub expires_at: u64,
 }
 
 impl Client {
@@ -469,6 +496,29 @@ impl Client {
                 });
             }
             Ok(response)
+        })
+    }
+
+    /// `POST /api/s/{token}/fetch`: mints a QUIC fetch capability for the
+    /// delivery, bound to `holder_key`, and says where to dial. `cookie` is
+    /// the grant cookie for a password delivery.
+    ///
+    /// # Errors
+    /// A network failure or a non-success status (404 when the server does not
+    /// serve).
+    pub fn mint_fetch(
+        &self,
+        token: &str,
+        holder_key: &str,
+        cookie: Option<&str>,
+    ) -> Result<FetchMint> {
+        let url = self.url(&format!("/api/s/{token}/fetch"));
+        // Mints a capability and reserves a ticket, so not replayed.
+        self.run("mint fetch", false, || {
+            with_cookie(
+                self.http.post(&url).json(&FetchRequest { holder_key }),
+                cookie,
+            )
         })
     }
 }

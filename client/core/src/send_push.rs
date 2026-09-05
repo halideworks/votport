@@ -106,7 +106,7 @@ pub fn try_push(
 }
 
 /// What a probe of a resolved address set found.
-enum Probe {
+pub(crate) enum Probe {
     /// One address answered with the pinned identity.
     Reachable(SocketAddr),
     /// No address answered within the budget.
@@ -120,7 +120,7 @@ enum Probe {
 /// Every other failure (no route to a v6 address on a v4-only host, a refused
 /// or silent port, a timeout) means this address did not answer, so the next
 /// is tried; if none answer the carrier is unreachable.
-fn probe_any(addresses: &[SocketAddr], digest: [u8; 32]) -> Probe {
+pub(crate) fn probe_any(addresses: &[SocketAddr], digest: [u8; 32]) -> Probe {
     for address in addresses {
         match probe_serve(*address, digest, PROBE_BUDGET) {
             Ok(()) => return Probe::Reachable(*address),

@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use vot_cli::{build_manifest_from, PackageSummary, ServedSource};
-use vot_manifest::{decode_page, decode_seal, EntryKind, StorageRef};
+use vot_manifest::{decode_page, decode_seal, EntryKind, PackagePath, StorageRef};
 use vot_object::{ObjectBuilder, PreparedObject, Suite};
 
 use crate::entries::Entry;
@@ -22,6 +22,52 @@ use crate::error::{Error, Result};
 // duplication; until then the client reads back the manifest it just wrote.
 const MANIFEST_DIRECTORY: &str = "manifest";
 const MANIFEST_SEAL: &str = "seal.cbor";
+
+/// One file a manifest names: its package path and the object that stores it.
+/// The fetch path reads this off a fetched bundle to know what to materialize.
+#[derive(Debug, Clone)]
+pub struct StoredEntry {
+    pub path: PackagePath,
+    pub root: [u8; 32],
+    pub length: u64,
+}
+
+/// Reads the file entries a bundle's manifest names, in canonical order.
+///
+/// votport only ever builds direct entries, so a packed entry is a manifest
+/// this client cannot materialize and is refused.
+///
+/// # Errors
+/// A read failure, a manifest the client cannot decode, or a packed entry.
+pub fn read_manifest(manifest_root: &Path) -> Result<Vec<StoredEntry>> {
+    let manifest_dir = manifest_root.join(MANIFEST_DIRECTORY);
+    let seal_bytes = fs::read(manifest_dir.join(MANIFEST_SEAL))?;
+    let seal = decode_seal(&seal_bytes)
+        .map_err(|error| Error::Other(format!("decoding the manifest seal: {error:?}")))?;
+
+    let mut entries = Vec::new();
+    for index in 0..seal.final_page_count {
+        let bytes = fs::read(manifest_page_path(&manifest_dir, index))?;
+        let page = decode_page(&bytes)
+            .map_err(|error| Error::Other(format!("decoding manifest page {index}: {error:?}")))?;
+        for entry in page.entries {
+            if entry.kind == EntryKind::Directory {
+                continue;
+            }
+            let Some(StorageRef::Direct(object)) = entry.storage else {
+                return Err(Error::Other(
+                    "the bundle carried a packed entry, which votport never builds".to_owned(),
+                ));
+            };
+            entries.push(StoredEntry {
+                path: entry.path,
+                root: object.root,
+                length: object.length,
+            });
+        }
+    }
+    Ok(entries)
+}
 
 fn manifest_page_path(directory: &Path, index: u64) -> PathBuf {
     directory.join(format!("{index:016}.cbor"))
