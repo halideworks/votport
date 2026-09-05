@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use votport_client_core::progress::{Event, Observer};
-use votport_client_core::{Device, Drop, Selected, Sent};
+use votport_client_core::{Delivery, Device, Drop, Selected, Sent};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -24,6 +24,7 @@ fn main() -> ExitCode {
 fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("send") => send(&args[1..]),
+        Some("receive") => receive(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             Ok(())
@@ -34,10 +35,13 @@ fn run(args: &[String]) -> Result<(), String> {
 
 fn print_usage() {
     eprintln!(
-        "votport send <link> <path>...  [--password <p>] [--json]\n\
+        "votport send <link> <path>...      [--password <p>] [--json]\n\
+         votport receive <link> <dir>       [--password <p>] [--json]\n\
          \n\
-         <link> is a votport request URL, e.g. https://drop.example/r/TOKEN.\n\
-         Each <path> is a file or a folder; a folder keeps its name in the drop."
+         send's <link> is a request URL, e.g. https://drop.example/r/TOKEN;\n\
+         each <path> is a file or folder, and a folder keeps its name.\n\
+         receive's <link> is a delivery URL, e.g. https://drop.example/s/TOKEN;\n\
+         <dir> is where its files land, verified against their announced roots."
     );
 }
 
@@ -113,11 +117,54 @@ fn send(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Splits a request link into its origin and token. Accepts `/r/<token>` and
-/// `/api/r/<token>` forms, with or without a trailing path, query, or fragment.
+fn receive(args: &[String]) -> Result<(), String> {
+    let mut link: Option<String> = None;
+    let mut dir: Option<String> = None;
+    let mut password: Option<String> = None;
+    let mut json = false;
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--password" => {
+                password = Some(iter.next().ok_or("--password needs a value")?.clone());
+            }
+            "--json" => json = true,
+            value if value.starts_with("--") => {
+                return Err(format!("unknown option {value:?}"));
+            }
+            value if link.is_none() => link = Some(value.to_owned()),
+            value if dir.is_none() => dir = Some(value.to_owned()),
+            value => return Err(format!("unexpected argument {value:?}")),
+        }
+    }
+
+    let link = link.ok_or("receive needs a delivery link and a directory")?;
+    let dir = dir.ok_or("receive needs a directory to land the files in")?;
+    let (base, token) = split_link(&link)?;
+
+    let delivery = Delivery { token, password };
+    let mut observer = CliObserver { json };
+    let received = votport_client_core::receive(&base, delivery, Path::new(&dir), &mut observer)
+        .map_err(|error| error.to_string())?;
+    if json {
+        println!(
+            "{{\"event\":\"done\",\"via\":\"receive\",\"files\":{}}}",
+            received.files.len()
+        );
+    } else {
+        println!("done: {} file(s) received into {dir}", received.files.len());
+    }
+    Ok(())
+}
+
+/// Splits a request or delivery link into its origin and token. Accepts
+/// `/r/<token>` and `/api/r/<token>` (send), `/s/<token>` and
+/// `/api/s/<token>` (receive), with or without a trailing path, query, or
+/// fragment.
 fn split_link(link: &str) -> Result<(String, String), String> {
     let trimmed = link.split(['?', '#']).next().unwrap_or(link);
-    for marker in ["/api/r/", "/r/"] {
+    for marker in ["/api/r/", "/r/", "/api/s/", "/s/"] {
         if let Some(index) = trimmed.find(marker) {
             let base = &trimmed[..index];
             let rest = &trimmed[index + marker.len()..];
@@ -129,7 +176,7 @@ fn split_link(link: &str) -> Result<(String, String), String> {
         }
     }
     Err(format!(
-        "{link:?} is not a votport request link (expected .../r/TOKEN)"
+        "{link:?} is not a votport link (expected .../r/TOKEN or .../s/TOKEN)"
     ))
 }
 
@@ -221,6 +268,12 @@ impl Observer for CliObserver {
                 }
                 Event::Rebegin => "{\"event\":\"rebegin\"}".to_owned(),
                 Event::Finished { files } => format!("{{\"event\":\"finished\",\"files\":{files}}}"),
+                Event::Downloading { index, received, total } => format!(
+                    "{{\"event\":\"downloading\",\"index\":{index},\"received\":{received},\"total\":{total}}}"
+                ),
+                Event::FileVerified { index, path } => {
+                    format!("{{\"event\":\"verified\",\"index\":{index},\"path\":{path:?}}}")
+                }
             };
             println!("{line}");
             return;
@@ -231,6 +284,8 @@ impl Observer for CliObserver {
             Event::EntryComplete { path, .. } => println!("  sent {path}"),
             Event::Rebegin => println!("  server restarted; resuming"),
             Event::Finished { .. } => {}
+            Event::Downloading { .. } => {}
+            Event::FileVerified { path, .. } => println!("  received {path}"),
         }
     }
 }
@@ -258,6 +313,17 @@ mod tests {
                 "http://127.0.0.1:8080/r/tok",
                 "http://127.0.0.1:8080",
                 "tok",
+            ),
+            ("https://drop.example/s/DEL", "https://drop.example", "DEL"),
+            (
+                "https://drop.example/api/s/DEL",
+                "https://drop.example",
+                "DEL",
+            ),
+            (
+                "https://drop.example/s/DEL/?x=1",
+                "https://drop.example",
+                "DEL",
             ),
         ];
         for (link, base, token) in cases {

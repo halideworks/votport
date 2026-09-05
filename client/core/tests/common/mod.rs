@@ -1,6 +1,10 @@
 //! Shared harness for the end-to-end tests: spawn the server binary named by
-//! `VOTPORT_BIN`, create a request link through the admin API, and find a
-//! received file.
+//! `VOTPORT_BIN`, create a request link or a delivery through the admin API,
+//! and find a received file.
+//!
+//! Each e2e is its own test binary that includes this module, so a helper used
+//! by only some of them is dead code in the others; the harness allows that.
+#![allow(dead_code)]
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -104,6 +108,63 @@ pub fn create_link(base: &str) -> String {
     assert!(created.status().is_success(), "create link failed");
     let body: serde_json::Value = created.json().unwrap();
     body["link"]["id"].as_str().expect("a link id").to_owned()
+}
+
+/// Uploads `files` into the outbound library and creates a delivery grant over
+/// them, returning the delivery token parsed from its `/s/{token}` url. Each
+/// pair is a library-relative path (which may nest) and its bytes.
+pub fn deliver(base: &str, files: &[(&str, Vec<u8>)], password: Option<&str>) -> String {
+    let admin = reqwest::blocking::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let login = admin
+        .post(format!("{base}/api/admin/login"))
+        .json(&serde_json::json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .unwrap();
+    assert!(login.status().is_success(), "admin login failed");
+
+    for (name, bytes) in files {
+        let uploaded = admin
+            .post(format!("{base}/api/admin/outbound-files"))
+            .query(&[("path", name)])
+            .header("X-Votport", "1")
+            .body(bytes.clone())
+            .send()
+            .unwrap();
+        assert!(
+            uploaded.status().is_success(),
+            "upload {name} failed: {}",
+            uploaded.status()
+        );
+    }
+
+    let mut body = serde_json::json!({
+        "paths": files.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        "label": "e2e delivery",
+        "expires_days": 7,
+    });
+    if let Some(password) = password {
+        body["password"] = serde_json::json!(password);
+    }
+    let created = admin
+        .post(format!("{base}/api/admin/outbound-grants"))
+        .header("X-Votport", "1")
+        .json(&body)
+        .send()
+        .unwrap();
+    assert!(
+        created.status().is_success(),
+        "create grant failed: {}",
+        created.status()
+    );
+    let created: serde_json::Value = created.json().unwrap();
+    let url = created["url"].as_str().expect("a delivery url");
+    url.rsplit("/s/")
+        .next()
+        .expect("a token in the delivery url")
+        .to_owned()
 }
 
 /// Finds a file by name anywhere under `root`.

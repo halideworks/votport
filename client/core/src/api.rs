@@ -148,6 +148,38 @@ pub struct PushPreflight {
     pub expires_at: u64,
 }
 
+/// One deliverable file as `GET /api/s/{token}` reports it: the name it takes
+/// on disk, its suite and root, its byte length, and the path to download it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OutboundFile {
+    pub name: String,
+    pub suite: String,
+    pub root: String,
+    pub bytes: u64,
+    /// The path to GET, relative to the origin (`/api/s/{token}/files/{i}`, or
+    /// `/api/s/{token}/file` for a single-file grant). Used verbatim.
+    pub download_url: String,
+}
+
+/// What `GET /api/s/{token}` tells a receiver about a delivery. A
+/// password-gated delivery reports only `has_password`/`authorized` until the
+/// receiver verifies; then a second read carries the files.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OutboundMetadata {
+    pub has_password: bool,
+    #[serde(default)]
+    pub authorized: bool,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub files: Vec<OutboundFile>,
+}
+
+#[derive(Debug, Serialize)]
+struct VerifyOutboundRequest<'a> {
+    password: &'a str,
+}
+
 impl Client {
     /// A client for `base` (the origin, e.g. `https://drop.example`).
     ///
@@ -353,6 +385,118 @@ impl Client {
             })
         })
     }
+
+    /// `GET /api/s/{token}`: what a delivery holds. The no-query form returns
+    /// every file, so the receiver needs no paging. `cookie`, when present, is
+    /// the grant cookie a verify returned, echoed so a password delivery
+    /// answers with its files.
+    ///
+    /// # Errors
+    /// A network failure or a non-success status (404 for an unknown or
+    /// expired delivery).
+    pub fn outbound_metadata(&self, token: &str, cookie: Option<&str>) -> Result<OutboundMetadata> {
+        let url = self.url(&format!("/api/s/{token}"));
+        self.run("delivery metadata", true, || {
+            with_cookie(self.http.get(&url), cookie)
+        })
+    }
+
+    /// `POST /api/s/{token}/verify`: proves the delivery password. On success
+    /// the server sets a grant cookie; this returns its `name=value` so the
+    /// caller can echo it onto the metadata and download requests that follow.
+    /// The cookie is not kept in a jar, so a many-file delivery never
+    /// accumulates the per-file lease cookies the downloads also set.
+    ///
+    /// # Errors
+    /// A network failure, a non-success status (401 for a wrong password), or
+    /// a success that carried no grant cookie.
+    pub fn verify_outbound(&self, token: &str, password: &str) -> Result<String> {
+        let url = self.url(&format!("/api/s/{token}/verify"));
+        // Idempotent: proving the password again only re-issues the cookie.
+        retry(true, || {
+            let response = self
+                .http
+                .post(&url)
+                .json(&VerifyOutboundRequest { password })
+                .send()
+                .map_err(|source| Error::Http {
+                    url: url.clone(),
+                    source,
+                })?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().unwrap_or_default();
+                return Err(Error::Server {
+                    status: status.as_u16(),
+                    what: "delivery verify".to_owned(),
+                    body,
+                });
+            }
+            grant_cookie(&response)
+                .ok_or_else(|| Error::Other("the delivery verify set no grant cookie".to_owned()))
+        })
+    }
+
+    /// `GET <path>`: a delivery file's bytes, streamed. `path` is a
+    /// `download_url` from the metadata, used verbatim; `cookie` is the grant
+    /// cookie for a password delivery. The caller reads the returned response
+    /// body incrementally.
+    ///
+    /// # Errors
+    /// A network failure or a non-success status.
+    pub fn download(
+        &self,
+        path: &str,
+        cookie: Option<&str>,
+    ) -> Result<reqwest::blocking::Response> {
+        let url = self.url(path);
+        // The whole-file GET is idempotent, so a transient failure before the
+        // body starts is retried; a break mid-stream is the caller's to handle.
+        retry(true, || {
+            let response = with_cookie(self.http.get(&url), cookie)
+                .send()
+                .map_err(|source| Error::Http {
+                    url: url.clone(),
+                    source,
+                })?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().unwrap_or_default();
+                return Err(Error::Server {
+                    status: status.as_u16(),
+                    what: "download".to_owned(),
+                    body,
+                });
+            }
+            Ok(response)
+        })
+    }
+}
+
+/// Attaches `cookie` (a `name=value`) as the request's `Cookie` header, or
+/// leaves the request untouched when there is none.
+fn with_cookie(
+    request: reqwest::blocking::RequestBuilder,
+    cookie: Option<&str>,
+) -> reqwest::blocking::RequestBuilder {
+    match cookie {
+        Some(value) => request.header(reqwest::header::COOKIE, value),
+        None => request,
+    }
+}
+
+/// The `name=value` of the first `Set-Cookie` a response carries, for the
+/// caller to echo back. A verify sets exactly one (the grant cookie).
+fn grant_cookie(response: &reqwest::blocking::Response) -> Option<String> {
+    response
+        .headers()
+        .get(reqwest::header::SET_COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .next()
+        .map(|pair| pair.trim().to_owned())
+        .filter(|pair| !pair.is_empty())
 }
 
 /// A transient failure is retried until this much wall-clock has passed, so a
@@ -374,7 +518,12 @@ fn is_retryable(error: &Error, idempotent: bool) -> bool {
         Error::Http { source, .. } => {
             source.is_connect() || source.is_timeout() || (idempotent && source.is_request())
         }
-        Error::Server { status, .. } => *status == 503,
+        // 503 while draining, or 429 from a download rate limiter on an
+        // idempotent GET. The budget rides out a brief burst; a delivery of
+        // more files than the per-window cap needs resume, which is C7.
+        // ponytail: no Retry-After honored (the server sends none); the
+        // fixed budget is the ceiling until resume lands.
+        Error::Server { status, .. } => *status == 503 || (idempotent && *status == 429),
         _ => false,
     }
 }

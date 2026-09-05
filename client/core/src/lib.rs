@@ -1,7 +1,9 @@
 //! Cross-platform core for the votport desktop client.
 //!
-//! One send path with two transports: a QUIC push, tried first when the link
+//! The send path has two transports: a QUIC push, tried first when the link
 //! offers it, and the HTTP session path the web sender uses as the fallback.
+//! The receive path pulls a delivery to a local directory over HTTP, hashing
+//! every file to the root the delivery announced before it lands.
 
 pub mod api;
 pub mod entries;
@@ -9,10 +11,12 @@ pub mod error;
 pub mod identity;
 pub mod package;
 pub mod progress;
+pub mod receive;
 pub mod send_http;
 pub mod send_push;
 pub mod transfer;
 
 pub use error::{Error, Result};
 pub use identity::Device;
+pub use receive::{receive, Delivery, Received};
 pub use transfer::{send, send_http as send_over_http, Drop, Selected, Sent};
