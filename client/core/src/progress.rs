@@ -1,0 +1,41 @@
+//! The one progress stream a send reports through.
+//!
+//! The CLI prints it; a shell forwards it to its UI. Keeping every tick on one
+//! observer means there is one place that knows what a transfer is doing.
+
+/// Something worth reporting during a send.
+#[derive(Debug, Clone)]
+pub enum Event {
+    /// The upload session was created and named.
+    SessionCreated { session: String },
+    /// A chunk was accepted; `covered` of `total` bytes of the entry are in.
+    Chunk {
+        index: usize,
+        covered: u64,
+        total: u64,
+    },
+    /// An entry finished, either just now or because begin reported it done.
+    EntryComplete { index: usize, path: String },
+    /// The server asked the sender to begin again after a restart.
+    Rebegin,
+    /// The drop finished; `files` were published.
+    Finished { files: usize },
+}
+
+/// A sink for [`Event`]s. Implemented by the CLI and by each shell.
+pub trait Observer {
+    fn event(&mut self, event: Event);
+}
+
+/// An observer that drops every event, for callers that do not want progress.
+pub struct Silent;
+
+impl Observer for Silent {
+    fn event(&mut self, _event: Event) {}
+}
+
+impl<F: FnMut(Event)> Observer for F {
+    fn event(&mut self, event: Event) {
+        self(event);
+    }
+}

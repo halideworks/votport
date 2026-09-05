@@ -2,3 +2,5 @@
 node_modules
 server/target
 server/target-*
+client/target
+client/target-*

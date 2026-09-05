@@ -1,0 +1,11 @@
+# The desktop client's own cargo workspace, like server/. votport has no root
+# manifest, so this is not swallowed by a parent. The wire feature and its
+# quiche patch arrive with the push path in PR 2.
+[workspace]
+resolver = "2"
+members = ["core", "cli"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

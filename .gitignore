@@ -1,4 +1,6 @@
 server/target/
+client/target/
+client/target-*/
 web/assets/vendor
 data/
 node_modules/

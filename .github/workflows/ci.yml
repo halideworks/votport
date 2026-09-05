@@ -8,6 +8,8 @@ on:
     paths:
       - server/Cargo.toml
       - server/Cargo.lock
+      - client/Cargo.toml
+      - client/Cargo.lock
       - package-lock.json
       - Dockerfile
   pull_request:
@@ -50,6 +52,45 @@ jobs:
 
       - name: Tests
         run: cargo test
+
+  client:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.97
+        run: rustup toolchain install 1.97 --profile minimal --component rustfmt,clippy && rustup default 1.97
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            client/target
+            server/target
+          key: cargo-client-${{ runner.os }}-${{ hashFiles('client/Cargo.lock', 'server/Cargo.lock') }}
+
+      - name: Format
+        working-directory: client
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: client
+        run: cargo clippy --all-targets -- -D warnings
+
+      # The HTTP end-to-end test drives a real server. A debug build is enough
+      # and skips the release profile's slow codegen; the wire feature it
+      # carries still builds BoringSSL, cached across runs.
+      - name: Build the server for the end-to-end test
+        working-directory: server
+        run: cargo build
+
+      - name: Tests
+        working-directory: client
+        run: VOTPORT_BIN="$GITHUB_WORKSPACE/server/target/debug/votport" cargo test
 
   web:
     runs-on: ubuntu-24.04

@@ -1,0 +1,15 @@
+[package]
+name = "votport-client"
+version = "0.1.0"
+edition = "2021"
+license-file = "../../LICENSE"
+rust-version = "1.97"
+description = "votport desktop client CLI"
+publish = false
+
+[[bin]]
+name = "votport"
+path = "src/main.rs"
+
+[dependencies]
+votport-client-core = { path = "../core" }
