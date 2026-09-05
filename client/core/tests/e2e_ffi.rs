@@ -1,15 +1,48 @@
 //! End-to-end over the UniFFI surface: the same functions a shell calls, with
 //! a Rust listener standing in for the shell's, against a real votport.
 //!
-//! Without `VOTPORT_BIN` the test returns early. The send loads this
-//! machine's device key from the real state directory, as the CLI does.
+//! Without `VOTPORT_BIN` the test returns early. The state directory (the
+//! device key and the journal) is pointed at a temporary directory through
+//! `XDG_DATA_HOME`, so the test neither reads this machine's key nor leaves
+//! journal entries behind; the e2e runs on Linux only.
+
+// The state directory is redirected through XDG_DATA_HOME, which only the
+// Linux arm reads; elsewhere the test would touch the real journal.
+#![cfg(target_os = "linux")]
 
 mod common;
 
 use std::sync::{Arc, Mutex};
 
 use votport_client_core::ffi::{self, FileState, Phase, Transfer, TransferListener, TransferView};
+use votport_client_core::journal::Kind;
 use votport_client_core::{Error, LinkKind, Transport};
+
+/// Points the state directory at a temporary directory. The environment is
+/// process-wide and setting it while another thread reads it is a race, so
+/// this binary runs its two scenarios in sequence from one test, after one
+/// set, and each asserts on its own journal ids.
+fn isolate_state() -> tempfile::TempDir {
+    let state = tempfile::tempdir().unwrap();
+    std::env::set_var("XDG_DATA_HOME", state.path());
+    state
+}
+
+#[test]
+fn the_ffi_end_to_end() {
+    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
+        eprintln!("VOTPORT_BIN unset; skipping the FFI e2e");
+        return;
+    };
+    let _state = isolate_state();
+    a_shell_sends_a_folder_and_receives_a_delivery_through_the_view_model(&bin);
+    a_cancel_before_the_download_lands_nothing_and_a_partial_resumes_next_time(&bin);
+}
+
+fn journalled(id: &Option<String>) -> bool {
+    let id = id.as_deref().expect("the handle learned its journal id");
+    ffi::pending().iter().any(|entry| entry.id == id)
+}
 
 /// Records every view the core hands over, as a shell would draw them.
 #[derive(Default)]
@@ -37,13 +70,8 @@ impl TransferListener for CancelOnTransferring {
     }
 }
 
-#[test]
-fn a_shell_sends_a_folder_and_receives_a_delivery_through_the_view_model() {
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
-        eprintln!("VOTPORT_BIN unset; skipping the FFI e2e");
-        return;
-    };
-    let server = common::start_server(&bin, &[]);
+fn a_shell_sends_a_folder_and_receives_a_delivery_through_the_view_model(bin: &str) {
+    let server = common::start_server(bin, &[]);
 
     // A pasted link is previewed before anything moves: what it is, whether
     // it needs a password, and what it accepts.
@@ -86,15 +114,20 @@ fn a_shell_sends_a_folder_and_receives_a_delivery_through_the_view_model() {
     std::fs::write(folder.join("note.txt"), b"beside the plate").unwrap();
 
     let sent = Arc::new(Recorder::default());
+    let send_handle = Transfer::new();
     let report = ffi::send(
         format!("{}/r/{token}", server.base),
         None,
         vec![folder.display().to_string()],
-        Transfer::new(),
+        send_handle.clone(),
         sent.clone(),
     )
     .expect("the folder sends");
     assert_eq!(report.files, 2);
+    assert!(
+        !send_handle.journal_kept() && !journalled(&send_handle.journal_id()),
+        "a send that ended well leaves no journal entry"
+    );
     let landed = common::find_file(&server.received, "big.bin").expect("big.bin landed");
     assert_eq!(std::fs::read(landed).unwrap(), big);
     let views = sent.0.lock().unwrap();
@@ -219,14 +252,100 @@ fn a_shell_sends_a_folder_and_receives_a_delivery_through_the_view_model() {
     // The errors a screen branches on arrive as their variant, and as the
     // Failed phase with a headline for the person and the detail behind it.
     let again = Arc::new(Recorder::default());
+    let handle = Transfer::new();
     let refused = ffi::receive(
         format!("{}/s/{token}", server.base),
         None,
         dest.path().display().to_string(),
-        Transfer::new(),
+        handle.clone(),
         again.clone(),
     );
     assert!(matches!(refused, Err(Error::Exists { .. })), "{refused:?}");
+    // The failed receive stays journalled under the id its handle learned,
+    // and resumes from the same entry once the way is clear.
+    assert!(handle.journal_kept() && journalled(&handle.journal_id()));
+    let pending = ffi::pending();
+    let entry = pending
+        .iter()
+        .find(|entry| Some(&entry.id) == handle.journal_id().as_ref())
+        .unwrap();
+    assert_eq!(
+        (entry.kind, entry.dest.as_deref(), entry.needs_password),
+        (Kind::Receive, Some(dest.path().to_str().unwrap()), false)
+    );
+    std::fs::remove_file(&report.files[0]).unwrap();
+    let resumed = ffi::resume(
+        entry.id.clone(),
+        None,
+        Transfer::new(),
+        Arc::new(Recorder::default()),
+    )
+    .expect("the resume lands");
+    assert!(
+        matches!(&resumed, ffi::ResumeReport::Received(r) if r.files.len() == 1),
+        "{resumed:?}"
+    );
+    assert!(
+        !journalled(&handle.journal_id()),
+        "a resumed transfer that ended well is forgotten"
+    );
+    let gone_handle = Transfer::new();
+    let gone = ffi::resume(
+        entry.id.clone(),
+        None,
+        gone_handle.clone(),
+        Arc::new(Recorder::default()),
+    );
+    assert!(
+        matches!(gone, Err(Error::UnknownTransfer { .. })),
+        "{gone:?}"
+    );
+    assert_eq!(
+        (gone_handle.journal_id(), gone_handle.journal_kept()),
+        (Some(entry.id.clone()), false)
+    );
+
+    // A password delivery received without one fails, stays journalled, and
+    // the entry now says a password is needed.
+    let token = common::deliver(
+        &server.base,
+        &[("locked.txt", b"x".to_vec())],
+        Some("pw"),
+        None,
+    );
+    let locked = Transfer::new();
+    let refused = ffi::receive(
+        format!("{}/s/{token}", server.base),
+        None,
+        dest.path().display().to_string(),
+        locked.clone(),
+        Arc::new(Recorder::default()),
+    );
+    assert!(
+        matches!(refused, Err(Error::PasswordRequired)),
+        "{refused:?}"
+    );
+    let entry = ffi::pending()
+        .into_iter()
+        .find(|entry| Some(&entry.id) == locked.journal_id().as_ref())
+        .expect("kept for a retry with the password");
+    assert!(entry.needs_password && locked.journal_kept() && locked.journal_needs_password());
+    assert!(
+        !handle.journal_needs_password(),
+        "the open delivery never needed one"
+    );
+    let resumed = ffi::resume(
+        entry.id.clone(),
+        Some("pw".into()),
+        Transfer::new(),
+        Arc::new(Recorder::default()),
+    )
+    .expect("the resume with the password lands");
+    assert!(
+        matches!(&resumed, ffi::ResumeReport::Received(r) if r.files.len() == 1),
+        "{resumed:?}"
+    );
+    ffi::forget(entry.id);
     let last = again.0.lock().unwrap().last().cloned().unwrap();
     assert_eq!(last.phase, Phase::Failed);
     assert_eq!(
@@ -249,16 +368,11 @@ fn a_shell_sends_a_folder_and_receives_a_delivery_through_the_view_model() {
     assert!(matches!(bad, Err(Error::BadLink { .. })), "{bad:?}");
 }
 
-#[test]
-fn a_cancel_before_the_download_lands_nothing_and_a_partial_resumes_next_time() {
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
-        eprintln!("VOTPORT_BIN unset; skipping the FFI cancel e2e");
-        return;
-    };
+fn a_cancel_before_the_download_lands_nothing_and_a_partial_resumes_next_time(bin: &str) {
     // The server serves QUIC fetches only when VOTPORT_SERVE_BIND is set, so
     // this receive takes the HTTP path, whose cancel is per read; the fetch
     // path honours a cancel only before its ticket is minted.
-    let server = common::start_server(&bin, &[]);
+    let server = common::start_server(bin, &[]);
     let big: Vec<u8> = (0..24u32 * 1024 * 1024)
         .map(|index| (index / 7) as u8)
         .collect();
@@ -275,10 +389,14 @@ fn a_cancel_before_the_download_lands_nothing_and_a_partial_resumes_next_time() 
         link.clone(),
         None,
         dest.path().display().to_string(),
-        transfer,
+        transfer.clone(),
         listener.clone(),
     );
     assert!(matches!(stopped, Err(Error::Cancelled)), "{stopped:?}");
+    assert!(
+        !journalled(&transfer.journal_id()),
+        "a cancel is the person's own choice, not a resume"
+    );
     let views = listener.views.lock().unwrap();
     let last = views.last().unwrap();
     assert_eq!(last.phase, Phase::Cancelled, "{last:?}");

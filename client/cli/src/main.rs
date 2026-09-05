@@ -29,6 +29,8 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("send") => send(&args[1..]),
         Some("receive") => receive(&args[1..]),
         Some("inspect") => inspect(&args[1..]),
+        Some("status") => status(),
+        Some("resume") => resume(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             Ok(())
@@ -42,6 +44,8 @@ fn print_usage() {
         "votport send <link> <path>...      [--password <p>] [--json]\n\
          votport receive <link> <dir>       [--password <p>] [--json]\n\
          votport inspect <link>\n\
+         votport status\n\
+         votport resume <id>                [--password <p>] [--json]\n\
          \n\
          send's <link> is a request URL, e.g. https://drop.example/r/TOKEN;\n\
          each <path> is a file or folder, and a folder keeps its name.\n\
@@ -151,6 +155,95 @@ fn inspect(args: &[String]) -> Result<(), String> {
         })
     );
     Ok(())
+}
+
+/// Prints the journalled transfers, one JSON object per line, oldest first.
+fn status() -> Result<(), String> {
+    for entry in votport_client_core::ffi::pending() {
+        println!(
+            "{}",
+            serde_json::json!({
+                "id": entry.id,
+                "kind": format!("{:?}", entry.kind).to_lowercase(),
+                "link": entry.link,
+                "paths": entry.paths,
+                "dest": entry.dest,
+                "needs_password": entry.needs_password,
+                "started_unix": entry.started_unix,
+            })
+        );
+    }
+    Ok(())
+}
+
+/// Runs a journalled transfer again, through the same view the shells draw.
+fn resume(args: &[String]) -> Result<(), String> {
+    let mut id: Option<String> = None;
+    let mut password: Option<String> = None;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--password" => {
+                password = Some(iter.next().ok_or("--password needs a value")?.clone());
+            }
+            "--json" => json = true,
+            value if value.starts_with("--") => return Err(format!("unknown option {value:?}")),
+            value if id.is_none() => id = Some(value.to_owned()),
+            value => return Err(format!("unexpected argument {value:?}")),
+        }
+    }
+    let id = id.ok_or("resume needs a transfer id from `votport status`")?;
+    let listener = std::sync::Arc::new(ViewPrinter { json });
+    let report = votport_client_core::ffi::resume(
+        id,
+        password,
+        votport_client_core::ffi::Transfer::new(),
+        listener,
+    )
+    .map_err(|error| error.to_string())?;
+    let (kind, files) = match &report {
+        votport_client_core::ffi::ResumeReport::Sent(sent) => ("send", sent.files),
+        votport_client_core::ffi::ResumeReport::Received(received) => {
+            ("receive", received.files.len() as u64)
+        }
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "event": "done", "kind": kind, "files": files })
+        );
+    } else {
+        println!("done: {files} file(s), {kind} complete");
+    }
+    Ok(())
+}
+
+/// Prints each view the core hands over: the JSON record, or one status line
+/// per phase change.
+struct ViewPrinter {
+    json: bool,
+}
+
+impl votport_client_core::ffi::TransferListener for ViewPrinter {
+    fn update(&self, view: votport_client_core::ffi::TransferView) {
+        if self.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "event": "view",
+                    "phase": format!("{:?}", view.phase).to_lowercase(),
+                    "moved": view.moved_bytes,
+                    "total": view.total_bytes,
+                    "rate": view.rate_bytes_per_second,
+                    "eta": view.eta_seconds,
+                    "headline": view.headline,
+                })
+            );
+        } else if let Some(headline) = view.headline {
+            eprintln!("{headline}");
+        }
+    }
 }
 
 fn receive(args: &[String]) -> Result<(), String> {

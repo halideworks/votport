@@ -63,7 +63,7 @@ struct MainWindow: View {
         .background(Tokens.bg)
         .foregroundStyle(Tokens.text)
         .onAppear {
-            if Launch.done {
+            if Launch.done || store.items.contains(where: \.interrupted) {
                 section = .transfers
             }
         }
@@ -116,6 +116,7 @@ struct MenuBarContent: View {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         MainActor.assumeIsolated {
+            TransferStore.shared.loadPending()
             _ = Launch.startFromArguments(store: .shared)
         }
     }

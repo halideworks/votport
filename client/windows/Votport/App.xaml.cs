@@ -41,6 +41,8 @@ public partial class App : Application
         Window = new MainWindow();
         Window.Activate();
         Protocol.RegisterIfUnpackaged();
+        TransferStore.Shared.LoadPending();
+        if (TransferStore.Shared.Items.Count > 0) Window.Show("transfers");
         // Launch-time work must not wait for the window: a headless run
         // (over ssh, into the console session) still has to move bytes.
         Launch.StartFromArguments(Environment.GetCommandLineArgs());

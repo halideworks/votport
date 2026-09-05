@@ -90,7 +90,21 @@ in Finder. Both apps follow the system theme: `scripts/design-tokens.mjs`
 now also writes `Tokens.swift` (dynamic colours from both blocks) and
 `Tokens.xaml` (theme dictionaries read through `ThemeResource`), and a
 node test fails when any of the three generated files is stale. The Mac
-expand animation follows reduce motion.
+expand animation follows reduce motion. The core now journals every
+transfer (`journal.rs`: one JSON file per transfer under the state
+directory's `journal`, holding the link, the paths or the destination,
+and whether a password was used, never the password), removes the entry
+when the transfer ends well, is cancelled, or fails on its own input,
+and keeps it for a failure that could go differently next time. The FFI
+lists them (`pending`), drops one (`forget`), and runs one again under
+its id (`resume`), and a `Transfer` handle reports its journal id so a
+shell can forget what it removes. Both shells list the journal at launch
+as interrupted cards with Resume (and a password field when the entry
+needs one), offer Retry on a failed card the core kept, and forget an
+entry on Remove; the CLI gains `votport status` and `votport resume`.
+Decision 4's SQLite journal is this directory of files; the design's
+resume-without-asking at launch is an offer instead, since a resume may
+need the password again.
 
 | Field | Value |
 | --- | --- |

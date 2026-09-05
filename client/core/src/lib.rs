@@ -12,6 +12,7 @@ pub mod error;
 pub mod fetch;
 pub mod ffi;
 pub mod identity;
+pub mod journal;
 pub mod package;
 pub mod progress;
 pub mod receive;

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use crate::api::{split_link, split_link_as, LinkKind};
 use crate::error::Error;
 use crate::identity::Device;
+use crate::journal;
 use crate::progress::{Event, Observer, Transport};
 use crate::receive::{receive_with_device_or_http, Delivery};
 use crate::transfer::{self, Drop, Selected};
@@ -104,10 +105,14 @@ pub trait TransferListener: Send + Sync {
     fn update(&self, view: TransferView);
 }
 
-/// The handle a shell keeps for one transfer: its only control is cancel.
+/// The handle a shell keeps for one transfer: its only control is cancel,
+/// and it learns the transfer's journal id once the transfer is recorded.
 #[derive(Debug, Default, uniffi::Object)]
 pub struct Transfer {
     cancelled: AtomicBool,
+    journal_id: Mutex<Option<String>>,
+    journal_kept: AtomicBool,
+    journal_needs_password: AtomicBool,
 }
 
 #[uniffi::export]
@@ -125,6 +130,116 @@ impl Transfer {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// The journal id of the transfer this handle ran, once it was recorded,
+    /// so a shell can `forget` a failed transfer it removes from its list.
+    pub fn journal_id(&self) -> Option<String> {
+        self.journal_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Whether the journal still holds the transfer after it ended: only a
+    /// failure that could go differently next time is kept, so a shell
+    /// offers Retry exactly when this is true.
+    pub fn journal_kept(&self) -> bool {
+        self.journal_kept.load(Ordering::Acquire)
+    }
+
+    /// Whether the kept entry needs a password on its next run: it was
+    /// started with one, or failed for the lack of one.
+    pub fn journal_needs_password(&self) -> bool {
+        self.journal_needs_password.load(Ordering::Acquire)
+    }
+}
+
+impl Transfer {
+    fn set_journal_id(&self, id: &str) {
+        *self
+            .journal_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.to_owned());
+    }
+
+    /// Settles the journal entry once the transfer ended: dropped when it
+    /// ended well, was cancelled, or failed on its own input; kept for a
+    /// failure that could go differently next time, and marked as needing
+    /// a password when that is what was missing.
+    fn settle(&self, entry: &journal::Entry, error: Option<&Error>) {
+        let kept = error.is_some_and(Error::worth_retrying);
+        let missing_password = matches!(error, Some(Error::PasswordRequired));
+        if kept {
+            if missing_password {
+                journal::mark_needs_password(&entry.id);
+            }
+        } else {
+            journal::forget(&entry.id);
+        }
+        self.journal_needs_password.store(
+            kept && (entry.needs_password || missing_password),
+            Ordering::Release,
+        );
+        self.journal_kept.store(kept, Ordering::Release);
+    }
+}
+
+/// The journalled transfers, oldest first: those cut by a quit, a crash, or
+/// a failure worth trying again, offered at the next launch.
+#[uniffi::export]
+pub fn pending() -> Vec<journal::Entry> {
+    journal::pending()
+}
+
+/// Drops a transfer from the journal, for a failed or interrupted one the
+/// person removed rather than resumed.
+#[uniffi::export]
+pub fn forget(id: String) {
+    journal::forget(&id);
+}
+
+/// What a resumed transfer did: a send's report or a receive's.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum ResumeReport {
+    Sent(SendReport),
+    Received(ReceiveReport),
+}
+
+/// Runs a journalled transfer again under the same id: the same link and
+/// paths or destination, with `password` supplied afresh. Whatever an
+/// earlier run landed is kept and resumed where the path allows. Blocks
+/// until done, like [`send`] and [`receive`].
+///
+/// # Errors
+/// An id the journal does not hold, or anything [`send`] or [`receive`]
+/// can fail with.
+#[uniffi::export]
+pub fn resume(
+    id: String,
+    password: Option<String>,
+    transfer: Arc<Transfer>,
+    listener: Arc<dyn TransferListener>,
+) -> std::result::Result<ResumeReport, Error> {
+    let entry = match journal::get(&id) {
+        Ok(entry) => entry,
+        Err(error) => {
+            // The handle still names the id, and the journal does not hold
+            // it, so a shell stops offering the resume.
+            transfer.set_journal_id(&id);
+            transfer.journal_kept.store(false, Ordering::Release);
+            let mut forward = Forward::new(transfer, listener);
+            forward.finish(Some(&error));
+            return Err(error);
+        }
+    };
+    match entry.kind {
+        journal::Kind::Send => {
+            run_send(entry, password, transfer, listener).map(ResumeReport::Sent)
+        }
+        journal::Kind::Receive => {
+            run_receive(entry, password, transfer, listener).map(ResumeReport::Received)
+        }
     }
 }
 
@@ -273,11 +388,26 @@ pub fn send(
     transfer: Arc<Transfer>,
     listener: Arc<dyn TransferListener>,
 ) -> std::result::Result<SendReport, Error> {
+    let entry = journal::record(journal::Kind::Send, &link, paths, None, password.is_some());
+    run_send(entry, password, transfer, listener)
+}
+
+/// Runs a journalled send. The entry is dropped from the journal when the
+/// send ends well or is cancelled, and kept when it fails, so the next
+/// launch can offer it again.
+fn run_send(
+    entry: journal::Entry,
+    password: Option<String>,
+    transfer: Arc<Transfer>,
+    listener: Arc<dyn TransferListener>,
+) -> std::result::Result<SendReport, Error> {
+    transfer.set_journal_id(&entry.id);
+    let handle = Arc::clone(&transfer);
     let mut forward = Forward::new(transfer, listener);
     let result = (|| {
-        let link = split_link_as(&link, LinkKind::Request)?;
+        let link = split_link_as(&entry.link, LinkKind::Request)?;
         let mut files: Vec<Selected> = Vec::new();
-        for path in &paths {
+        for path in &entry.paths {
             transfer::collect(Path::new(path), &mut files).map_err(|source| Error::Read {
                 path: path.into(),
                 source,
@@ -304,6 +434,7 @@ pub fn send(
             },
         )
     })();
+    handle.settle(&entry, result.as_ref().err());
     forward.finish(result.as_ref().err());
     result
 }
@@ -324,15 +455,40 @@ pub fn receive(
     transfer: Arc<Transfer>,
     listener: Arc<dyn TransferListener>,
 ) -> std::result::Result<ReceiveReport, Error> {
+    let entry = journal::record(
+        journal::Kind::Receive,
+        &link,
+        Vec::new(),
+        Some(dest),
+        password.is_some(),
+    );
+    run_receive(entry, password, transfer, listener)
+}
+
+/// Runs a journalled receive; the entry's fate is as for [`run_send`].
+fn run_receive(
+    entry: journal::Entry,
+    password: Option<String>,
+    transfer: Arc<Transfer>,
+    listener: Arc<dyn TransferListener>,
+) -> std::result::Result<ReceiveReport, Error> {
+    transfer.set_journal_id(&entry.id);
+    let handle = Arc::clone(&transfer);
     let mut forward = Forward::new(transfer, listener);
     let result = (|| {
-        let link = split_link_as(&link, LinkKind::Delivery)?;
+        let link = split_link_as(&entry.link, LinkKind::Delivery)?;
+        let dest = entry
+            .dest
+            .as_deref()
+            .ok_or_else(|| Error::UnknownTransfer {
+                id: entry.id.clone(),
+            })?;
         let delivery = Delivery {
             token: link.token,
             password,
         };
         let received =
-            receive_with_device_or_http(&link.base, delivery, Path::new(&dest), &mut forward)?;
+            receive_with_device_or_http(&link.base, delivery, Path::new(dest), &mut forward)?;
         Ok(ReceiveReport {
             files: received
                 .files
@@ -341,6 +497,7 @@ pub fn receive(
                 .collect(),
         })
     })();
+    handle.settle(&entry, result.as_ref().err());
     forward.finish(result.as_ref().err());
     result
 }
