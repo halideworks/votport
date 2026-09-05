@@ -145,8 +145,17 @@ fn receive(args: &[String]) -> Result<(), String> {
 
     let delivery = Delivery { token, password };
     let mut observer = CliObserver { json };
-    let received = votport_client_core::receive(&base, delivery, Path::new(&dir), &mut observer)
-        .map_err(|error| error.to_string())?;
+    // A device key is needed only for the QUIC fetch. When the state directory
+    // is not writable, receive over HTTP rather than failing outright.
+    let received = match Device::load_or_create() {
+        Ok(device) => {
+            votport_client_core::receive(&base, delivery, &device, Path::new(&dir), &mut observer)
+        }
+        Err(_) => {
+            votport_client_core::receive_over_http(&base, delivery, Path::new(&dir), &mut observer)
+        }
+    }
+    .map_err(|error| error.to_string())?;
     if json {
         println!(
             "{{\"event\":\"done\",\"via\":\"receive\",\"files\":{}}}",
