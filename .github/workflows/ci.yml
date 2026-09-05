@@ -92,6 +92,44 @@ jobs:
         working-directory: client
         run: VOTPORT_BIN="$GITHUB_WORKSPACE/server/target/debug/votport" cargo test
 
+  client-windows:
+    # The client carries a QUIC push carrier, so it builds BoringSSL through
+    # bindgen and nasm. This job proves it compiles and its tests build on
+    # Windows; push receive is Unix-only, so the tests are built, not run
+    # (there is no Windows server), and the push e2e is Unix-gated anyway.
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.97
+        run: rustup toolchain install 1.97 --profile minimal --component clippy && rustup default 1.97
+
+      - name: Install nasm
+        run: choco install nasm --no-progress -y
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            client/target
+          key: cargo-client-windows-${{ hashFiles('client/Cargo.lock') }}
+
+      - name: Clippy and build the tests
+        working-directory: client
+        shell: bash
+        # LLVM ships on the runner; bindgen needs libclang and BoringSSL needs
+        # nasm on PATH.
+        env:
+          LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
+        run: |
+          export PATH="$PATH:/c/Program Files/NASM"
+          cargo clippy --all-targets -- -D warnings
+          cargo test --no-run
+
   web:
     runs-on: ubuntu-24.04
     # npm ci against a slow registry ran past five minutes twice on one day

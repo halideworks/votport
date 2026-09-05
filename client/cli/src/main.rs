@@ -1,13 +1,14 @@
 //! `votport` command line client.
 //!
 //! `votport send <link> <path>...` sends files and folders to a votport
-//! request link over HTTP. The push path arrives with PR 2.
+//! request link, over QUIC push when the link offers it and the receiver's
+//! carrier answers, over HTTP otherwise.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use votport_client_core::progress::{Event, Observer};
-use votport_client_core::{Drop, Selected};
+use votport_client_core::{Device, Drop, Selected, Sent};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -81,21 +82,33 @@ fn send(args: &[String]) -> Result<(), String> {
         files,
     };
 
+    let device = Device::load_or_create().map_err(|error| error.to_string())?;
     let mut observer = CliObserver { json };
-    let report = votport_client_core::send_over_http(&base, drop, &mut observer)
+    let sent = votport_client_core::send(&base, drop, &device, &mut observer)
         .map_err(|error| error.to_string())?;
-    if json {
-        println!(
-            "{{\"event\":\"done\",\"upload_id\":{:?},\"files\":{}}}",
-            report.upload_id,
-            report.files.len()
-        );
-    } else {
-        println!(
-            "done: {} file(s) published (upload {})",
-            report.files.len(),
-            report.upload_id
-        );
+    match sent {
+        Sent::Push { files } => {
+            if json {
+                println!("{{\"event\":\"done\",\"via\":\"push\",\"files\":{files}}}");
+            } else {
+                println!("done: {files} file(s) pushed");
+            }
+        }
+        Sent::Http(report) => {
+            if json {
+                println!(
+                    "{{\"event\":\"done\",\"via\":\"http\",\"upload_id\":{:?},\"files\":{}}}",
+                    report.upload_id,
+                    report.files.len()
+                );
+            } else {
+                println!(
+                    "done: {} file(s) published (upload {})",
+                    report.files.len(),
+                    report.upload_id
+                );
+            }
+        }
     }
     Ok(())
 }

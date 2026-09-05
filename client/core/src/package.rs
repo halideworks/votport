@@ -69,12 +69,17 @@ impl PreparedEntry {
 }
 
 /// A built manifest ready to send: its root package, the seal and page bytes
-/// the HTTP session posts, and the objects in begin order.
+/// the HTTP session posts, the objects in begin order, and the manifest root
+/// and served map a push assembles a server from.
 pub struct Prepared {
     pub summary: PackageSummary,
     pub seal_bytes: Vec<u8>,
     pub page_bytes: Vec<Vec<u8>>,
     pub objects: Vec<PreparedEntry>,
+    /// The directory the manifest was written under, for `BundleServer::assemble`.
+    pub manifest_root: PathBuf,
+    /// The stored objects by root, for `BundleServer::assemble`.
+    pub served: BTreeMap<[u8; 32], ServedSource>,
 }
 
 /// Hashes `entries` in place and reads the manifest back into begin order.
@@ -127,6 +132,8 @@ pub fn build(entries: Vec<Entry>, manifest_root: &Path) -> Result<Prepared> {
         seal_bytes,
         page_bytes,
         objects,
+        manifest_root: manifest_root.to_path_buf(),
+        served,
     })
 }
 
