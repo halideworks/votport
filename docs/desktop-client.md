@@ -11,10 +11,22 @@ bundle refetch (#189) have landed. The UniFFI surface in `client/core/src/ffi.rs
 (proc-macros, no `.udl`: `send`, `receive`, a `ProgressListener` foreign
 trait, and the transfer records) is generated to Swift by the `client` CI job
 through the workspace's own `uniffi-bindgen` crate, pinned with the core's
-UniFFI 0.31 so the C# generator can share it. Next are the native shells (C4
-macOS SwiftUI, C5 Windows WinUI 3) on their target machines, and the core
-follow-ons: the client journal with `votport status` (which also gives
-multi-file resume) and watch folders.
+UniFFI 0.31 so the C# generator can share it. The first macOS slice is in
+`client/macos`: an xcodegen project and a local Swift package wrapping the
+core's XCFramework (both produced by `build-core.sh`, neither committed), and
+one Receive screen that takes a delivery link, a password, and a folder,
+lists the files the core planned, and draws their progress and verification.
+It received a 300 MB delivery on the Mac Studio byte-identical in under
+three seconds. Two findings from that run: macOS 15+ holds a GUI app's
+connections to LAN addresses until the user answers the Local Network
+prompt (the CLI is not asked), so a headless test reaches the server over
+an ssh reverse tunnel on loopback; and `Votport --receive <link> <dir>
+--snapshot <png>` drives a receive from the command line and writes the
+window's own rendering, since screen capture over ssh needs a permission
+grant at the Mac. Next: the Finder drop target and Send, the sidebar, the
+menu bar item, notifications, the `votport://` scheme, then the Windows
+shell (C5) and the core follow-ons: the client journal with `votport
+status` (which also gives multi-file resume) and watch folders.
 
 | Field | Value |
 | --- | --- |
