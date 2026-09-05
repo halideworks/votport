@@ -3,7 +3,7 @@
 # quiche patch arrive with the push path in PR 2.
 [workspace]
 resolver = "2"
-members = ["core", "cli"]
+members = ["core", "cli", "uniffi-bindgen"]
 
 # vot-cli's wire feature pulls VOT's live QUIC transport, which needs the same
 # quiche fork VOT's workspace patches to. A git dependency's own patch is not

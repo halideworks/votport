@@ -4,11 +4,13 @@
 //! request link, over QUIC push when the link offers it and the receiver's
 //! carrier answers, over HTTP otherwise.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
 use votport_client_core::progress::{Event, Observer};
-use votport_client_core::{Delivery, Device, Drop, Selected, Sent};
+use votport_client_core::{
+    collect, receive_with_device_or_http, split_link, Delivery, Device, Drop, Sent,
+};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -70,7 +72,7 @@ fn send(args: &[String]) -> Result<(), String> {
     if paths.is_empty() {
         return Err("send needs at least one file or folder".to_owned());
     }
-    let (base, token) = split_link(&link)?;
+    let (base, token) = split_link(&link).map_err(|error| error.to_string())?;
 
     let mut files = Vec::new();
     for path in &paths {
@@ -141,21 +143,12 @@ fn receive(args: &[String]) -> Result<(), String> {
 
     let link = link.ok_or("receive needs a delivery link and a directory")?;
     let dir = dir.ok_or("receive needs a directory to land the files in")?;
-    let (base, token) = split_link(&link)?;
+    let (base, token) = split_link(&link).map_err(|error| error.to_string())?;
 
     let delivery = Delivery { token, password };
     let mut observer = CliObserver { json };
-    // A device key is needed only for the QUIC fetch. When the state directory
-    // is not writable, receive over HTTP rather than failing outright.
-    let received = match Device::load_or_create() {
-        Ok(device) => {
-            votport_client_core::receive(&base, delivery, &device, Path::new(&dir), &mut observer)
-        }
-        Err(_) => {
-            votport_client_core::receive_over_http(&base, delivery, Path::new(&dir), &mut observer)
-        }
-    }
-    .map_err(|error| error.to_string())?;
+    let received = receive_with_device_or_http(&base, delivery, Path::new(&dir), &mut observer)
+        .map_err(|error| error.to_string())?;
     if json {
         println!(
             "{{\"event\":\"done\",\"via\":\"receive\",\"files\":{}}}",
@@ -163,97 +156,6 @@ fn receive(args: &[String]) -> Result<(), String> {
         );
     } else {
         println!("done: {} file(s) received into {dir}", received.files.len());
-    }
-    Ok(())
-}
-
-/// Splits a request or delivery link into its origin and token. Accepts
-/// `/r/<token>` and `/api/r/<token>` (send), `/s/<token>` and
-/// `/api/s/<token>` (receive), with or without a trailing path, query, or
-/// fragment.
-fn split_link(link: &str) -> Result<(String, String), String> {
-    let trimmed = link.split(['?', '#']).next().unwrap_or(link);
-    for marker in ["/api/r/", "/r/", "/api/s/", "/s/"] {
-        if let Some(index) = trimmed.find(marker) {
-            let base = &trimmed[..index];
-            let rest = &trimmed[index + marker.len()..];
-            let token = rest.split('/').next().unwrap_or("").trim();
-            if base.is_empty() || token.is_empty() {
-                break;
-            }
-            return Ok((base.to_owned(), token.to_owned()));
-        }
-    }
-    Err(format!(
-        "{link:?} is not a votport link (expected .../r/TOKEN or .../s/TOKEN)"
-    ))
-}
-
-/// Collects files under `path` into selections. A file keeps its own name; a
-/// folder keeps its name as the top component, like a browser folder drop.
-fn collect(path: &Path, out: &mut Vec<Selected>) -> std::io::Result<()> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
-        // A symlink arg would otherwise be neither file nor dir and yield
-        // nothing silently; the manifest build refuses symlinks anyway.
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "symlinks are not sent",
-        ));
-    }
-    if metadata.is_file() {
-        let name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string_lossy().into_owned());
-        out.push(Selected {
-            relative: name,
-            source: path.to_path_buf(),
-        });
-        return Ok(());
-    }
-    if metadata.is_dir() {
-        // `.` and `..` have no file name; canonicalize so the folder keeps its
-        // real name instead of flattening into the drop root.
-        let top = match path.file_name() {
-            Some(name) => name.to_string_lossy().into_owned(),
-            None => std::fs::canonicalize(path)?
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "the folder has no name")
-                })?,
-        };
-        walk(path, &top, out)?;
-    }
-    Ok(())
-}
-
-/// Recursively adds files under `dir`, each relative to `prefix`. Symlinks are
-/// skipped, matching the manifest build's refusal of them.
-fn walk(dir: &Path, prefix: &str, out: &mut Vec<Selected>) -> std::io::Result<()> {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.path())
-        .collect();
-    entries.sort();
-    for entry in entries {
-        let metadata = std::fs::symlink_metadata(&entry)?;
-        let name = entry
-            .file_name()
-            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        let relative = format!("{prefix}/{name}");
-        if metadata.file_type().is_symlink() {
-            continue;
-        }
-        if metadata.is_dir() {
-            walk(&entry, &relative, out)?;
-        } else if metadata.is_file() {
-            out.push(Selected {
-                relative,
-                source: entry,
-            });
-        }
     }
     Ok(())
 }
@@ -266,6 +168,18 @@ impl Observer for CliObserver {
     fn event(&mut self, event: Event) {
         if self.json {
             let line = match &event {
+                Event::Planned { files } => {
+                    let files: Vec<String> = files
+                        .iter()
+                        .map(|file| {
+                            format!(
+                                "{{\"index\":{},\"path\":{:?},\"bytes\":{}}}",
+                                file.index, file.path, file.bytes
+                            )
+                        })
+                        .collect();
+                    format!("{{\"event\":\"planned\",\"files\":[{}]}}", files.join(","))
+                }
                 Event::SessionCreated { session } => {
                     format!("{{\"event\":\"session\",\"session\":{session:?}}}")
                 }
@@ -288,6 +202,7 @@ impl Observer for CliObserver {
             return;
         }
         match event {
+            Event::Planned { .. } => {}
             Event::SessionCreated { .. } => {}
             Event::Chunk { .. } => {}
             Event::EntryComplete { path, .. } => println!("  sent {path}"),
@@ -296,51 +211,5 @@ impl Observer for CliObserver {
             Event::Downloading { .. } => {}
             Event::FileVerified { path, .. } => println!("  received {path}"),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::split_link;
-
-    #[test]
-    fn splits_request_links_into_origin_and_token() {
-        let cases = [
-            ("https://drop.example/r/ABC", "https://drop.example", "ABC"),
-            (
-                "https://drop.example/api/r/XYZ",
-                "https://drop.example",
-                "XYZ",
-            ),
-            ("https://drop.example/r/ABC/", "https://drop.example", "ABC"),
-            (
-                "https://drop.example/r/ABC?x=1#f",
-                "https://drop.example",
-                "ABC",
-            ),
-            (
-                "http://127.0.0.1:8080/r/tok",
-                "http://127.0.0.1:8080",
-                "tok",
-            ),
-            ("https://drop.example/s/DEL", "https://drop.example", "DEL"),
-            (
-                "https://drop.example/api/s/DEL",
-                "https://drop.example",
-                "DEL",
-            ),
-            (
-                "https://drop.example/s/DEL/?x=1",
-                "https://drop.example",
-                "DEL",
-            ),
-        ];
-        for (link, base, token) in cases {
-            let (got_base, got_token) = split_link(link).expect(link);
-            assert_eq!(got_base, base, "{link}");
-            assert_eq!(got_token, token, "{link}");
-        }
-        assert!(split_link("https://drop.example/verify").is_err());
-        assert!(split_link("not a url").is_err());
     }
 }

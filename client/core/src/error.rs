@@ -3,7 +3,11 @@
 use std::path::PathBuf;
 
 /// Anything that stops a send.
-#[derive(Debug, thiserror::Error)]
+// Crosses the FFI flat: the shell sees the variant and the message, never the
+// fields, so no wrapped reqwest or io value has to be representable there.
+// Named VotportError there because a bare `Error` shadows Swift.Error.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+#[uniffi(flat_error, name = "VotportError")]
 pub enum Error {
     #[error("network error talking to {url}: {source}")]
     Http {
@@ -23,6 +27,9 @@ pub enum Error {
     /// sender to call begin again. Recoverable: the transfer re-begins.
     #[error("the server asked the sender to re-begin the session")]
     Rebegin,
+
+    #[error("{link:?} is not a votport link (expected .../r/TOKEN or .../s/TOKEN)")]
+    BadLink { link: String },
 
     #[error("the link at {token} is not usable for a drop")]
     LinkUnusable { token: String },

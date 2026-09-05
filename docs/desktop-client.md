@@ -6,11 +6,15 @@ vot-cli at pin `0a129ea` (`build_manifest`, `build_manifest_from`,
 and the wire build on the platform-native CI job); the listener session cap
 is a separate follow-on. The core and CLI now move bytes end to end: C1 send
 over HTTP and QUIC push (#183, #184), C2 receive over HTTP and QUIC fetch
-(#185, #186), and C7 within-object resume over HTTP (#187) have landed. Next
-are the native shells (C4 macOS SwiftUI, C5 Windows WinUI 3) on their target
-machines, and the core follow-ons: the client journal with `votport status`
-(which also gives multi-file resume), QUIC bundle-refetch resume, and watch
-folders.
+(#185, #186), and C7 within-object resume over HTTP (#187) and over a QUIC
+bundle refetch (#189) have landed. The UniFFI surface in `client/core/src/ffi.rs`
+(proc-macros, no `.udl`: `send`, `receive`, a `ProgressListener` foreign
+trait, and the transfer records) is generated to Swift by the `client` CI job
+through the workspace's own `uniffi-bindgen` crate, pinned with the core's
+UniFFI 0.31 so the C# generator can share it. Next are the native shells (C4
+macOS SwiftUI, C5 Windows WinUI 3) on their target machines, and the core
+follow-ons: the client journal with `votport status` (which also gives
+multi-file resume) and watch folders.
 
 | Field | Value |
 | --- | --- |

@@ -22,7 +22,7 @@ use crate::entries::admit;
 use crate::error::{Error, Result};
 use crate::fetch::{try_fetch, Outcome};
 use crate::identity::Device;
-use crate::progress::{Event, Observer};
+use crate::progress::{Event, Observer, PlannedFile};
 
 /// A delivery to fetch: the token from the share link and its password, if any.
 pub struct Delivery {
@@ -59,6 +59,24 @@ pub fn receive(
     match try_fetch(&client, &delivery, device, dest, observer)? {
         Outcome::Fetched(received) => Ok(received),
         Outcome::Unreachable => receive_over_http(base, delivery, dest, observer),
+    }
+}
+
+/// [`receive`] with this machine's device key, or over HTTP alone when the
+/// state directory cannot hold one: the key is needed only for the QUIC fetch,
+/// so an unwritable state directory should not fail the receive outright.
+///
+/// # Errors
+/// As [`receive`].
+pub fn receive_with_device_or_http(
+    base: &str,
+    delivery: Delivery,
+    dest: &Path,
+    observer: &mut dyn Observer,
+) -> Result<Received> {
+    match Device::load_or_create() {
+        Ok(device) => receive(base, delivery, &device, dest, observer),
+        Err(_) => receive_over_http(base, delivery, dest, observer),
     }
 }
 
@@ -120,6 +138,18 @@ pub fn receive_over_http(
             return Err(Error::Exists { path: path.clone() });
         }
     }
+
+    observer.event(Event::Planned {
+        files: planned
+            .iter()
+            .enumerate()
+            .map(|(index, (file, _, _))| PlannedFile {
+                index,
+                path: file.name.clone(),
+                bytes: file.bytes,
+            })
+            .collect(),
+    });
 
     fs::create_dir_all(dest)?;
     let cookie = cookie.as_deref();

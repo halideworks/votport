@@ -629,3 +629,74 @@ fn json<T: for<'de> Deserialize<'de>>(
         source,
     })
 }
+
+/// Splits a request or delivery link into its origin and token. Accepts
+/// `/r/<token>` and `/api/r/<token>` (send), `/s/<token>` and
+/// `/api/s/<token>` (receive), with or without a trailing path, query, or
+/// fragment.
+///
+/// # Errors
+/// A link with none of those markers, or an empty origin or token.
+pub fn split_link(link: &str) -> Result<(String, String)> {
+    let trimmed = link.split(['?', '#']).next().unwrap_or(link);
+    for marker in ["/api/r/", "/r/", "/api/s/", "/s/"] {
+        if let Some(index) = trimmed.find(marker) {
+            let base = &trimmed[..index];
+            let rest = &trimmed[index + marker.len()..];
+            let token = rest.split('/').next().unwrap_or("").trim();
+            if base.is_empty() || token.is_empty() {
+                break;
+            }
+            return Ok((base.to_owned(), token.to_owned()));
+        }
+    }
+    Err(Error::BadLink {
+        link: link.to_owned(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_link;
+
+    #[test]
+    fn splits_request_links_into_origin_and_token() {
+        let cases = [
+            ("https://drop.example/r/ABC", "https://drop.example", "ABC"),
+            (
+                "https://drop.example/api/r/XYZ",
+                "https://drop.example",
+                "XYZ",
+            ),
+            ("https://drop.example/r/ABC/", "https://drop.example", "ABC"),
+            (
+                "https://drop.example/r/ABC?x=1#f",
+                "https://drop.example",
+                "ABC",
+            ),
+            (
+                "http://127.0.0.1:8080/r/tok",
+                "http://127.0.0.1:8080",
+                "tok",
+            ),
+            ("https://drop.example/s/DEL", "https://drop.example", "DEL"),
+            (
+                "https://drop.example/api/s/DEL",
+                "https://drop.example",
+                "DEL",
+            ),
+            (
+                "https://drop.example/s/DEL/?x=1",
+                "https://drop.example",
+                "DEL",
+            ),
+        ];
+        for (link, base, token) in cases {
+            let (got_base, got_token) = split_link(link).expect(link);
+            assert_eq!(got_base, base, "{link}");
+            assert_eq!(got_token, token, "{link}");
+        }
+        assert!(split_link("https://drop.example/verify").is_err());
+        assert!(split_link("not a url").is_err());
+    }
+}
