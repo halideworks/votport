@@ -57,7 +57,7 @@ fn path_of(dir: &std::path::Path, id: &str) -> PathBuf {
 
 /// A fresh id: the start time and 64 random bits, so two transfers started
 /// in the same second never share a file.
-fn fresh_id(started_unix: u64) -> String {
+pub(crate) fn fresh_id(started_unix: u64) -> String {
     let random: u64 = rand::random();
     format!("{started_unix}-{random:016x}")
 }
@@ -120,6 +120,17 @@ fn write_in(dir: &std::path::Path, entry: &Entry) -> Result<()> {
     fs::write(&temp, bytes)?;
     fs::rename(&temp, path_of(dir, &entry.id))?;
     Ok(())
+}
+
+/// Forgets the pending send entries that name exactly `path`: a watch drop
+/// shipping afresh after a cut send has nothing to resume.
+pub(crate) fn forget_send_of(path: &str) {
+    let path = absolute(path);
+    for entry in pending() {
+        if entry.kind == Kind::Send && entry.paths == [path.clone()] {
+            forget(&entry.id);
+        }
+    }
 }
 
 /// Removes a transfer from the journal. A missing entry is not an error.

@@ -20,6 +20,7 @@ pub mod receive;
 pub mod send_http;
 pub mod send_push;
 pub mod transfer;
+pub mod watch;
 
 uniffi::setup_scaffolding!();
 
