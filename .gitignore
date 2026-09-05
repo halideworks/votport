@@ -13,3 +13,8 @@ CLAUDE.md
 .claude/
 .codex/
 target-main/
+client/macos/Votport.xcodeproj/
+client/macos/Votport/Info.plist
+client/macos/VotportCore/VotportCoreFFI.xcframework/
+client/macos/VotportCore/Sources/VotportCore/*.swift
+client/macos/build/
