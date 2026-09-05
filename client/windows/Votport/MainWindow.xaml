@@ -8,7 +8,7 @@
   </Window.SystemBackdrop>
   <NavigationView x:Name="Nav" PaneDisplayMode="Left" IsBackButtonVisible="Collapsed"
       IsSettingsVisible="False" OpenPaneLength="180" SelectionChanged="Nav_SelectionChanged"
-      Background="{StaticResource VotBgBrush}" RequestedTheme="Dark">
+      Background="{ThemeResource VotBgBrush}">
     <NavigationView.MenuItems>
       <NavigationViewItem Content="Send" Tag="send" Icon="Upload" />
       <NavigationViewItem Content="Receive" Tag="receive" Icon="Download" />

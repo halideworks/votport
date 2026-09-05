@@ -6,6 +6,7 @@ import SwiftUI
 struct ReceiveView: View {
     @EnvironmentObject private var store: TransferStore
     @AppStorage(Prefs.receiveFolderKey) private var defaultFolder = ""
+    @StateObject private var previewer = LinkPreviewer()
     @State private var link = ""
     @State private var password = ""
     @State private var destination: URL?
@@ -19,8 +20,16 @@ struct ReceiveView: View {
 
             TextField("Delivery link", text: $link)
                 .textFieldStyle(.roundedBorder)
-            SecureField("Password, if the delivery has one", text: $password)
-                .textFieldStyle(.roundedBorder)
+                .onChange(of: link) { _, value in previewer.update(value) }
+            if let line = PreviewLine.text(previewer) {
+                Text(line)
+                    .font(.callout)
+                    .foregroundStyle(PreviewLine.isProblem(previewer) ? Tokens.danger : Tokens.muted)
+            }
+            if previewer.needsPassword {
+                SecureField("Password", text: $password)
+                    .textFieldStyle(.roundedBorder)
+            }
 
             HStack {
                 Button("Choose Folder") { chooseFolder() }
@@ -32,7 +41,7 @@ struct ReceiveView: View {
                 Spacer()
                 Button("Receive") { receive() }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(link.isEmpty || folder == nil)
+                    .disabled(!previewer.ready || folder == nil)
             }
 
             Spacer()
@@ -40,7 +49,10 @@ struct ReceiveView: View {
                 .foregroundStyle(Tokens.muted)
         }
         .padding(20)
-        .onAppear { takePrefill() }
+        .onAppear {
+            takePrefill()
+            previewer.update(link)
+        }
         .onChange(of: store.prefillReceive) { _, _ in takePrefill() }
     }
 

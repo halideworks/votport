@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 /// the clipboard, a request link, and one primary action.
 struct SendView: View {
     @EnvironmentObject private var store: TransferStore
+    @StateObject private var previewer = LinkPreviewer()
     @State private var link = ""
     @State private var password = ""
     @State private var paths: [String] = []
@@ -20,8 +21,16 @@ struct SendView: View {
 
             TextField("Request link", text: $link)
                 .textFieldStyle(.roundedBorder)
-            SecureField("Password, if the link has one", text: $password)
-                .textFieldStyle(.roundedBorder)
+                .onChange(of: link) { _, value in previewer.update(value) }
+            if let line = PreviewLine.text(previewer) {
+                Text(line)
+                    .font(.callout)
+                    .foregroundStyle(PreviewLine.isProblem(previewer) ? Tokens.danger : Tokens.muted)
+            }
+            if previewer.needsPassword {
+                SecureField("Password", text: $password)
+                    .textFieldStyle(.roundedBorder)
+            }
 
             dropZone
 
@@ -34,11 +43,14 @@ struct SendView: View {
                 Spacer()
                 Button("Send") { send() }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(link.isEmpty || paths.isEmpty)
+                    .disabled(!previewer.ready || paths.isEmpty)
             }
         }
         .padding(20)
-        .onAppear { takePrefill() }
+        .onAppear {
+            takePrefill()
+            previewer.update(link)
+        }
         .onChange(of: store.prefillSend) { _, _ in takePrefill() }
     }
 
@@ -103,5 +115,6 @@ struct SendView: View {
     private func send() {
         store.send(link: link, password: password.isEmpty ? nil : password, paths: paths)
         paths.removeAll()
+        password = ""
     }
 }

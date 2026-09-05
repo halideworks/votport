@@ -3,9 +3,10 @@ import SwiftUI
 import VotportCore
 
 /// The transfer list: every transfer of the session, newest first. A
-/// selected transfer expands to its files; nothing is marked with a border.
+/// clicked transfer expands to its files; nothing is selected or marked.
 struct TransfersView: View {
     @EnvironmentObject private var store: TransferStore
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var expanded: UUID?
 
     var body: some View {
@@ -24,7 +25,7 @@ struct TransfersView: View {
                     LazyVStack(alignment: .leading, spacing: 12) {
                         ForEach(store.items) { item in
                             TransferCard(item: item, expanded: expanded == item.id) {
-                                withAnimation(.easeInOut(duration: 0.15)) {
+                                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.15)) {
                                     expanded = expanded == item.id ? nil : item.id
                                 }
                             }
@@ -78,6 +79,12 @@ struct TransferCard: View {
                     ProgressView()
                 }
                 if expanded {
+                    if let detail = view.detail {
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundStyle(Tokens.muted)
+                            .textSelection(.enabled)
+                    }
                     ForEach(view.files, id: \.index) { file in
                         FileRowView(file: file)
                     }
@@ -168,9 +175,10 @@ enum Format {
             return parts.joined(separator: ", ")
         case .done:
             let count = view.files.count
+            let noun = count == 1 ? "file" : "files"
             return item.kind == .send
-                ? "Done, \(count) file(s) sent"
-                : "Done, \(count) file(s) received and verified"
+                ? "Done, \(count) \(noun) sent"
+                : "Done, \(count) \(noun) received and verified"
         case .cancelled:
             return "Cancelled"
         case .failed:

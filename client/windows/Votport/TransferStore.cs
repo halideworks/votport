@@ -18,7 +18,13 @@ public sealed class TransferItem : INotifyPropertyChanged
     public string Subject { get; init; } = "";
     public string Link { get; init; } = "";
     public DateTime Started { get; } = DateTime.Now;
-    public string[] Landed { get; set; } = Array.Empty<string>();
+    private string[] landed = Array.Empty<string>();
+
+    public string[] Landed
+    {
+        get => landed;
+        set { landed = value; Changed(); Changed(nameof(CanReveal)); }
+    }
 
     private TransferView? view;
     private bool running = true;
@@ -33,7 +39,7 @@ public sealed class TransferItem : INotifyPropertyChanged
     internal TransferView? View
     {
         get => view;
-        set { view = value; Changed(); Changed(nameof(Status)); Changed(nameof(Fraction)); Changed(nameof(Files)); }
+        set { view = value; Changed(); Changed(nameof(Status)); Changed(nameof(Fraction)); Changed(nameof(Files)); Changed(nameof(Detail)); Changed(nameof(HasDetail)); }
     }
 
     public bool Running
@@ -43,6 +49,10 @@ public sealed class TransferItem : INotifyPropertyChanged
     }
 
     public bool NotRunning => !running;
+    public bool CanReveal => !running && Kind == Kinds.Receive && landed.Length > 0;
+    /// The full error text behind a failed card's headline.
+    public string Detail => view?.Detail ?? "";
+    public bool HasDetail => view?.Detail is not null;
     public string Icon => Kind == Kinds.Send ? "" : "";
     public string Status => Format.StatusLine(this);
     public double Fraction => view is null || view.TotalBytes is null || view.TotalBytes == 0
@@ -306,9 +316,11 @@ public static class Format
                 if (view.EtaSeconds is ulong eta) parts.Add($"about {Seconds(eta)} left");
                 return string.Join(", ", parts);
             case Phase.Done:
+                var count = view.Files.Length;
+                var noun = count == 1 ? "file" : "files";
                 return item.Kind == TransferItem.Kinds.Send
-                    ? $"Done, {view.Files.Length} file(s) sent"
-                    : $"Done, {view.Files.Length} file(s) received and verified";
+                    ? $"Done, {count} {noun} sent"
+                    : $"Done, {count} {noun} received and verified";
             case Phase.Cancelled:
                 return "Cancelled";
             default:

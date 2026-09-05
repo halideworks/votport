@@ -4,15 +4,17 @@
   <StackPanel Spacing="12">
     <TextBlock Text="RECEIVE" Style="{StaticResource SectionLabel}" />
     <TextBox x:Name="LinkBox" PlaceholderText="Delivery link" />
-    <PasswordBox x:Name="PasswordBox" PlaceholderText="Password, if the delivery has one" />
+    <TextBlock x:Name="PreviewText" Visibility="Collapsed" TextWrapping="Wrap"
+        Foreground="{ThemeResource VotMutedBrush}" />
+    <PasswordBox x:Name="PasswordBox" PlaceholderText="Password" Visibility="Collapsed" />
     <StackPanel Orientation="Horizontal" Spacing="8">
       <Button Content="Choose Folder" Click="ChooseFolder_Click" />
       <TextBlock x:Name="FolderText" Text="No folder chosen" Style="{StaticResource Mono}"
-          Foreground="{StaticResource VotMutedBrush}" VerticalAlignment="Center" MaxWidth="420" />
+          Foreground="{ThemeResource VotMutedBrush}" VerticalAlignment="Center" MaxWidth="420" />
     </StackPanel>
     <Button x:Name="ReceiveButton" Content="Receive" Click="Receive_Click" IsEnabled="False"
         Style="{StaticResource AccentButtonStyle}" />
     <TextBlock Text="Files land verified against the roots the delivery announced."
-        Foreground="{StaticResource VotMutedBrush}" />
+        Foreground="{ThemeResource VotMutedBrush}" />
   </StackPanel>
 </Page>
