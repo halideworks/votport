@@ -39,8 +39,13 @@ public partial class App : Application
         });
 
         Window = new MainWindow();
-        Window.Activate();
+        // Started with Windows: stay in the tray until the icon is clicked.
+        if (Environment.GetCommandLineArgs().Contains("--minimized")) Window.AppWindow.Hide();
+        else Window.Activate();
         Protocol.RegisterIfUnpackaged();
+        // The Run value names this executable; a moved or updated build
+        // rewrites it so the next boot still finds the app.
+        if (Settings.StartWithWindows) Settings.StartWithWindows = true;
         TransferStore.Shared.LoadPending();
         if (TransferStore.Shared.Items.Count > 0) Window.Show("transfers");
         // Launch-time work must not wait for the window: a headless run

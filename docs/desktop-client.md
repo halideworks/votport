@@ -69,9 +69,11 @@ land. The core now previews a pasted link before anything moves
 QUIC offer, a request's caps, a delivery's files and total, from the two
 unauthenticated GETs alone, so a preview reserves nothing; it never
 throws, a link that cannot be used comes back with a one-sentence
-`problem`, and a password delivery reports nothing but the gate until it
-is verified), refuses a link of the wrong kind by name, announces a
-send's files before the hash pass (`Event::Selected`, a `selected` line
+`problem`, a password delivery reports nothing but the gate until it is
+verified, and a screen passes the kind it takes so a delivery link pasted
+into Send is named as such rather than previewed), refuses a link of the
+wrong kind by name, announces a send's files before the hash pass
+(`Event::Selected`, a `selected` line
 in the CLI's JSON, superseded by `planned` in canonical order once the
 manifest is built) so the list is visible while hashing runs, checks the
 destination's free space before a receive commits (a fetch needs room
@@ -104,7 +106,30 @@ needs one), offer Retry on a failed card the core kept, and forget an
 entry on Remove; the CLI gains `votport status` and `votport resume`.
 Decision 4's SQLite journal is this directory of files; the design's
 resume-without-asking at launch is an offer instead, since a resume may
-need the password again.
+need the password again. Both apps now bundle Plus Jakarta Sans and
+JetBrains Mono (variable TTFs under `client/design/fonts` with their OFL
+texts): the Mac copies them into `Resources/fonts` through
+`ATSApplicationFontsPath` and draws through the `Type` helper, logging at
+launch whether both families resolved (they do); Windows copies them
+beside the executable under `Assets/Fonts` and names them through
+`ms-appx` font URIs on the window and the mono style, with the system
+families as fallbacks. Driven through UI Automation on the unlocked
+tr-desktop, the Windows app showed the preview line for a request, a
+delivery, a wrong-kind link, and a password delivery (the field appears
+only then), received, failed on an existing file with the headline and
+Retry, retried after the file was cleared, listed a journalled entry as
+Interrupted at launch and resumed it, and raised a toast for each end.
+The unpackaged protocol registration now writes the classic
+`HKCU\Software\Classes\votport` keys: the App SDK's
+`RegisterForProtocolActivation` claim never launched the app from the
+shell on Windows 11 26200 and shadowed the class keys while it existed,
+and a claim left by a build at another path points at nothing. The
+window draws its own title bar (theme colours, the app type, caption
+buttons painted to match), Settings gained "Keep running in the tray
+when the window is closed" (close hides; Quit in the tray menu ends the
+app) and "Start with Windows, minimized to the tray" (the per-user Run
+key, `--minimized` keeps the window hidden), and the Mac gained "Open at
+login" through `SMAppService`.
 
 | Field | Value |
 | --- | --- |

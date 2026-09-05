@@ -6,19 +6,31 @@
   <Window.SystemBackdrop>
     <MicaBackdrop />
   </Window.SystemBackdrop>
-  <NavigationView x:Name="Nav" PaneDisplayMode="Left" IsBackButtonVisible="Collapsed"
-      IsSettingsVisible="False" OpenPaneLength="180" SelectionChanged="Nav_SelectionChanged"
-      Background="{ThemeResource VotBgBrush}">
-    <NavigationView.MenuItems>
-      <NavigationViewItem Content="Send" Tag="send" Icon="Upload" />
-      <NavigationViewItem Content="Receive" Tag="receive" Icon="Download" />
-      <NavigationViewItem Content="Transfers" Tag="transfers" Icon="List">
-        <NavigationViewItem.InfoBadge>
-          <InfoBadge x:Name="ActiveBadge" Visibility="Collapsed" />
-        </NavigationViewItem.InfoBadge>
-      </NavigationViewItem>
-      <NavigationViewItem Content="Settings" Tag="settings" Icon="Setting" />
-    </NavigationView.MenuItems>
-    <Frame x:Name="Pages" Padding="20" />
-  </NavigationView>
+  <Grid Background="{ThemeResource VotBgBrush}">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="*" />
+    </Grid.RowDefinitions>
+    <!-- The app draws its own title bar so it follows the theme and the
+         type; the caption buttons stay the system's, coloured to match. -->
+    <Grid x:Name="TitleBar" Height="36" Padding="16,0,0,0" VerticalAlignment="Top">
+      <TextBlock Text="votport" VerticalAlignment="Center" FontSize="12"
+          FontFamily="{StaticResource VotSansFont}" Foreground="{ThemeResource VotMutedBrush}" />
+    </Grid>
+    <NavigationView x:Name="Nav" Grid.Row="1" PaneDisplayMode="Left" IsBackButtonVisible="Collapsed"
+        IsSettingsVisible="False" OpenPaneLength="180" SelectionChanged="Nav_SelectionChanged"
+        Background="{ThemeResource VotBgBrush}" FontFamily="{StaticResource VotSansFont}">
+      <NavigationView.MenuItems>
+        <NavigationViewItem Content="Send" Tag="send" Icon="Upload" />
+        <NavigationViewItem Content="Receive" Tag="receive" Icon="Download" />
+        <NavigationViewItem Content="Transfers" Tag="transfers" Icon="List">
+          <NavigationViewItem.InfoBadge>
+            <InfoBadge x:Name="ActiveBadge" Visibility="Collapsed" />
+          </NavigationViewItem.InfoBadge>
+        </NavigationViewItem>
+        <NavigationViewItem Content="Settings" Tag="settings" Icon="Setting" />
+      </NavigationView.MenuItems>
+      <Frame x:Name="Pages" Padding="20" />
+    </NavigationView>
+  </Grid>
 </Window>

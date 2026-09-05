@@ -35,5 +35,11 @@
     <Content Include="Assets\*.png;Assets\*.ico">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+    <!-- The OFL fonts from client/design/fonts with their licence texts,
+         beside the executable under Assets\Fonts, where the ms-appx font
+         URIs resolve. -->
+    <Content Include="..\..\design\fonts\*" Link="Assets\Fonts\%(Filename)%(Extension)">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 </Project>

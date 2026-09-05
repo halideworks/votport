@@ -76,7 +76,10 @@ fn a_shell_sends_a_folder_and_receives_a_delivery_through_the_view_model(bin: &s
     // A pasted link is previewed before anything moves: what it is, whether
     // it needs a password, and what it accepts.
     let token = common::create_link(&server.base);
-    let preview = ffi::inspect(format!("{}/r/{token}", server.base));
+    let preview = ffi::inspect(
+        format!("{}/r/{token}", server.base),
+        Some(LinkKind::Request),
+    );
     assert_eq!(
         (preview.kind, preview.problem.as_deref()),
         (Some(LinkKind::Request), None)
@@ -86,7 +89,24 @@ fn a_shell_sends_a_folder_and_receives_a_delivery_through_the_view_model(bin: &s
     assert_eq!(preview.quic, Some(false));
     assert_eq!(preview.max_bytes, Some(1u64 << 32));
     assert!(preview.max_entries.is_some_and(|n| n > 0) && preview.files.is_empty());
-    // The other kind of link is refused by name, not sent to.
+    // The other kind of link is refused by name on the screen and in the
+    // send itself, not previewed or sent to.
+    let misplaced = ffi::inspect(
+        format!("{}/s/{token}", server.base),
+        Some(LinkKind::Request),
+    );
+    assert_eq!(
+        (
+            misplaced.kind,
+            misplaced.usable,
+            misplaced.problem.as_deref()
+        ),
+        (
+            Some(LinkKind::Delivery),
+            false,
+            Some("That is a delivery link. Paste it into Receive.")
+        )
+    );
     let wrong = ffi::send(
         format!("{}/s/{token}", server.base),
         None,
@@ -171,7 +191,10 @@ fn a_shell_sends_a_folder_and_receives_a_delivery_through_the_view_model(bin: &s
     // A closed request link previews as closed, with the sentence under the
     // field and the primary action disabled.
     common::close_link(&server.base, &token);
-    let closed = ffi::inspect(format!("{}/r/{token}", server.base));
+    let closed = ffi::inspect(
+        format!("{}/r/{token}", server.base),
+        Some(LinkKind::Request),
+    );
     assert_eq!(
         (closed.kind, closed.usable, closed.problem.as_deref()),
         (Some(LinkKind::Request), false, Some("This link is closed."))
@@ -185,7 +208,10 @@ fn a_shell_sends_a_folder_and_receives_a_delivery_through_the_view_model(bin: &s
         Some("pw"),
         None,
     );
-    let gated = ffi::inspect(format!("{}/s/{token}", server.base));
+    let gated = ffi::inspect(
+        format!("{}/s/{token}", server.base),
+        Some(LinkKind::Delivery),
+    );
     assert_eq!(
         (gated.kind, gated.problem.as_deref()),
         (Some(LinkKind::Delivery), None)
@@ -195,7 +221,10 @@ fn a_shell_sends_a_folder_and_receives_a_delivery_through_the_view_model(bin: &s
         (gated.total_bytes, gated.quic, gated.label.as_deref()),
         (None, None, None)
     );
-    let unknown = ffi::inspect(format!("{}/s/not-a-token", server.base));
+    let unknown = ffi::inspect(
+        format!("{}/s/not-a-token", server.base),
+        Some(LinkKind::Delivery),
+    );
     assert_eq!(
         unknown.problem.as_deref(),
         Some("This link is closed or has expired.")
@@ -205,7 +234,7 @@ fn a_shell_sends_a_folder_and_receives_a_delivery_through_the_view_model(bin: &s
         "{unknown:?}"
     );
     assert!(!unknown.usable);
-    let nonsense = ffi::inspect("not a link".into());
+    let nonsense = ffi::inspect("not a link".into(), None);
     assert_eq!(
         (nonsense.kind, nonsense.problem.as_deref()),
         (None, Some("That is not a votport link."))
@@ -214,7 +243,10 @@ fn a_shell_sends_a_folder_and_receives_a_delivery_through_the_view_model(bin: &s
     // Receive: the delivery is planned, downloaded, verified, and done.
     let note = b"delivered beside the plate".to_vec();
     let token = common::deliver(&server.base, &[("note.txt", note.clone())], None, None);
-    let open = ffi::inspect(format!("{}/s/{token}", server.base));
+    let open = ffi::inspect(
+        format!("{}/s/{token}", server.base),
+        Some(LinkKind::Delivery),
+    );
     assert!(!open.needs_password && open.problem.is_none(), "{open:?}");
     // This server binds no serve listener, so the delivery offers no QUIC.
     assert_eq!(open.quic, Some(false), "{open:?}");

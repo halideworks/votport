@@ -11,6 +11,8 @@ public sealed partial class SettingsPage : Page
     {
         InitializeComponent();
         NotifySwitch.IsOn = Settings.Notify;
+        TraySwitch.IsOn = Settings.CloseToTray;
+        StartSwitch.IsOn = Settings.StartWithWindows;
         CoreText.Text = $"Core {VotportClientCoreMethods.CoreVersion()}";
         Refresh();
     }
@@ -42,4 +44,8 @@ public sealed partial class SettingsPage : Page
     }
 
     private void Notify_Toggled(object sender, RoutedEventArgs e) => Settings.Notify = NotifySwitch.IsOn;
+
+    private void Tray_Toggled(object sender, RoutedEventArgs e) => Settings.CloseToTray = TraySwitch.IsOn;
+
+    private void Start_Toggled(object sender, RoutedEventArgs e) => Settings.StartWithWindows = StartSwitch.IsOn;
 }

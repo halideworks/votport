@@ -6,7 +6,7 @@ import SwiftUI
 struct ReceiveView: View {
     @EnvironmentObject private var store: TransferStore
     @AppStorage(Prefs.receiveFolderKey) private var defaultFolder = ""
-    @StateObject private var previewer = LinkPreviewer()
+    @StateObject private var previewer = LinkPreviewer(expect: .delivery)
     @State private var link = ""
     @State private var password = ""
     @State private var destination: URL?
@@ -14,7 +14,7 @@ struct ReceiveView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("RECEIVE")
-                .font(.caption.weight(.semibold))
+                .font(Type.label)
                 .tracking(1.5)
                 .foregroundStyle(Tokens.muted)
 
@@ -23,7 +23,7 @@ struct ReceiveView: View {
                 .onChange(of: link) { _, value in previewer.update(value) }
             if let line = PreviewLine.text(previewer) {
                 Text(line)
-                    .font(.callout)
+                    .font(Type.callout)
                     .foregroundStyle(PreviewLine.isProblem(previewer) ? Tokens.danger : Tokens.muted)
             }
             if previewer.needsPassword {
@@ -34,7 +34,7 @@ struct ReceiveView: View {
             HStack {
                 Button("Choose Folder") { chooseFolder() }
                 Text(folder?.path ?? "No folder chosen")
-                    .font(.system(.body, design: .monospaced))
+                    .font(Type.monoBody)
                     .foregroundStyle(Tokens.muted)
                     .lineLimit(1)
                     .truncationMode(.middle)
