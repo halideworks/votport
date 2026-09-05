@@ -31,7 +31,7 @@ fn a_delivery_is_received_and_verified_into_a_local_directory() {
         ("empty.bin", Vec::new()),
     ];
 
-    let token = common::deliver(&server.base, &files, None);
+    let token = common::deliver(&server.base, &files, None, None);
     let dest = tempfile::tempdir().unwrap();
     let delivery = Delivery {
         token: token.clone(),
@@ -74,7 +74,7 @@ fn a_password_delivery_needs_the_password() {
 
     let note = b"for authorized eyes".to_vec();
     let files: Vec<(&str, Vec<u8>)> = vec![("secret.txt", note.clone())];
-    let token = common::deliver(&server.base, &files, Some("open-sesame"));
+    let token = common::deliver(&server.base, &files, Some("open-sesame"), None);
 
     // Without the password the receive stops before any byte is written.
     let dest = tempfile::tempdir().unwrap();
@@ -126,7 +126,7 @@ fn an_interrupted_download_resumes_from_the_partial() {
     const PREFIX: usize = 5 * 1024 * 1024 + 12345;
     let movie: Vec<u8> = (0..8u32 * 1024 * 1024).map(|index| index as u8).collect();
     let files: Vec<(&str, Vec<u8>)> = vec![("movie.bin", movie.clone())];
-    let token = common::deliver(&server.base, &files, None);
+    let token = common::deliver(&server.base, &files, None, None);
 
     let dest = tempfile::tempdir().unwrap();
     // The temporary a receive resumes is a hidden `.vot-<name>.journal`.

@@ -112,8 +112,14 @@ pub fn create_link(base: &str) -> String {
 
 /// Uploads `files` into the outbound library and creates a delivery grant over
 /// them, returning the delivery token parsed from its `/s/{token}` url. Each
-/// pair is a library-relative path (which may nest) and its bytes.
-pub fn deliver(base: &str, files: &[(&str, Vec<u8>)], password: Option<&str>) -> String {
+/// pair is a library-relative path (which may nest) and its bytes. `password`
+/// gates the delivery; `max_downloads` caps how many deliveries it serves.
+pub fn deliver(
+    base: &str,
+    files: &[(&str, Vec<u8>)],
+    password: Option<&str>,
+    max_downloads: Option<u64>,
+) -> String {
     let admin = reqwest::blocking::Client::builder()
         .cookie_store(true)
         .build()
@@ -147,6 +153,9 @@ pub fn deliver(base: &str, files: &[(&str, Vec<u8>)], password: Option<&str>) ->
     });
     if let Some(password) = password {
         body["password"] = serde_json::json!(password);
+    }
+    if let Some(max_downloads) = max_downloads {
+        body["max_downloads"] = serde_json::json!(max_downloads);
     }
     let created = admin
         .post(format!("{base}/api/admin/outbound-grants"))
