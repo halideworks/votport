@@ -1,0 +1,18 @@
+<Page x:Class="Votport.ReceivePage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <StackPanel Spacing="12">
+    <TextBlock Text="RECEIVE" Style="{StaticResource SectionLabel}" />
+    <TextBox x:Name="LinkBox" PlaceholderText="Delivery link" />
+    <PasswordBox x:Name="PasswordBox" PlaceholderText="Password, if the delivery has one" />
+    <StackPanel Orientation="Horizontal" Spacing="8">
+      <Button Content="Choose Folder" Click="ChooseFolder_Click" />
+      <TextBlock x:Name="FolderText" Text="No folder chosen" Style="{StaticResource Mono}"
+          Foreground="{StaticResource VotMutedBrush}" VerticalAlignment="Center" MaxWidth="420" />
+    </StackPanel>
+    <Button x:Name="ReceiveButton" Content="Receive" Click="Receive_Click" IsEnabled="False"
+        Style="{StaticResource AccentButtonStyle}" />
+    <TextBlock Text="Files land verified against the roots the delivery announced."
+        Foreground="{StaticResource VotMutedBrush}" />
+  </StackPanel>
+</Page>

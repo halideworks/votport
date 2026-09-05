@@ -1,0 +1,24 @@
+<Window x:Class="Votport.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:Votport"
+    Title="votport">
+  <Window.SystemBackdrop>
+    <MicaBackdrop />
+  </Window.SystemBackdrop>
+  <NavigationView x:Name="Nav" PaneDisplayMode="Left" IsBackButtonVisible="Collapsed"
+      IsSettingsVisible="False" OpenPaneLength="180" SelectionChanged="Nav_SelectionChanged"
+      Background="{StaticResource VotBgBrush}" RequestedTheme="Dark">
+    <NavigationView.MenuItems>
+      <NavigationViewItem Content="Send" Tag="send" Icon="Upload" />
+      <NavigationViewItem Content="Receive" Tag="receive" Icon="Download" />
+      <NavigationViewItem Content="Transfers" Tag="transfers" Icon="List">
+        <NavigationViewItem.InfoBadge>
+          <InfoBadge x:Name="ActiveBadge" Visibility="Collapsed" />
+        </NavigationViewItem.InfoBadge>
+      </NavigationViewItem>
+      <NavigationViewItem Content="Settings" Tag="settings" Icon="Setting" />
+    </NavigationView.MenuItems>
+    <Frame x:Name="Pages" Padding="20" />
+  </NavigationView>
+</Window>
