@@ -13,7 +13,7 @@
     "browser:e2e": "node scripts/browser-e2e.mjs"
   },
   "devDependencies": {
-    "eslint": "10.9.0",
+    "eslint": "10.9.1",
     "playwright": "1.62.1"
   }
 }
