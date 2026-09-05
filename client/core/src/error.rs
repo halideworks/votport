@@ -44,6 +44,14 @@ pub enum Error {
     #[error("this link needs a password")]
     PasswordRequired,
 
+    /// An operator call without a signed-in port, or a session the server no
+    /// longer honours.
+    #[error("not signed in to a votport")]
+    NotSignedIn,
+
+    #[error("the admin password was refused")]
+    WrongPassword,
+
     #[error("nothing to send: no files were selected")]
     Empty,
 
@@ -125,14 +133,21 @@ impl Error {
     pub fn headline(&self) -> String {
         match self {
             Self::Http { .. } => "Could not reach the server.".to_owned(),
-            Self::Server { status, .. } => match status {
+            Self::Server { status, body, .. } => match status {
                 401 | 403 => "The password was not accepted.".to_owned(),
                 404 | 410 => "This link is closed or has expired.".to_owned(),
+                409 => "The server is busy with that. Try again in a moment.".to_owned(),
                 413 => "The drop is larger than this link accepts.".to_owned(),
+                // The server's own reason, when its JSON carries one: "label
+                // must be 1..=200 characters" is the sentence to show.
+                422 => server_reason(body)
+                    .unwrap_or_else(|| "The server did not accept that.".to_owned()),
                 429 => "Too many tries. Wait a minute and try again.".to_owned(),
-                _ => "The server refused the transfer.".to_owned(),
+                _ => "The server refused it.".to_owned(),
             },
             Self::Rebegin => "The server restarted. Send again to continue.".to_owned(),
+            Self::NotSignedIn => "Sign in to your votport first.".to_owned(),
+            Self::WrongPassword => "That password is wrong.".to_owned(),
             Self::BadLink { .. } => "That is not a votport link.".to_owned(),
             Self::WrongLink { kind, .. } => match kind {
                 crate::api::LinkKind::Delivery => {
@@ -224,9 +239,29 @@ impl Error {
                 | Self::UnknownSuite { .. }
                 | Self::BadName { .. }
                 | Self::UnknownTransfer { .. }
+                | Self::NotSignedIn
+                | Self::WrongPassword
                 | Self::Cancelled
         )
     }
+}
+
+/// The `error` field of a server JSON body, as a sentence.
+fn server_reason(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let reason = value.get("error")?.as_str()?.trim();
+    if reason.is_empty() {
+        return None;
+    }
+    let mut chars = reason.chars();
+    let first = chars.next()?.to_uppercase().collect::<String>();
+    let rest: String = chars.collect();
+    let sentence = format!("{first}{rest}");
+    Some(if sentence.ends_with('.') {
+        sentence
+    } else {
+        format!("{sentence}.")
+    })
 }
 
 fn name_of(path: &str) -> String {
@@ -326,8 +361,34 @@ mod tests {
                     what: "begin".into(),
                     body: "proof rejected".into(),
                 },
-                "The server refused the transfer.",
+                "The server refused it.",
             ),
+            (
+                Error::Server {
+                    status: 422,
+                    what: "issue request".into(),
+                    body: "{\"error\":\"label must be 1..=200 characters\"}".into(),
+                },
+                "Label must be 1..=200 characters.",
+            ),
+            (
+                Error::Server {
+                    status: 422,
+                    what: "issue request".into(),
+                    body: "not json".into(),
+                },
+                "The server did not accept that.",
+            ),
+            (
+                Error::Server {
+                    status: 409,
+                    what: "library".into(),
+                    body: String::new(),
+                },
+                "The server is busy with that. Try again in a moment.",
+            ),
+            (Error::NotSignedIn, "Sign in to your votport first."),
+            (Error::WrongPassword, "That password is wrong."),
             (
                 Error::Rejected {
                     count: 1,

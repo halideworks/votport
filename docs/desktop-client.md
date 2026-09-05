@@ -151,7 +151,32 @@ renders the asset catalog, the Windows tiles, the `.ico`, and a 512 pixel
 reference under `client/design/icon` from
 `web/assets/pommern_ship_white.png` on the navy logo square) and show it
 with the name at the top of the sidebar, open at 900 by 580 points
-instead of the platform's default, and call the sender screen Ship.
+instead of the platform's default, and call the sender screen Ship. The
+core now holds the operator session of phase C8 (`port.rs`, "the home
+port"): `sign_in` posts the admin password to `/api/admin/login`, keeps
+the `votport_admin` cookie the server sets in `port.json` beside the
+device key (owner-only on Unix, a plain profile file on Windows until the
+keychain lands; never handed to a shell, never the password),
+and reads `/api/admin/session` for the tenant; `check` asks whether the
+session still holds and drops one the server no longer honours;
+`sign_out` ends it. Over that session the core lists the open request
+links with their URLs, drop counts, and senders shipping now
+(`GET /api/admin/links?status=open`), issues one (`POST /api/admin/links`
+with a label, an optional password, expiry, and cap) and closes one,
+lists the deliveries (`GET /api/admin/outbound-grants`; a delivery's link
+is shown once, at issue, since the server keeps only its hash), revokes
+one, browses the library one directory at a time
+(`GET /api/admin/outbound-files?directory=`), and issues a delivery of
+library files (`POST /api/admin/outbound-grants` with `paths`), whose
+reply carries the link. Mutations send the `X-Votport` header and are
+never retried; a 401 becomes `Error::NotSignedIn` and a refused password
+`Error::WrongPassword`, each with a headline, and a 422's headline is the
+server's own reason ("Label must be 1..=200 characters."). The CLI gains `signin`
+(password from a flag or stdin), `signout`, `port`, `requests`,
+`issue-request`, `close-request`, `deliveries`, `revoke-delivery`,
+`library`, and `issue-delivery`. SSO sign-in still needs the three server
+touches under "The shells" and is not in the core yet. The shells do not
+draw any of this yet.
 
 | Field | Value |
 | --- | --- |
