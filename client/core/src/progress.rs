@@ -20,6 +20,14 @@ pub enum Event {
     Rebegin,
     /// The drop finished; `files` were published.
     Finished { files: usize },
+    /// A receive is pulling file `index`; `received` of `total` bytes are in.
+    Downloading {
+        index: usize,
+        received: u64,
+        total: u64,
+    },
+    /// A received file's bytes hashed to its announced root and landed at `path`.
+    FileVerified { index: usize, path: String },
 }
 
 /// A sink for [`Event`]s. Implemented by the CLI and by each shell.
