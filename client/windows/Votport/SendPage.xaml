@@ -10,7 +10,7 @@
       <RowDefinition Height="*" />
       <RowDefinition Height="Auto" />
     </Grid.RowDefinitions>
-    <TextBlock Text="SEND" Style="{StaticResource SectionLabel}" />
+    <TextBlock Text="SHIP" Style="{StaticResource SectionLabel}" />
     <TextBox x:Name="LinkBox" Grid.Row="1" PlaceholderText="Request link" />
     <TextBlock x:Name="PreviewText" Grid.Row="2" Visibility="Collapsed" TextWrapping="Wrap"
         Foreground="{ThemeResource VotMutedBrush}" />
@@ -20,8 +20,10 @@
         BorderThickness="1" CornerRadius="6" MinHeight="160">
       <Grid>
         <StackPanel x:Name="Empty" VerticalAlignment="Center" HorizontalAlignment="Center" Spacing="8">
-          <FontIcon Glyph="&#xE896;" FontSize="28" Foreground="{ThemeResource VotMutedBrush}" />
-          <TextBlock Text="Drop files or folders here" Foreground="{ThemeResource VotMutedBrush}" />
+          <FontIcon Glyph="&#xE7B8;" FontSize="28" Foreground="{ThemeResource VotMutedBrush}" />
+          <TextBlock Text="Drop files or folders here" Foreground="{ThemeResource VotMutedBrush}" HorizontalAlignment="Center" />
+          <TextBlock Text="They ship from where they are; nothing is copied first." FontSize="12"
+              Foreground="{ThemeResource VotMutedBrush}" HorizontalAlignment="Center" />
         </StackPanel>
         <ListView x:Name="Paths" Visibility="Collapsed" SelectionMode="None">
           <ListView.ItemTemplate>
@@ -37,7 +39,7 @@
       <Button Content="Choose Folder" Click="ChooseFolder_Click" />
       <Button Content="Paste" Click="Paste_Click" />
       <Button x:Name="ClearButton" Content="Clear" Click="Clear_Click" Visibility="Collapsed" />
-      <Button x:Name="SendButton" Content="Send" Click="Send_Click" IsEnabled="False"
+      <Button x:Name="SendButton" Content="Ship" Click="Send_Click" IsEnabled="False"
           Style="{StaticResource AccentButtonStyle}" HorizontalAlignment="Right" />
     </StackPanel>
   </Grid>

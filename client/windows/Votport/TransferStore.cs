@@ -72,8 +72,12 @@ public sealed class TransferItem : INotifyPropertyChanged
     internal TransferView? View
     {
         get => view;
-        set { view = value; Changed(); Changed(nameof(Status)); Changed(nameof(Fraction)); Changed(nameof(Files)); Changed(nameof(Detail)); Changed(nameof(HasDetail)); }
+        set { view = value; Changed(); Changed(nameof(Status)); Changed(nameof(Fraction)); Changed(nameof(Files)); Changed(nameof(Detail)); Changed(nameof(HasDetail)); Changed(nameof(Route)); Changed(nameof(HasRoute)); }
     }
+
+    /// The path in the person's words, once the core chose it.
+    public string Route => view?.Route ?? "";
+    public bool HasRoute => view?.Route is not null;
 
     public bool Running
     {
@@ -109,7 +113,7 @@ public sealed class FileRow
 
     public string Path => file.Path;
     public double Fraction => file.Bytes == 0 ? 100 : 100.0 * file.Moved / file.Bytes;
-    public string Label => Format.FileLabel(file);
+    public string Label => file.Label;
     public bool Verified => file.State == FileState.Verified;
 }
 
@@ -352,72 +356,20 @@ public static class Launch
 /// core; nothing is computed here.
 public static class Format
 {
-    public static string Bytes(ulong value)
-    {
-        string[] units = { "bytes", "KB", "MB", "GB", "TB" };
-        double amount = value;
-        var unit = 0;
-        while (amount >= 1000 && unit < units.Length - 1) { amount /= 1000; unit++; }
-        return unit == 0 ? $"{value} {units[0]}" : $"{amount:0.#} {units[unit]}";
-    }
-
-    public static string Seconds(ulong value)
-    {
-        var span = TimeSpan.FromSeconds(value);
-        return value >= 3600 ? $"{(int)span.TotalHours} h {span.Minutes} min" : $"{span.Minutes} min {span.Seconds} s";
-    }
-
-    internal static string TransportName(Transport transport) => transport switch
-    {
-        Transport.Push => "QUIC push",
-        Transport.Fetch => "QUIC fetch",
-        _ => "HTTP",
-    };
-
-    internal static string FileLabel(FileView file) => file.State switch
-    {
-        FileState.Waiting => Bytes(file.Bytes),
-        FileState.Moving => $"{Bytes(file.Moved)} of {Bytes(file.Bytes)}",
-        FileState.Landed => "landed",
-        _ => "verified",
-    };
-
     public static string MenuLine(TransferItem item)
     {
         var line = item.Subject;
-        if (item.View?.RateBytesPerSecond is ulong rate) line += $"  {Bytes(rate)}/s";
+        if (item.View?.RateText is string rate) line += $"  {rate}";
         return line;
     }
 
+    /// The core's status line, or the two states only the shell knows: a
+    /// journal entry not yet run, and a transfer the core never answered (a
+    /// panic or a load failure the crash log names).
     internal static string StatusLine(TransferItem item)
     {
-        var view = item.View;
-        // No view at all means the core never answered (a panic or a load
-        // failure the crash log names), which is the shell's failure to show.
         if (item.Interrupted) return "Interrupted before it finished";
-        if (view is null) return item.Running ? "Starting" : "Failed";
-        var verb = item.Kind == TransferItem.Kinds.Send ? "Sending" : "Receiving";
-        switch (view.Phase)
-        {
-            case Phase.Preparing:
-                return item.Kind == TransferItem.Kinds.Send ? "Hashing" : "Preparing";
-            case Phase.Transferring:
-                var parts = new List<string> { verb };
-                if (view.Transport is Transport via) parts.Add($"over {TransportName(via)}");
-                if (view.TotalBytes is ulong total) parts.Add($"{Bytes(view.MovedBytes)} of {Bytes(total)}");
-                if (view.RateBytesPerSecond is ulong rate) parts.Add($"{Bytes(rate)}/s");
-                if (view.EtaSeconds is ulong eta) parts.Add($"about {Seconds(eta)} left");
-                return string.Join(", ", parts);
-            case Phase.Done:
-                var count = view.Files.Length;
-                var noun = count == 1 ? "file" : "files";
-                return item.Kind == TransferItem.Kinds.Send
-                    ? $"Done, {count} {noun} sent"
-                    : $"Done, {count} {noun} received and verified";
-            case Phase.Cancelled:
-                return "Cancelled";
-            default:
-                return view.Headline ?? "Failed";
-        }
+        if (item.View is not TransferView view) return item.Running ? "Starting" : "Failed";
+        return view.Status;
     }
 }

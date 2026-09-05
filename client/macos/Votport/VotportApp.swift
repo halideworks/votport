@@ -13,8 +13,9 @@ struct VotportApp: App {
         WindowGroup(id: "main") {
             MainWindow()
                 .environmentObject(store)
-                .frame(minWidth: 760, minHeight: 480)
+                .frame(minWidth: 720, minHeight: 460)
         }
+        .defaultSize(width: 900, height: 580)
         MenuBarExtra {
             MenuBarContent()
                 .environmentObject(store)
@@ -27,16 +28,19 @@ struct VotportApp: App {
 /// The four sections the design names; the transfer list is the rest of the
 /// app.
 enum Screen: String, CaseIterable, Identifiable {
-    case send = "Send"
+    case send = "Ship"
     case receive = "Receive"
     case transfers = "Transfers"
     case settings = "Settings"
 
-    var id: String { rawValue }
+    // The sidebar's selection binding holds a Screen, so the row id must be
+    // the Screen itself: a string id matches no selection and the rows
+    // ignore clicks.
+    var id: Self { self }
 
     var symbol: String {
         switch self {
-        case .send: return "arrow.up.doc"
+        case .send: return "sailboat"
         case .receive: return "arrow.down.doc"
         case .transfers: return "list.bullet.rectangle"
         case .settings: return "gearshape"
@@ -47,12 +51,26 @@ enum Screen: String, CaseIterable, Identifiable {
 struct MainWindow: View {
     @EnvironmentObject private var store: TransferStore
     @State private var section: Screen? = .send
+    @State private var urlChoseSection = false
 
     var body: some View {
         NavigationSplitView {
-            List(Screen.allCases, selection: $section) { section in
-                Label(section.rawValue, systemImage: section.symbol)
-                    .badge(section == .transfers ? store.active.count : 0)
+            VStack(alignment: .leading, spacing: 0) {
+                // The web masthead's mark: the ship on its square, the name.
+                HStack(spacing: 8) {
+                    Image(nsImage: NSApp.applicationIconImage)
+                        .resizable()
+                        .frame(width: 26, height: 26)
+                    Text("votport")
+                        .font(Type.sans(14, .semibold, relativeTo: .body))
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 6)
+                .padding(.bottom, 10)
+                List(Screen.allCases, selection: $section) { section in
+                    Label(section.rawValue, systemImage: section.symbol)
+                        .badge(section == .transfers ? store.active.count : 0)
+                }
             }
             .navigationSplitViewColumnWidth(min: 160, ideal: 180)
         } detail: {
@@ -71,6 +89,12 @@ struct MainWindow: View {
                 section = .transfers
             }
         }
+        // The journal is read from the app delegate, which can run after the
+        // window is already up; an interrupted transfer still opens the list,
+        // unless a votport:// link already chose a screen this launch.
+        .onChange(of: store.items.contains(where: \.interrupted)) { _, interrupted in
+            if interrupted && !urlChoseSection { section = .transfers }
+        }
         .onOpenURL { url in
             // votport://r/<token>?base=<origin> opens Send with the request
             // link; votport://s/<token>?base=<origin> opens Receive with the
@@ -79,6 +103,7 @@ struct MainWindow: View {
             // origin is visible in the field and nothing moves until the user
             // presses Send or Receive.
             guard let link = Launch.webLink(from: url) else { return }
+            urlChoseSection = true
             if url.host == "r" {
                 store.prefillSend = link
                 section = .send
@@ -98,14 +123,14 @@ struct MenuBarContent: View {
 
     var body: some View {
         if store.active.isEmpty {
-            Text("No active transfers")
+            Text("Nothing under way")
         } else {
             ForEach(store.active) { item in
                 Text(Format.menuLine(item))
             }
         }
         Divider()
-        Button("Open Votport") {
+        Button("Open votport") {
             // Reuses the main window or makes a new one after it was closed.
             openWindow(id: "main")
             NSApp.activate(ignoringOtherApps: true)

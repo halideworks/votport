@@ -1,4 +1,5 @@
 server/target/
+server/target-*/
 client/target/
 client/target-*/
 web/assets/vendor

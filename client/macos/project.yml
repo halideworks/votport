@@ -38,6 +38,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.halideworks.votport
+        # Votport/Assets.xcassets, rendered by scripts/app-icon.py.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         SWIFT_VERSION: "5.0"
         # Ad hoc until the Developer ID lands; the app runs locally unsigned.
         CODE_SIGN_IDENTITY: "-"

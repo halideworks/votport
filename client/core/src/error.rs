@@ -241,6 +241,18 @@ fn name_of_path(path: &std::path::Path) -> String {
     }
 }
 
+/// Seconds as a person reads a time left: "45 s", "3 min 20 s", "1 h 5 min".
+#[must_use]
+pub fn human_seconds(value: u64) -> String {
+    if value >= 3600 {
+        format!("{} h {} min", value / 3600, (value % 3600) / 60)
+    } else if value >= 60 {
+        format!("{} min {} s", value / 60, value % 60)
+    } else {
+        format!("{value} s")
+    }
+}
+
 /// `1.5 GB`-style text for a headline. Decimal units, as Finder and the web
 /// pages show them.
 #[must_use]
@@ -385,6 +397,16 @@ mod tests {
         assert!(!Error::Cancelled.worth_retrying());
         assert!(!Error::Empty.worth_retrying());
         assert!(!Error::BadLink { link: "x".into() }.worth_retrying());
+    }
+
+    #[test]
+    fn human_seconds_picks_two_units() {
+        assert_eq!(human_seconds(0), "0 s");
+        assert_eq!(human_seconds(59), "59 s");
+        assert_eq!(human_seconds(60), "1 min 0 s");
+        assert_eq!(human_seconds(200), "3 min 20 s");
+        assert_eq!(human_seconds(3600), "1 h 0 min");
+        assert_eq!(human_seconds(3900), "1 h 5 min");
     }
 
     #[test]

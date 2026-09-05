@@ -62,24 +62,7 @@ final class LinkPreviewer: ObservableObject {
 enum PreviewLine {
     static func text(_ previewer: LinkPreviewer) -> String? {
         if previewer.checking { return "Checking the link" }
-        guard let preview = previewer.preview else { return nil }
-        if let problem = preview.problem { return problem }
-        var parts: [String] = []
-        if let label = preview.label, !label.isEmpty { parts.append(label) }
-        switch preview.kind {
-        case .request:
-            if let max = preview.maxBytes { parts.append("accepts up to \(Format.bytes(max))") }
-        case .delivery:
-            if let total = preview.totalBytes {
-                let count = preview.files.count
-                parts.append("\(count) file\(count == 1 ? "" : "s"), \(Format.bytes(total))")
-            }
-        case nil:
-            break
-        }
-        if preview.needsPassword { parts.append("password needed") }
-        if preview.quic == true { parts.append("QUIC offered") }
-        return parts.isEmpty ? nil : parts.joined(separator: ", ")
+        return previewer.preview?.line
     }
 
     static func isProblem(_ previewer: LinkPreviewer) -> Bool {

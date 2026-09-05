@@ -45,7 +45,8 @@ struct ReceiveView: View {
             }
 
             Spacer()
-            Text("Files land verified against the roots the delivery announced.")
+            Text("Each file is checked as it lands, so what arrives is exactly what was sent.")
+                .font(Type.callout)
                 .foregroundStyle(Tokens.muted)
         }
         .padding(20)

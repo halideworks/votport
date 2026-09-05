@@ -20,8 +20,15 @@
     <NavigationView x:Name="Nav" Grid.Row="1" PaneDisplayMode="Left" IsBackButtonVisible="Collapsed"
         IsSettingsVisible="False" OpenPaneLength="180" SelectionChanged="Nav_SelectionChanged"
         Background="{ThemeResource VotBgBrush}" FontFamily="{StaticResource VotSansFont}">
+      <NavigationView.PaneHeader>
+        <!-- The web masthead's mark: the ship on its square, the name. -->
+        <StackPanel Orientation="Horizontal" Spacing="8" Margin="4,0,0,4" VerticalAlignment="Center">
+          <Image Source="ms-appx:///Assets/Square44x44Logo.png" Width="24" Height="24" />
+          <TextBlock Text="votport" FontWeight="SemiBold" VerticalAlignment="Center" />
+        </StackPanel>
+      </NavigationView.PaneHeader>
       <NavigationView.MenuItems>
-        <NavigationViewItem Content="Send" Tag="send" Icon="Upload" />
+        <NavigationViewItem Content="Ship" Tag="send" Icon="Send" />
         <NavigationViewItem Content="Receive" Tag="receive" Icon="Download" />
         <NavigationViewItem Content="Transfers" Tag="transfers" Icon="List">
           <NavigationViewItem.InfoBadge>

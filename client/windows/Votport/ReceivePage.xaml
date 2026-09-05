@@ -14,7 +14,7 @@
     </StackPanel>
     <Button x:Name="ReceiveButton" Content="Receive" Click="Receive_Click" IsEnabled="False"
         Style="{StaticResource AccentButtonStyle}" />
-    <TextBlock Text="Files land verified against the roots the delivery announced."
-        Foreground="{ThemeResource VotMutedBrush}" />
+    <TextBlock Text="Each file is checked as it lands, so what arrives is exactly what was sent."
+        FontSize="12" Foreground="{ThemeResource VotMutedBrush}" TextWrapping="Wrap" />
   </StackPanel>
 </Page>
