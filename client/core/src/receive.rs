@@ -125,9 +125,15 @@ pub fn receive_over_http(
     let cookie = cookie.as_deref();
     let mut files = Vec::with_capacity(planned.len());
     for (index, (file, path, root)) in planned.into_iter().enumerate() {
-        let mut response = client.download(&file.download_url, cookie)?;
+        let mut source = |offset: u64| -> Result<Resumed> {
+            let (response, start) = client.download(&file.download_url, cookie, offset)?;
+            Ok(Resumed {
+                reader: Box::new(response),
+                start,
+            })
+        };
         write_verified(
-            &mut response,
+            &mut source,
             &path,
             root,
             &file.root,
@@ -145,11 +151,24 @@ pub fn receive_over_http(
     Ok(Received { files })
 }
 
-/// Streams `reader` into `destination`, hashing as it writes, and lands it
-/// only if its `total` bytes hash to the announced root. The byte source is
-/// abstract: an HTTP download for a receive, an object file for a fetch.
+/// A byte source positioned to resume at a requested offset, with the offset
+/// its bytes actually start at: the requested one, or 0 when the source could
+/// only give the whole thing (a server that ignored the range).
+pub(crate) struct Resumed {
+    pub reader: Box<dyn Read>,
+    pub start: u64,
+}
+
+/// Streams the bytes `source` gives into `destination`, hashing as it writes,
+/// and lands the file only if its `total` bytes hash to the announced root.
+///
+/// A partial from an interrupted attempt is resumed: its bytes are hashed into
+/// the builder and `source` is asked to continue past them. A stream that ends
+/// short keeps the partial so the next run resumes it; a wrong root, a landed
+/// file, or a rename failure removes it. `source` is called with the resume
+/// offset and gives a reader plus where its bytes begin.
 pub(crate) fn write_verified(
-    reader: &mut dyn Read,
+    source: &mut dyn FnMut(u64) -> Result<Resumed>,
     destination: &Path,
     announced: [u8; 32],
     announced_hex: &str,
@@ -160,28 +179,129 @@ pub(crate) fn write_verified(
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
+    let temporary = part_path(destination);
 
-    // Write to a sibling temporary and rename on success, so a failed or
-    // unverified stream never leaves a partial file at the real name. Every
-    // failure path from here removes the temporary.
-    let temporary = destination.with_extension(format!("part.{}", std::process::id()));
-    let landed = (|| -> Result<()> {
-        let mut builder = ObjectBuilder::new(Suite::Blake3Bao64, Some(total))?;
-        let mut sink = File::create(&temporary).map_err(|source| Error::Read {
-            path: temporary.clone(),
-            source,
-        })?;
-        hash_copy(reader, &mut builder, &mut sink, total, index, observer)?;
-        sink.sync_all()?;
-        // The handle must close before the rename: Windows refuses to rename
-        // a file that is still open.
-        drop(sink);
-        verify_and_rename(builder, destination, announced, announced_hex, &temporary)
-    })();
-    if landed.is_err() {
-        let _ = fs::remove_file(&temporary);
+    // Resume: hash any prior partial into the builder and continue past it. A
+    // partial that hashes to the wrong root fails at finish and is removed, so
+    // the next run starts clean; a bad prefix cannot land silently.
+    let mut builder = ObjectBuilder::new(Suite::Blake3Bao64, Some(total))?;
+    let mut resume_from = feed_partial(&temporary, &mut builder, total)?;
+    let resumed = source(resume_from)?;
+    if resumed.start != resume_from {
+        if resumed.start != 0 {
+            return Err(Error::Other(format!(
+                "the source resumed at {} but {resume_from} was requested",
+                resumed.start
+            )));
+        }
+        // The source gave the whole file rather than the range: start over.
+        builder = ObjectBuilder::new(Suite::Blake3Bao64, Some(total))?;
+        resume_from = 0;
     }
-    landed
+    let mut reader = resumed.reader;
+
+    // A stream failure keeps the partial for the next run to resume; only a
+    // verification failure removes it.
+    stream_to_temp(
+        &temporary,
+        &mut *reader,
+        &mut builder,
+        resume_from,
+        total,
+        index,
+        observer,
+    )?;
+    match verify_and_rename(builder, destination, announced, announced_hex, &temporary) {
+        Ok(()) => Ok(()),
+        // A stream that ended short (the builder's LengthMismatch) leaves a
+        // usable prefix, so the partial stays to resume. Any other failure
+        // means finish already produced a complete file: a wrong root is
+        // poison, and a landed file or a rename race leaves a full-size partial
+        // the next run would only discard, so all of these remove it.
+        Err(error) => {
+            if !matches!(error, Error::Object(vot_object::Error::LengthMismatch)) {
+                let _ = fs::remove_file(&temporary);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// The resumable temporary beside `destination`: a hidden `.vot-<name>.journal`
+/// in its directory. That shape is one `admit` refuses, so no delivered file
+/// lands on it, and no common tool produces it, so a browser's `<name>.part`
+/// or a user's own file is never mistaken for votport's partial and destroyed.
+fn part_path(destination: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".vot-");
+    name.push(destination.file_name().unwrap_or_default());
+    name.push(".journal");
+    match destination.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+/// Feeds an existing partial at `temporary` into `builder` and returns its
+/// length, the offset a resume continues from. A partial that is empty, at or
+/// past the full length, or unreadable is discarded and zero is returned.
+fn feed_partial(temporary: &Path, builder: &mut ObjectBuilder, total: u64) -> Result<u64> {
+    let Ok(metadata) = fs::metadata(temporary) else {
+        return Ok(0);
+    };
+    let length = metadata.len();
+    if length == 0 || length >= total {
+        let _ = fs::remove_file(temporary);
+        return Ok(0);
+    }
+    let mut file = File::open(temporary).map_err(|source| Error::Read {
+        path: temporary.to_path_buf(),
+        source,
+    })?;
+    let mut buffer = vec![0u8; READ_CHUNK];
+    let mut fed = 0u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        builder.update(&buffer[..read])?;
+        fed = fed.saturating_add(read as u64);
+    }
+    Ok(fed)
+}
+
+/// Opens the temporary for the resume, appending when continuing and starting
+/// fresh at zero, and streams `reader` into it while hashing. The handle closes
+/// before the caller renames, since Windows refuses to rename an open file.
+fn stream_to_temp(
+    temporary: &Path,
+    reader: &mut dyn Read,
+    builder: &mut ObjectBuilder,
+    resume_from: u64,
+    total: u64,
+    index: usize,
+    observer: &mut dyn Observer,
+) -> Result<()> {
+    let mut sink = if resume_from > 0 {
+        std::fs::OpenOptions::new().append(true).open(temporary)
+    } else {
+        File::create(temporary)
+    }
+    .map_err(|source| Error::Read {
+        path: temporary.to_path_buf(),
+        source,
+    })?;
+    hash_copy(
+        reader,
+        builder,
+        &mut sink,
+        resume_from,
+        total,
+        index,
+        observer,
+    )?;
+    sink.sync_all()?;
+    Ok(())
 }
 
 /// Finishes the hash, checks it against the announced root, and renames the
@@ -221,17 +341,20 @@ fn root_matches(got: &[u8; 32], announced: &[u8; 32]) -> bool {
     got == announced
 }
 
-/// Reads `reader` in chunks, feeding each to the hasher and the file.
+/// Reads `reader` in chunks, feeding each to the hasher and the file. `base`
+/// is the bytes already on disk from a resumed partial, so progress counts the
+/// whole file, not just this run's tail.
 fn hash_copy(
     reader: &mut dyn Read,
     builder: &mut ObjectBuilder,
     sink: &mut File,
+    base: u64,
     total: u64,
     index: usize,
     observer: &mut dyn Observer,
 ) -> Result<()> {
     let mut buffer = vec![0u8; READ_CHUNK];
-    let mut received = 0u64;
+    let mut received = base;
     loop {
         let read = reader.read(&mut buffer)?;
         if read == 0 {

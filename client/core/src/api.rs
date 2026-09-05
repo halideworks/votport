@@ -464,10 +464,12 @@ impl Client {
         })
     }
 
-    /// `GET <path>`: a delivery file's bytes, streamed. `path` is a
-    /// `download_url` from the metadata, used verbatim; `cookie` is the grant
-    /// cookie for a password delivery. The caller reads the returned response
-    /// body incrementally.
+    /// `GET <path>`: a delivery file's bytes from `offset`, streamed. `path` is
+    /// a `download_url` from the metadata, used verbatim; `cookie` is the grant
+    /// cookie for a password delivery. Returns the response and the byte offset
+    /// its body actually starts at: `offset` when the server honored the range
+    /// with 206, or 0 when it answered the whole file with 200. The caller
+    /// reads the body incrementally.
     ///
     /// # Errors
     /// A network failure or a non-success status.
@@ -475,17 +477,20 @@ impl Client {
         &self,
         path: &str,
         cookie: Option<&str>,
-    ) -> Result<reqwest::blocking::Response> {
+        offset: u64,
+    ) -> Result<(reqwest::blocking::Response, u64)> {
         let url = self.url(path);
-        // The whole-file GET is idempotent, so a transient failure before the
-        // body starts is retried; a break mid-stream is the caller's to handle.
+        // The GET is idempotent, so a transient failure before the body starts
+        // is retried; a break mid-stream is the caller's to handle by resuming.
         retry(true, || {
-            let response = with_cookie(self.http.get(&url), cookie)
-                .send()
-                .map_err(|source| Error::Http {
-                    url: url.clone(),
-                    source,
-                })?;
+            let mut request = with_cookie(self.http.get(&url), cookie);
+            if offset > 0 {
+                request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+            }
+            let response = request.send().map_err(|source| Error::Http {
+                url: url.clone(),
+                source,
+            })?;
             let status = response.status();
             if !status.is_success() {
                 let body = response.text().unwrap_or_default();
@@ -495,7 +500,14 @@ impl Client {
                     body,
                 });
             }
-            Ok(response)
+            // 206 means the range was honored and the body starts at `offset`;
+            // any other success is the whole file from zero.
+            let start = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+                offset
+            } else {
+                0
+            };
+            Ok((response, start))
         })
     }
 
