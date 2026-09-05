@@ -1,8 +1,11 @@
 # The desktop client: native apps on one Rust core
 
-Status: design, 2026-09-04. Nothing under `client/` exists yet. The VOT
-seams in "VOT changes" are the first work; the shells come after the core
-and CLI move bytes end to end against a local votport.
+Status: design, 2026-09-04. The VOT seams in "VOT changes" landed in
+vot-cli at pin `0a129ea` (`build_manifest`, `build_manifest_from`,
+`push_from`, `fetch_bundle_with`, `probe_serve`, the proof-cache accessors,
+and the wire build on the platform-native CI job); the listener session cap
+is a separate follow-on. Nothing under `client/` exists yet; the shells
+come after the core and CLI move bytes end to end against a local votport.
 
 | Field | Value |
 | --- | --- |
@@ -86,7 +89,7 @@ Server, the contract the client speaks (route table in `server/src/app.rs`):
 | `GET /api/s/{token}/{file,batch,bundle,receipt}` | HTTP delivery and receipts, the fallback. |
 | `GET /api/receipt-key`, `POST /api/verify` | Public receipt verification. |
 
-VOT at the pinned revision (`26ccd14`), the functions the core builds on:
+VOT at the pinned revision (`0a129ea`), the functions the core builds on:
 
 - `push_bundle(bundle_dir, address, capability_path, key_source, identity)`
   dials `rails` sessions, each `ServeSession::begin_push_session` over a
@@ -428,7 +431,7 @@ are coalesced to ten per second before they cross the FFI.
    for the free space the grant's `total_bytes` needs and refuses early.
 2. If the `fetch` object is present: the probe against `fetch.address`
    and `fetch.certificate_digest`, then `POST /api/s/{token}/fetch` with
-   the holder key, then `fetch_with(FetchOptions)` into a staging
+   the holder key, then `fetch_bundle_with(FetchOptions)` into a staging
    directory beside the destination on the same filesystem (so publish is
    a rename), then `receive_bundle`-equivalent publication through
    `NativeFile` with the receipt and the observed time. The final-cursor
@@ -526,19 +529,22 @@ one votport repin across the server, the client, and the docs.
    to a cache the caller names, and returned as a `ServedSource` instead
    of being copied. `build_bundle` stays for the CLI. The proof cache
    writer (`package/proof_cache.rs`) becomes public for the leaves cache.
-2. `push_from(server: &BundleServer, options: &PushOptions) ->
+2. `push_from(server: &BundleServer, options: PushOptions) ->
    Result<PackageSummary, Error>` with `PushOptions { address, holder:
-   Arc<CapabilityHolder>, identity: [u8; 32], rails, datagram_fec,
-   observer: Option<&dyn TransferObserver> }`. `push_bundle` becomes
-   `open` plus this. The observer receives per-rail placed bytes, object
-   completions, and FEC counts at a bounded tick; `ServeConnection::progress`
-   already carries the number.
-3. `fetch_with(options: &FetchOptions, bundle: &Path) -> Result<PackageSummary,
-   Error>` with `FetchOptions { address, capability: Vec<u8>, holder,
-   serve_identity, rails, provers, observer }`, replacing the environment
-   variables for library callers (item 5 of `docs/deliver-over-quic.md`,
-   not yet landed). The existing `BundleFetcher::report_placed` callback
-   and `moved_bytes` feed the observer.
+   Arc<authz::Holder>, identity: [u8; 32], rails, extensions, progress:
+   Option<(u64, Progress)> }`, where `Progress` is a boxed `FnMut(u64,
+   Option<u64>)`. `push_bundle` becomes `open` plus this. Push progress is
+   the sum over rails of the bytes the carriers have taken, framing
+   included, with no total, because a sender does not know how much of what
+   it offers the receiver will ask for. Object completions on the sender
+   are a later seam.
+3. `fetch_bundle_with(options: FetchOptions, bundle: &Path) ->
+   Result<PackageSummary, Error>` with `FetchOptions { address, holder:
+   Option<Arc<authz::Holder>>, serve_identity, pin, rails, provers,
+   extensions, progress }`, replacing the environment variables for library
+   callers (item 5 of `docs/deliver-over-quic.md`). The existing
+   `BundleFetcher::report_placed` callback feeds the progress observer,
+   which reports placed bytes and the package length once known.
 4. The `platform-native` CI job compiles `vot-cli` with the wire feature
    on `windows-2025` and `macos-15` (cmake and nasm on both, LLVM for
    bindgen on Windows), and runs the live loopback tests there with the
@@ -605,7 +611,7 @@ machines on 2026-09-04, `cargo +1.97.1 build -p vot-cli --features wire
 
 | Phase | Repo | Content | Done when |
 | --- | --- | --- | --- |
-| C0 | VOT | `build_manifest`, `push_from`, `fetch_with`, observers, the listener session cap, wire on the platform-native job | Loopback push from an assembled server and fetch with options pass on Linux, macOS, and Windows in CI |
+| C0 | VOT | `build_manifest`, `build_manifest_from`, `push_from`, `fetch_bundle_with`, `probe_serve`, progress observers, wire on the platform-native job (the listener session cap is a follow-on) | Loopback push from an assembled server and fetch with options pass on Linux, macOS, and Windows in CI (landed, pin `0a129ea`) |
 | C1 | votport | `client/core` and `client/cli`: api, identity, hash, package, transfer, send over push and HTTP, journal, e2e on loopback | `votport send` moves a 20,000-entry drop and a 4 GiB file over both paths on all three platforms; the HTTP path resumes after a kill; hash and transfer rates recorded on the two target machines |
 | C2 | votport | Receive over fetch and HTTP, publish with receipt, verify | `votport receive` publishes a grant with a verified receipt and the delivery counts on the server |
 | C3 | votport | Push resume on the receiver: staging keyed by link, package root, and holder key, kept across a disconnect and by the boot sweep, adopted by a new preflight once the old session is gone, sink factory re-proves and skips complete staged objects; the core aborts the cut session, re-preflights, and re-dials | A push killed at 90% of a 20,000-entry drop, resumed after the ticket expired and after a server restart, finishes by sending only the objects that were not complete |
