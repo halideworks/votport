@@ -34,11 +34,21 @@ resume store once a bundle is whole and a stop after that would discard a
 complete download (threading vot-cli's `CancellationHandle` through its
 options is the VOT change that makes a mid-carrier cancel possible). A
 one-second ticker re-measures the rate while nothing arrives, so a stall
-reads as a rate falling to zero. Next: the Finder drop target
-and Send, the sidebar, the menu bar item, notifications, the `votport://`
-scheme, then the Windows shell (C5) and the core follow-ons: the client
-journal with `votport status` (which also gives multi-file resume) and
-watch folders.
+reads as a rate falling to zero. The macOS app now has the four sections
+of Decision 6 (Send with the Finder drop target and clipboard paste,
+Receive, Transfers with per-transfer cancel and an expanding row, Settings
+with a default receive folder), a menu bar item listing the active
+transfers and their rates, done and failed notifications, and the
+`votport://` scheme (`votport://r/<token>?base=<origin>` and
+`votport://s/<token>?base=<origin>`; any page can emit one, so the link is
+only prefilled with its origin visible and nothing moves until the user
+presses Send or Receive). Launch-time
+work runs from the app delegate, since a locked screen never shows a
+window. `scripts/design-tokens.mjs` generates `client/design/tokens.json`
+from the web stylesheet. Next: the "Open in the app" links on the web
+pages, the Windows shell (C5), and the core follow-ons: the client journal
+with `votport status` (which also gives multi-file resume) and watch
+folders.
 
 | Field | Value |
 | --- | --- |
