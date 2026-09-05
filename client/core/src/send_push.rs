@@ -21,7 +21,7 @@ use crate::api::{Client, PushPackageAnnouncement};
 use crate::error::{Error, Result};
 use crate::identity::Device;
 use crate::package::Prepared;
-use crate::progress::{Event, Observer};
+use crate::progress::{with_progress, Event, Observer, Transport, PROGRESS_QUANTUM};
 
 /// How long the probe waits for the receiver's handshake before falling back.
 const PROBE_BUDGET: Duration = Duration::from_secs(2);
@@ -76,6 +76,9 @@ pub fn try_push(
         Probe::Mismatch => return Err(Error::Package(VotError::ServeIdentityMismatch)),
     };
 
+    if observer.cancelled() {
+        return Err(Error::Cancelled);
+    }
     // The carrier answered, so reserve a capability and commit to the push.
     let preflight = client.create_push_session(
         token,
@@ -91,8 +94,13 @@ pub fn try_push(
     observer.event(Event::SessionCreated {
         session: preflight.session.clone(),
     });
+    observer.event(Event::Transport(Transport::Push));
 
-    let result = push(device, prepared, &preflight, reachable);
+    // ponytail: after the preflight a cancel is not honoured: the receiver
+    // holds the session and the bundle lands whole. Threading vot-cli's
+    // CancellationHandle through PushOptions is the VOT change that makes a
+    // mid-push cancel possible.
+    let result = push(device, prepared, &preflight, reachable, observer);
     if result.is_err() {
         // A push that fails after the preflight leaves a reserved session and
         // staging on the receiver; abort releases them.
@@ -138,6 +146,7 @@ fn push(
     prepared: &Prepared,
     preflight: &crate::api::PushPreflight,
     reachable: SocketAddr,
+    observer: &mut dyn Observer,
 ) -> Result<()> {
     let capability = base64_decode(&preflight.capability)?;
     let holder = Arc::new(
@@ -153,18 +162,20 @@ fn push(
     let identity = decode_digest(&preflight.certificate_digest)?;
 
     let server = BundleServer::assemble(&prepared.manifest_root, prepared.served.clone())?;
-    push_from(
-        &server,
-        PushOptions {
-            address,
-            holder,
-            identity,
-            rails: PUSH_RAILS,
-            // push_from adds the PUSH extension; no FEC is offered here.
-            extensions: BTreeSet::new(),
-            progress: None,
-        },
-    )?;
+    with_progress(observer, |progress| {
+        push_from(
+            &server,
+            PushOptions {
+                address,
+                holder,
+                identity,
+                rails: PUSH_RAILS,
+                // push_from adds the PUSH extension; no FEC is offered here.
+                extensions: BTreeSet::new(),
+                progress: Some((PROGRESS_QUANTUM, progress)),
+            },
+        )
+    })?;
     Ok(())
 }
 

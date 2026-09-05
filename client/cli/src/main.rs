@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use votport_client_core::progress::{Event, Observer};
 use votport_client_core::{
-    collect, receive_with_device_or_http, split_link, Delivery, Device, Drop, Sent,
+    collect, receive_with_device_or_http, split_link, Delivery, Device, Drop, Sent, Transport,
 };
 
 fn main() -> ExitCode {
@@ -160,6 +160,14 @@ fn receive(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn transport_name(transport: Transport) -> &'static str {
+    match transport {
+        Transport::Push => "push",
+        Transport::Http => "http",
+        Transport::Fetch => "fetch",
+    }
+}
+
 struct CliObserver {
     json: bool,
 }
@@ -180,6 +188,13 @@ impl Observer for CliObserver {
                         .collect();
                     format!("{{\"event\":\"planned\",\"files\":[{}]}}", files.join(","))
                 }
+                Event::Transport(transport) => {
+                    format!("{{\"event\":\"transport\",\"via\":{:?}}}", transport_name(*transport))
+                }
+                Event::Bytes { moved, total } => match total {
+                    Some(total) => format!("{{\"event\":\"bytes\",\"moved\":{moved},\"total\":{total}}}"),
+                    None => format!("{{\"event\":\"bytes\",\"moved\":{moved}}}"),
+                },
                 Event::SessionCreated { session } => {
                     format!("{{\"event\":\"session\",\"session\":{session:?}}}")
                 }
@@ -202,6 +217,7 @@ impl Observer for CliObserver {
             return;
         }
         match event {
+            Event::Transport(_) | Event::Bytes { .. } => {}
             Event::Planned { .. } => {}
             Event::SessionCreated { .. } => {}
             Event::Chunk { .. } => {}

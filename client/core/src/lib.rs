@@ -25,5 +25,6 @@ pub use api::split_link;
 pub use error::{Error, Result};
 pub use fetch::receive_over_fetch;
 pub use identity::Device;
+pub use progress::Transport;
 pub use receive::{receive, receive_over_http, receive_with_device_or_http, Delivery, Received};
 pub use transfer::{collect, send, send_http as send_over_http, Drop, Selected, Sent};
