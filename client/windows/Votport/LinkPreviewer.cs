@@ -77,19 +77,7 @@ public sealed class LinkPreviewer
     public string? Line()
     {
         if (Checking) return "Checking the link";
-        if (Preview is not LinkPreview preview) return null;
-        if (preview.Problem is string problem) return problem;
-        var parts = new List<string>();
-        if (!string.IsNullOrEmpty(preview.Label)) parts.Add(preview.Label);
-        if (preview.Kind == LinkKind.Request && preview.MaxBytes is ulong max) parts.Add($"accepts up to {Format.Bytes(max)}");
-        if (preview.Kind == LinkKind.Delivery && preview.TotalBytes is ulong total)
-        {
-            var count = preview.Files.Length;
-            parts.Add($"{count} file{(count == 1 ? "" : "s")}, {Format.Bytes(total)}");
-        }
-        if (preview.NeedsPassword) parts.Add("password needed");
-        if (preview.Quic == true) parts.Add("QUIC offered");
-        return parts.Count == 0 ? null : string.Join(", ", parts);
+        return Preview?.Line;
     }
 
     public bool IsProblem => Preview?.Problem is not null;

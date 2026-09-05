@@ -238,6 +238,8 @@ impl votport_client_core::ffi::TransferListener for ViewPrinter {
                     "rate": view.rate_bytes_per_second,
                     "eta": view.eta_seconds,
                     "headline": view.headline,
+                    "status": view.status,
+                    "route": view.route,
                 })
             );
         } else if let Some(headline) = view.headline {

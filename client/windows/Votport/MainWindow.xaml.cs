@@ -22,6 +22,18 @@ public sealed partial class MainWindow : Window
             tray.SetTip(count == 0 ? "votport" : $"votport, {count} active");
         };
         Nav.SelectedItem = Nav.MenuItems[0];
+        // The taskbar and Alt-Tab icon; the executable's own icon does not
+        // reach an unpackaged WinUI window.
+        AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "Assets", "tray.ico"));
+        // A first window at the shell's default size fills a 4K display;
+        // Resize takes physical pixels, so the size follows the DPI.
+        var scale = GetDpiForWindow(WinRT.Interop.WindowNative.GetWindowHandle(this)) / 96.0;
+        AppWindow.Resize(new Windows.Graphics.SizeInt32((int)(900 * scale), (int)(580 * scale)));
+        if (AppWindow.Presenter is Microsoft.UI.Windowing.OverlappedPresenter sized)
+        {
+            sized.PreferredMinimumWidth = (int)(720 * scale);
+            sized.PreferredMinimumHeight = (int)(460 * scale);
+        }
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(TitleBar);
         PaintCaptionButtons();
@@ -90,4 +102,7 @@ public sealed partial class MainWindow : Window
     {
         Pages.Navigate(PageFor((string?)(args.SelectedItem as NavigationViewItem)?.Tag));
     }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern uint GetDpiForWindow(IntPtr hwnd);
 }

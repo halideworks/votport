@@ -14,7 +14,7 @@ struct SendView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("SEND")
+            Text("SHIP")
                 .font(Type.label)
                 .tracking(1.5)
                 .foregroundStyle(Tokens.muted)
@@ -41,7 +41,7 @@ struct SendView: View {
                     Button("Clear") { paths.removeAll() }
                 }
                 Spacer()
-                Button("Send") { send() }
+                Button("Ship") { send() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(!previewer.ready || paths.isEmpty)
             }
@@ -64,10 +64,13 @@ struct SendView: View {
     private var dropZone: some View {
         VStack(spacing: 8) {
             if paths.isEmpty {
-                Image(systemName: "arrow.down.doc")
+                Image(systemName: "shippingbox")
                     .font(.system(size: 28))
                     .foregroundStyle(Tokens.muted)
                 Text("Drop files or folders here")
+                    .foregroundStyle(Tokens.muted)
+                Text("They ship from where they are; nothing is copied first.")
+                    .font(Type.caption)
                     .foregroundStyle(Tokens.muted)
             } else {
                 List(paths, id: \.self) { path in

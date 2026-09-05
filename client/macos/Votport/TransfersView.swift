@@ -17,7 +17,7 @@ struct TransfersView: View {
                 .foregroundStyle(Tokens.muted)
             if store.items.isEmpty {
                 Spacer()
-                Text("Nothing yet. Send a drop or receive a delivery.")
+                Text("Nothing under way. Ship files or receive a delivery.")
                     .foregroundStyle(Tokens.muted)
                 Spacer()
             } else {
@@ -49,7 +49,7 @@ struct TransferCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Image(systemName: item.kind == .send ? "arrow.up.doc" : "arrow.down.doc")
+                Image(systemName: item.kind == .send ? "sailboat" : "arrow.down.doc")
                     .foregroundStyle(Tokens.muted)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(item.subject)
@@ -88,10 +88,15 @@ struct TransferCard: View {
                 if let total = view.totalBytes {
                     ProgressView(value: Double(view.movedBytes), total: Double(max(total, 1)))
                         .tint(view.phase == .done ? Tokens.ok : Tokens.progress)
-                } else {
+                } else if item.running {
                     ProgressView()
                 }
                 if expanded {
+                    if let route = view.route {
+                        Text(route)
+                            .font(Type.caption)
+                            .foregroundStyle(Tokens.muted)
+                    }
                     if let detail = view.detail {
                         Text(detail)
                             .font(Type.caption)
@@ -134,7 +139,7 @@ struct FileRowView: View {
             ProgressView(value: Double(file.moved), total: Double(max(file.bytes, 1)))
                 .frame(width: 120)
                 .tint(file.state == .verified ? Tokens.ok : Tokens.progress)
-            Text(Format.fileLabel(file))
+            Text(file.label)
                 .font(Type.caption.monospacedDigit())
                 .foregroundStyle(file.state == .verified ? Tokens.ok : Tokens.muted)
                 .frame(width: 150, alignment: .trailing)
@@ -142,68 +147,21 @@ struct FileRowView: View {
     }
 }
 
-/// Words and units around the core's numbers. Every value comes from the
-/// core; nothing is computed here.
+/// The core's words, joined for the places that show them. Nothing is
+/// computed or formatted here.
 enum Format {
-    static func bytes(_ value: UInt64) -> String {
-        ByteCountFormatter.string(fromByteCount: Int64(clamping: value), countStyle: .file)
-    }
-
-    static func seconds(_ value: UInt64) -> String {
-        let formatter = DateComponentsFormatter()
-        formatter.allowedUnits = value >= 3600 ? [.hour, .minute] : [.minute, .second]
-        formatter.unitsStyle = .short
-        return formatter.string(from: TimeInterval(value)) ?? "\(value) s"
-    }
-
-    static func transport(_ transport: Transport) -> String {
-        switch transport {
-        case .push: return "QUIC push"
-        case .fetch: return "QUIC fetch"
-        case .http: return "HTTP"
-        }
-    }
-
-    static func fileLabel(_ file: FileView) -> String {
-        switch file.state {
-        case .waiting: return bytes(file.bytes)
-        case .moving: return "\(bytes(file.moved)) of \(bytes(file.bytes))"
-        case .landed: return "landed"
-        case .verified: return "verified"
-        }
-    }
-
+    /// The core's status line, or the two states only the shell knows: a
+    /// journal entry not yet run, and a transfer the core has not answered.
     static func statusLine(_ item: TransferItem) -> String {
         if item.interrupted { return "Interrupted before it finished" }
-        guard let view = item.view else { return "Starting" }
-        let verb = item.kind == .send ? "Sending" : "Receiving"
-        switch view.phase {
-        case .preparing:
-            return item.kind == .send ? "Hashing" : "Preparing"
-        case .transferring:
-            var parts = [verb]
-            if let via = view.transport { parts.append("over \(transport(via))") }
-            if let total = view.totalBytes { parts.append("\(bytes(view.movedBytes)) of \(bytes(total))") }
-            if let rate = view.rateBytesPerSecond { parts.append("\(bytes(rate))/s") }
-            if let eta = view.etaSeconds { parts.append("about \(seconds(eta)) left") }
-            return parts.joined(separator: ", ")
-        case .done:
-            let count = view.files.count
-            let noun = count == 1 ? "file" : "files"
-            return item.kind == .send
-                ? "Done, \(count) \(noun) sent"
-                : "Done, \(count) \(noun) received and verified"
-        case .cancelled:
-            return "Cancelled"
-        case .failed:
-            return view.headline ?? "Failed"
-        }
+        guard let view = item.view else { return item.running ? "Starting" : "Failed" }
+        return view.status
     }
 
     static func menuLine(_ item: TransferItem) -> String {
         var line = item.subject
-        if let rate = item.view?.rateBytesPerSecond {
-            line += "  \(bytes(rate))/s"
+        if let rate = item.view?.rateText {
+            line += "  \(rate)"
         }
         return line
     }

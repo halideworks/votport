@@ -9,6 +9,8 @@
     <TargetPlatformMinVersion>10.0.19041.0</TargetPlatformMinVersion>
     <RootNamespace>Votport</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- The ship on the web's navy square, rendered by scripts/app-icon.py. -->
+    <ApplicationIcon>Assets\tray.ico</ApplicationIcon>
     <Platforms>x64</Platforms>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <UseWinUI>true</UseWinUI>

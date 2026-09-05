@@ -8,7 +8,7 @@
       <RowDefinition Height="*" />
     </Grid.RowDefinitions>
     <TextBlock Text="TRANSFERS" Style="{StaticResource SectionLabel}" />
-    <TextBlock x:Name="EmptyText" Grid.Row="1" Text="Nothing yet. Send a drop or receive a delivery."
+    <TextBlock x:Name="EmptyText" Grid.Row="1" Text="Nothing under way. Ship files or receive a delivery."
         Foreground="{ThemeResource VotMutedBrush}" VerticalAlignment="Center" HorizontalAlignment="Center" />
     <ListView x:Name="List" Grid.Row="1" SelectionMode="None" IsItemClickEnabled="True"
         ItemClick="List_ItemClick">
@@ -41,6 +41,8 @@
             </Grid>
             <ProgressBar Grid.Row="1" Value="{x:Bind Fraction, Mode=OneWay}" Maximum="100" Foreground="{ThemeResource VotProgressBrush}" />
             <StackPanel Grid.Row="2" Visibility="{x:Bind Expanded, Mode=OneWay}" Spacing="4">
+              <TextBlock Text="{x:Bind Route, Mode=OneWay}" Visibility="{x:Bind HasRoute, Mode=OneWay}" FontSize="12"
+                  Foreground="{ThemeResource VotMutedBrush}" />
               <TextBlock Text="{x:Bind Detail, Mode=OneWay}" Visibility="{x:Bind HasDetail, Mode=OneWay}" FontSize="12"
                   Foreground="{ThemeResource VotMutedBrush}" TextWrapping="Wrap" IsTextSelectionEnabled="True" />
               <ItemsControl ItemsSource="{x:Bind Files, Mode=OneWay}">

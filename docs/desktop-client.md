@@ -129,7 +129,29 @@ buttons painted to match), Settings gained "Keep running in the tray
 when the window is closed" (close hides; Quit in the tray menu ends the
 app) and "Start with Windows, minimized to the tray" (the per-user Run
 key, `--minimized` keeps the window hidden), and the Mac gained "Open at
-login" through `SMAppService`.
+login" through `SMAppService`. The first Mac on-device pass (System
+Events over ssh, with Accessibility and Screen Recording granted) showed
+the same flows the Windows pass did and found the sidebar dead to clicks:
+the rows were identified by their name string while the selection held
+the `Screen` value, so no row ever matched; the id is the value now. The
+copy a card shows now comes from the core: `TransferView.status` is the
+one line for every phase ("Checking the files", "Shipping, 120 MB of
+300 MB, 95 MB/s, about 2 s left", "Shipped and verified, 3 files",
+"Landed and verified, 3 files", the headline on a failure) and
+`TransferView.route` names the path in plain words ("Direct route
+(QUIC)", "Standard route (HTTP)"); `LinkPreview.line` is the sentence
+under a link field; `FileView.label` and `TransferView.rate_text` carry
+the file row's words and the rate for a menu line, so every number on a
+card comes from one formatter. The shells draw those strings and keep
+only the two states the core cannot know (a journal entry not yet run, a
+transfer the core never answered). The words are the web pages' (Ship,
+Shipping, Shipped and verified) and never name a hash or a root. Both
+apps carry the web's ship mark as their icon (`scripts/app-icon.py`
+renders the asset catalog, the Windows tiles, the `.ico`, and a 512 pixel
+reference under `client/design/icon` from
+`web/assets/pommern_ship_white.png` on the navy logo square) and show it
+with the name at the top of the sidebar, open at 900 by 580 points
+instead of the platform's default, and call the sender screen Ship.
 
 | Field | Value |
 | --- | --- |
