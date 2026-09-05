@@ -73,3 +73,99 @@ jobs:
             gh release create "$VERSION" --verify-tag --generate-notes --title "$VERSION" \
               --notes "Image: ${IMAGE}@${{ steps.image.outputs.digest }}"
           fi
+
+  # The shells build only on their own platforms. macOS minutes bill at ten
+  # times Linux and Windows at two, so both run on tags alone. Both artifacts
+  # are unsigned until the Developer ID and the code-signing certificate
+  # land: the steps that would sign are the ones marked below. Both need
+  # the release job, which creates the release they upload to, so a failed
+  # release never bills them.
+  macos-app:
+    needs: release
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Install Rust 1.97
+        run: rustup toolchain install 1.97 --profile minimal && rustup default 1.97
+
+      - name: Install cmake and xcodegen
+        run: brew install cmake xcodegen
+
+      - name: Build the core and the app
+        working-directory: client/macos
+        run: |
+          sh build-core.sh
+          xcodegen generate
+          # The XCFramework holds one arm64 slice; a Release build would
+          # otherwise also ask for x86_64 and find no library for it.
+          xcodebuild -project Votport.xcodeproj -scheme Votport -configuration Release \
+            -derivedDataPath build ARCHS=arm64 CODE_SIGN_IDENTITY=- build
+
+      # Developer ID signing and notarization go here once the identity is
+      # in the repository secrets: codesign --deep --options runtime, then
+      # notarytool submit --wait and stapler staple.
+      - name: Make the disk image
+        working-directory: client/macos
+        run: |
+          mkdir -p dist/Votport
+          cp -R build/Build/Products/Release/Votport.app dist/Votport/
+          ln -s /Applications dist/Votport/Applications
+          hdiutil create -volname Votport -srcfolder dist/Votport -ov -format UDZO "dist/votport-${VERSION}-macos-arm64.dmg"
+
+      - name: Upload the disk image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: client/macos
+        run: gh release upload "$VERSION" "dist/votport-${VERSION}-macos-arm64.dmg" --clobber
+
+  windows-app:
+    needs: release
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Install Rust 1.97
+        run: rustup toolchain install 1.97 --profile minimal && rustup default 1.97
+
+      - name: Install nasm and the C# bindgen
+        run: |
+          choco install nasm --no-progress -y
+          cargo install uniffi-bindgen-cs --git https://github.com/NordSecurity/uniffi-bindgen-cs --tag v0.11.0+v0.31.0 --locked
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build the core and the package
+        working-directory: client/windows
+        shell: pwsh
+        env:
+          LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
+        run: |
+          $env:PATH = "C:\Program Files\NASM;" + $env:PATH
+          .\build-core.ps1
+          dotnet build Votport\Votport.csproj -c Release -p:Platform=x64 -p:WindowsPackageType=MSIX -p:GenerateAppxPackageOnBuild=true
+          $msix = Get-ChildItem -Recurse -Filter "Votport_*.msix" | Where-Object { $_.FullName -notmatch "Dependencies" } | Select-Object -First 1
+          Copy-Item $msix.FullName "votport-$env:VERSION-windows-x64.msix"
+
+      # signtool with the code-signing certificate goes here once it is in
+      # the repository secrets.
+      - name: Upload the package
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: client/windows
+        shell: bash
+        run: gh release upload "$VERSION" "votport-${VERSION}-windows-x64.msix" --clobber
