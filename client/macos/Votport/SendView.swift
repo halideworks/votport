@@ -40,7 +40,7 @@ struct SendView: View {
                     .foregroundStyle(PreviewLine.isProblem(previewer) ? Tokens.danger : Tokens.muted)
             }
             if previewer.needsPassword {
-                SecureField("Password", text: $password)
+                PasswordField("Password", text: $password)
                     .textFieldStyle(.roundedBorder)
             }
 

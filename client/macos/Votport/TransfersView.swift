@@ -66,7 +66,7 @@ struct TransferCard: View {
                 } else {
                     if item.canResume {
                         if item.needsPassword {
-                            SecureField("Password", text: $password)
+                            PasswordField("Password", text: $password)
                                 .textFieldStyle(.roundedBorder)
                                 .frame(width: 160)
                         }

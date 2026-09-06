@@ -1,10 +1,12 @@
 import SwiftUI
 import VotportCore
 
-/// Deliver from the port's library: browse a directory, tick files, issue
-/// the delivery, copy the one link the server shows for it.
+/// A new delivery from the port's library, as a sheet over Links: browse a
+/// directory, tick files, issue the delivery, copy the one link the server
+/// shows for it.
 struct DeliverView: View {
     @EnvironmentObject private var port: PortStore
+    @Environment(\.dismiss) private var dismiss
     @State private var directory = ""
     @State private var listing: Library?
     @State private var chosen: Set<String> = []
@@ -16,10 +18,15 @@ struct DeliverView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("DELIVER")
-                .font(Type.label)
-                .tracking(1.5)
-                .foregroundStyle(Tokens.muted)
+            HStack {
+                Text("NEW DELIVERY")
+                    .font(Type.label)
+                    .tracking(1.5)
+                    .foregroundStyle(Tokens.muted)
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
 
             crumbs
             browser
@@ -98,15 +105,17 @@ struct DeliverView: View {
             HStack {
                 TextField("Label, e.g. Final grade for Alex", text: $label)
                     .textFieldStyle(.roundedBorder)
-                SecureField("Password (optional)", text: $password)
+                PasswordField("Password (optional)", text: $password)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 160)
             }
             HStack {
                 TextField("Expires after (days)", text: $expiresDays)
+                    .numeric($expiresDays)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 160)
                 TextField("Downloads allowed", text: $maxDownloads)
+                    .numeric($maxDownloads)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 160)
                 Spacer()
@@ -124,7 +133,7 @@ struct DeliverView: View {
                         .textSelection(.enabled)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Button("Copy") { copy(issued.url) }
+                    CopyButton(text: issued.url)
                 }
                 .foregroundStyle(Tokens.ok)
                 Text("This is the only time the link is shown; the recipient pastes it into Receive.")

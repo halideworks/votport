@@ -18,7 +18,7 @@
           FontFamily="{StaticResource VotSansFont}" Foreground="{ThemeResource VotMutedBrush}" />
     </Grid>
     <NavigationView x:Name="Nav" Grid.Row="1" PaneDisplayMode="Left" IsBackButtonVisible="Collapsed"
-        IsSettingsVisible="False" OpenPaneLength="180" SelectionChanged="Nav_SelectionChanged"
+        IsSettingsVisible="False" OpenPaneLength="180" SelectionChanged="Nav_SelectionChanged" ItemInvoked="Nav_ItemInvoked"
         Background="{ThemeResource VotBgBrush}" FontFamily="{StaticResource VotSansFont}">
       <NavigationView.PaneHeader>
         <!-- The web masthead's mark: the ship on its square, the name. -->
@@ -31,7 +31,6 @@
         <NavigationViewItem Content="Ship" Tag="send" Icon="Send" />
         <NavigationViewItem Content="Receive" Tag="receive" Icon="Download" />
         <!-- Signed in to a port only. -->
-        <NavigationViewItem x:Name="DeliverItem" Content="Deliver" Tag="deliver" Icon="Library" Visibility="Collapsed" />
         <NavigationViewItem x:Name="LinksItem" Content="Links" Tag="links" Icon="Link" Visibility="Collapsed" />
         <NavigationViewItem Content="Transfers" Tag="transfers" Icon="List">
           <NavigationViewItem.InfoBadge>
