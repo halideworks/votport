@@ -134,7 +134,7 @@ struct HomePortSection: View {
                 HStack {
                     TextField("https://drop.example", text: $base)
                         .textFieldStyle(.roundedBorder)
-                    SecureField("Admin password", text: $password)
+                    PasswordField("Admin password", text: $password)
                         .textFieldStyle(.roundedBorder)
                         .frame(width: 180)
                     Button("Sign in") {
@@ -215,7 +215,7 @@ struct WatchFoldersSection: View {
                     .frame(width: 100)
                 }
                 if previewer.needsPassword {
-                    SecureField("Password", text: $password)
+                    PasswordField("Password", text: $password)
                         .textFieldStyle(.roundedBorder)
                         .frame(width: 140)
                 }

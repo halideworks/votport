@@ -27,8 +27,9 @@ public sealed class LibraryEntry : INotifyPropertyChanged
     public Action? ChosenChanged { get; set; }
 }
 
-/// Deliver from the port's library: browse a directory, tick files, issue
-/// the delivery, copy the one link the server shows for it.
+/// A new delivery from the port's library, reached from Links: browse a
+/// directory, tick files, issue the delivery, copy the one link the server
+/// shows for it.
 public sealed partial class DeliverPage : Page
 {
     private readonly ObservableCollection<LibraryEntry> entries = new();
@@ -138,6 +139,14 @@ public sealed partial class DeliverPage : Page
 
     private void CopyIssued_Click(object sender, RoutedEventArgs e)
     {
-        if (issued is not null) LinksPage.Copy(issued);
+        if (issued is not null) LinksPage.Copy(issued, sender as Button);
+    }
+
+    // XAML handlers must live on the page; the rule itself is shared.
+    private void Digits(TextBox sender, TextBoxBeforeTextChangingEventArgs args) => Numeric.Digits(sender, args);
+
+    private void Back_Click(object sender, RoutedEventArgs e)
+    {
+        if (Frame.CanGoBack) Frame.GoBack(); else Frame.Navigate(typeof(LinksPage));
     }
 }

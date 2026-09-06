@@ -30,12 +30,11 @@ struct VotportApp: App {
     }
 }
 
-/// The sections; the transfer list is the rest of the app. Links and
-/// Deliver appear once the operator is signed in to a port.
+/// The sections; the transfer list is the rest of the app. Links appears
+/// once the operator is signed in to a port.
 enum Screen: String, CaseIterable, Identifiable {
     case send = "Ship"
     case receive = "Receive"
-    case deliver = "Deliver"
     case links = "Links"
     case transfers = "Transfers"
     case settings = "Settings"
@@ -49,7 +48,6 @@ enum Screen: String, CaseIterable, Identifiable {
         switch self {
         case .send: return "sailboat"
         case .receive: return "arrow.down.doc"
-        case .deliver: return "shippingbox"
         case .links: return "link"
         case .transfers: return "list.bullet.rectangle"
         case .settings: return "gearshape"
@@ -58,7 +56,7 @@ enum Screen: String, CaseIterable, Identifiable {
 
     /// Whether the screen needs a signed-in port.
     var operator_: Bool {
-        self == .deliver || self == .links
+        self == .links
     }
 }
 
@@ -100,12 +98,13 @@ struct MainWindow: View {
                         .padding(.bottom, 10)
                 }
             }
-            .navigationSplitViewColumnWidth(min: 160, ideal: 180)
+            // With no max the sidebar animates to its ideal width, then snaps
+            // to the last dragged width at the end: the "catch" on expand.
+            .navigationSplitViewColumnWidth(min: 160, ideal: 180, max: 240)
         } detail: {
             switch section ?? .send {
             case .send: SendView()
             case .receive: ReceiveView()
-            case .deliver: DeliverView()
             case .links: LinksView()
             case .transfers: TransfersView()
             case .settings: SettingsView()

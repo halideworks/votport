@@ -19,10 +19,9 @@ public sealed partial class MainWindow : Window
         PortStore.Shared.Changed += () =>
         {
             var signedIn = PortStore.Shared.SignedIn;
-            DeliverItem.Visibility = signedIn ? Visibility.Visible : Visibility.Collapsed;
             LinksItem.Visibility = signedIn ? Visibility.Visible : Visibility.Collapsed;
-            // Signing out while on an operator page lands on Settings.
-            if (!signedIn && Nav.SelectedItem is NavigationViewItem current && ((string)current.Tag is "deliver" or "links")) Show("settings");
+            // Signing out while on Links (or its Deliver page) lands on Settings.
+            if (!signedIn && Nav.SelectedItem is NavigationViewItem current && (string)current.Tag == "links") Show("settings");
         };
         TransferStore.Shared.ActiveChanged += count =>
         {
@@ -126,16 +125,30 @@ public sealed partial class MainWindow : Window
     private static Type PageFor(string? tag) => tag switch
     {
         "receive" => typeof(ReceivePage),
-        "deliver" => typeof(DeliverPage),
         "links" => typeof(LinksPage),
         "transfers" => typeof(TransfersPage),
         "settings" => typeof(SettingsPage),
         _ => typeof(SendPage),
     };
 
+    // A click raises ItemInvoked (with SelectedItem already updated) and
+    // then, for a new item, SelectionChanged; both navigate only when the
+    // frame shows a different page, so a click lands one page. A click on
+    // the selected item raises ItemInvoked alone, which is what brings
+    // Links back over its Deliver page.
     private void Nav_SelectionChanged(NavigationView sender, NavigationViewSelectionChangedEventArgs args)
     {
-        Pages.Navigate(PageFor((string?)(args.SelectedItem as NavigationViewItem)?.Tag));
+        ShowIfDifferent(PageFor((string?)(args.SelectedItem as NavigationViewItem)?.Tag));
+    }
+
+    private void Nav_ItemInvoked(NavigationView sender, NavigationViewItemInvokedEventArgs args)
+    {
+        ShowIfDifferent(PageFor((string?)args.InvokedItemContainer?.Tag));
+    }
+
+    private void ShowIfDifferent(Type page)
+    {
+        if (Pages.Content?.GetType() != page) Pages.Navigate(page);
     }
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]

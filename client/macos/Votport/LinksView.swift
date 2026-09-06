@@ -3,9 +3,11 @@ import SwiftUI
 import VotportCore
 
 /// The port's links: the request links senders ship to, and the deliveries
-/// recipients pull. Issue a request here; close or revoke what is done.
+/// recipients pull. Issue a request or open the library sheet for a new
+/// delivery at the top; close or revoke what is done below.
 struct LinksView: View {
     @EnvironmentObject private var port: PortStore
+    @State private var newDelivery = false
     @State private var label = ""
     @State private var password = ""
     @State private var expiresDays = ""
@@ -33,24 +35,37 @@ struct LinksView: View {
             .padding(20)
         }
         .onAppear { port.refresh() }
+        .sheet(isPresented: $newDelivery) {
+            // Shorter than the 580 pt window, so the issued link at the
+            // bottom of the sheet is never off screen.
+            DeliverView()
+                .environmentObject(port)
+                .frame(width: 660, height: 480)
+        }
     }
 
     private var issueForm: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Issue a request link")
-                .font(Type.sans(13, .semibold, relativeTo: .body))
+            HStack {
+                Text("Issue a request link")
+                    .font(Type.sans(13, .semibold, relativeTo: .body))
+                Spacer()
+                Button("New delivery") { newDelivery = true }
+            }
             HStack {
                 TextField("Label, e.g. Dailies from Alex", text: $label)
                     .textFieldStyle(.roundedBorder)
-                SecureField("Password (optional)", text: $password)
+                PasswordField("Password (optional)", text: $password)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 160)
             }
             HStack {
                 TextField("Closes after (days)", text: $expiresDays)
+                    .numeric($expiresDays)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 160)
                 TextField("Accepts up to (GB)", text: $maxGigabytes)
+                    .numeric($maxGigabytes, decimal: true)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 160)
                 Spacer()
@@ -65,7 +80,7 @@ struct LinksView: View {
                         .textSelection(.enabled)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Button("Copy") { copy(issued.url) }
+                    CopyButton(text: issued.url)
                 }
                 .foregroundStyle(Tokens.ok)
             }
@@ -129,6 +144,40 @@ func copy(_ text: String) {
     NSPasteboard.general.setString(text, forType: .string)
 }
 
+extension View {
+    /// Keeps a field to digits (and one point when `decimal`): an entry
+    /// with anything else is refused whole, as a typed key or a paste, so
+    /// "1,5" never turns into 15.
+    func numeric(_ text: Binding<String>, decimal: Bool = false) -> some View {
+        onChange(of: text.wrappedValue) { old, value in
+            let digitsOnly = value.allSatisfy { ($0.isASCII && $0.isNumber) || (decimal && $0 == ".") }
+            let points = value.filter { $0 == "." }.count
+            if !digitsOnly || points > 1 { text.wrappedValue = old }
+        }
+    }
+}
+
+/// Copies its text and says so on the button for a moment.
+struct CopyButton: View {
+    let text: String
+    @State private var copied = false
+
+    var body: some View {
+        Button(copied ? "Copied" : "Copy") {
+            copy(text)
+            // A second click inside the two seconds copies again and
+            // leaves the first task to restore the label.
+            guard !copied else { return }
+            copied = true
+            Task {
+                try? await Task.sleep(for: .seconds(2))
+                copied = false
+            }
+        }
+        .frame(minWidth: 64)
+    }
+}
+
 struct RequestRow: View {
     let link: RequestLink
     let close: () -> Void
@@ -147,7 +196,7 @@ struct RequestRow: View {
                     .foregroundStyle(link.receiving > 0 ? Tokens.progress : Tokens.muted)
             }
             Spacer()
-            Button("Copy") { copy(link.url) }
+            CopyButton(text: link.url)
             Button("Close") { close() }
         }
         .padding(12)

@@ -201,17 +201,19 @@ from a terminal. The core also gained Pause: `Transfer::pause` stops a
 transfer like cancel but keeps the journal entry, the view ends in a
 `Paused` phase ("Paused, 120 MB of 300 MB"), and Resume picks it up from
 the partial. Both shells now draw all of it. Settings gained "Home port"
-(the origin and the admin password; signed in, the sidebar gains Deliver
-and Links and Ship offers the port's open request links behind a "Ship
-to" menu) and "Watch folders" (a folder, a request link previewed like
-any other, the password when the link needs one; the scan starts with
-the app and runs while the window is closed to the tray or menu bar).
+(the origin and the admin password; signed in, the sidebar gains Links
+and Ship offers the port's open request links behind a "Ship to" menu)
+and "Watch folders" (a folder, a request link previewed like any other,
+the password when the link needs one; the scan starts with the app and
+runs while the window is closed to the tray or menu bar).
 Links lists the open request links with their URLs, drop counts, and
 senders shipping now, issues one (label, optional password, expiry, cap;
 the link is copied as it is issued) and closes one, and lists the
-deliveries with their download counts and revokes one. Deliver browses
-the library one directory at a time, ticks files, and issues a delivery
-whose link is shown once and copied. Every failure line is the core's
+deliveries with their download counts and revokes one. "New delivery"
+on Links opens the library (a sheet on the Mac, a page with a Links
+crumb on Windows), browses it one directory at a time, ticks files, and
+issues a delivery whose link is shown once and copied. Copy buttons say
+"Copied" for a moment. Every failure line is the core's
 headline: operator calls return a `PortError` record (headline, detail,
 and whether the session ended, which folds the operator screens), and
 the core adds `RequestLink.summary`, `Delivery.summary`, and
