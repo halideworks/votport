@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 /// the clipboard, a request link, and one primary action.
 struct SendView: View {
     @EnvironmentObject private var store: TransferStore
+    @EnvironmentObject private var port: PortStore
     @StateObject private var previewer = LinkPreviewer(expect: .request)
     @State private var link = ""
     @State private var password = ""
@@ -19,9 +20,20 @@ struct SendView: View {
                 .tracking(1.5)
                 .foregroundStyle(Tokens.muted)
 
-            TextField("Request link", text: $link)
-                .textFieldStyle(.roundedBorder)
-                .onChange(of: link) { _, value in previewer.update(value) }
+            HStack {
+                TextField("Request link", text: $link)
+                    .textFieldStyle(.roundedBorder)
+                    .onChange(of: link) { _, value in previewer.update(value) }
+                // Signed in to a port: its open request links, one click.
+                if !port.requests.isEmpty {
+                    Menu("Ship to") {
+                        ForEach(port.requests) { request in
+                            Button(request.label) { link = request.url }
+                        }
+                    }
+                    .frame(width: 110)
+                }
+            }
             if let line = PreviewLine.text(previewer) {
                 Text(line)
                     .font(Type.callout)

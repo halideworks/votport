@@ -1,0 +1,70 @@
+<Window x:Class="Votport.TrayPanel"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:Votport"
+    Title="votport">
+  <Window.SystemBackdrop>
+    <MicaBackdrop />
+  </Window.SystemBackdrop>
+  <!-- No FontFamily on the Grid: the XAML compiler fails silently on it. -->
+  <Grid Background="{ThemeResource VotBgBrush}" Padding="14" RowSpacing="10">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="*" />
+      <RowDefinition Height="Auto" />
+    </Grid.RowDefinitions>
+    <Grid ColumnSpacing="8">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="Auto" />
+        <ColumnDefinition Width="*" />
+        <ColumnDefinition Width="Auto" />
+      </Grid.ColumnDefinitions>
+      <Image Source="ms-appx:///Assets/Square44x44Logo.png" Width="22" Height="22" />
+      <TextBlock Grid.Column="1" Text="votport" FontWeight="SemiBold" VerticalAlignment="Center" FontFamily="{StaticResource VotSansFont}" />
+      <TextBlock x:Name="Headline" Grid.Column="2" FontSize="12" Foreground="{ThemeResource VotMutedBrush}" VerticalAlignment="Center" FontFamily="{StaticResource VotSansFont}" />
+    </Grid>
+    <TextBlock x:Name="EmptyText" Grid.Row="1" Text="Nothing under way. Ship files or receive a delivery from the window."
+        FontSize="12" Foreground="{ThemeResource VotMutedBrush}" TextWrapping="Wrap" Margin="0,6" FontFamily="{StaticResource VotSansFont}" />
+    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+    <ItemsControl x:Name="List" FontFamily="{StaticResource VotSansFont}">
+      <ItemsControl.ItemTemplate>
+        <DataTemplate x:DataType="local:TransferItem">
+          <Grid Padding="10" Margin="0,0,0,8" Background="{ThemeResource VotPanelBrush}" CornerRadius="8" RowSpacing="6">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto" />
+              <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <Grid ColumnSpacing="8">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+              </Grid.ColumnDefinitions>
+              <FontIcon Glyph="{x:Bind Icon}" FontSize="14" Foreground="{ThemeResource VotMutedBrush}" VerticalAlignment="Top" />
+              <StackPanel Grid.Column="1" Spacing="2">
+                <TextBlock Text="{x:Bind Subject}" TextTrimming="CharacterEllipsis" />
+                <TextBlock Text="{x:Bind Status, Mode=OneWay}" FontSize="12" Foreground="{ThemeResource VotMutedBrush}" TextWrapping="Wrap" />
+              </StackPanel>
+              <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6">
+                <Button Content="Pause" FontSize="12" Padding="8,3" Visibility="{x:Bind Running, Mode=OneWay}" Click="Pause_Click" />
+                <Button Content="Cancel" FontSize="12" Padding="8,3" Visibility="{x:Bind Running, Mode=OneWay}" Click="Cancel_Click" />
+                <Button Content="{x:Bind ResumeLabel, Mode=OneWay}" FontSize="12" Padding="8,3" Visibility="{x:Bind CanResumeNow, Mode=OneWay}" Click="Resume_Click" />
+              </StackPanel>
+            </Grid>
+            <ProgressBar Grid.Row="1" Value="{x:Bind Fraction, Mode=OneWay}" Maximum="100" Foreground="{ThemeResource VotProgressBrush}"
+                Visibility="{x:Bind HasTotal, Mode=OneWay}" />
+          </Grid>
+        </DataTemplate>
+      </ItemsControl.ItemTemplate>
+    </ItemsControl>
+    </ScrollViewer>
+    <Grid Grid.Row="2" ColumnSpacing="8">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="*" />
+        <ColumnDefinition Width="Auto" />
+      </Grid.ColumnDefinitions>
+      <HyperlinkButton Content="Open votport" Click="Open_Click" Padding="0" FontFamily="{StaticResource VotSansFont}" />
+      <HyperlinkButton Grid.Column="1" Content="Quit" Click="Quit_Click" Padding="0" FontFamily="{StaticResource VotSansFont}" />
+    </Grid>
+  </Grid>
+</Window>

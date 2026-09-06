@@ -4,8 +4,8 @@ using Microsoft.UI.Dispatching;
 namespace Votport;
 
 /// The tray icon, through the shell's own notification area API on a hidden
-/// message window: a left click opens the app, a right click shows the
-/// active transfers with their rates, Open, and Quit.
+/// message window: a left click opens the panel with what is under way, a
+/// right click shows the active transfers with their rates, Open, and Quit.
 public sealed class Tray : IDisposable
 {
     private const uint WmApp = 0x8000;
@@ -23,13 +23,15 @@ public sealed class Tray : IDisposable
     private readonly IntPtr window;
     private readonly IntPtr icon;
     private readonly Action open;
+    private readonly Action panel;
     private readonly Action quit;
     private readonly Func<IReadOnlyList<string>> statusLines;
     private bool disposed;
 
-    public Tray(string iconPath, Action open, Action quit, Func<IReadOnlyList<string>> statusLines)
+    public Tray(string iconPath, Action open, Action panel, Action quit, Func<IReadOnlyList<string>> statusLines)
     {
         this.open = open;
+        this.panel = panel;
         this.quit = quit;
         this.statusLines = statusLines;
         procedure = Procedure;
@@ -72,7 +74,7 @@ public sealed class Tray : IDisposable
         if (message == WmTray)
         {
             var mouse = (uint)(lParam.ToInt64() & 0xffff);
-            if (mouse == WmLButtonUp) open();
+            if (mouse == WmLButtonUp) panel();
             else if (mouse == WmRButtonUp) ShowMenu();
             return IntPtr.Zero;
         }

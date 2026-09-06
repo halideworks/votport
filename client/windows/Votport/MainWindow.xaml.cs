@@ -13,8 +13,17 @@ public sealed partial class MainWindow : Window
         tray = new Tray(
             Path.Combine(AppContext.BaseDirectory, "Assets", "tray.ico"),
             open: () => DispatcherQueue.TryEnqueue(Raise),
-            quit: () => DispatcherQueue.TryEnqueue(() => { tray!.Dispose(); Application.Current.Exit(); }),
+            panel: () => DispatcherQueue.TryEnqueue(ShowPanel),
+            quit: () => DispatcherQueue.TryEnqueue(App.Quit),
             statusLines: () => TransferStore.Shared.Items.Where(item => item.Running).Select(Format.MenuLine).ToList());
+        PortStore.Shared.Changed += () =>
+        {
+            var signedIn = PortStore.Shared.SignedIn;
+            DeliverItem.Visibility = signedIn ? Visibility.Visible : Visibility.Collapsed;
+            LinksItem.Visibility = signedIn ? Visibility.Visible : Visibility.Collapsed;
+            // Signing out while on an operator page lands on Settings.
+            if (!signedIn && Nav.SelectedItem is NavigationViewItem current && ((string)current.Tag is "deliver" or "links")) Show("settings");
+        };
         TransferStore.Shared.ActiveChanged += count =>
         {
             ActiveBadge.Value = count;
@@ -46,7 +55,22 @@ public sealed partial class MainWindow : Window
             args.Cancel = true;
             AppWindow.Hide();
         };
-        Closed += (_, _) => tray.Dispose();
+        // The panel is a real window: left open, it would keep the process
+        // alive with no icon and no way back.
+        Closed += (_, _) => QuitFromTray();
+        // Built once the window is up, so the first tray click shows it at
+        // once instead of paying for the XAML load then.
+        DispatcherQueue.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, () => panel ??= new TrayPanel());
+    }
+
+    /// Ends the app from the tray or the panel: the icon goes first, so no
+    /// stale icon lingers in the notification area.
+    public void QuitFromTray()
+    {
+        tray.Dispose();
+        var open = panel;
+        panel = null;
+        open?.Close();
     }
 
     /// The system caption buttons sit on the app's own title bar, so they
@@ -90,9 +114,20 @@ public sealed partial class MainWindow : Window
         else Nav.SelectedItem = target;
     }
 
+    private TrayPanel? panel;
+
+    /// The tray panel, made on first use and shown above the tray.
+    private void ShowPanel()
+    {
+        panel ??= new TrayPanel();
+        panel.ToggleNearTray();
+    }
+
     private static Type PageFor(string? tag) => tag switch
     {
         "receive" => typeof(ReceivePage),
+        "deliver" => typeof(DeliverPage),
+        "links" => typeof(LinksPage),
         "transfers" => typeof(TransfersPage),
         "settings" => typeof(SettingsPage),
         _ => typeof(SendPage),

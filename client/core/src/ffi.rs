@@ -484,8 +484,8 @@ pub fn port() -> Option<port::Port> {
 /// A base that is not an origin, a wrong password, too many tries, or an
 /// unreachable server.
 #[uniffi::export]
-pub fn sign_in(base: String, password: String) -> std::result::Result<port::Port, Error> {
-    port::sign_in(&base, &password)
+pub fn sign_in(base: String, password: String) -> std::result::Result<port::Port, port::PortError> {
+    port::sign_in(&base, &password).map_err(port::PortError::from)
 }
 
 /// Asks the server whether the stored session still holds; a session it no
@@ -496,8 +496,8 @@ pub fn sign_in(base: String, password: String) -> std::result::Result<port::Port
 /// # Errors
 /// An unreachable server.
 #[uniffi::export]
-pub fn check_port() -> std::result::Result<Option<port::Port>, Error> {
-    port::check()
+pub fn check_port() -> std::result::Result<Option<port::Port>, port::PortError> {
+    port::check().map_err(port::PortError::from)
 }
 
 /// Ends the session and forgets it.
@@ -511,8 +511,8 @@ pub fn sign_out() {
 /// # Errors
 /// Not signed in, or an unreachable server.
 #[uniffi::export]
-pub fn requests() -> std::result::Result<Vec<port::RequestLink>, Error> {
-    port::requests()
+pub fn requests() -> std::result::Result<Vec<port::RequestLink>, port::PortError> {
+    port::requests().map_err(port::PortError::from)
 }
 
 /// Issues a request link on the port.
@@ -520,8 +520,10 @@ pub fn requests() -> std::result::Result<Vec<port::RequestLink>, Error> {
 /// # Errors
 /// Not signed in, a refused spec, or an unreachable server.
 #[uniffi::export]
-pub fn issue_request(spec: port::RequestSpec) -> std::result::Result<port::RequestLink, Error> {
-    port::issue_request(spec)
+pub fn issue_request(
+    spec: port::RequestSpec,
+) -> std::result::Result<port::RequestLink, port::PortError> {
+    port::issue_request(spec).map_err(port::PortError::from)
 }
 
 /// Closes a request link.
@@ -529,8 +531,8 @@ pub fn issue_request(spec: port::RequestSpec) -> std::result::Result<port::Reque
 /// # Errors
 /// Not signed in, or an unreachable server.
 #[uniffi::export]
-pub fn close_request(id: String) -> std::result::Result<(), Error> {
-    port::close_request(&id)
+pub fn close_request(id: String) -> std::result::Result<(), port::PortError> {
+    port::close_request(&id).map_err(port::PortError::from)
 }
 
 /// The port's deliveries.
@@ -538,8 +540,8 @@ pub fn close_request(id: String) -> std::result::Result<(), Error> {
 /// # Errors
 /// Not signed in, or an unreachable server.
 #[uniffi::export]
-pub fn deliveries() -> std::result::Result<Vec<port::Delivery>, Error> {
-    port::deliveries()
+pub fn deliveries() -> std::result::Result<Vec<port::Delivery>, port::PortError> {
+    port::deliveries().map_err(port::PortError::from)
 }
 
 /// Revokes a delivery.
@@ -547,8 +549,8 @@ pub fn deliveries() -> std::result::Result<Vec<port::Delivery>, Error> {
 /// # Errors
 /// Not signed in, or an unreachable server.
 #[uniffi::export]
-pub fn revoke_delivery(id: String) -> std::result::Result<(), Error> {
-    port::revoke_delivery(&id)
+pub fn revoke_delivery(id: String) -> std::result::Result<(), port::PortError> {
+    port::revoke_delivery(&id).map_err(port::PortError::from)
 }
 
 /// One directory of the port's library (`""` for the root).
@@ -556,8 +558,8 @@ pub fn revoke_delivery(id: String) -> std::result::Result<(), Error> {
 /// # Errors
 /// Not signed in, a refused directory, or an unreachable server.
 #[uniffi::export]
-pub fn library(directory: String) -> std::result::Result<port::Library, Error> {
-    port::library(&directory)
+pub fn library(directory: String) -> std::result::Result<port::Library, port::PortError> {
+    port::library(&directory).map_err(port::PortError::from)
 }
 
 /// Issues a delivery of library files; the reply carries the one link the
@@ -568,8 +570,8 @@ pub fn library(directory: String) -> std::result::Result<port::Library, Error> {
 #[uniffi::export]
 pub fn issue_delivery(
     spec: port::DeliverySpec,
-) -> std::result::Result<port::IssuedDelivery, Error> {
-    port::issue_delivery(spec)
+) -> std::result::Result<port::IssuedDelivery, port::PortError> {
+    port::issue_delivery(spec).map_err(port::PortError::from)
 }
 
 /// The watched folders.
@@ -581,14 +583,15 @@ pub fn watches() -> Vec<watch::Watch> {
 /// Watches `dir`: its settled drops ship to the request `link`.
 ///
 /// # Errors
-/// A `dir` that is not a folder, or a link that is not a request link.
+/// A `dir` that is not a folder, or a link that is not a request link,
+/// as a [`port::PortError`] so a settings screen shows the headline.
 #[uniffi::export]
 pub fn add_watch(
     dir: String,
     link: String,
     password: Option<String>,
-) -> std::result::Result<watch::Watch, Error> {
-    watch::add_watch(&dir, &link, password)
+) -> std::result::Result<watch::Watch, port::PortError> {
+    watch::add_watch(&dir, &link, password).map_err(port::PortError::from)
 }
 
 /// Stops watching; nothing in the folder changes.
@@ -596,8 +599,8 @@ pub fn add_watch(
 /// # Errors
 /// A write failure.
 #[uniffi::export]
-pub fn remove_watch(id: String) -> std::result::Result<(), Error> {
-    watch::remove_watch(&id)
+pub fn remove_watch(id: String) -> std::result::Result<(), port::PortError> {
+    watch::remove_watch(&id).map_err(port::PortError::from)
 }
 
 /// What a watch ship did.

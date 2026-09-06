@@ -8,28 +8,35 @@ private let launchLog = Logger(subsystem: "com.halideworks.votport", category: "
 struct VotportApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var store = TransferStore.shared
+    @StateObject private var port = PortStore.shared
 
     var body: some Scene {
         WindowGroup(id: "main") {
             MainWindow()
                 .environmentObject(store)
+                .environmentObject(port)
                 .frame(minWidth: 720, minHeight: 460)
         }
         .defaultSize(width: 900, height: 580)
+        // A window-style extra draws a real panel: progress, the status
+        // lines, and the controls, not a menu of grey text.
         MenuBarExtra {
-            MenuBarContent()
+            MenuPanel()
                 .environmentObject(store)
         } label: {
-            Image(systemName: store.active.isEmpty ? "arrow.up.arrow.down.circle" : "arrow.up.arrow.down.circle.fill")
+            Image(systemName: store.active.isEmpty ? "sailboat" : "sailboat.fill")
         }
+        .menuBarExtraStyle(.window)
     }
 }
 
-/// The four sections the design names; the transfer list is the rest of the
-/// app.
+/// The sections; the transfer list is the rest of the app. Links and
+/// Deliver appear once the operator is signed in to a port.
 enum Screen: String, CaseIterable, Identifiable {
     case send = "Ship"
     case receive = "Receive"
+    case deliver = "Deliver"
+    case links = "Links"
     case transfers = "Transfers"
     case settings = "Settings"
 
@@ -42,16 +49,28 @@ enum Screen: String, CaseIterable, Identifiable {
         switch self {
         case .send: return "sailboat"
         case .receive: return "arrow.down.doc"
+        case .deliver: return "shippingbox"
+        case .links: return "link"
         case .transfers: return "list.bullet.rectangle"
         case .settings: return "gearshape"
         }
+    }
+
+    /// Whether the screen needs a signed-in port.
+    var operator_: Bool {
+        self == .deliver || self == .links
     }
 }
 
 struct MainWindow: View {
     @EnvironmentObject private var store: TransferStore
+    @EnvironmentObject private var port: PortStore
     @State private var section: Screen? = .send
     @State private var urlChoseSection = false
+
+    private var screens: [Screen] {
+        Screen.allCases.filter { port.signedIn || !$0.operator_ }
+    }
 
     var body: some View {
         NavigationSplitView {
@@ -67,9 +86,18 @@ struct MainWindow: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 6)
                 .padding(.bottom, 10)
-                List(Screen.allCases, selection: $section) { section in
+                List(screens, selection: $section) { section in
                     Label(section.rawValue, systemImage: section.symbol)
                         .badge(section == .transfers ? store.active.count : 0)
+                }
+                if let signed = port.port {
+                    Text(signed.base.replacingOccurrences(of: "https://", with: ""))
+                        .font(Type.caption)
+                        .foregroundStyle(Tokens.muted)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 10)
                 }
             }
             .navigationSplitViewColumnWidth(min: 160, ideal: 180)
@@ -77,6 +105,8 @@ struct MainWindow: View {
             switch section ?? .send {
             case .send: SendView()
             case .receive: ReceiveView()
+            case .deliver: DeliverView()
+            case .links: LinksView()
             case .transfers: TransfersView()
             case .settings: SettingsView()
             }
@@ -94,6 +124,13 @@ struct MainWindow: View {
         // unless a votport:// link already chose a screen this launch.
         .onChange(of: store.items.contains(where: \.interrupted)) { _, interrupted in
             if interrupted && !urlChoseSection { section = .transfers }
+        }
+        // Signing out while on an operator screen lands on Settings.
+        .onChange(of: port.signedIn) { _, signedIn in
+            // The list loses its operator rows in the same update, which can
+            // clear the selection before this runs; either way land on
+            // Settings.
+            if !signedIn && (section == nil || section?.operator_ == true) { section = .settings }
         }
         .onOpenURL { url in
             // votport://r/<token>?base=<origin> opens Send with the request
@@ -115,31 +152,6 @@ struct MainWindow: View {
     }
 }
 
-/// The menu bar item: the active transfers and their rates, from the core's
-/// views.
-struct MenuBarContent: View {
-    @EnvironmentObject private var store: TransferStore
-    @Environment(\.openWindow) private var openWindow
-
-    var body: some View {
-        if store.active.isEmpty {
-            Text("Nothing under way")
-        } else {
-            ForEach(store.active) { item in
-                Text(Format.menuLine(item))
-            }
-        }
-        Divider()
-        Button("Open votport") {
-            // Reuses the main window or makes a new one after it was closed.
-            openWindow(id: "main")
-            NSApp.activate(ignoringOtherApps: true)
-        }
-        Button("Quit") { NSApp.terminate(nil) }
-            .keyboardShortcut("q")
-    }
-}
-
 /// Launch-time work that must not wait for a window to appear: a locked
 /// screen never shows one, and a headless run still has to move bytes.
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -151,6 +163,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "fonts: sans \(families.contains(Type.sansFamily)) mono \(families.contains(Type.monoFamily))")
         MainActor.assumeIsolated {
             TransferStore.shared.loadPending()
+            PortStore.shared.load()
+            TransferStore.shared.startWatching()
             _ = Launch.startFromArguments(store: .shared)
         }
     }

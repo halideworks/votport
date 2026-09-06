@@ -61,7 +61,10 @@ public sealed class TransferItem : INotifyPropertyChanged
 
     public bool CanResume => !running && journalled;
     public bool ShowPassword => CanResume && NeedsPassword;
-    public string ResumeLabel => interrupted ? "Resume" : "Retry";
+    /// Resume without a password prompt: what the tray panel offers.
+    public bool CanResumeNow => CanResume && !NeedsPassword;
+    public string ResumeLabel => interrupted || view?.Phase == Phase.Paused ? "Resume" : "Retry";
+    public bool HasTotal => view?.TotalBytes is not null;
 
     public bool Expanded
     {
@@ -72,7 +75,7 @@ public sealed class TransferItem : INotifyPropertyChanged
     internal TransferView? View
     {
         get => view;
-        set { view = value; Changed(); Changed(nameof(Status)); Changed(nameof(Fraction)); Changed(nameof(Files)); Changed(nameof(Detail)); Changed(nameof(HasDetail)); Changed(nameof(Route)); Changed(nameof(HasRoute)); }
+        set { view = value; Changed(); Changed(nameof(Status)); Changed(nameof(Fraction)); Changed(nameof(Files)); Changed(nameof(Detail)); Changed(nameof(HasDetail)); Changed(nameof(Route)); Changed(nameof(HasRoute)); Changed(nameof(HasTotal)); Changed(nameof(ResumeLabel)); }
     }
 
     /// The path in the person's words, once the core chose it.
@@ -82,7 +85,7 @@ public sealed class TransferItem : INotifyPropertyChanged
     public bool Running
     {
         get => running;
-        set { running = value; Changed(); Changed(nameof(NotRunning)); Changed(nameof(CanResume)); Changed(nameof(ShowPassword)); Changed(nameof(CanReveal)); }
+        set { running = value; Changed(); Changed(nameof(NotRunning)); Changed(nameof(CanResume)); Changed(nameof(ShowPassword)); Changed(nameof(CanReveal)); Changed(nameof(CanResumeNow)); }
     }
 
     public bool NotRunning => !running;
@@ -158,6 +161,44 @@ public sealed class TransferStore
             }
             catch (VotportException) { return Array.Empty<string>(); }
         });
+    }
+
+    /// Ships a settled drop of a watched folder, as a send of that one path;
+    /// the core moves it into the folder's shipped subfolder afterwards.
+    public void Ship(string watchId, string path)
+    {
+        var item = Start(TransferItem.Kinds.Send, Subject(new[] { path }), "");
+        Run(item, (transfer, listener) =>
+        {
+            try { VotportClientCoreMethods.Ship(watchId, path, transfer, listener); }
+            catch (VotportException) { /* the final view carries the outcome */ }
+            return Array.Empty<string>();
+        });
+    }
+
+    /// Stops a transfer and keeps its journal entry, so the card ends as
+    /// Paused with Resume.
+    public void Pause(TransferItem item)
+    {
+        if (handles.TryGetValue(item.Id, out var transfer)) transfer.Pause();
+    }
+
+    private Watcher? watcher;
+
+    /// Starts the watch folder scan for the life of the app. The listener
+    /// is called on the core's thread and hops to the UI thread to start
+    /// the ship like any other transfer.
+    public void StartWatching()
+    {
+        watcher ??= VotportClientCoreMethods.WatchAll(new WatchHandoff(this, dispatcher));
+    }
+
+    private sealed class WatchHandoff : WatchListener
+    {
+        private readonly TransferStore store;
+        private readonly DispatcherQueue dispatcher;
+        public WatchHandoff(TransferStore store, DispatcherQueue dispatcher) { this.store = store; this.dispatcher = dispatcher; }
+        public void Ready(string watchId, string path) => dispatcher.TryEnqueue(() => store.Ship(watchId, path));
     }
 
     /// Lists the transfers the journal held over from an earlier run, as

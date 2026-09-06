@@ -26,6 +26,9 @@ public sealed partial class SendPage : Page
         Paths.ItemsSource = paths;
         paths.CollectionChanged += (_, _) => Refresh();
         LinkBox.TextChanged += (_, _) => previewer.Update(LinkBox.Text);
+        Loaded += (_, _) => PortStore.Shared.Changed += ShipTo;
+        Unloaded += (_, _) => PortStore.Shared.Changed -= ShipTo;
+        ShipTo();
         if (TransferStore.Shared.PrefillSend is string link)
         {
             LinkBox.Text = link;
@@ -55,6 +58,22 @@ public sealed partial class SendPage : Page
         foreach (var item in items)
         {
             if (item.Path.Length > 0 && !paths.Contains(item.Path)) paths.Add(item.Path);
+        }
+    }
+
+    /// The port's open request links behind the Ship to button.
+    private void ShipTo()
+    {
+        var requests = PortStore.Shared.Requests;
+        ShipToButton.Visibility = requests.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
+        // An open flyout keeps its items until it closes.
+        if (ShipToMenu.IsOpen) return;
+        ShipToMenu.Items.Clear();
+        foreach (var request in requests)
+        {
+            var item = new MenuFlyoutItem { Text = request.Label };
+            item.Click += (_, _) => LinkBox.Text = request.Url;
+            ShipToMenu.Items.Add(item);
         }
     }
 
