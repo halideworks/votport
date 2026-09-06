@@ -11,7 +11,19 @@
       <RowDefinition Height="Auto" />
     </Grid.RowDefinitions>
     <TextBlock Text="SHIP" Style="{StaticResource SectionLabel}" />
-    <TextBox x:Name="LinkBox" Grid.Row="1" PlaceholderText="Request link" />
+    <Grid Grid.Row="1" ColumnSpacing="8">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="*" />
+        <ColumnDefinition Width="Auto" />
+      </Grid.ColumnDefinitions>
+      <TextBox x:Name="LinkBox" PlaceholderText="Request link" />
+      <!-- Signed in to a port: its open request links, one click. -->
+      <DropDownButton x:Name="ShipToButton" Grid.Column="1" Content="Ship to" Visibility="Collapsed">
+        <DropDownButton.Flyout>
+          <MenuFlyout x:Name="ShipToMenu" />
+        </DropDownButton.Flyout>
+      </DropDownButton>
+    </Grid>
     <TextBlock x:Name="PreviewText" Grid.Row="2" Visibility="Collapsed" TextWrapping="Wrap"
         Foreground="{ThemeResource VotMutedBrush}" />
     <PasswordBox x:Name="PasswordBox" Grid.Row="3" PlaceholderText="Password" Visibility="Collapsed" />

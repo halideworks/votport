@@ -24,6 +24,29 @@ use crate::identity::{state_dir, write_private};
 
 const FILE: &str = "port.json";
 
+/// What a failed operator call tells a shell: the headline for the person,
+/// the detail behind it, and whether the session ended (so the operator
+/// screens fold). One shape for every call, since the shells hold no copy.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
+pub enum PortError {
+    #[error("{headline}")]
+    Failed {
+        headline: String,
+        detail: String,
+        signed_out: bool,
+    },
+}
+
+impl From<Error> for PortError {
+    fn from(error: Error) -> Self {
+        Self::Failed {
+            headline: error.headline(),
+            detail: error.to_string(),
+            signed_out: matches!(error, Error::NotSignedIn),
+        }
+    }
+}
+
 /// The port an operator is signed in to, as a shell shows it. Never the
 /// cookie.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -208,6 +231,8 @@ pub struct RequestLink {
     pub drops: u64,
     /// Senders shipping to it right now.
     pub receiving: u64,
+    /// The counts in words: "2 drops, 1 shipping now, password".
+    pub summary: String,
 }
 
 #[derive(Deserialize)]
@@ -229,7 +254,17 @@ struct LinkView {
 
 impl From<LinkView> for RequestLink {
     fn from(view: LinkView) -> Self {
+        let drops = view.uploads.len() as u64;
+        let receiving = view.receiving.len() as u64;
+        let mut parts = vec![count(drops, "drop", "drops")];
+        if receiving > 0 {
+            parts.push(format!("{receiving} shipping now"));
+        }
+        if view.has_password {
+            parts.push("password".to_owned());
+        }
         Self {
+            summary: parts.join(", "),
             id: view.id,
             label: view.label,
             url: view.url,
@@ -239,9 +274,17 @@ impl From<LinkView> for RequestLink {
             max_bytes: view.max_bytes,
             usable: view.usable,
             active: view.active,
-            drops: view.uploads.len() as u64,
-            receiving: view.receiving.len() as u64,
+            drops,
+            receiving,
         }
+    }
+}
+
+fn count(n: u64, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {many}")
     }
 }
 
@@ -336,6 +379,29 @@ pub struct Delivery {
     pub downloads: u64,
     pub max_downloads: Option<u64>,
     pub file_count: u64,
+    /// The counts in words: "2 files, 5 downloads, revoked".
+    #[serde(skip)]
+    pub summary: String,
+}
+
+impl Delivery {
+    fn with_summary(mut self) -> Self {
+        let mut parts = vec![
+            count(self.file_count, "file", "files"),
+            count(self.downloads, "download", "downloads"),
+        ];
+        if let Some(max) = self.max_downloads {
+            parts.push(format!("of {max} allowed"));
+        }
+        if self.has_password {
+            parts.push("password".to_owned());
+        }
+        if self.revoked_at.is_some() {
+            parts.push("revoked".to_owned());
+        }
+        self.summary = parts.join(", ");
+        self
+    }
 }
 
 #[derive(Deserialize)]
@@ -350,7 +416,11 @@ struct Grants {
 pub fn deliveries() -> Result<Vec<Delivery>> {
     run(|client, cookie| {
         let page: Grants = client.admin_get("/api/admin/outbound-grants?limit=100", cookie)?;
-        Ok(page.grants)
+        Ok(page
+            .grants
+            .into_iter()
+            .map(Delivery::with_summary)
+            .collect())
     })
 }
 
@@ -376,6 +446,9 @@ pub struct LibraryFile {
     /// Library-relative, forward slashes.
     pub path: String,
     pub bytes: u64,
+    /// `bytes` as a person reads it.
+    #[serde(skip)]
+    pub size: String,
 }
 
 /// One directory of the port's library: what a deliver screen browses.
@@ -400,10 +473,14 @@ pub struct Library {
 pub fn library(directory: &str) -> Result<Library> {
     run(|client, cookie| {
         let query = url_query(directory.trim_matches('/'));
-        client.admin_get(
+        let mut listing: Library = client.admin_get(
             &format!("/api/admin/outbound-files?directory={query}"),
             cookie,
-        )
+        )?;
+        for file in &mut listing.files {
+            file.size = crate::error::human_bytes(file.bytes);
+        }
+        Ok(listing)
     })
 }
 
@@ -458,7 +535,7 @@ pub fn issue_delivery(spec: DeliverySpec) -> Result<IssuedDelivery> {
         )?;
         Ok(IssuedDelivery {
             url: issued.url,
-            delivery: issued.grant,
+            delivery: issued.grant.with_summary(),
         })
     })
 }

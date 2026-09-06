@@ -67,6 +67,33 @@ final class TransferStore: ObservableObject {
         }
     }
 
+    /// Ships a settled drop of a watched folder, as a send of that one path;
+    /// the core moves it into the folder's `shipped` subfolder afterwards.
+    func ship(watchId: String, path: String) {
+        let item = start(kind: .send, subject: Self.subject(for: [path]), link: "")
+        run(item.id) { transfer, listener in
+            _ = try? VotportCore.ship(
+                watchId: watchId, path: path, transfer: transfer, listener: listener)
+            return []
+        }
+    }
+
+    /// Stops a transfer and keeps its journal entry, so the card ends as
+    /// Paused with Resume.
+    func pause(_ id: UUID) {
+        handles[id]?.pause()
+    }
+
+    private var watcher: Watcher?
+
+    /// Starts the watch folder scan for the life of the app. The listener
+    /// is called on the core's thread and hops to the main actor to start
+    /// the ship like any other transfer.
+    func startWatching() {
+        guard watcher == nil else { return }
+        watcher = VotportCore.watchAll(listener: WatchHandoff(store: self))
+    }
+
     /// Lists the transfers the journal held over from an earlier run, as
     /// interrupted cards. Called once at launch.
     func loadPending() {
@@ -176,6 +203,22 @@ final class TransferStore: ObservableObject {
         log.notice("ended: \(String(describing: item.view?.phase), privacy: .public)")
         Notifier.transferEnded(item)
         Snapshot.writeIfRequested()
+    }
+}
+
+/// The core's callback for a drop that settled in a watched folder. Called
+/// on the watcher's thread; hops to the main actor to start the ship.
+final class WatchHandoff: WatchListener, @unchecked Sendable {
+    private let store: TransferStore
+
+    init(store: TransferStore) {
+        self.store = store
+    }
+
+    func ready(watchId: String, path: String) {
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated { self.store.ship(watchId: watchId, path: path) }
+        }
     }
 }
 

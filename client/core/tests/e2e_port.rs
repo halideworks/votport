@@ -14,8 +14,20 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use votport_client_core::ffi::{self, Transfer, TransferListener, TransferView};
-use votport_client_core::port::{DeliverySpec, RequestSpec};
+use votport_client_core::port::{DeliverySpec, PortError, RequestSpec};
 use votport_client_core::Error;
+
+/// The headline and the signed-out flag of a failed operator call.
+fn failed<T: std::fmt::Debug>(result: Result<T, PortError>) -> (String, bool) {
+    match result {
+        Err(PortError::Failed {
+            headline,
+            signed_out,
+            ..
+        }) => (headline, signed_out),
+        other => panic!("expected a failure, got {other:?}"),
+    }
+}
 
 #[derive(Default)]
 struct Recorder(Mutex<Vec<TransferView>>);
@@ -39,17 +51,30 @@ fn an_operator_runs_the_port_from_the_core() {
     // Nobody is signed in: the stored port is empty and every operator call
     // says so without a round trip.
     assert_eq!(ffi::port(), None);
-    assert!(matches!(ffi::requests(), Err(Error::NotSignedIn)));
+    assert_eq!(
+        failed(ffi::requests()),
+        ("Sign in to your votport first.".to_owned(), true)
+    );
 
     // A base that is not an origin, and one wrong password (the server
     // throttles by address, so only one).
-    assert!(matches!(
-        ffi::sign_in("drop.example".to_owned(), "x".to_owned()),
-        Err(Error::BadLink { .. })
-    ));
-    let wrong = ffi::sign_in(server.base.clone(), "not-the-password".to_owned());
-    assert!(matches!(wrong, Err(Error::WrongPassword)), "{wrong:?}");
-    assert_eq!(wrong.unwrap_err().headline(), "That password is wrong.");
+    assert_eq!(
+        failed(ffi::sign_in("drop.example".to_owned(), "x".to_owned())),
+        (
+            Error::BadLink {
+                link: "drop.example".to_owned()
+            }
+            .headline(),
+            false
+        )
+    );
+    assert_eq!(
+        failed(ffi::sign_in(
+            server.base.clone(),
+            "not-the-password".to_owned()
+        )),
+        ("That password is wrong.".to_owned(), false)
+    );
 
     let port = ffi::sign_in(
         format!("{}/", server.base),
@@ -107,9 +132,11 @@ fn an_operator_runs_the_port_from_the_core() {
         password: None,
         expires_days: None,
         max_bytes: None,
-    })
-    .unwrap_err();
-    assert_eq!(refused.headline(), "Label must be 1..=200 characters.");
+    });
+    assert_eq!(
+        failed(refused),
+        ("Label must be 1..=200 characters.".to_owned(), false)
+    );
 
     // The library: a file uploaded through the admin API shows up at the
     // root, and a delivery issued from it carries the one link it ever
@@ -125,9 +152,9 @@ fn an_operator_runs_the_port_from_the_core() {
     assert_eq!(
         root.files
             .iter()
-            .map(|f| (f.path.as_str(), f.bytes))
+            .map(|f| (f.path.as_str(), f.bytes, f.size.as_str()))
             .collect::<Vec<_>>(),
-        vec![("plate.bin", 100_000)]
+        vec![("plate.bin", 100_000, "100 KB")]
     );
     assert!(!root.truncated);
     let before = ffi::deliveries().unwrap().len();
@@ -147,6 +174,11 @@ fn an_operator_runs_the_port_from_the_core() {
     assert_eq!(delivery.delivery.label.as_deref(), Some("For Alex"));
     assert_eq!(delivery.delivery.max_downloads, Some(5));
     assert_eq!(delivery.delivery.file_count, 1);
+    assert_eq!(
+        delivery.delivery.summary,
+        "1 file, 0 downloads, of 5 allowed"
+    );
+    assert_eq!(issued.summary, "0 drops");
     assert_eq!(ffi::deliveries().unwrap().len(), before + 1);
 
     let dest = tempfile::tempdir().unwrap();
@@ -182,7 +214,7 @@ fn an_operator_runs_the_port_from_the_core() {
     // dropped by the next check.
     ffi::sign_out();
     assert_eq!(ffi::port(), None);
-    assert!(matches!(ffi::deliveries(), Err(Error::NotSignedIn)));
+    assert!(failed(ffi::deliveries()).1, "signed out");
     std::fs::write(
         state.path().join("votport/port.json"),
         format!(

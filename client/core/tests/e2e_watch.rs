@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use votport_client_core::ffi::{self, Phase, ShipReport, Transfer, TransferListener, TransferView};
+use votport_client_core::port::PortError;
 use votport_client_core::watch::{self, WatchListener};
 use votport_client_core::Error;
 
@@ -54,19 +55,32 @@ fn a_watched_folder_ships_what_settles_in_it() {
     let link = format!("{}/r/{token}", server.base);
     let folder = tempfile::tempdir().unwrap();
 
-    // Not a folder, not a request link, then a real watch.
-    assert!(matches!(
-        ffi::add_watch("/nonexistent/x".to_owned(), link.clone(), None),
-        Err(Error::Read { .. })
-    ));
-    assert!(matches!(
-        ffi::add_watch(
+    // Not a folder, not a request link, then a real watch. The refusals
+    // carry the core's headline for the settings screen.
+    let headline = |result: Result<watch::Watch, PortError>| match result {
+        Err(PortError::Failed { headline, .. }) => headline,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    assert_eq!(
+        headline(ffi::add_watch(
+            "/nonexistent/x".to_owned(),
+            link.clone(),
+            None
+        )),
+        "\"x\" could not be read."
+    );
+    assert_eq!(
+        headline(ffi::add_watch(
             folder.path().to_string_lossy().into_owned(),
             format!("{}/s/{token}", server.base),
             None
-        ),
-        Err(Error::WrongLink { .. })
-    ));
+        )),
+        Error::WrongLink {
+            link: String::new(),
+            kind: votport_client_core::LinkKind::Delivery
+        }
+        .headline()
+    );
     let added = ffi::add_watch(
         folder.path().to_string_lossy().into_owned(),
         link.clone(),

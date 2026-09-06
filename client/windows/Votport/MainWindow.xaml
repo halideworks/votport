@@ -30,6 +30,9 @@
       <NavigationView.MenuItems>
         <NavigationViewItem Content="Ship" Tag="send" Icon="Send" />
         <NavigationViewItem Content="Receive" Tag="receive" Icon="Download" />
+        <!-- Signed in to a port only. -->
+        <NavigationViewItem x:Name="DeliverItem" Content="Deliver" Tag="deliver" Icon="Library" Visibility="Collapsed" />
+        <NavigationViewItem x:Name="LinksItem" Content="Links" Tag="links" Icon="Link" Visibility="Collapsed" />
         <NavigationViewItem Content="Transfers" Tag="transfers" Icon="List">
           <NavigationViewItem.InfoBadge>
             <InfoBadge x:Name="ActiveBadge" Visibility="Collapsed" />

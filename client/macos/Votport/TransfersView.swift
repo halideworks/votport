@@ -61,6 +61,7 @@ struct TransferCard: View {
                 }
                 Spacer()
                 if item.running {
+                    Button("Pause") { store.pause(item.id) }
                     Button("Cancel") { store.cancel(item.id) }
                 } else {
                     if item.canResume {
@@ -69,7 +70,7 @@ struct TransferCard: View {
                                 .textFieldStyle(.roundedBorder)
                                 .frame(width: 160)
                         }
-                        Button(item.interrupted ? "Resume" : "Retry") {
+                        Button(item.interrupted || item.view?.phase == .paused ? "Resume" : "Retry") {
                             store.resume(item.id, password: password.isEmpty ? nil : password)
                             password = ""
                         }

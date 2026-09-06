@@ -38,6 +38,11 @@ public sealed partial class TransfersPage : Page
         foreach (var item in TransferStore.Shared.Items) item.Expanded = item == clicked && !item.Expanded;
     }
 
+    private void Pause_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is TransferItem item) TransferStore.Shared.Pause(item);
+    }
+
     private void Cancel_Click(object sender, RoutedEventArgs e)
     {
         if ((sender as FrameworkElement)?.DataContext is TransferItem item) TransferStore.Shared.Cancel(item);

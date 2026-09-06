@@ -200,7 +200,28 @@ entry before it sends afresh. `votport watch add | list | remove | run` manage a
 from a terminal. The core also gained Pause: `Transfer::pause` stops a
 transfer like cancel but keeps the journal entry, the view ends in a
 `Paused` phase ("Paused, 120 MB of 300 MB"), and Resume picks it up from
-the partial.
+the partial. Both shells now draw all of it. Settings gained "Home port"
+(the origin and the admin password; signed in, the sidebar gains Deliver
+and Links and Ship offers the port's open request links behind a "Ship
+to" menu) and "Watch folders" (a folder, a request link previewed like
+any other, the password when the link needs one; the scan starts with
+the app and runs while the window is closed to the tray or menu bar).
+Links lists the open request links with their URLs, drop counts, and
+senders shipping now, issues one (label, optional password, expiry, cap;
+the link is copied as it is issued) and closes one, and lists the
+deliveries with their download counts and revokes one. Deliver browses
+the library one directory at a time, ticks files, and issues a delivery
+whose link is shown once and copied. Every failure line is the core's
+headline: operator calls return a `PortError` record (headline, detail,
+and whether the session ended, which folds the operator screens), and
+the core adds `RequestLink.summary`, `Delivery.summary`, and
+`LibraryFile.size` so the screens draw no counts of their own. The
+transfer cards gained Pause beside Cancel, and a paused card offers
+Resume. The menu bar item is a panel now (`MenuBarExtra` in window
+style) and the Windows tray's left click opens a matching borderless
+window above the notification area: the ship mark, "N under way", each
+transfer with its status line, bar, and Pause, Cancel, or Resume, then
+Open and Quit.
 
 | Field | Value |
 | --- | --- |

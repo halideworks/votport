@@ -47,11 +47,20 @@ public partial class App : Application
         // rewrites it so the next boot still finds the app.
         if (Settings.StartWithWindows) Settings.StartWithWindows = true;
         TransferStore.Shared.LoadPending();
+        PortStore.Shared.Load();
+        TransferStore.Shared.StartWatching();
         if (TransferStore.Shared.Items.Count > 0) Window.Show("transfers");
         // Launch-time work must not wait for the window: a headless run
         // (over ssh, into the console session) still has to move bytes.
         Launch.StartFromArguments(Environment.GetCommandLineArgs());
         Activate(activation);
+    }
+
+    /// Quit from the tray menu or the tray panel.
+    public static void Quit()
+    {
+        Window?.QuitFromTray();
+        Current.Exit();
     }
 
     private static void Activate(AppActivationArguments activation)
