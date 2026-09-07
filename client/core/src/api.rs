@@ -946,6 +946,7 @@ mod tests {
             for _ in 0..400 {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
                         stream
                             .set_read_timeout(Some(Duration::from_secs(2)))
                             .unwrap();
@@ -1085,6 +1086,7 @@ mod tests {
                 for _ in 0..400 {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
                             stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                             stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
                             let mut reader = BufReader::new(&stream);
@@ -1110,10 +1112,16 @@ mod tests {
             let destination = dir.path().join("file");
             let partial = dir.path().join(".vot-file.journal");
             std::fs::write(&partial, b"ab").unwrap();
-            let result = crate::receive::write_verified(&mut |offset| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let target = destination.clone();
+            std::thread::spawn(move || {
+                let result = crate::receive::write_verified(&mut |offset| {
                 let (response, start) = client.download("/file", None, offset, 4)?;
                 Ok(crate::receive::Resumed { reader: Box::new(response), start })
-            }, &destination, [0; 32], "unused", 4, 0, &mut crate::progress::Silent);
+            }, &target, [0; 32], "unused", 4, 0, &mut crate::progress::Silent);
+                let _ = sender.send(result);
+            });
+            let result = receiver.recv_timeout(Duration::from_secs(5)).expect("download stalled");
             server.join().unwrap();
             assert_eq!(std::fs::read(partial).unwrap(), b"ab");
             assert!(matches!(result, Err(Error::Other(_))), "{result:?}");
