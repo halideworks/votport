@@ -163,7 +163,8 @@ pub fn receive_over_http(
             return Err(Error::Cancelled);
         }
         let mut source = |offset: u64| -> Result<Resumed> {
-            let (response, start) = client.download(&file.download_url, cookie, offset)?;
+            let (response, start) =
+                client.download(&file.download_url, cookie, offset, file.bytes)?;
             Ok(Resumed {
                 reader: Box::new(response),
                 start,

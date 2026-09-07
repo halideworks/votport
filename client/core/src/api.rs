@@ -470,15 +470,17 @@ impl Client {
     /// cookie for a password delivery. Returns the response and the byte offset
     /// its body actually starts at: `offset` when the server honored the range
     /// with 206, or 0 when it answered the whole file with 200. The caller
-    /// reads the body incrementally.
+    /// reads the body incrementally. A partial response must match `offset`
+    /// and the metadata's `total` length.
     ///
     /// # Errors
-    /// A network failure or a non-success status.
+    /// A network failure, an unexpected status, or a mismatched byte range.
     pub fn download(
         &self,
         path: &str,
         cookie: Option<&str>,
         offset: u64,
+        total: u64,
     ) -> Result<(reqwest::blocking::Response, u64)> {
         let url = self.url(path);
         // The GET is idempotent, so a transient failure before the body starts
@@ -501,13 +503,15 @@ impl Client {
                     body,
                 });
             }
-            // 206 means the range was honored and the body starts at `offset`;
-            // any other success is the whole file from zero.
-            let start = if status == reqwest::StatusCode::PARTIAL_CONTENT {
-                offset
-            } else {
-                0
-            };
+            let start = download_start(
+                status,
+                response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok()),
+                offset,
+                total,
+            )?;
             Ok((response, start))
         })
     }
@@ -533,6 +537,39 @@ impl Client {
                 cookie,
             )
         })
+    }
+}
+
+fn download_start(
+    status: reqwest::StatusCode,
+    range: Option<&str>,
+    offset: u64,
+    total: u64,
+) -> Result<u64> {
+    if status == reqwest::StatusCode::OK {
+        return Ok(0);
+    }
+    if status != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(Error::Other(format!("unexpected download status {status}")));
+    }
+    let parsed = range.and_then(|value| {
+        let (start, rest) = value.strip_prefix("bytes ")?.split_once('-')?;
+        let (end, length) = rest.split_once('/')?;
+        let number = |value: &str| {
+            value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+                .then(|| value.parse::<u64>().ok())
+                .flatten()
+        };
+        Some((number(start)?, number(end)?, number(length)?))
+    });
+    if offset < total && parsed == Some((offset, total - 1, total)) {
+        Ok(offset)
+    } else {
+        Err(Error::Other(
+            "download response has an invalid byte range".to_owned(),
+        ))
     }
 }
 
@@ -980,6 +1017,107 @@ mod tests {
                 matches!(result, Err(Error::Server { status: actual, .. }) if actual == status),
                 "{result:?}"
             );
+        }
+    }
+
+    #[test]
+    fn download_responses_match_the_requested_range() {
+        for (status, range, offset, total, expected) in [
+            (200, None, 2, 4, Some(0)),
+            (200, None, 0, 0, Some(0)),
+            (206, Some("bytes 2-3/4"), 2, 4, Some(2)),
+            (206, Some("bytes 0-3/4"), 0, 4, Some(0)),
+            (206, Some("bytes 02-03/04"), 2, 4, Some(2)),
+            (206, None, 2, 4, None),
+            (206, Some("bytes 0-3/4"), 2, 4, None),
+            (206, Some("bytes 2-2/4"), 2, 4, None),
+            (206, Some("bytes 2-3/5"), 2, 4, None),
+            (206, Some("bytes 2-3/*"), 2, 4, None),
+            (206, Some("items 2-3/4"), 2, 4, None),
+            (206, Some("bytes 2-3"), 2, 4, None),
+            (206, Some("bytes 2/3/4"), 2, 4, None),
+            (206, Some("bytes x-3/4"), 2, 4, None),
+            (206, Some("bytes 2-x/4"), 2, 4, None),
+            (206, Some("bytes +2-3/4"), 2, 4, None),
+            (206, Some("bytes 2-+3/4"), 2, 4, None),
+            (206, Some("bytes 2-3/+4"), 2, 4, None),
+            (206, Some("bytes 18446744073709551616-3/4"), 2, 4, None),
+            (206, Some("bytes 2-18446744073709551616/4"), 2, 4, None),
+            (206, Some("bytes 2-3/18446744073709551616"), 2, 4, None),
+            (206, Some("bytes -3/4"), 2, 4, None),
+            (206, Some("bytes 2-/4"), 2, 4, None),
+            (206, Some("bytes 2-3/"), 2, 4, None),
+            (206, Some("bytes 4-3/4"), 4, 4, None),
+            (206, Some("bytes 5-3/4"), 5, 4, None),
+            (206, Some("bytes 0-0/0"), 0, 0, None),
+            (201, None, 2, 4, None),
+            (202, None, 2, 4, None),
+            (204, None, 2, 4, None),
+            (205, None, 2, 4, None),
+        ] {
+            assert_eq!(
+                super::download_start(
+                    reqwest::StatusCode::from_u16(status).unwrap(),
+                    range,
+                    offset,
+                    total
+                )
+                .ok(),
+                expected,
+                "{status} {range:?} at {offset}/{total}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_download_responses_preserve_the_partial() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+        for response in [
+            "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-1/4\r\nContent-Length: 2\r\nConnection: close\r\n\r\ncd",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                for _ in 0..400 {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                            stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                            let mut reader = BufReader::new(&stream);
+                            for _ in 0..64 {
+                                let mut line = String::new();
+                                assert!(reader.read_line(&mut line).unwrap() > 0);
+                                if line == "\r\n" { break; }
+                            }
+                            stream.write_all(response.as_bytes()).unwrap();
+                            return;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(5)),
+                        Err(error) => panic!("accept failed: {error}"),
+                    }
+                }
+                panic!("download never connected");
+            });
+            let client = super::Client {
+                http: reqwest::blocking::Client::builder().no_proxy().timeout(Duration::from_secs(2)).build().unwrap(),
+                base,
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let destination = dir.path().join("file");
+            let partial = dir.path().join(".vot-file.journal");
+            std::fs::write(&partial, b"ab").unwrap();
+            let result = crate::receive::write_verified(&mut |offset| {
+                let (response, start) = client.download("/file", None, offset, 4)?;
+                Ok(crate::receive::Resumed { reader: Box::new(response), start })
+            }, &destination, [0; 32], "unused", 4, 0, &mut crate::progress::Silent);
+            server.join().unwrap();
+            assert_eq!(std::fs::read(partial).unwrap(), b"ab");
+            assert!(matches!(result, Err(Error::Other(_))), "{result:?}");
+            assert!(!destination.exists());
         }
     }
 
