@@ -348,8 +348,12 @@ pub struct ResolvedSettings {
     pub default_max_sessions: Option<u64>,
     pub public_password_login: bool,
     pub sso_session_secs: u64,
-    /// SCIM bearer; None means /scim/v2 answers 401 to everything.
+    /// SCIM bearer; None means /scim/v2 answers 401 to everything. A stored
+    /// value is `sha256:<hex>`; an env value is the plain token.
     pub scim_token: Option<String>,
+    /// The bearer saved before the current one, kept valid until cleared so
+    /// a rotation has no gap. Always a stored hash, never from env.
+    pub scim_token_previous: Option<String>,
     /// SSO sign-in is refused for subjects without a principal row.
     pub require_provisioning: bool,
     /// When true, new upload sessions are refused so active ones can finish
@@ -404,6 +408,7 @@ pub struct SettingsOverlay {
     pub sso_session_secs_source: &'static str,
     pub scim_token_set: bool,
     pub scim_token_source: &'static str,
+    pub scim_token_previous_set: bool,
     pub require_provisioning_source: &'static str,
     pub draining_source: &'static str,
 }
@@ -4355,6 +4360,7 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
         overlay_u64(rows, "sso_session_secs", config.sso_session_secs);
     let (scim_token, scim_token_source) =
         overlay_text(rows, "scim_token", config.scim_token.clone());
+    let (scim_token_previous, _) = overlay_text(rows, "scim_token_previous", None);
     let (require_provisioning, require_provisioning_source) =
         overlay_bool(rows, "require_provisioning", config.require_provisioning);
     // The write path refuses zero; a hand-edited row falls back to env.
@@ -4385,6 +4391,7 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
             public_password_login,
             sso_session_secs,
             scim_token: scim_token.clone(),
+            scim_token_previous: scim_token_previous.clone(),
             require_provisioning,
             draining,
         },
@@ -4418,6 +4425,7 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
         sso_session_secs_source,
         scim_token_set: scim_token.is_some(),
         scim_token_source,
+        scim_token_previous_set: scim_token_previous.is_some(),
         require_provisioning_source,
         draining_source,
     }

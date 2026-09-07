@@ -1782,6 +1782,7 @@ const SETTINGS_KEYS: &[&str] = &[
     "public_password_login",
     "sso_session_secs",
     "scim_token",
+    "scim_token_previous",
     "require_provisioning",
     "draining",
 ];
@@ -1916,6 +1917,7 @@ fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
         "sso_session_secs_source": overlay.sso_session_secs_source,
         "scim_token_set": overlay.scim_token_set,
         "scim_token_source": overlay.scim_token_source,
+        "scim_token_previous_set": overlay.scim_token_previous_set,
         "require_provisioning": resolved.require_provisioning,
         "require_provisioning_source": overlay.require_provisioning_source,
         "draining": resolved.draining,
@@ -2059,7 +2061,8 @@ pub async fn put_settings(
             | "smtp_password"
             | "smtp_from"
             | "smtp_to"
-            | "scim_token" => write_secret(key, value)?,
+            | "scim_token"
+            | "scim_token_previous" => write_secret(key, value)?,
             "audit_retention_days" | "upload_retention_days" => write_u64(key, value, true)?,
             "default_max_total_bytes"
             | "default_max_links"
@@ -2070,6 +2073,31 @@ pub async fn put_settings(
             }
             "smtp_port" => write_smtp_port(key, value)?,
             _ => unreachable!(),
+        };
+        // SCIM bearers are stored hashed, and saving a new one keeps the
+        // one it replaces valid as scim_token_previous until it is cleared.
+        let write = match (*key, write) {
+            ("scim_token" | "scim_token_previous", crate::store::SettingWrite::Set(text))
+                if !text.is_empty() =>
+            {
+                if *key == "scim_token" {
+                    if let Some(current) = app
+                        .store
+                        .setting("scim_token")
+                        .map_err(ApiError::internal)?
+                    {
+                        if !current.is_empty() && !object.contains_key("scim_token_previous") {
+                            writes.push((
+                                "scim_token_previous".to_owned(),
+                                crate::store::SettingWrite::Set(current),
+                            ));
+                            keys.push("scim_token_previous".to_owned());
+                        }
+                    }
+                }
+                crate::store::SettingWrite::Set(super::scim::hash_bearer(&text))
+            }
+            (_, write) => write,
         };
         match &write {
             crate::store::SettingWrite::Reset => reset.push((*key).to_owned()),

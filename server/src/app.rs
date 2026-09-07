@@ -61,6 +61,8 @@ pub struct App {
     /// `link_throttle` so public link guessing cannot consume an operator's
     /// sign-in budget, or the reverse.
     pub login_throttle: crate::auth::IpThrottle,
+    /// Failed SCIM bearers per client bucket; a correct bearer resets it.
+    pub scim_throttle: crate::auth::IpThrottle,
     /// argon2 budget for admin sign-in. Separate from the link budget below:
     /// sharing one meant a flood of link password guesses queued ahead of the
     /// operator, which is a lockout with extra steps. Holding the whole
@@ -780,6 +782,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         web_build,
         change_password_throttle: LoginThrottle::new(),
         login_throttle: crate::auth::IpThrottle::new(),
+        scim_throttle: crate::auth::IpThrottle::new(),
         login_permits: Arc::new(tokio::sync::Semaphore::new(VERIFY_PERMITS)),
         link_verify_permits: Arc::new(tokio::sync::Semaphore::new(VERIFY_PERMITS)),
         change_password_permits: Arc::new(tokio::sync::Semaphore::new(VERIFY_PERMITS)),
