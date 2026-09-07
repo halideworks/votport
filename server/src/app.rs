@@ -1756,10 +1756,11 @@ async fn healthz(State(app): State<Arc<App>>) -> Response {
     StatusCode::OK.into_response()
 }
 
-/// Readiness for a balancer or orchestrator: 503 while unhealthy or
-/// draining, so a drained instance stops receiving new traffic while
-/// /healthz keeps reporting the process itself as fine. The body carries the
-/// active upload count so a failover script can wait for zero.
+/// Readiness for failover scripts and orchestrators: 503 while unhealthy or
+/// draining, while /healthz keeps reporting the process itself as fine. Not
+/// for a single-upstream proxy health check: drain keeps downloads and admin
+/// up on purpose (docs/deployment.md, Scaling and availability). The body
+/// carries the active upload count so a failover script can wait for zero.
 async fn readyz(State(app): State<Arc<App>>) -> Response {
     let healthy = check_health(&app);
     let draining = app

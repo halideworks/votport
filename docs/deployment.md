@@ -651,15 +651,14 @@ the generated `push.crt` under `data/` moves with the volume so pinned
 senders keep matching.
 
 Planned failover: turn on **Drain for restart** so new upload sessions are
-refused and `/readyz` goes 503, poll `/readyz` on the live host directly
-(not through the proxy) until `sessions_active` reaches 0, stop the live
-container,
-move or restore `data/`, start the standby, turn drain off. Unplanned
-failover skips the drain: in-flight uploads whose worker checkpointed resume
-from that offset once the standby is up, uploads killed before a checkpoint
-start over, and streaming downloads and QUIC sessions die with the process
-and are retried by the client. Per-IP throttles and session rate windows
-reset. Nothing is lost that had been published.
+refused and `/readyz` goes 503, poll `/readyz` on the live host directly (not
+through the proxy) until `sessions_active` reaches 0, stop the live container,
+move or restore `data/`, start the standby, turn drain off. Unplanned failover
+skips the drain: in-flight uploads whose worker checkpointed resume from that
+offset once the standby is up, uploads killed before a checkpoint start over,
+and streaming downloads and QUIC sessions die with the process and are retried
+by the client. Per-IP throttles and session rate windows reset. Nothing is lost
+that had been published.
 
 What this does not give: two live instances. The single SQLite writer, the
 process-wide publication lock, and the in-memory session registry are the
