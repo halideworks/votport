@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod outbound;
+pub mod replica;
 pub mod scim;
 pub mod serve;
 pub mod session_rate;
@@ -324,6 +325,7 @@ pub(crate) mod testing {
             smtp_username: None,
             smtp_password: None,
             scim_token: None,
+            replica_token: None,
             smtp_from: None,
             smtp_to: None,
             public_url: Some("https://drop.example.com".to_owned()),

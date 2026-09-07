@@ -137,6 +137,7 @@ async fn start_server_in(
         smtp_username: None,
         smtp_password: None,
         scim_token: None,
+        replica_token: None,
         smtp_from: None,
         smtp_to: None,
         public_url: None,
@@ -3062,6 +3063,117 @@ async fn backup_restores_through_a_restart() {
         .collect();
     assert!(ids.contains(&before.as_str()), "{ids:?}");
     assert!(!ids.contains(&after.as_str()), "{ids:?}");
+}
+
+/// The replicated topology end to end: a standby pulls the live instance's
+/// archive into its own data directory, and a normal boot over that
+/// directory applies it, carrying the links from before the pull.
+#[tokio::test(flavor = "multi_thread")]
+async fn standby_pull_stages_the_live_copy_and_a_boot_promotes_it() {
+    let server = start_server().await;
+    let base = server.base.clone();
+    server
+        .application
+        .store
+        .put_settings(
+            "test",
+            &[(
+                "replica_token".to_owned(),
+                votport::store::SettingWrite::Set(votport::api::scim::hash_bearer(
+                    "replica-secret",
+                )),
+            )],
+        )
+        .unwrap();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let before = create_open_link(&client, &base, "before pull", "", None).await;
+
+    let standby_data = tempfile::tempdir().unwrap();
+    let config = votport::standby::Config {
+        data_dir: standby_data.path().to_path_buf(),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        source: base.clone(),
+        token: "replica-secret".to_owned(),
+        interval: Duration::from_secs(60),
+    };
+    let puller = reqwest::Client::new();
+    let manifest = votport::standby::pull_once(&puller, &config).await.unwrap();
+    assert!(manifest.schema_version > 0);
+    // A second pull replaces the first stage rather than piling up.
+    votport::standby::pull_once(&puller, &config).await.unwrap();
+    let stages = std::fs::read_dir(standby_data.path())
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".votport-restore-stage-")
+        })
+        .count();
+    assert_eq!(stages, 1, "one staged copy at a time");
+    let after = create_open_link(&client, &base, "after pull", "", None).await;
+    let wrong = votport::standby::Config {
+        token: "wrong".to_owned(),
+        ..config.clone()
+    };
+    assert!(votport::standby::pull_once(&puller, &wrong)
+        .await
+        .unwrap_err()
+        .contains("401"));
+
+    // Promotion: a normal boot over the standby's data directory.
+    let promoted = start_server_in(
+        standby_data,
+        tempfile::tempdir().unwrap(),
+        64 * 1024 * 1024,
+        false,
+        600,
+        32,
+    )
+    .await;
+    let promoted_client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let response = promoted_client
+        .post(format!("{}/api/admin/login", promoted.base))
+        .json(&json!({ "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let links = promoted_client
+        .get(format!("{}/api/admin/links", promoted.base))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = links["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|link| link["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&before.as_str()), "{ids:?}");
+    assert!(!ids.contains(&after.as_str()), "{ids:?}");
+    // The receipt signer came along byte for byte; the cookie secret is
+    // rotated by every restore on purpose, so sessions do not survive.
+    assert_eq!(
+        std::fs::read(server.application.config.data_dir.join("receipt.key")).unwrap(),
+        std::fs::read(promoted.application.config.data_dir.join("receipt.key")).unwrap(),
+        "receipt.key replicated"
+    );
+    assert_ne!(
+        std::fs::read(server.application.config.data_dir.join("secret")).unwrap(),
+        std::fs::read(promoted.application.config.data_dir.join("secret")).unwrap(),
+        "promotion rotates the cookie secret"
+    );
 }
 
 /// A staging file shorter than its checkpointed prefix (power loss before

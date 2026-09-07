@@ -364,6 +364,8 @@ pub struct ResolvedSettings {
     /// The bearer saved before the current one, kept valid until cleared so
     /// a rotation has no gap. Always a stored hash, never from env.
     pub scim_token_previous: Option<String>,
+    /// Bearer for GET /api/replica, stored as `sha256:<hex>`; env is plain.
+    pub replica_token: Option<String>,
     /// SSO sign-in is refused for subjects without a principal row.
     pub require_provisioning: bool,
     /// When true, new upload sessions are refused so active ones can finish
@@ -419,6 +421,8 @@ pub struct SettingsOverlay {
     pub scim_token_set: bool,
     pub scim_token_source: &'static str,
     pub scim_token_previous_set: bool,
+    pub replica_token_set: bool,
+    pub replica_token_source: &'static str,
     pub require_provisioning_source: &'static str,
     pub draining_source: &'static str,
 }
@@ -4627,6 +4631,8 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
     let (scim_token, scim_token_source) =
         overlay_text(rows, "scim_token", config.scim_token.clone());
     let (scim_token_previous, _) = overlay_text(rows, "scim_token_previous", None);
+    let (replica_token, replica_token_source) =
+        overlay_text(rows, "replica_token", config.replica_token.clone());
     let (require_provisioning, require_provisioning_source) =
         overlay_bool(rows, "require_provisioning", config.require_provisioning);
     // The write path refuses zero; a hand-edited row falls back to env.
@@ -4658,6 +4664,7 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
             sso_session_secs,
             scim_token: scim_token.clone(),
             scim_token_previous: scim_token_previous.clone(),
+            replica_token: replica_token.clone(),
             require_provisioning,
             draining,
         },
@@ -4692,6 +4699,8 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
         scim_token_set: scim_token.is_some(),
         scim_token_source,
         scim_token_previous_set: scim_token_previous.is_some(),
+        replica_token_set: replica_token.is_some(),
+        replica_token_source,
         require_provisioning_source,
         draining_source,
     }
@@ -7650,6 +7659,7 @@ mod settings_tests {
             smtp_username: None,
             smtp_password: None,
             scim_token: None,
+            replica_token: None,
             smtp_from: None,
             smtp_to: None,
             public_url: None,

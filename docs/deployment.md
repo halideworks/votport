@@ -646,13 +646,37 @@ Layout:
   removes the file after confirming the old process is gone. An instance
   that loses the lease checkpoints its uploads and exits immediately rather
   than draining, because the new holder is already re-attaching its staging.
-- Where the data volume cannot move, run Litestream (see
-  [Litestream](#litestream)) on the live host and `litestream restore` on the
-  standby before starting it. The RPO is Litestream's replication interval;
-  the identity files under `data/` are static and copy once.
-- Caddy in front of both hosts with a health-checked upstream pair. The
-  check is `/healthz`, so a drained live instance keeps serving downloads and
-  admin until it is stopped, and the standby takes over once it is up:
+- Where the data volume cannot move, run the standby in replica mode:
+  `votport standby` with `VOTPORT_STANDBY_SOURCE` (the live instance's
+  https URL), `VOTPORT_REPLICA_TOKEN` (the token saved under System >
+  Standby replica, or the live instance's `VOTPORT_REPLICA_TOKEN`),
+  `VOTPORT_DATA_DIR`, and optionally `VOTPORT_STANDBY_INTERVAL_SECS`
+  (default 60). On each interval it pulls `GET /api/replica`, a fresh
+  archive of the database and identity files, validates it, and stages it
+  as the pending restore that its next normal boot applies; the standby
+  never opens the database or touches the receive root. Its `/healthz` is
+  200 while pulls land within two intervals and its `/readyz` is always
+  503 with `replica_lag_secs`, so a failover script can see how fresh the
+  copy is. A replica-mode standby serves nothing else, so it is not a proxy
+  upstream until it has been promoted: the Caddy pair below is for the
+  shared-volume topology, and its `/healthz` exists for the container
+  runtime's health check. Promotion is stopping the standby process and
+  starting `votport` normally over the same data directory. Like any
+  restore, promotion rotates the cookie secret, so every admin signs in
+  again; receipt and push identities carry over. Upgrade the standby binary
+  before the live one, since a pull refuses an archive from a newer schema.
+  If a promotion boot is interrupted mid-restore, run `votport` normally to
+  finish it before returning the directory to standby mode. The RPO is the
+  interval: links, settings, and resume records written on the live
+  instance after the last pull are lost, and uploads in that window start
+  over. Litestream (see [Litestream](#litestream)) remains an option for a
+  tighter RPO with an operator-owned restore step. Plain `http://` sources
+  are accepted only for loopback.
+- Caddy in front of both hosts with a health-checked upstream pair
+  (shared-volume topology; a replica-mode standby joins the pool only after
+  promotion). The check is `/healthz`, so a drained live instance keeps
+  serving downloads and admin until it is stopped, and the standby takes
+  over once it is up:
 
 ```caddyfile
 reverse_proxy live:8321 standby:8321 {

@@ -55,6 +55,8 @@ pub struct Config {
     pub smtp_password: Option<String>,
     /// Bearer the SCIM client presents; None disables /scim/v2.
     pub scim_token: Option<String>,
+    /// Bearer a standby presents to GET /api/replica; None disables it.
+    pub replica_token: Option<String>,
     pub smtp_from: Option<String>,
     /// Comma-separated recipient addresses.
     pub smtp_to: Option<String>,
@@ -547,6 +549,7 @@ pub fn from_env() -> Result<Config, String> {
         smtp_username: optional("VOTPORT_NOTIFY_SMTP_USERNAME"),
         smtp_password: optional("VOTPORT_NOTIFY_SMTP_PASSWORD"),
         scim_token: optional("VOTPORT_SCIM_TOKEN"),
+        replica_token: optional("VOTPORT_REPLICA_TOKEN"),
         smtp_from: optional("VOTPORT_NOTIFY_SMTP_FROM"),
         smtp_to: optional("VOTPORT_NOTIFY_SMTP_TO"),
         public_url,

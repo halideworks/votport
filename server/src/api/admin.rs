@@ -1783,6 +1783,7 @@ const SETTINGS_KEYS: &[&str] = &[
     "sso_session_secs",
     "scim_token",
     "scim_token_previous",
+    "replica_token",
     "require_provisioning",
     "draining",
 ];
@@ -1918,6 +1919,8 @@ fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
         "scim_token_set": overlay.scim_token_set,
         "scim_token_source": overlay.scim_token_source,
         "scim_token_previous_set": overlay.scim_token_previous_set,
+        "replica_token_set": overlay.replica_token_set,
+        "replica_token_source": overlay.replica_token_source,
         "require_provisioning": resolved.require_provisioning,
         "require_provisioning_source": overlay.require_provisioning_source,
         "draining": resolved.draining,
@@ -2062,7 +2065,8 @@ pub async fn put_settings(
             | "smtp_from"
             | "smtp_to"
             | "scim_token"
-            | "scim_token_previous" => write_secret(key, value)?,
+            | "scim_token_previous"
+            | "replica_token" => write_secret(key, value)?,
             "audit_retention_days" | "upload_retention_days" => write_u64(key, value, true)?,
             "default_max_total_bytes"
             | "default_max_links"
@@ -2077,9 +2081,10 @@ pub async fn put_settings(
         // SCIM bearers are stored hashed, and saving a new one keeps the
         // one it replaces valid as scim_token_previous until it is cleared.
         let write = match (*key, write) {
-            ("scim_token" | "scim_token_previous", crate::store::SettingWrite::Set(text))
-                if !text.is_empty() =>
-            {
+            (
+                "scim_token" | "scim_token_previous" | "replica_token",
+                crate::store::SettingWrite::Set(text),
+            ) if !text.is_empty() => {
                 if *key == "scim_token" {
                     if let Some(current) = app
                         .store
@@ -5257,6 +5262,7 @@ mod ops_tests {
             smtp_username: None,
             smtp_password: None,
             scim_token: None,
+            replica_token: None,
             smtp_from: None,
             smtp_to: None,
             public_url: None,

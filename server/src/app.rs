@@ -63,6 +63,8 @@ pub struct App {
     pub login_throttle: crate::auth::IpThrottle,
     /// Failed SCIM bearers per client bucket; a correct bearer resets it.
     pub scim_throttle: crate::auth::IpThrottle,
+    /// The same for the replica bearer.
+    pub replica_throttle: crate::auth::IpThrottle,
     /// argon2 budget for admin sign-in. Separate from the link budget below:
     /// sharing one meant a flood of link password guesses queued ahead of the
     /// operator, which is a lockout with extra steps. Holding the whole
@@ -811,6 +813,7 @@ fn build_under_lease(
         change_password_throttle: LoginThrottle::new(),
         login_throttle: crate::auth::IpThrottle::new(),
         scim_throttle: crate::auth::IpThrottle::new(),
+        replica_throttle: crate::auth::IpThrottle::new(),
         login_permits: Arc::new(tokio::sync::Semaphore::new(VERIFY_PERMITS)),
         link_verify_permits: Arc::new(tokio::sync::Semaphore::new(VERIFY_PERMITS)),
         change_password_permits: Arc::new(tokio::sync::Semaphore::new(VERIFY_PERMITS)),
@@ -2387,6 +2390,7 @@ pub fn router(app: Arc<App>) -> Router {
                 .patch(api::scim::patch_user)
                 .delete(api::scim::delete_user),
         )
+        .route("/api/replica", get(api::replica::replica_archive))
         .route("/api/push-identity", get(push_identity))
         .route("/api/r/{token}", get(api::link_info))
         .route("/api/receipt-key", get(api::receipt_key))

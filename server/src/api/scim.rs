@@ -105,7 +105,7 @@ fn scim_json(status: StatusCode, body: Value) -> Response {
 const HASH_PREFIX: &str = "sha256:";
 
 /// The stored form of a bearer: the settings row never holds the token.
-pub(crate) fn hash_bearer(token: &str) -> String {
+pub fn hash_bearer(token: &str) -> String {
     format!(
         "{HASH_PREFIX}{}",
         hex::encode(Sha256::digest(token.as_bytes()))
@@ -114,7 +114,7 @@ pub(crate) fn hash_bearer(token: &str) -> String {
 
 /// A stored hash matches by digest; an env value (never hashed) matches
 /// byte for byte. Both comparisons are constant time.
-fn bearer_matches(stored: &str, presented: &str) -> bool {
+pub(crate) fn bearer_matches(stored: &str, presented: &str) -> bool {
     if stored.is_empty() || presented.is_empty() {
         return false;
     }
