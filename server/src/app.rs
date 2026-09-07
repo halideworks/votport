@@ -839,17 +839,14 @@ pub async fn suspend_sessions(app: &App) {
         }
     }
     let count = replies.len();
-    if count != 0 {
-        let all = futures_util::future::join_all(replies);
-        match tokio::time::timeout(std::time::Duration::from_secs(30), all).await {
-            Ok(_) => tracing::info!(count, "suspended upload sessions for restart"),
-            Err(_) => tracing::warn!(count, "suspending upload sessions timed out"),
-        }
+    if count == 0 {
+        return;
     }
-    // The checkpoints are on disk and nothing serves any more, so the next
-    // instance may take the data directory before this process has exited.
-    #[cfg(unix)]
-    let _ = rustix::fs::flock(&app._data_lock, rustix::fs::FlockOperation::Unlock);
+    let all = futures_util::future::join_all(replies);
+    match tokio::time::timeout(std::time::Duration::from_secs(30), all).await {
+        Ok(_) => tracing::info!(count, "suspended upload sessions for restart"),
+        Err(_) => tracing::warn!(count, "suspending upload sessions timed out"),
+    }
 }
 
 /// Re-attaches the upload sessions the last shutdown suspended, and returns
@@ -981,8 +978,6 @@ fn web_build(web_root: &std::path::Path) -> String {
     hex::encode(hasher.finalize())[..16].to_owned()
 }
 
-/// Remove only VOTPORT-owned outbound staging entries. `symlink_metadata` and
-/// per-entry removal keep cleanup from traversing an operator-created link.
 /// Takes the single-writer lock. flock is advisory and per open file
 /// description, so the returned handle must stay open; it is released by
 /// the kernel when the process exits, however it exits.
@@ -1007,6 +1002,17 @@ fn lock_data_dir(data_dir: &std::path::Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
+/// Releases the data directory lock without exiting. Production never calls
+/// this: push and serve listener threads and blocking store work can outlive
+/// suspend_sessions, so the lock has to hold until the process is gone. The
+/// restart e2e tests boot a second App in the same process and need it.
+pub fn release_data_lock(app: &App) {
+    #[cfg(unix)]
+    let _ = rustix::fs::flock(&app._data_lock, rustix::fs::FlockOperation::Unlock);
+}
+
+/// Remove only VOTPORT-owned outbound staging entries. `symlink_metadata` and
+/// per-entry removal keep cleanup from traversing an operator-created link.
 fn clean_outbound_stage(data_dir: &std::path::Path) {
     let root = data_dir.join("outbound.stage");
     let Ok(root_meta) = std::fs::symlink_metadata(&root) else {

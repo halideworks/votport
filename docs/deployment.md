@@ -632,12 +632,14 @@ Layout:
   [Litestream](#litestream)) on the live host and `litestream restore` on the
   standby before starting it. The RPO is Litestream's replication interval;
   the identity files under `data/` are static and copy once.
-- Caddy in front of both hosts with a health-checked upstream pair:
+- Caddy in front of both hosts with a health-checked upstream pair. The
+  check is `/healthz`, so a drained live instance keeps serving downloads and
+  admin until it is stopped, and the standby takes over once it is up:
 
 ```caddyfile
 reverse_proxy live:8321 standby:8321 {
 	lb_policy first
-	health_uri /readyz
+	health_uri /healthz
 	health_interval 5s
 }
 ```
@@ -648,9 +650,10 @@ that follows the failover (a floating IP, or a DNS name with a short TTL), and
 the generated `push.crt` under `data/` moves with the volume so pinned
 senders keep matching.
 
-Planned failover: turn on **Drain for restart** so `/readyz` goes 503 and new
-upload sessions are refused, wait for `sessions_active` in `/readyz` (or
-`votport_sessions_active` on `/metrics`) to reach 0, stop the live container,
+Planned failover: turn on **Drain for restart** so new upload sessions are
+refused and `/readyz` goes 503, poll `/readyz` on the live host directly
+(not through the proxy) until `sessions_active` reaches 0, stop the live
+container,
 move or restore `data/`, start the standby, turn drain off. Unplanned
 failover skips the drain: in-flight uploads whose worker checkpointed resume
 from that offset once the standby is up, uploads killed before a checkpoint
@@ -677,14 +680,16 @@ upload sessions, throttles, and rate state live in process memory. Running two
 replicas behind one hostname is unsupported; scale up (CPU, RAM, faster disk),
 not out. This is the deliberate trade for atomic verified publication with no
 external dependencies; see docs/multi-tenancy.md non-goals. Availability
-comes from a warm standby instead, described under
+comes from a stopped standby instead, described under
 [High availability](#high-availability-active-passive) below.
 
-`GET /healthz` answers 200 when the database and both storage roots answer.
-`GET /readyz` additionally answers 503 while **Drain for restart** is on, with
-a JSON body `{"ready","draining","sessions_active"}`, so a balancer or a
-failover script can tell "this process is fine" from "stop sending it new
-work". Point the proxy's health check at `/readyz`.
+`GET /healthz` answers 200 when the database and both storage roots answer,
+and is what a proxy health check should poll. `GET /readyz` additionally
+answers 503 while **Drain for restart** is on, with a JSON body
+`{"ready","draining","sessions_active"}`, for failover scripts and
+orchestrators that wait for a drained instance. Do not point a single-upstream
+proxy at `/readyz`: drain keeps downloads and the admin pages up on purpose,
+and a proxy that drops the upstream on 503 would take them down.
 
 In-flight upload sessions survive a restart. On SIGTERM the process stops
 serving, then each upload worker records how far its file is contiguously
