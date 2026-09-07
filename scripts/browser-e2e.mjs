@@ -119,7 +119,7 @@ await Promise.all([
 ]);
 await page.focus("#cancel");
 await page.keyboard.press("Enter");
-await page.waitForSelector("#confirm-cancel[open]");
+await page.getByRole("dialog", { name: "Cancel transfer", exact: true }).waitFor();
 await page.keyboard.press("Tab");
 await page.keyboard.press("Enter");
 await page.waitForFunction(() =>

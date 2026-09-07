@@ -93,9 +93,9 @@
 
 <!-- Native <dialog>: focus trap, Esc to dismiss and a backdrop come with it.
      "Continue transfer" is first so Enter is the safe answer. -->
-<dialog id="confirm-cancel" class="modal">
+<dialog id="confirm-cancel" class="modal" aria-labelledby="confirm-cancel-title" aria-describedby="confirm-cancel-detail">
   <form method="dialog">
-    <h2>Cancel transfer</h2>
+    <h2 id="confirm-cancel-title">Cancel transfer</h2>
     <p id="confirm-cancel-detail">The file in progress is discarded. Files already delivered are kept.</p>
     <div class="modal-actions">
       <button value="keep" class="ghost">Continue transfer</button>
