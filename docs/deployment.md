@@ -703,8 +703,9 @@ and QUIC sessions die with the process and are retried by the client. Browser
 downloads that stream to disk (Chromium's save-to-folder path) keep resuming
 by byte range for ten minutes, long enough for a failover; when the cookie
 secret was rotated by a promotion, a password-gated delivery asks for the
-password again and then continues from the same offset, and on a capped
-delivery the resumed download counts again. Browsers on the plain download
+password again and then continues from the same offset; on a capped
+delivery that resume consumes another count, and a delivery whose cap was
+already spent cannot resume after a promotion. Browsers on the plain download
 fallback (Firefox, Safari) need a click to retry, and the desktop client
 resumes on its own. Per-IP throttles and session rate windows reset. Nothing
 is lost that had been published.

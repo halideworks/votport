@@ -336,10 +336,9 @@ test('streamToWritable restarts from zero when a resume is answered with 200', a
   assert.equal(writable.written(), 8);
 });
 
-test('streamToWritable keeps resuming for the time budget, not a fixed count', async () => {
+test('streamToWritable keeps resuming for the waiting budget, not a fixed count', async () => {
   let clock = 0;
   const sleep = async (ms) => { clock += ms; };
-  const now = () => clock;
   let calls = 0;
   const responses = [];
   for (let i = 0; i < 40; i += 1) responses.push({ ok: false, status: 503, body: null });
@@ -349,15 +348,48 @@ test('streamToWritable keeps resuming for the time budget, not a fixed count', a
   writable.write(bytes(4, 1));
   // Forty 503s at the 8 s cap is nearly five minutes of waiting; the ten
   // minute budget covers it, a five-attempt limit would not.
-  const total = await streamToWritable(fetchFn, writable, { download_url: '/f/0' }, { sleep, now });
+  const total = await streamToWritable(fetchFn, writable, { download_url: '/f/0' }, { sleep });
   assert.equal(calls, 41);
   assert.ok(clock > 4 * 60 * 1000 && clock < 10 * 60 * 1000, `waited ${clock} ms`);
   assert.equal(total, 4);
   await assert.rejects(
     streamToWritable(async () => ({ ok: false, status: 503, body: null }), fakeWritable(),
-      { download_url: '/f/0' }, { sleep, now, retryBudgetMs: 20000 }),
+      { download_url: '/f/0' }, { sleep, retryBudgetMs: 20000 }),
     /server returned 503/,
   );
+});
+
+test('streamToWritable does not charge streaming time against the budget', async () => {
+  // A body that takes far longer than the budget to deliver, then drops:
+  // the resume must still happen, since only backoff sleeps are budgeted.
+  const slowBody = {
+    getReader() {
+      let delivered = 0;
+      return {
+        async read() {
+          if (delivered === 0) {
+            delivered += 1;
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            return { value: bytes(4, 1), done: false };
+          }
+          throw new TypeError('network dropped after a long stream');
+        },
+        releaseLock() {},
+      };
+    },
+  };
+  const responses = [
+    { ok: true, status: 200, body: slowBody },
+    { ok: true, status: 206, body: bodyOf([bytes(4, 2)]) },
+  ];
+  const requests = [];
+  const fetchFn = async (url, options) => { requests.push(options.headers); return responses.shift(); };
+  const writable = fakeWritable();
+  // The budget is smaller than any realistic transfer time; it bounds
+  // waiting, not streaming.
+  const total = await streamToWritable(fetchFn, writable, { download_url: '/f/0' }, { ...noSleep, retryBudgetMs: 1000 });
+  assert.equal(total, 8);
+  assert.deepEqual(requests, [{}, { Range: 'bytes=4-' }]);
 });
 
 test('streamToWritable re-authorizes on 401 and resumes from its offset', async () => {

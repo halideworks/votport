@@ -61,28 +61,26 @@ export async function saveBatchFiles(response, directory, files, names, onComple
   }
 }
 
-export const SAVE_RETRY_LIMIT = 5;
 // A failover (drain, stop, promote) takes minutes, not seconds; keep
-// resuming for this long before giving a file up.
+// resuming for this much waiting before giving a file up. Time spent
+// streaming does not count, so a long transfer keeps its retries.
 export const SAVE_RETRY_BUDGET_MS = 10 * 60 * 1000;
 export const SAVE_RETRY_CAP_MS = 8000;
 
 // Streams file.download_url into an open writable, retrying transient
 // failures with a byte-range resume so bytes already on disk are kept. A
-// resume answered with 200 instead of 206 (range ignored, e.g. the download
-// lease expired) starts the file over. Retries run until options.retries
-// attempts when given, otherwise until options.retryBudgetMs of waiting has
-// elapsed. A 401 or 403 mid-file means the authorization cookie stopped
-// verifying (a failover that rotated the cookie secret); options.onAuthLost
-// may restore it, and a true return resumes from the same offset. The
-// caller closes or aborts the writable. fetchFn, sleep, and now are
-// injectable for tests.
+// resume answered with 200 instead of 206 (a server that ignored the range)
+// starts the file over. Retries run until options.retries attempts when
+// given, otherwise until options.retryBudgetMs of backoff has been slept.
+// A 401 or 403 mid-file means the authorization cookie stopped verifying
+// (a failover that rotated the cookie secret); options.onAuthLost may
+// restore it, and a true return resumes from the same offset. The caller
+// closes or aborts the writable. fetchFn and sleep are injectable for tests.
 export async function streamToWritable(fetchFn, writable, file, options = {}) {
   const retries = options.retries;
   const budgetMs = options.retryBudgetMs ?? SAVE_RETRY_BUDGET_MS;
   const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-  const now = options.now || (() => Date.now());
-  const started = now();
+  let waited = 0;
   let written = 0;
   let reauthorized = 0;
   for (let attempt = 0; ; attempt += 1) {
@@ -120,11 +118,13 @@ export async function streamToWritable(fetchFn, writable, file, options = {}) {
     } catch (error) {
       const transient = error.transient || error instanceof TypeError;
       if (!transient) throw error;
+      const delay = Math.min(500 * 2 ** Math.min(attempt, 10), SAVE_RETRY_CAP_MS);
       const exhausted = retries === undefined
-        ? now() - started >= budgetMs
+        ? waited + delay > budgetMs
         : attempt + 1 >= retries;
       if (exhausted) throw error;
-      await sleep(Math.min(500 * 2 ** Math.min(attempt, 10), SAVE_RETRY_CAP_MS));
+      waited += delay;
+      await sleep(delay);
     }
   }
 }
