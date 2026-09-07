@@ -169,3 +169,20 @@ for (let run = 0; run < 3; run++) {
 console.log({ milliseconds: times, median: times.toSorted((a, b) => a - b)[1] });
 JS
 ```
+
+## Deliver project suggestions
+
+On 2026-09-07, Chromium measured the Deliver page's project suggestion list with
+one mocked library response per folder navigation. The fixture used 50
+navigations with 1,000 unique directories in each response (the same fixture
+for both runs); the benchmark ends with 50,000 datalist options before the cap
+and 200 after it. Navigation timing includes the response handling and visible
+library row rendering, and has no page errors.
+
+The run used a disposable Chromium harness and local static server. The
+uncapped comparison loaded the page script from fixed commit
+`ec14166b010842eb88f6668c26f6d419fdb180c8`; the capped comparison loaded the
+working tree. A 30-second observer timeout fails a run that does not render
+the expected option count. Before the cap, the median navigation was 197.8 ms
+(244.1 ms median across the final five navigations), with 50,000 final options.
+After the cap, those medians were 104.0 ms and 95.3 ms, with 200 final options.

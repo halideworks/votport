@@ -6,3 +6,12 @@ export function parseLibraryPath(path) {
   const parts = value.split('/');
   return parts.some((part) => !part || part === '.' || part === '..') ? null : parts;
 }
+
+export function retainLibraryProjectSuggestions(suggestions, directories, current, limit) {
+  for (const directory of directories) suggestions.add(directory);
+  if (current) {
+    suggestions.delete(current);
+    suggestions.add(current);
+  }
+  for (const entry of [...suggestions].slice(0, -limit)) suggestions.delete(entry);
+}

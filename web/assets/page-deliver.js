@@ -3,6 +3,7 @@
 
 import {
   parseLibraryPath,
+  retainLibraryProjectSuggestions,
 } from '/assets/library-paths.js';
 import { entryFiles, runUploadBatch, uploadLibraryFile } from '/assets/upload-entries.js';
 import {
@@ -328,6 +329,7 @@ $('outbound-grants-load-more').addEventListener('click', () => refreshGrants(fal
 
 const MAX_LIBRARY_SELECTION = 64;
 const MAX_LIBRARY_SEARCH_RESULTS = 200;
+const MAX_LIBRARY_PROJECT_SUGGESTIONS = 200;
 const selectedLibraryPaths = new Map();
 let deliverGrantBusy = false;
 let libraryFiles = [];
@@ -637,8 +639,12 @@ function renderLibrary(response) {
   libraryDirectories = (response.directories || []).filter((path) => parseLibraryPath(path));
   libraryTruncated = Boolean(response.truncated);
   if (!$('library-search').value.trim()) {
-    if (libraryDirectory) libraryProjectSuggestions.add(libraryDirectory);
-    for (const directory of libraryDirectories) libraryProjectSuggestions.add(directory);
+    retainLibraryProjectSuggestions(
+      libraryProjectSuggestions,
+      libraryDirectories,
+      libraryDirectory,
+      MAX_LIBRARY_PROJECT_SUGGESTIONS,
+    );
     updateProjectSuggestions(libraryProjectSuggestions);
   }
   updateLibrarySelectionStatus();
