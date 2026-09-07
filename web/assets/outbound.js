@@ -19,6 +19,7 @@ import {
 
 const $ = (id) => document.getElementById(id);
 const token = window.location.pathname.split('/').filter(Boolean).pop();
+let metadataHasPassword = false;
 let metadataFiles = [];
 let renderedFileCount = 0;
 let metadataTotal = 0;
@@ -149,11 +150,28 @@ function validateMetadataFiles(files) {
   }
 }
 
+// Resolvers waiting for the next successful password verification, from a
+// download whose cookie stopped verifying mid-file.
+const reauthorizeWaiters = [];
+
+// Called by a streaming save when the server answers 401 or 403 mid-file:
+// after a failover that rotated the cookie secret the verified-password
+// cookie is dead. Shows the password gate and resolves true once the
+// recipient has verified again, so the save resumes from its offset.
+function reauthorizeDownload() {
+  if (!$('download-gate') || !metadataHasPassword) return Promise.resolve(false);
+  showPasswordGate();
+  $('status').textContent = 'Password required to continue the download';
+  return new Promise((resolve) => { reauthorizeWaiters.push(resolve); });
+}
+
 async function saveFile(directory, file, name) {
   const handle = await directory.getFileHandle(name, { create: true });
   const writable = await handle.createWritable();
   try {
-    await streamToWritable((...args) => fetch(...args), writable, file);
+    await streamToWritable((...args) => fetch(...args), writable, file, {
+      onAuthLost: reauthorizeDownload,
+    });
     await writable.close();
   } catch (error) {
     await writable.abort().catch(() => {});
@@ -230,7 +248,8 @@ async function fetchMetadataPage(offset, limit = FILE_RENDER_BATCH_SIZE) {
   }
   let body = null;
   try { body = await response.json(); } catch { /* non-JSON error page */ }
-  if ((body?.needs_password || body?.has_password) && !body.authorized) {
+  metadataHasPassword = Boolean(body?.needs_password || body?.has_password);
+  if (metadataHasPassword && !body.authorized) {
     if (offset === 0) showPasswordGate();
     throw new Error('outbound grant password required');
   }
@@ -533,6 +552,14 @@ $('download-password-form').addEventListener('submit', async (event) => {
     try { body = await response.json(); } catch { /* non-JSON error page */ }
     if (!response.ok) throw new Error(body?.error || `verification failed (${response.status})`);
     $('download-password').value = '';
+    if (reauthorizeWaiters.length) {
+      // A save is waiting: hand the page back to it instead of reloading.
+      $('download-gate').hidden = true;
+      $('download-content').hidden = false;
+      $('status').textContent = 'Resuming download';
+      for (const resolve of reauthorizeWaiters.splice(0)) resolve(true);
+      return;
+    }
     await loadMetadata();
   } catch (verificationError) {
     error.textContent = verificationError.message;
