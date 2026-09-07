@@ -3162,14 +3162,18 @@ async fn standby_pull_stages_the_live_copy_and_a_boot_promotes_it() {
         .collect();
     assert!(ids.contains(&before.as_str()), "{ids:?}");
     assert!(!ids.contains(&after.as_str()), "{ids:?}");
-    // The identity files came along byte for byte.
-    for name in ["secret", "receipt.key"] {
-        assert_eq!(
-            std::fs::read(server.application.config.data_dir.join(name)).unwrap(),
-            std::fs::read(promoted.application.config.data_dir.join(name)).unwrap(),
-            "{name} replicated"
-        );
-    }
+    // The receipt signer came along byte for byte; the cookie secret is
+    // rotated by every restore on purpose, so sessions do not survive.
+    assert_eq!(
+        std::fs::read(server.application.config.data_dir.join("receipt.key")).unwrap(),
+        std::fs::read(promoted.application.config.data_dir.join("receipt.key")).unwrap(),
+        "receipt.key replicated"
+    );
+    assert_ne!(
+        std::fs::read(server.application.config.data_dir.join("secret")).unwrap(),
+        std::fs::read(promoted.application.config.data_dir.join("secret")).unwrap(),
+        "promotion rotates the cookie secret"
+    );
 }
 
 /// A staging file shorter than its checkpointed prefix (power loss before

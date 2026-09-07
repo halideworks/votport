@@ -659,9 +659,11 @@ Layout:
   503 with `replica_lag_secs`, so a proxy never routes to it and a
   failover script can see how fresh the copy is. Promotion is stopping the
   standby process and starting `votport` normally over the same data
-  directory. The RPO is the interval: links, settings, and resume records
-  written on the live instance after the last pull are lost, and uploads in
-  that window start over. Litestream (see [Litestream](#litestream)) remains
+  directory. Like any restore, promotion rotates the cookie secret, so
+  every admin signs in again; receipt and push identities carry over. The
+  RPO is the interval: links, settings, and resume records written on the
+  live instance after the last pull are lost, and uploads in that window
+  start over. Litestream (see [Litestream](#litestream)) remains
   an option for a tighter RPO with an operator-owned restore step.
 - Caddy in front of both hosts with a health-checked upstream pair. The
   check is `/healthz`, so a drained live instance keeps serving downloads and
