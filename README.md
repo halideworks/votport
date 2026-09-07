@@ -293,8 +293,8 @@ hashed, verified range by range, independent of every proxy in between.
    Library upload requests retry within the current browser or desktop
    operation. Selecting a file again starts a fresh upload, so a changed
    file cannot reuse another attempt's partial bytes even when its name,
-   size, and timestamp match. Abandoned partial library uploads are removed
-   when the service restarts.
+   size, and timestamp match. A minute sweep removes partial library uploads
+   idle longer than `VOTPORT_SESSION_IDLE_SECS` while preserving active requests.
    Delivery links have an optional notification policy for the first download
    and completed delivery. Issued links show aggregate and per-file download
    starts with first and most recent timestamps. For multi-file links,

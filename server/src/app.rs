@@ -3586,6 +3586,12 @@ pub async fn session_sweeper(app: Arc<App>) {
                 app.sessions.sweep(idle);
                 sweep_push_tickets(&app);
                 crate::api::serve::prune(&app);
+                let sweep_app = Arc::clone(&app);
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    crate::api::outbound::sweep_upload_stages(&sweep_app, std::time::SystemTime::now());
+                }).await {
+                    tracing::warn!(%error, "library upload cleanup task failed");
+                }
             }
             _ = day.tick() => {
                 // Skip this tick rather than sweep on guessed settings: a
