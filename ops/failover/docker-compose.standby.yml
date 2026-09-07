@@ -9,15 +9,20 @@
 #
 # For the shared-volume topology use the main docker-compose.yml on both
 # hosts instead; the standby simply is not started until failover.
+#
+# Ports are published on the host's LAN address (10.0.0.6 here) rather than
+# loopback so the watcher and the failover script on another host can poll
+# /healthz and /readyz directly; keep that address off the public interface.
 services:
   votport-standby:
     profiles: ["standby"]
     image: ghcr.io/halideworks/votport:vX.Y.Z@sha256:<published-digest>
-    command: ["votport", "standby"]
+    # The image has no entrypoint and /app is not on PATH.
+    command: ["/app/votport", "standby"]
     restart: unless-stopped
     user: "1000:1000"
     ports:
-      - "127.0.0.1:8104:8080"
+      - "10.0.0.6:8103:8080"
     environment:
       VOTPORT_STANDBY_SOURCE: "https://drop.example.com"
       VOTPORT_REPLICA_TOKEN: "${VOTPORT_REPLICA_TOKEN:?set VOTPORT_REPLICA_TOKEN in .env}"
@@ -32,10 +37,11 @@ services:
     stop_grace_period: 5m
     user: "1000:1000"
     ports:
-      - "127.0.0.1:8103:8080"
+      - "10.0.0.6:8103:8080"
     environment:
       VOTPORT_ADMIN_PASSWORD: "${VOTPORT_ADMIN_PASSWORD:?set VOTPORT_ADMIN_PASSWORD in .env}"
       VOTPORT_PUBLIC_URL: "https://drop.example.com"
+      # Kept on the live profile so a future standby can pull from this host.
       VOTPORT_REPLICA_TOKEN: "${VOTPORT_REPLICA_TOKEN:?set VOTPORT_REPLICA_TOKEN in .env}"
     volumes:
       - ./data:/data
