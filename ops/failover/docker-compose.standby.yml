@@ -1,0 +1,43 @@
+# Standby host compose file for the replicated topology. Two profiles over
+# one data volume: `standby` runs `votport standby` pulling copies from the
+# live instance; `live` runs votport normally over the same volume, which
+# applies the last copy at boot. Promotion is switching profiles:
+#
+#   docker compose --profile standby up -d          # normal operation
+#   docker compose --profile standby stop \
+#     && docker compose --profile live up -d        # promote
+#
+# For the shared-volume topology use the main docker-compose.yml on both
+# hosts instead; the standby simply is not started until failover.
+services:
+  votport-standby:
+    profiles: ["standby"]
+    image: ghcr.io/halideworks/votport:vX.Y.Z@sha256:<published-digest>
+    command: ["votport", "standby"]
+    restart: unless-stopped
+    user: "1000:1000"
+    ports:
+      - "127.0.0.1:8104:8080"
+    environment:
+      VOTPORT_STANDBY_SOURCE: "https://drop.example.com"
+      VOTPORT_REPLICA_TOKEN: "${VOTPORT_REPLICA_TOKEN:?set VOTPORT_REPLICA_TOKEN in .env}"
+      VOTPORT_STANDBY_INTERVAL_SECS: "60"
+    volumes:
+      - ./data:/data
+
+  votport:
+    profiles: ["live"]
+    image: ghcr.io/halideworks/votport:vX.Y.Z@sha256:<published-digest>
+    restart: unless-stopped
+    stop_grace_period: 5m
+    user: "1000:1000"
+    ports:
+      - "127.0.0.1:8103:8080"
+    environment:
+      VOTPORT_ADMIN_PASSWORD: "${VOTPORT_ADMIN_PASSWORD:?set VOTPORT_ADMIN_PASSWORD in .env}"
+      VOTPORT_PUBLIC_URL: "https://drop.example.com"
+      VOTPORT_REPLICA_TOKEN: "${VOTPORT_REPLICA_TOKEN:?set VOTPORT_REPLICA_TOKEN in .env}"
+    volumes:
+      - ./data:/data
+      - /mnt/nfs/vot-in:/received
+      - /mnt/nfs/vot-out:/outbound
