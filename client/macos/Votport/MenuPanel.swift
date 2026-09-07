@@ -11,7 +11,7 @@ struct MenuPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
-                Image(nsImage: NSApp.applicationIconImage)
+                Image("Mark")
                     .resizable()
                     .frame(width: 22, height: 22)
                 Text("votport")

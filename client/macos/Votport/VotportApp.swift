@@ -46,7 +46,8 @@ enum Screen: String, CaseIterable, Identifiable {
 
     var symbol: String {
         switch self {
-        case .send: return "sailboat"
+        // The same glyph as the Windows shell's Send icon.
+        case .send: return "paperplane"
         case .receive: return "arrow.down.doc"
         case .links: return "link"
         case .transfers: return "list.bullet.rectangle"
@@ -74,10 +75,12 @@ struct MainWindow: View {
         NavigationSplitView {
             VStack(alignment: .leading, spacing: 0) {
                 // The web masthead's mark: the ship on its square, the name.
+                // The Mark asset, not the app icon: the icon sits inset on
+                // Apple's grid and would draw smaller than Windows' 24 pt mark.
                 HStack(spacing: 8) {
-                    Image(nsImage: NSApp.applicationIconImage)
+                    Image("Mark")
                         .resizable()
-                        .frame(width: 26, height: 26)
+                        .frame(width: 24, height: 24)
                     Text("votport")
                         .font(Type.sans(14, .semibold, relativeTo: .body))
                 }

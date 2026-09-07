@@ -3,8 +3,8 @@ import SwiftUI
 import VotportCore
 
 /// The port's links: the request links senders ship to, and the deliveries
-/// recipients pull. Issue a request or open the library sheet for a new
-/// delivery at the top; close or revoke what is done below.
+/// recipients pull. Each section opens with its issue form: the request
+/// form inline, the delivery browser as a sheet.
 struct LinksView: View {
     @EnvironmentObject private var port: PortStore
     @State private var newDelivery = false
@@ -22,13 +22,11 @@ struct LinksView: View {
                     .tracking(1.5)
                     .foregroundStyle(Tokens.muted)
 
-                issueForm
-
-                section("REQUESTS", empty: "No open request links.", items: port.requests) { link in
+                section("REQUESTS", empty: "No open request links.", items: port.requests, form: issueForm) { link in
                     RequestRow(link: link) { port.closeRequest(link.id) }
                 }
 
-                section("DELIVERIES", empty: "No deliveries issued yet.", items: port.deliveries) { delivery in
+                section("DELIVERIES", empty: "No deliveries issued yet.", items: port.deliveries, form: deliveryCard) { delivery in
                     DeliveryRow(delivery: delivery) { port.revokeDelivery(delivery.id) }
                 }
             }
@@ -46,12 +44,8 @@ struct LinksView: View {
 
     private var issueForm: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Issue a request link")
-                    .font(Type.sans(13, .semibold, relativeTo: .body))
-                Spacer()
-                Button("New delivery") { newDelivery = true }
-            }
+            Text("Issue a request link")
+                .font(Type.sans(13, .semibold, relativeTo: .body))
             HStack {
                 TextField("Label, e.g. Dailies from Alex", text: $label)
                     .textFieldStyle(.roundedBorder)
@@ -59,17 +53,13 @@ struct LinksView: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 160)
             }
-            HStack {
-                TextField("Closes after (days)", text: $expiresDays)
-                    .numeric($expiresDays)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 160)
-                TextField("Accepts up to (GB)", text: $maxGigabytes)
-                    .numeric($maxGigabytes, decimal: true)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 160)
-                Spacer()
-                Button("Issue") { issue() }
+            HStack(alignment: .bottom) {
+                NumberField("Closes after", unit: "days", placeholder: "Never", text: $expiresDays)
+                NumberField("Accepts up to", unit: "GB", placeholder: "Port default", text: $maxGigabytes, decimal: true)
+                Button("Issue request link") { issue() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .frame(maxWidth: .infinity)
                     .keyboardShortcut(.defaultAction)
                     .disabled(label.trimmingCharacters(in: .whitespaces).isEmpty || port.busy)
             }
@@ -95,11 +85,31 @@ struct LinksView: View {
         .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
+    /// The way to a new delivery, as the first card of DELIVERIES: the
+    /// library browser needs the room of a sheet.
+    private var deliveryCard: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Issue a delivery")
+                    .font(Type.sans(13, .semibold, relativeTo: .body))
+                Text("Pick files from the library; the recipient gets one link.")
+                    .font(Type.callout)
+                    .foregroundStyle(Tokens.muted)
+            }
+            Spacer()
+            Button("New delivery") { newDelivery = true }
+                .buttonStyle(.borderedProminent)
+        }
+        .padding(14)
+        .background(Tokens.panel)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
     private func issue() {
         let spec = RequestSpec(
             label: label.trimmingCharacters(in: .whitespaces),
             password: password.isEmpty ? nil : password,
-            expiresDays: UInt32(expiresDays.trimmingCharacters(in: .whitespaces)),
+            expiresDays: positive(expiresDays),
             maxBytes: gigabytes(maxGigabytes))
         port.issueRequest(spec) { link in
             guard let link else { return }
@@ -111,22 +121,23 @@ struct LinksView: View {
     }
 
     /// A cap typed in gigabytes, or nil for anything that is not a sane
-    /// number (the server then applies its own cap).
+    /// number above zero (the server then applies its own cap).
     private func gigabytes(_ text: String) -> UInt64? {
         guard let value = Double(text.trimmingCharacters(in: .whitespaces)),
-            value.isFinite, value >= 0, value <= 1_000_000
+            value.isFinite, value > 0, value <= 1_000_000
         else { return nil }
         return UInt64(value * 1_000_000_000)
     }
 
-    private func section<Item: Identifiable, Row: View>(
-        _ title: String, empty: String, items: [Item], @ViewBuilder row: @escaping (Item) -> Row
+    private func section<Item: Identifiable, Form: View, Row: View>(
+        _ title: String, empty: String, items: [Item], form: Form, @ViewBuilder row: @escaping (Item) -> Row
     ) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(title)
                 .font(Type.label)
                 .tracking(1.5)
                 .foregroundStyle(Tokens.muted)
+            form
             if items.isEmpty {
                 Text(empty).foregroundStyle(Tokens.muted)
             } else {
@@ -144,16 +155,72 @@ func copy(_ text: String) {
     NSPasteboard.general.setString(text, forType: .string)
 }
 
-extension View {
-    /// Keeps a field to digits (and one point when `decimal`): an entry
-    /// with anything else is refused whole, as a typed key or a paste, so
-    /// "1,5" never turns into 15.
-    func numeric(_ text: Binding<String>, decimal: Bool = false) -> some View {
-        onChange(of: text.wrappedValue) { old, value in
-            let digitsOnly = value.allSatisfy { ($0.isASCII && $0.isNumber) || (decimal && $0 == ".") }
-            let points = value.filter { $0 == "." }.count
-            if !digitsOnly || points > 1 { text.wrappedValue = old }
+/// A whole number above zero, or nil: a typed 0 means the same as an empty
+/// field (a link that never closes, unlimited downloads), never a zero the
+/// server would take literally.
+func positive(_ text: String) -> UInt32? {
+    UInt32(text.trimmingCharacters(in: .whitespaces)).flatMap { $0 > 0 ? $0 : nil }
+}
+
+/// A number entry that reads as one: the quantity as its label, the unit
+/// after the field, and a stepper. The field keeps to digits (and one point
+/// when `decimal`): an entry with anything else is refused whole, as a typed
+/// key or a paste, so "1,5" never turns into 15. Empty means the default
+/// the placeholder names: the stepper counts up from 1 and a step below 1
+/// empties the field again, so 0 is never sent.
+struct NumberField: View {
+    let title: String
+    let unit: String
+    let placeholder: String
+    @Binding var text: String
+    var decimal = false
+
+    init(_ title: String, unit: String, placeholder: String, text: Binding<String>, decimal: Bool = false) {
+        self.title = title
+        self.unit = unit
+        self.placeholder = placeholder
+        _text = text
+        self.decimal = decimal
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(Type.caption)
+                .foregroundStyle(Tokens.muted)
+            HStack(spacing: 4) {
+                TextField(placeholder, text: $text)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 96)
+                    .accessibilityLabel(title)
+                    .onChange(of: text) { old, value in
+                        let digitsOnly = value.allSatisfy { ($0.isASCII && $0.isNumber) || (decimal && $0 == ".") }
+                        let points = value.filter { $0 == "." }.count
+                        if !digitsOnly || points > 1 { text = old }
+                    }
+                Stepper(unit, value: stepped, in: 0...1_000_000, step: 1)
+                    .font(Type.callout)
+                    .foregroundStyle(Tokens.muted)
+                    .accessibilityLabel("\(title) in \(unit)")
+            }
         }
+    }
+
+    /// The stepper's view of the text: empty is 0 (one step up gives 1),
+    /// a step down to 0 empties the field, and a fraction keeps its digits
+    /// after the point.
+    private var stepped: Binding<Double> {
+        Binding(
+            get: { Double(text) ?? 0 },
+            set: { value in
+                if value < 1 {
+                    text = ""
+                } else if let whole = Int(exactly: value) {
+                    text = String(whole)
+                } else {
+                    text = String(value)
+                }
+            })
     }
 }
 

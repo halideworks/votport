@@ -9,10 +9,17 @@
       <RowDefinition Height="*" />
       <RowDefinition Height="Auto" />
     </Grid.RowDefinitions>
-    <StackPanel Orientation="Horizontal" Spacing="12">
-      <HyperlinkButton x:Name="BackButton" Content="Links" Padding="0" Click="Back_Click" VerticalAlignment="Center" />
-      <TextBlock Text="/" Foreground="{ThemeResource VotMutedBrush}" VerticalAlignment="Center" />
-      <TextBlock Text="NEW DELIVERY" Style="{StaticResource SectionLabel}" VerticalAlignment="Center" />
+    <!-- The title row reads as a path back: a chevron and LINKS as a link,
+         then the page's own label in the same section type. -->
+    <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,0,0,4">
+      <HyperlinkButton x:Name="BackButton" Padding="0" Click="Back_Click" VerticalAlignment="Center" AutomationProperties.Name="Links">
+        <StackPanel Orientation="Horizontal" Spacing="6">
+          <FontIcon Glyph="&#xE76B;" FontSize="10" VerticalAlignment="Center" />
+          <TextBlock Text="LINKS" FontSize="11" FontWeight="SemiBold" CharacterSpacing="150" VerticalAlignment="Center" />
+        </StackPanel>
+      </HyperlinkButton>
+      <TextBlock Text="/" Style="{StaticResource SectionLabel}" Margin="0" VerticalAlignment="Center" />
+      <TextBlock Text="NEW DELIVERY" Style="{StaticResource SectionLabel}" Margin="0" VerticalAlignment="Center" />
     </StackPanel>
     <StackPanel x:Name="Crumbs" Grid.Row="1" Orientation="Horizontal" Spacing="4" />
     <Border Grid.Row="2" Background="{ThemeResource VotPanelBrush}" CornerRadius="8" Padding="8">
@@ -50,12 +57,26 @@
         <TextBox x:Name="LabelBox" PlaceholderText="Label, e.g. Final grade for Alex" />
         <PasswordBox x:Name="DeliveryPasswordBox" Grid.Column="1" PlaceholderText="Password (optional)" />
       </Grid>
-      <StackPanel Orientation="Horizontal" Spacing="8">
-        <TextBox x:Name="ExpiresBox" PlaceholderText="Expires after (days)" Text="7" Width="170" BeforeTextChanging="Digits" />
-        <TextBox x:Name="DownloadsBox" PlaceholderText="Downloads allowed" Width="170" BeforeTextChanging="Digits" />
-        <TextBlock x:Name="ChosenText" Foreground="{ThemeResource VotMutedBrush}" VerticalAlignment="Center" />
-        <Button x:Name="IssueButton" Content="Issue delivery" Click="Issue_Click" Style="{StaticResource AccentButtonStyle}" />
-      </StackPanel>
+      <Grid ColumnSpacing="8">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+        <NumberBox x:Name="ExpiresBox" Value="7" PlaceholderText="7" Minimum="1" SpinButtonPlacementMode="Inline" Width="190">
+          <NumberBox.Header>
+            <TextBlock Text="Expires after (days)" FontSize="12" Foreground="{ThemeResource VotMutedBrush}" />
+          </NumberBox.Header>
+        </NumberBox>
+        <NumberBox x:Name="DownloadsBox" Grid.Column="1" PlaceholderText="Unlimited" Minimum="1"
+            SpinButtonPlacementMode="Inline" Width="190">
+          <NumberBox.Header>
+            <TextBlock Text="Downloads allowed" FontSize="12" Foreground="{ThemeResource VotMutedBrush}" />
+          </NumberBox.Header>
+        </NumberBox>
+        <Button x:Name="IssueButton" Grid.Column="2" Click="Issue_Click" Style="{StaticResource AccentButtonStyle}"
+            HorizontalAlignment="Stretch" VerticalAlignment="Bottom" />
+      </Grid>
       <StackPanel x:Name="IssuedPanel" Spacing="4" Visibility="Collapsed">
         <StackPanel Orientation="Horizontal" Spacing="8">
           <TextBlock x:Name="IssuedText" Style="{StaticResource Mono}" Foreground="{ThemeResource VotOkBrush}"

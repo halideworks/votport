@@ -147,10 +147,12 @@ only the two states the core cannot know (a journal entry not yet run, a
 transfer the core never answered). The words are the web pages' (Ship,
 Shipping, Shipped and verified) and never name a hash or a root. Both
 apps carry the web's ship mark as their icon (`scripts/app-icon.py`
-renders the asset catalog, the Windows tiles, the `.ico`, and a 512 pixel
-reference under `client/design/icon` from
-`web/assets/pommern_ship_white.png` on the navy logo square) and show it
-with the name at the top of the sidebar, open at 900 by 580 points
+renders the asset catalog, a Mark imageset, the Windows tiles, the
+`.ico`, and a 512 pixel reference under `client/design/icon` from
+`web/assets/pommern_ship_white.png` on the navy logo square, one shape
+with corners at 22.37% of the side everywhere) and show the same 24 point
+mark with the name at the top of the sidebar, above a paper plane for
+Ship on both, open at 900 by 580 points
 instead of the platform's default, and call the sender screen Ship. The
 core now holds the operator session of phase C8 (`port.rs`, "the home
 port"): `sign_in` posts the admin password to `/api/admin/login`, keeps
@@ -209,11 +211,16 @@ runs while the window is closed to the tray or menu bar).
 Links lists the open request links with their URLs, drop counts, and
 senders shipping now, issues one (label, optional password, expiry, cap;
 the link is copied as it is issued) and closes one, and lists the
-deliveries with their download counts and revokes one. "New delivery"
-on Links opens the library (a sheet on the Mac, a page with a Links
-crumb on Windows), browses it one directory at a time, ticks files, and
-issues a delivery whose link is shown once and copied. Copy buttons say
-"Copied" for a moment. Every failure line is the core's
+deliveries with their download counts and revokes one. Each section
+opens with its issue form: the request form under REQUESTS, and under
+DELIVERIES a card whose "New delivery" button opens the library (a sheet
+on the Mac, a page on Windows whose title row is a chevron and LINKS as
+the way back), browses it one directory at a time, ticks files, and
+issues a delivery whose link is shown once and copied. The day, count,
+and gigabyte fields are number entries (a spin box under a caption on
+Windows, a field with its unit and a stepper on the Mac), and the issue
+button fills the rest of its row and carries the file count. Copy
+buttons say "Copied" for a moment. Every failure line is the core's
 headline: operator calls return a `PortError` record (headline, detail,
 and whether the session ended, which folds the operator screens), and
 the core adds `RequestLink.summary`, `Delivery.summary`, and

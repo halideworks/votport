@@ -1,13 +1,14 @@
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media.Animation;
 using Windows.ApplicationModel.DataTransfer;
 using uniffi.votport_client_core;
 
 namespace Votport;
 
 /// The port's links: the request links senders ship to, and the deliveries
-/// recipients pull. Issue a request or open the Deliver page for a new
-/// delivery at the top; close or revoke what is done below.
+/// recipients pull. Each section opens with its issue form: the request
+/// form inline, the delivery browser as its own page.
 public sealed partial class LinksPage : Page
 {
     private string? issued;
@@ -21,6 +22,7 @@ public sealed partial class LinksPage : Page
         Unloaded += (_, _) => PortStore.Shared.Changed -= Refresh;
         ActualThemeChanged += (_, _) => Refresh();
         LabelBox.TextChanged += (_, _) => Refresh();
+        Numeric.Integer(ExpiresBox);
         PortStore.Shared.Refresh();
         Refresh();
     }
@@ -46,8 +48,10 @@ public sealed partial class LinksPage : Page
         var spec = new RequestSpec(
             LabelBox.Text.Trim(),
             RequestPasswordBox.Password.Length == 0 ? null : RequestPasswordBox.Password,
-            uint.TryParse(ExpiresBox.Text.Trim(), out var days) ? days : null,
-            double.TryParse(CapBox.Text.Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var gb) && double.IsFinite(gb) && gb >= 0 && gb <= 1_000_000 ? (ulong)(gb * 1_000_000_000) : null);
+            Numeric.Whole(ExpiresBox),
+            // No Minimum on the box: a 0.5 GB cap is ordinary, and 0 or less
+            // means the port's own cap, as it does on the Mac.
+            CapBox.Value is var gb && double.IsFinite(gb) && gb > 0 && gb <= 1_000_000 ? (ulong)(gb * 1_000_000_000) : null);
         PortStore.Shared.IssueRequest(spec, link =>
         {
             if (link is null) return;
@@ -69,13 +73,9 @@ public sealed partial class LinksPage : Page
         if ((sender as FrameworkElement)?.DataContext is RequestItem item) Copy(item.Url, sender as Button);
     }
 
-    // XAML handlers must live on the page; the rule itself is shared.
-    private void Digits(TextBox sender, TextBoxBeforeTextChangingEventArgs args) => Numeric.Digits(sender, args);
-    private void Decimal(TextBox sender, TextBoxBeforeTextChangingEventArgs args) => Numeric.Decimal(sender, args);
-
     private void NewDelivery_Click(object sender, RoutedEventArgs e)
     {
-        Frame.Navigate(typeof(DeliverPage));
+        Frame.Navigate(typeof(DeliverPage), null, new SuppressNavigationTransitionInfo());
     }
 
     private void CloseRequest_Click(object sender, RoutedEventArgs e)
