@@ -332,22 +332,42 @@ pub async fn upload_outbound_file(
     Query(query): Query<OutboundPathQuery>,
     body: Body,
 ) -> ApiResult<Response> {
-    let identity = admin::require_operator(&app, &headers)?;
-    admin::require_admin_write(&headers, &identity)?;
-    let _operation = begin_outbound_operation(&app, &identity.tenant)?;
+    // Every refusal of a chunk before its body is read drains it first, so
+    // a client still writing reads the status (a session that ended
+    // mid-upload must arrive as the 401 it is, not a reset connection). The
+    // whole-file branch below is only reached with empty bodies.
+    let admitted = admin::require_operator(&app, &headers).and_then(|identity| {
+        admin::require_admin_write(&headers, &identity)?;
+        let operation = begin_outbound_operation(&app, &identity.tenant)?;
+        Ok((identity, operation))
+    });
+    let (identity, _operation) = match admitted {
+        Ok(admitted) => admitted,
+        Err(refused) => {
+            drain(body).await;
+            return Err(refused);
+        }
+    };
     // A file under an active grant is being served; replacing it would make
     // that grant's VOT package fail to assemble. Refuse both paths as delete
-    // does, before draining the body.
+    // does.
     let relative = query.path.trim_matches('/').replace('\\', "/");
-    if app
+    match app
         .store
         .has_active_library_grant(&identity.tenant, &relative, now_unix())
-        .map_err(super::store_unavailable)?
     {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "outbound file is referenced by an active grant",
-        ));
+        Ok(false) => {}
+        Ok(true) => {
+            drain(body).await;
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "outbound file is referenced by an active grant",
+            ));
+        }
+        Err(error) => {
+            drain(body).await;
+            return Err(super::store_unavailable(error));
+        }
     }
     if headers.contains_key(header::CONTENT_RANGE) || headers.contains_key(OUTBOUND_UPLOAD_ID) {
         return upload_outbound_chunk(Arc::clone(&app), identity, headers, query.path, body).await;
@@ -417,89 +437,114 @@ pub async fn upload_outbound_file(
     Ok(Json(json!({ "path": query.path, "bytes": bytes })).into_response())
 }
 
-async fn upload_outbound_chunk(
-    app: Arc<App>,
-    identity: auth::AdminIdentity,
-    headers: HeaderMap,
-    requested_path: String,
-    body: Body,
-) -> ApiResult<Response> {
+/// A chunk's stage, opened and locked, with the request's range checked
+/// against it: everything an upload settles before it reads the body.
+struct ChunkStage<'a> {
+    _lock: tokio::sync::MutexGuard<'a, ()>,
+    file: tokio::fs::File,
+    path: PathBuf,
+    stage: PathBuf,
+    start: u64,
+    end: u64,
+    total: u64,
+    chunk_len: u64,
+}
+
+/// Checks a chunk request and opens its stage. A refusal comes back as the
+/// response to send, so the caller can drain the body first: a client still
+/// writing an 8 MiB chunk otherwise sees a reset connection instead of the
+/// 409, 413, or 422, and reqwest reports that as a network failure.
+async fn prepare_outbound_chunk<'a>(
+    app: &'a App,
+    identity: &auth::AdminIdentity,
+    headers: &HeaderMap,
+    requested_path: &str,
+) -> Result<ChunkStage<'a>, ApiResult<Response>> {
     let upload_id = headers
         .get(OUTBOUND_UPLOAD_ID)
         .and_then(|value| value.to_str().ok())
         .filter(|value| valid_outbound_upload_id(value))
         .ok_or_else(|| {
-            ApiError::new(
+            Err(ApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "X-Votport-Upload-Id must be 64 hexadecimal characters",
-            )
+            ))
         })?
         .to_owned();
-    let (start, end, total) = parse_outbound_content_range(&headers)?;
+    let (start, end, total) = parse_outbound_content_range(headers).map_err(Err)?;
     let chunk_len = end
         .checked_sub(start)
         .and_then(|length| length.checked_add(1))
-        .ok_or_else(|| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid Content-Range"))?;
+        .ok_or_else(|| {
+            Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid Content-Range",
+            ))
+        })?;
     if chunk_len > MAX_OUTBOUND_CHUNK_BYTES {
-        return Err(ApiError::new(
+        return Err(Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             "outbound chunk exceeds 16 MiB",
-        ));
+        )));
     }
     let declared = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or_else(|| {
-            ApiError::new(
+            Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "Content-Length must match the requested range",
-            )
+            ))
         })?;
     if declared != chunk_len {
-        return Err(ApiError::new(
+        return Err(Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "Content-Length must match the requested range",
-        ));
+        )));
     }
     if total > app.config.max_upload_bytes {
-        return Err(ApiError::new(
+        return Err(Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             "file exceeds upload limit",
-        ));
+        )));
     }
     if end >= total {
-        return Err(ApiError::new(
+        return Err(Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "Content-Range exceeds the declared file size",
-        ));
+        )));
     }
 
-    let path = safe_library_path(&app, &identity.tenant, &requested_path)?;
+    let path = safe_library_path(app, &identity.tenant, requested_path).map_err(Err)?;
     let stripe = outbound_upload_stripe(&path);
-    let _lock = app.outbound_upload_locks[stripe].lock().await;
+    let lock = app.outbound_upload_locks[stripe].lock().await;
     let parent = path
         .parent()
-        .ok_or_else(|| ApiError::internal("outbound path has no parent"))?;
-    create_library_dirs(parent)?;
+        .ok_or_else(|| Err(ApiError::internal("outbound path has no parent")))?;
+    create_library_dirs(parent).map_err(Err)?;
     let stage = parent.join(outbound_stage_name(&path, &upload_id));
     if std::fs::symlink_metadata(&path).is_ok() {
         let _ = std::fs::remove_file(&stage);
-        return Err(ApiError::new(
+        return Err(Err(ApiError::new(
             StatusCode::CONFLICT,
             "outbound file already exists",
-        ));
+        )));
     }
     match std::fs::symlink_metadata(&stage) {
         Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_file() => {
-            return Err(ApiError::new(
+            return Err(Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "outbound staging path is not a regular file",
-            ));
+            )));
         }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return Err(ApiError::internal("inspect outbound staging file failed")),
+        Err(_) => {
+            return Err(Err(ApiError::internal(
+                "inspect outbound staging file failed",
+            )))
+        }
     }
     let mut options = tokio::fs::OpenOptions::new();
     options.write(true).create(true);
@@ -510,18 +555,75 @@ async fn upload_outbound_chunk(
     let mut file = options
         .open(&stage)
         .await
-        .map_err(|_| ApiError::internal("open outbound staging file failed"))?;
+        .map_err(|_| Err(ApiError::internal("open outbound staging file failed")))?;
     let stage_len = file
         .metadata()
         .await
-        .map_err(|_| ApiError::internal("inspect outbound staging file failed"))?
+        .map_err(|_| Err(ApiError::internal("inspect outbound staging file failed")))?
         .len();
+    if stage_len == total {
+        // The client's last chunk landed but the connection went before the
+        // publish (or its reply) did. The bytes may still sit in the page
+        // cache, since only the final request syncs; sync, then publish,
+        // whatever range this request named.
+        file.sync_all()
+            .await
+            .map_err(|_| Err(ApiError::internal("sync outbound file failed")))?;
+        drop(file);
+        return Err(publish_outbound_stage(
+            app,
+            identity,
+            &stage,
+            &path,
+            requested_path,
+            total,
+        ));
+    }
     if stage_len != start {
-        return Ok(outbound_upload_conflict(&requested_path, stage_len, total));
+        return Err(Ok(outbound_upload_conflict(
+            requested_path,
+            stage_len,
+            total,
+        )));
     }
     file.seek(SeekFrom::Start(start))
         .await
-        .map_err(|_| ApiError::internal("seek outbound staging file failed"))?;
+        .map_err(|_| Err(ApiError::internal("seek outbound staging file failed")))?;
+    Ok(ChunkStage {
+        _lock: lock,
+        file,
+        path,
+        stage,
+        start,
+        end,
+        total,
+        chunk_len,
+    })
+}
+
+async fn upload_outbound_chunk(
+    app: Arc<App>,
+    identity: auth::AdminIdentity,
+    headers: HeaderMap,
+    requested_path: String,
+    body: Body,
+) -> ApiResult<Response> {
+    let ChunkStage {
+        _lock,
+        mut file,
+        path,
+        stage,
+        start,
+        end,
+        total,
+        chunk_len,
+    } = match prepare_outbound_chunk(&app, &identity, &headers, &requested_path).await {
+        Ok(stage) => stage,
+        Err(refusal) => {
+            drain(body).await;
+            return refusal;
+        }
+    };
     let mut stream = body.into_data_stream();
     let mut received = 0u64;
     while let Some(chunk) = stream.next().await {
@@ -591,15 +693,28 @@ async fn upload_outbound_chunk(
         return Err(ApiError::internal("sync outbound file failed"));
     }
     drop(file);
-    if let Err(error) = std::fs::hard_link(&stage, &path) {
+    publish_outbound_stage(&app, &identity, &stage, &path, &requested_path, total)
+}
+
+/// Links a complete stage into the library under `path`, drops the stage,
+/// and audits the upload.
+fn publish_outbound_stage(
+    app: &App,
+    identity: &auth::AdminIdentity,
+    stage: &Path,
+    path: &Path,
+    requested_path: &str,
+    total: u64,
+) -> ApiResult<Response> {
+    if let Err(error) = std::fs::hard_link(stage, path) {
         return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
-            let _ = std::fs::remove_file(&stage);
+            let _ = std::fs::remove_file(stage);
             ApiError::new(StatusCode::CONFLICT, "outbound file already exists")
         } else {
             ApiError::internal("publish outbound file failed")
         });
     }
-    let _ = std::fs::remove_file(&stage);
+    let _ = std::fs::remove_file(stage);
     let relative_path = requested_path.trim_matches('/').replace('\\', "/");
     app.store.audit(
         &identity.tenant,
@@ -669,6 +784,21 @@ fn parse_outbound_content_range(headers: &HeaderMap) -> ApiResult<(u64, u64, u64
         ));
     }
     Ok((start, end, total))
+}
+
+/// Reads and discards a refused upload's body, up to one chunk, so a client
+/// still writing it finishes and reads the status instead of a reset
+/// connection (which reqwest reports as a network failure, never as the
+/// 409, 413, or 422 it was). A body past the chunk cap is cut off as before.
+async fn drain(body: Body) {
+    let mut stream = body.into_data_stream();
+    let mut seen = 0u64;
+    while let Some(Ok(chunk)) = stream.next().await {
+        seen = seen.saturating_add(chunk.len() as u64);
+        if seen > MAX_OUTBOUND_CHUNK_BYTES {
+            break;
+        }
+    }
 }
 
 fn outbound_upload_conflict(path: &str, offset: u64, total: u64) -> Response {
@@ -6671,6 +6801,66 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(std::fs::read(first).unwrap(), b"abc");
         assert_eq!(std::fs::read(second).unwrap(), b"xyz");
+    }
+
+    #[tokio::test]
+    async fn a_complete_stage_left_unpublished_is_published_on_the_next_request() {
+        // The last chunk landed but the connection went before the publish:
+        // the stage holds the whole file, and the client's next attempt,
+        // which starts the file over from its first chunk, publishes it and
+        // learns the file is complete.
+        let (_directory, app, cookie, _bytes) = fixture().await;
+        let upload_id = "e".repeat(64);
+        let path = app.config.outbound_dir.join("late.bin");
+        let stage = app
+            .config
+            .outbound_dir
+            .join(outbound_stage_name(&path, &upload_id));
+        std::fs::write(&stage, b"whole file").unwrap();
+        let response = crate::app::router(app.clone())
+            .oneshot(chunk_request(
+                &cookie, "late.bin", &upload_id, 0, 4, 10, b"whole",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["complete"], true);
+        assert_eq!(body["offset"], 10);
+        assert_eq!(std::fs::read(&path).unwrap(), b"whole file");
+        assert!(!stage.exists());
+    }
+
+    #[tokio::test]
+    async fn a_refused_chunk_body_is_read_through_before_the_answer() {
+        // The body arrives in pieces and the handler must pull every one
+        // before answering, or a client mid-write sees a reset connection
+        // instead of the 422 (here: a path the library refuses).
+        let (_directory, app, cookie, _bytes) = fixture().await;
+        let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&pulled);
+        let pieces: Vec<Result<Bytes, std::io::Error>> =
+            (0..8).map(|_| Ok(Bytes::from(vec![7u8; 1024]))).collect();
+        let body = Body::from_stream(futures_util::stream::iter(pieces).inspect(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/outbound-files?path=../escape.bin")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header(OUTBOUND_UPLOAD_ID, "d".repeat(64))
+                    .header(header::CONTENT_RANGE, "bytes 0-8191/16384")
+                    .header(header::CONTENT_LENGTH, 8192)
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(pulled.load(std::sync::atomic::Ordering::SeqCst), 8);
     }
 
     #[tokio::test]

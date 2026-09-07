@@ -94,6 +94,13 @@ public sealed class PortStore
     internal void Library(string directory, Action<Library?> done) =>
         Run(Scope.Deliver, () => VotportClientCoreMethods.Library(directory), done, () => done(null));
 
+    /// Uploads a drop (files, and folders with everything under them) into
+    /// the port under `into` and hands back every library file made.
+    /// Progress reaches `listener` on the core's thread; a failure midway
+    /// returns nothing here, and the listener's last view names what landed.
+    internal void Upload(string[] paths, string into, Transfer transfer, UploadListener listener, Action<LibraryFile[]> done, Action failed) =>
+        Run(Scope.Deliver, () => VotportClientCoreMethods.Upload(paths, into, transfer, listener), done, failed);
+
     internal void IssueDelivery(DeliverySpec spec, Action<IssuedDelivery?> done) =>
         Run(Scope.Deliver, () => VotportClientCoreMethods.IssueDelivery(spec), issued =>
         {

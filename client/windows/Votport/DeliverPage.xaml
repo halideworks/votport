@@ -6,6 +6,7 @@
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto" />
       <RowDefinition Height="Auto" />
+      <RowDefinition Height="Auto" />
       <RowDefinition Height="*" />
       <RowDefinition Height="Auto" />
     </Grid.RowDefinitions>
@@ -21,14 +22,39 @@
       <TextBlock Text="/" Style="{StaticResource SectionLabel}" Margin="0" VerticalAlignment="Center" />
       <TextBlock Text="NEW DELIVERY" Style="{StaticResource SectionLabel}" Margin="0" VerticalAlignment="Center" />
     </StackPanel>
-    <StackPanel x:Name="Crumbs" Grid.Row="1" Orientation="Horizontal" Spacing="4" />
-    <Border Grid.Row="2" Background="{ThemeResource VotPanelBrush}" CornerRadius="8" Padding="8">
+    <!-- Files from this machine go up to the port first, then get ticked
+         below like anything already there. -->
+    <Border x:Name="DropZone" Grid.Row="1" AllowDrop="True" DragOver="DropZone_DragOver" Drop="DropZone_Drop"
+        Background="{ThemeResource VotPanelBrush}" BorderBrush="{ThemeResource VotBorderBrush}" BorderThickness="1"
+        CornerRadius="6" Padding="12,10">
+      <StackPanel Spacing="8">
+        <TextBlock x:Name="DropText" Text="Drop files or folders here" Foreground="{ThemeResource VotMutedBrush}"
+            TextTrimming="CharacterEllipsis" />
+        <Grid ColumnSpacing="8">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="Auto" />
+          </Grid.ColumnDefinitions>
+          <Button x:Name="ChooseButton" Content="Choose Files" Click="Choose_Click" />
+          <Button x:Name="ChooseFolderButton" Grid.Column="1" Content="Choose Folder" Click="ChooseFolder_Click" />
+          <Button x:Name="CancelUploadButton" Grid.Column="1" Content="Cancel" Click="CancelUpload_Click" Visibility="Collapsed" />
+          <Button x:Name="PasteButton" Grid.Column="2" Content="Paste" Click="Paste_Click" />
+          <TextBox x:Name="FolderBox" Grid.Column="4" PlaceholderText="Folder on the port" Width="170"
+              ToolTipService.ToolTip="The folder on the port the files go into" />
+        </Grid>
+      </StackPanel>
+    </Border>
+    <StackPanel x:Name="Crumbs" Grid.Row="2" Orientation="Horizontal" Spacing="4" />
+    <Border Grid.Row="3" Background="{ThemeResource VotPanelBrush}" CornerRadius="8" Padding="8">
       <Grid RowSpacing="4">
         <Grid.RowDefinitions>
           <RowDefinition Height="Auto" />
           <RowDefinition Height="*" />
         </Grid.RowDefinitions>
-        <TextBlock x:Name="BrowserNote" Text="Reading the library" Foreground="{ThemeResource VotMutedBrush}" Margin="6" />
+        <TextBlock x:Name="BrowserNote" Text="Reading what is on the port" Foreground="{ThemeResource VotMutedBrush}" Margin="6" />
         <ListView x:Name="Entries" Grid.Row="1" SelectionMode="None" IsItemClickEnabled="True" ItemClick="Entries_ItemClick">
           <ListView.ItemTemplate>
             <DataTemplate x:DataType="local:LibraryEntry">
@@ -48,7 +74,7 @@
         </ListView>
       </Grid>
     </Border>
-    <StackPanel Grid.Row="3" Spacing="8">
+    <StackPanel Grid.Row="4" Spacing="8">
       <Grid ColumnSpacing="8">
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="*" />

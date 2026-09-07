@@ -92,7 +92,7 @@ struct LinksView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Issue a delivery")
                     .font(Type.sans(13, .semibold, relativeTo: .body))
-                Text("Pick files from the library; the recipient gets one link.")
+                Text("Drop files, or pick what is already on the port; the recipient gets one link.")
                     .font(Type.callout)
                     .foregroundStyle(Tokens.muted)
             }

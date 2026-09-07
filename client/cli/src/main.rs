@@ -44,6 +44,7 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("revoke-delivery") => revoke_delivery(&args[1..]),
         Some("library") => library(&args[1..]),
         Some("issue-delivery") => issue_delivery(&args[1..]),
+        Some("upload") => upload(&args[1..]),
         Some("watch") => watch(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
@@ -70,6 +71,7 @@ fn print_usage() {
          votport revoke-delivery <id>\n\
          votport library [<dir>]            [--json]\n\
          votport issue-delivery <label> <path>... [--password <p>] [--expires-days <n>] [--max-downloads <n>] [--json]\n\
+         votport upload <path>...           [--into <dir>] [--json]\n\
          votport watch add <dir> <link>     [--password <p>]\n\
          votport watch list | remove <id> | run [--json]\n\
          \n\
@@ -638,6 +640,37 @@ fn issue_delivery(args: &[String]) -> Result<(), String> {
         );
     } else {
         println!("{}", issued.url);
+    }
+    Ok(())
+}
+
+/// `votport upload <path>... [--into <dir>]`: each file or folder goes into
+/// the library under `--into` (today's date when not given) and its library
+/// paths are printed, ready for `issue-delivery`.
+fn upload(args: &[String]) -> Result<(), String> {
+    let (options, positional, json) = parse(args, &["--into"])?;
+    if positional.is_empty() {
+        return Err("upload takes at least one file or folder".to_owned());
+    }
+    struct Quiet;
+    impl votport_client_core::port::UploadListener for Quiet {
+        fn update(&self, _view: votport_client_core::port::UploadView) {}
+    }
+    let into = options.get("--into").cloned().unwrap_or_default();
+    let made =
+        votport_client_core::port::upload(&positional, &into, &|| false, &Quiet).map_err(human)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!(made
+                .iter()
+                .map(|f| serde_json::json!({ "path": f.path, "bytes": f.bytes }))
+                .collect::<Vec<_>>())
+        );
+    } else {
+        for file in &made {
+            println!("{}  {}", file.path, file.bytes);
+        }
     }
     Ok(())
 }

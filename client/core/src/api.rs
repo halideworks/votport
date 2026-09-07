@@ -612,6 +612,97 @@ impl Client {
     }
 }
 
+/// The server's answer to one outbound chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkReply {
+    /// The chunk landed; the stage now holds `offset` bytes.
+    Stored { offset: u64 },
+    /// The stage held `offset` bytes, not the chunk's start: the client
+    /// continues from there (a replay after a lost response, or a resume).
+    Resume { offset: u64 },
+}
+
+#[derive(Deserialize)]
+struct ChunkBody {
+    offset: Option<u64>,
+}
+
+impl Client {
+    /// One chunk of an outbound library upload: `POST
+    /// /api/admin/outbound-files?path=` with `Content-Range` and the
+    /// upload id. Retried only when the connection never opened, timed out
+    /// before a reply, or met a 503: the server compares the stage's length with the
+    /// range and answers 409 with its offset when a chunk lands twice, but
+    /// a replayed final chunk finds the file already published and gets the
+    /// same 409 as a foreign file, with no offset to tell them apart.
+    ///
+    /// # Errors
+    /// [`Error::NotSignedIn`], a 409 without an offset (the file exists or
+    /// a delivery serves it), 413 over the port's limit, or a network
+    /// failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admin_upload_chunk(
+        &self,
+        path: &str,
+        cookie: &str,
+        upload_id: &str,
+        start: u64,
+        end: u64,
+        total: u64,
+        body: Vec<u8>,
+    ) -> Result<ChunkReply> {
+        let url = self.url(path);
+        let result: Result<ChunkBody> = self.run(path, false, || {
+            with_cookie(self.http.post(&url), Some(cookie))
+                .header("X-Votport", "1")
+                .header("X-Votport-Upload-Id", upload_id)
+                .header(
+                    reqwest::header::CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{total}"),
+                )
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .body(body.clone())
+        });
+        match result {
+            Ok(ChunkBody {
+                offset: Some(offset),
+            }) => Ok(ChunkReply::Stored { offset }),
+            Ok(ChunkBody { offset: None }) => Err(Error::Other(
+                "the server stored the chunk without saying where it stands".to_owned(),
+            )),
+            Err(Error::Server {
+                status: 409, body, ..
+            }) if offset_in(&body).is_some() => Ok(ChunkReply::Resume {
+                offset: offset_in(&body).unwrap_or_default(),
+            }),
+            Err(error) => Err(signed_out(error)),
+        }
+    }
+
+    /// An empty outbound file: the chunked route refuses a zero total, so
+    /// the plain `POST` with no body writes it.
+    ///
+    /// # Errors
+    /// As [`Client::admin_upload_chunk`].
+    pub fn admin_upload_empty(&self, path: &str, cookie: &str) -> Result<()> {
+        let url = self.url(path);
+        let _: serde_json::Value = self
+            .run(path, false, || {
+                with_cookie(self.http.post(&url), Some(cookie))
+                    .header("X-Votport", "1")
+                    .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                    .header(reqwest::header::CONTENT_LENGTH, "0")
+            })
+            .map_err(signed_out)?;
+        Ok(())
+    }
+}
+
+/// The `offset` a 409 body names when the stage stands elsewhere.
+fn offset_in(body: &str) -> Option<u64> {
+    serde_json::from_str::<ChunkBody>(body).ok()?.offset
+}
+
 /// A 401 on an admin call means the session is gone.
 fn signed_out(error: Error) -> Error {
     match error {
