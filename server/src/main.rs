@@ -70,6 +70,9 @@ async fn main() {
         Ok(listener) => listener,
         Err(error) => {
             tracing::error!("bind {bind}: {error}");
+            // The fences were taken in build; a boot that dies here must
+            // give them back or the next attempt waits out the lease.
+            app::release_data_lock(&application);
             std::process::exit(2);
         }
     };

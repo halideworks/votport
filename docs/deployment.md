@@ -703,6 +703,15 @@ and streaming downloads and QUIC sessions die with the process and are retried
 by the client. Per-IP throttles and session rate windows reset. Nothing is lost
 that had been published.
 
+`ops/failover/` holds the automation: `planned.sh` drains, waits, stops,
+promotes, and clears the drain on the new live; `watch.sh` probes the live
+instance's `/healthz` and, after a run of misses, fences and promotes, then
+exits for a person to re-arm; `docker-compose.standby.yml` is the standby
+host's compose file with `standby` and `live` profiles over one data volume.
+Both scripts take the stop and promote steps as commands and end by waiting
+for the promoted instance to report the lease as its own. See
+`ops/failover/README.md`.
+
 Drill both topologies against the real binary before relying on either:
 
 ```sh
