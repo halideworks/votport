@@ -707,6 +707,7 @@ Drill both topologies against the real binary before relying on either:
 
 ```sh
 cargo build --release --manifest-path server/Cargo.toml
+scripts/build-wasm.sh /path/to/VOT            # the browser uploader's wasm bundle
 npm ci && npx playwright install chromium
 MODE=shared  node scripts/restart-e2e.mjs   # SIGTERM mid-upload, same directories
 MODE=replica node scripts/restart-e2e.mjs   # standby pulls, live stops, standby promoted

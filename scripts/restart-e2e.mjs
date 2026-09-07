@@ -4,7 +4,9 @@
 // verifies the same upload finishes with byte-identical output.
 // VOTPORT PROPRIETARY LICENSE.
 //
-// Requires: `npm ci`, Playwright chromium, and a built server binary:
+// Requires: `npm ci`, Playwright chromium, the wasm bundle in
+// web/assets/vendor (`scripts/build-wasm.sh /path/to/VOT`), and a built
+// server binary, run from the repo root:
 //   VOTPORT_BIN=server/target/release/votport node scripts/restart-e2e.mjs
 //
 // MODE=shared (default) restarts the same process over the same three
@@ -102,18 +104,21 @@ async function readyz(url) {
   const response = await fetch(`${url}/readyz`);
   return { status: response.status, body: await response.json() };
 }
-// Waits until the standby has staged a copy whose archive was built after
-// `after`, so the upload session begun before then is in the copy.
-async function waitForReplica(after, timeoutMs = 60000) {
+// Waits until the standby has staged a copy whose archive the live instance
+// built in a later second than `afterMs`, so a session that had begun by
+// then is in the copy. The archive time, not the pull time, is what proves
+// that: a pull can finish after a moment while its snapshot predates it.
+async function waitForReplica(afterMs, timeoutMs = 60000) {
+  const afterSecond = Math.floor(afterMs / 1000);
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     try {
       const { body } = await readyz(standbyBase);
-      if (body.last_success_at && body.last_success_at * 1000 >= after && !body.last_error) return body;
+      if (body.archive_created_at && body.archive_created_at > afterSecond && !body.last_error) return body;
     } catch {}
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  throw new Error(`standby never staged a copy newer than ${after}: ${standbyLogs.slice(-5).join("")}`);
+  throw new Error(`standby never staged a copy built after ${afterSecond}: ${standbyLogs.slice(-5).join("")}`);
 }
 async function waitForServer(timeoutMs = 20000) {
   const started = Date.now();
@@ -128,23 +133,33 @@ async function waitForServer(timeoutMs = 20000) {
 }
 function stopServer(child) {
   return new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve({ code: child.exitCode, signal: child.signalCode });
+      return;
+    }
     child.once("exit", (code, signal) => resolve({ code, signal }));
     child.kill("SIGTERM");
   });
 }
 
-let server = startServer();
-await waitForServer();
-let standby = mode === "replica" ? startStandby() : null;
-{
-  const { status, body } = await readyz(base);
-  if (status !== 200 || body.lease?.mine !== true) throw new Error(`live instance does not hold the lease: ${JSON.stringify(body)}`);
-}
-const browser = await chromium.launch();
-const page = await browser.newPage();
+let server = null;
+let standby = null;
+let browser = null;
 const errors = [];
-page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
 try {
+  server = startServer();
+  await waitForServer();
+  // An orphan from an earlier run would answer on the port while this
+  // child had already died on bind.
+  if (server.exitCode !== null) throw new Error(`server exited on start: ${logs.slice(-5).join("")}`);
+  if (mode === "replica") standby = startStandby();
+  {
+    const { status, body } = await readyz(base);
+    if (status !== 200 || body.lease?.mine !== true) throw new Error(`live instance does not hold the lease: ${JSON.stringify(body)}`);
+  }
+  browser = await chromium.launch();
+  const page = await browser.newPage();
+  page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
   await page.goto(base);
   await page.waitForSelector("#login:not([hidden])");
   await page.fill("#login-password", adminPassword);
@@ -180,11 +195,12 @@ try {
     null,
     { timeout: 120000 },
   );
+  // Bytes are moving, so begin has happened; a copy built after this
+  // instant holds the session record with whatever prefix was checkpointed.
+  const pastBegin = Date.now();
   const beforeStop = await page.textContent("#progress-note");
   if (mode === "replica") {
-    // The session record was written at begin; a pull after that carries
-    // it, with whatever prefix had been checkpointed, to the standby.
-    const copy = await waitForReplica(uploadStarted);
+    const copy = await waitForReplica(pastBegin);
     console.log("standby staged a copy:", JSON.stringify(copy));
   }
   console.log("stopping server at:", beforeStop.trim());
@@ -234,8 +250,8 @@ try {
   if (errors.length) throw new Error(errors.join("\n"));
   console.log(`restart e2e passed (${mode}): byte-identical after SIGTERM mid-upload`);
 } finally {
-  await browser.close();
-  if (server.exitCode === null) await stopServer(server);
-  if (standby && standby.exitCode === null) await stopServer(standby);
+  if (browser) await browser.close();
+  if (server) await stopServer(server);
+  if (standby) await stopServer(standby);
   fs.rmSync(root, { recursive: true, force: true });
 }

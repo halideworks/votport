@@ -338,6 +338,7 @@ async fn standby_readyz(State(state): State<StatusState>) -> Response {
             "healthy": healthy(&status, state.interval, now),
             "last_success_at": status.last_success_at,
             "last_error": status.last_error,
+            "archive_created_at": status.archive_created_at,
             "replica_lag_secs": status.archive_created_at.map(|at| now.saturating_sub(at)),
             "schema_version": status.schema_version,
         })),
@@ -423,6 +424,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["standby"], true);
         assert_eq!(json["healthy"], true);
+        assert_eq!(json["archive_created_at"], now - 45);
         assert!(json["replica_lag_secs"].as_u64().unwrap() >= 45);
 
         status.lock().unwrap().last_success_at = Some(now - 121);
