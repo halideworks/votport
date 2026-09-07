@@ -1782,6 +1782,7 @@ const SETTINGS_KEYS: &[&str] = &[
     "public_password_login",
     "sso_session_secs",
     "scim_token",
+    "require_provisioning",
     "draining",
 ];
 
@@ -1915,6 +1916,8 @@ fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
         "sso_session_secs_source": overlay.sso_session_secs_source,
         "scim_token_set": overlay.scim_token_set,
         "scim_token_source": overlay.scim_token_source,
+        "require_provisioning": resolved.require_provisioning,
+        "require_provisioning_source": overlay.require_provisioning_source,
         "draining": resolved.draining,
         "draining_source": overlay.draining_source,
         "sso_configured": app.sso_config.is_some(),
@@ -2062,7 +2065,9 @@ pub async fn put_settings(
             | "default_max_links"
             | "default_max_sessions"
             | "sso_session_secs" => write_u64(key, value, false)?,
-            "public_password_login" | "smtp_starttls" | "draining" => write_bool(key, value)?,
+            "public_password_login" | "smtp_starttls" | "draining" | "require_provisioning" => {
+                write_bool(key, value)?
+            }
             "smtp_port" => write_smtp_port(key, value)?,
             _ => unreachable!(),
         };
@@ -5234,6 +5239,7 @@ mod ops_tests {
             default_max_links: None,
             default_max_sessions: None,
             public_password_login: true,
+            require_provisioning: false,
             metrics_token: None,
             max_total_sessions: 32,
             max_link_sessions: 8,

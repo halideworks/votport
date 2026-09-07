@@ -199,6 +199,9 @@ function fillSettings(data) {
   setSecret('scim-token', data.scim_token_set);
   setSource('scim-token-source', data.scim_token_source);
   $('scim-token').disabled = !data.sso_configured;
+  $('require-provisioning').checked = data.require_provisioning === true;
+  $('require-provisioning').disabled = !data.sso_configured;
+  setSource('require-provisioning-source', data.require_provisioning_source);
   $('signin-save').disabled = !data.sso_configured;
   for (const button of $('signin-form').querySelectorAll('[data-clear]')) {
     button.disabled = !data.sso_configured;
@@ -528,6 +531,7 @@ $('signin-form').addEventListener('submit', async (event) => {
   const body = {
     public_password_login: !$('signin-collapse').checked,
     sso_session_secs: hours * 3600,
+    require_provisioning: $('require-provisioning').checked,
   };
   if ($('scim-token').value !== '') {
     body.scim_token = $('scim-token').value;

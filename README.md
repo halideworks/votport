@@ -155,6 +155,8 @@ the row so env applies again. Details: [`docs/deployment.md`](docs/deployment.md
 | `VOTPORT_NOTIFY_SMTP_USERNAME` | — | Optional SMTP AUTH username. |
 | `VOTPORT_NOTIFY_SMTP_PASSWORD` | — | Optional SMTP AUTH password. |
 | `VOTPORT_SCIM_TOKEN` | — | Bearer for the SCIM 2.0 provisioning endpoint at `/scim/v2`; unset disables it. Overridable via `PUT /api/admin/settings`. |
+| `VOTPORT_SCIM_REQUIRE_PROVISIONING` | `0` | `1` refuses SSO sign-in for subjects with no principal row. Overridable via `PUT /api/admin/settings`. |
+| `VOTPORT_OIDC_SUBJECT_CLAIM` | `sub` | Id-token claim used as the principal subject: `sub`, `email`, or `preferred_username`. Must match the SCIM `userName` mapping. |
 | `VOTPORT_NOTIFY_SMTP_FROM` | — | SMTP From address (required with host and `to`). |
 | `VOTPORT_NOTIFY_SMTP_TO` | — | Comma-separated SMTP recipients (at least one required with host and from). |
 | `VOTPORT_AUDIT_RETENTION_DAYS` | `400` | Days to keep queryable audit rows; `0` disables pruning. Overridable via `PUT /api/admin/settings`. |

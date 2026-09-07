@@ -318,6 +318,10 @@ pub struct Principal {
     #[serde(rename = "grants")]
     pub last_grants: serde_json::Value,
     pub source: String,
+    /// The provisioning system's own id for this user (SCIM externalId).
+    pub external_id: Option<String>,
+    /// Unix seconds the row was created; 0 for rows older than schema v22.
+    pub created_at: u64,
 }
 
 /// One settings PUT: write TEXT (including empty disable) or delete the row.
@@ -346,6 +350,8 @@ pub struct ResolvedSettings {
     pub sso_session_secs: u64,
     /// SCIM bearer; None means /scim/v2 answers 401 to everything.
     pub scim_token: Option<String>,
+    /// SSO sign-in is refused for subjects without a principal row.
+    pub require_provisioning: bool,
     /// When true, new upload sessions are refused so active ones can finish
     /// before a restart. Downloads and admin are unaffected.
     pub draining: bool,
@@ -398,6 +404,7 @@ pub struct SettingsOverlay {
     pub sso_session_secs_source: &'static str,
     pub scim_token_set: bool,
     pub scim_token_source: &'static str,
+    pub require_provisioning_source: &'static str,
     pub draining_source: &'static str,
 }
 
@@ -410,7 +417,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 21;
+pub(crate) const SCHEMA_VERSION: u64 = 22;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -431,9 +438,19 @@ CREATE TABLE IF NOT EXISTS principals (
     last_login_at INTEGER NOT NULL DEFAULT 0,
     last_groups TEXT NOT NULL DEFAULT '[]',
     last_grants TEXT NOT NULL DEFAULT '[]',
-    source TEXT NOT NULL DEFAULT 'sso'
+    source TEXT NOT NULL DEFAULT 'sso',
+    external_id TEXT,
+    created_at INTEGER NOT NULL DEFAULT 0
 );
 ";
+
+// v22: SCIM identity. created_at is 0 for rows from before the columns.
+const PRINCIPALS_IDENTITY_SCHEMA: &str = "
+ALTER TABLE principals ADD COLUMN external_id TEXT;
+ALTER TABLE principals ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;
+";
+const PRINCIPALS_IDENTITY_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS principals_external_id ON principals (external_id);";
 
 const LEGAL_HOLD_SCHEMA: &str =
     "ALTER TABLE links ADD COLUMN legal_hold INTEGER NOT NULL DEFAULT 0;";
@@ -1096,6 +1113,32 @@ impl Store {
             transaction
                 .execute_batch(OUTBOUND_GRANT_MANIFESTS_SCHEMA)
                 .map_err(|error| format!("schema: {error}"))?;
+        }
+        if stored < 22 {
+            // Tables created by PRINCIPALS_SCHEMA at this version have the
+            // columns, and so does a database rolled back to an older
+            // version number (the migration tests do that); only a table
+            // from before v22 needs the ALTER. A hand-built fixture without
+            // the table stays without it; no real database passes v5
+            // without creating it.
+            let columns: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('principals')
+                     WHERE name IN ('subject', 'external_id')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("schema: {error}"))?;
+            if columns == 1 {
+                transaction
+                    .execute_batch(PRINCIPALS_IDENTITY_SCHEMA)
+                    .map_err(|error| format!("schema: {error}"))?;
+            }
+            if columns > 0 {
+                transaction
+                    .execute_batch(PRINCIPALS_IDENTITY_INDEX)
+                    .map_err(|error| format!("schema: {error}"))?;
+            }
         }
         transaction
             .execute(
@@ -2232,7 +2275,7 @@ impl Store {
             connection
                 .query_row(
                     "SELECT subject, credential_version, blocked, last_login_at,
-                            last_groups, last_grants, source
+                            last_groups, last_grants, source, external_id, created_at
                      FROM principals WHERE subject = ?1",
                     [subject],
                     map_principal,
@@ -2259,7 +2302,7 @@ impl Store {
             )?;
             let mut statement = connection.prepare(
                 "SELECT subject, credential_version, blocked, last_login_at,
-                        last_groups, last_grants, source
+                        last_groups, last_grants, source, external_id, created_at
                  FROM principals
                  WHERE (?1 IS NULL OR subject LIKE ?1 ESCAPE '\\' COLLATE NOCASE)
                  ORDER BY last_login_at DESC, subject ASC
@@ -2286,14 +2329,14 @@ impl Store {
         let at = i64::try_from(now_unix()).unwrap_or(0);
         self.with(|connection| {
             connection.query_row(
-                "INSERT INTO principals (subject, last_login_at, last_groups, last_grants, source)
-                 VALUES (?1, ?2, ?3, ?4, 'sso')
+                "INSERT INTO principals (subject, last_login_at, last_groups, last_grants, source, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 'sso', ?2)
                  ON CONFLICT(subject) DO UPDATE SET
                     last_login_at = excluded.last_login_at,
                     last_groups = excluded.last_groups,
                     last_grants = excluded.last_grants
                  RETURNING subject, credential_version, blocked, last_login_at,
-                           last_groups, last_grants, source",
+                           last_groups, last_grants, source, external_id, created_at",
                 rusqlite::params![subject, at, groups_json, grants_json],
                 map_principal,
             )
@@ -2302,13 +2345,33 @@ impl Store {
 
     /// SCIM create: a new unblocked row with source 'scim'. Returns false
     /// when the subject already exists, whatever its state.
-    pub fn provision_principal(&self, subject: &str) -> Result<bool, String> {
+    pub fn provision_principal(
+        &self,
+        subject: &str,
+        external_id: Option<&str>,
+    ) -> Result<bool, String> {
+        let at = i64::try_from(now_unix()).unwrap_or(0);
         self.with(|connection| {
             let changed = connection.execute(
-                "INSERT OR IGNORE INTO principals (subject, source) VALUES (?1, 'scim')",
-                [subject],
+                "INSERT OR IGNORE INTO principals (subject, source, external_id, created_at)
+                 VALUES (?1, 'scim', ?2, ?3)",
+                rusqlite::params![subject, external_id, at],
             )?;
             Ok(changed > 0)
+        })
+    }
+
+    pub fn principal_by_external_id(&self, external_id: &str) -> Result<Option<Principal>, String> {
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT subject, credential_version, blocked, last_login_at,
+                            last_groups, last_grants, source, external_id, created_at
+                     FROM principals WHERE external_id = ?1 ORDER BY subject LIMIT 1",
+                    [external_id],
+                    map_principal,
+                )
+                .optional()
         })
     }
 
@@ -3961,6 +4024,8 @@ fn map_principal(row: &rusqlite::Row<'_>) -> rusqlite::Result<Principal> {
         last_groups: parse_json(&last_groups, 4)?,
         last_grants: parse_json(&last_grants, 5)?,
         source: row.get("source")?,
+        external_id: row.get("external_id")?,
+        created_at: row.get::<_, i64>("created_at")?.max(0) as u64,
     })
 }
 
@@ -4290,6 +4355,8 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
         overlay_u64(rows, "sso_session_secs", config.sso_session_secs);
     let (scim_token, scim_token_source) =
         overlay_text(rows, "scim_token", config.scim_token.clone());
+    let (require_provisioning, require_provisioning_source) =
+        overlay_bool(rows, "require_provisioning", config.require_provisioning);
     // The write path refuses zero; a hand-edited row falls back to env.
     let (sso_session_secs, sso_session_secs_source) = if sso_session_secs == 0 {
         tracing::error!(
@@ -4318,6 +4385,7 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
             public_password_login,
             sso_session_secs,
             scim_token: scim_token.clone(),
+            require_provisioning,
             draining,
         },
         notify_webhook_source,
@@ -4350,6 +4418,7 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
         sso_session_secs_source,
         scim_token_set: scim_token.is_some(),
         scim_token_source,
+        require_provisioning_source,
         draining_source,
     }
 }
@@ -6390,7 +6459,50 @@ mod tenant_tests {
         assert_eq!(store.tenant_received_bytes("acme").unwrap(), 300);
     }
 
-    /// A v19 token table gains the nullable directory column.
+    /// A v21 principals table gains external_id and created_at; the columns
+    /// then round-trip through provision and lookup.
+    #[test]
+    fn v21_adds_principal_identity_columns() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .upsert_sso_principal("old@example.com", &[], &serde_json::json!([]))
+            .unwrap();
+        store
+            .with(|connection| {
+                connection.execute_batch(
+                    "DROP INDEX principals_external_id;
+                     ALTER TABLE principals DROP COLUMN external_id;
+                     ALTER TABLE principals DROP COLUMN created_at;
+                     UPDATE meta SET value = '21' WHERE key = 'schema_version';",
+                )
+            })
+            .unwrap();
+        drop(store);
+        let store = Store::open(directory.path()).unwrap();
+        let row = store.principal("old@example.com").unwrap().unwrap();
+        assert_eq!(row.external_id, None);
+        assert_eq!(
+            row.created_at, 0,
+            "rows from before v22 carry no creation time"
+        );
+        assert!(store
+            .provision_principal("new@example.com", Some("ext-1"))
+            .unwrap());
+        assert!(!store.provision_principal("new@example.com", None).unwrap());
+        let row = store.principal_by_external_id("ext-1").unwrap().unwrap();
+        assert_eq!(row.subject, "new@example.com");
+        assert!(row.created_at > 0);
+        assert!(store.principal_by_external_id("ext-9").unwrap().is_none());
+        // Sign-in after provisioning keeps the identity columns.
+        store
+            .upsert_sso_principal("new@example.com", &["g".to_owned()], &serde_json::json!([]))
+            .unwrap();
+        let row = store.principal("new@example.com").unwrap().unwrap();
+        assert_eq!(row.external_id.as_deref(), Some("ext-1"));
+        assert_eq!(row.source, "scim");
+    }
+
     #[test]
     fn v20_adds_the_token_directory_column() {
         let directory = tempfile::tempdir().unwrap();
@@ -7198,6 +7310,7 @@ mod settings_tests {
             default_max_links: None,
             default_max_sessions: None,
             public_password_login: true,
+            require_provisioning: false,
         }
     }
 

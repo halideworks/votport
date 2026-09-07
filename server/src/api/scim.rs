@@ -140,13 +140,36 @@ fn parse_active(value: &Value) -> ScimResult<bool> {
 }
 
 fn resource(principal: &Principal) -> Value {
-    json!({
+    let mut resource = json!({
         "schemas": [USER_SCHEMA],
         "id": principal.subject,
         "userName": principal.subject,
         "active": !principal.blocked,
         "meta": { "resourceType": "User" },
-    })
+    });
+    if let Some(external_id) = &principal.external_id {
+        resource["externalId"] = json!(external_id);
+    }
+    resource
+}
+
+/// externalId is optional and opaque; refuse only what could not be a
+/// provider id.
+fn admit_external_id(value: Option<&Value>) -> ScimResult<Option<String>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => {
+            let text = text.trim();
+            if text.is_empty() {
+                return Ok(None);
+            }
+            if text.len() > MAX_SUBJECT_BYTES || text.chars().any(char::is_control) {
+                return Err(ScimError::bad_request("externalId is not acceptable"));
+            }
+            Ok(Some(text.to_owned()))
+        }
+        Some(_) => Err(ScimError::bad_request("externalId must be a string")),
+    }
 }
 
 fn load(app: &App, subject: &str) -> ScimResult<Principal> {
@@ -206,13 +229,31 @@ pub struct ListQuery {
     count: Option<usize>,
 }
 
-/// The one filter provisioning clients send: `userName eq "value"`.
-fn filter_subject(filter: &str) -> ScimResult<String> {
-    let rest = filter
-        .trim()
+/// Which attribute an equality filter names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilterKey {
+    UserName,
+    ExternalId,
+}
+
+/// The filters provisioning clients send: `userName eq "value"` and
+/// `externalId eq "value"`.
+fn filter_subject(filter: &str) -> ScimResult<(FilterKey, String)> {
+    let filter = filter.trim();
+    let (key, rest) = if filter
         .get(..8)
-        .filter(|head| head.eq_ignore_ascii_case("userName"))
-        .and_then(|_| filter.trim().get(8..))
+        .is_some_and(|head| head.eq_ignore_ascii_case("userName"))
+    {
+        (FilterKey::UserName, filter.get(8..))
+    } else if filter
+        .get(..10)
+        .is_some_and(|head| head.eq_ignore_ascii_case("externalId"))
+    {
+        (FilterKey::ExternalId, filter.get(10..))
+    } else {
+        (FilterKey::UserName, None)
+    };
+    let rest = rest
         .map(str::trim_start)
         .and_then(|rest| rest.strip_prefix("eq").or_else(|| rest.strip_prefix("EQ")))
         .map(str::trim)
@@ -220,9 +261,11 @@ fn filter_subject(filter: &str) -> ScimResult<String> {
         .and_then(|rest| rest.strip_suffix('"'))
         .filter(|value| !value.contains('"'))
         .ok_or_else(|| {
-            ScimError::bad_request("only the filter userName eq \"value\" is supported")
+            ScimError::bad_request(
+                "only the filters userName eq \"value\" and externalId eq \"value\" are supported",
+            )
         })?;
-    Ok(rest.to_owned())
+    Ok((key, rest.to_owned()))
 }
 
 pub async fn list_users(
@@ -235,13 +278,12 @@ pub async fn list_users(
     let count = query.count.unwrap_or(MAX_PAGE).min(MAX_PAGE);
     let (rows, total) = match query.filter.as_deref() {
         Some(filter) => {
-            let subject = filter_subject(filter)?;
-            let rows: Vec<_> = app
-                .store
-                .principal(&subject)
-                .map_err(ScimError::store)?
-                .into_iter()
-                .collect();
+            let (key, value) = filter_subject(filter)?;
+            let found = match key {
+                FilterKey::UserName => app.store.principal(&value),
+                FilterKey::ExternalId => app.store.principal_by_external_id(&value),
+            };
+            let rows: Vec<_> = found.map_err(ScimError::store)?.into_iter().collect();
             let total = rows.len() as u64;
             (rows, total)
         }
@@ -270,6 +312,7 @@ pub async fn create_user(
 ) -> ScimResult<Response> {
     authorize(&app, &headers)?;
     let subject = admit_subject(body.get("userName"))?;
+    let external_id = admit_external_id(body.get("externalId"))?;
     let active = body
         .get("active")
         .map(parse_active)
@@ -277,7 +320,7 @@ pub async fn create_user(
         .unwrap_or(true);
     if !app
         .store
-        .provision_principal(&subject)
+        .provision_principal(&subject, external_id.as_deref())
         .map_err(ScimError::store)?
     {
         return Err(ScimError::new(
@@ -529,6 +572,7 @@ mod tests {
         assert_eq!(json["id"], "ok@example.com");
         assert_eq!(json["userName"], "ok@example.com");
         assert_eq!(json["active"], true);
+        assert_eq!(json["externalId"], "00u1");
         let row = application
             .store
             .principal("ok@example.com")
@@ -536,7 +580,27 @@ mod tests {
             .unwrap();
         assert_eq!(row.source, "scim");
         assert!(!row.blocked);
+        assert_eq!(row.external_id.as_deref(), Some("00u1"));
+        assert!(row.created_at > 0);
         assert!(application.store.principal_allows("ok@example.com", 1));
+        let (status, json) = scim(
+            &application,
+            "GET",
+            "/scim/v2/Users?filter=externalId%20eq%20%2200u1%22",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["totalResults"], 1);
+        assert_eq!(json["Resources"][0]["userName"], "ok@example.com");
+        let (status, _) = scim(
+            &application,
+            "POST",
+            "/scim/v2/Users",
+            Some(r#"{"userName":"bad","externalId":7}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
 
         let (status, json) = scim(&application, "GET", "/scim/v2/Users/ok@example.com", None).await;
         assert_eq!(status, StatusCode::OK);
@@ -806,9 +870,19 @@ mod tests {
     }
 
     #[test]
-    fn filter_parser_accepts_the_one_shape() {
-        assert_eq!(filter_subject(r#"userName eq "a b""#).unwrap(), "a b");
-        assert_eq!(filter_subject(r#"  username EQ "x"  "#).unwrap(), "x");
+    fn filter_parser_accepts_username_and_external_id_only() {
+        assert_eq!(
+            filter_subject(r#"userName eq "a b""#).unwrap(),
+            (FilterKey::UserName, "a b".to_owned())
+        );
+        assert_eq!(
+            filter_subject(r#"  username EQ "x"  "#).unwrap(),
+            (FilterKey::UserName, "x".to_owned())
+        );
+        assert_eq!(
+            filter_subject(r#"externalId eq "00u1""#).unwrap(),
+            (FilterKey::ExternalId, "00u1".to_owned())
+        );
         for bad in [
             r#"userName co "a""#,
             r#"userName eq a"#,

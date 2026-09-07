@@ -119,14 +119,58 @@ fn sso_role(
 
 /// Builds the SSO session identity. Refuses the reserved break-glass subject
 /// and blocked principals. Records `sso_login` only after those checks pass.
+/// The principal subject for the configured claim, or None when the claim
+/// is absent so the caller can retry with the userinfo document. An empty
+/// value counts as absent. An email the provider marks unverified is
+/// refused outright: a self-asserted address must not select a principal.
+/// Providers that omit email_verified (Entra) are accepted as is.
+fn select_subject(
+    claim: crate::config::SubjectClaim,
+    sub: &str,
+    email: Option<&str>,
+    email_verified: Option<bool>,
+    preferred_username: Option<&str>,
+) -> Result<Option<String>, &'static str> {
+    use crate::config::SubjectClaim;
+    let chosen = match claim {
+        SubjectClaim::Sub => Some(sub),
+        SubjectClaim::Email if email_verified == Some(false) => {
+            return Err("the provider marks this email unverified")
+        }
+        SubjectClaim::Email => email,
+        SubjectClaim::PreferredUsername => preferred_username,
+    };
+    Ok(chosen
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned))
+}
+
 fn finish_sso_login(
     store: &crate::store::Store,
     subject: &str,
     role: String,
     groups: &[String],
+    require_provisioning: bool,
 ) -> Result<auth::AdminIdentity, &'static str> {
     if subject == "local" {
         return Err("identity could not be verified");
+    }
+    // With provisioning required, an absent row is a refusal before any
+    // upsert could create one; a read failure denies for the same reason
+    // principal_allows does.
+    if require_provisioning {
+        match store.principal(subject) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::warn!(target: "audit", event = "sso_failed", subject = %subject, "subject is not provisioned");
+                return Err("this account is not provisioned");
+            }
+            Err(error) => {
+                tracing::error!(%error, "principal read failed during sign-in");
+                return Err("could not complete sign-in");
+            }
+        }
     }
     let mut grants = vec![auth::TenantGrant {
         tenant: String::new(),
@@ -457,7 +501,22 @@ pub async fn sso_callback(
         );
         return home("identity could not be verified");
     }
-    let subject = claims.subject().to_string();
+    // The verified sub anchors the userinfo check; the principal subject may
+    // be a different claim and is chosen once userinfo has been read.
+    let sub = claims.subject().to_string();
+    let mut subject = match select_subject(
+        sso_config.0.subject_claim,
+        &sub,
+        claims.email().map(|value| value.as_str()),
+        claims.email_verified(),
+        claims.preferred_username().map(|value| value.as_str()),
+    ) {
+        Ok(subject) => subject,
+        Err(reason) => {
+            tracing::warn!(target: "audit", event = "sso_failed", reason, "subject claim refused");
+            return home("identity could not be verified");
+        }
+    };
 
     // Groups come from the userinfo endpoint; the id token may not carry them.
     let mut groups: Vec<String> = Vec::new();
@@ -488,9 +547,24 @@ pub async fn sso_callback(
         };
         // OIDC Core 5.3.2: the userinfo sub must match the verified id-token
         // subject, or the response is not about this user.
-        if value["sub"].as_str() != Some(subject.as_str()) {
+        if value["sub"].as_str() != Some(sub.as_str()) {
             tracing::warn!(target: "audit", event = "sso_failed", "userinfo sub mismatch");
             return home("identity could not be verified");
+        }
+        if subject.is_none() {
+            subject = match select_subject(
+                sso_config.0.subject_claim,
+                &sub,
+                value["email"].as_str(),
+                value["email_verified"].as_bool(),
+                value["preferred_username"].as_str(),
+            ) {
+                Ok(subject) => subject,
+                Err(reason) => {
+                    tracing::warn!(target: "audit", event = "sso_failed", reason, "userinfo subject claim refused");
+                    return home("identity could not be verified");
+                }
+            };
         }
         if let Some(list) = value["groups"].as_array() {
             groups.extend(
@@ -500,13 +574,31 @@ pub async fn sso_callback(
         }
     }
 
+    let Some(subject) = subject else {
+        tracing::warn!(
+            target: "audit",
+            event = "sso_failed",
+            claim = ?sso_config.0.subject_claim,
+            "the configured subject claim is absent from the id token and userinfo"
+        );
+        return home("identity could not be verified");
+    };
+    let require_provisioning = match app.store.resolved_settings(&app.config) {
+        Ok(settings) => settings.require_provisioning,
+        Err(error) => {
+            tracing::error!(%error, "settings read failed during sign-in");
+            return home("could not complete sign-in");
+        }
+    };
+
     let role = sso_role(
         sso_config.0.admin_group.as_deref(),
         sso_config.0.auditor_group.as_deref(),
         &groups,
     )
     .to_owned();
-    let identity = match finish_sso_login(&app.store, &subject, role, &groups) {
+    let identity = match finish_sso_login(&app.store, &subject, role, &groups, require_provisioning)
+    {
         Ok(identity) => identity,
         Err(message) => return home(message),
     };
@@ -594,6 +686,7 @@ mod tests {
             client_secret: "secret".to_owned(),
             admin_group: None,
             auditor_group: None,
+            subject_claim: crate::config::SubjectClaim::Sub,
         });
         let application = crate::app::build(config).unwrap();
         assert!(!application.sso_client.health_peek());
@@ -769,7 +862,7 @@ mod tests {
     #[test]
     fn reserved_sub_is_not_issued() {
         let (_directory, store) = test_store();
-        let error = finish_sso_login(&store, "local", "admin".to_owned(), &[]).unwrap_err();
+        let error = finish_sso_login(&store, "local", "admin".to_owned(), &[], false).unwrap_err();
         assert_eq!(error, "identity could not be verified");
         assert!(store.principal("local").unwrap().is_none());
         assert!(sso_login_events(&store).is_empty());
@@ -782,12 +875,99 @@ mod tests {
             .upsert_sso_principal("user@example.com", &[], &json!([]))
             .unwrap();
         store.revoke_principal("user@example.com").unwrap();
-        let error =
-            finish_sso_login(&store, "user@example.com", "admin".to_owned(), &[]).unwrap_err();
+        let error = finish_sso_login(&store, "user@example.com", "admin".to_owned(), &[], false)
+            .unwrap_err();
         assert_eq!(error, "this account is blocked");
         assert!(sso_login_events(&store).is_empty());
-        let issued = finish_sso_login(&store, "ok@example.com", "viewer".to_owned(), &[]).unwrap();
+        let issued =
+            finish_sso_login(&store, "ok@example.com", "viewer".to_owned(), &[], false).unwrap();
         assert_eq!(issued.subject, "ok@example.com");
         assert_eq!(sso_login_events(&store), vec!["ok@example.com".to_owned()]);
+    }
+
+    #[test]
+    fn required_provisioning_refuses_unknown_subjects_and_admits_provisioned_ones() {
+        let (_directory, store) = test_store();
+        let error =
+            finish_sso_login(&store, "new@example.com", "admin".to_owned(), &[], true).unwrap_err();
+        assert_eq!(error, "this account is not provisioned");
+        assert!(store.principal("new@example.com").unwrap().is_none());
+        assert!(sso_login_events(&store).is_empty());
+
+        assert!(store
+            .provision_principal("new@example.com", Some("00u1"))
+            .unwrap());
+        let issued =
+            finish_sso_login(&store, "new@example.com", "viewer".to_owned(), &[], true).unwrap();
+        assert_eq!(issued.subject, "new@example.com");
+        let row = store.principal("new@example.com").unwrap().unwrap();
+        assert_eq!(row.source, "scim", "sign-in keeps the provisioning source");
+        assert_eq!(row.external_id.as_deref(), Some("00u1"));
+        assert!(row.created_at > 0);
+        assert!(row.last_login_at >= row.created_at);
+
+        // A blocked provisioned row is still refused as blocked.
+        store.revoke_principal("new@example.com").unwrap();
+        let error = finish_sso_login(&store, "new@example.com", "viewer".to_owned(), &[], true)
+            .unwrap_err();
+        assert_eq!(error, "this account is blocked");
+    }
+
+    #[test]
+    fn subject_selection_follows_the_configured_claim() {
+        use crate::config::SubjectClaim;
+        let pick = |claim, email: Option<&str>, username: Option<&str>| {
+            select_subject(claim, "abc123", email, None, username).unwrap()
+        };
+        assert_eq!(
+            pick(SubjectClaim::Sub, None, None).as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            pick(SubjectClaim::Sub, Some("e@x"), Some("u")).as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            pick(SubjectClaim::Email, Some(" e@x "), None).as_deref(),
+            Some("e@x")
+        );
+        assert_eq!(pick(SubjectClaim::Email, None, Some("u")), None);
+        assert_eq!(pick(SubjectClaim::Email, Some(""), None), None);
+        assert_eq!(
+            pick(SubjectClaim::PreferredUsername, Some("e@x"), Some("u")).as_deref(),
+            Some("u")
+        );
+        assert_eq!(
+            pick(SubjectClaim::PreferredUsername, Some("e@x"), None),
+            None
+        );
+
+        // email_verified: false refuses; true or absent is accepted; other
+        // claims ignore it.
+        assert!(select_subject(SubjectClaim::Email, "s", Some("e@x"), Some(false), None).is_err());
+        assert_eq!(
+            select_subject(SubjectClaim::Email, "s", Some("e@x"), Some(true), None)
+                .unwrap()
+                .as_deref(),
+            Some("e@x")
+        );
+        assert_eq!(
+            select_subject(SubjectClaim::Sub, "s", Some("e@x"), Some(false), None)
+                .unwrap()
+                .as_deref(),
+            Some("s")
+        );
+        assert_eq!(
+            select_subject(
+                SubjectClaim::PreferredUsername,
+                "s",
+                None,
+                Some(false),
+                Some("u")
+            )
+            .unwrap()
+            .as_deref(),
+            Some("u")
+        );
     }
 }

@@ -80,6 +80,9 @@ pub struct Config {
     /// When false, the login page may collapse the local password form if
     /// SSO is offered. The login API itself always stays available.
     pub public_password_login: bool,
+    /// Refuse SSO sign-in for subjects with no principal row, so SCIM is the
+    /// source of truth for who may enter. Overridable from settings.
+    pub require_provisioning: bool,
     /// When set, /metrics requires this bearer token.
     pub metrics_token: Option<String>,
     /// Process-wide cap on concurrent upload sessions across all tenants.
@@ -112,6 +115,30 @@ pub struct OidcConfig {
     /// Members of this group get the audit-only role; admin membership
     /// outranks it, everyone else is a viewer.
     pub auditor_group: Option<String>,
+    /// Which id-token claim becomes the principal subject. `sub` is the
+    /// OIDC default; email or preferred_username lets a SCIM userName match
+    /// on providers whose sub is opaque or pairwise (Entra, Okta).
+    pub subject_claim: SubjectClaim,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubjectClaim {
+    Sub,
+    Email,
+    PreferredUsername,
+}
+
+impl SubjectClaim {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "" | "sub" => Ok(Self::Sub),
+            "email" => Ok(Self::Email),
+            "preferred_username" => Ok(Self::PreferredUsername),
+            other => Err(format!(
+                "VOTPORT_OIDC_SUBJECT_CLAIM must be sub, email, or preferred_username, not {other:?}"
+            )),
+        }
+    }
 }
 
 const DEFAULT_MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024 * 1024; // 50 GiB
@@ -415,6 +442,9 @@ pub fn from_env() -> Result<Config, String> {
     let public_password_login = env::var("VOTPORT_PUBLIC_PASSWORD_LOGIN")
         .ok()
         .is_none_or(|value| value != "0");
+    let require_provisioning = env::var("VOTPORT_SCIM_REQUIRE_PROVISIONING")
+        .ok()
+        .is_some_and(|value| value == "1");
 
     let session_idle_secs = match env::var("VOTPORT_SESSION_IDLE_SECS") {
         Ok(value) => value
@@ -472,12 +502,15 @@ pub fn from_env() -> Result<Config, String> {
             let auditor_group = env::var("VOTPORT_OIDC_AUDITOR_GROUP")
                 .ok()
                 .filter(|group| !group.trim().is_empty());
+            let subject_claim =
+                SubjectClaim::parse(&env::var("VOTPORT_OIDC_SUBJECT_CLAIM").unwrap_or_default())?;
             Some(OidcConfig {
                 issuer,
                 client_id,
                 client_secret,
                 admin_group,
                 auditor_group,
+                subject_claim,
             })
         }
         (None, None, None) => None,
@@ -526,6 +559,7 @@ pub fn from_env() -> Result<Config, String> {
         default_max_links,
         default_max_sessions,
         public_password_login,
+        require_provisioning,
         metrics_token,
         max_total_sessions,
         max_link_sessions,
