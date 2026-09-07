@@ -11,8 +11,8 @@ ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa used for public-key signature verification only" },
 ]
 
-# Inventory on 2026-09-01 (cargo deny list): every third-party crate offers
-# one of the permissive licenses below. GPL-2.0-only (self_cell) and
+# Server and client inventory on 2026-09-07: third-party crates use the
+# allowlist below or the package-scoped UniFFI exceptions. GPL-2.0-only (self_cell) and
 # LGPL-2.1-or-later (r-efi) appear only as alternatives beside MIT or
 # Apache-2.0 and are satisfied by those. The AGPL-3.0-only vot-* crates are
 # publish = false and skipped here like votport itself; [sources] is what
@@ -36,6 +36,17 @@ allow = [
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
+]
+
+exceptions = [
+    { name = "uniffi", version = "=0.31.2", allow = ["MPL-2.0"] },
+    { name = "uniffi_bindgen", version = "=0.31.2", allow = ["MPL-2.0"] },
+    { name = "uniffi_core", version = "=0.31.2", allow = ["MPL-2.0"] },
+    { name = "uniffi_internal_macros", version = "=0.31.2", allow = ["MPL-2.0"] },
+    { name = "uniffi_macros", version = "=0.31.2", allow = ["MPL-2.0"] },
+    { name = "uniffi_meta", version = "=0.31.2", allow = ["MPL-2.0"] },
+    { name = "uniffi_pipeline", version = "=0.31.2", allow = ["MPL-2.0"] },
+    { name = "uniffi_udl", version = "=0.31.2", allow = ["MPL-2.0"] },
 ]
 
 # Informational today (duplicates warn, none banned); add `deny` entries here
