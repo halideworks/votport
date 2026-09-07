@@ -2034,6 +2034,22 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/admin/sso/start", get(api::sso_start))
         .route("/api/admin/callback", get(api::sso_callback))
         // Public upload API.
+        // SCIM 2.0 provisioning, bearer-authenticated, no cookie or CSRF header.
+        .route(
+            "/scim/v2/ServiceProviderConfig",
+            get(api::scim::service_provider_config),
+        )
+        .route(
+            "/scim/v2/Users",
+            get(api::scim::list_users).post(api::scim::create_user),
+        )
+        .route(
+            "/scim/v2/Users/{id}",
+            get(api::scim::get_user)
+                .put(api::scim::replace_user)
+                .patch(api::scim::patch_user)
+                .delete(api::scim::delete_user),
+        )
         .route("/api/push-identity", get(push_identity))
         .route("/api/r/{token}", get(api::link_info))
         .route("/api/receipt-key", get(api::receipt_key))

@@ -195,7 +195,14 @@ function fillSettings(data) {
   $('sso-session-hours').value = Math.max(1, Math.round(data.sso_session_secs / 3600));
   $('sso-session-hours').disabled = !data.sso_configured;
   setSource('sso-session-source', data.sso_session_secs_source);
+  // SCIM keys on the OIDC subject, so it is only useful with SSO configured.
+  setSecret('scim-token', data.scim_token_set);
+  setSource('scim-token-source', data.scim_token_source);
+  $('scim-token').disabled = !data.sso_configured;
   $('signin-save').disabled = !data.sso_configured;
+  for (const button of $('signin-form').querySelectorAll('[data-clear]')) {
+    button.disabled = !data.sso_configured;
+  }
 
   $('drain-toggle').checked = data.draining === true;
   setSource('drain-source', data.draining_source);
@@ -518,10 +525,14 @@ $('signin-form').addEventListener('submit', async (event) => {
     formError(event.currentTarget, new Error('SSO session lifetime must be at least 1 hour.'));
     return;
   }
-  await saveSettings(event.currentTarget, {
+  const body = {
     public_password_login: !$('signin-collapse').checked,
     sso_session_secs: hours * 3600,
-  });
+  };
+  if ($('scim-token').value !== '') {
+    body.scim_token = $('scim-token').value;
+  }
+  await saveSettings(event.currentTarget, body);
 });
 
 $('drain-form').addEventListener('submit', async (event) => {
