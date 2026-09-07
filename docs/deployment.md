@@ -703,6 +703,23 @@ and streaming downloads and QUIC sessions die with the process and are retried
 by the client. Per-IP throttles and session rate windows reset. Nothing is lost
 that had been published.
 
+Drill both topologies against the real binary before relying on either:
+
+```sh
+cargo build --release --manifest-path server/Cargo.toml
+npm ci && npx playwright install chromium
+MODE=shared  node scripts/restart-e2e.mjs   # SIGTERM mid-upload, same directories
+MODE=replica node scripts/restart-e2e.mjs   # standby pulls, live stops, standby promoted
+```
+
+Each run uploads a large file through the browser, stops the live process
+while the transfer is in flight, checks that the clean stop yielded the
+lease and that the next instance holds it, and requires the same upload to
+finish byte-identical with a receipt. The replica run additionally waits for
+the standby to stage a copy taken after the upload began, promotes the
+standby by starting `votport` over its data directory, and checks that the
+pending restore was consumed.
+
 What this does not give: two live instances. The single SQLite writer, the
 process-wide publication lock, and the in-memory session registry are the
 items that a multi-node design has to replace, and that is a separate

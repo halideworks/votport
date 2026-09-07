@@ -45,6 +45,10 @@ pub fn config_from_env() -> Result<Config, String> {
 /// must be https unless it is loopback.
 fn admit_source(source: &str) -> Result<String, String> {
     let source = source.trim().trim_end_matches('/');
+    // Userinfo would let a loopback-looking authority resolve elsewhere.
+    if source.contains('@') {
+        return Err("VOTPORT_STANDBY_SOURCE must not carry credentials".to_owned());
+    }
     if source.starts_with("https://") {
         return Ok(source.to_owned());
     }
@@ -465,6 +469,8 @@ mod tests {
             "http://live.internal:8080",
             "http://10.0.0.5",
             "live.example",
+            "http://127.0.0.1:8080@evil.example",
+            "https://user:pass@live.example",
         ] {
             assert!(
                 parse(&[
