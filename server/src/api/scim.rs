@@ -22,6 +22,9 @@ use crate::auth;
 use crate::store::Principal;
 
 const USER_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:User";
+const SPC_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig";
+const RESOURCE_TYPE_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:ResourceType";
+const SCHEMA_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:Schema";
 const LIST_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:ListResponse";
 const ERROR_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:Error";
 const CONTENT_TYPE: &str = "application/scim+json";
@@ -32,6 +35,8 @@ const MAX_SUBJECT_BYTES: usize = 256;
 pub struct ScimError {
     status: StatusCode,
     detail: String,
+    /// RFC 7644 3.12 scimType, set for the 400 and 409 classes it names.
+    scim_type: Option<&'static str>,
 }
 
 impl ScimError {
@@ -39,15 +44,27 @@ impl ScimError {
         Self {
             status,
             detail: detail.into(),
+            scim_type: None,
         }
     }
 
-    fn bad_request(detail: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, detail)
+    fn typed(status: StatusCode, scim_type: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            scim_type: Some(scim_type),
+            ..Self::new(status, detail)
+        }
     }
 
-    fn not_found() -> Self {
-        Self::new(StatusCode::NOT_FOUND, "no such user")
+    fn invalid_value(detail: impl Into<String>) -> Self {
+        Self::typed(StatusCode::BAD_REQUEST, "invalidValue", detail)
+    }
+
+    fn mutability(detail: impl Into<String>) -> Self {
+        Self::typed(StatusCode::BAD_REQUEST, "mutability", detail)
+    }
+
+    fn not_found(what: &str) -> Self {
+        Self::new(StatusCode::NOT_FOUND, format!("no such {what}"))
     }
 
     fn store(error: String) -> Self {
@@ -58,14 +75,15 @@ impl ScimError {
 
 impl IntoResponse for ScimError {
     fn into_response(self) -> Response {
-        scim_json(
-            self.status,
-            json!({
-                "schemas": [ERROR_SCHEMA],
-                "status": self.status.as_u16().to_string(),
-                "detail": self.detail,
-            }),
-        )
+        let mut body = json!({
+            "schemas": [ERROR_SCHEMA],
+            "status": self.status.as_u16().to_string(),
+            "detail": self.detail,
+        });
+        if let Some(scim_type) = self.scim_type {
+            body["scimType"] = json!(scim_type);
+        }
+        scim_json(self.status, body)
     }
 }
 
@@ -111,17 +129,17 @@ fn admit_subject(value: Option<&Value>) -> ScimResult<String> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .ok_or_else(|| ScimError::bad_request("userName is required"))?;
+        .ok_or_else(|| ScimError::invalid_value("userName is required"))?;
     // Interior whitespace means a display name was mapped, not a subject.
     if subject.len() > MAX_SUBJECT_BYTES
         || subject
             .chars()
             .any(|ch| ch.is_control() || ch.is_whitespace())
     {
-        return Err(ScimError::bad_request("userName is not acceptable"));
+        return Err(ScimError::invalid_value("userName is not acceptable"));
     }
     if subject == "local" {
-        return Err(ScimError::bad_request(
+        return Err(ScimError::invalid_value(
             "the local administrator is not provisionable",
         ));
     }
@@ -135,17 +153,46 @@ fn parse_active(value: &Value) -> ScimResult<bool> {
         Value::Bool(active) => Ok(*active),
         Value::String(text) if text.eq_ignore_ascii_case("true") => Ok(true),
         Value::String(text) if text.eq_ignore_ascii_case("false") => Ok(false),
-        _ => Err(ScimError::bad_request("active must be a boolean")),
+        _ => Err(ScimError::invalid_value("active must be a boolean")),
     }
 }
 
-fn resource(principal: &Principal) -> Value {
+/// Percent-encodes one path segment (RFC 3986 unreserved characters pass).
+fn encode_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// The absolute base for meta.location; the request path when no public
+/// URL is configured (loopback deployments).
+fn location(app: &App, path: &str) -> String {
+    match app.config.public_url.as_deref() {
+        Some(base) => format!("{}{path}", base.trim_end_matches('/')),
+        None => path.to_owned(),
+    }
+}
+
+fn resource(app: &App, principal: &Principal) -> Value {
+    let mut meta = json!({
+        "resourceType": "User",
+        "location": location(app, &format!("/scim/v2/Users/{}", encode_segment(&principal.subject))),
+    });
+    if principal.created_at > 0 {
+        meta["created"] = json!(crate::receipt::rfc3339(principal.created_at));
+    }
     let mut resource = json!({
         "schemas": [USER_SCHEMA],
         "id": principal.subject,
         "userName": principal.subject,
         "active": !principal.blocked,
-        "meta": { "resourceType": "User" },
+        "meta": meta,
     });
     if let Some(external_id) = &principal.external_id {
         resource["externalId"] = json!(external_id);
@@ -164,11 +211,11 @@ fn admit_external_id(value: Option<&Value>) -> ScimResult<Option<String>> {
                 return Ok(None);
             }
             if text.len() > MAX_SUBJECT_BYTES || text.chars().any(char::is_control) {
-                return Err(ScimError::bad_request("externalId is not acceptable"));
+                return Err(ScimError::invalid_value("externalId is not acceptable"));
             }
             Ok(Some(text.to_owned()))
         }
-        Some(_) => Err(ScimError::bad_request("externalId must be a string")),
+        Some(_) => Err(ScimError::invalid_value("externalId must be a string")),
     }
 }
 
@@ -176,7 +223,7 @@ fn load(app: &App, subject: &str) -> ScimResult<Principal> {
     app.store
         .principal(subject)
         .map_err(ScimError::store)?
-        .ok_or_else(ScimError::not_found)
+        .ok_or_else(|| ScimError::not_found("user"))
 }
 
 /// Deactivate revokes: version bump plus blocked, so live sessions die and
@@ -205,7 +252,12 @@ pub async fn service_provider_config(
     Ok(scim_json(
         StatusCode::OK,
         json!({
-            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"],
+            "schemas": [SPC_SCHEMA],
+            "meta": {
+                "resourceType": "ServiceProviderConfig",
+                "location": location(&app, "/scim/v2/ServiceProviderConfig"),
+            },
+            "documentationUri": "https://github.com/halideworks/votport/blob/main/docs/deployment.md",
             "patch": { "supported": true },
             "bulk": { "supported": false, "maxOperations": 0, "maxPayloadSize": 0 },
             "filter": { "supported": true, "maxResults": MAX_PAGE },
@@ -219,6 +271,114 @@ pub async fn service_provider_config(
             }],
         }),
     ))
+}
+
+fn user_resource_type(app: &App) -> Value {
+    json!({
+        "schemas": [RESOURCE_TYPE_SCHEMA],
+        "id": "User",
+        "name": "User",
+        "endpoint": "/Users",
+        "description": "A principal that may sign in through the identity provider",
+        "schema": USER_SCHEMA,
+        "schemaExtensions": [],
+        "meta": {
+            "resourceType": "ResourceType",
+            "location": location(app, "/scim/v2/ResourceTypes/User"),
+        },
+    })
+}
+
+fn user_schema(app: &App) -> Value {
+    let attribute = |name: &str,
+                     kind: &str,
+                     mutability: &str,
+                     uniqueness: &str,
+                     required: bool,
+                     description: &str| {
+        json!({
+            "name": name,
+            "type": kind,
+            "multiValued": false,
+            "description": description,
+            "required": required,
+            "caseExact": true,
+            "mutability": mutability,
+            "returned": "default",
+            "uniqueness": uniqueness,
+        })
+    };
+    json!({
+        "schemas": [SCHEMA_SCHEMA],
+        "id": USER_SCHEMA,
+        "name": "User",
+        "description": "User account",
+        "attributes": [
+            attribute("userName", "string", "immutable", "server", true,
+                "The principal subject; must equal the identity provider's configured subject claim"),
+            attribute("externalId", "string", "readWrite", "none", false,
+                "The provisioning system's identifier for the user"),
+            attribute("active", "boolean", "readWrite", "none", false,
+                "false revokes the principal: live sessions end and sign-in is refused"),
+        ],
+        "meta": {
+            "resourceType": "Schema",
+            "location": location(app, &format!("/scim/v2/Schemas/{USER_SCHEMA}")),
+        },
+    })
+}
+
+fn list_response(resources: Vec<Value>) -> Value {
+    json!({
+        "schemas": [LIST_SCHEMA],
+        "totalResults": resources.len(),
+        "startIndex": 1,
+        "itemsPerPage": resources.len(),
+        "Resources": resources,
+    })
+}
+
+pub async fn resource_types(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ScimResult<Response> {
+    authorize(&app, &headers)?;
+    Ok(scim_json(
+        StatusCode::OK,
+        list_response(vec![user_resource_type(&app)]),
+    ))
+}
+
+pub async fn resource_type(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ScimResult<Response> {
+    authorize(&app, &headers)?;
+    if id != "User" {
+        return Err(ScimError::not_found("resource type"));
+    }
+    Ok(scim_json(StatusCode::OK, user_resource_type(&app)))
+}
+
+pub async fn schemas(State(app): State<Arc<App>>, headers: HeaderMap) -> ScimResult<Response> {
+    authorize(&app, &headers)?;
+    Ok(scim_json(
+        StatusCode::OK,
+        list_response(vec![user_schema(&app)]),
+    ))
+}
+
+pub async fn schema(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ScimResult<Response> {
+    authorize(&app, &headers)?;
+    if id != USER_SCHEMA {
+        return Err(ScimError::not_found("schema"));
+    }
+    Ok(scim_json(StatusCode::OK, user_schema(&app)))
 }
 
 #[derive(Deserialize)]
@@ -261,7 +421,9 @@ fn filter_subject(filter: &str) -> ScimResult<(FilterKey, String)> {
         .and_then(|rest| rest.strip_suffix('"'))
         .filter(|value| !value.contains('"'))
         .ok_or_else(|| {
-            ScimError::bad_request(
+            ScimError::typed(
+                StatusCode::BAD_REQUEST,
+                "invalidFilter",
                 "only the filters userName eq \"value\" and externalId eq \"value\" are supported",
             )
         })?;
@@ -292,7 +454,7 @@ pub async fn list_users(
             .principals_page(count, start_index - 1, None)
             .map_err(ScimError::store)?,
     };
-    let resources: Vec<_> = rows.iter().map(resource).collect();
+    let resources: Vec<_> = rows.iter().map(|row| resource(&app, row)).collect();
     Ok(scim_json(
         StatusCode::OK,
         json!({
@@ -323,8 +485,9 @@ pub async fn create_user(
         .provision_principal(&subject, external_id.as_deref())
         .map_err(ScimError::store)?
     {
-        return Err(ScimError::new(
+        return Err(ScimError::typed(
             StatusCode::CONFLICT,
+            "uniqueness",
             "userName already exists",
         ));
     }
@@ -341,7 +504,7 @@ pub async fn create_user(
     }
     Ok(scim_json(
         StatusCode::CREATED,
-        resource(&load(&app, &subject)?),
+        resource(&app, &load(&app, &subject)?),
     ))
 }
 
@@ -351,7 +514,7 @@ pub async fn get_user(
     Path(id): Path<String>,
 ) -> ScimResult<Response> {
     authorize(&app, &headers)?;
-    Ok(scim_json(StatusCode::OK, resource(&load(&app, &id)?)))
+    Ok(scim_json(StatusCode::OK, resource(&app, &load(&app, &id)?)))
 }
 
 /// PUT replaces the whole resource. userName is immutable here (it is the
@@ -365,7 +528,7 @@ pub async fn replace_user(
     authorize(&app, &headers)?;
     load(&app, &id)?;
     if admit_subject(body.get("userName"))? != id {
-        return Err(ScimError::bad_request("userName cannot change"));
+        return Err(ScimError::mutability("userName cannot change"));
     }
     let active = body
         .get("active")
@@ -373,7 +536,7 @@ pub async fn replace_user(
         .transpose()?
         .unwrap_or(true);
     set_active(&app, &id, active)?;
-    Ok(scim_json(StatusCode::OK, resource(&load(&app, &id)?)))
+    Ok(scim_json(StatusCode::OK, resource(&app, &load(&app, &id)?)))
 }
 
 /// Reads the `active` value out of one PatchOp operation: either
@@ -387,7 +550,7 @@ fn patched_active(operation: &Value) -> ScimResult<Option<bool>> {
     }
     let path = operation.get("path").and_then(Value::as_str);
     if path.is_some_and(|path| path.eq_ignore_ascii_case("userName")) {
-        return Err(ScimError::bad_request("userName cannot change"));
+        return Err(ScimError::mutability("userName cannot change"));
     }
     let value = match path {
         Some(path) if path.eq_ignore_ascii_case("active") => operation.get("value"),
@@ -408,7 +571,13 @@ pub async fn patch_user(
     let operations = body
         .get("Operations")
         .and_then(Value::as_array)
-        .ok_or_else(|| ScimError::bad_request("Operations is required"))?;
+        .ok_or_else(|| {
+            ScimError::typed(
+                StatusCode::BAD_REQUEST,
+                "invalidSyntax",
+                "Operations is required",
+            )
+        })?;
     let mut active = None;
     for operation in operations {
         if let Some(value) = patched_active(operation)? {
@@ -418,7 +587,7 @@ pub async fn patch_user(
     if let Some(active) = active {
         set_active(&app, &id, active)?;
     }
-    Ok(scim_json(StatusCode::OK, resource(&load(&app, &id)?)))
+    Ok(scim_json(StatusCode::OK, resource(&app, &load(&app, &id)?)))
 }
 
 pub async fn delete_user(
@@ -431,7 +600,7 @@ pub async fn delete_user(
     // the client while the tombstone stays in place.
     let principal = load(&app, &id)?;
     if principal.blocked {
-        return Err(ScimError::not_found());
+        return Err(ScimError::not_found("user"));
     }
     set_active(&app, &id, false)?;
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -893,6 +1062,128 @@ mod tests {
         ] {
             assert!(filter_subject(bad).is_err(), "{bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn discovery_resources_and_meta_are_served() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = build(directory.path());
+        for uri in [
+            "/scim/v2/ResourceTypes",
+            "/scim/v2/ResourceTypes/User",
+            "/scim/v2/Schemas",
+            "/scim/v2/Schemas/urn:ietf:params:scim:schemas:core:2.0:User",
+        ] {
+            let (status, _, _) = call(&application, "GET", uri, None, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+            let (status, json) = scim(&application, "GET", uri, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert!(json["schemas"][0].is_string(), "{uri}");
+        }
+        let (status, json) = scim(&application, "GET", "/scim/v2/Schemas", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["totalResults"], 1);
+        assert_eq!(json["Resources"][0]["id"], USER_SCHEMA);
+        let names: Vec<_> = json["Resources"][0]["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|attribute| attribute["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(names, ["userName", "externalId", "active"]);
+        let (status, json) = scim(&application, "GET", "/scim/v2/ResourceTypes/User", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["endpoint"], "/Users");
+        assert_eq!(
+            json["meta"]["location"],
+            "https://drop.example.com/scim/v2/ResourceTypes/User"
+        );
+        let (status, _) = scim(&application, "GET", "/scim/v2/ResourceTypes/Group", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = scim(&application, "GET", "/scim/v2/Schemas/nope", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, json) =
+            scim(&application, "GET", "/scim/v2/ServiceProviderConfig", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["meta"]["resourceType"], "ServiceProviderConfig");
+
+        let (status, json) = scim(
+            &application,
+            "POST",
+            "/scim/v2/Users",
+            Some(r#"{"userName":"a/b@example.com"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            json["meta"]["location"],
+            "https://drop.example.com/scim/v2/Users/a%2Fb%40example.com"
+        );
+        let created = json["meta"]["created"].as_str().unwrap();
+        assert!(created.ends_with('Z') && created.len() == 20, "{created}");
+        let (status, json) = scim(
+            &application,
+            "GET",
+            "/scim/v2/Users/a%2Fb@example.com",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["userName"], "a/b@example.com");
+    }
+
+    #[tokio::test]
+    async fn errors_carry_scim_types() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = build(directory.path());
+        scim(
+            &application,
+            "POST",
+            "/scim/v2/Users",
+            Some(r#"{"userName":"t"}"#),
+        )
+        .await;
+        let cases: [(&str, &str, Option<&str>, &str); 5] = [
+            (
+                "POST",
+                "/scim/v2/Users",
+                Some(r#"{"userName":"t"}"#),
+                "uniqueness",
+            ),
+            (
+                "POST",
+                "/scim/v2/Users",
+                Some(r#"{"userName":"local"}"#),
+                "invalidValue",
+            ),
+            (
+                "GET",
+                "/scim/v2/Users?filter=emails%20co%20%22x%22",
+                None,
+                "invalidFilter",
+            ),
+            (
+                "PUT",
+                "/scim/v2/Users/t",
+                Some(r#"{"userName":"u"}"#),
+                "mutability",
+            ),
+            ("PATCH", "/scim/v2/Users/t", Some(r#"{}"#), "invalidSyntax"),
+        ];
+        for (method, uri, body, scim_type) in cases {
+            let (status, json) = scim(&application, method, uri, body).await;
+            assert!(status.is_client_error(), "{method} {uri}");
+            assert_eq!(json["scimType"], scim_type, "{method} {uri} {json}");
+        }
+        let (_, json) = scim(&application, "GET", "/scim/v2/Users/missing", None).await;
+        assert!(json.get("scimType").is_none(), "404 carries no scimType");
+    }
+
+    #[test]
+    fn segment_encoding_keeps_unreserved_bytes_only() {
+        assert_eq!(encode_segment("a-b_c.d~E9"), "a-b_c.d~E9");
+        assert_eq!(encode_segment("a/b@x y"), "a%2Fb%40x%20y");
+        assert_eq!(encode_segment("é"), "%C3%A9");
     }
 
     #[test]

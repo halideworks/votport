@@ -149,7 +149,7 @@ fn rfc3339_now() -> String {
     )
 }
 
-fn rfc3339(unix: u64) -> String {
+pub(crate) fn rfc3339(unix: u64) -> String {
     let days = i64::try_from(unix / 86_400).unwrap_or(0);
     let seconds = unix % 86_400;
     // Civil-from-days (Howard Hinnant's algorithm), valid for the era range
