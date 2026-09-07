@@ -103,7 +103,10 @@ except Exception:
   if [ "$mine" = true ]; then
     if [ -n "$REPOINT_CMD" ]; then
       log "repointing the proxy"
-      run "$REPOINT_CMD"
+      run "$REPOINT_CMD" || {
+        log "promoted, but the repoint failed: $NEW_LIVE_HOST_URL holds the lease; repoint by hand, clear Drain for restart if it was on, and re-arm this watch"
+        exit 1
+      }
     fi
     log "promoted: $NEW_LIVE_HOST_URL holds the lease; clear Drain for restart if it was on, and re-arm this watch against the new pair"
     exit 0

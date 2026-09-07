@@ -169,7 +169,10 @@ done
 # Only now is there something to point the proxy at.
 if [ -n "$REPOINT_CMD" ]; then
   log "repointing the proxy"
-  run "$REPOINT_CMD"
+  run "$REPOINT_CMD" || {
+    log "promoted, but the repoint failed; repoint by hand, then turn Drain for restart off on the new live's System page"
+    exit 1
+  }
 fi
 
 # The drain setting travelled with the database, so the new live starts
