@@ -25,6 +25,7 @@ use crate::identity::{state_dir, write_private};
 use crate::transfer;
 
 const FILE: &str = "port.json";
+const MAX_UPLOAD_BACKWARD_RECOVERIES: u8 = 3;
 
 /// What a failed operator call tells a shell: the headline for the person,
 /// the detail behind it, and whether the session ended (so the operator
@@ -733,6 +734,7 @@ fn upload_file(
     let mut file =
         std::fs::File::open(source_path).map_err(|source| read_failed(source_path, source))?;
     let mut offset = 0;
+    let mut backward_recoveries = 0;
     let mut chunk = Vec::new();
     while let Some((start, end)) = next_chunk(offset, total, UPLOAD_CHUNK) {
         if stop() {
@@ -759,19 +761,43 @@ fn upload_file(
                     "the server stands at {next} after a chunk ending at {end}"
                 )))
             }
-            // The server publishes a stage that already holds the whole
-            // file, so an offset at or past the end is a stage it should
-            // never have.
-            ChunkReply::Resume { offset: next } if next < total => offset = next,
+            // Cleanup or failover can lower the stage; bound that recovery
+            // because unchanged and repeated rewinds cannot make progress.
             ChunkReply::Resume { offset: next } => {
-                return Err(Error::Other(format!(
-                    "the server holds {next} of the {total}-byte file but did not publish it"
-                )))
+                offset = accept_resume_offset(offset, total, next, &mut backward_recoveries)?;
             }
         }
         progress(offset);
     }
     Ok(())
+}
+
+/// Accepts a server checkpoint, allowing bounded recovery after stage loss.
+fn accept_resume_offset(
+    current: u64,
+    total: u64,
+    next: u64,
+    backward_recoveries: &mut u8,
+) -> Result<u64> {
+    if next >= total {
+        return Err(Error::Other(format!(
+            "the server holds {next} of the {total}-byte file but did not publish it"
+        )));
+    }
+    if next == current {
+        return Err(Error::Other(format!(
+            "the server returned an unchanged upload offset {next}"
+        )));
+    }
+    if next < current {
+        if *backward_recoveries >= MAX_UPLOAD_BACKWARD_RECOVERIES {
+            return Err(Error::Other(format!(
+                "the server rewound the upload more than {MAX_UPLOAD_BACKWARD_RECOVERIES} times"
+            )));
+        }
+        *backward_recoveries += 1;
+    }
+    Ok(next)
 }
 
 fn read_failed(path: &Path, source: std::io::Error) -> Error {
@@ -856,6 +882,166 @@ mod tests {
         assert_eq!(next_chunk(0, 1, 16), Some((0, 0)));
         assert_eq!(next_chunk(0, 0, 16), None);
         assert_eq!(next_chunk(0, 100, 0), None);
+    }
+
+    #[test]
+    fn resume_offsets_validate_progress_and_bound_backtracking() {
+        let cases = [
+            (0, 16, 0, 0, None, 0),
+            (8, 16, 8, 0, None, 0),
+            (8, 16, 16, 0, None, 0),
+            (8, 16, 17, 0, None, 0),
+            (8, 16, 12, 0, Some(12), 0),
+            (8, 16, 4, 0, Some(4), 1),
+            (8, 16, 4, 2, Some(4), 3),
+            (8, 16, 4, 3, None, 3),
+            (8, 16, 12, 3, Some(12), 3),
+            (0, 0, 0, 0, None, 0),
+        ];
+        for (current, total, next, used, expected, expected_used) in cases {
+            let mut backward_recoveries = used;
+            let result = accept_resume_offset(current, total, next, &mut backward_recoveries);
+            assert_eq!(result.ok(), expected);
+            assert_eq!(backward_recoveries, expected_used);
+        }
+    }
+
+    #[test]
+    fn upload_file_bounds_rewinds_across_stored_chunks() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+        use std::thread;
+        use std::time::Duration;
+
+        fn accept(listener: &TcpListener) -> TcpStream {
+            for _ in 0..5000 {
+                match listener.accept() {
+                    Ok((stream, _)) => return stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            }
+            panic!("accept timed out");
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let stored = format!(r#"{{"offset":{UPLOAD_CHUNK}}}"#);
+        let done = Arc::new(AtomicBool::new(false));
+        let server_done = Arc::clone(&done);
+        let server = thread::spawn(move || {
+            for request in 0..8 {
+                let mut stream = accept(&listener);
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut headers = Vec::new();
+                for _ in 0..16 * 1024 {
+                    if headers.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                    assert!(headers.len() < 16 * 1024, "request headers too large");
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    headers.push(byte[0]);
+                }
+                assert!(headers.ends_with(b"\r\n\r\n"), "request headers timed out");
+                let body_len = if request % 2 == 0 { UPLOAD_CHUNK } else { 1 };
+                let mut remaining = body_len;
+                let mut buffer = [0; 64 * 1024];
+                while remaining > 0 {
+                    let size = remaining.min(buffer.len() as u64) as usize;
+                    let received = stream.read(&mut buffer[..size]).unwrap();
+                    assert!(received > 0, "request body ended early");
+                    remaining -= received as u64;
+                }
+                let (status, body) = if request % 2 == 0 {
+                    (200, stored.clone())
+                } else {
+                    (409, r#"{"offset":0}"#.to_owned())
+                };
+                let reason = if status == 200 { "OK" } else { "Conflict" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            for _ in 0..5000 {
+                if server_done.load(Ordering::Acquire) {
+                    return;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        let response = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = stream.write_all(response);
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            }
+            assert!(
+                server_done.load(Ordering::Acquire),
+                "ninth request timed out"
+            );
+        });
+
+        let source = tempfile::NamedTempFile::new().unwrap();
+        let total = UPLOAD_CHUNK + 1;
+        source.as_file().set_len(total).unwrap();
+        let client = Client::new(base).unwrap();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut progress = Vec::new();
+            let result = upload_file(
+                &client,
+                "cookie",
+                source.path(),
+                "library.bin",
+                total,
+                &|| false,
+                &mut |offset| progress.push(offset),
+            );
+            result_tx.send((result, progress)).unwrap();
+        });
+        let (result, progress) = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("upload_file did not finish within the test bound");
+        done.store(true, Ordering::Release);
+        worker.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(Error::Other(detail))
+                if detail == "the server rewound the upload more than 3 times"
+        ));
+        assert_eq!(
+            progress,
+            vec![
+                UPLOAD_CHUNK,
+                0,
+                UPLOAD_CHUNK,
+                0,
+                UPLOAD_CHUNK,
+                0,
+                UPLOAD_CHUNK
+            ]
+        );
+        server.join().unwrap();
     }
 
     #[test]

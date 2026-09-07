@@ -80,6 +80,7 @@ export async function uploadLibraryFile(file, path, progress = () => {}) {
     .map((byte) => byte.toString(16).padStart(2, '0')).join('');
   const chunkSize = 8 * 1024 * 1024;
   let offset = 0;
+  let rewinds = 0;
   while (offset < file.size) {
     const end = Math.min(offset + chunkSize, file.size);
     let retries = 0;
@@ -99,7 +100,10 @@ export async function uploadLibraryFile(file, path, progress = () => {}) {
         let body = null;
         try { body = await response.json(); } catch { /* empty error response */ }
         if (response.status === 409 && Number.isInteger(body?.offset)) {
-          if (body.offset < 0 || body.offset > file.size) throw new Error('server returned invalid upload offset');
+          if (body.offset < 0 || body.offset >= file.size || body.offset === offset) throw new Error('server returned invalid upload offset');
+          // Idle cleanup or failover can lose a stage; bound repeated loss
+          // across successful chunks so a rewind cycle cannot run forever.
+          if (body.offset < offset && ++rewinds > 3) throw new Error('server repeatedly lost upload progress');
           offset = body.offset;
           progress(offset);
           break;
@@ -112,7 +116,7 @@ export async function uploadLibraryFile(file, path, progress = () => {}) {
         progress(offset);
         break;
       } catch (error) {
-        if (retries++ >= 3) throw error;
+        if (rewinds > 3 || retries++ >= 3) throw error;
         await new Promise((resolve) => setTimeout(resolve, 200 * retries));
       }
     }
