@@ -17,7 +17,6 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use ed25519_dalek::{Digest, Sha512};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{ChunkReply, Client};
@@ -607,9 +606,8 @@ impl UploadView {
 /// names the local day), and returns the library files made. A folder keeps
 /// its name as the top component, as a drop does. One call takes the whole
 /// drop, so one view and one status line span it. Files go up in [`UPLOAD_CHUNK`]
-/// pieces under one upload id per file, so a second attempt continues from
-/// the server's offset instead of starting over (a stage that already holds
-/// the whole file is published then); a file that was published before its
+/// pieces under one upload id per file. Requests retried in this call keep
+/// that id; a new call starts a fresh stage. A file published before its
 /// reply was lost is refused as already on the port, which it is. `stop` is
 /// read between chunks. Every view handed to `listener` carries the library
 /// paths landed so far, so a failure or a cancel midway still tells the
@@ -730,7 +728,8 @@ fn upload_file(
     if total == 0 {
         return client.admin_upload_empty(&route, cookie).map_err(refused);
     }
-    let upload_id = upload_id(library_path, source_path, total)?;
+    // ponytail: cross-call resume needs a content identity, not file metadata.
+    let upload_id = hex::encode(rand::random::<[u8; 32]>());
     let mut file =
         std::fs::File::open(source_path).map_err(|source| read_failed(source_path, source))?;
     let mut offset = 0;
@@ -790,21 +789,6 @@ fn next_chunk(offset: u64, total: u64, size: u64) -> Option<(u64, u64)> {
     }
     let end = offset.saturating_add(size).min(total) - 1;
     Some((offset, end))
-}
-
-/// The upload id the server keys a stage file on: 64 hex characters that
-/// are the same for the same file at the same library path, so a second
-/// attempt resumes the stage instead of starting a new one. Sha512 is the
-/// hash the device key already brings in; the id is a name, not a proof.
-fn upload_id(library_path: &str, source: &Path, total: u64) -> Result<String> {
-    let modified = std::fs::metadata(source)
-        .map_err(|error| read_failed(source, error))?
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |since| since.as_secs());
-    let digest = Sha512::digest(format!("{library_path}\n{total}\n{modified}").as_bytes());
-    Ok(hex::encode(&digest[..32]))
 }
 
 /// Today's date as `YYYY-MM-DD` in UTC: the folder a CLI upload lands in

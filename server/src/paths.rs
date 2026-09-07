@@ -424,7 +424,7 @@ pub fn clean_staging(root: &Path, keep: &std::collections::HashSet<PathBuf>) {
 }
 
 #[cfg(unix)]
-fn walk(dir: &Path, visit: &mut impl FnMut(&Path, &str, bool) -> bool) {
+pub(crate) fn walk(dir: &Path, visit: &mut impl FnMut(&Path, &str, bool) -> bool) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };

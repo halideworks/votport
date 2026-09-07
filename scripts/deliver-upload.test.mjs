@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
-import { entryFiles, runUploadBatch } from '../web/assets/upload-entries.js';
+import { entryFiles, runUploadBatch, uploadLibraryFile } from '../web/assets/upload-entries.js';
 
 const deliver = await readFile(new URL('../web/deliver.html', import.meta.url), 'utf8');
 const deliverScript = await readFile(new URL('../web/assets/page-deliver.js', import.meta.url), 'utf8');
@@ -56,6 +56,37 @@ test('one upload batch validates paths and reports per-file progress', () => {
   assert.match(deliverScript, /if \(completedUploads > 0\) \{\s+await refreshLibrary\(\)/);
   assert.match(deliverScript, /\$\{error\.message\} \$\{completedUploads\} of \$\{uploads\.length\} files added\./);
   assert.match(deliverScript, /await refreshLibrary\(\);\s+\$\('library-status'\)\.textContent = `\$\{uploads\.length\}/);
+});
+
+test('library upload attempts isolate same-metadata files and keep the id through retries', async (t) => {
+  const stages = new Map();
+  const requests = [];
+  let loseReply = true;
+  t.mock.method(globalThis, 'fetch', async (_url, request) => {
+    const id = request.headers['X-Votport-Upload-Id'];
+    const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(request.headers['Content-Range']);
+    const start = Number(range[1]);
+    const end = Number(range[2]) + 1;
+    requests.push({ id, start });
+    const chunks = stages.get(id) || [];
+    const offset = chunks.reduce((size, chunk) => size + chunk.length, 0);
+    if (offset !== start) return Response.json({ offset }, { status: 409 });
+    chunks.push(new Uint8Array(await request.body.arrayBuffer()));
+    stages.set(id, chunks);
+    if (loseReply) { loseReply = false; throw new TypeError('reply lost'); }
+    return Response.json({ offset: end });
+  });
+  const metadata = { lastModified: 123456789 };
+  const first = new File(['old bytes'], 'same.bin', metadata);
+  const second = new File(['new bytes'], 'same.bin', metadata);
+  await uploadLibraryFile(first, 'same.bin');
+  await uploadLibraryFile(second, 'same.bin');
+  assert.equal(requests.length, 3);
+  assert.match(requests[0].id, /^[a-f0-9]{64}$/);
+  assert.equal(requests[0].id, requests[1].id);
+  assert.notEqual(requests[0].id, requests[2].id);
+  assert.equal(requests[2].start, 0);
+  assert.equal(new TextDecoder().decode(stages.get(requests[2].id)[0]), 'new bytes');
 });
 
 test('upload batches cap concurrency and wait for running work after failure', async () => {

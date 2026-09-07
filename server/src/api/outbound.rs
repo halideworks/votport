@@ -742,7 +742,64 @@ fn outbound_stage_name(path: &Path, upload_id: &str) -> String {
     hasher.update(path.to_string_lossy().as_bytes());
     hasher.update([0]);
     hasher.update(upload_id.as_bytes());
-    format!(".vot-outbound-{}.stage", hex::encode(hasher.finalize()))
+    format!(
+        ".vot-outbound-{:02x}-{}.stage",
+        outbound_upload_stripe(path),
+        hex::encode(hasher.finalize())
+    )
+}
+
+pub(crate) fn sweep_upload_stages(app: &App, now: std::time::SystemTime) {
+    #[cfg(not(unix))]
+    let _ = (app, now);
+    #[cfg(unix)]
+    {
+        let Some(cutoff) =
+            now.checked_sub(std::time::Duration::from_secs(app.config.session_idle_secs))
+        else {
+            return;
+        };
+        crate::paths::walk(&app.config.outbound_dir, &mut |path, name, is_dir| {
+            if is_dir {
+                return true;
+            }
+            let Some((stripe, digest)) = name
+                .strip_prefix(".vot-outbound-")
+                .and_then(|name| name.strip_suffix(".stage"))
+                .and_then(|name| name.split_once('-'))
+            else {
+                return true;
+            };
+            if stripe.len() != 2
+                || !stripe.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || !valid_outbound_upload_id(digest)
+            {
+                return true;
+            }
+            let Some(lock) = usize::from_str_radix(stripe, 16)
+                .ok()
+                .and_then(|stripe| app.outbound_upload_locks.get(stripe))
+            else {
+                return true;
+            };
+            // The stage name carries the destination's lock stripe; a slow
+            // request owns it even when its last write is older than the cutoff.
+            let Ok(_guard) = lock.try_lock() else {
+                return true;
+            };
+            let expired = std::fs::symlink_metadata(path)
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .and_then(|metadata| metadata.modified().ok())
+                .is_some_and(|modified| modified <= cutoff);
+            if expired {
+                if let Err(error) = std::fs::remove_file(path) {
+                    tracing::warn!(%error, path = %path.display(), "expired library upload cleanup failed");
+                }
+            }
+            true
+        });
+    }
 }
 
 fn valid_outbound_upload_id(value: &str) -> bool {
@@ -6930,6 +6987,103 @@ mod tests {
             .outbound_upload_locks
             .iter()
             .all(|lock| lock.try_lock().is_ok()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_upload_stages_are_removed_without_touching_active_or_unowned_files() {
+        use std::time::{Duration, SystemTime};
+
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let root = &app.config.outbound_dir;
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let now = old + Duration::from_secs(app.config.session_idle_secs);
+        let write = |path: &Path, modified| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"partial").unwrap();
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        };
+        let stage =
+            |path: &Path, id: &str| path.parent().unwrap().join(outbound_stage_name(path, id));
+        let destination = root.join("project/expired.bin");
+        let expired = stage(&destination, &"a".repeat(64));
+        let abandoned = stage(&destination, &"b".repeat(64));
+        let recent = stage(&destination, &"c".repeat(64));
+        write(&expired, old);
+        write(&abandoned, old);
+        write(&recent, old + Duration::from_secs(1));
+        let active_destination = (0..1000)
+            .map(|i| root.join(format!("active-{i}.bin")))
+            .find(|path| {
+                let stripe = outbound_upload_stripe(path);
+                stripe > 1 && stripe != outbound_upload_stripe(&destination)
+            })
+            .unwrap();
+        let active = stage(&active_destination, &"d".repeat(64));
+        write(&active, old);
+        let guard = app.outbound_upload_locks[outbound_upload_stripe(&active_destination)]
+            .try_lock()
+            .unwrap();
+
+        let digest = "e".repeat(64);
+        let preserved: Vec<_> = [
+            "operator.bin".to_owned(),
+            format!(".vot-outbound-{digest}.stage"),
+            format!(".vot-outbound-0-{digest}.stage"),
+            format!(".vot-outbound-+1-{digest}.stage"),
+            format!(".vot-outbound-ff-{digest}.stage"),
+            format!(".vot-outbound-zz-{digest}.stage"),
+            ".vot-outbound-00-short.stage".to_owned(),
+            format!(".vot-outbound-00-{}.stage", "g".repeat(64)),
+            format!(".vot-outbound-00-{digest}.journal"),
+        ]
+        .into_iter()
+        .map(|name| root.join(name))
+        .collect();
+        for path in &preserved {
+            write(path, old);
+        }
+        let external = directory.path().join("external");
+        let external_stage = stage(&external.join("file.bin"), &digest);
+        write(&external_stage, old);
+        std::os::unix::fs::symlink(&external, root.join("linked-directory")).unwrap();
+        let linked_stage = stage(&destination, &digest);
+        std::os::unix::fs::symlink(&external_stage, &linked_stage).unwrap();
+        let stamp = rustix::fs::Timespec {
+            tv_sec: 1000,
+            tv_nsec: 0,
+        };
+        rustix::fs::utimensat(
+            rustix::fs::CWD,
+            &linked_stage,
+            &rustix::fs::Timestamps {
+                last_access: stamp,
+                last_modification: stamp,
+            },
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+
+        sweep_upload_stages(&app, now - Duration::from_secs(1));
+        assert!(
+            expired.exists(),
+            "a stage younger than the idle limit stays"
+        );
+        sweep_upload_stages(&app, now);
+        assert!(!expired.exists() && !abandoned.exists());
+        assert!(recent.exists() && active.exists());
+        assert!(preserved.iter().all(|path| path.exists()));
+        assert!(external_stage.exists() && linked_stage.exists());
+        drop(guard);
+        sweep_upload_stages(&app, now);
+        assert!(
+            !active.exists(),
+            "an expired stage is removed once its request ends"
+        );
     }
 
     #[tokio::test]
