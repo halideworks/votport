@@ -153,7 +153,11 @@ renders the asset catalog, a Mark imageset, the Windows tiles, the
 with corners at 22.37% of the side everywhere) and show the same 24 point
 mark with the name at the top of the sidebar, above a paper plane for
 Ship on both, open at 900 by 580 points
-instead of the platform's default, and call the sender screen Ship. The
+instead of the platform's default, and call the sender screen Ship. On
+macOS 26 the Dock drew a blank tile for the Debug bundle launched from
+the Xcode build folder, even after `lsregister -f` on it, while the same
+bundle copied into both `/Applications` and `~/Applications` drew the
+ship; the release DMG has not been installed there yet. The
 core now holds the operator session of phase C8 (`port.rs`, "the home
 port"): `sign_in` posts the admin password to `/api/admin/login`, keeps
 the `votport_admin` cookie the server sets in `port.json` beside the
