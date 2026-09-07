@@ -45,7 +45,11 @@ run() {
     log "would run: $1"
   else
     log "running: $1"
-    timeout "$CMD_TIMEOUT" bash -c "$1"
+    timeout "$CMD_TIMEOUT" bash -c "$1" || {
+      local status=$?
+      log "command exited $status (124 is the ${CMD_TIMEOUT}s timeout)"
+      return "$status"
+    }
   fi
 }
 probe() { curl -fsS -m 5 -o /dev/null "$LIVE_HOST_URL/healthz"; }
@@ -77,15 +81,16 @@ log "live instance unreachable; fencing"
 run "$FENCE_CMD" || log "fence exited non-zero (host dead or unreachable); the lease is the fence of last resort, continuing"
 log "promoting the standby"
 run "$PROMOTE_CMD"
-if [ -n "$REPOINT_CMD" ]; then
-  log "repointing the proxy"
-  run "$REPOINT_CMD"
-fi
 if [ "$DRY_RUN" = 1 ]; then
+  log "dry run: would wait for $NEW_LIVE_HOST_URL/readyz to report lease.mine true (up to ${READY_TIMEOUT}s)"
+  run "$REPOINT_CMD"
   log "dry run complete; nothing was changed"
   exit 0
 fi
 
+# The proxy is repointed only once the promoted instance holds the lease:
+# a false alarm (live healthy but unreachable from here) leaves the site
+# on the old live, which the lease kept in charge.
 log "waiting up to ${READY_TIMEOUT}s for $NEW_LIVE_HOST_URL to hold the lease"
 deadline=$((SECONDS + READY_TIMEOUT))
 while :; do
@@ -96,11 +101,15 @@ try:
 except Exception:
     print("null")')"
   if [ "$mine" = true ]; then
+    if [ -n "$REPOINT_CMD" ]; then
+      log "repointing the proxy"
+      run "$REPOINT_CMD"
+    fi
     log "promoted: $NEW_LIVE_HOST_URL holds the lease; clear Drain for restart if it was on, and re-arm this watch against the new pair"
     exit 0
   fi
   if [ "$SECONDS" -ge "$deadline" ]; then
-    log "the promoted instance did not come up holding the lease (a live holder still renewing it refuses the boot); inspect $NEW_LIVE_HOST_URL/readyz and the receive root's .votport-lease"
+    log "the promoted instance did not come up holding the lease (a live holder still renewing it refuses the boot); the proxy was not repointed; inspect $NEW_LIVE_HOST_URL/readyz and the receive root's .votport-lease"
     exit 1
   fi
   sleep 3

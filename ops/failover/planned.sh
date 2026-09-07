@@ -30,8 +30,9 @@
 # Optional: DRAIN_TIMEOUT (seconds to wait for sessions_active 0, default
 # 1800), READY_TIMEOUT (seconds to wait for the new live to hold the lease,
 # default 300), CMD_TIMEOUT (seconds each supplied command may take, default
-# 120), DRY_RUN=1 to print every step without signing in, draining, or
-# running anything.
+# 600: it must exceed the container's stop_grace_period, since a clean stop
+# waits for in-flight downloads), DRY_RUN=1 to print every step without
+# signing in, draining, or running anything.
 #
 # If the script aborts with the drain on, the EXIT trap clears it on the old
 # live while that instance is still running; after the stop, a failed clear
@@ -45,7 +46,7 @@ set -euo pipefail
 REPOINT_CMD="${REPOINT_CMD:-}"
 DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-1800}"
 READY_TIMEOUT="${READY_TIMEOUT:-300}"
-CMD_TIMEOUT="${CMD_TIMEOUT:-120}"
+CMD_TIMEOUT="${CMD_TIMEOUT:-600}"
 LIVE_HOST_URL="${LIVE_HOST_URL:-$LIVE_URL}"
 NEW_LIVE_HOST_URL="${NEW_LIVE_HOST_URL:-$NEW_LIVE_URL}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -59,7 +60,11 @@ run() {
     log "would run: $1"
   else
     log "running: $1"
-    timeout "$CMD_TIMEOUT" bash -c "$1"
+    timeout "$CMD_TIMEOUT" bash -c "$1" || {
+      local status=$?
+      log "command exited $status (124 is the ${CMD_TIMEOUT}s timeout)"
+      return "$status"
+    }
   fi
 }
 
@@ -68,8 +73,8 @@ if [ "$DRY_RUN" = 1 ]; then
   log "dry run: would poll $LIVE_HOST_URL/readyz until sessions_active is 0 (up to ${DRAIN_TIMEOUT}s)"
   run "$LIVE_STOP_CMD"
   run "$PROMOTE_CMD"
-  run "$REPOINT_CMD"
   log "dry run: would wait for $NEW_LIVE_HOST_URL/readyz to report lease.mine true (up to ${READY_TIMEOUT}s)"
+  run "$REPOINT_CMD"
   log "dry run: would sign in to $NEW_LIVE_URL and clear draining"
   log "dry run complete; nothing was changed"
   exit 0
@@ -88,12 +93,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Signs in with the local password and keeps the cookie in the jar.
+# Signs in with the local password and keeps the cookie in the jar. The
+# body arrives on stdin so the password never sits in an argv.
 login() {
   local url="$1"
-  curl -fsS -m 30 -c "$jar" -b "$jar" -H 'Content-Type: application/json' \
-    -d "{\"password\":$(printf '%s' "$VOTPORT_ADMIN_PASSWORD" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}" \
-    "$url/api/admin/login" >/dev/null
+  printf '%s' "$VOTPORT_ADMIN_PASSWORD" \
+    | python3 -c 'import json,sys; print(json.dumps({"password": sys.stdin.read()}))' \
+    | curl -fsS -m 30 -c "$jar" -b "$jar" -H 'Content-Type: application/json' \
+        -d @- "$url/api/admin/login" >/dev/null
 }
 
 # Sets the draining flag through the settings API.
@@ -144,10 +151,6 @@ run "$LIVE_STOP_CMD"
 drained=0
 log "promoting the standby"
 run "$PROMOTE_CMD"
-if [ -n "$REPOINT_CMD" ]; then
-  log "repointing the proxy"
-  run "$REPOINT_CMD"
-fi
 
 log "waiting up to ${READY_TIMEOUT}s for $NEW_LIVE_HOST_URL to hold the lease"
 deadline=$((SECONDS + READY_TIMEOUT))
@@ -157,11 +160,17 @@ while :; do
     break
   fi
   if [ "$SECONDS" -ge "$deadline" ]; then
-    log "the new live instance did not come up holding the lease; inspect $NEW_LIVE_HOST_URL/readyz (a live holder still renewing the lease refuses the boot)"
+    log "the new live instance did not come up holding the lease; inspect $NEW_LIVE_HOST_URL/readyz (a live holder still renewing the lease refuses the boot); the proxy was not repointed"
     exit 1
   fi
   sleep 3
 done
+
+# Only now is there something to point the proxy at.
+if [ -n "$REPOINT_CMD" ]; then
+  log "repointing the proxy"
+  run "$REPOINT_CMD"
+fi
 
 # The drain setting travelled with the database, so the new live starts
 # drained; clear it there through the proxy address, since the admin cookie

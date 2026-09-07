@@ -11,13 +11,16 @@ ssh, a local process, or an orchestrator without changes.
 | `watch.sh` | Unattended: probe the live instance's `/healthz`; after a run of misses, fence it, promote the standby, repoint the proxy. One-shot, re-armed by a person. |
 | `docker-compose.standby.yml` | Standby host compose file for the replicated topology, with `standby` and `live` profiles over one data volume. |
 
-Both scripts end by waiting for the promoted instance to report the
-receive-root lease as its own on `/readyz`. If the old instance is in fact
-still alive and renewing the lease, the promoted one refuses to boot and the
-script reports that instead of forcing anything: the lease is the fence of
-last resort. A fence command that fails because the host is dead is logged
-and the promotion proceeds. Every supplied command runs under `CMD_TIMEOUT`
-(default 120 s) so a wedged docker daemon cannot stall the failover.
+Both scripts wait for the promoted instance to report the receive-root
+lease as its own on `/readyz` before repointing the proxy. If the old
+instance is in fact still alive and renewing the lease, the promoted one
+refuses to boot, the proxy stays on the old live, and the script reports
+that instead of forcing anything: the lease is the fence of last resort. A
+fence command that fails because the host is dead is logged and the
+promotion proceeds. Every supplied command runs under `CMD_TIMEOUT` so a
+wedged docker daemon cannot stall the failover; `planned.sh` defaults it to
+600 s because it must exceed the container's `stop_grace_period` (a clean
+stop waits for in-flight downloads), `watch.sh` to 120 s.
 
 `LIVE_HOST_URL` and `NEW_LIVE_HOST_URL` are where `/healthz` and `/readyz`
 are polled directly from the host running the script, bypassing the proxy (a
