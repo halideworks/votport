@@ -9,7 +9,13 @@ drop.example.com {
 	# votport itself sends uncompressed responses and relies on the proxy.
 	encode zstd gzip
 
-	reverse_proxy 127.0.0.1:8321
+	reverse_proxy 127.0.0.1:8321 {
+		# /readyz turns 503 while the System page's Drain for restart is on,
+		# so a second upstream (see docs/deployment.md, High availability)
+		# takes over only when the live instance asks it to.
+		health_uri /readyz
+		health_interval 5s
+	}
 
 	# votport uploads travel as chunks of at most ~9 MiB per request, so no
 	# special body-size configuration is needed. If you use a global

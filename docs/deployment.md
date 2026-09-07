@@ -606,6 +606,63 @@ are `immutable`, cached for a year without revalidation. Stamps maintain
 themselves: `scripts/build-wasm.sh` and `scripts/fetch-fonts.sh` restamp
 what they generate, and `npm test` fails if a stamp goes stale.
 
+## High availability (active-passive)
+
+One live instance, one stopped standby, the same three volumes. votport keeps
+no state outside `data/`, `/received`, and `/outbound`, so a standby host that
+mounts the same three paths and starts the same image is the live instance.
+It sees the same links, tenants, settings, cookie secret, receipt key, and
+push certificate (all under `data/`), and it re-attaches the uploads the
+previous instance suspended: staging and journal files sit beside their
+destination under `/received`, and the resume record in SQLite names them by
+path, not by host.
+
+Layout:
+
+- `/received` and `/outbound` on the NFS export both hosts mount, under the
+  rules in [Network filesystems](#network-filesystems).
+- `data/` on storage exactly one host writes at a time: a block device or ZFS
+  dataset that fails over with the service, or a DRBD volume. SQLite over NFS
+  is not supported (its locking is unreliable there), and two hosts writing
+  one `data/` is corruption. votport takes an exclusive `flock` on
+  `data/lock` at boot and refuses to start while another process holds it,
+  which catches a standby started too early on shared block storage but not
+  on NFS, where `flock` semantics vary by server.
+- Where the data volume cannot move, run Litestream (see
+  [Litestream](#litestream)) on the live host and `litestream restore` on the
+  standby before starting it. The RPO is Litestream's replication interval;
+  the identity files under `data/` are static and copy once.
+- Caddy in front of both hosts with a health-checked upstream pair:
+
+```caddyfile
+reverse_proxy live:8321 standby:8321 {
+	lb_policy first
+	health_uri /readyz
+	health_interval 5s
+}
+```
+
+Native push and deliver-over-QUIC listeners bind a UDP port on the live host;
+`VOTPORT_PUSH_ADVERTISE` and `VOTPORT_SERVE_ADVERTISE` must name an address
+that follows the failover (a floating IP, or a DNS name with a short TTL), and
+the generated `push.crt` under `data/` moves with the volume so pinned
+senders keep matching.
+
+Planned failover: turn on **Drain for restart** so `/readyz` goes 503 and new
+upload sessions are refused, wait for `sessions_active` in `/readyz` (or
+`votport_sessions_active` on `/metrics`) to reach 0, stop the live container,
+move or restore `data/`, start the standby, turn drain off. Unplanned
+failover skips the drain: in-flight uploads whose worker checkpointed resume
+from that offset once the standby is up, uploads killed before a checkpoint
+start over, and streaming downloads and QUIC sessions die with the process
+and are retried by the client. Per-IP throttles and session rate windows
+reset. Nothing is lost that had been published.
+
+What this does not give: two live instances. The single SQLite writer, the
+process-wide publication lock, and the in-memory session registry are the
+items that a multi-node design has to replace, and that is a separate
+architecture, not a configuration.
+
 ## Logs
 
 Operational logs use a human-readable format by default. Set
@@ -619,7 +676,15 @@ votport is a single-replica service by design: SQLite is the one writer, and
 upload sessions, throttles, and rate state live in process memory. Running two
 replicas behind one hostname is unsupported; scale up (CPU, RAM, faster disk),
 not out. This is the deliberate trade for atomic verified publication with no
-external dependencies; see docs/multi-tenancy.md non-goals.
+external dependencies; see docs/multi-tenancy.md non-goals. Availability
+comes from a warm standby instead, described under
+[High availability](#high-availability-active-passive) below.
+
+`GET /healthz` answers 200 when the database and both storage roots answer.
+`GET /readyz` additionally answers 503 while **Drain for restart** is on, with
+a JSON body `{"ready","draining","sessions_active"}`, so a balancer or a
+failover script can tell "this process is fine" from "stop sending it new
+work". Point the proxy's health check at `/readyz`.
 
 In-flight upload sessions survive a restart. On SIGTERM the process stops
 serving, then each upload worker records how far its file is contiguously
