@@ -847,6 +847,25 @@ pub(crate) fn admit_fetch(
         }
     };
     if !grant_open(&grant, presentation.now) {
+        // A rail that dials after the primary's completion closed a capped
+        // grant is this fetch's own straggler, not a refused delivery: the
+        // ticket already records the delivery. Re-read it here, since the
+        // completion marks the ticket just after it records the delivery
+        // and the earlier read may predate both. Turned away quietly so the
+        // closed counter and the audit line keep meaning something.
+        let delivered = app
+            .store
+            .fetch_ticket(&hex::encode(token))
+            .ok()
+            .flatten()
+            .is_some_and(|ticket| ticket.delivered_at.is_some());
+        if delivered {
+            tracing::debug!(
+                target: "audit", event = "serve_straggler", %peer,
+                "late rail on a delivered ticket turned away"
+            );
+            return None;
+        }
         return refuse(app, ServeRefusalReason::Closed, peer);
     }
     let Some(server) = serve.registry.server(root) else {
