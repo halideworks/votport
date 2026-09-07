@@ -5684,4 +5684,28 @@ async fn a_library_grant_is_fetched_over_vot_quic_and_counted_once() {
         twin_downloads, 1,
         "the twin's fetch was not counted to the twin"
     );
+    // The twin has no download cap, so nothing in the store would stop a
+    // second final-cursor report from a rail; wait for quiescence and then
+    // read the process-wide counter, which only these two fetches moved.
+    let mut quiet = false;
+    for _ in 0..100 {
+        let metrics = recipient
+            .get(format!("{}/metrics", server.base))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        if metrics.contains("votport_serve_sessions_active 0\n") {
+            assert!(
+                metrics.contains("votport_serve_deliveries_total 2\n"),
+                "two fetches must count exactly two deliveries: {metrics}"
+            );
+            quiet = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(quiet, "serve sessions never went idle after the twin fetch");
 }

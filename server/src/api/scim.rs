@@ -63,8 +63,8 @@ impl ScimError {
         Self::typed(StatusCode::BAD_REQUEST, "mutability", detail)
     }
 
-    fn not_found() -> Self {
-        Self::new(StatusCode::NOT_FOUND, "no such user")
+    fn not_found(what: &str) -> Self {
+        Self::new(StatusCode::NOT_FOUND, format!("no such {what}"))
     }
 
     fn store(error: String) -> Self {
@@ -223,7 +223,7 @@ fn load(app: &App, subject: &str) -> ScimResult<Principal> {
     app.store
         .principal(subject)
         .map_err(ScimError::store)?
-        .ok_or_else(ScimError::not_found)
+        .ok_or_else(|| ScimError::not_found("user"))
 }
 
 /// Deactivate revokes: version bump plus blocked, so live sessions die and
@@ -356,7 +356,7 @@ pub async fn resource_type(
 ) -> ScimResult<Response> {
     authorize(&app, &headers)?;
     if id != "User" {
-        return Err(ScimError::not_found());
+        return Err(ScimError::not_found("resource type"));
     }
     Ok(scim_json(StatusCode::OK, user_resource_type(&app)))
 }
@@ -376,7 +376,7 @@ pub async fn schema(
 ) -> ScimResult<Response> {
     authorize(&app, &headers)?;
     if id != USER_SCHEMA {
-        return Err(ScimError::not_found());
+        return Err(ScimError::not_found("schema"));
     }
     Ok(scim_json(StatusCode::OK, user_schema(&app)))
 }
@@ -600,7 +600,7 @@ pub async fn delete_user(
     // the client while the tombstone stays in place.
     let principal = load(&app, &id)?;
     if principal.blocked {
-        return Err(ScimError::not_found());
+        return Err(ScimError::not_found("user"));
     }
     set_active(&app, &id, false)?;
     Ok(StatusCode::NO_CONTENT.into_response())
