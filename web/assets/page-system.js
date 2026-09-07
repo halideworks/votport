@@ -199,6 +199,9 @@ function fillSettings(data) {
   setSecret('scim-token', data.scim_token_set);
   setSource('scim-token-source', data.scim_token_source);
   $('scim-token').disabled = !data.sso_configured;
+  $('scim-token-previous-state').textContent = data.scim_token_previous_set
+    ? 'A previous token is still accepted.'
+    : '';
   $('require-provisioning').checked = data.require_provisioning === true;
   $('require-provisioning').disabled = !data.sso_configured;
   setSource('require-provisioning-source', data.require_provisioning_source);

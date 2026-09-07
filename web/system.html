@@ -132,9 +132,17 @@
                   Clear
                 </button>
               </div>
+              <div class="field">
+                <span class="muted" id="scim-token-previous-state"></span>
+                <button type="button" class="link" data-clear="scim_token_previous" disabled>
+                  Clear previous token
+                </button>
+              </div>
               <p class="muted">
-                Provisioning endpoint: <code>/scim/v2</code>. A deactivated or
-                deleted user is revoked here; userName must equal the claim
+                Provisioning endpoint: <code>/scim/v2</code>. Tokens are stored
+                hashed; saving a new one keeps the previous one valid until it
+                is cleared, so the provider can be moved without a gap. A
+                deactivated or deleted user is revoked here; userName must equal the claim
                 named by <code>VOTPORT_OIDC_SUBJECT_CLAIM</code>. With
                 provisioning required, a subject with no SCIM or prior
                 sign-in row cannot sign in; the local password is unaffected.

@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -20,6 +20,10 @@ use serde_json::{json, Value};
 use crate::app::App;
 use crate::auth;
 use crate::store::Principal;
+
+use sha2::{Digest, Sha256};
+
+type Peer = ConnectInfo<std::net::SocketAddr>;
 
 const USER_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:User";
 const SPC_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig";
@@ -97,29 +101,79 @@ fn scim_json(status: StatusCode, body: Value) -> Response {
     response
 }
 
-/// Every SCIM route is refused unless the stored (or env) token is set and
-/// the bearer matches it byte for byte.
-fn authorize(app: &App, headers: &HeaderMap) -> ScimResult<()> {
-    let expected = app
+const HASH_PREFIX: &str = "sha256:";
+
+/// The stored form of a bearer: the settings row never holds the token.
+pub(crate) fn hash_bearer(token: &str) -> String {
+    format!(
+        "{HASH_PREFIX}{}",
+        hex::encode(Sha256::digest(token.as_bytes()))
+    )
+}
+
+/// A stored hash matches by digest; an env value (never hashed) matches
+/// byte for byte. Both comparisons are constant time.
+fn bearer_matches(stored: &str, presented: &str) -> bool {
+    if stored.is_empty() || presented.is_empty() {
+        return false;
+    }
+    match stored.strip_prefix(HASH_PREFIX) {
+        Some(digest) => {
+            let presented = hex::encode(Sha256::digest(presented.as_bytes()));
+            auth::constant_time_eq(digest.as_bytes(), presented.as_bytes())
+        }
+        None => auth::constant_time_eq(stored.as_bytes(), presented.as_bytes()),
+    }
+}
+
+/// The client address the audit rows and the throttle key on.
+fn client_ip(app: &App, headers: &HeaderMap, peer: &Peer) -> String {
+    super::client_ip(headers, &peer.0, &app.config.trusted_proxies)
+}
+
+/// Every SCIM route is refused unless a token is set and the bearer matches
+/// the current or the previous one. Failures count against the client's
+/// throttle bucket the way admin password failures do; a match resets it.
+fn authorize(app: &App, headers: &HeaderMap, ip: &str) -> ScimResult<()> {
+    let bucket = super::throttle_key(ip);
+    if !app.scim_throttle.claim(&bucket) {
+        tracing::warn!(target: "audit", event = "scim_throttled", %ip, "scim bearer attempts throttled");
+        return Err(ScimError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed attempts; wait a minute",
+        ));
+    }
+    let settings = app
         .store
         .resolved_settings(&app.config)
-        .map_err(ScimError::store)?
-        .scim_token;
+        .map_err(ScimError::store)?;
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
-    match (expected, presented) {
-        (Some(expected), Some(presented))
-            if auth::constant_time_eq(expected.as_bytes(), presented.as_bytes()) =>
-        {
-            Ok(())
-        }
-        _ => {
-            tracing::warn!(target: "audit", event = "scim_unauthorized", "scim bearer refused");
-            Err(ScimError::new(StatusCode::UNAUTHORIZED, "invalid bearer"))
-        }
+    let Some(presented) = presented else {
+        tracing::warn!(target: "audit", event = "scim_unauthorized", %ip, "scim bearer missing");
+        return Err(ScimError::new(StatusCode::UNAUTHORIZED, "invalid bearer"));
+    };
+    let current = settings
+        .scim_token
+        .as_deref()
+        .is_some_and(|stored| bearer_matches(stored, presented));
+    let previous = !current
+        && settings
+            .scim_token_previous
+            .as_deref()
+            .is_some_and(|stored| bearer_matches(stored, presented));
+    if !(current || previous) {
+        tracing::warn!(target: "audit", event = "scim_unauthorized", %ip, "scim bearer refused");
+        return Err(ScimError::new(StatusCode::UNAUTHORIZED, "invalid bearer"));
     }
+    app.scim_throttle.succeeded(&bucket);
+    if previous {
+        // Visible so the operator knows the client has not moved yet.
+        tracing::info!(target: "audit", event = "scim_previous_token_used", %ip, "scim client authenticated with the previous token");
+    }
+    Ok(())
 }
 
 /// A userName usable as a principal subject. Refuses the break-glass
@@ -229,7 +283,7 @@ fn load(app: &App, subject: &str) -> ScimResult<Principal> {
 /// Deactivate revokes: version bump plus blocked, so live sessions die and
 /// a later SSO sign-in is refused. Activate unblocks. Returns whether the
 /// row existed.
-fn set_active(app: &App, subject: &str, active: bool) -> ScimResult<bool> {
+fn set_active(app: &App, subject: &str, active: bool, ip: &str) -> ScimResult<bool> {
     let (changed, event) = if active {
         (app.store.unblock_principal(subject), "principal_unblocked")
     } else {
@@ -237,9 +291,14 @@ fn set_active(app: &App, subject: &str, active: bool) -> ScimResult<bool> {
     };
     let changed = changed.map_err(ScimError::store)?;
     if changed {
-        tracing::info!(target: "audit", event, subject = %subject, "principal updated by scim");
-        app.store
-            .audit("", "scim", event, subject, &json!({ "via": "scim" }));
+        tracing::info!(target: "audit", event, subject = %subject, %ip, "principal updated by scim");
+        app.store.audit(
+            "",
+            "scim",
+            event,
+            subject,
+            &json!({ "via": "scim", "ip": ip }),
+        );
     }
     Ok(changed)
 }
@@ -247,8 +306,9 @@ fn set_active(app: &App, subject: &str, active: bool) -> ScimResult<bool> {
 pub async fn service_provider_config(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
+    peer: Peer,
 ) -> ScimResult<Response> {
-    authorize(&app, &headers)?;
+    authorize(&app, &headers, &client_ip(&app, &headers, &peer))?;
     Ok(scim_json(
         StatusCode::OK,
         json!({
@@ -341,8 +401,9 @@ fn list_response(resources: Vec<Value>) -> Value {
 pub async fn resource_types(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
+    peer: Peer,
 ) -> ScimResult<Response> {
-    authorize(&app, &headers)?;
+    authorize(&app, &headers, &client_ip(&app, &headers, &peer))?;
     Ok(scim_json(
         StatusCode::OK,
         list_response(vec![user_resource_type(&app)]),
@@ -352,17 +413,23 @@ pub async fn resource_types(
 pub async fn resource_type(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
+    peer: Peer,
     Path(id): Path<String>,
 ) -> ScimResult<Response> {
-    authorize(&app, &headers)?;
+    let ip = client_ip(&app, &headers, &peer);
+    authorize(&app, &headers, &ip)?;
     if id != "User" {
         return Err(ScimError::not_found("resource type"));
     }
     Ok(scim_json(StatusCode::OK, user_resource_type(&app)))
 }
 
-pub async fn schemas(State(app): State<Arc<App>>, headers: HeaderMap) -> ScimResult<Response> {
-    authorize(&app, &headers)?;
+pub async fn schemas(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    peer: Peer,
+) -> ScimResult<Response> {
+    authorize(&app, &headers, &client_ip(&app, &headers, &peer))?;
     Ok(scim_json(
         StatusCode::OK,
         list_response(vec![user_schema(&app)]),
@@ -372,9 +439,11 @@ pub async fn schemas(State(app): State<Arc<App>>, headers: HeaderMap) -> ScimRes
 pub async fn schema(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
+    peer: Peer,
     Path(id): Path<String>,
 ) -> ScimResult<Response> {
-    authorize(&app, &headers)?;
+    let ip = client_ip(&app, &headers, &peer);
+    authorize(&app, &headers, &ip)?;
     if id != USER_SCHEMA {
         return Err(ScimError::not_found("schema"));
     }
@@ -433,9 +502,10 @@ fn filter_subject(filter: &str) -> ScimResult<(FilterKey, String)> {
 pub async fn list_users(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
+    peer: Peer,
     Query(query): Query<ListQuery>,
 ) -> ScimResult<Response> {
-    authorize(&app, &headers)?;
+    authorize(&app, &headers, &client_ip(&app, &headers, &peer))?;
     let start_index = query.start_index.unwrap_or(1).max(1);
     let count = query.count.unwrap_or(MAX_PAGE).min(MAX_PAGE);
     let (rows, total) = match query.filter.as_deref() {
@@ -470,9 +540,11 @@ pub async fn list_users(
 pub async fn create_user(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
+    peer: Peer,
     Json(body): Json<Value>,
 ) -> ScimResult<Response> {
-    authorize(&app, &headers)?;
+    let ip = client_ip(&app, &headers, &peer);
+    authorize(&app, &headers, &ip)?;
     let subject = admit_subject(body.get("userName"))?;
     let external_id = admit_external_id(body.get("externalId"))?;
     let active = body
@@ -491,16 +563,16 @@ pub async fn create_user(
             "userName already exists",
         ));
     }
-    tracing::info!(target: "audit", event = "principal_provisioned", subject = %subject, "principal created by scim");
+    tracing::info!(target: "audit", event = "principal_provisioned", subject = %subject, %ip, "principal created by scim");
     app.store.audit(
         "",
         "scim",
         "principal_provisioned",
         &subject,
-        &json!({ "via": "scim" }),
+        &json!({ "via": "scim", "ip": ip }),
     );
     if !active {
-        set_active(&app, &subject, false)?;
+        set_active(&app, &subject, false, &ip)?;
     }
     Ok(scim_json(
         StatusCode::CREATED,
@@ -511,9 +583,11 @@ pub async fn create_user(
 pub async fn get_user(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
+    peer: Peer,
     Path(id): Path<String>,
 ) -> ScimResult<Response> {
-    authorize(&app, &headers)?;
+    let ip = client_ip(&app, &headers, &peer);
+    authorize(&app, &headers, &ip)?;
     Ok(scim_json(StatusCode::OK, resource(&app, &load(&app, &id)?)))
 }
 
@@ -522,10 +596,12 @@ pub async fn get_user(
 pub async fn replace_user(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
+    peer: Peer,
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> ScimResult<Response> {
-    authorize(&app, &headers)?;
+    let ip = client_ip(&app, &headers, &peer);
+    authorize(&app, &headers, &ip)?;
     load(&app, &id)?;
     if admit_subject(body.get("userName"))? != id {
         return Err(ScimError::mutability("userName cannot change"));
@@ -535,7 +611,7 @@ pub async fn replace_user(
         .map(parse_active)
         .transpose()?
         .unwrap_or(true);
-    set_active(&app, &id, active)?;
+    set_active(&app, &id, active, &ip)?;
     Ok(scim_json(StatusCode::OK, resource(&app, &load(&app, &id)?)))
 }
 
@@ -563,10 +639,12 @@ fn patched_active(operation: &Value) -> ScimResult<Option<bool>> {
 pub async fn patch_user(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
+    peer: Peer,
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> ScimResult<Response> {
-    authorize(&app, &headers)?;
+    let ip = client_ip(&app, &headers, &peer);
+    authorize(&app, &headers, &ip)?;
     load(&app, &id)?;
     let operations = body
         .get("Operations")
@@ -585,7 +663,7 @@ pub async fn patch_user(
         }
     }
     if let Some(active) = active {
-        set_active(&app, &id, active)?;
+        set_active(&app, &id, active, &ip)?;
     }
     Ok(scim_json(StatusCode::OK, resource(&app, &load(&app, &id)?)))
 }
@@ -593,16 +671,18 @@ pub async fn patch_user(
 pub async fn delete_user(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
+    peer: Peer,
     Path(id): Path<String>,
 ) -> ScimResult<Response> {
-    authorize(&app, &headers)?;
+    let ip = client_ip(&app, &headers, &peer);
+    authorize(&app, &headers, &ip)?;
     // Already-revoked rows answer 404 so a retried delete is idempotent to
     // the client while the tombstone stays in place.
     let principal = load(&app, &id)?;
     if principal.blocked {
         return Err(ScimError::not_found("user"));
     }
-    set_active(&app, &id, false)?;
+    set_active(&app, &id, false, &ip)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -620,6 +700,7 @@ mod tests {
     use crate::store::SettingWrite;
 
     const TOKEN: &str = "scim-secret-token";
+    const PEER: [u8; 4] = [127, 0, 0, 1];
 
     fn build(directory: &std::path::Path) -> Arc<App> {
         let application = testing::build(directory);
@@ -627,7 +708,10 @@ mod tests {
             .store
             .put_settings(
                 "test",
-                &[("scim_token".to_owned(), SettingWrite::Set(TOKEN.to_owned()))],
+                &[(
+                    "scim_token".to_owned(),
+                    SettingWrite::Set(hash_bearer(TOKEN)),
+                )],
             )
             .unwrap();
         application
@@ -640,7 +724,21 @@ mod tests {
         bearer: Option<&str>,
         body: Option<(&str, &str)>,
     ) -> (StatusCode, Value, Option<String>) {
-        let mut request = Request::builder().method(method).uri(uri);
+        call_from(application, PEER, method, uri, bearer, body).await
+    }
+
+    async fn call_from(
+        application: &Arc<App>,
+        peer: [u8; 4],
+        method: &str,
+        uri: &str,
+        bearer: Option<&str>,
+        body: Option<(&str, &str)>,
+    ) -> (StatusCode, Value, Option<String>) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .extension(ConnectInfo(std::net::SocketAddr::from((peer, 1234))));
         if let Some(bearer) = bearer {
             request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
         }
@@ -701,7 +799,9 @@ mod tests {
             "application/scim+json",
             r#"{"Operations":[{"op":"replace","path":"active","value":false}]}"#,
         ));
-        for (bearer, uri, method, body) in [
+        // Each case from its own client, so the failure throttle (covered by
+        // its own test) does not turn a later 401 into a 429 here.
+        for (index, (bearer, uri, method, body)) in [
             (None, "/scim/v2/Users", "GET", None),
             (Some("wrong"), "/scim/v2/Users", "GET", None),
             (Some("scim-secret-toke"), "/scim/v2/Users", "GET", None),
@@ -711,8 +811,12 @@ mod tests {
             (Some("wrong"), "/scim/v2/Users/a", "PUT", user),
             (None, "/scim/v2/Users/a", "PATCH", patch),
             (Some("wrong"), "/scim/v2/Users/a", "DELETE", None),
-        ] {
-            let (status, _, _) = call(&application, method, uri, bearer, body).await;
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let peer = [10, 1, 0, index as u8];
+            let (status, _, _) = call_from(&application, peer, method, uri, bearer, body).await;
             assert_eq!(
                 status,
                 StatusCode::UNAUTHORIZED,
@@ -1177,6 +1281,176 @@ mod tests {
         }
         let (_, json) = scim(&application, "GET", "/scim/v2/Users/missing", None).await;
         assert!(json.get("scimType").is_none(), "404 carries no scimType");
+    }
+
+    #[tokio::test]
+    async fn failed_bearers_are_throttled_per_client_and_a_match_resets() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = build(directory.path());
+        let mut seen_429 = false;
+        for _ in 0..20 {
+            let (status, _, _) = call_from(
+                &application,
+                [10, 0, 0, 1],
+                "GET",
+                "/scim/v2/Users",
+                Some("wrong"),
+                None,
+            )
+            .await;
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                seen_429 = true;
+                break;
+            }
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        assert!(seen_429, "repeated bad bearers never reached the throttle");
+        // The locked bucket refuses even the right bearer; another client
+        // is unaffected, and its correct bearer keeps its bucket clean.
+        let (status, _, _) = call_from(
+            &application,
+            [10, 0, 0, 1],
+            "GET",
+            "/scim/v2/Users",
+            Some(TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        for _ in 0..20 {
+            let (status, _, _) = call_from(
+                &application,
+                [10, 0, 0, 2],
+                "GET",
+                "/scim/v2/Users",
+                Some(TOKEN),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn previous_token_stays_valid_until_cleared_and_env_token_is_plain() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = build(directory.path());
+        application
+            .store
+            .put_settings(
+                "test",
+                &[
+                    (
+                        "scim_token".to_owned(),
+                        SettingWrite::Set(hash_bearer("new-token")),
+                    ),
+                    (
+                        "scim_token_previous".to_owned(),
+                        SettingWrite::Set(hash_bearer(TOKEN)),
+                    ),
+                ],
+            )
+            .unwrap();
+        for bearer in [TOKEN, "new-token"] {
+            let (status, _, _) =
+                call(&application, "GET", "/scim/v2/Users", Some(bearer), None).await;
+            assert_eq!(status, StatusCode::OK, "{bearer}");
+        }
+        application
+            .store
+            .put_settings(
+                "test",
+                &[(
+                    "scim_token_previous".to_owned(),
+                    SettingWrite::Set(String::new()),
+                )],
+            )
+            .unwrap();
+        let (status, _, _) = call(&application, "GET", "/scim/v2/Users", Some(TOKEN), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "cleared previous token");
+        let (status, _, _) = call(
+            &application,
+            "GET",
+            "/scim/v2/Users",
+            Some("new-token"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // An env token is compared as given, and its hash is not a bearer.
+        let mut config = testing::config(&directory.path().join("env"));
+        config.scim_token = Some("env-token".to_owned());
+        let env_app = app::build(config).unwrap();
+        let (status, _, _) = call(&env_app, "GET", "/scim/v2/Users", Some("env-token"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) = call(
+            &env_app,
+            "GET",
+            "/scim/v2/Users",
+            Some(&hash_bearer("env-token")),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "the hash is not a bearer");
+    }
+
+    #[tokio::test]
+    async fn mutations_audit_the_client_address() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = build(directory.path());
+        let (status, _, _) = call_from(
+            &application,
+            [198, 51, 100, 7],
+            "POST",
+            "/scim/v2/Users",
+            Some(TOKEN),
+            Some((
+                "application/scim+json",
+                r#"{"userName":"audited","active":false}"#,
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let rows = application.store.audit_export("", 0, 0, 100).unwrap();
+        let events: Vec<_> = rows
+            .iter()
+            .filter(|row| row.subject == "audited")
+            .map(|row| {
+                (
+                    row.event.clone(),
+                    row.detail["ip"].as_str().map(str::to_owned),
+                )
+            })
+            .collect();
+        assert_eq!(
+            events,
+            [
+                (
+                    "principal_provisioned".to_owned(),
+                    Some("198.51.100.7".to_owned())
+                ),
+                (
+                    "principal_revoked".to_owned(),
+                    Some("198.51.100.7".to_owned())
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn bearer_matching_covers_hashed_and_plain_forms() {
+        let hashed = hash_bearer("abc");
+        assert!(hashed.starts_with("sha256:") && hashed.len() == 7 + 64);
+        assert!(bearer_matches(&hashed, "abc"));
+        assert!(!bearer_matches(&hashed, "abd"));
+        assert!(!bearer_matches(&hashed, &hashed));
+        assert!(bearer_matches("plain", "plain"));
+        assert!(!bearer_matches("plain", "plain "));
+        assert!(
+            !bearer_matches("", ""),
+            "an empty stored token matches nothing"
+        );
     }
 
     #[test]
