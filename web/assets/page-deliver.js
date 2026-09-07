@@ -389,7 +389,9 @@ async function uploadLibraryFile(file, path, progress = () => {}) {
           break;
         }
         if (!response.ok) throw new Error(body?.error || `upload failed (${response.status})`);
-        if (!Number.isInteger(body?.offset) || body.offset !== end) throw new Error('server returned invalid upload offset');
+        // `file.size` after any chunk: the stage already held the whole file
+        // (a last chunk whose reply was lost) and the server has published it.
+        if (!Number.isInteger(body?.offset) || (body.offset !== end && body.offset !== file.size)) throw new Error('server returned invalid upload offset');
         offset = body.offset;
         progress(offset);
         break;

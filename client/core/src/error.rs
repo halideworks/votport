@@ -106,6 +106,20 @@ pub enum Error {
     #[error("the transfer was cancelled")]
     Cancelled,
 
+    /// The port's library already holds a file at that path, or a delivery
+    /// is serving it; the server will not replace it.
+    #[error("{path} is already on the port")]
+    AlreadyOnPort { path: String },
+
+    /// The file is over the port's upload limit.
+    #[error("{path} is larger than the port's upload limit")]
+    TooLargeForPort { path: String },
+
+    /// The port refused an upload for a reason it stated (a folder name that
+    /// is a file, a tenant being deleted): `reason` is its sentence.
+    #[error("the port refused {path}: {reason}")]
+    PortRefused { path: String, reason: String },
+
     /// A resume named a transfer the journal does not hold.
     #[error("no journalled transfer {id}")]
     UnknownTransfer { id: String },
@@ -166,6 +180,11 @@ impl Error {
                 }
             },
             Self::LinkUnusable { .. } => "This link is closed.".to_owned(),
+            Self::AlreadyOnPort { path } => format!("{} is already on the port.", name_of(path)),
+            Self::TooLargeForPort { path } => {
+                format!("{} is larger than the port accepts.", name_of(path))
+            }
+            Self::PortRefused { reason, .. } => reason.clone(),
             Self::PasswordRequired => "This link needs a password.".to_owned(),
             Self::Empty => "Nothing was selected.".to_owned(),
             Self::Rejected { count, first } => {
@@ -250,13 +269,16 @@ impl Error {
                 | Self::NotSignedIn
                 | Self::WrongPassword
                 | Self::AlreadyShipping { .. }
+                | Self::AlreadyOnPort { .. }
+                | Self::TooLargeForPort { .. }
+                | Self::PortRefused { .. }
                 | Self::Cancelled
         )
     }
 }
 
 /// The `error` field of a server JSON body, as a sentence.
-fn server_reason(body: &str) -> Option<String> {
+pub(crate) fn server_reason(body: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let reason = value.get("error")?.as_str()?.trim();
     if reason.is_empty() {
@@ -436,6 +458,25 @@ mod tests {
                 "Not enough space: 120 GB needed, 8.0 GB free.",
             ),
             (Error::Cancelled, "Cancelled."),
+            (
+                Error::AlreadyOnPort {
+                    path: "dailies/reel.mov".into(),
+                },
+                "\"reel.mov\" is already on the port.",
+            ),
+            (
+                Error::TooLargeForPort {
+                    path: "dailies/reel.mov".into(),
+                },
+                "\"reel.mov\" is larger than the port accepts.",
+            ),
+            (
+                Error::PortRefused {
+                    path: "dailies/reel.mov".into(),
+                    reason: "Outbound path component is not a directory.".into(),
+                },
+                "Outbound path component is not a directory.",
+            ),
             (
                 Error::Other("chunk too large".into()),
                 "The transfer could not continue.",

@@ -77,7 +77,7 @@
         </Grid.ColumnDefinitions>
         <StackPanel Spacing="2" VerticalAlignment="Center">
           <TextBlock Text="Issue a delivery" FontWeight="SemiBold" />
-          <TextBlock Text="Pick files from the library; the recipient gets one link." FontSize="12" Foreground="{ThemeResource VotMutedBrush}" />
+          <TextBlock Text="Drop files, or pick what is already on the port; the recipient gets one link." FontSize="12" Foreground="{ThemeResource VotMutedBrush}" />
         </StackPanel>
         <Button x:Name="NewDeliveryButton" Grid.Column="1" Content="New delivery" Click="NewDelivery_Click"
             Style="{StaticResource AccentButtonStyle}" VerticalAlignment="Center" />

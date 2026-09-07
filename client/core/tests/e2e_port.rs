@@ -14,7 +14,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use votport_client_core::ffi::{self, Transfer, TransferListener, TransferView};
-use votport_client_core::port::{DeliverySpec, PortError, RequestSpec};
+use votport_client_core::port::{DeliverySpec, PortError, RequestSpec, UploadListener, UploadView};
 use votport_client_core::Error;
 
 /// The headline and the signed-out flag of a failed operator call.
@@ -26,6 +26,15 @@ fn failed<T: std::fmt::Debug>(result: Result<T, PortError>) -> (String, bool) {
             ..
         }) => (headline, signed_out),
         other => panic!("expected a failure, got {other:?}"),
+    }
+}
+
+#[derive(Default)]
+struct Uploads(Mutex<Vec<UploadView>>);
+
+impl UploadListener for Uploads {
+    fn update(&self, view: UploadView) {
+        self.0.lock().unwrap().push(view);
     }
 }
 
@@ -195,6 +204,101 @@ fn an_operator_runs_the_port_from_the_core() {
     assert_eq!(std::fs::read(&report.files[0]).unwrap(), vec![7u8; 100_000]);
     let last = recorder.0.lock().unwrap().last().cloned().unwrap();
     assert_eq!(last.status, "Landed and verified, 1 file");
+
+    // Uploading from this machine: a folder with a file over one chunk and an
+    // empty file goes up under the named folder, the listener hears the
+    // bytes move and the final line, the library lists both, and a delivery
+    // of the upload comes back byte for byte. The same upload again is
+    // refused as already on the port.
+    let local = tempfile::tempdir().unwrap();
+    let shots = local.path().join("shots");
+    std::fs::create_dir(&shots).unwrap();
+    let reel: Vec<u8> = (0..9 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(shots.join("reel.bin"), &reel).unwrap();
+    std::fs::write(shots.join("empty.txt"), b"").unwrap();
+    let slate = local.path().join("slate.txt");
+    std::fs::write(&slate, b"scene 4 take 2").unwrap();
+    let uploads = Arc::new(Uploads::default());
+    // One call takes the whole drop: a folder and a loose file.
+    let made = ffi::upload(
+        vec![
+            shots.to_string_lossy().into_owned(),
+            slate.to_string_lossy().into_owned(),
+        ],
+        "dailies".to_owned(),
+        Transfer::new(),
+        uploads.clone(),
+    )
+    .expect("upload the folder");
+    assert_eq!(
+        made.iter()
+            .map(|f| (f.path.as_str(), f.bytes))
+            .collect::<Vec<_>>(),
+        vec![
+            ("dailies/shots/empty.txt", 0),
+            ("dailies/shots/reel.bin", reel.len() as u64),
+            ("dailies/slate.txt", 14),
+        ]
+    );
+    let heard = uploads.0.lock().unwrap().clone();
+    assert!(
+        heard.iter().any(|v| v
+            .status
+            .starts_with("Uploading reel.bin, 8.4 MB of 9.4 MB (2 of 3 files)")),
+        "{heard:?}"
+    );
+    assert_eq!(
+        heard.last().unwrap().status,
+        "Added 3 files to the port, 9.4 MB"
+    );
+    assert_eq!(heard.last().unwrap().moved_bytes, reel.len() as u64 + 14);
+    assert_eq!(
+        heard.last().unwrap().landed,
+        vec![
+            "dailies/shots/empty.txt",
+            "dailies/shots/reel.bin",
+            "dailies/slate.txt"
+        ]
+    );
+    let listed = ffi::library("dailies/shots".to_owned()).unwrap();
+    assert_eq!(
+        listed
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.bytes))
+            .collect::<Vec<_>>(),
+        vec![
+            ("dailies/shots/empty.txt", 0),
+            ("dailies/shots/reel.bin", reel.len() as u64)
+        ]
+    );
+    assert_eq!(
+        failed(ffi::upload(
+            vec![shots.join("reel.bin").to_string_lossy().into_owned()],
+            "dailies/shots".to_owned(),
+            Transfer::new(),
+            uploads.clone(),
+        )),
+        ("\"reel.bin\" is already on the port.".to_owned(), false)
+    );
+    let uploaded = ffi::issue_delivery(DeliverySpec {
+        paths: vec!["dailies/shots/reel.bin".to_owned()],
+        label: "Reel".to_owned(),
+        password: None,
+        expires_days: 1,
+        max_downloads: None,
+    })
+    .unwrap();
+    let landing = tempfile::tempdir().unwrap();
+    let report = ffi::receive(
+        uploaded.url.clone(),
+        None,
+        landing.path().to_string_lossy().into_owned(),
+        Transfer::new(),
+        Arc::new(Recorder::default()),
+    )
+    .expect("receive the uploaded reel");
+    assert_eq!(std::fs::read(&report.files[0]).unwrap(), reel);
 
     ffi::revoke_delivery(delivery.delivery.id.clone()).unwrap();
     let revoked = ffi::deliveries()

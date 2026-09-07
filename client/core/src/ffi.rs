@@ -562,6 +562,31 @@ pub fn library(directory: String) -> std::result::Result<port::Library, port::Po
     port::library(&directory).map_err(port::PortError::from)
 }
 
+/// Uploads a drop of files and folders into the port's library under `into`
+/// (the UTC date when empty; a shell passes the local day), reporting
+/// progress to `listener` with one view across the whole drop, and returns
+/// the library files made, ready for [`issue_delivery`]. Blocks until done,
+/// so a shell calls it off its main thread; `transfer` cancels it.
+///
+/// # Errors
+/// Not signed in, a path the library already holds, a file over the port's
+/// limit, a cancel, or an unreachable server.
+#[uniffi::export]
+pub fn upload(
+    paths: Vec<String>,
+    into: String,
+    transfer: Arc<Transfer>,
+    listener: Arc<dyn port::UploadListener>,
+) -> std::result::Result<Vec<port::LibraryFile>, port::PortError> {
+    port::upload(
+        &paths,
+        &into,
+        &|| transfer.is_cancelled(),
+        listener.as_ref(),
+    )
+    .map_err(port::PortError::from)
+}
+
 /// Issues a delivery of library files; the reply carries the one link the
 /// server ever shows for it.
 ///

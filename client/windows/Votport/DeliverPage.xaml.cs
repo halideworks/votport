@@ -4,6 +4,9 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Animation;
+using Windows.ApplicationModel.DataTransfer;
+using Windows.Storage;
+using Windows.Storage.Pickers;
 using uniffi.votport_client_core;
 
 namespace Votport;
@@ -29,15 +32,21 @@ public sealed class LibraryEntry : INotifyPropertyChanged
     public Action? ChosenChanged { get; set; }
 }
 
-/// A new delivery from the port's library, reached from Links: browse a
-/// directory, tick files, issue the delivery, copy the one link the server
-/// shows for it.
+/// A new delivery, reached from Links. Files dropped or chosen here go up
+/// to the port first and come back ticked; what is already on the port is
+/// browsed one directory at a time and ticked the same way. Then the
+/// delivery is issued and its one link copied.
 public sealed partial class DeliverPage : Page
 {
+    private const string DropPrompt = "Drop files or folders here";
     private readonly ObservableCollection<LibraryEntry> entries = new();
     private readonly HashSet<string> chosen = new();
     private string directory = "";
     private string? issued;
+    /// The cancel handle of the upload in flight, if any, and the core's
+    /// last word on it.
+    private Transfer? uploading;
+    private UploadView? lastUpload;
 
     public DeliverPage()
     {
@@ -49,6 +58,8 @@ public sealed partial class DeliverPage : Page
         LabelBox.TextChanged += (_, _) => Refresh();
         Numeric.Integer(ExpiresBox);
         Numeric.Integer(DownloadsBox);
+        // The local day, not the core's UTC one: an evening drop belongs to today.
+        FolderBox.Text = DateTime.Now.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
         Open("");
         Refresh();
     }
@@ -59,6 +70,12 @@ public sealed partial class DeliverPage : Page
         // The button carries the count, so the row has one control to read.
         IssueButton.Content = chosen.Count == 0 ? "Tick the files to deliver" : chosen.Count == 1 ? "Deliver 1 file" : $"Deliver {chosen.Count} files";
         IssueButton.IsEnabled = !port.Busy && chosen.Count > 0 && LabelBox.Text.Trim().Length > 0;
+        var busy = uploading is not null;
+        ChooseButton.IsEnabled = !busy;
+        ChooseFolderButton.Visibility = busy ? Visibility.Collapsed : Visibility.Visible;
+        PasteButton.IsEnabled = !busy;
+        CancelUploadButton.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
+        FolderBox.IsEnabled = !busy;
         var problem = port.ProblemFor(PortStore.Scope.Deliver);
         ProblemText.Text = problem ?? "";
         ProblemText.Visibility = problem is null ? Visibility.Collapsed : Visibility.Visible;
@@ -71,7 +88,7 @@ public sealed partial class DeliverPage : Page
     {
         directory = target;
         entries.Clear();
-        BrowserNote.Text = "Reading the library";
+        BrowserNote.Text = "Reading what is on the port";
         BrowserNote.Visibility = Visibility.Visible;
         DrawCrumbs();
         PortStore.Shared.Library(target, listing =>
@@ -97,13 +114,99 @@ public sealed partial class DeliverPage : Page
         });
     }
 
-    /// The path into the library in the path type: every directory above
-    /// the current one is a link back to it, the current one is plain text.
+    private void DropZone_DragOver(object sender, DragEventArgs e)
+    {
+        e.AcceptedOperation = uploading is null && e.DataView.Contains(StandardDataFormats.StorageItems)
+            ? DataPackageOperation.Copy
+            : DataPackageOperation.None;
+    }
+
+    private async void DropZone_Drop(object sender, DragEventArgs e)
+    {
+        if (!e.DataView.Contains(StandardDataFormats.StorageItems)) return;
+        Upload(await e.DataView.GetStorageItemsAsync());
+    }
+
+    private async void Choose_Click(object sender, RoutedEventArgs e)
+    {
+        var picker = new FileOpenPicker { SuggestedStartLocation = PickerLocationId.DocumentsLibrary };
+        picker.FileTypeFilter.Add("*");
+        WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(App.Window));
+        Upload(await picker.PickMultipleFilesAsync());
+    }
+
+    private async void ChooseFolder_Click(object sender, RoutedEventArgs e)
+    {
+        var picker = new FolderPicker { SuggestedStartLocation = PickerLocationId.DocumentsLibrary };
+        picker.FileTypeFilter.Add("*");
+        WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(App.Window));
+        var folder = await picker.PickSingleFolderAsync();
+        if (folder is not null) Upload(new[] { folder });
+    }
+
+    private async void Paste_Click(object sender, RoutedEventArgs e)
+    {
+        var data = Clipboard.GetContent();
+        if (data.Contains(StandardDataFormats.StorageItems)) Upload(await data.GetStorageItemsAsync());
+    }
+
+    private void CancelUpload_Click(object sender, RoutedEventArgs e) => uploading?.Cancel();
+
+    /// Sends the items up to the port under the folder named in the box;
+    /// what lands is ticked and its folder opened so the ticks are seen.
+    private void Upload(IEnumerable<IStorageItem> items)
+    {
+        var paths = items.Select(item => item.Path).Where(path => path.Length > 0).ToArray();
+        if (paths.Length == 0 || uploading is not null) return;
+        var transfer = new Transfer();
+        uploading = transfer;
+        lastUpload = null;
+        Refresh();
+        // What landed is ticked whether the upload ended well or not: a
+        // failure or a cancel midway still put the earlier files on the port.
+        PortStore.Shared.Upload(paths, FolderBox.Text.Trim(), transfer, new UploadHop(this), _ => Landed(reopen: true), () =>
+        {
+            // The problem line below says what went wrong; the prompt returns.
+            // No reload here: a library call would clear that line.
+            DropText.Text = DropPrompt;
+            Landed(reopen: false);
+        });
+    }
+
+    private void Landed(bool reopen)
+    {
+        uploading = null;
+        var landed = lastUpload?.Landed ?? Array.Empty<string>();
+        foreach (var path in landed) chosen.Add(path);
+        if (reopen && landed.Length > 0) Open(landed[0][..Math.Max(landed[0].LastIndexOf('/'), 0)]);
+        Refresh();
+    }
+
+    /// The core's line stays up after the upload ends ("Added 2 files to
+    /// the port, 21 MB") until the next one starts.
+    private void ShowUpload(UploadView view)
+    {
+        lastUpload = view;
+        DropText.Text = view.Status;
+    }
+
+    /// The core's progress callback for an upload. Called on the core's
+    /// thread; hops to the UI thread before touching the page.
+    private sealed class UploadHop : UploadListener
+    {
+        private readonly DeliverPage page;
+        public UploadHop(DeliverPage page) => this.page = page;
+        public void Update(UploadView view) => page.DispatcherQueue.TryEnqueue(() => page.ShowUpload(view));
+    }
+
+    /// The path into what is on the port, in the path type: every directory
+    /// above the current one is a link back to it, the current one is plain
+    /// text.
     private void DrawCrumbs()
     {
         Crumbs.Children.Clear();
         var parts = directory.Split('/', StringSplitOptions.RemoveEmptyEntries);
-        AddCrumb("Library", "", current: parts.Length == 0);
+        AddCrumb("On the port", "", current: parts.Length == 0);
         for (var i = 0; i < parts.Length; i++)
         {
             Crumbs.Children.Add(new TextBlock { Text = "/", Foreground = Theme.Brush(this, "VotMuted"), VerticalAlignment = VerticalAlignment.Center });

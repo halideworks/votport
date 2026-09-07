@@ -131,6 +131,26 @@ final class PortStore: ObservableObject {
         }
     }
 
+    /// Uploads a drop (files, and folders with everything under them) into
+    /// the port under `into` and hands back every library file made.
+    /// Progress reaches `listener` on the core's thread; a failure midway
+    /// returns nothing here, and the listener's last view names what landed.
+    func upload(
+        _ paths: [String], into: String, transfer: Transfer, listener: UploadListener,
+        done: @escaping ([LibraryFile]?) -> Void
+    ) {
+        run(.deliver) {
+            try VotportCore.upload(paths: paths, into: into, transfer: transfer, listener: listener)
+        } then: { [weak self] result in
+            switch result {
+            case .success(let made): done(made)
+            case .failure(let error):
+                self?.take(error, .deliver)
+                done(nil)
+            }
+        }
+    }
+
     func issueDelivery(_ spec: DeliverySpec, done: @escaping (IssuedDelivery?) -> Void) {
         run(.deliver) { try VotportCore.issueDelivery(spec: spec) } then: { [weak self] result in
             guard let self else { return }

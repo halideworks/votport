@@ -171,14 +171,18 @@ one, browses the library one directory at a time
 (`GET /api/admin/outbound-files?directory=`), and issues a delivery of
 library files (`POST /api/admin/outbound-grants` with `paths`), whose
 reply carries the link. Mutations send the `X-Votport` header and are
-never retried; a 401 becomes `Error::NotSignedIn` and a refused password
+never retried, except an upload chunk, which is retried when the
+connection never opened, timed out before a reply, or met a 503, and is
+safe to repeat because the server answers a chunk it already holds with
+its stage offset; the server drains a refused chunk's body before
+answering, so the client reads the 409 or 413 rather than a reset
+connection; a 401 becomes `Error::NotSignedIn` and a refused password
 `Error::WrongPassword`, each with a headline, and a 422's headline is the
 server's own reason ("Label must be 1..=200 characters."). The CLI gains `signin`
 (password from a flag or stdin), `signout`, `port`, `requests`,
 `issue-request`, `close-request`, `deliveries`, `revoke-delivery`,
-`library`, and `issue-delivery`. SSO sign-in still needs the three server
-touches under "The shells" and is not in the core yet. The shells do not
-draw any of this yet. Watch folders (phase C6) are in the core and the CLI
+`library`, `issue-delivery`, and `upload`. SSO sign-in still needs the three server
+touches under "The shells" and is not in the core yet. Watch folders (phase C6) are in the core and the CLI
 as well (`watch.rs`): the list of watches lives in `watches.json` under
 the state directory (a folder, a request link, and the link's password
 when it has one, since an unattended send must hold it); a watcher thread
@@ -213,10 +217,25 @@ senders shipping now, issues one (label, optional password, expiry, cap;
 the link is copied as it is issued) and closes one, and lists the
 deliveries with their download counts and revokes one. Each section
 opens with its issue form: the request form under REQUESTS, and under
-DELIVERIES a card whose "New delivery" button opens the library (a sheet
-on the Mac, a page on Windows whose title row is a chevron and LINKS as
-the way back), browses it one directory at a time, ticks files, and
-issues a delivery whose link is shown once and copied. The day, count,
+DELIVERIES a card whose "New delivery" button opens the delivery screen
+(a sheet on the Mac, a page on Windows whose title row is a chevron and
+LINKS as the way back). It opens with a drop zone: files or folders
+dropped, chosen, or pasted there go up to the port first, into the folder named
+beside it (today's date unless changed), in 8 MiB chunks under one upload
+id per file through `POST /api/admin/outbound-files?path=` with
+`Content-Range`, so a second attempt resumes from the server's offset
+(a stage that already holds the whole file is published on the next
+attempt; a file that was published before its reply was lost is refused
+as already on the port, which it is)
+(`port::upload`, `UploadListener` with a core-computed line such as
+"Uploading reel.mov, 1.2 GB of 4.0 GB (2 of 5 files)", cancel through a
+`Transfer` handle, `votport upload` in the CLI); what lands comes back
+ticked with its folder open. Below it, "On the port" browses what is
+already there one directory at a time for ticking, and the delivery is
+issued with its link shown once and copied. A path the port already
+holds, or that a delivery is serving, is refused as "already on the
+port"; a file over the port's upload limit as "larger than the port
+accepts". The day, count,
 and gigabyte fields are number entries (a spin box under a caption on
 Windows, a field with its unit and a stepper on the Mac), and the issue
 button fills the rest of its row and carries the file count. Copy
