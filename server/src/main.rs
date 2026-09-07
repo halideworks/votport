@@ -50,6 +50,7 @@ async fn main() {
     app::start_push_receiver(application.clone());
     app::start_serve(application.clone());
     tokio::spawn(app::session_sweeper(application.clone()));
+    tokio::spawn(app::lease_keeper(application.clone()));
     tokio::spawn(app::upload_ended_notifier(application.clone()));
     tokio::spawn(votport::backup::scheduler(application.clone()));
     let router = app::router(application.clone());

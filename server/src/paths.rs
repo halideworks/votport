@@ -307,6 +307,9 @@ pub fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String
     if component.eq_ignore_ascii_case(TENANT_STORAGE_DIR) {
         return Err("name is reserved for tenant storage".to_owned());
     }
+    if component.eq_ignore_ascii_case(crate::lease::FILE_NAME) {
+        return Err("name is reserved for the instance lease".to_owned());
+    }
     if is_push_staging_name(component)
         || (component.starts_with(".vot-")
             && (component.ends_with(".stage") || component.ends_with(".journal")))
@@ -504,6 +507,8 @@ mod tests {
     #[test]
     fn probe_names_are_reserved_from_senders_and_swept_as_staging() {
         assert!(super::admit_component(".vot-probe-abc.stage", true).is_err());
+        assert!(super::admit_component(".votport-lease", true).is_err());
+        assert!(super::admit_component(".VOTPORT-LEASE", true).is_err());
         assert!(super::admit_component(".vot-probe-abc.journal", true).is_err());
         let directory = tempfile::tempdir().unwrap();
         for name in [".vot-probe-abc.stage", ".vot-probe-abc.journal"] {

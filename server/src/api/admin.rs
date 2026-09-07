@@ -4788,9 +4788,11 @@ mod tenant_offboard_tests {
         let response = delete_tenant_req(application.clone(), &cookie, "ghost").await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(keep.exists());
+        // The instance lease lives at the root and is not tenant content.
         let mut entries: Vec<_> = std::fs::read_dir(&application.config.receive_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != crate::lease::FILE_NAME)
             .collect();
         entries.sort();
         assert_eq!(entries, vec![std::ffi::OsString::from("keep.bin")]);

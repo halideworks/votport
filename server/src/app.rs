@@ -1,7 +1,7 @@
 //! Application state and router assembly.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{DefaultBodyLimit, State};
@@ -125,6 +125,25 @@ pub struct App {
     /// active-passive standby started too early) refuses to boot instead of
     /// sharing SQLite and staging with the live one.
     pub(crate) _data_lock: std::fs::File,
+    /// This instance's name in the receive-root lease (crate::lease).
+    pub lease_holder: String,
+    pub lease_acquired_at: u64,
+    /// Set when a heartbeat finds another holder in the lease file; the
+    /// process is then shutting down and /readyz reports it.
+    pub lease_lost: AtomicBool,
+}
+
+impl Drop for App {
+    /// The last reference goes away only when no task, listener, or blocking
+    /// job can still write, so the lease may be yielded here: a clean exit
+    /// that gets this far lets the standby start without waiting for the
+    /// lease to go stale. A crash never runs it and the clock covers that.
+    fn drop(&mut self) {
+        crate::lease::release(
+            &crate::lease::path(&self.config.receive_dir),
+            &self.lease_holder,
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -744,6 +763,16 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
     crate::paths::tighten_private_dir(&config.data_dir).map_err(|error| error.to_string())?;
     let data_lock = lock_data_dir(&config.data_dir)?;
+    // The receive root is the one path every topology shares, so the lease
+    // there fences a standby the data directory lock cannot see. Taken after
+    // the lock so two instances over one data directory get the lock's
+    // message, which names the nearer problem.
+    let lease_holder = crate::lease::new_holder();
+    let lease = crate::lease::acquire(
+        &crate::lease::path(&config.receive_dir),
+        &lease_holder,
+        now_unix(),
+    )?;
     crate::backup::apply_pending_restore(&config.data_dir, crate::store::SCHEMA_VERSION)?;
     crate::paths::clean_staging(&config.outbound_dir, &HashSet::new());
     let store = Arc::new(Store::open(&config.data_dir)?);
@@ -817,6 +846,9 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         backup_lock: Arc::new(tokio::sync::Mutex::new(())),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         _data_lock: data_lock,
+        lease_holder,
+        lease_acquired_at: lease.acquired_at,
+        lease_lost: AtomicBool::new(false),
         config,
     }))
 }
@@ -1005,13 +1037,60 @@ fn lock_data_dir(data_dir: &std::path::Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
-/// Releases the data directory lock without exiting. Production never calls
-/// this: push and serve listener threads and blocking store work can outlive
-/// suspend_sessions, so the lock has to hold until the process is gone. The
-/// restart e2e tests boot a second App in the same process and need it.
+/// Releases the data directory lock and the receive-root lease without
+/// exiting. Production never calls this: push and serve listener threads and
+/// blocking store work can outlive suspend_sessions, so both fences have to
+/// hold until the process is gone. The restart e2e tests boot a second App
+/// in the same process and need it.
 pub fn release_data_lock(app: &App) {
     #[cfg(unix)]
     let _ = rustix::fs::flock(&app._data_lock, rustix::fs::FlockOperation::Unlock);
+    crate::lease::release(
+        &crate::lease::path(&app.config.receive_dir),
+        &app.lease_holder,
+    );
+}
+
+/// One heartbeat: renews the lease, or records the loss and asks the process
+/// to stop when another instance holds it. Returns whether the lease is
+/// still ours.
+pub fn renew_lease(app: &App, now: u64) -> bool {
+    if app.lease_lost.load(Ordering::Relaxed) {
+        return false;
+    }
+    let path = crate::lease::path(&app.config.receive_dir);
+    match crate::lease::renew(&path, &app.lease_holder, app.lease_acquired_at, now) {
+        Ok(crate::lease::Renewal::Renewed) => true,
+        Ok(crate::lease::Renewal::Lost { holder }) => {
+            tracing::error!(
+                target: "audit",
+                event = "lease_lost",
+                %holder,
+                "another instance holds the receive-root lease; stopping so it can serve alone"
+            );
+            app.lease_lost.store(true, Ordering::Relaxed);
+            app.request_shutdown();
+            false
+        }
+        Err(error) => {
+            // A renewal that cannot be written leaves the clock running
+            // toward staleness; the next tick retries.
+            tracing::warn!(%error, "lease renewal failed");
+            true
+        }
+    }
+}
+
+/// Heartbeats the lease for the life of the process.
+pub async fn lease_keeper(app: Arc<App>) {
+    let mut tick = tokio::time::interval(crate::lease::RENEW_EVERY);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        if !renew_lease(&app, now_unix()) {
+            return;
+        }
+    }
 }
 
 /// Remove only VOTPORT-owned outbound staging entries. `symlink_metadata` and
@@ -1770,10 +1849,15 @@ async fn readyz(State(app): State<Arc<App>>) -> Response {
         .store
         .resolved_settings(&app.config)
         .map(|settings| settings.draining);
+    let lease_lost = app.lease_lost.load(Ordering::Relaxed);
     let (ready, draining) = match (&healthy, draining) {
-        (Ok(()), Ok(draining)) => (!draining, draining),
+        (Ok(()), Ok(draining)) => (!draining && !lease_lost, draining),
         _ => (false, false),
     };
+    let now = now_unix();
+    let lease = crate::lease::read(&crate::lease::path(&app.config.receive_dir))
+        .ok()
+        .flatten();
     if let Err(error) = healthy {
         tracing::error!(%error, "readiness check failed");
     }
@@ -1788,6 +1872,12 @@ async fn readyz(State(app): State<Arc<App>>) -> Response {
             "ready": ready,
             "draining": draining,
             "sessions_active": app.sessions.total(),
+            "lease": {
+                "holder": lease.as_ref().map(|lease| lease.holder.clone()),
+                "mine": lease.as_ref().is_some_and(|lease| lease.holder == app.lease_holder),
+                "age_secs": lease.as_ref().map(|lease| lease.age(now)),
+                "lost": lease_lost,
+            },
         })),
     )
         .into_response()
@@ -1884,6 +1974,69 @@ mod health_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_second_instance_on_the_same_receive_root_refuses_to_boot_and_readyz_shows_the_lease()
+    {
+        use http_body_util::BodyExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let first = crate::api::testing::build(directory.path());
+        // Its own data directory, so only the receive-root lease can refuse it.
+        let mut config = crate::api::testing::config(&directory.path().join("standby"));
+        config.receive_dir = first.config.receive_dir.clone();
+        let error = match build(config.clone()) {
+            Ok(_) => panic!("second instance booted over a live lease"),
+            Err(error) => error,
+        };
+        assert!(error.contains(".votport-lease is held by"), "{error}");
+        assert!(error.contains(&first.lease_holder), "{error}");
+
+        let response = router(first.clone())
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["lease"]["holder"], first.lease_holder);
+        assert_eq!(json["lease"]["mine"], true);
+        assert_eq!(json["lease"]["lost"], false);
+        assert!(json["lease"]["age_secs"].as_u64().unwrap() < 5);
+        let metrics = metrics_text(&first).unwrap();
+        assert!(metrics.contains("votport_lease_held 1\n"), "{metrics}");
+
+        // Once the holder is gone and its clock has run out, the standby
+        // takes over; the old holder's next heartbeat learns it lost.
+        let path = crate::lease::path(&first.config.receive_dir);
+        let stale = crate::lease::Lease {
+            holder: first.lease_holder.clone(),
+            acquired_at: 1,
+            renewed_at: 1,
+        };
+        release_data_lock(&first);
+        std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
+        let standby = build(config).unwrap();
+        assert!(!renew_lease(&first, crate::store::now_unix()));
+        assert!(first.lease_lost.load(Ordering::Relaxed));
+        assert!(!renew_lease(&first, crate::store::now_unix()), "stays lost");
+        assert!(renew_lease(&standby, crate::store::now_unix()));
+        let response = router(first.clone())
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["lease"]["lost"], true);
+        assert_eq!(json["lease"]["mine"], false);
+        assert_eq!(json["lease"]["holder"], standby.lease_holder);
+        assert!(metrics_text(&first)
+            .unwrap()
+            .contains("votport_lease_held 0\n"));
+        assert!(metrics_text(&standby)
+            .unwrap()
+            .contains("votport_lease_held 1\n"));
     }
 
     #[cfg(unix)]
@@ -2880,6 +3033,16 @@ fn metrics_text(app: &App) -> Result<String, String> {
         body,
         "# TYPE votport_draining gauge\nvotport_draining {}\n",
         u8::from(draining)
+    );
+    let lease = crate::lease::read(&crate::lease::path(&app.config.receive_dir))
+        .ok()
+        .flatten();
+    let _ = write!(
+        body,
+        "# TYPE votport_lease_held gauge\nvotport_lease_held {}\n# TYPE votport_lease_age_seconds gauge\nvotport_lease_age_seconds {}\n",
+        u8::from(lease.as_ref().is_some_and(|lease| lease.holder == app.lease_holder)
+            && !app.lease_lost.load(Ordering::Relaxed)),
+        lease.as_ref().map_or(0, |lease| lease.age(now_unix()))
     );
     let _ = write!(
         body,
