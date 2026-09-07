@@ -118,6 +118,11 @@ pub struct App {
     /// must never produce two snapshots or apply two restores concurrently.
     pub backup_lock: Arc<tokio::sync::Mutex<()>>,
     pub shutdown: Arc<tokio::sync::Notify>,
+    /// Exclusive flock on `<data_dir>/lock`, held for the life of the
+    /// process: a second instance over the same data directory (an
+    /// active-passive standby started too early) refuses to boot instead of
+    /// sharing SQLite and staging with the live one.
+    pub(crate) _data_lock: std::fs::File,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -736,6 +741,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
     crate::paths::tighten_private_dir(&config.data_dir).map_err(|error| error.to_string())?;
+    let data_lock = lock_data_dir(&config.data_dir)?;
     crate::backup::apply_pending_restore(&config.data_dir, crate::store::SCHEMA_VERSION)?;
     crate::paths::clean_staging(&config.outbound_dir, &HashSet::new());
     let store = Arc::new(Store::open(&config.data_dir)?);
@@ -807,6 +813,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         push_tickets: Mutex::new(HashMap::new()),
         backup_lock: Arc::new(tokio::sync::Mutex::new(())),
         shutdown: Arc::new(tokio::sync::Notify::new()),
+        _data_lock: data_lock,
         config,
     }))
 }
@@ -969,6 +976,39 @@ fn web_build(web_root: &std::path::Path) -> String {
         hasher.update(std::fs::read(&path).unwrap_or_default());
     }
     hex::encode(hasher.finalize())[..16].to_owned()
+}
+
+/// Takes the single-writer lock. flock is advisory and per open file
+/// description, so the returned handle must stay open; it is released by
+/// the kernel when the process exits, however it exits.
+fn lock_data_dir(data_dir: &std::path::Path) -> Result<std::fs::File, String> {
+    let path = data_dir.join("lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options
+        .open(&path)
+        .map_err(|error| format!("open {}: {error}", path.display()))?;
+    #[cfg(unix)]
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+        |error| {
+            format!(
+                "{} is held by another votport process ({error}); only one instance may run on a data directory",
+                path.display()
+            )
+        },
+    )?;
+    Ok(file)
+}
+
+/// Releases the data directory lock without exiting. Production never calls
+/// this: push and serve listener threads and blocking store work can outlive
+/// suspend_sessions, so the lock has to hold until the process is gone. The
+/// restart e2e tests boot a second App in the same process and need it.
+pub fn release_data_lock(app: &App) {
+    #[cfg(unix)]
+    let _ = rustix::fs::flock(&app._data_lock, rustix::fs::FlockOperation::Unlock);
 }
 
 /// Remove only VOTPORT-owned outbound staging entries. `symlink_metadata` and
@@ -1716,6 +1756,40 @@ async fn healthz(State(app): State<Arc<App>>) -> Response {
     StatusCode::OK.into_response()
 }
 
+/// Readiness for failover scripts and orchestrators: 503 while unhealthy or
+/// draining, while /healthz keeps reporting the process itself as fine. Not
+/// for a single-upstream proxy health check: drain keeps downloads and admin
+/// up on purpose (docs/deployment.md, Scaling and availability). The body
+/// carries the active upload count so a failover script can wait for zero.
+async fn readyz(State(app): State<Arc<App>>) -> Response {
+    let healthy = check_health(&app);
+    let draining = app
+        .store
+        .resolved_settings(&app.config)
+        .map(|settings| settings.draining);
+    let (ready, draining) = match (&healthy, draining) {
+        (Ok(()), Ok(draining)) => (!draining, draining),
+        _ => (false, false),
+    };
+    if let Err(error) = healthy {
+        tracing::error!(%error, "readiness check failed");
+    }
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "ready": ready,
+            "draining": draining,
+            "sessions_active": app.sessions.total(),
+        })),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod health_tests {
     use super::*;
@@ -1754,6 +1828,73 @@ mod health_tests {
                 .file_name()
                 .to_string_lossy()
                 .starts_with(".votport-health-")));
+    }
+
+    #[tokio::test]
+    async fn readyz_follows_draining_and_healthz_does_not() {
+        use http_body_util::BodyExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let response = router(app.clone())
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ready"], true);
+        assert_eq!(json["draining"], false);
+        assert_eq!(json["sessions_active"], 0);
+
+        app.store
+            .put_settings(
+                "test",
+                &[(
+                    "draining".to_owned(),
+                    crate::store::SettingWrite::Set("1".to_owned()),
+                )],
+            )
+            .unwrap();
+        let response = router(app.clone())
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ready"], false);
+        assert_eq!(json["draining"], true);
+        let response = router(app)
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readyz_is_unavailable_when_storage_cannot_be_probed() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        std::fs::remove_dir_all(&app.config.receive_dir).unwrap();
+        let response = router(app)
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_second_instance_on_the_same_data_directory_refuses_to_boot() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = crate::api::testing::build(directory.path());
+        let error = match build(crate::api::testing::config(directory.path())) {
+            Ok(_) => panic!("second instance booted over a held data directory"),
+            Err(error) => error,
+        };
+        assert!(error.contains("held by another votport process"), "{error}");
+        drop(first);
+        crate::api::testing::build(directory.path());
     }
 
     #[tokio::test]
@@ -1899,6 +2040,7 @@ pub fn router(app: Arc<App>) -> Router {
 
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         // Pages.
         .route("/", serve_page(admin_page))
         .route("/r/{token}", serve_page(request_page))
