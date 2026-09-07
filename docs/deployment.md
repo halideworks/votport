@@ -699,9 +699,15 @@ through the proxy) until `sessions_active` reaches 0, stop the live container
 turn drain off. Unplanned failover
 skips the drain: in-flight uploads whose worker checkpointed resume from that
 offset once the standby is up, uploads killed before a checkpoint start over,
-and streaming downloads and QUIC sessions die with the process and are retried
-by the client. Per-IP throttles and session rate windows reset. Nothing is lost
-that had been published.
+and QUIC sessions die with the process and are retried by the client. Browser
+downloads that stream to disk (Chromium's save-to-folder path) keep resuming
+by byte range for ten minutes, long enough for a failover; when the cookie
+secret was rotated by a promotion, a password-gated delivery asks for the
+password again and then continues from the same offset, and on a capped
+delivery the resumed download counts again. Browsers on the plain download
+fallback (Firefox, Safari) need a click to retry, and the desktop client
+resumes on its own. Per-IP throttles and session rate windows reset. Nothing
+is lost that had been published.
 
 `ops/failover/` holds the automation: `planned.sh` drains, waits, stops,
 promotes, and clears the drain on the new live; `watch.sh` probes the live

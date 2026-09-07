@@ -336,6 +336,61 @@ test('streamToWritable restarts from zero when a resume is answered with 200', a
   assert.equal(writable.written(), 8);
 });
 
+test('streamToWritable keeps resuming for the time budget, not a fixed count', async () => {
+  let clock = 0;
+  const sleep = async (ms) => { clock += ms; };
+  const now = () => clock;
+  let calls = 0;
+  const responses = [];
+  for (let i = 0; i < 40; i += 1) responses.push({ ok: false, status: 503, body: null });
+  responses.push({ ok: true, status: 206, body: bodyOf([bytes(4, 2)]) });
+  const fetchFn = async () => { calls += 1; return responses.shift(); };
+  const writable = fakeWritable();
+  writable.write(bytes(4, 1));
+  // Forty 503s at the 8 s cap is nearly five minutes of waiting; the ten
+  // minute budget covers it, a five-attempt limit would not.
+  const total = await streamToWritable(fetchFn, writable, { download_url: '/f/0' }, { sleep, now });
+  assert.equal(calls, 41);
+  assert.ok(clock > 4 * 60 * 1000 && clock < 10 * 60 * 1000, `waited ${clock} ms`);
+  assert.equal(total, 4);
+  await assert.rejects(
+    streamToWritable(async () => ({ ok: false, status: 503, body: null }), fakeWritable(),
+      { download_url: '/f/0' }, { sleep, now, retryBudgetMs: 20000 }),
+    /server returned 503/,
+  );
+});
+
+test('streamToWritable re-authorizes on 401 and resumes from its offset', async () => {
+  const requests = [];
+  const responses = [
+    { ok: true, status: 200, body: bodyOf([bytes(4, 1), bytes(4, 2)], { failAfter: 1 }) },
+    { ok: false, status: 401, body: null },
+    { ok: true, status: 206, body: bodyOf([bytes(4, 2)]) },
+  ];
+  const fetchFn = async (url, options) => { requests.push(options.headers); return responses.shift(); };
+  let asked = 0;
+  const writable = fakeWritable();
+  const total = await streamToWritable(fetchFn, writable, { download_url: '/f/0' }, {
+    ...noSleep,
+    onAuthLost: async () => { asked += 1; return true; },
+  });
+  assert.equal(total, 8);
+  assert.equal(asked, 1);
+  assert.deepEqual(requests, [{}, { Range: 'bytes=4-' }, { Range: 'bytes=4-' }]);
+  assert.equal(writable.truncated, 0);
+  // A gate that cannot re-authorize, or no gate at all, is a hard failure.
+  await assert.rejects(
+    streamToWritable(async () => ({ ok: false, status: 401, body: null }), fakeWritable(),
+      { download_url: '/f/0' }, { ...noSleep, onAuthLost: async () => false }),
+    /server returned 401/,
+  );
+  await assert.rejects(
+    streamToWritable(async () => ({ ok: false, status: 403, body: null }), fakeWritable(),
+      { download_url: '/f/0' }, noSleep),
+    /server returned 403/,
+  );
+});
+
 test('streamToWritable gives up after the retry limit and on non-transient statuses', async () => {
   let calls = 0;
   await assert.rejects(
