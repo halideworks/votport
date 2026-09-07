@@ -344,6 +344,8 @@ pub struct ResolvedSettings {
     pub default_max_sessions: Option<u64>,
     pub public_password_login: bool,
     pub sso_session_secs: u64,
+    /// SCIM bearer; None means /scim/v2 answers 401 to everything.
+    pub scim_token: Option<String>,
     /// When true, new upload sessions are refused so active ones can finish
     /// before a restart. Downloads and admin are unaffected.
     pub draining: bool,
@@ -394,6 +396,8 @@ pub struct SettingsOverlay {
     pub default_max_sessions_source: &'static str,
     pub public_password_login_source: &'static str,
     pub sso_session_secs_source: &'static str,
+    pub scim_token_set: bool,
+    pub scim_token_source: &'static str,
     pub draining_source: &'static str,
 }
 
@@ -2293,6 +2297,18 @@ impl Store {
                 rusqlite::params![subject, at, groups_json, grants_json],
                 map_principal,
             )
+        })
+    }
+
+    /// SCIM create: a new unblocked row with source 'scim'. Returns false
+    /// when the subject already exists, whatever its state.
+    pub fn provision_principal(&self, subject: &str) -> Result<bool, String> {
+        self.with(|connection| {
+            let changed = connection.execute(
+                "INSERT OR IGNORE INTO principals (subject, source) VALUES (?1, 'scim')",
+                [subject],
+            )?;
+            Ok(changed > 0)
         })
     }
 
@@ -4272,6 +4288,8 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
         overlay_bool(rows, "public_password_login", config.public_password_login);
     let (sso_session_secs, sso_session_secs_source) =
         overlay_u64(rows, "sso_session_secs", config.sso_session_secs);
+    let (scim_token, scim_token_source) =
+        overlay_text(rows, "scim_token", config.scim_token.clone());
     // The write path refuses zero; a hand-edited row falls back to env.
     let (sso_session_secs, sso_session_secs_source) = if sso_session_secs == 0 {
         tracing::error!(
@@ -4299,6 +4317,7 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
             default_max_sessions,
             public_password_login,
             sso_session_secs,
+            scim_token: scim_token.clone(),
             draining,
         },
         notify_webhook_source,
@@ -4329,6 +4348,8 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
         default_max_sessions_source,
         public_password_login_source,
         sso_session_secs_source,
+        scim_token_set: scim_token.is_some(),
+        scim_token_source,
         draining_source,
     }
 }
@@ -7158,6 +7179,7 @@ mod settings_tests {
             smtp_starttls: true,
             smtp_username: None,
             smtp_password: None,
+            scim_token: None,
             smtp_from: None,
             smtp_to: None,
             public_url: None,

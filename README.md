@@ -154,6 +154,7 @@ the row so env applies again. Details: [`docs/deployment.md`](docs/deployment.md
 | `VOTPORT_NOTIFY_SMTP_STARTTLS` | on | SMTP STARTTLS. Off only when `0`. Port 465 uses implicit TLS regardless. |
 | `VOTPORT_NOTIFY_SMTP_USERNAME` | — | Optional SMTP AUTH username. |
 | `VOTPORT_NOTIFY_SMTP_PASSWORD` | — | Optional SMTP AUTH password. |
+| `VOTPORT_SCIM_TOKEN` | — | Bearer for the SCIM 2.0 provisioning endpoint at `/scim/v2`; unset disables it. Overridable via `PUT /api/admin/settings`. |
 | `VOTPORT_NOTIFY_SMTP_FROM` | — | SMTP From address (required with host and `to`). |
 | `VOTPORT_NOTIFY_SMTP_TO` | — | Comma-separated SMTP recipients (at least one required with host and from). |
 | `VOTPORT_AUDIT_RETENTION_DAYS` | `400` | Days to keep queryable audit rows; `0` disables pruning. Overridable via `PUT /api/admin/settings`. |

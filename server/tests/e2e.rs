@@ -133,6 +133,7 @@ async fn start_server_in(
         smtp_starttls: true,
         smtp_username: None,
         smtp_password: None,
+        scim_token: None,
         smtp_from: None,
         smtp_to: None,
         public_url: None,

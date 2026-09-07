@@ -79,7 +79,7 @@ A security team can put one instance behind their IdP, give each group a namespa
 - Per-tenant encryption keys, custom domains, tenant self-signup, public sharing.
 - Closing the quota TOCTOU.
 - Dashboard rewrite, component library, Kubernetes.
-- Invites or SCIM.
+- Invites. (SCIM Users shipped later at `/scim/v2`.)
 - Automation tokens exist (`POST /api/automation/share`, per-tenant, expiring, revocable, rate limited per IP, optionally confined to a library folder, use and token refusal audited).
 - Legal hold versus retention (per-tenant or per-link "do not sweep" flag). Own design later.
 
@@ -113,7 +113,7 @@ A security team can put one instance behind their IdP, give each group a namespa
 
 9. **One platform break-glass, with live grants to every named tenant.** Revise the threat table rather than invent per-tenant passwords. `require_admin` expands `subject == "local"` grants from `store.tenants()` on every request so a newly created namespace is reachable without re-login.
 
-10. **Principals are SSO-sourced. Revoke = bump `credential_version` plus a `blocked` flag.** IdP group membership remains the source of truth for "who should have access". Session-only revoke is a lie if they can click SSO again; `blocked` makes the smallest slice honest. No invites, no SCIM. Revoke/unblock POST a JSON `{ "subject": "..." }` body, not a path segment.
+10. **Principals are SSO-sourced. Revoke = bump `credential_version` plus a `blocked` flag.** IdP group membership remains the source of truth for "who should have access". Session-only revoke is a lie if they can click SSO again; `blocked` makes the smallest slice honest. No invites; SCIM Users came later at `/scim/v2` (deployment.md). Revoke/unblock POST a JSON `{ "subject": "..." }` body, not a path segment.
 
 11. **Bind per-subject version as JSON `"cv"` on `AdminIdentity` with `#[serde(rename = "cv", default = "cv_one")]`.** Build the cookie payload with `serde_json::to_string` of `AdminIdentity` so issue and verify share one field set. After principal upsert, set `identity.credential_version` from the row (1 if no row). `switch_tenant` copies `credential_version`. `local_admin()` sets `cv: 1` in the struct literal. Global `admin_token_phc` stays in the MAC so a local password change still evicts everyone, including SSO. Missing principal row accepts `cv == 1` only. Present row requires `cv == credential_version && blocked == 0`. Pre-v5 cookies (no field) deserialize as `cv: 1`.
 

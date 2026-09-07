@@ -1781,6 +1781,7 @@ const SETTINGS_KEYS: &[&str] = &[
     "default_max_sessions",
     "public_password_login",
     "sso_session_secs",
+    "scim_token",
     "draining",
 ];
 
@@ -1912,6 +1913,8 @@ fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
         "public_password_login_source": overlay.public_password_login_source,
         "sso_session_secs": resolved.sso_session_secs,
         "sso_session_secs_source": overlay.sso_session_secs_source,
+        "scim_token_set": overlay.scim_token_set,
+        "scim_token_source": overlay.scim_token_source,
         "draining": resolved.draining,
         "draining_source": overlay.draining_source,
         "sso_configured": app.sso_config.is_some(),
@@ -2052,7 +2055,8 @@ pub async fn put_settings(
             | "smtp_username"
             | "smtp_password"
             | "smtp_from"
-            | "smtp_to" => write_secret(key, value)?,
+            | "smtp_to"
+            | "scim_token" => write_secret(key, value)?,
             "audit_retention_days" | "upload_retention_days" => write_u64(key, value, true)?,
             "default_max_total_bytes"
             | "default_max_links"
@@ -5217,6 +5221,7 @@ mod ops_tests {
             smtp_starttls: true,
             smtp_username: None,
             smtp_password: None,
+            scim_token: None,
             smtp_from: None,
             smtp_to: None,
             public_url: None,

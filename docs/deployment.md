@@ -361,6 +361,20 @@ offboarding is a two-step action across the IdP and votport.
    IDs); use the object ID of your admin group as `VOTPORT_OIDC_ADMIN_GROUP`,
    or expose group names via directory roles/attributes as your policy allows.
 
+### SCIM provisioning
+
+votport serves SCIM 2.0 Users at `/scim/v2` (RFC 7643 and RFC 7644): `ServiceProviderConfig`, `GET /Users` with the filter `userName eq "value"` and `startIndex`/`count` paging, `POST /Users`, and `GET`, `PUT`, `PATCH`, `DELETE /Users/{id}`. The bearer token is `VOTPORT_SCIM_TOKEN` or the value saved under System > Sign-in (the stored value wins; clear it to disable the endpoint). Every route answers 401 until a token is set.
+
+A user's `userName` is the principal subject, so it must equal the `sub` claim the OIDC provider issues at sign-in: that is the row the sign-in path looks up and the row SCIM deactivates. Authentik: set the provider's subject mode to email or username and send the same value as `userName`. Okta: the default `sub` is the Okta user id, so either map the SCIM `userName` to the user id or add a custom `sub` claim carrying the login. Entra ID issues a pairwise `sub` that no SCIM attribute matches; use another provider or bridge Entra through one that can emit a chosen subject.
+
+Deactivating (`active: false`) or deleting a user revokes the principal: its live sessions die on the next request and further SSO sign-ins are refused until it is set active again. Delete keeps a blocked row rather than removing it, because an absent principal is treated as a first sign-in. Creating a user pre-provisions an unblocked row; the role at sign-in still comes from the group claims. Groups are not served over SCIM, and an unprovisioned user can still sign in through SSO; both are open items.
+
+```sh
+curl -H 'Authorization: Bearer YOUR-TOKEN' -H 'Content-Type: application/scim+json' \
+     -d '{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"userName":"user@example.com","active":true}' \
+     https://YOUR-HOST/scim/v2/Users
+```
+
 ### Tenants
 
 Create namespaces from an admin session (default-tenant admin only):

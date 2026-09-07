@@ -115,6 +115,23 @@
                 sign-in, so this bounds offboarding latency. The local
                 break-glass session is fixed at 7 days.
               </p>
+              <div class="field">
+                <label
+                  >SCIM bearer token <span class="muted" id="scim-token-source"></span>
+                  <input id="scim-token" type="password" autocomplete="off" />
+                </label>
+                <button type="button" class="link" data-reset="scim_token">
+                  Use environment
+                </button>
+                <button type="button" class="link" data-clear="scim_token" disabled>
+                  Clear
+                </button>
+              </div>
+              <p class="muted">
+                Provisioning endpoint: <code>/scim/v2</code>. A deactivated or
+                deleted user is revoked here; userName must equal the
+                provider's OIDC subject.
+              </p>
               <div class="actions">
                 <button type="submit" id="signin-save" disabled>Save</button>
                 <span id="signin-note" class="muted"></span>
