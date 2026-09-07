@@ -137,6 +137,13 @@ fn client_ip(app: &App, headers: &HeaderMap, peer: &Peer) -> String {
 /// concurrent burst must never trip it); a match clears the bucket.
 fn authorize(app: &App, headers: &HeaderMap, ip: &str) -> ScimResult<()> {
     let bucket = super::throttle_key(ip);
+    let settings = app
+        .store
+        .resolved_settings(&app.config)
+        .map_err(ScimError::store)?;
+    // Checked after the settings read so the check-then-record window
+    // holds a digest, not the store mutex: a wrong-bearer flood that queues
+    // on the store cannot pass the gate together.
     if app.scim_throttle.locked(&bucket) {
         tracing::warn!(target: "audit", event = "scim_throttled", %ip, "scim bearer attempts throttled");
         return Err(ScimError::new(
@@ -144,10 +151,6 @@ fn authorize(app: &App, headers: &HeaderMap, ip: &str) -> ScimResult<()> {
             "too many failed attempts; wait a minute",
         ));
     }
-    let settings = app
-        .store
-        .resolved_settings(&app.config)
-        .map_err(ScimError::store)?;
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -1433,7 +1436,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_concurrent_burst_of_correct_bearers_is_never_throttled() {
         let directory = tempfile::tempdir().unwrap();
         let application = build(directory.path());
