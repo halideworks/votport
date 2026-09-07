@@ -395,6 +395,14 @@ pub fn ensure_no_pending_restore(data_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The stage directory name a pending restore marker points at, whatever
+/// its phase; None when there is no marker or it is unreadable.
+pub fn pending_restore_stage(data_dir: &Path) -> Option<String> {
+    let bytes = fs::read(data_dir.join(PENDING_FILE)).ok()?;
+    let marker: PendingRestore = serde_json::from_slice(&bytes).ok()?;
+    Some(marker.stage)
+}
+
 /// Discards a prepared (not yet applied) pending restore and its stage so a
 /// newer one can replace it. A restore that a boot already started applying
 /// is left alone: that boot has to finish it.

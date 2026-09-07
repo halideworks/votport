@@ -38,16 +38,36 @@ pub struct Config {
 }
 
 pub fn config_from_env() -> Result<Config, String> {
-    let env = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-    };
+    config_from(|name| std::env::var(name).ok())
+}
+
+/// The bearer hands out the database and every identity key, so the source
+/// must be https unless it is loopback.
+fn admit_source(source: &str) -> Result<String, String> {
+    let source = source.trim().trim_end_matches('/');
+    if source.starts_with("https://") {
+        return Ok(source.to_owned());
+    }
+    let host = source
+        .strip_prefix("http://")
+        .ok_or("VOTPORT_STANDBY_SOURCE must be an https URL")?;
+    let host = host.split('/').next().unwrap_or("");
+    let host = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.split(']').next())
+        .unwrap_or_else(|| host.split(':').next().unwrap_or(""));
+    if matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        Ok(source.to_owned())
+    } else {
+        Err("VOTPORT_STANDBY_SOURCE must be an https URL (plain http only for loopback)".to_owned())
+    }
+}
+
+pub fn config_from(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, String> {
+    let env = |name: &str| lookup(name).filter(|value| !value.trim().is_empty());
     let source = env("VOTPORT_STANDBY_SOURCE")
         .ok_or("VOTPORT_STANDBY_SOURCE (the live instance's https URL) is required")?;
-    if !(source.starts_with("https://") || source.starts_with("http://")) {
-        return Err("VOTPORT_STANDBY_SOURCE must be an http(s) URL".to_owned());
-    }
+    let source = admit_source(&source)?;
     let token = env("VOTPORT_REPLICA_TOKEN")
         .ok_or("VOTPORT_REPLICA_TOKEN (the live instance's replica bearer) is required")?;
     let bind = env("VOTPORT_BIND")
@@ -64,7 +84,7 @@ pub fn config_from_env() -> Result<Config, String> {
     Ok(Config {
         data_dir: PathBuf::from(env("VOTPORT_DATA_DIR").unwrap_or_else(|| "/data".to_owned())),
         bind,
-        source: source.trim_end_matches('/').to_owned(),
+        source,
         token,
         interval: Duration::from_secs(interval),
     })
@@ -122,9 +142,11 @@ pub async fn pull_once(
         crate::auth::random_token()
     ));
     let _download_cleanup = crate::backup::CleanupPath::new(download.clone());
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
         .open(&download)
         .await
         .map_err(|error| format!("create download: {error}"))?;
@@ -147,8 +169,8 @@ pub async fn pull_once(
         crate::auth::random_token()
     ));
     std::fs::create_dir(&stage).map_err(|error| format!("create stage: {error}"))?;
-    crate::paths::tighten_private_dir(&stage)?;
     let mut stage_cleanup = crate::backup::CleanupPath::directory(stage.clone());
+    crate::paths::tighten_private_dir(&stage)?;
     let manifest = {
         let download = download.clone();
         let stage = stage.clone();
@@ -165,11 +187,45 @@ pub async fn pull_once(
     Ok(manifest)
 }
 
+/// Removes what a pull killed mid-way left behind: downloads, and stage
+/// directories the pending marker does not point at. The marker's own
+/// stage is never touched, whatever phase it is in.
+pub fn sweep_orphans(data_dir: &Path) -> Result<usize, String> {
+    let keep = crate::backup::pending_restore_stage(data_dir);
+    let mut removed = 0;
+    for entry in std::fs::read_dir(data_dir).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir()
+            && name.starts_with(".votport-restore-stage-")
+            && keep.as_deref() != Some(name.as_str())
+        {
+            std::fs::remove_dir_all(entry.path()).map_err(|error| error.to_string())?;
+            removed += 1;
+        } else if kind.is_file()
+            && name.starts_with(".votport-restore-")
+            && name.ends_with(".download")
+        {
+            std::fs::remove_file(entry.path()).map_err(|error| error.to_string())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// Runs pulls forever and serves /healthz and /readyz on the bind address.
 pub async fn run(config: Config) -> Result<(), String> {
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
     crate::paths::tighten_private_dir(&config.data_dir).map_err(|error| error.to_string())?;
+    match sweep_orphans(&config.data_dir) {
+        Ok(0) => {}
+        Ok(count) => tracing::info!(count, "removed leftovers of an interrupted pull"),
+        Err(error) => tracing::warn!(%error, "leftover sweep failed"),
+    }
     let status = Arc::new(Mutex::new(
         read_status(&config.data_dir).unwrap_or_default(),
     ));
@@ -294,6 +350,34 @@ mod tests {
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
 
+    #[test]
+    fn orphan_sweep_keeps_the_marked_stage_and_removes_the_rest() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path();
+        std::fs::create_dir(data.join(".votport-restore-stage-live")).unwrap();
+        std::fs::create_dir(data.join(".votport-restore-stage-orphan")).unwrap();
+        std::fs::write(data.join(".votport-restore-abc.download"), b"x").unwrap();
+        std::fs::write(data.join("keep.txt"), b"x").unwrap();
+        let manifest = crate::backup::Manifest {
+            version: crate::backup::VERSION,
+            created_at: 1,
+            schema_version: 1,
+            entries: Vec::new(),
+        };
+        crate::backup::write_pending_restore(
+            data,
+            &data.join(".votport-restore-stage-live"),
+            manifest,
+        )
+        .unwrap();
+        assert_eq!(sweep_orphans(data).unwrap(), 2);
+        assert!(data.join(".votport-restore-stage-live").exists());
+        assert!(!data.join(".votport-restore-stage-orphan").exists());
+        assert!(!data.join(".votport-restore-abc.download").exists());
+        assert!(data.join("keep.txt").exists());
+        assert_eq!(sweep_orphans(data).unwrap(), 0);
+    }
+
     #[tokio::test]
     async fn status_routes_follow_the_last_success() {
         let status = Arc::new(Mutex::new(Status {
@@ -351,16 +435,69 @@ mod tests {
 
     #[test]
     fn config_needs_source_and_token_and_bounds_the_interval() {
-        // Env-driven parse is exercised through the pieces it composes.
-        assert!(Config {
-            data_dir: PathBuf::from("/data"),
-            bind: "127.0.0.1:0".parse().unwrap(),
-            source: "https://live.example".to_owned(),
-            token: "t".to_owned(),
-            interval: Duration::from_secs(60),
+        let parse = |pairs: &[(&str, &str)]| {
+            let map: std::collections::HashMap<String, String> = pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect();
+            config_from(|name| map.get(name).cloned())
+        };
+        let base = [
+            ("VOTPORT_STANDBY_SOURCE", "https://live.example/"),
+            ("VOTPORT_REPLICA_TOKEN", "t"),
+        ];
+        let config = parse(&base).unwrap();
+        assert_eq!(
+            config.source, "https://live.example",
+            "trailing slash trimmed"
+        );
+        assert_eq!(config.interval, Duration::from_secs(60));
+        assert_eq!(config.data_dir, PathBuf::from("/data"));
+
+        assert!(parse(&[("VOTPORT_REPLICA_TOKEN", "t")])
+            .unwrap_err()
+            .contains("VOTPORT_STANDBY_SOURCE"));
+        assert!(parse(&[("VOTPORT_STANDBY_SOURCE", "https://x")])
+            .unwrap_err()
+            .contains("VOTPORT_REPLICA_TOKEN"));
+        for bad in [
+            "ftp://x",
+            "http://live.internal:8080",
+            "http://10.0.0.5",
+            "live.example",
+        ] {
+            assert!(
+                parse(&[
+                    ("VOTPORT_STANDBY_SOURCE", bad),
+                    ("VOTPORT_REPLICA_TOKEN", "t")
+                ])
+                .is_err(),
+                "{bad}"
+            );
         }
-        .source
-        .starts_with("https://"));
+        for loopback in [
+            "http://127.0.0.1:18080",
+            "http://localhost",
+            "http://[::1]:8080/",
+        ] {
+            assert!(
+                parse(&[
+                    ("VOTPORT_STANDBY_SOURCE", loopback),
+                    ("VOTPORT_REPLICA_TOKEN", "t")
+                ])
+                .is_ok(),
+                "{loopback}"
+            );
+        }
+        let with_interval = |value: &str| {
+            let mut pairs = base.to_vec();
+            pairs.push(("VOTPORT_STANDBY_INTERVAL_SECS", value));
+            parse(&pairs)
+        };
+        assert!(with_interval("4").is_err());
+        assert!(with_interval("x").is_err());
+        assert_eq!(with_interval("5").unwrap().interval, Duration::from_secs(5));
+
         let directory = tempfile::tempdir().unwrap();
         let status = Status {
             source: "s".to_owned(),

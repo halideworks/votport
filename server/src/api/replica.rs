@@ -57,9 +57,8 @@ pub async fn replica_archive(
 ) -> ApiResult<Response> {
     let ip = super::client_ip(&headers, &peer, &app.config.trusted_proxies);
     authorize(&app, &headers, &ip)?;
-    let _guard = app
-        .backup_lock
-        .try_lock()
+    let guard = Arc::clone(&app.backup_lock)
+        .try_lock_owned()
         .map_err(|_| ApiError::new(StatusCode::CONFLICT, "backup already running"))?;
     let stage = app.config.data_dir.join(format!(
         ".votport-replica-{}.tar",
@@ -67,22 +66,22 @@ pub async fn replica_archive(
     ));
     let store = Arc::clone(&app.store);
     let data_dir = app.config.data_dir.clone();
-    let stage_for_build = stage.clone();
-    let manifest = tokio::task::spawn_blocking(move || {
-        crate::backup::create_archive(
-            &store,
-            &data_dir,
-            &stage_for_build,
-            crate::store::SCHEMA_VERSION,
-        )
+    // Build, open, and unlink in one blocking step that owns the lock: a
+    // client that gives up mid-build cannot leave the archive (every
+    // identity key in the clear) on disk or free the lock while the
+    // snapshot is still being written.
+    let (manifest, file) = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        let manifest =
+            crate::backup::create_archive(&store, &data_dir, &stage, crate::store::SCHEMA_VERSION)?;
+        let file = std::fs::File::open(&stage).map_err(|error| format!("open archive: {error}"));
+        let _ = std::fs::remove_file(&stage);
+        Ok::<_, String>((manifest, file?))
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?
     .map_err(ApiError::internal)?;
-    let file = tokio::fs::File::open(&stage)
-        .await
-        .map_err(|error| ApiError::internal(format!("open archive: {error}")))?;
-    let _ = tokio::fs::remove_file(&stage).await;
+    let file = tokio::fs::File::from_std(file);
     let len = file
         .metadata()
         .await
