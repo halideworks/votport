@@ -10,6 +10,7 @@ pub mod app;
 pub mod auth;
 pub mod backup;
 pub mod config;
+pub mod lease;
 pub mod notify;
 pub mod paths;
 pub mod receipt;

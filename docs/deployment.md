@@ -630,6 +630,22 @@ Layout:
   `data/lock` at boot and refuses to start while another process holds it,
   which catches a standby started too early on shared block storage but not
   on NFS, where `flock` semantics vary by server.
+- The lease at `/received/.votport-lease` fences the case the lock cannot:
+  it is the one path both hosts share whether `data/` moves or is
+  replicated. An instance creates it exclusively at boot, renews it every
+  30 s, and refuses to start while another holder renewed it within the
+  last 90 s; a holder whose heartbeat finds another name in the file stops
+  itself, since that instance is now re-attaching the staging. The two
+  clocks only need to agree to within tens of seconds. `/readyz` reports the
+  holder, whether it is this instance, the seconds since renewal, and
+  whether the lease was lost; `/metrics` exposes `votport_lease_held` and
+  `votport_lease_age_seconds`. A clean stop (SIGTERM) gives the lease back
+  as its last step, so the standby, or the same host's next container,
+  starts at once; after a crash or SIGKILL the file stays and the next
+  instance can start once 90 s have passed, or sooner if the operator
+  removes the file after confirming the old process is gone. An instance
+  that loses the lease checkpoints its uploads and exits immediately rather
+  than draining, because the new holder is already re-attaching its staging.
 - Where the data volume cannot move, run Litestream (see
   [Litestream](#litestream)) on the live host and `litestream restore` on the
   standby before starting it. The RPO is Litestream's replication interval;
@@ -654,8 +670,9 @@ senders keep matching.
 
 Planned failover: turn on **Drain for restart** so new upload sessions are
 refused and `/readyz` goes 503, poll `/readyz` on the live host directly (not
-through the proxy) until `sessions_active` reaches 0, stop the live container,
-move or restore `data/`, start the standby, turn drain off. Unplanned failover
+through the proxy) until `sessions_active` reaches 0, stop the live container
+(a clean stop yields the lease), move or restore `data/`, start the standby,
+turn drain off. Unplanned failover
 skips the drain: in-flight uploads whose worker checkpointed resume from that
 offset once the standby is up, uploads killed before a checkpoint start over,
 and streaming downloads and QUIC sessions die with the process and are retried

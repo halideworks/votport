@@ -50,6 +50,7 @@ async fn main() {
     app::start_push_receiver(application.clone());
     app::start_serve(application.clone());
     tokio::spawn(app::session_sweeper(application.clone()));
+    tokio::spawn(app::lease_keeper(application.clone()));
     tokio::spawn(app::upload_ended_notifier(application.clone()));
     tokio::spawn(votport::backup::scheduler(application.clone()));
     let router = app::router(application.clone());
@@ -76,8 +77,11 @@ async fn main() {
         std::process::exit(1);
     }
     // No handler can reach a session now; park the in-flight uploads on
-    // disk so the next boot re-attaches them.
+    // disk so the next boot re-attaches them, give the fences back, and
+    // exit before the runtime drop can let a blocking job write again.
     app::suspend_sessions(&application).await;
+    app::release_data_lock(&application);
+    std::process::exit(0);
 }
 
 #[derive(Debug, PartialEq)]

@@ -1252,7 +1252,9 @@ mod tests {
         assert_eq!(json["schemas"][0], ERROR_SCHEMA);
         assert_eq!(json["status"], "401");
         assert_eq!(content_type.as_deref(), Some(CONTENT_TYPE));
-        // One instance per data directory: the lock refuses a second build.
+        // One instance per data directory: a rebuild needs the first one's
+        // clean-shutdown release, as a real restart would have done.
+        crate::app::release_data_lock(&unset);
         drop(unset);
 
         let application = build(directory.path());
