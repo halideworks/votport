@@ -112,7 +112,12 @@ fn admit_subject(value: Option<&Value>) -> ScimResult<String> {
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| ScimError::bad_request("userName is required"))?;
-    if subject.len() > MAX_SUBJECT_BYTES || subject.chars().any(char::is_control) {
+    // Interior whitespace means a display name was mapped, not a subject.
+    if subject.len() > MAX_SUBJECT_BYTES
+        || subject
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
         return Err(ScimError::bad_request("userName is not acceptable"));
     }
     if subject == "local" {
@@ -477,20 +482,30 @@ mod tests {
         assert_eq!(content_type.as_deref(), Some(CONTENT_TYPE));
 
         let application = build(directory.path());
-        for (bearer, uri, method) in [
-            (None, "/scim/v2/Users", "GET"),
-            (Some("wrong"), "/scim/v2/Users", "GET"),
-            (Some("scim-secret-toke"), "/scim/v2/Users", "GET"),
-            (Some("wrong"), "/scim/v2/ServiceProviderConfig", "GET"),
-            (Some("wrong"), "/scim/v2/Users/a", "DELETE"),
+        let user = Some(("application/scim+json", r#"{"userName":"a"}"#));
+        let patch = Some((
+            "application/scim+json",
+            r#"{"Operations":[{"op":"replace","path":"active","value":false}]}"#,
+        ));
+        for (bearer, uri, method, body) in [
+            (None, "/scim/v2/Users", "GET", None),
+            (Some("wrong"), "/scim/v2/Users", "GET", None),
+            (Some("scim-secret-toke"), "/scim/v2/Users", "GET", None),
+            (Some("wrong"), "/scim/v2/ServiceProviderConfig", "GET", None),
+            (None, "/scim/v2/Users", "POST", user),
+            (Some("wrong"), "/scim/v2/Users/a", "GET", None),
+            (Some("wrong"), "/scim/v2/Users/a", "PUT", user),
+            (None, "/scim/v2/Users/a", "PATCH", patch),
+            (Some("wrong"), "/scim/v2/Users/a", "DELETE", None),
         ] {
-            let (status, _, _) = call(&application, method, uri, bearer, None).await;
+            let (status, _, _) = call(&application, method, uri, bearer, body).await;
             assert_eq!(
                 status,
                 StatusCode::UNAUTHORIZED,
                 "{method} {uri} {bearer:?}"
             );
         }
+        assert!(application.store.principal("a").unwrap().is_none());
         let (status, json) =
             scim(&application, "GET", "/scim/v2/ServiceProviderConfig", None).await;
         assert_eq!(status, StatusCode::OK);
@@ -583,11 +598,11 @@ mod tests {
             r#"{"userName":"local"}"#,
             r#"{"userName":"  "}"#,
             r#"{}"#,
-            r#"{"userName":"a b"}"#,
+            r#"{"userName":"Jane Doe"}"#,
             r#"{"userName":"ok","active":"maybe"}"#,
         ] {
-            let (status, _) = scim(&application, "POST", "/scim/v2/Users", Some(body)).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            let (status, json) = scim(&application, "POST", "/scim/v2/Users", Some(body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body} {json}");
         }
         assert!(application.store.principal("ok").unwrap().is_none());
         scim(

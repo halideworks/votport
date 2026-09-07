@@ -79,7 +79,7 @@ A security team can put one instance behind their IdP, give each group a namespa
 - Per-tenant encryption keys, custom domains, tenant self-signup, public sharing.
 - Closing the quota TOCTOU.
 - Dashboard rewrite, component library, Kubernetes.
-- Invites or SCIM.
+- Invites. (SCIM Users shipped later at `/scim/v2`.)
 - Automation tokens exist (`POST /api/automation/share`, per-tenant, expiring, revocable, rate limited per IP, optionally confined to a library folder, use and token refusal audited).
 - Legal hold versus retention (per-tenant or per-link "do not sweep" flag). Own design later.
 
