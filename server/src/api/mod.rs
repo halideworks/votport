@@ -336,6 +336,7 @@ pub(crate) mod testing {
             default_max_links: None,
             default_max_sessions: None,
             public_password_login: true,
+            require_provisioning: false,
             metrics_token: None,
             max_total_sessions: 32,
             max_link_sessions: 8,

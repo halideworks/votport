@@ -115,6 +115,11 @@
                 sign-in, so this bounds offboarding latency. The local
                 break-glass session is fixed at 7 days.
               </p>
+              <label class="check"
+                ><input type="checkbox" id="require-provisioning" disabled />
+                Require SCIM provisioning before SSO sign-in
+                <span class="muted" id="require-provisioning-source"></span>
+              </label>
               <div class="field">
                 <label
                   >SCIM bearer token <span class="muted" id="scim-token-source"></span>
@@ -129,8 +134,10 @@
               </div>
               <p class="muted">
                 Provisioning endpoint: <code>/scim/v2</code>. A deactivated or
-                deleted user is revoked here; userName must equal the
-                provider's OIDC subject.
+                deleted user is revoked here; userName must equal the claim
+                named by <code>VOTPORT_OIDC_SUBJECT_CLAIM</code>. With
+                provisioning required, a subject with no SCIM or prior
+                sign-in row cannot sign in; the local password is unaffected.
               </p>
               <div class="actions">
                 <button type="submit" id="signin-save" disabled>Save</button>
