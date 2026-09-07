@@ -1119,7 +1119,8 @@ impl Store {
             // columns, and so does a database rolled back to an older
             // version number (the migration tests do that); only a table
             // from before v22 needs the ALTER. A hand-built fixture without
-            // the table gets it from the v5 step of a later boot.
+            // the table stays without it; no real database passes v5
+            // without creating it.
             let columns: i64 = transaction
                 .query_row(
                     "SELECT COUNT(*) FROM pragma_table_info('principals')
@@ -6458,7 +6459,8 @@ mod tenant_tests {
         assert_eq!(store.tenant_received_bytes("acme").unwrap(), 300);
     }
 
-    /// A v19 token table gains the nullable directory column.
+    /// A v21 principals table gains external_id and created_at; the columns
+    /// then round-trip through provision and lookup.
     #[test]
     fn v21_adds_principal_identity_columns() {
         let directory = tempfile::tempdir().unwrap();

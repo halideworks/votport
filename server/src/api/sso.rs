@@ -121,23 +121,29 @@ fn sso_role(
 /// and blocked principals. Records `sso_login` only after those checks pass.
 /// The principal subject for the configured claim, or None when the claim
 /// is absent so the caller can retry with the userinfo document. An empty
-/// value counts as absent.
+/// value counts as absent. An email the provider marks unverified is
+/// refused outright: a self-asserted address must not select a principal.
+/// Providers that omit email_verified (Entra) are accepted as is.
 fn select_subject(
     claim: crate::config::SubjectClaim,
     sub: &str,
     email: Option<&str>,
+    email_verified: Option<bool>,
     preferred_username: Option<&str>,
-) -> Option<String> {
+) -> Result<Option<String>, &'static str> {
     use crate::config::SubjectClaim;
     let chosen = match claim {
         SubjectClaim::Sub => Some(sub),
+        SubjectClaim::Email if email_verified == Some(false) => {
+            return Err("the provider marks this email unverified")
+        }
         SubjectClaim::Email => email,
         SubjectClaim::PreferredUsername => preferred_username,
     };
-    chosen
+    Ok(chosen
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_owned)
+        .map(str::to_owned))
 }
 
 fn finish_sso_login(
@@ -498,12 +504,19 @@ pub async fn sso_callback(
     // The verified sub anchors the userinfo check; the principal subject may
     // be a different claim and is chosen once userinfo has been read.
     let sub = claims.subject().to_string();
-    let mut subject = select_subject(
+    let mut subject = match select_subject(
         sso_config.0.subject_claim,
         &sub,
         claims.email().map(|value| value.as_str()),
+        claims.email_verified(),
         claims.preferred_username().map(|value| value.as_str()),
-    );
+    ) {
+        Ok(subject) => subject,
+        Err(reason) => {
+            tracing::warn!(target: "audit", event = "sso_failed", reason, "subject claim refused");
+            return home("identity could not be verified");
+        }
+    };
 
     // Groups come from the userinfo endpoint; the id token may not carry them.
     let mut groups: Vec<String> = Vec::new();
@@ -539,12 +552,19 @@ pub async fn sso_callback(
             return home("identity could not be verified");
         }
         if subject.is_none() {
-            subject = select_subject(
+            subject = match select_subject(
                 sso_config.0.subject_claim,
                 &sub,
                 value["email"].as_str(),
+                value["email_verified"].as_bool(),
                 value["preferred_username"].as_str(),
-            );
+            ) {
+                Ok(subject) => subject,
+                Err(reason) => {
+                    tracing::warn!(target: "audit", event = "sso_failed", reason, "userinfo subject claim refused");
+                    return home("identity could not be verified");
+                }
+            };
         }
         if let Some(list) = value["groups"].as_array() {
             groups.extend(
@@ -897,7 +917,7 @@ mod tests {
     fn subject_selection_follows_the_configured_claim() {
         use crate::config::SubjectClaim;
         let pick = |claim, email: Option<&str>, username: Option<&str>| {
-            select_subject(claim, "abc123", email, username)
+            select_subject(claim, "abc123", email, None, username).unwrap()
         };
         assert_eq!(
             pick(SubjectClaim::Sub, None, None).as_deref(),
@@ -920,6 +940,34 @@ mod tests {
         assert_eq!(
             pick(SubjectClaim::PreferredUsername, Some("e@x"), None),
             None
+        );
+
+        // email_verified: false refuses; true or absent is accepted; other
+        // claims ignore it.
+        assert!(select_subject(SubjectClaim::Email, "s", Some("e@x"), Some(false), None).is_err());
+        assert_eq!(
+            select_subject(SubjectClaim::Email, "s", Some("e@x"), Some(true), None)
+                .unwrap()
+                .as_deref(),
+            Some("e@x")
+        );
+        assert_eq!(
+            select_subject(SubjectClaim::Sub, "s", Some("e@x"), Some(false), None)
+                .unwrap()
+                .as_deref(),
+            Some("s")
+        );
+        assert_eq!(
+            select_subject(
+                SubjectClaim::PreferredUsername,
+                "s",
+                None,
+                Some(false),
+                Some("u")
+            )
+            .unwrap()
+            .as_deref(),
+            Some("u")
         );
     }
 }

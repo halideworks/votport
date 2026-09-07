@@ -870,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_parser_accepts_the_one_shape() {
+    fn filter_parser_accepts_username_and_external_id_only() {
         assert_eq!(
             filter_subject(r#"userName eq "a b""#).unwrap(),
             (FilterKey::UserName, "a b".to_owned())
