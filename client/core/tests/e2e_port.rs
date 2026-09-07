@@ -11,10 +11,13 @@
 
 mod common;
 
+use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 
 use votport_client_core::ffi::{self, Transfer, TransferListener, TransferView};
-use votport_client_core::port::{DeliverySpec, PortError, RequestSpec, UploadListener, UploadView};
+use votport_client_core::port::{
+    self, DeliverySpec, PortError, RequestSpec, UploadListener, UploadView,
+};
 use votport_client_core::Error;
 
 /// The headline and the signed-out flag of a failed operator call.
@@ -299,6 +302,53 @@ fn an_operator_runs_the_port_from_the_core() {
     )
     .expect("receive the uploaded reel");
     assert_eq!(std::fs::read(&report.files[0]).unwrap(), reel);
+
+    let source = shots.join("reel.bin");
+    let original_modified = std::fs::metadata(&source).unwrap().modified().unwrap();
+    let stopped = Cell::new(false);
+    assert!(matches!(
+        port::upload(
+            &[source.to_string_lossy().into_owned()],
+            "attempts",
+            &|| stopped.replace(true),
+            &Uploads::default(),
+        ),
+        Err(Error::Cancelled)
+    ));
+    let replacement = vec![42; reel.len()];
+    std::fs::write(&source, &replacement).unwrap();
+    std::fs::File::open(&source)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+        .unwrap();
+    let made = port::upload(
+        &[source.to_string_lossy().into_owned()],
+        "attempts",
+        &|| false,
+        &Uploads::default(),
+    )
+    .expect("a changed file starts a fresh upload even when size and timestamp match");
+    let issued = ffi::issue_delivery(DeliverySpec {
+        paths: made.into_iter().map(|file| file.path).collect(),
+        label: "Replacement".to_owned(),
+        password: None,
+        expires_days: 1,
+        max_downloads: None,
+    })
+    .unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let report = ffi::receive(
+        issued.url,
+        None,
+        dest.path().to_string_lossy().into_owned(),
+        Transfer::new(),
+        Arc::new(Recorder::default()),
+    )
+    .unwrap();
+    assert!(
+        std::fs::read(&report.files[0]).unwrap() == replacement,
+        "replacement contains bytes from the cancelled upload"
+    );
 
     ffi::revoke_delivery(delivery.delivery.id.clone()).unwrap();
     let revoked = ffi::deliveries()

@@ -290,6 +290,11 @@ hashed, verified range by range, independent of every proxy in between.
    or share a project folder directly and issue one expiring, revocable
    download link. Manual mixed selection is limited to 64 files; direct folder
    shares can include up to 50,000 files.
+   Library upload requests retry within the current browser or desktop
+   operation. Selecting a file again starts a fresh upload, so a changed
+   file cannot reuse another attempt's partial bytes even when its name,
+   size, and timestamp match. Abandoned partial library uploads are removed
+   when the service restarts.
    Delivery links have an optional notification policy for the first download
    and completed delivery. Issued links show aggregate and per-file download
    starts with first and most recent timestamps. For multi-file links,
