@@ -16,6 +16,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 vot-cli = { git = "https://github.com/halideworks/VOT", rev = "0a129ea8b7ef47578b956f3c70a8274bf623cb79", default-features = false, features = ["wire"] }
 vot-object = { git = "https://github.com/halideworks/VOT", rev = "0a129ea8b7ef47578b956f3c70a8274bf623cb79" }
 vot-manifest = { git = "https://github.com/halideworks/VOT", rev = "0a129ea8b7ef47578b956f3c70a8274bf623cb79" }
+vot-platform-fs = { git = "https://github.com/halideworks/VOT", rev = "0a129ea8b7ef47578b956f3c70a8274bf623cb79" }
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -32,6 +33,12 @@ tempfile = "3"
 # Free space at a destination before a receive commits; already in the
 # tree through vot-platform-fs.
 fs4 = "1"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "cookies", "rustls-tls"] }

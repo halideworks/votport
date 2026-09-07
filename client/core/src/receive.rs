@@ -11,7 +11,7 @@
 //! shared with the fetch path through [`write_verified`] and [`local_path_of`].
 
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use vot_manifest::{Component, PackagePath};
@@ -259,12 +259,22 @@ pub(crate) fn write_verified(
         fs::create_dir_all(parent)?;
     }
     let temporary = part_path(destination);
+    let mut journal = open_journal(&temporary)?;
+    match fs::symlink_metadata(destination) {
+        Ok(_) => {
+            return Err(Error::Exists {
+                path: destination.to_owned(),
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
 
     // Resume: hash any prior partial into the builder and continue past it. A
     // partial that hashes to the wrong root fails at finish and is removed, so
     // the next run starts clean; a bad prefix cannot land silently.
     let mut builder = ObjectBuilder::new(Suite::Blake3Bao64, Some(total))?;
-    let mut resume_from = feed_partial(&temporary, &mut builder, total)?;
+    let mut resume_from = feed_partial(&mut journal, &mut builder, total)?;
     let resumed = source(resume_from)?;
     if resumed.start != resume_from {
         if resumed.start != 0 {
@@ -282,7 +292,7 @@ pub(crate) fn write_verified(
     // A stream failure keeps the partial for the next run to resume; only a
     // verification failure removes it.
     stream_to_temp(
-        &temporary,
+        &mut journal,
         &mut *reader,
         &mut builder,
         resume_from,
@@ -290,7 +300,14 @@ pub(crate) fn write_verified(
         index,
         observer,
     )?;
-    match verify_and_rename(builder, destination, announced, announced_hex, &temporary) {
+    match verify_and_rename(
+        builder,
+        destination,
+        announced,
+        announced_hex,
+        &temporary,
+        &journal,
+    ) {
         Ok(()) => Ok(()),
         // A stream that ended short (the builder's LengthMismatch) leaves a
         // usable prefix, so the partial stays to resume. Any other failure
@@ -298,7 +315,9 @@ pub(crate) fn write_verified(
         // poison, and a landed file or a rename race leaves a full-size partial
         // the next run would only discard, so all of these remove it.
         Err(error) => {
-            if !matches!(error, Error::Object(vot_object::Error::LengthMismatch)) {
+            if !matches!(error, Error::Object(vot_object::Error::LengthMismatch))
+                && vot_platform_fs::same_file_handle(&journal, &temporary).unwrap_or(false)
+            {
                 let _ = fs::remove_file(&temporary);
             }
             Err(error)
@@ -320,22 +339,48 @@ fn part_path(destination: &Path) -> PathBuf {
     }
 }
 
-/// Feeds an existing partial at `temporary` into `builder` and returns its
-/// length, the offset a resume continues from. A partial that is empty, at or
-/// past the full length, or unreadable is discarded and zero is returned.
-fn feed_partial(temporary: &Path, builder: &mut ObjectBuilder, total: u64) -> Result<u64> {
-    let Ok(metadata) = fs::metadata(temporary) else {
-        return Ok(0);
-    };
-    let length = metadata.len();
-    if length == 0 || length >= total {
-        let _ = fs::remove_file(temporary);
+fn open_journal(path: &Path) -> Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    lock_journal(file, path)
+}
+
+fn lock_journal(file: File, path: &Path) -> Result<File> {
+    if !file.metadata()?.is_file() {
+        return Err(Error::Other(
+            "receive journal is not a regular file".to_owned(),
+        ));
+    }
+    file.try_lock()
+        .map_err(|error| Error::Other(format!("cannot lock receive journal: {error}")))?;
+    if !vot_platform_fs::same_file_handle(&file, path)? {
+        return Err(Error::Other(
+            "receive journal changed while acquiring its lock".to_owned(),
+        ));
+    }
+    Ok(file)
+}
+
+/// Hashes a usable prefix without changing the journal before a source opens.
+fn feed_partial(file: &mut File, builder: &mut ObjectBuilder, total: u64) -> Result<u64> {
+    let length = file.metadata()?.len();
+    if length >= total {
         return Ok(0);
     }
-    let mut file = File::open(temporary).map_err(|source| Error::Read {
-        path: temporary.to_path_buf(),
-        source,
-    })?;
+    file.rewind()?;
     let mut buffer = vec![0u8; READ_CHUNK];
     let mut fed = 0u64;
     loop {
@@ -349,11 +394,9 @@ fn feed_partial(temporary: &Path, builder: &mut ObjectBuilder, total: u64) -> Re
     Ok(fed)
 }
 
-/// Opens the temporary for the resume, appending when continuing and starting
-/// fresh at zero, and streams `reader` into it while hashing. The handle closes
-/// before the caller renames, since Windows refuses to rename an open file.
+/// Writes through the locked handle, restarting only after a source opens.
 fn stream_to_temp(
-    temporary: &Path,
+    sink: &mut File,
     reader: &mut dyn Read,
     builder: &mut ObjectBuilder,
     resume_from: u64,
@@ -361,24 +404,9 @@ fn stream_to_temp(
     index: usize,
     observer: &mut dyn Observer,
 ) -> Result<()> {
-    let mut sink = if resume_from > 0 {
-        std::fs::OpenOptions::new().append(true).open(temporary)
-    } else {
-        File::create(temporary)
-    }
-    .map_err(|source| Error::Read {
-        path: temporary.to_path_buf(),
-        source,
-    })?;
-    hash_copy(
-        reader,
-        builder,
-        &mut sink,
-        resume_from,
-        total,
-        index,
-        observer,
-    )?;
+    sink.set_len(resume_from)?;
+    sink.seek(SeekFrom::Start(resume_from))?;
+    hash_copy(reader, builder, sink, resume_from, total, index, observer)?;
     sink.sync_all()?;
     Ok(())
 }
@@ -392,6 +420,7 @@ fn verify_and_rename(
     announced: [u8; 32],
     announced_hex: &str,
     temporary: &Path,
+    journal: &File,
 ) -> Result<()> {
     let prepared = builder.finish()?;
     let got = prepared.object_id().root;
@@ -402,15 +431,22 @@ fn verify_and_rename(
             got: hex::encode(got),
         });
     }
-    // The up-front check ran before any download; re-check here so a file that
-    // appeared meanwhile (a case-insensitive sibling on macOS or Windows, or
-    // another process) is not silently replaced by the clobbering rename.
-    if destination.exists() {
-        return Err(Error::Exists {
-            path: destination.to_path_buf(),
-        });
+    if !vot_platform_fs::same_file_handle(journal, temporary)? {
+        return Err(Error::Other(
+            "receive journal changed before publication".to_owned(),
+        ));
     }
-    fs::rename(temporary, destination)?;
+    let mut path = tempfile::TempPath::try_from_path(temporary)?;
+    path.disable_cleanup(true);
+    path.persist_noclobber(destination).map_err(|error| {
+        if error.error.kind() == std::io::ErrorKind::AlreadyExists {
+            Error::Exists {
+                path: destination.to_owned(),
+            }
+        } else {
+            error.error.into()
+        }
+    })?;
     Ok(())
 }
 
@@ -507,6 +543,224 @@ fn decode_root(hex_root: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn receive_from(
+        destination: &Path,
+        bytes: &[u8],
+        source: &mut dyn FnMut(u64) -> Result<Resumed>,
+    ) -> Result<()> {
+        let mut builder = ObjectBuilder::new(Suite::Blake3Bao64, Some(bytes.len() as u64))?;
+        builder.update(bytes)?;
+        let root = builder.finish()?.object_id().root;
+        write_verified(
+            source,
+            destination,
+            root,
+            "expected",
+            bytes.len() as u64,
+            0,
+            &mut crate::progress::Silent,
+        )
+    }
+
+    fn stream(bytes: &[u8], start: u64) -> Resumed {
+        Resumed {
+            reader: Box::new(std::io::Cursor::new(bytes.to_vec())),
+            start,
+        }
+    }
+
+    #[test]
+    fn a_second_writer_is_rejected_before_opening_its_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("file");
+        receive_from(&destination, b"abcd", &mut |offset| {
+            assert_eq!(offset, 0);
+            let second = receive_from(&destination, b"abcd", &mut |_| {
+                panic!("second writer opened its source")
+            });
+            assert!(matches!(second, Err(Error::Other(_))), "{second:?}");
+            Ok(stream(b"abcd", 0))
+        })
+        .unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"abcd");
+        assert!(!part_path(&destination).exists());
+    }
+
+    #[test]
+    fn a_stale_open_handle_cannot_lock_a_replacement_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal");
+        let published = dir.path().join("published");
+        fs::write(&journal, b"published bytes").unwrap();
+        let stale = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&journal)
+            .unwrap();
+        fs::rename(&journal, &published).unwrap();
+        fs::write(&journal, b"another writer").unwrap();
+        assert!(lock_journal(stale, &journal).is_err());
+        assert_eq!(fs::read(&published).unwrap(), b"published bytes");
+        assert_eq!(fs::read(&journal).unwrap(), b"another writer");
+    }
+
+    #[test]
+    fn resumes_and_full_responses_use_the_locked_journal() {
+        for restart in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let destination = dir.path().join("file");
+            fs::write(part_path(&destination), b"ab").unwrap();
+            receive_from(&destination, b"abcd", &mut |offset| {
+                assert_eq!(offset, 2);
+                Ok(if restart {
+                    stream(b"abcd", 0)
+                } else {
+                    stream(b"cd", offset)
+                })
+            })
+            .unwrap();
+            assert_eq!(fs::read(destination).unwrap(), b"abcd");
+        }
+        for initial in [b"abcd".as_slice(), b"abcde"] {
+            let dir = tempfile::tempdir().unwrap();
+            let destination = dir.path().join("file");
+            fs::write(part_path(&destination), initial).unwrap();
+            receive_from(&destination, b"abcd", &mut |offset| {
+                assert_eq!(offset, 0);
+                Ok(stream(b"abcd", 0))
+            })
+            .unwrap();
+            assert_eq!(fs::read(destination).unwrap(), b"abcd");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("empty");
+        receive_from(&destination, b"", &mut |offset| {
+            assert_eq!(offset, 0);
+            Ok(stream(b"", 0))
+        })
+        .unwrap();
+        assert!(fs::read(destination).unwrap().is_empty());
+    }
+
+    #[test]
+    fn source_errors_leave_existing_journal_bytes_unchanged() {
+        for initial in [b"ab".as_slice(), b"abcd", b"abcde"] {
+            let dir = tempfile::tempdir().unwrap();
+            let destination = dir.path().join("file");
+            let journal = part_path(&destination);
+            fs::write(&journal, initial).unwrap();
+            let result = receive_from(&destination, b"abcd", &mut |offset| {
+                assert_eq!(offset, if initial.len() < 4 { 2 } else { 0 });
+                Err(Error::Other("source unavailable".to_owned()))
+            });
+            assert!(result.is_err());
+            assert_eq!(fs::read(journal).unwrap(), initial);
+        }
+    }
+
+    #[test]
+    fn publication_refuses_a_destination_created_during_the_receive() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("file");
+        let result = receive_from(&destination, b"abcd", &mut |_| {
+            fs::write(&destination, b"other owner").unwrap();
+            Ok(stream(b"abcd", 0))
+        });
+        assert!(matches!(result, Err(Error::Exists { .. })), "{result:?}");
+        assert_eq!(fs::read(destination).unwrap(), b"other owner");
+    }
+
+    #[test]
+    fn failed_publication_leaves_cleanup_to_the_locked_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("file");
+        let temporary = part_path(&destination);
+        fs::write(&temporary, b"abcd").unwrap();
+        fs::write(&destination, b"existing").unwrap();
+        let journal = open_journal(&temporary).unwrap();
+        let mut expected = ObjectBuilder::new(Suite::Blake3Bao64, Some(4)).unwrap();
+        expected.update(b"abcd").unwrap();
+        let root = expected.finish().unwrap().object_id().root;
+        let mut builder = ObjectBuilder::new(Suite::Blake3Bao64, Some(4)).unwrap();
+        builder.update(b"abcd").unwrap();
+        let result = verify_and_rename(
+            builder,
+            &destination,
+            root,
+            "expected",
+            &temporary,
+            &journal,
+        );
+        assert!(matches!(result, Err(Error::Exists { .. })), "{result:?}");
+        assert!(vot_platform_fs::same_file_handle(&journal, &temporary).unwrap());
+        drop(journal);
+        assert_eq!(fs::read(temporary).unwrap(), b"abcd");
+        assert_eq!(fs::read(destination).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn publication_and_cleanup_do_not_take_a_replacement_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("file");
+        let journal = part_path(&destination);
+        let moved = dir.path().join("moved");
+        let result = receive_from(&destination, b"abcd", &mut |_| {
+            fs::rename(&journal, &moved).unwrap();
+            fs::write(&journal, b"another writer").unwrap();
+            Ok(stream(b"abcd", 0))
+        });
+        assert!(matches!(result, Err(Error::Other(_))), "{result:?}");
+        assert_eq!(fs::read(&journal).unwrap(), b"another writer");
+        assert_eq!(fs::read(moved).unwrap(), b"abcd");
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn a_wrong_root_removes_only_its_owned_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("file");
+        let result = receive_from(&destination, b"abcd", &mut |_| Ok(stream(b"wxyz", 0)));
+        assert!(matches!(result, Err(Error::Verify { .. })), "{result:?}");
+        assert!(!part_path(&destination).exists());
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_symlinks_and_nonregular_files_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("file");
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, part_path(&destination)).unwrap();
+        assert!(receive_from(&destination, b"abcd", &mut |_| panic!(
+            "symlink reached source"
+        ))
+        .is_err());
+        assert_eq!(fs::read(victim).unwrap(), b"untouched");
+        assert!(lock_journal(File::open(dir.path()).unwrap(), dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_destination_symlinks_are_never_overwritten() {
+        for during_receive in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let destination = dir.path().join("file");
+            let absent = dir.path().join("absent");
+            if !during_receive {
+                std::os::unix::fs::symlink(&absent, &destination).unwrap();
+            }
+            let result = receive_from(&destination, b"abcd", &mut |_| {
+                assert!(during_receive, "existing destination reached source");
+                std::os::unix::fs::symlink(&absent, &destination).unwrap();
+                Ok(stream(b"abcd", 0))
+            });
+            assert!(matches!(result, Err(Error::Exists { .. })), "{result:?}");
+            assert_eq!(fs::read_link(destination).unwrap(), absent);
+        }
+    }
 
     #[test]
     fn a_plain_name_lands_under_the_destination() {

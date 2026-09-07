@@ -2752,6 +2752,7 @@ dependencies = [
  "hex",
  "rand 0.8.8",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -2760,6 +2761,8 @@ dependencies = [
  "vot-cli",
  "vot-manifest",
  "vot-object",
+ "vot-platform-fs",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
