@@ -5690,8 +5690,12 @@ async fn a_library_grant_is_fetched_over_vot_quic_and_counted_once() {
             .unwrap();
         if metrics.contains("votport_serve_deliveries_total 1\n") {
             // A rail that dials after the primary's completion closed the
-            // one-download grant is refused as closed; that is not a
-            // second delivery, so only the delivery counter is asserted.
+            // one-download grant is turned away without counting, so the
+            // closed counter stays an alert signal.
+            assert!(
+                metrics.contains("votport_serve_refused_total{reason=\"closed\"} 0\n"),
+                "{metrics}"
+            );
             delivered_metric = true;
             break;
         }

@@ -847,6 +847,14 @@ pub(crate) fn admit_fetch(
         }
     };
     if !grant_open(&grant, presentation.now) {
+        // A rail that dials after the primary's completion closed a capped
+        // grant is this fetch's own straggler, not a refused delivery: the
+        // ticket already records the delivery. Turn it away quietly so the
+        // closed counter and the audit line keep meaning something.
+        if ticket.delivered_at.is_some() {
+            tracing::debug!(%peer, "late rail on a delivered ticket turned away");
+            return None;
+        }
         return refuse(app, ServeRefusalReason::Closed, peer);
     }
     let Some(server) = serve.registry.server(root) else {
