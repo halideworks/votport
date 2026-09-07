@@ -20,7 +20,7 @@ use vot_object::{ObjectBuilder, Suite};
 use crate::api::Client;
 use crate::entries::admit;
 use crate::error::{Error, Result};
-use crate::fetch::{try_fetch, Outcome};
+use crate::fetch::{try_fetch_with_resume, Outcome};
 use crate::identity::Device;
 use crate::progress::{Event, Observer, PlannedFile, Transport};
 
@@ -55,10 +55,21 @@ pub fn receive(
     dest: &Path,
     observer: &mut dyn Observer,
 ) -> Result<Received> {
+    receive_inner(base, delivery, device, dest, observer, false)
+}
+
+fn receive_inner(
+    base: &str,
+    delivery: Delivery,
+    device: &Device,
+    dest: &Path,
+    observer: &mut dyn Observer,
+    resume: bool,
+) -> Result<Received> {
     let client = Client::new(base)?;
-    match try_fetch(&client, &delivery, device, dest, observer)? {
+    match try_fetch_with_resume(&client, &delivery, device, dest, observer, resume)? {
         Outcome::Fetched(received) => Ok(received),
-        Outcome::Unreachable => receive_over_http(base, delivery, dest, observer),
+        Outcome::Unreachable => receive_over_http_inner(base, delivery, dest, observer, resume),
     }
 }
 
@@ -74,9 +85,19 @@ pub fn receive_with_device_or_http(
     dest: &Path,
     observer: &mut dyn Observer,
 ) -> Result<Received> {
+    receive_with_device_or_http_mode(base, delivery, dest, observer, false)
+}
+
+pub(crate) fn receive_with_device_or_http_mode(
+    base: &str,
+    delivery: Delivery,
+    dest: &Path,
+    observer: &mut dyn Observer,
+    resume: bool,
+) -> Result<Received> {
     match Device::load_or_create() {
-        Ok(device) => receive(base, delivery, &device, dest, observer),
-        Err(_) => receive_over_http(base, delivery, dest, observer),
+        Ok(device) => receive_inner(base, delivery, &device, dest, observer, resume),
+        Err(_) => receive_over_http_inner(base, delivery, dest, observer, resume),
     }
 }
 
@@ -91,6 +112,16 @@ pub fn receive_over_http(
     delivery: Delivery,
     dest: &Path,
     observer: &mut dyn Observer,
+) -> Result<Received> {
+    receive_over_http_inner(base, delivery, dest, observer, false)
+}
+
+fn receive_over_http_inner(
+    base: &str,
+    delivery: Delivery,
+    dest: &Path,
+    observer: &mut dyn Observer,
+    resume: bool,
 ) -> Result<Received> {
     let client = Client::new(base)?;
     let mut metadata = client.outbound_metadata(&delivery.token, None)?;
@@ -114,6 +145,19 @@ pub fn receive_over_http(
         }
     }
 
+    observer.event(Event::Planned {
+        files: metadata
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| PlannedFile {
+                index,
+                path: file.name.clone(),
+                bytes: file.bytes,
+            })
+            .collect(),
+    });
+
     // Resolve, validate, and check every file before writing a byte, so the
     // whole delivery is refused up front rather than landing some files and
     // failing on a later one: a suite the client does not fetch, a root that
@@ -130,59 +174,58 @@ pub fn receive_over_http(
             }
             let root = decode_root(&file.root)?;
             let path = local_path(dest, &file.name)?;
-            Ok((file, path, root))
+            let complete = reusable_file(&path, root, file.bytes, resume, observer)?;
+            Ok((file, path, root, complete))
         })
         .collect::<Result<Vec<_>>>()?;
-    for (_, path, _) in &planned {
-        if path.exists() {
-            return Err(Error::Exists { path: path.clone() });
-        }
-    }
-    let needed: u64 = planned.iter().map(|(file, _, _)| file.bytes).sum();
+    let needed: u64 = planned
+        .iter()
+        .filter(|(_, _, _, complete)| !complete)
+        .map(|(file, _, _, _)| file.bytes)
+        .sum();
     require_space(dest, needed)?;
 
-    observer.event(Event::Planned {
-        files: planned
-            .iter()
-            .enumerate()
-            .map(|(index, (file, _, _))| PlannedFile {
+    for (index, (_, path, _, complete)) in planned.iter().enumerate() {
+        if *complete {
+            observer.event(Event::FileVerified {
                 index,
-                path: file.name.clone(),
-                bytes: file.bytes,
-            })
-            .collect(),
-    });
+                path: path.display().to_string(),
+            });
+        }
+    }
 
     observer.event(Event::Transport(Transport::Http));
 
     fs::create_dir_all(dest)?;
     let cookie = cookie.as_deref();
     let mut files = Vec::with_capacity(planned.len());
-    for (index, (file, path, root)) in planned.into_iter().enumerate() {
+    for (index, (file, path, root, complete)) in planned.into_iter().enumerate() {
         if observer.cancelled() {
             return Err(Error::Cancelled);
         }
-        let mut source = |offset: u64| -> Result<Resumed> {
-            let (response, start) =
-                client.download(&file.download_url, cookie, offset, file.bytes)?;
-            Ok(Resumed {
-                reader: Box::new(response),
-                start,
-            })
-        };
-        write_verified(
-            &mut source,
-            &path,
-            root,
-            &file.root,
-            file.bytes,
-            index,
-            observer,
-        )?;
-        observer.event(Event::FileVerified {
-            index,
-            path: path.display().to_string(),
-        });
+        if !complete {
+            let mut source = |offset: u64| -> Result<Resumed> {
+                let (response, start) =
+                    client.download(&file.download_url, cookie, offset, file.bytes)?;
+                Ok(Resumed {
+                    reader: Box::new(response),
+                    start,
+                })
+            };
+            write_verified(
+                &mut source,
+                &path,
+                root,
+                &file.root,
+                file.bytes,
+                index,
+                observer,
+            )?;
+            observer.event(Event::FileVerified {
+                index,
+                path: path.display().to_string(),
+            });
+        }
         files.push(path);
     }
     observer.event(Event::Finished { files: files.len() });
@@ -339,9 +382,13 @@ fn part_path(destination: &Path) -> PathBuf {
     }
 }
 
-fn open_journal(path: &Path) -> Result<File> {
+fn open_receive_file(path: &Path, write: bool) -> Result<File> {
     let mut options = fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
+    options
+        .read(true)
+        .write(write)
+        .create(write)
+        .truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -354,8 +401,11 @@ fn open_journal(path: &Path) -> Result<File> {
         use std::os::windows::fs::OpenOptionsExt;
         options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let file = options.open(path)?;
-    lock_journal(file, path)
+    Ok(options.open(path)?)
+}
+
+fn open_journal(path: &Path) -> Result<File> {
+    lock_journal(open_receive_file(path, true)?, path)
 }
 
 fn lock_journal(file: File, path: &Path) -> Result<File> {
@@ -372,6 +422,52 @@ fn lock_journal(file: File, path: &Path) -> Result<File> {
         ));
     }
     Ok(file)
+}
+
+pub(crate) fn reusable_file(
+    path: &Path,
+    root: [u8; 32],
+    total: u64,
+    resume: bool,
+    observer: &mut dyn Observer,
+) -> Result<bool> {
+    let exists = || Error::Exists {
+        path: path.to_owned(),
+    };
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !resume || !metadata.is_file() {
+        return Err(exists());
+    }
+    let mut file = open_receive_file(path, false)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.len() != total {
+        return Err(exists());
+    }
+    let mut builder = ObjectBuilder::new(Suite::Blake3Bao64, Some(total))?;
+    let mut buffer = vec![0u8; READ_CHUNK];
+    let mut reader = (&mut file).take(total);
+    for _ in 0..=total {
+        if observer.cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        builder.update(&buffer[..read]).map_err(|_| exists())?;
+    }
+    let prepared = builder.finish().map_err(|_| exists())?;
+    if file.metadata()?.len() != total
+        || !root_matches(&prepared.object_id().root, &root)
+        || !vot_platform_fs::same_file_handle(&file, path)?
+    {
+        return Err(exists());
+    }
+    Ok(true)
 }
 
 /// Hashes a usable prefix without changing the journal before a source opens.
@@ -543,6 +639,103 @@ fn decode_root(hex_root: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_reuses_only_matching_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        let bytes = b"completed";
+        let mut builder = ObjectBuilder::new(Suite::Blake3Bao64, Some(bytes.len() as u64)).unwrap();
+        builder.update(bytes).unwrap();
+        let root = builder.finish().unwrap().object_id().root;
+        let mut observer = crate::progress::Silent;
+        assert!(!reusable_file(&path, root, 9, true, &mut observer).unwrap());
+        fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            reusable_file(&path, root, 9, false, &mut observer),
+            Err(Error::Exists { .. })
+        ));
+        assert!(reusable_file(&path, root, 9, true, &mut observer).unwrap());
+        for (hash, length) in [(root, 8), (root, 10), ([0; 32], 9)] {
+            assert!(matches!(
+                reusable_file(&path, hash, length, true, &mut observer),
+                Err(Error::Exists { .. })
+            ));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+        assert!(matches!(
+            reusable_file(dir.path(), root, 9, true, &mut observer),
+            Err(Error::Exists { .. })
+        ));
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(matches!(
+                reusable_file(&link, root, 9, true, &mut observer),
+                Err(Error::Exists { .. })
+            ));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn resume_hashing_checks_cancellation_replacement_and_growth() {
+        struct Change<'a> {
+            path: &'a Path,
+            action: u8,
+            done: std::cell::Cell<bool>,
+        }
+        impl Observer for Change<'_> {
+            fn event(&mut self, _: Event) {}
+            fn cancelled(&self) -> bool {
+                if !self.done.replace(true) {
+                    match self.action {
+                        0 => return true,
+                        1 => {
+                            fs::rename(self.path, self.path.with_extension("old")).unwrap();
+                            fs::write(self.path, b"same").unwrap();
+                        }
+                        2 => {
+                            use std::io::Write;
+                            fs::OpenOptions::new()
+                                .append(true)
+                                .open(self.path)
+                                .unwrap()
+                                .write_all(b"extra")
+                                .unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                false
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        let mut builder = ObjectBuilder::new(Suite::Blake3Bao64, Some(4)).unwrap();
+        builder.update(b"same").unwrap();
+        let root = builder.finish().unwrap().object_id().root;
+        for action in 0..3 {
+            fs::write(&path, b"same").unwrap();
+            let result = reusable_file(
+                &path,
+                root,
+                4,
+                true,
+                &mut Change {
+                    path: &path,
+                    action,
+                    done: std::cell::Cell::new(false),
+                },
+            );
+            if action == 0 {
+                assert!(matches!(result, Err(Error::Cancelled)));
+            } else {
+                assert!(matches!(result, Err(Error::Exists { .. })), "{result:?}");
+            }
+        }
+    }
 
     fn receive_from(
         destination: &Path,

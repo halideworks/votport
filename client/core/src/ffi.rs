@@ -23,7 +23,7 @@ use crate::identity::Device;
 use crate::journal;
 use crate::port;
 use crate::progress::{Event, Observer, Transport};
-use crate::receive::{receive_with_device_or_http, Delivery};
+use crate::receive::Delivery;
 use crate::transfer::{self, Drop, Selected};
 use crate::watch;
 
@@ -289,7 +289,7 @@ pub fn resume(
             run_send(entry, password, transfer, listener).map(ResumeReport::Sent)
         }
         journal::Kind::Receive => {
-            run_receive(entry, password, transfer, listener).map(ResumeReport::Received)
+            run_receive(entry, password, transfer, listener, true).map(ResumeReport::Received)
         }
     }
 }
@@ -774,7 +774,7 @@ pub fn receive(
         Some(dest),
         password.is_some(),
     );
-    run_receive(entry, password, transfer, listener)
+    run_receive(entry, password, transfer, listener, false)
 }
 
 /// Runs a journalled receive; the entry's fate is as for [`run_send`].
@@ -783,6 +783,7 @@ fn run_receive(
     password: Option<String>,
     transfer: Arc<Transfer>,
     listener: Arc<dyn TransferListener>,
+    resume: bool,
 ) -> std::result::Result<ReceiveReport, Error> {
     transfer.set_journal_id(&entry.id);
     let handle = Arc::clone(&transfer);
@@ -799,8 +800,13 @@ fn run_receive(
             token: link.token,
             password,
         };
-        let received =
-            receive_with_device_or_http(&link.base, delivery, Path::new(dest), &mut forward)?;
+        let received = crate::receive::receive_with_device_or_http_mode(
+            &link.base,
+            delivery,
+            Path::new(dest),
+            &mut forward,
+            resume,
+        )?;
         Ok(ReceiveReport {
             files: received
                 .files
