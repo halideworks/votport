@@ -624,6 +624,31 @@
 
           <section class="settings-group" id="maintenance-verification" data-group="maintenance-verification">
             <h2>Maintenance &amp; verification</h2>
+            <form id="replica-form" class="card">
+              <h3>Standby replica</h3>
+              <p class="muted">
+                A standby started with <code>votport standby</code> pulls this
+                instance's database and identity files with this token and
+                keeps them staged as its next boot's restore. Stored hashed.
+              </p>
+              <div class="field">
+                <label
+                  >Replica token <span class="muted" id="replica-token-source"></span>
+                  <input id="replica-token" type="password" autocomplete="off" />
+                </label>
+                <button type="button" class="link" data-reset="replica_token">
+                  Use environment
+                </button>
+                <button type="button" class="link" data-clear="replica_token">
+                  Clear
+                </button>
+              </div>
+              <div class="actions">
+                <button type="submit" id="replica-save">Save</button>
+                <span id="replica-note" class="muted"></span>
+              </div>
+              <p class="error" id="replica-error" role="alert" hidden></p>
+            </form>
             <form id="drain-form" class="card">
               <h3>Drain for restart</h3>
               <p class="muted">

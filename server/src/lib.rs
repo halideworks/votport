@@ -15,4 +15,5 @@ pub mod notify;
 pub mod paths;
 pub mod receipt;
 pub mod session;
+pub mod standby;
 pub mod store;

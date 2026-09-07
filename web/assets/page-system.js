@@ -212,6 +212,8 @@ function fillSettings(data) {
 
   $('drain-toggle').checked = data.draining === true;
   setSource('drain-source', data.draining_source);
+  setSecret('replica-token', data.replica_token_set);
+  setSource('replica-token-source', data.replica_token_source);
 
   // Reset and clear links only where they do something: a saved override
   // to drop, or a stored secret to wipe.
@@ -540,6 +542,15 @@ $('signin-form').addEventListener('submit', async (event) => {
     body.scim_token = $('scim-token').value;
   }
   await saveSettings(event.currentTarget, body);
+});
+
+$('replica-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if ($('replica-token').value === '') {
+    formNote(event.currentTarget, 'Enter a token to save.');
+    return;
+  }
+  await saveSettings(event.currentTarget, { replica_token: $('replica-token').value });
 });
 
 $('drain-form').addEventListener('submit', async (event) => {

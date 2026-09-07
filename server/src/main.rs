@@ -10,7 +10,8 @@ use votport::{app, config};
 #[tokio::main]
 async fn main() {
     let mut arguments = std::env::args().skip(1);
-    if arguments.next().as_deref() == Some("share") {
+    let command = arguments.next();
+    if command.as_deref() == Some("share") {
         if let Err(error) = share(arguments.collect()).await {
             eprintln!("{error}");
             std::process::exit(2);
@@ -31,6 +32,17 @@ async fn main() {
             .init();
     } else {
         tracing_subscriber::fmt().with_env_filter(filter()).init();
+    }
+    if command.as_deref() == Some("standby") {
+        let result = match votport::standby::config_from_env() {
+            Ok(config) => votport::standby::run(config).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            tracing::error!("{error}");
+            std::process::exit(2);
+        }
+        return;
     }
     let config = match config::from_env() {
         Ok(config) => config,

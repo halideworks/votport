@@ -395,6 +395,32 @@ pub fn ensure_no_pending_restore(data_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Discards a prepared (not yet applied) pending restore and its stage so a
+/// newer one can replace it. A restore that a boot already started applying
+/// is left alone: that boot has to finish it.
+pub fn clear_pending_restore(data_dir: &Path) -> Result<(), String> {
+    let marker_path = data_dir.join(PENDING_FILE);
+    let bytes = match fs::read(&marker_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let marker: PendingRestore =
+        serde_json::from_slice(&bytes).map_err(|_| "invalid pending restore marker".to_owned())?;
+    if marker.phase != RestorePhase::Prepared {
+        return Err("a restore is being applied; restart to finish it first".into());
+    }
+    if marker.stage.starts_with(".votport-restore-stage-") && !marker.stage.contains('/') {
+        let stage = data_dir.join(&marker.stage);
+        if let Ok(meta) = fs::symlink_metadata(&stage) {
+            if meta.file_type().is_dir() {
+                fs::remove_dir_all(&stage).map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    fs::remove_file(&marker_path).map_err(|error| error.to_string())
+}
+
 pub fn read_secrets(data_dir: &Path) -> Result<BackupSecrets, String> {
     let path = data_dir.join(SECRETS_FILE);
     let meta = match fs::symlink_metadata(&path) {
