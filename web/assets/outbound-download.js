@@ -77,6 +77,9 @@ export const SAVE_RETRY_CAP_MS = 8000;
 // restore it, and a true return resumes from the same offset. The caller
 // closes or aborts the writable. fetchFn and sleep are injectable for tests.
 export async function streamToWritable(fetchFn, writable, file, options = {}) {
+  if (!Number.isSafeInteger(file.bytes) || file.bytes < 0) {
+    throw new Error('invalid file size');
+  }
   const retries = options.retries;
   const budgetMs = options.retryBudgetMs ?? SAVE_RETRY_BUDGET_MS;
   const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
@@ -87,6 +90,7 @@ export async function streamToWritable(fetchFn, writable, file, options = {}) {
     try {
       const headers = written ? { Range: `bytes=${written}-` } : {};
       const response = await fetchFn(file.download_url, { credentials: 'same-origin', headers });
+      if (!response.ok) await response.body?.cancel().catch(() => {});
       if (response.status >= 500 || response.status === 429) {
         throw Object.assign(new Error(`server returned ${response.status}`), { transient: true });
       }
@@ -99,6 +103,17 @@ export async function streamToWritable(fetchFn, writable, file, options = {}) {
       }
       if (!response.ok) throw new Error(`server returned ${response.status}`);
       if (!response.body) throw new Error('browser cannot stream this response');
+      if (response.status === 206) {
+        const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('content-range'));
+        if (!range || Number(range[1]) !== written || Number(range[2]) !== file.bytes - 1 ||
+            Number(range[3]) !== file.bytes || written >= file.bytes) {
+          await response.body.cancel().catch(() => {});
+          throw new Error('download response has an invalid byte range');
+        }
+      } else if (response.status !== 200) {
+        await response.body.cancel().catch(() => {});
+        throw new Error(`unexpected download status ${response.status}`);
+      }
       if (written && response.status !== 206) {
         await writable.truncate(0);
         written = 0;
@@ -108,9 +123,18 @@ export async function streamToWritable(fetchFn, writable, file, options = {}) {
         for (;;) {
           const { value, done } = await reader.read();
           if (done) break;
+          if (value.byteLength > file.bytes - written) {
+            throw new Error('download response exceeds the file size');
+          }
           await writable.write(value);
           written += value.byteLength;
         }
+        if (written !== file.bytes) {
+          throw Object.assign(new Error('download response truncated'), { transient: true });
+        }
+      } catch (error) {
+        await reader.cancel().catch(() => {});
+        throw error;
       } finally {
         reader.releaseLock();
       }
@@ -197,14 +221,17 @@ export function sanitizeFilename(name) {
 
 export function dedupeFilenames(names) {
   const used = new Set();
+  const nextSuffix = new Map();
   return names.map((name) => {
     const original = sanitizeFilename(name);
+    const key = original.toLowerCase();
     const extensionIndex = original.lastIndexOf('.');
     const stem = extensionIndex > 0 ? original.slice(0, extensionIndex) : original;
     const extension = extensionIndex > 0 ? original.slice(extensionIndex) : '';
     let candidate = original;
-    let suffix = 2;
+    let suffix = nextSuffix.get(key) || 2;
     while (used.has(candidate.toLowerCase())) candidate = `${stem} (${suffix++})${extension}`;
+    nextSuffix.set(key, suffix);
     used.add(candidate.toLowerCase());
     return candidate;
   });

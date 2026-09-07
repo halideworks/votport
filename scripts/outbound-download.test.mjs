@@ -169,6 +169,18 @@ test('deduplicates case-insensitive names before extensions', () => {
   );
 });
 
+test('deduplicates repeated names across folders and existing numbered names', () => {
+  assert.deepEqual(
+    dedupeFilenames(['a/frame.exr', 'frame (2).exr', 'b/frame.exr', 'FRAME.EXR',
+      'frame (3).exr', 'frame.exr', 'CON', '_con']),
+    ['frame.exr', 'frame (2).exr', 'frame (3).exr', 'FRAME (4).EXR',
+      'frame (3) (2).exr', 'frame (5).exr', '_CON', '_con (2)'],
+  );
+  const names = dedupeFilenames(Array(20000).fill('nested/frame.exr'));
+  assert.equal(new Set(names).size, 20000);
+  assert.equal(names.at(-1), 'frame (20000).exr');
+});
+
 test('caps failure summaries', () => {
   assert.equal(
     summarizeFailures(['a: failed', 'b: failed', 'c: failed', 'd: failed', 'e: failed']),
@@ -300,6 +312,7 @@ function bodyOf(chunks, { failAfter = Infinity } = {}) {
           delivered += 1;
           return { value: chunks[index++], done: false };
         },
+        async cancel() {},
         releaseLock() {},
       };
     },
@@ -313,11 +326,11 @@ test('streamToWritable resumes a dropped stream with a byte range', async () => 
   const requests = [];
   const responses = [
     { ok: true, status: 200, body: bodyOf([bytes(4, 1), bytes(4, 2)], { failAfter: 1 }) },
-    { ok: true, status: 206, body: bodyOf([bytes(4, 2)]) },
+    { ok: true, status: 206, headers: new Headers({ 'content-range': 'bytes 4-7/8' }), body: bodyOf([bytes(4, 2)]) },
   ];
   const fetchFn = async (url, options) => { requests.push(options.headers); return responses.shift(); };
   const writable = fakeWritable();
-  const total = await streamToWritable(fetchFn, writable, { download_url: '/f/0' }, noSleep);
+  const total = await streamToWritable(fetchFn, writable, { download_url: '/f/0', bytes: 8 }, noSleep);
   assert.equal(total, 8);
   assert.equal(writable.written(), 8);
   assert.deepEqual(requests, [{}, { Range: 'bytes=4-' }]);
@@ -330,7 +343,7 @@ test('streamToWritable restarts from zero when a resume is answered with 200', a
     { ok: true, status: 200, body: bodyOf([bytes(4, 1), bytes(4, 2)]) },
   ];
   const writable = fakeWritable();
-  const total = await streamToWritable(async () => responses.shift(), writable, { download_url: '/f/0' }, noSleep);
+  const total = await streamToWritable(async () => responses.shift(), writable, { download_url: '/f/0', bytes: 8 }, noSleep);
   assert.equal(total, 8);
   assert.equal(writable.truncated, 1);
   assert.equal(writable.written(), 8);
@@ -342,19 +355,18 @@ test('streamToWritable keeps resuming for the waiting budget, not a fixed count'
   let calls = 0;
   const responses = [];
   for (let i = 0; i < 40; i += 1) responses.push({ ok: false, status: 503, body: null });
-  responses.push({ ok: true, status: 206, body: bodyOf([bytes(4, 2)]) });
+  responses.push({ ok: true, status: 200, body: bodyOf([bytes(8, 2)]) });
   const fetchFn = async () => { calls += 1; return responses.shift(); };
   const writable = fakeWritable();
-  writable.write(bytes(4, 1));
   // Forty 503s at the 8 s cap is nearly five minutes of waiting; the ten
   // minute budget covers it, a five-attempt limit would not.
-  const total = await streamToWritable(fetchFn, writable, { download_url: '/f/0' }, { sleep });
+  const total = await streamToWritable(fetchFn, writable, { download_url: '/f/0', bytes: 8 }, { sleep });
   assert.equal(calls, 41);
   assert.ok(clock > 4 * 60 * 1000 && clock < 10 * 60 * 1000, `waited ${clock} ms`);
-  assert.equal(total, 4);
+  assert.equal(total, 8);
   await assert.rejects(
     streamToWritable(async () => ({ ok: false, status: 503, body: null }), fakeWritable(),
-      { download_url: '/f/0' }, { sleep, retryBudgetMs: 20000 }),
+      { download_url: '/f/0', bytes: 8 }, { sleep, retryBudgetMs: 20000 }),
     /server returned 503/,
   );
 });
@@ -374,20 +386,21 @@ test('streamToWritable does not charge streaming time against the budget', async
           }
           throw new TypeError('network dropped after a long stream');
         },
+        async cancel() {},
         releaseLock() {},
       };
     },
   };
   const responses = [
     { ok: true, status: 200, body: slowBody },
-    { ok: true, status: 206, body: bodyOf([bytes(4, 2)]) },
+    { ok: true, status: 206, headers: new Headers({ 'content-range': 'bytes 4-7/8' }), body: bodyOf([bytes(4, 2)]) },
   ];
   const requests = [];
   const fetchFn = async (url, options) => { requests.push(options.headers); return responses.shift(); };
   const writable = fakeWritable();
   // The stream took longer than the budget; wall-clock accounting would
   // give up here, backoff accounting retries.
-  const total = await streamToWritable(fetchFn, writable, { download_url: '/f/0' }, { ...noSleep, retryBudgetMs: 500 });
+  const total = await streamToWritable(fetchFn, writable, { download_url: '/f/0', bytes: 8 }, { ...noSleep, retryBudgetMs: 500 });
   assert.equal(total, 8);
   assert.deepEqual(requests, [{}, { Range: 'bytes=4-' }]);
 
@@ -395,7 +408,7 @@ test('streamToWritable does not charge streaming time against the budget', async
   const slept = [];
   await assert.rejects(
     streamToWritable(async () => ({ ok: false, status: 503, body: null }), fakeWritable(),
-      { download_url: '/f/0' }, { sleep: async (ms) => { slept.push(ms); }, retryBudgetMs: 3000 }),
+      { download_url: '/f/0', bytes: 8 }, { sleep: async (ms) => { slept.push(ms); }, retryBudgetMs: 3000 }),
     /server returned 503/,
   );
   assert.deepEqual(slept, [500, 1000]);
@@ -406,12 +419,12 @@ test('streamToWritable re-authorizes on 401 and resumes from its offset', async 
   const responses = [
     { ok: true, status: 200, body: bodyOf([bytes(4, 1), bytes(4, 2)], { failAfter: 1 }) },
     { ok: false, status: 401, body: null },
-    { ok: true, status: 206, body: bodyOf([bytes(4, 2)]) },
+    { ok: true, status: 206, headers: new Headers({ 'content-range': 'bytes 4-7/8' }), body: bodyOf([bytes(4, 2)]) },
   ];
   const fetchFn = async (url, options) => { requests.push(options.headers); return responses.shift(); };
   let asked = 0;
   const writable = fakeWritable();
-  const total = await streamToWritable(fetchFn, writable, { download_url: '/f/0' }, {
+  const total = await streamToWritable(fetchFn, writable, { download_url: '/f/0', bytes: 8 }, {
     ...noSleep,
     onAuthLost: async () => { asked += 1; return true; },
   });
@@ -422,12 +435,12 @@ test('streamToWritable re-authorizes on 401 and resumes from its offset', async 
   // A gate that cannot re-authorize, or no gate at all, is a hard failure.
   await assert.rejects(
     streamToWritable(async () => ({ ok: false, status: 401, body: null }), fakeWritable(),
-      { download_url: '/f/0' }, { ...noSleep, onAuthLost: async () => false }),
+      { download_url: '/f/0', bytes: 8 }, { ...noSleep, onAuthLost: async () => false }),
     /server returned 401/,
   );
   await assert.rejects(
     streamToWritable(async () => ({ ok: false, status: 403, body: null }), fakeWritable(),
-      { download_url: '/f/0' }, noSleep),
+      { download_url: '/f/0', bytes: 8 }, noSleep),
     /server returned 403/,
   );
 });
@@ -436,12 +449,104 @@ test('streamToWritable gives up after the retry limit and on non-transient statu
   let calls = 0;
   await assert.rejects(
     streamToWritable(async () => { calls += 1; return { ok: true, status: 200, body: bodyOf([], { failAfter: 0 }) }; },
-      fakeWritable(), { download_url: '/f/0' }, { retries: 3, ...noSleep }),
+      fakeWritable(), { download_url: '/f/0', bytes: 8 }, { retries: 3, ...noSleep }),
     TypeError,
   );
   assert.equal(calls, 3);
   await assert.rejects(
-    streamToWritable(async () => ({ ok: false, status: 404 }), fakeWritable(), { download_url: '/f/0' }, noSleep),
+    streamToWritable(async () => ({ ok: false, status: 404 }), fakeWritable(), { download_url: '/f/0', bytes: 8 }, noSleep),
     /server returned 404/,
   );
+});
+
+test('streamToWritable rejects invalid sizes before fetching or writing', async () => {
+  for (const size of [undefined, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, '8']) {
+    await assert.rejects(streamToWritable(
+      async () => assert.fail('must not fetch'), fakeWritable(),
+      { download_url: '/f/0', bytes: size }, noSleep,
+    ), /invalid file size/);
+  }
+});
+
+test('streamToWritable rejects mismatched resumed ranges before appending bytes', async () => {
+  for (const range of [null, 'garbage', 'bytes 0-7/8', 'bytes 5-7/8', 'bytes 4-6/8',
+    'bytes 4-7/9', 'bytes 4-7/*']) {
+    let calls = 0;
+    let cancelled = false;
+    const writable = fakeWritable();
+    await assert.rejects(streamToWritable(async () => {
+      calls += 1;
+      if (calls === 1) return { ok: true, status: 200, body: bodyOf([bytes(4, 1)], { failAfter: 1 }) };
+      assert.equal(calls, 2);
+      return new Response(new ReadableStream({
+        start(controller) { controller.enqueue(bytes(4, 2)); controller.close(); },
+        cancel() { cancelled = true; },
+      }), { status: 206, headers: range === null ? {} : { 'content-range': range } });
+    }, writable, { download_url: '/f/0', bytes: 8 }, noSleep), /invalid byte range/);
+    assert.equal(writable.written(), 4);
+    assert.equal(cancelled, true);
+  }
+});
+
+test('streamToWritable resumes clean truncation and refuses excess bytes', async () => {
+  const requests = [];
+  const responses = [
+    new Response(bytes(4, 1)),
+    new Response(bytes(4, 2), { status: 206, headers: { 'content-range': 'bytes 4-7/8' } }),
+  ];
+  const writable = fakeWritable();
+  assert.equal(await streamToWritable(async (_url, options) => {
+    requests.push(options.headers);
+    return responses.shift();
+  }, writable, { download_url: '/f/0', bytes: 8 }, noSleep), 8);
+  assert.deepEqual(requests, [{}, { Range: 'bytes=4-' }]);
+  assert.deepEqual(join(...writable.chunks), join(bytes(4, 1), bytes(4, 2)));
+
+  let cancelled = false;
+  const oversized = fakeWritable();
+  await assert.rejects(streamToWritable(async () => new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(bytes(9, 1));
+      controller.enqueue(bytes(1, 1));
+      controller.close();
+    },
+    cancel() { cancelled = true; },
+  })), oversized, { download_url: '/f/0', bytes: 8 }, noSleep), /exceeds the file size/);
+  assert.equal(oversized.written(), 0);
+  assert.equal(cancelled, true);
+
+  await assert.rejects(streamToWritable(async () => new Response(bytes(0)), fakeWritable(),
+    { download_url: '/f/0', bytes: 8 }, { ...noSleep, retries: 2 }), /truncated/);
+  assert.equal(await streamToWritable(async () => new Response(bytes(0)), fakeWritable(),
+    { download_url: '/f/0', bytes: 0 }, noSleep), 0);
+});
+
+test('streamToWritable rejects unexpected successful statuses', async () => {
+  await assert.rejects(streamToWritable(async () => new Response(bytes(8), { status: 202 }),
+    fakeWritable(), { download_url: '/f/0', bytes: 8 }, noSleep), /unexpected download status 202/);
+});
+
+test('streamToWritable cancels error bodies before retrying or asking for authorization', async () => {
+  for (const status of [429, 503, 401, 403, 404]) {
+    let cancelled = false;
+    let calls = 0;
+    const saving = streamToWritable(async () => {
+      calls += 1;
+      if (calls > 1) {
+        assert.equal(cancelled, true);
+        return new Response(bytes(8));
+      }
+      return new Response(new ReadableStream({
+        start(controller) { controller.enqueue(bytes(16)); controller.close(); },
+        cancel() { cancelled = true; },
+      }), { status });
+    }, fakeWritable(), { download_url: '/f/0', bytes: 8 }, {
+      retries: 2,
+      sleep: async () => { assert.equal(cancelled, true); },
+      onAuthLost: async () => { assert.equal(cancelled, true); return true; },
+    });
+    if (status === 404) await assert.rejects(saving, /server returned 404/);
+    else assert.equal(await saving, 8);
+    assert.equal(cancelled, true);
+  }
 });
