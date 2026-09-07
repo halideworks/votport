@@ -112,6 +112,7 @@ async function waitForReplica(afterMs, timeoutMs = 60000) {
   const afterSecond = Math.floor(afterMs / 1000);
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
+    if (standby.exitCode !== null) throw new Error(`standby exited: ${standbyLogs.slice(-5).join("")}`);
     try {
       const { body } = await readyz(standbyBase);
       if (body.archive_created_at && body.archive_created_at > afterSecond && !body.last_error) return body;
