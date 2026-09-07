@@ -1084,6 +1084,8 @@ pub fn renew_lease(app: &App, now: u64) -> bool {
 /// drain that lets in-flight uploads and pre-minted pushes keep writing
 /// would be two writers for as long as the longest transfer. Workers
 /// checkpoint, then the process exits; the standby resumes from there.
+/// Only main spawns this: a test that ran it over a receive root another
+/// test takes over would exit the whole test binary.
 pub async fn lease_keeper(app: Arc<App>) {
     let mut tick = tokio::time::interval(crate::lease::RENEW_EVERY);
     tick.tick().await;
