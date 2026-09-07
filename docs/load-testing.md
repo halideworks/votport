@@ -143,3 +143,29 @@ Set the `session_cap` dashboard variable to the target's
 it defaults to 32 like the server does. The audit insert failures panel is
 the one to alert on: any non-zero value means audit events are being
 dropped.
+
+## Browser filename preparation
+
+On 2026-09-07, Node.js v24.19.0 on the development Linux host took a median
+5187.23 ms to prepare 10,000 identical filenames with `dedupeFilenames`.
+Remembering the next suffix for each case-insensitive name reduced that to
+7.77 ms on the same host. Each result is the median of three calls, with
+uniqueness checked outside the timed section. This measures filename
+preparation only, not download throughput.
+
+Run from the repository root:
+
+```sh
+node --input-type=module <<'JS'
+import { dedupeFilenames } from './web/assets/outbound-download.js';
+const names = Array(10000).fill('frame.exr');
+const times = [];
+for (let run = 0; run < 3; run++) {
+  const start = performance.now();
+  const result = dedupeFilenames(names);
+  times.push(performance.now() - start);
+  if (new Set(result).size !== names.length) throw new Error('duplicate names');
+}
+console.log({ milliseconds: times, median: times.toSorted((a, b) => a - b)[1] });
+JS
+```
