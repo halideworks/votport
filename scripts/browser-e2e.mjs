@@ -110,6 +110,40 @@ console.log("link:", linkUrl);
 
 await page.goto(linkUrl);
 await page.waitForSelector("#uploader:not([hidden])", { timeout: 15000 });
+await page.route("**/api/r/*/session", (route) => route.fulfill({ status: 503 }));
+await page.setInputFiles("#file-input", path.join(dir, "Résumé Draft.pdf"));
+await page.focus("#send");
+await Promise.all([
+  page.waitForResponse((response) => response.url().endsWith("/session") && response.status() === 503),
+  page.keyboard.press("Enter"),
+]);
+await page.focus("#cancel");
+await page.keyboard.press("Enter");
+await page.waitForSelector("#confirm-cancel[open]");
+await page.keyboard.press("Tab");
+await page.keyboard.press("Enter");
+await page.waitForFunction(() =>
+  document.getElementById("progress-card").hidden
+  && document.getElementById("upload-error").textContent === "Transfer cancelled."
+  && document.activeElement === document.getElementById("send"),
+);
+await page.unroute("**/api/r/*/session");
+console.log("cancel restores keyboard focus: ok");
+await page.route("**/api/r/*/session", (route) => route.fulfill({ status: 403 }));
+await page.reload();
+await page.waitForSelector("#uploader:not([hidden])", { timeout: 15000 });
+await page.setInputFiles("#file-input", path.join(dir, "Résumé Draft.pdf"));
+await page.focus("#pick");
+await page.evaluate(() => document.getElementById("upload-form").requestSubmit());
+await page.waitForFunction(() =>
+  document.getElementById("progress-card").hidden
+  && !document.getElementById("upload-error").hidden
+  && document.activeElement === document.getElementById("pick"),
+);
+console.log("failed upload preserves external focus: ok");
+await page.unroute("**/api/r/*/session");
+await page.reload();
+await page.waitForSelector("#uploader:not([hidden])", { timeout: 15000 });
 await page.setInputFiles("#file-input", [
   path.join(dir, "Résumé Draft.pdf"),
   path.join(dir, "archive.tar"),
