@@ -70,6 +70,7 @@ test('library upload attempts isolate same-metadata files and keep the id throug
     requests.push({ id, start });
     const chunks = stages.get(id) || [];
     const offset = chunks.reduce((size, chunk) => size + chunk.length, 0);
+    if (offset === Number(range[3])) return Response.json({ offset });
     if (offset !== start) return Response.json({ offset }, { status: 409 });
     chunks.push(new Uint8Array(await request.body.arrayBuffer()));
     stages.set(id, chunks);
@@ -87,6 +88,47 @@ test('library upload attempts isolate same-metadata files and keep the id throug
   assert.notEqual(requests[0].id, requests[2].id);
   assert.equal(requests[2].start, 0);
   assert.equal(new TextDecoder().decode(stages.get(requests[2].id)[0]), 'new bytes');
+});
+
+test('library upload recovery rejects unchanged and unpublished completion offsets', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  for (const offset of [0, 1, 2, -1]) {
+    let requests = 0;
+    t.mock.method(globalThis, 'fetch', async () => {
+      assert.ok(++requests <= 8, 'upload must stop retrying an invalid checkpoint');
+      return Response.json({ offset }, { status: 409 });
+    });
+    const result = assert.rejects(uploadLibraryFile(new File(['x'], 'x'), 'x'), /invalid upload offset/);
+    for (let i = 0; i < 20; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+      t.mock.timers.tick(1000);
+    }
+    await result;
+    assert.equal(requests, 4);
+  }
+});
+
+test('library uploads recover a lost stage but bound repeated rewinds across successful chunks', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const file = new File([new Uint8Array(8 * 1024 * 1024 + 1)], 'two-chunks.bin');
+  for (const lostStages of [1, 4]) {
+    let losses = 0;
+    let requests = 0;
+    t.mock.method(globalThis, 'fetch', async (_url, request) => {
+      assert.ok(++requests <= 20, 'upload must stop a rewind cycle');
+      const [, start, end] = /^bytes (\d+)-(\d+)\/\d+$/.exec(request.headers['Content-Range']);
+      if (Number(start) > 0 && losses++ < lostStages) return Response.json({ offset: 0 }, { status: 409 });
+      return Response.json({ offset: Number(end) + 1 });
+    });
+    const upload = uploadLibraryFile(file, file.name);
+    const result = lostStages === 1 ? upload : assert.rejects(upload, /repeatedly lost upload progress/);
+    for (let i = 0; i < 30; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+      t.mock.timers.tick(1000);
+    }
+    await result;
+    assert.equal(requests, lostStages === 1 ? 4 : 8);
+  }
 });
 
 test('upload batches cap concurrency and wait for running work after failure', async () => {
