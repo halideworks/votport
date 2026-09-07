@@ -870,25 +870,41 @@ fn name_taken(error: String) -> ScimError {
     }
 }
 
-/// The filter provisioning clients send for groups: `displayName eq "x"`.
-fn filter_group_name(filter: &str) -> ScimResult<String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupFilterKey {
+    DisplayName,
+    ExternalId,
+}
+
+/// The filters provisioning clients send for groups: `displayName eq "x"`
+/// and `externalId eq "x"`.
+fn filter_group(filter: &str) -> ScimResult<(GroupFilterKey, String)> {
     let filter = filter.trim();
-    filter
+    let (key, rest) = if filter
         .get(..11)
-        .filter(|head| head.eq_ignore_ascii_case("displayName"))
-        .and_then(|_| filter.get(11..))
-        .map(str::trim_start)
+        .is_some_and(|head| head.eq_ignore_ascii_case("displayName"))
+    {
+        (GroupFilterKey::DisplayName, filter.get(11..))
+    } else if filter
+        .get(..10)
+        .is_some_and(|head| head.eq_ignore_ascii_case("externalId"))
+    {
+        (GroupFilterKey::ExternalId, filter.get(10..))
+    } else {
+        (GroupFilterKey::DisplayName, None)
+    };
+    rest.map(str::trim_start)
         .and_then(|rest| rest.strip_prefix("eq").or_else(|| rest.strip_prefix("EQ")))
         .map(str::trim)
         .and_then(|rest| rest.strip_prefix('"'))
         .and_then(|rest| rest.strip_suffix('"'))
         .filter(|value| !value.contains('"'))
-        .map(str::to_owned)
+        .map(|value| (key, value.to_owned()))
         .ok_or_else(|| {
             ScimError::typed(
                 StatusCode::BAD_REQUEST,
                 "invalidFilter",
-                "only the filter displayName eq \"value\" is supported",
+                "only the filters displayName eq \"value\" and externalId eq \"value\" are supported",
             )
         })
 }
@@ -904,13 +920,12 @@ pub async fn list_groups(
     let count = query.count.unwrap_or(MAX_PAGE).min(MAX_PAGE);
     let (rows, total) = match query.filter.as_deref() {
         Some(filter) => {
-            let name = filter_group_name(filter)?;
-            let rows: Vec<_> = app
-                .store
-                .scim_group_by_name(&name)
-                .map_err(ScimError::store)?
-                .into_iter()
-                .collect();
+            let (key, value) = filter_group(filter)?;
+            let found = match key {
+                GroupFilterKey::DisplayName => app.store.scim_group_by_name(&value),
+                GroupFilterKey::ExternalId => app.store.scim_group_by_external_id(&value),
+            };
+            let rows: Vec<_> = found.map_err(ScimError::store)?.into_iter().collect();
             let total = rows.len() as u64;
             (rows, total)
         }
@@ -2088,6 +2103,25 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["scimType"], "invalidFilter");
+        let (status, json) = scim(
+            &application,
+            "GET",
+            "/scim/v2/Groups?filter=externalId%20eq%20%2200g1%22",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["totalResults"], 1);
+        assert_eq!(json["Resources"][0]["id"], id);
+        let (status, json) = scim(
+            &application,
+            "GET",
+            "/scim/v2/Groups?filter=externalId%20eq%20%22nope%22",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["totalResults"], 0);
         let (status, json) = scim(
             &application,
             "GET",
