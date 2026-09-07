@@ -1246,9 +1246,11 @@ $('upload-form').addEventListener('submit', async (event) => {
         : expired
           ? `${error.message}.${keptNote} The partial transfer was discarded, reselect the same files to send them again from the start.`
           : `${error.message}.${keptNote} Reselect the same files to resume where this stopped.`);
+    const restoreFocus = $('progress-card').contains(document.activeElement);
     $('progress-card').hidden = true;
     $('send').disabled = false;
     $('clear-files').disabled = false;
+    if (restoreFocus) $('send').focus();
     showResumeNote();
   } finally {
     uploading = false;
