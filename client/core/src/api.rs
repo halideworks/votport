@@ -214,6 +214,7 @@ impl Client {
     /// A TLS or client build failure.
     pub fn new(base: impl Into<String>) -> Result<Self> {
         let http = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("votport-client/", env!("CARGO_PKG_VERSION")))
             // No total-request timeout: an 8 MiB chunk on a slow uplink, or a
             // finish that rehashes a resumed file, legitimately runs long. A
@@ -892,6 +893,95 @@ pub fn split_link_as(link: &str, kind: LinkKind) -> Result<Link> {
 mod tests {
     use super::{split_link, split_link_as, LinkKind};
     use crate::error::Error;
+
+    #[test]
+    fn credential_posts_do_not_follow_redirects() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use std::time::Duration;
+
+        fn serve(listener: TcpListener, response: String, done: Arc<AtomicBool>) -> bool {
+            listener.set_nonblocking(true).unwrap();
+            for _ in 0..400 {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let mut reader = BufReader::new(&stream);
+                        let mut length = 0;
+                        for _ in 0..64 {
+                            let mut line = String::new();
+                            assert!(reader.read_line(&mut line).unwrap() > 0);
+                            if line == "\r\n" {
+                                break;
+                            }
+                            if let Some(value) =
+                                line.to_ascii_lowercase().strip_prefix("content-length:")
+                            {
+                                length = value.trim().parse::<usize>().unwrap();
+                            }
+                        }
+                        assert!(length < 1024);
+                        reader.read_exact(&mut vec![0; length]).unwrap();
+                        stream.write_all(response.as_bytes()).unwrap();
+                        return true;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if done.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            }
+            false
+        }
+
+        for status in [307, 308, 301, 302, 303] {
+            let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+            let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", origin.local_addr().unwrap());
+            let location = format!("http://{}/stolen", destination.local_addr().unwrap());
+            let done = Arc::new(AtomicBool::new(false));
+            let first_done = Arc::clone(&done);
+            let first = std::thread::spawn(move || {
+                serve(origin, format!("HTTP/1.1 {status} Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"), first_done)
+            });
+            let second_done = Arc::clone(&done);
+            let second = std::thread::spawn(move || {
+                serve(destination, "HTTP/1.1 200 OK\r\nSet-Cookie: votport_admin=redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(), second_done)
+            });
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = super::Client::new(base)
+                    .unwrap()
+                    .admin_login("secret-password");
+                done.store(true, Ordering::Relaxed);
+                sender.send(result).unwrap();
+            });
+            let result = receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("login stalled");
+            assert!(first.join().unwrap(), "origin was not contacted");
+            assert!(
+                !second.join().unwrap(),
+                "{status} contacted a second origin"
+            );
+            assert!(
+                matches!(result, Err(Error::Server { status: actual, .. }) if actual == status),
+                "{result:?}"
+            );
+        }
+    }
 
     #[test]
     fn splits_request_links_into_origin_and_token() {
