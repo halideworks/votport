@@ -119,6 +119,26 @@ fn sso_role(
 
 /// Builds the SSO session identity. Refuses the reserved break-glass subject
 /// and blocked principals. Records `sso_login` only after those checks pass.
+/// SCIM group names join the provider's group claims, so the admin,
+/// auditor, and tenant admin group settings match either source. A read
+/// failure fails the sign-in rather than silently dropping a role.
+fn merge_scim_groups(
+    store: &crate::store::Store,
+    subject: &str,
+    groups: &mut Vec<String>,
+) -> Result<(), &'static str> {
+    let scim = store.scim_groups_of(subject).map_err(|error| {
+        tracing::error!(%error, "scim group read failed during sign-in");
+        "could not verify group membership"
+    })?;
+    for name in scim {
+        if !groups.contains(&name) {
+            groups.push(name);
+        }
+    }
+    Ok(())
+}
+
 /// The principal subject for the configured claim, or None when the claim
 /// is absent so the caller can retry with the userinfo document. An empty
 /// value counts as absent. An email the provider marks unverified is
@@ -591,6 +611,9 @@ pub async fn sso_callback(
         }
     };
 
+    if let Err(message) = merge_scim_groups(&app.store, &subject, &mut groups) {
+        return home(message);
+    }
     let role = sso_role(
         sso_config.0.admin_group.as_deref(),
         sso_config.0.auditor_group.as_deref(),
@@ -911,6 +934,30 @@ mod tests {
         let error = finish_sso_login(&store, "new@example.com", "viewer".to_owned(), &[], true)
             .unwrap_err();
         assert_eq!(error, "this account is blocked");
+    }
+
+    #[test]
+    fn scim_groups_join_the_claim_groups_without_duplicates() {
+        let (_directory, store) = test_store();
+        store
+            .create_scim_group("votport-admins", None, &["u@example.com".to_owned()])
+            .unwrap()
+            .unwrap();
+        store
+            .create_scim_group("shared", None, &["u@example.com".to_owned()])
+            .unwrap()
+            .unwrap();
+        let mut groups = vec!["shared".to_owned(), "idp-only".to_owned()];
+        merge_scim_groups(&store, "u@example.com", &mut groups).unwrap();
+        assert_eq!(groups, ["shared", "idp-only", "votport-admins"]);
+        assert_eq!(
+            sso_role(Some("votport-admins"), None, &groups),
+            "admin",
+            "a SCIM-only group grants the role"
+        );
+        let mut none = Vec::new();
+        merge_scim_groups(&store, "other@example.com", &mut none).unwrap();
+        assert!(none.is_empty());
     }
 
     #[test]

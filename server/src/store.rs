@@ -324,6 +324,16 @@ pub struct Principal {
     pub created_at: u64,
 }
 
+/// A SCIM group: a name the sign-in role mapping can match, plus members.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScimGroup {
+    pub id: String,
+    pub display_name: String,
+    pub external_id: Option<String>,
+    pub created_at: u64,
+    pub members: Vec<String>,
+}
+
 /// One settings PUT: write TEXT (including empty disable) or delete the row.
 #[derive(Clone, Debug)]
 pub enum SettingWrite {
@@ -422,7 +432,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 22;
+pub(crate) const SCHEMA_VERSION: u64 = 23;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -456,6 +466,23 @@ ALTER TABLE principals ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;
 ";
 const PRINCIPALS_IDENTITY_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS principals_external_id ON principals (external_id);";
+
+// v23: SCIM Groups. Membership is by subject so a group can name a user the
+// provider has not created yet; a name is unique so it can map to a role.
+const SCIM_GROUPS_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS scim_groups (
+    id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL UNIQUE,
+    external_id TEXT,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS scim_group_members (
+    group_id TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    PRIMARY KEY (group_id, subject)
+);
+CREATE INDEX IF NOT EXISTS scim_group_members_subject ON scim_group_members (subject);
+";
 
 const LEGAL_HOLD_SCHEMA: &str =
     "ALTER TABLE links ADD COLUMN legal_hold INTEGER NOT NULL DEFAULT 0;";
@@ -1144,6 +1171,11 @@ impl Store {
                     .execute_batch(PRINCIPALS_IDENTITY_INDEX)
                     .map_err(|error| format!("schema: {error}"))?;
             }
+        }
+        if stored < 23 {
+            transaction
+                .execute_batch(SCIM_GROUPS_SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
         }
         transaction
             .execute(
@@ -2377,6 +2409,207 @@ impl Store {
                     map_principal,
                 )
                 .optional()
+        })
+    }
+
+    // ----------------------------------------------------------- scim groups
+
+    /// Creates a group with its members; None when the name is taken.
+    pub fn create_scim_group(
+        &self,
+        display_name: &str,
+        external_id: Option<&str>,
+        members: &[String],
+    ) -> Result<Option<ScimGroup>, String> {
+        let id = crate::auth::random_token();
+        let at = i64::try_from(now_unix()).unwrap_or(0);
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let inserted = transaction
+            .execute(
+                "INSERT OR IGNORE INTO scim_groups (id, display_name, external_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![id, display_name, external_id, at],
+            )
+            .map_err(|error| error.to_string())?;
+        if inserted == 0 {
+            return Ok(None);
+        }
+        write_scim_members(&transaction, &id, members).map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        drop(connection);
+        self.scim_group(&id)
+    }
+
+    pub fn scim_group(&self, id: &str) -> Result<Option<ScimGroup>, String> {
+        self.with(|connection| {
+            let Some(mut group) = connection
+                .query_row(
+                    "SELECT id, display_name, external_id, created_at FROM scim_groups WHERE id = ?1",
+                    [id],
+                    map_scim_group,
+                )
+                .optional()?
+            else {
+                return Ok(None);
+            };
+            group.members = read_scim_members(connection, id)?;
+            Ok(Some(group))
+        })
+    }
+
+    pub fn scim_group_by_name(&self, display_name: &str) -> Result<Option<ScimGroup>, String> {
+        let id = self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT id FROM scim_groups WHERE display_name = ?1",
+                    [display_name],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+        })?;
+        match id {
+            Some(id) => self.scim_group(&id),
+            None => Ok(None),
+        }
+    }
+
+    /// Groups ordered by name, members included, plus the total count.
+    pub fn scim_groups_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<ScimGroup>, u64), String> {
+        let limit = i64::try_from(limit).map_err(|_| "group limit overflow".to_owned())?;
+        let offset = i64::try_from(offset).map_err(|_| "group offset overflow".to_owned())?;
+        self.with(|connection| {
+            let total = connection.query_row("SELECT COUNT(*) FROM scim_groups", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+            let mut statement = connection.prepare(
+                "SELECT id, display_name, external_id, created_at FROM scim_groups
+                 ORDER BY display_name LIMIT ?1 OFFSET ?2",
+            )?;
+            let mut groups = statement
+                .query_map(rusqlite::params![limit, offset], map_scim_group)?
+                .collect::<Result<Vec<_>, _>>()?;
+            for group in &mut groups {
+                group.members = read_scim_members(connection, &group.id)?;
+            }
+            Ok((groups, u64::try_from(total).unwrap_or(0)))
+        })
+    }
+
+    /// Replaces the name (when given) and the whole member list. Ok(false)
+    /// when the group does not exist; Err on a name collision.
+    pub fn replace_scim_group(
+        &self,
+        id: &str,
+        display_name: Option<&str>,
+        members: Option<&[String]>,
+    ) -> Result<bool, String> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let exists: i64 = transaction
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM scim_groups WHERE id = ?1)",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if exists == 0 {
+            return Ok(false);
+        }
+        if let Some(display_name) = display_name {
+            transaction
+                .execute(
+                    "UPDATE scim_groups SET display_name = ?2 WHERE id = ?1",
+                    rusqlite::params![id, display_name],
+                )
+                .map_err(|error| match error {
+                    rusqlite::Error::SqliteFailure(failure, _)
+                        if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    {
+                        SCIM_GROUP_NAME_TAKEN.to_owned()
+                    }
+                    other => other.to_string(),
+                })?;
+        }
+        if let Some(members) = members {
+            transaction
+                .execute("DELETE FROM scim_group_members WHERE group_id = ?1", [id])
+                .map_err(|error| error.to_string())?;
+            write_scim_members(&transaction, id, members).map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    /// Adds or removes members without touching the rest. Ok(false) when
+    /// the group does not exist.
+    pub fn change_scim_group_members(
+        &self,
+        id: &str,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<bool, String> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let exists: i64 = transaction
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM scim_groups WHERE id = ?1)",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if exists == 0 {
+            return Ok(false);
+        }
+        write_scim_members(&transaction, id, add).map_err(|error| error.to_string())?;
+        for subject in remove {
+            transaction
+                .execute(
+                    "DELETE FROM scim_group_members WHERE group_id = ?1 AND subject = ?2",
+                    rusqlite::params![id, subject],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    pub fn delete_scim_group(&self, id: &str) -> Result<bool, String> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute("DELETE FROM scim_group_members WHERE group_id = ?1", [id])
+            .map_err(|error| error.to_string())?;
+        let deleted = transaction
+            .execute("DELETE FROM scim_groups WHERE id = ?1", [id])
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(deleted > 0)
+    }
+
+    /// Names of the groups a subject belongs to, for the sign-in role
+    /// mapping.
+    pub fn scim_groups_of(&self, subject: &str) -> Result<Vec<String>, String> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT g.display_name FROM scim_group_members m
+                 JOIN scim_groups g ON g.id = m.group_id
+                 WHERE m.subject = ?1 ORDER BY g.display_name",
+            )?;
+            let rows = statement.query_map([subject], |row| row.get::<_, String>(0))?;
+            rows.collect()
         })
     }
 
@@ -4016,6 +4249,39 @@ fn map_tenant(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tenant> {
         max_sessions: decode_quota(row.get(5)?, 5)?,
         created_at: row.get::<_, i64>(6)?.max(0) as u64,
     })
+}
+
+pub const SCIM_GROUP_NAME_TAKEN: &str = "scim group name taken";
+
+fn map_scim_group(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScimGroup> {
+    Ok(ScimGroup {
+        id: row.get("id")?,
+        display_name: row.get("display_name")?,
+        external_id: row.get("external_id")?,
+        created_at: row.get::<_, i64>("created_at")?.max(0) as u64,
+        members: Vec::new(),
+    })
+}
+
+fn read_scim_members(connection: &Connection, id: &str) -> rusqlite::Result<Vec<String>> {
+    let mut statement = connection
+        .prepare("SELECT subject FROM scim_group_members WHERE group_id = ?1 ORDER BY subject")?;
+    let rows = statement.query_map([id], |row| row.get::<_, String>(0))?;
+    rows.collect()
+}
+
+fn write_scim_members(
+    connection: &Connection,
+    id: &str,
+    members: &[String],
+) -> rusqlite::Result<()> {
+    for subject in members {
+        connection.execute(
+            "INSERT OR IGNORE INTO scim_group_members (group_id, subject) VALUES (?1, ?2)",
+            rusqlite::params![id, subject],
+        )?;
+    }
+    Ok(())
 }
 
 fn map_principal(row: &rusqlite::Row<'_>) -> rusqlite::Result<Principal> {
@@ -6509,6 +6775,90 @@ mod tenant_tests {
         let row = store.principal("new@example.com").unwrap().unwrap();
         assert_eq!(row.external_id.as_deref(), Some("ext-1"));
         assert_eq!(row.source, "scim");
+    }
+
+    #[test]
+    fn scim_groups_round_trip_and_map_to_subjects() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let admins = store
+            .create_scim_group(
+                "votport-admins",
+                Some("g1"),
+                &["a@example.com".to_owned(), "b@example.com".to_owned()],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(admins.members, ["a@example.com", "b@example.com"]);
+        assert_eq!(admins.external_id.as_deref(), Some("g1"));
+        assert!(admins.created_at > 0);
+        assert!(
+            store
+                .create_scim_group("votport-admins", None, &[])
+                .unwrap()
+                .is_none(),
+            "names are unique"
+        );
+        let viewers = store
+            .create_scim_group("viewers", None, &["a@example.com".to_owned()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.scim_groups_of("a@example.com").unwrap(),
+            ["viewers", "votport-admins"]
+        );
+        assert_eq!(
+            store.scim_groups_of("b@example.com").unwrap(),
+            ["votport-admins"]
+        );
+        assert!(store.scim_groups_of("nobody").unwrap().is_empty());
+
+        let (page, total) = store.scim_groups_page(10, 0).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(page[0].display_name, "viewers");
+        assert_eq!(page[1].members.len(), 2);
+        assert_eq!(
+            store.scim_group_by_name("viewers").unwrap().unwrap().id,
+            viewers.id
+        );
+
+        assert!(store
+            .change_scim_group_members(
+                &admins.id,
+                &["c@example.com".to_owned(), "a@example.com".to_owned()],
+                &["b@example.com".to_owned()],
+            )
+            .unwrap());
+        assert_eq!(
+            store.scim_group(&admins.id).unwrap().unwrap().members,
+            ["a@example.com", "c@example.com"]
+        );
+        assert!(!store
+            .change_scim_group_members("missing", &[], &[])
+            .unwrap());
+
+        assert_eq!(
+            store
+                .replace_scim_group(&admins.id, Some("viewers"), None)
+                .unwrap_err(),
+            SCIM_GROUP_NAME_TAKEN
+        );
+        assert!(store
+            .replace_scim_group(
+                &admins.id,
+                Some("admins"),
+                Some(&["z@example.com".to_owned()]),
+            )
+            .unwrap());
+        let renamed = store.scim_group(&admins.id).unwrap().unwrap();
+        assert_eq!(renamed.display_name, "admins");
+        assert_eq!(renamed.members, ["z@example.com"]);
+        assert!(!store.replace_scim_group("missing", None, None).unwrap());
+
+        assert!(store.delete_scim_group(&admins.id).unwrap());
+        assert!(!store.delete_scim_group(&admins.id).unwrap());
+        assert!(store.scim_groups_of("z@example.com").unwrap().is_empty());
+        assert_eq!(store.scim_groups_page(10, 0).unwrap().1, 1);
     }
 
     #[test]
