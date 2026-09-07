@@ -1053,7 +1053,12 @@ fn patch_group_operation(patch: &mut GroupPatch, operation: &Value) -> ScimResul
             Ok(())
         }
         ("remove", Some(path)) if path.eq_ignore_ascii_case("members") => {
-            patch.remove.extend(admit_members(value)?);
+            // No value removes every member (RFC 7644 3.5.2.2); a list
+            // removes those members.
+            match value {
+                None => patch.replace_members = Some(Vec::new()),
+                Some(_) => patch.remove.extend(admit_members(value)?),
+            }
             Ok(())
         }
         ("remove", Some(path)) => {
@@ -2253,6 +2258,13 @@ mod tests {
                 remove: vec!["b".to_owned()],
                 replace_members: None,
             }
+        );
+        let mut patch = GroupPatch::default();
+        patch_group_operation(&mut patch, &json!({"op":"remove","path":"members"})).unwrap();
+        assert_eq!(
+            patch.replace_members,
+            Some(Vec::new()),
+            "remove-all clears the list"
         );
         let mut patch = GroupPatch::default();
         patch_group_operation(
