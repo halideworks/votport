@@ -369,7 +369,7 @@ test('streamToWritable does not charge streaming time against the budget', async
         async read() {
           if (delivered === 0) {
             delivered += 1;
-            await new Promise((resolve) => setTimeout(resolve, 5));
+            await new Promise((resolve) => setTimeout(resolve, 600));
             return { value: bytes(4, 1), done: false };
           }
           throw new TypeError('network dropped after a long stream');
@@ -385,11 +385,20 @@ test('streamToWritable does not charge streaming time against the budget', async
   const requests = [];
   const fetchFn = async (url, options) => { requests.push(options.headers); return responses.shift(); };
   const writable = fakeWritable();
-  // The budget is smaller than any realistic transfer time; it bounds
-  // waiting, not streaming.
-  const total = await streamToWritable(fetchFn, writable, { download_url: '/f/0' }, { ...noSleep, retryBudgetMs: 1000 });
+  // The stream took longer than the budget; wall-clock accounting would
+  // give up here, backoff accounting retries.
+  const total = await streamToWritable(fetchFn, writable, { download_url: '/f/0' }, { ...noSleep, retryBudgetMs: 500 });
   assert.equal(total, 8);
   assert.deepEqual(requests, [{}, { Range: 'bytes=4-' }]);
+
+  // The boundary: a sleep that would overrun the budget is not taken.
+  const slept = [];
+  await assert.rejects(
+    streamToWritable(async () => ({ ok: false, status: 503, body: null }), fakeWritable(),
+      { download_url: '/f/0' }, { sleep: async (ms) => { slept.push(ms); }, retryBudgetMs: 3000 }),
+    /server returned 503/,
+  );
+  assert.deepEqual(slept, [500, 1000]);
 });
 
 test('streamToWritable re-authorizes on 401 and resumes from its offset', async () => {
