@@ -2181,6 +2181,10 @@ pub fn router(app: Arc<App>) -> Router {
             "/scim/v2/ServiceProviderConfig",
             get(api::scim::service_provider_config),
         )
+        .route("/scim/v2/ResourceTypes", get(api::scim::resource_types))
+        .route("/scim/v2/ResourceTypes/{id}", get(api::scim::resource_type))
+        .route("/scim/v2/Schemas", get(api::scim::schemas))
+        .route("/scim/v2/Schemas/{id}", get(api::scim::schema))
         .route(
             "/scim/v2/Users",
             get(api::scim::list_users).post(api::scim::create_user),
