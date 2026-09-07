@@ -109,20 +109,14 @@ struct DeliverView: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 160)
             }
-            HStack {
-                TextField("Expires after (days)", text: $expiresDays)
-                    .numeric($expiresDays)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 160)
-                TextField("Downloads allowed", text: $maxDownloads)
-                    .numeric($maxDownloads)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 160)
-                Spacer()
-                Text(chosen.isEmpty ? "Tick the files to deliver" : (chosen.count == 1 ? "1 file" : "\(chosen.count) files"))
-                    .font(Type.callout)
-                    .foregroundStyle(Tokens.muted)
-                Button("Issue delivery") { issue() }
+            HStack(alignment: .bottom) {
+                NumberField("Expires after", unit: "days", placeholder: "7", text: $expiresDays)
+                NumberField("Downloads allowed", unit: "downloads", placeholder: "Unlimited", text: $maxDownloads)
+                // The button carries the count, so the row has one control to read.
+                Button(chosen.isEmpty ? "Tick the files to deliver" : (chosen.count == 1 ? "Deliver 1 file" : "Deliver \(chosen.count) files")) { issue() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .frame(maxWidth: .infinity)
                     .keyboardShortcut(.defaultAction)
                     .disabled(chosen.isEmpty || label.trimmingCharacters(in: .whitespaces).isEmpty || port.busy)
             }
@@ -173,8 +167,8 @@ struct DeliverView: View {
             paths: chosen.sorted(),
             label: label.trimmingCharacters(in: .whitespaces),
             password: password.isEmpty ? nil : password,
-            expiresDays: UInt32(expiresDays.trimmingCharacters(in: .whitespaces)) ?? 7,
-            maxDownloads: UInt64(maxDownloads.trimmingCharacters(in: .whitespaces)))
+            expiresDays: positive(expiresDays) ?? 7,
+            maxDownloads: positive(maxDownloads).map(UInt64.init))
         port.issueDelivery(spec) { result in
             guard let result else { return }
             issued = result

@@ -2,6 +2,8 @@ using System.Collections.ObjectModel;
 using System.ComponentModel;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Media.Animation;
 using uniffi.votport_client_core;
 
 namespace Votport;
@@ -45,6 +47,8 @@ public sealed partial class DeliverPage : Page
         Unloaded += (_, _) => PortStore.Shared.Changed -= Refresh;
         ActualThemeChanged += (_, _) => Refresh();
         LabelBox.TextChanged += (_, _) => Refresh();
+        Numeric.Integer(ExpiresBox);
+        Numeric.Integer(DownloadsBox);
         Open("");
         Refresh();
     }
@@ -52,7 +56,8 @@ public sealed partial class DeliverPage : Page
     private void Refresh()
     {
         var port = PortStore.Shared;
-        ChosenText.Text = chosen.Count == 0 ? "Tick the files to deliver" : chosen.Count == 1 ? "1 file" : $"{chosen.Count} files";
+        // The button carries the count, so the row has one control to read.
+        IssueButton.Content = chosen.Count == 0 ? "Tick the files to deliver" : chosen.Count == 1 ? "Deliver 1 file" : $"Deliver {chosen.Count} files";
         IssueButton.IsEnabled = !port.Busy && chosen.Count > 0 && LabelBox.Text.Trim().Length > 0;
         var problem = port.ProblemFor(PortStore.Scope.Deliver);
         ProblemText.Text = problem ?? "";
@@ -92,21 +97,30 @@ public sealed partial class DeliverPage : Page
         });
     }
 
+    /// The path into the library in the path type: every directory above
+    /// the current one is a link back to it, the current one is plain text.
     private void DrawCrumbs()
     {
         Crumbs.Children.Clear();
-        AddCrumb("Library", "");
         var parts = directory.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        AddCrumb("Library", "", current: parts.Length == 0);
         for (var i = 0; i < parts.Length; i++)
         {
             Crumbs.Children.Add(new TextBlock { Text = "/", Foreground = Theme.Brush(this, "VotMuted"), VerticalAlignment = VerticalAlignment.Center });
-            AddCrumb(parts[i], string.Join('/', parts.Take(i + 1)));
+            AddCrumb(parts[i], string.Join('/', parts.Take(i + 1)), current: i == parts.Length - 1);
         }
     }
 
-    private void AddCrumb(string text, string target)
+    private void AddCrumb(string text, string target, bool current)
     {
-        var button = new HyperlinkButton { Content = text, Padding = new Thickness(4, 2, 4, 2) };
+        var mono = (FontFamily)Application.Current.Resources["VotMonoFont"];
+        var padding = new Thickness(4, 2, 4, 2);
+        if (current)
+        {
+            Crumbs.Children.Add(new TextBlock { Text = text, FontFamily = mono, Padding = padding, VerticalAlignment = VerticalAlignment.Center });
+            return;
+        }
+        var button = new HyperlinkButton { Content = text, FontFamily = mono, Padding = padding };
         button.Click += (_, _) => Open(target);
         Crumbs.Children.Add(button);
     }
@@ -122,8 +136,8 @@ public sealed partial class DeliverPage : Page
             chosen.OrderBy(p => p).ToArray(),
             LabelBox.Text.Trim(),
             DeliveryPasswordBox.Password.Length == 0 ? null : DeliveryPasswordBox.Password,
-            uint.TryParse(ExpiresBox.Text.Trim(), out var days) ? days : 7,
-            ulong.TryParse(DownloadsBox.Text.Trim(), out var max) ? max : null);
+            Numeric.Whole(ExpiresBox) ?? 7,
+            Numeric.Whole(DownloadsBox));
         PortStore.Shared.IssueDelivery(spec, result =>
         {
             if (result is null) return;
@@ -142,11 +156,9 @@ public sealed partial class DeliverPage : Page
         if (issued is not null) LinksPage.Copy(issued, sender as Button);
     }
 
-    // XAML handlers must live on the page; the rule itself is shared.
-    private void Digits(TextBox sender, TextBoxBeforeTextChangingEventArgs args) => Numeric.Digits(sender, args);
-
     private void Back_Click(object sender, RoutedEventArgs e)
     {
-        if (Frame.CanGoBack) Frame.GoBack(); else Frame.Navigate(typeof(LinksPage));
+        if (Frame.CanGoBack) Frame.GoBack(new SuppressNavigationTransitionInfo());
+        else Frame.Navigate(typeof(LinksPage), null, new SuppressNavigationTransitionInfo());
     }
 }

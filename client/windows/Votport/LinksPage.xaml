@@ -6,12 +6,10 @@
     <StackPanel Spacing="16">
       <TextBlock Text="LINKS" Style="{StaticResource SectionLabel}" />
 
+      <TextBlock Text="REQUESTS" Style="{StaticResource SectionLabel}" Margin="0" />
       <!-- Issue a request link -->
       <StackPanel Padding="14" Spacing="8" Background="{ThemeResource VotPanelBrush}" CornerRadius="8">
-        <Grid>
-          <TextBlock Text="Issue a request link" FontWeight="SemiBold" VerticalAlignment="Center" />
-          <Button x:Name="NewDeliveryButton" Content="New delivery" HorizontalAlignment="Right" Click="NewDelivery_Click" />
-        </Grid>
+        <TextBlock Text="Issue a request link" FontWeight="SemiBold" />
         <Grid ColumnSpacing="8">
           <Grid.ColumnDefinitions>
             <ColumnDefinition Width="*" />
@@ -20,11 +18,27 @@
           <TextBox x:Name="LabelBox" PlaceholderText="Label, e.g. Dailies from Alex" />
           <PasswordBox x:Name="RequestPasswordBox" Grid.Column="1" PlaceholderText="Password (optional)" />
         </Grid>
-        <StackPanel Orientation="Horizontal" Spacing="8">
-          <TextBox x:Name="ExpiresBox" PlaceholderText="Closes after (days)" Width="170" BeforeTextChanging="Digits" />
-          <TextBox x:Name="CapBox" PlaceholderText="Accepts up to (GB)" Width="170" BeforeTextChanging="Decimal" />
-          <Button x:Name="IssueButton" Content="Issue" Click="Issue_Click" Style="{StaticResource AccentButtonStyle}" />
-        </StackPanel>
+        <Grid ColumnSpacing="8">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="*" />
+          </Grid.ColumnDefinitions>
+          <NumberBox x:Name="ExpiresBox" PlaceholderText="Never" Minimum="1"
+              SpinButtonPlacementMode="Inline" Width="190">
+            <NumberBox.Header>
+              <TextBlock Text="Closes after (days)" FontSize="12" Foreground="{ThemeResource VotMutedBrush}" />
+            </NumberBox.Header>
+          </NumberBox>
+          <NumberBox x:Name="CapBox" Grid.Column="1" PlaceholderText="Port default"
+              SpinButtonPlacementMode="Inline" Width="190">
+            <NumberBox.Header>
+              <TextBlock Text="Accepts up to (GB)" FontSize="12" Foreground="{ThemeResource VotMutedBrush}" />
+            </NumberBox.Header>
+          </NumberBox>
+          <Button x:Name="IssueButton" Grid.Column="2" Content="Issue request link" Click="Issue_Click" Style="{StaticResource AccentButtonStyle}"
+              HorizontalAlignment="Stretch" VerticalAlignment="Bottom" />
+        </Grid>
         <StackPanel x:Name="IssuedPanel" Orientation="Horizontal" Spacing="8" Visibility="Collapsed">
           <TextBlock x:Name="IssuedText" Style="{StaticResource Mono}" Foreground="{ThemeResource VotOkBrush}"
               VerticalAlignment="Center" IsTextSelectionEnabled="True" MaxWidth="520" />
@@ -32,8 +46,6 @@
         </StackPanel>
         <TextBlock x:Name="ProblemText" Visibility="Collapsed" TextWrapping="Wrap" />
       </StackPanel>
-
-      <TextBlock Text="REQUESTS" Style="{StaticResource SectionLabel}" Margin="0,8,0,0" />
       <TextBlock x:Name="NoRequests" Text="No open request links." Foreground="{ThemeResource VotMutedBrush}" />
       <ItemsControl x:Name="RequestList">
         <ItemsControl.ItemTemplate>
@@ -57,6 +69,19 @@
       </ItemsControl>
 
       <TextBlock Text="DELIVERIES" Style="{StaticResource SectionLabel}" Margin="0,8,0,0" />
+      <!-- A new delivery: the library browser is its own page. -->
+      <Grid Padding="14" ColumnSpacing="12" Background="{ThemeResource VotPanelBrush}" CornerRadius="8">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*" />
+          <ColumnDefinition Width="Auto" />
+        </Grid.ColumnDefinitions>
+        <StackPanel Spacing="2" VerticalAlignment="Center">
+          <TextBlock Text="Issue a delivery" FontWeight="SemiBold" />
+          <TextBlock Text="Pick files from the library; the recipient gets one link." FontSize="12" Foreground="{ThemeResource VotMutedBrush}" />
+        </StackPanel>
+        <Button x:Name="NewDeliveryButton" Grid.Column="1" Content="New delivery" Click="NewDelivery_Click"
+            Style="{StaticResource AccentButtonStyle}" VerticalAlignment="Center" />
+      </Grid>
       <TextBlock x:Name="NoDeliveries" Text="No deliveries issued yet." Foreground="{ThemeResource VotMutedBrush}" />
       <ItemsControl x:Name="DeliveryList">
         <ItemsControl.ItemTemplate>

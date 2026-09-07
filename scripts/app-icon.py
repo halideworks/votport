@@ -2,10 +2,12 @@
 """Renders the app icons from the web's ship mark.
 
 Source: web/assets/pommern_ship_white.png (the white ship) on the web's
-navy logo square (--logo-square in web/assets/style.css). Writes the macOS
-asset catalog PNGs (the rounded square sits on a transparent 1024 canvas at
-the size Apple's grid gives it), the Windows tile PNGs (full bleed), and
-the .ico used for the tray, the executable, and the window.
+navy logo square (--logo-square in web/assets/style.css). One shape
+everywhere: a square with corners at 22.37% of its side, Apple's icon grid.
+Writes the macOS asset catalog PNGs (the square sits on a transparent 1024
+canvas at the size the grid gives it), the Mark imageset both sidebars draw
+at 24 pt, the Windows tile PNGs (full bleed), and the .ico used for the
+tray, the executable, and the window.
 
 Needs Pillow: python3 -m venv .venv && .venv/bin/pip install pillow.
 """
@@ -15,17 +17,19 @@ from PIL import Image, ImageDraw
 ROOT = Path(__file__).resolve().parent.parent
 SHIP = ROOT / "web/assets/pommern_ship_white.png"
 NAVY = (0x0A, 0x1C, 0x2A, 255)
+RADIUS = 0.2237
 MAC = ROOT / "client/macos/Votport/Assets.xcassets/AppIcon.appiconset"
+MARK = ROOT / "client/macos/Votport/Assets.xcassets/Mark.imageset"
 WIN = ROOT / "client/windows/Votport/Assets"
 
 
-def tile(size, radius_fraction, ship_fraction=0.72):
+def tile(size, ship_fraction=0.72):
     """A navy rounded square of `size` with the ship centred on it."""
     scale = 4
     big = size * scale
     img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
     ImageDraw.Draw(img).rounded_rectangle(
-        (0, 0, big - 1, big - 1), radius=int(big * radius_fraction), fill=NAVY)
+        (0, 0, big - 1, big - 1), radius=int(big * RADIUS), fill=NAVY)
     ship = Image.open(SHIP).convert("RGBA")
     width = int(big * ship_fraction)
     ship = ship.resize((width, int(width * ship.height / ship.width)), Image.LANCZOS)
@@ -37,7 +41,7 @@ def mac_icon(size):
     """Apple's grid: the shape covers 824 of a 1024 canvas, corners at 22.37%."""
     canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     inner = round(size * 824 / 1024)
-    canvas.alpha_composite(tile(inner, 0.2237), ((size - inner) // 2, (size - inner) // 2))
+    canvas.alpha_composite(tile(inner), ((size - inner) // 2, (size - inner) // 2))
     return canvas
 
 
@@ -54,12 +58,19 @@ def main():
         '{\n  "images": [\n' + ",\n".join(
             f'    {{"size": "{i["size"]}", "idiom": "mac", "scale": "{i["scale"]}", "filename": "{i["filename"]}"}}'
             for i in images) + '\n  ],\n  "info": {"version": 1, "author": "xcode"}\n}\n')
-    # Windows tiles are full bleed; the shell rounds nothing, so a soft
-    # corner keeps the square from looking cut out of the taskbar.
+    MARK.mkdir(parents=True, exist_ok=True)
+    tile(24).save(MARK / "mark@1x.png")
+    tile(48).save(MARK / "mark@2x.png")
+    (MARK / "Contents.json").write_text(
+        '{\n  "images": [\n'
+        '    {"idiom": "universal", "scale": "1x", "filename": "mark@1x.png"},\n'
+        '    {"idiom": "universal", "scale": "2x", "filename": "mark@2x.png"}\n'
+        '  ],\n  "info": {"version": 1, "author": "xcode"}\n}\n')
+    # Windows tiles are full bleed; the shell rounds nothing.
     for name, size in (("Square44x44Logo.png", 44), ("Square150x150Logo.png", 150), ("StoreLogo.png", 50)):
-        tile(size, 0.12).save(WIN / name)
-    tile(256, 0.12).save(WIN / "tray.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (256, 256)])
-    tile(512, 0.2237).save(ROOT / "client/design/icon/votport-512.png")
+        tile(size).save(WIN / name)
+    tile(256).save(WIN / "tray.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (256, 256)])
+    tile(512).save(ROOT / "client/design/icon/votport-512.png")
 
 
 if __name__ == "__main__":

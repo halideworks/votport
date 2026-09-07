@@ -1,5 +1,6 @@
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media.Animation;
 
 namespace Votport;
 
@@ -109,7 +110,7 @@ public sealed partial class MainWindow : Window
     public void Show(string section)
     {
         var target = Nav.MenuItems.OfType<NavigationViewItem>().First(nav => (string)nav.Tag == section);
-        if (ReferenceEquals(Nav.SelectedItem, target)) Pages.Navigate(PageFor(section));
+        if (ReferenceEquals(Nav.SelectedItem, target)) Navigate(PageFor(section));
         else Nav.SelectedItem = target;
     }
 
@@ -148,8 +149,12 @@ public sealed partial class MainWindow : Window
 
     private void ShowIfDifferent(Type page)
     {
-        if (Pages.Content?.GetType() != page) Pages.Navigate(page);
+        if (Pages.Content?.GetType() != page) Navigate(page);
     }
+
+    // No page transition: the frame's entrance animation runs alongside the
+    // pane's selection indicator and the two stutter on a section switch.
+    private void Navigate(Type page) => Pages.Navigate(page, null, new SuppressNavigationTransitionInfo());
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern uint GetDpiForWindow(IntPtr hwnd);
