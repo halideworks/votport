@@ -19,13 +19,14 @@ use serde_json::{json, Value};
 
 use crate::app::App;
 use crate::auth;
-use crate::store::Principal;
+use crate::store::{Principal, ScimGroup};
 
 use sha2::{Digest, Sha256};
 
 type Peer = ConnectInfo<std::net::SocketAddr>;
 
 const USER_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:User";
+const GROUP_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:Group";
 const SPC_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig";
 const RESOURCE_TYPE_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:ResourceType";
 const SCHEMA_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:Schema";
@@ -400,6 +401,79 @@ fn user_schema(app: &App) -> Value {
     })
 }
 
+fn group_resource_type(app: &App) -> Value {
+    json!({
+        "schemas": [RESOURCE_TYPE_SCHEMA],
+        "id": "Group",
+        "name": "Group",
+        "endpoint": "/Groups",
+        "description": "A named set of principals; the name feeds the sign-in role mapping",
+        "schema": GROUP_SCHEMA,
+        "schemaExtensions": [],
+        "meta": {
+            "resourceType": "ResourceType",
+            "location": location(app, "/scim/v2/ResourceTypes/Group"),
+        },
+    })
+}
+
+fn group_schema(app: &App) -> Value {
+    json!({
+        "schemas": [SCHEMA_SCHEMA],
+        "id": GROUP_SCHEMA,
+        "name": "Group",
+        "description": "Group",
+        "attributes": [
+            {
+                "name": "displayName",
+                "type": "string",
+                "multiValued": false,
+                "description": "The group name; matched against the admin, auditor, and tenant admin group settings at sign-in",
+                "required": true,
+                "caseExact": true,
+                "mutability": "readWrite",
+                "returned": "default",
+                "uniqueness": "server",
+            },
+            {
+                "name": "externalId",
+                "type": "string",
+                "multiValued": false,
+                "description": "The provisioning system's identifier for the group",
+                "required": false,
+                "caseExact": true,
+                "mutability": "readWrite",
+                "returned": "default",
+                "uniqueness": "none",
+            },
+            {
+                "name": "members",
+                "type": "complex",
+                "multiValued": true,
+                "description": "Member users, by id",
+                "required": false,
+                "mutability": "readWrite",
+                "returned": "default",
+                "subAttributes": [{
+                    "name": "value",
+                    "type": "string",
+                    "multiValued": false,
+                    "description": "The member user's id",
+                    "required": true,
+                    "caseExact": true,
+                    "mutability": "immutable",
+                    "returned": "default",
+                    "uniqueness": "none",
+                }],
+            },
+        ],
+        "meta": {
+            "resourceType": "Schema",
+            "location": location(app, &format!("/scim/v2/Schemas/{GROUP_SCHEMA}")),
+        },
+    })
+}
+
 fn list_response(resources: Vec<Value>) -> Value {
     json!({
         "schemas": [LIST_SCHEMA],
@@ -418,7 +492,7 @@ pub async fn resource_types(
     authorize(&app, &headers, &client_ip(&app, &headers, &peer))?;
     Ok(scim_json(
         StatusCode::OK,
-        list_response(vec![user_resource_type(&app)]),
+        list_response(vec![user_resource_type(&app), group_resource_type(&app)]),
     ))
 }
 
@@ -430,10 +504,11 @@ pub async fn resource_type(
 ) -> ScimResult<Response> {
     let ip = client_ip(&app, &headers, &peer);
     authorize(&app, &headers, &ip)?;
-    if id != "User" {
-        return Err(ScimError::not_found("resource type"));
+    match id.as_str() {
+        "User" => Ok(scim_json(StatusCode::OK, user_resource_type(&app))),
+        "Group" => Ok(scim_json(StatusCode::OK, group_resource_type(&app))),
+        _ => Err(ScimError::not_found("resource type")),
     }
-    Ok(scim_json(StatusCode::OK, user_resource_type(&app)))
 }
 
 pub async fn schemas(
@@ -444,7 +519,7 @@ pub async fn schemas(
     authorize(&app, &headers, &client_ip(&app, &headers, &peer))?;
     Ok(scim_json(
         StatusCode::OK,
-        list_response(vec![user_schema(&app)]),
+        list_response(vec![user_schema(&app), group_schema(&app)]),
     ))
 }
 
@@ -456,10 +531,11 @@ pub async fn schema(
 ) -> ScimResult<Response> {
     let ip = client_ip(&app, &headers, &peer);
     authorize(&app, &headers, &ip)?;
-    if id != USER_SCHEMA {
-        return Err(ScimError::not_found("schema"));
+    match id.as_str() {
+        USER_SCHEMA => Ok(scim_json(StatusCode::OK, user_schema(&app))),
+        GROUP_SCHEMA => Ok(scim_json(StatusCode::OK, group_schema(&app))),
+        _ => Err(ScimError::not_found("schema")),
     }
-    Ok(scim_json(StatusCode::OK, user_schema(&app)))
 }
 
 #[derive(Deserialize)]
@@ -695,6 +771,380 @@ pub async fn delete_user(
         return Err(ScimError::not_found("user"));
     }
     set_active(&app, &id, false, &ip)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+// ----------------------------------------------------------------- Groups
+
+fn group_resource(app: &App, group: &ScimGroup) -> Value {
+    let members: Vec<_> = group
+        .members
+        .iter()
+        .map(|subject| {
+            json!({
+                "value": subject,
+                "$ref": location(app, &format!("/scim/v2/Users/{}", encode_segment(subject))),
+            })
+        })
+        .collect();
+    let mut resource = json!({
+        "schemas": [GROUP_SCHEMA],
+        "id": group.id,
+        "displayName": group.display_name,
+        "members": members,
+        "meta": {
+            "resourceType": "Group",
+            "location": location(app, &format!("/scim/v2/Groups/{}", group.id)),
+            "created": crate::receipt::rfc3339(group.created_at),
+        },
+    });
+    if let Some(external_id) = &group.external_id {
+        resource["externalId"] = json!(external_id);
+    }
+    resource
+}
+
+fn admit_display_name(value: Option<&Value>) -> ScimResult<String> {
+    let name = value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| ScimError::invalid_value("displayName is required"))?;
+    if name.len() > MAX_SUBJECT_BYTES || name.chars().any(char::is_control) {
+        return Err(ScimError::invalid_value("displayName is not acceptable"));
+    }
+    Ok(name.to_owned())
+}
+
+/// Member entries are `{"value": "<user id>"}`; the id is the subject.
+fn admit_members(value: Option<&Value>) -> ScimResult<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| ScimError::invalid_value("members must be a list"))?;
+    let mut members = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let subject = entry
+            .get("value")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|subject| !subject.is_empty())
+            .ok_or_else(|| ScimError::invalid_value("each member needs a value"))?;
+        if subject.len() > MAX_SUBJECT_BYTES || subject.chars().any(char::is_control) {
+            return Err(ScimError::invalid_value("member value is not acceptable"));
+        }
+        members.push(subject.to_owned());
+    }
+    Ok(members)
+}
+
+fn load_group(app: &App, id: &str) -> ScimResult<ScimGroup> {
+    app.store
+        .scim_group(id)
+        .map_err(ScimError::store)?
+        .ok_or_else(|| ScimError::not_found("group"))
+}
+
+fn audit_group(app: &App, event: &str, group: &ScimGroup, ip: &str) {
+    tracing::info!(target: "audit", event, group = %group.display_name, %ip, "scim group changed");
+    app.store.audit(
+        "",
+        "scim",
+        event,
+        &group.display_name,
+        &json!({ "via": "scim", "ip": ip, "id": group.id, "members": group.members.len() }),
+    );
+}
+
+fn name_taken(error: String) -> ScimError {
+    if error == crate::store::SCIM_GROUP_NAME_TAKEN {
+        ScimError::typed(
+            StatusCode::CONFLICT,
+            "uniqueness",
+            "displayName already exists",
+        )
+    } else {
+        ScimError::store(error)
+    }
+}
+
+/// The filter provisioning clients send for groups: `displayName eq "x"`.
+fn filter_group_name(filter: &str) -> ScimResult<String> {
+    let filter = filter.trim();
+    filter
+        .get(..11)
+        .filter(|head| head.eq_ignore_ascii_case("displayName"))
+        .and_then(|_| filter.get(11..))
+        .map(str::trim_start)
+        .and_then(|rest| rest.strip_prefix("eq").or_else(|| rest.strip_prefix("EQ")))
+        .map(str::trim)
+        .and_then(|rest| rest.strip_prefix('"'))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .filter(|value| !value.contains('"'))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            ScimError::typed(
+                StatusCode::BAD_REQUEST,
+                "invalidFilter",
+                "only the filter displayName eq \"value\" is supported",
+            )
+        })
+}
+
+pub async fn list_groups(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    peer: Peer,
+    Query(query): Query<ListQuery>,
+) -> ScimResult<Response> {
+    authorize(&app, &headers, &client_ip(&app, &headers, &peer))?;
+    let start_index = query.start_index.unwrap_or(1).max(1);
+    let count = query.count.unwrap_or(MAX_PAGE).min(MAX_PAGE);
+    let (rows, total) = match query.filter.as_deref() {
+        Some(filter) => {
+            let name = filter_group_name(filter)?;
+            let rows: Vec<_> = app
+                .store
+                .scim_group_by_name(&name)
+                .map_err(ScimError::store)?
+                .into_iter()
+                .collect();
+            let total = rows.len() as u64;
+            (rows, total)
+        }
+        None => app
+            .store
+            .scim_groups_page(count, start_index - 1)
+            .map_err(ScimError::store)?,
+    };
+    let resources: Vec<_> = rows.iter().map(|row| group_resource(&app, row)).collect();
+    Ok(scim_json(
+        StatusCode::OK,
+        json!({
+            "schemas": [LIST_SCHEMA],
+            "totalResults": total,
+            "startIndex": start_index,
+            "itemsPerPage": resources.len(),
+            "Resources": resources,
+        }),
+    ))
+}
+
+pub async fn create_group(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    peer: Peer,
+    Json(body): Json<Value>,
+) -> ScimResult<Response> {
+    let ip = client_ip(&app, &headers, &peer);
+    authorize(&app, &headers, &ip)?;
+    let display_name = admit_display_name(body.get("displayName"))?;
+    let external_id = admit_external_id(body.get("externalId"))?;
+    let members = admit_members(body.get("members"))?;
+    let group = app
+        .store
+        .create_scim_group(&display_name, external_id.as_deref(), &members)
+        .map_err(ScimError::store)?
+        .ok_or_else(|| {
+            ScimError::typed(
+                StatusCode::CONFLICT,
+                "uniqueness",
+                "displayName already exists",
+            )
+        })?;
+    audit_group(&app, "scim_group_created", &group, &ip);
+    Ok(scim_json(StatusCode::CREATED, group_resource(&app, &group)))
+}
+
+pub async fn get_group(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    peer: Peer,
+    Path(id): Path<String>,
+) -> ScimResult<Response> {
+    let ip = client_ip(&app, &headers, &peer);
+    authorize(&app, &headers, &ip)?;
+    Ok(scim_json(
+        StatusCode::OK,
+        group_resource(&app, &load_group(&app, &id)?),
+    ))
+}
+
+/// PUT replaces the name and the whole member list.
+pub async fn replace_group(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    peer: Peer,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> ScimResult<Response> {
+    let ip = client_ip(&app, &headers, &peer);
+    authorize(&app, &headers, &ip)?;
+    load_group(&app, &id)?;
+    let display_name = admit_display_name(body.get("displayName"))?;
+    let members = admit_members(body.get("members"))?;
+    if !app
+        .store
+        .replace_scim_group(&id, Some(&display_name), Some(&members))
+        .map_err(name_taken)?
+    {
+        return Err(ScimError::not_found("group"));
+    }
+    let group = load_group(&app, &id)?;
+    audit_group(&app, "scim_group_replaced", &group, &ip);
+    Ok(scim_json(StatusCode::OK, group_resource(&app, &group)))
+}
+
+/// One PatchOp operation on a group, reduced to what the store applies.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct GroupPatch {
+    display_name: Option<String>,
+    add: Vec<String>,
+    remove: Vec<String>,
+    replace_members: Option<Vec<String>>,
+}
+
+/// Okta and Entra shapes: `replace` with a value object holding displayName
+/// or members; `add`/`replace` with path "members" and a member list;
+/// `remove` with path `members[value eq "id"]` or path "members" plus a
+/// member list.
+fn patch_group_operation(patch: &mut GroupPatch, operation: &Value) -> ScimResult<()> {
+    let op = operation
+        .get("op")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let path = operation.get("path").and_then(Value::as_str).map(str::trim);
+    let value = operation.get("value");
+    match (op.as_str(), path) {
+        ("replace" | "add", None) => {
+            if !value.is_some_and(Value::is_object) {
+                return Err(ScimError::typed(
+                    StatusCode::BAD_REQUEST,
+                    "invalidValue",
+                    "a pathless operation needs a value object",
+                ));
+            }
+            if let Some(name) = value.and_then(|value| value.get("displayName")) {
+                patch.display_name = Some(admit_display_name(Some(name))?);
+            }
+            if let Some(members) = value.and_then(|value| value.get("members")) {
+                let members = admit_members(Some(members))?;
+                if op == "replace" {
+                    patch.replace_members = Some(members);
+                } else {
+                    patch.add.extend(members);
+                }
+            }
+            Ok(())
+        }
+        ("replace" | "add", Some(path)) if path.eq_ignore_ascii_case("displayName") => {
+            patch.display_name = Some(admit_display_name(value)?);
+            Ok(())
+        }
+        ("replace", Some(path)) if path.eq_ignore_ascii_case("members") => {
+            patch.replace_members = Some(admit_members(value)?);
+            Ok(())
+        }
+        ("add", Some(path)) if path.eq_ignore_ascii_case("members") => {
+            patch.add.extend(admit_members(value)?);
+            Ok(())
+        }
+        ("remove", Some(path)) if path.eq_ignore_ascii_case("members") => {
+            // No value removes every member (RFC 7644 3.5.2.2); a list
+            // removes those members.
+            match value {
+                None => patch.replace_members = Some(Vec::new()),
+                Some(_) => patch.remove.extend(admit_members(value)?),
+            }
+            Ok(())
+        }
+        ("remove", Some(path)) => {
+            let subject = path
+                .strip_prefix("members[")
+                .and_then(|rest| rest.strip_suffix(']'))
+                .map(str::trim)
+                .and_then(|rest| rest.strip_prefix("value"))
+                .map(str::trim_start)
+                .and_then(|rest| rest.strip_prefix("eq"))
+                .map(str::trim)
+                .and_then(|rest| rest.strip_prefix('"'))
+                .and_then(|rest| rest.strip_suffix('"'))
+                .filter(|subject| !subject.is_empty() && !subject.contains('"'))
+                .ok_or_else(|| {
+                    ScimError::typed(
+                        StatusCode::BAD_REQUEST,
+                        "invalidPath",
+                        "remove supports members or members[value eq \"id\"]",
+                    )
+                })?;
+            patch.remove.push(subject.to_owned());
+            Ok(())
+        }
+        _ => Err(ScimError::typed(
+            StatusCode::BAD_REQUEST,
+            "invalidSyntax",
+            "unsupported operation",
+        )),
+    }
+}
+
+pub async fn patch_group(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    peer: Peer,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> ScimResult<Response> {
+    let ip = client_ip(&app, &headers, &peer);
+    authorize(&app, &headers, &ip)?;
+    load_group(&app, &id)?;
+    let operations = body
+        .get("Operations")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ScimError::typed(
+                StatusCode::BAD_REQUEST,
+                "invalidSyntax",
+                "Operations is required",
+            )
+        })?;
+    let mut patch = GroupPatch::default();
+    for operation in operations {
+        patch_group_operation(&mut patch, operation)?;
+    }
+    if patch.display_name.is_some() || patch.replace_members.is_some() {
+        app.store
+            .replace_scim_group(
+                &id,
+                patch.display_name.as_deref(),
+                patch.replace_members.as_deref(),
+            )
+            .map_err(name_taken)?;
+    }
+    if !(patch.add.is_empty() && patch.remove.is_empty()) {
+        app.store
+            .change_scim_group_members(&id, &patch.add, &patch.remove)
+            .map_err(ScimError::store)?;
+    }
+    let group = load_group(&app, &id)?;
+    audit_group(&app, "scim_group_patched", &group, &ip);
+    Ok(scim_json(StatusCode::OK, group_resource(&app, &group)))
+}
+
+pub async fn delete_group(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    peer: Peer,
+    Path(id): Path<String>,
+) -> ScimResult<Response> {
+    let ip = client_ip(&app, &headers, &peer);
+    authorize(&app, &headers, &ip)?;
+    let group = load_group(&app, &id)?;
+    app.store.delete_scim_group(&id).map_err(ScimError::store)?;
+    audit_group(&app, "scim_group_deleted", &group, &ip);
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -1198,8 +1648,9 @@ mod tests {
         }
         let (status, json) = scim(&application, "GET", "/scim/v2/Schemas", None).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["totalResults"], 1);
         assert_eq!(json["Resources"][0]["id"], USER_SCHEMA);
+        assert_eq!(json["totalResults"], 2);
+        assert_eq!(json["Resources"][1]["id"], GROUP_SCHEMA);
         let names: Vec<_> = json["Resources"][0]["attributes"]
             .as_array()
             .unwrap()
@@ -1214,7 +1665,10 @@ mod tests {
             json["meta"]["location"],
             "https://drop.example.com/scim/v2/ResourceTypes/User"
         );
-        let (status, _) = scim(&application, "GET", "/scim/v2/ResourceTypes/Group", None).await;
+        let (status, json) = scim(&application, "GET", "/scim/v2/ResourceTypes/Group", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["endpoint"], "/Groups");
+        let (status, _) = scim(&application, "GET", "/scim/v2/ResourceTypes/Nope", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = scim(&application, "GET", "/scim/v2/Schemas/nope", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -1528,6 +1982,308 @@ mod tests {
             !bearer_matches("", ""),
             "an empty stored token matches nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn groups_are_created_listed_patched_and_feed_sign_in_groups() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = build(directory.path());
+        let body = Some((
+            "application/scim+json",
+            r#"{"displayName":"g","Operations":[]}"#,
+        ));
+        // One client per case: the sixth failure from one address is a 429.
+        for (index, (method, uri, body)) in [
+            ("GET", "/scim/v2/Groups", None),
+            ("POST", "/scim/v2/Groups", body),
+            ("GET", "/scim/v2/Groups/x", None),
+            ("PUT", "/scim/v2/Groups/x", body),
+            ("PATCH", "/scim/v2/Groups/x", body),
+            ("DELETE", "/scim/v2/Groups/x", None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (status, _, _) = call_from(
+                &application,
+                [10, 2, 0, index as u8],
+                method,
+                uri,
+                None,
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
+        assert!(application
+            .store
+            .scim_groups_page(10, 0)
+            .unwrap()
+            .0
+            .is_empty());
+
+        let (status, json) = scim(
+            &application,
+            "POST",
+            "/scim/v2/Groups",
+            Some(r#"{"schemas":["urn:ietf:params:scim:schemas:core:2.0:Group"],"displayName":"votport-admins","externalId":"00g1","members":[{"value":"a@example.com"},{"value":"b@example.com","display":"B"}]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        let id = json["id"].as_str().unwrap().to_owned();
+        assert_eq!(json["displayName"], "votport-admins");
+        assert_eq!(json["externalId"], "00g1");
+        assert_eq!(json["members"].as_array().unwrap().len(), 2);
+        assert_eq!(json["members"][0]["value"], "a@example.com");
+        assert_eq!(
+            json["members"][0]["$ref"],
+            "https://drop.example.com/scim/v2/Users/a%40example.com"
+        );
+        assert_eq!(
+            json["meta"]["location"],
+            format!("https://drop.example.com/scim/v2/Groups/{id}")
+        );
+        assert_eq!(
+            application.store.scim_groups_of("a@example.com").unwrap(),
+            ["votport-admins"]
+        );
+
+        let (status, json) = scim(
+            &application,
+            "POST",
+            "/scim/v2/Groups",
+            Some(r#"{"displayName":"votport-admins"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(json["scimType"], "uniqueness");
+        for body in [
+            r#"{}"#,
+            r#"{"displayName":"x","members":"no"}"#,
+            r#"{"displayName":"x","members":[{"display":"only"}]}"#,
+        ] {
+            let (status, json) = scim(&application, "POST", "/scim/v2/Groups", Some(body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["scimType"], "invalidValue", "{body}");
+        }
+
+        let (status, json) = scim(
+            &application,
+            "GET",
+            "/scim/v2/Groups?filter=displayName%20eq%20%22votport-admins%22",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["totalResults"], 1);
+        assert_eq!(json["Resources"][0]["id"], id);
+        let (status, json) = scim(
+            &application,
+            "GET",
+            "/scim/v2/Groups?filter=id%20eq%20%22x%22",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["scimType"], "invalidFilter");
+        let (status, json) = scim(
+            &application,
+            "GET",
+            "/scim/v2/Groups?startIndex=1&count=10",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["totalResults"], 1);
+
+        // Okta: add members by path; remove one by filter path.
+        let (status, json) = scim(
+            &application,
+            "PATCH",
+            &format!("/scim/v2/Groups/{id}"),
+            Some(r#"{"schemas":["urn:ietf:params:scim:api:messages:2.0:PatchOp"],"Operations":[{"op":"add","path":"members","value":[{"value":"c@example.com"}]},{"op":"remove","path":"members[value eq \"a@example.com\"]"}]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let members: Vec<_> = json["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| member["value"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(members, ["b@example.com", "c@example.com"]);
+
+        // Entra: pathless replace with a value object; remove with a list.
+        let (status, json) = scim(
+            &application,
+            "PATCH",
+            &format!("/scim/v2/Groups/{id}"),
+            Some(r#"{"Operations":[{"op":"Replace","value":{"displayName":"admins"}},{"op":"Remove","path":"members","value":[{"value":"b@example.com"}]}]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["displayName"], "admins");
+        assert_eq!(json["members"].as_array().unwrap().len(), 1);
+        assert_eq!(json["members"][0]["value"], "c@example.com");
+
+        // Replace the member list wholesale, then an unsupported op.
+        let (status, json) = scim(
+            &application,
+            "PATCH",
+            &format!("/scim/v2/Groups/{id}"),
+            Some(r#"{"Operations":[{"op":"replace","path":"members","value":[{"value":"d@example.com"}]}]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["members"][0]["value"], "d@example.com");
+        assert_eq!(json["members"].as_array().unwrap().len(), 1);
+        for body in [
+            r#"{"Operations":[{"op":"remove","path":"displayName"}]}"#,
+            r#"{"Operations":[{"op":"move","path":"members"}]}"#,
+            r#"{"nope":1}"#,
+        ] {
+            let (status, json) = scim(
+                &application,
+                "PATCH",
+                &format!("/scim/v2/Groups/{id}"),
+                Some(body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(json["scimType"].is_string(), "{body} {json}");
+        }
+
+        // PUT replaces everything; a rename onto another group conflicts.
+        scim(
+            &application,
+            "POST",
+            "/scim/v2/Groups",
+            Some(r#"{"displayName":"other"}"#),
+        )
+        .await;
+        let (status, json) = scim(
+            &application,
+            "PUT",
+            &format!("/scim/v2/Groups/{id}"),
+            Some(r#"{"displayName":"other","members":[]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        let (status, json) = scim(
+            &application,
+            "PUT",
+            &format!("/scim/v2/Groups/{id}"),
+            Some(r#"{"displayName":"renamed","members":[{"value":"e@example.com"}]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["displayName"], "renamed");
+        assert_eq!(
+            application.store.scim_groups_of("e@example.com").unwrap(),
+            ["renamed"]
+        );
+        assert!(application
+            .store
+            .scim_groups_of("d@example.com")
+            .unwrap()
+            .is_empty());
+
+        let (status, _) = scim(
+            &application,
+            "DELETE",
+            &format!("/scim/v2/Groups/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = scim(
+            &application,
+            "DELETE",
+            &format!("/scim/v2/Groups/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = scim(&application, "GET", &format!("/scim/v2/Groups/{id}"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(application
+            .store
+            .scim_groups_of("e@example.com")
+            .unwrap()
+            .is_empty());
+
+        let events: Vec<_> = application
+            .store
+            .audit_export("", 0, 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.event.starts_with("scim_group_"))
+            .map(|row| row.event)
+            .collect();
+        assert_eq!(
+            events.first().map(String::as_str),
+            Some("scim_group_created")
+        );
+        assert_eq!(
+            events.last().map(String::as_str),
+            Some("scim_group_deleted")
+        );
+        assert!(events.iter().any(|event| event == "scim_group_patched"));
+        assert!(events.iter().any(|event| event == "scim_group_replaced"));
+    }
+
+    #[test]
+    fn group_patch_operations_reduce_to_store_changes() {
+        let mut patch = GroupPatch::default();
+        patch_group_operation(
+            &mut patch,
+            &json!({"op":"add","path":"members","value":[{"value":"a"}]}),
+        )
+        .unwrap();
+        patch_group_operation(
+            &mut patch,
+            &json!({"op":"remove","path":"members[value eq \"b\"]"}),
+        )
+        .unwrap();
+        patch_group_operation(
+            &mut patch,
+            &json!({"op":"replace","path":"displayName","value":"n"}),
+        )
+        .unwrap();
+        assert_eq!(
+            patch,
+            GroupPatch {
+                display_name: Some("n".to_owned()),
+                add: vec!["a".to_owned()],
+                remove: vec!["b".to_owned()],
+                replace_members: None,
+            }
+        );
+        let mut patch = GroupPatch::default();
+        patch_group_operation(&mut patch, &json!({"op":"remove","path":"members"})).unwrap();
+        assert_eq!(
+            patch.replace_members,
+            Some(Vec::new()),
+            "remove-all clears the list"
+        );
+        let mut patch = GroupPatch::default();
+        patch_group_operation(
+            &mut patch,
+            &json!({"op":"replace","value":{"members":[{"value":"z"}],"displayName":"m"}}),
+        )
+        .unwrap();
+        assert_eq!(patch.replace_members, Some(vec!["z".to_owned()]));
+        assert_eq!(patch.display_name.as_deref(), Some("m"));
+        for bad in [
+            json!({"op":"remove","path":"members[value co \"b\"]"}),
+            json!({"op":"remove","path":"members[value eq b]"}),
+            json!({"op":"add","path":"members","value":[{"value":""}]}),
+            json!({"op":"replace","path":"displayName","value":""}),
+            json!({"op":"add"}),
+        ] {
+            let mut patch = GroupPatch::default();
+            assert!(patch_group_operation(&mut patch, &bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

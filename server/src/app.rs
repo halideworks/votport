@@ -2189,6 +2189,17 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/scim/v2/Schemas", get(api::scim::schemas))
         .route("/scim/v2/Schemas/{id}", get(api::scim::schema))
         .route(
+            "/scim/v2/Groups",
+            get(api::scim::list_groups).post(api::scim::create_group),
+        )
+        .route(
+            "/scim/v2/Groups/{id}",
+            get(api::scim::get_group)
+                .put(api::scim::replace_group)
+                .patch(api::scim::patch_group)
+                .delete(api::scim::delete_group),
+        )
+        .route(
             "/scim/v2/Users",
             get(api::scim::list_users).post(api::scim::create_user),
         )
