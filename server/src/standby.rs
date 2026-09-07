@@ -45,6 +45,10 @@ pub fn config_from_env() -> Result<Config, String> {
 /// must be https unless it is loopback.
 fn admit_source(source: &str) -> Result<String, String> {
     let source = source.trim().trim_end_matches('/');
+    // Userinfo would let a loopback-looking authority resolve elsewhere.
+    if source.contains('@') {
+        return Err("VOTPORT_STANDBY_SOURCE must not carry credentials".to_owned());
+    }
     if source.starts_with("https://") {
         return Ok(source.to_owned());
     }
@@ -334,6 +338,7 @@ async fn standby_readyz(State(state): State<StatusState>) -> Response {
             "healthy": healthy(&status, state.interval, now),
             "last_success_at": status.last_success_at,
             "last_error": status.last_error,
+            "archive_created_at": status.archive_created_at,
             "replica_lag_secs": status.archive_created_at.map(|at| now.saturating_sub(at)),
             "schema_version": status.schema_version,
         })),
@@ -419,6 +424,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["standby"], true);
         assert_eq!(json["healthy"], true);
+        assert_eq!(json["archive_created_at"], now - 45);
         assert!(json["replica_lag_secs"].as_u64().unwrap() >= 45);
 
         status.lock().unwrap().last_success_at = Some(now - 121);
@@ -465,6 +471,8 @@ mod tests {
             "http://live.internal:8080",
             "http://10.0.0.5",
             "live.example",
+            "http://127.0.0.1:8080@evil.example",
+            "https://user:pass@live.example",
         ] {
             assert!(
                 parse(&[
