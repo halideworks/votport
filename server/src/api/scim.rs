@@ -131,12 +131,13 @@ fn client_ip(app: &App, headers: &HeaderMap, peer: &Peer) -> String {
     super::client_ip(headers, &peer.0, &app.config.trusted_proxies)
 }
 
-/// Every SCIM route is refused unless a token is set and the bearer matches
-/// the current or the previous one. Failures count against the client's
-/// throttle bucket the way admin password failures do; a match resets it.
+/// Every SCIM route is refused unless a current token is set and the bearer
+/// matches it or the previous one. Only failures count against the client's
+/// throttle bucket (a bearer is checked, not verified, so a correct
+/// concurrent burst must never trip it); a match clears the bucket.
 fn authorize(app: &App, headers: &HeaderMap, ip: &str) -> ScimResult<()> {
     let bucket = super::throttle_key(ip);
-    if !app.scim_throttle.claim(&bucket) {
+    if app.scim_throttle.locked(&bucket) {
         tracing::warn!(target: "audit", event = "scim_throttled", %ip, "scim bearer attempts throttled");
         return Err(ScimError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -151,22 +152,30 @@ fn authorize(app: &App, headers: &HeaderMap, ip: &str) -> ScimResult<()> {
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
+    let refused = |what: &str| {
+        // Counted only now, so a wrong or missing bearer is a failure and a
+        // right one never is, however many are in flight.
+        app.scim_throttle.claim(&bucket);
+        tracing::warn!(target: "audit", event = "scim_unauthorized", %ip, "scim bearer {what}");
+        ScimError::new(StatusCode::UNAUTHORIZED, "invalid bearer")
+    };
     let Some(presented) = presented else {
-        tracing::warn!(target: "audit", event = "scim_unauthorized", %ip, "scim bearer missing");
-        return Err(ScimError::new(StatusCode::UNAUTHORIZED, "invalid bearer"));
+        return Err(refused("missing"));
     };
     let current = settings
         .scim_token
         .as_deref()
         .is_some_and(|stored| bearer_matches(stored, presented));
+    // The previous slot only bridges a rotation: with no current token the
+    // endpoint is off, whatever the slot still holds.
     let previous = !current
+        && settings.scim_token.is_some()
         && settings
             .scim_token_previous
             .as_deref()
             .is_some_and(|stored| bearer_matches(stored, presented));
     if !(current || previous) {
-        tracing::warn!(target: "audit", event = "scim_unauthorized", %ip, "scim bearer refused");
-        return Err(ScimError::new(StatusCode::UNAUTHORIZED, "invalid bearer"));
+        return Err(refused("refused"));
     }
     app.scim_throttle.succeeded(&bucket);
     if previous {
@@ -1393,6 +1402,71 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "the hash is not a bearer");
+
+        // Clearing the current token turns the endpoint off even while the
+        // previous slot still holds a digest.
+        application
+            .store
+            .put_settings(
+                "test",
+                &[
+                    ("scim_token".to_owned(), SettingWrite::Set(String::new())),
+                    (
+                        "scim_token_previous".to_owned(),
+                        SettingWrite::Set(hash_bearer("new-token")),
+                    ),
+                ],
+            )
+            .unwrap();
+        let (status, _, _) = call(
+            &application,
+            "GET",
+            "/scim/v2/Users",
+            Some("new-token"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "no current token, no access"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_burst_of_correct_bearers_is_never_throttled() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = build(directory.path());
+        let mut tasks = Vec::new();
+        for _ in 0..24 {
+            let application = Arc::clone(&application);
+            tasks.push(tokio::spawn(async move {
+                call_from(
+                    &application,
+                    [10, 0, 0, 9],
+                    "GET",
+                    "/scim/v2/Users",
+                    Some(TOKEN),
+                    None,
+                )
+                .await
+                .0
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), StatusCode::OK);
+        }
+        // A wrong bearer afterwards is the first failure, not the sixth.
+        let (status, _, _) = call_from(
+            &application,
+            [10, 0, 0, 9],
+            "GET",
+            "/scim/v2/Users",
+            Some("wrong"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
