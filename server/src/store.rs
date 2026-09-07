@@ -2465,11 +2465,25 @@ impl Store {
     }
 
     pub fn scim_group_by_name(&self, display_name: &str) -> Result<Option<ScimGroup>, String> {
+        self.scim_group_by_column("display_name", display_name)
+    }
+
+    /// First group carrying the provider's id, by name when two share it.
+    pub fn scim_group_by_external_id(
+        &self,
+        external_id: &str,
+    ) -> Result<Option<ScimGroup>, String> {
+        self.scim_group_by_column("external_id", external_id)
+    }
+
+    fn scim_group_by_column(&self, column: &str, value: &str) -> Result<Option<ScimGroup>, String> {
         let id = self.with(|connection| {
             connection
                 .query_row(
-                    "SELECT id FROM scim_groups WHERE display_name = ?1",
-                    [display_name],
+                    &format!(
+                        "SELECT id FROM scim_groups WHERE {column} = ?1 ORDER BY display_name LIMIT 1"
+                    ),
+                    [value],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()
@@ -6830,6 +6844,11 @@ mod tenant_tests {
             store.scim_group_by_name("viewers").unwrap().unwrap().id,
             viewers.id
         );
+        assert_eq!(
+            store.scim_group_by_external_id("g1").unwrap().unwrap().id,
+            admins.id
+        );
+        assert!(store.scim_group_by_external_id("g9").unwrap().is_none());
 
         assert!(store
             .change_scim_group_members(
