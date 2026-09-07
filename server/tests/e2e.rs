@@ -5685,27 +5685,39 @@ async fn a_library_grant_is_fetched_over_vot_quic_and_counted_once() {
         "the twin's fetch was not counted to the twin"
     );
     // The twin has no download cap, so nothing in the store would stop a
-    // second final-cursor report from a rail; wait for quiescence and then
-    // read the process-wide counter, which only these two fetches moved.
-    let mut quiet = false;
-    for _ in 0..100 {
-        let metrics = recipient
+    // second final-cursor report from a rail. The gauge drops before the
+    // counter moves (the hold is released ahead of the delivery record), so
+    // poll for both, then read once more after a settle: a third delivery
+    // makes the 2 line never appear or disappear again.
+    let read_metrics = || async {
+        recipient
             .get(format!("{}/metrics", server.base))
             .send()
             .await
             .unwrap()
             .text()
             .await
-            .unwrap();
-        if metrics.contains("votport_serve_sessions_active 0\n") {
-            assert!(
-                metrics.contains("votport_serve_deliveries_total 2\n"),
-                "two fetches must count exactly two deliveries: {metrics}"
-            );
+            .unwrap()
+    };
+    let mut quiet = false;
+    for _ in 0..100 {
+        let metrics = read_metrics().await;
+        if metrics.contains("votport_serve_sessions_active 0\n")
+            && metrics.contains("votport_serve_deliveries_total 2\n")
+        {
             quiet = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    assert!(quiet, "serve sessions never went idle after the twin fetch");
+    assert!(
+        quiet,
+        "two fetches must count exactly two deliveries once sessions are idle"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let metrics = read_metrics().await;
+    assert!(
+        metrics.contains("votport_serve_deliveries_total 2\n"),
+        "the counter moved past two: {metrics}"
+    );
 }
