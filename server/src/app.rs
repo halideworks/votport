@@ -133,19 +133,6 @@ pub struct App {
     pub lease_lost: AtomicBool,
 }
 
-impl Drop for App {
-    /// The last reference goes away only when no task, listener, or blocking
-    /// job can still write, so the lease may be yielded here: a clean exit
-    /// that gets this far lets the standby start without waiting for the
-    /// lease to go stale. A crash never runs it and the clock covers that.
-    fn drop(&mut self) {
-        crate::lease::release(
-            &crate::lease::path(&self.config.receive_dir),
-            &self.lease_holder,
-        );
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PushRefusalReason {
     Rate,
@@ -768,11 +755,23 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     // the lock so two instances over one data directory get the lock's
     // message, which names the nearer problem.
     let lease_holder = crate::lease::new_holder();
-    let lease = crate::lease::acquire(
-        &crate::lease::path(&config.receive_dir),
-        &lease_holder,
-        now_unix(),
-    )?;
+    let lease_path = crate::lease::path(&config.receive_dir);
+    let lease = crate::lease::acquire(&lease_path, &lease_holder, now_unix())?;
+    // Everything from here writes under the lease; a failure must give it
+    // back or the next boot spends 90 s blaming a process that is gone.
+    let built = build_under_lease(config, data_lock, lease_holder.clone(), lease);
+    if built.is_err() {
+        crate::lease::release(&lease_path, &lease_holder);
+    }
+    built
+}
+
+fn build_under_lease(
+    config: Config,
+    data_lock: std::fs::File,
+    lease_holder: String,
+    lease: crate::lease::Lease,
+) -> Result<Arc<App>, String> {
     crate::backup::apply_pending_restore(&config.data_dir, crate::store::SCHEMA_VERSION)?;
     crate::paths::clean_staging(&config.outbound_dir, &HashSet::new());
     let store = Arc::new(Store::open(&config.data_dir)?);
@@ -1037,11 +1036,11 @@ fn lock_data_dir(data_dir: &std::path::Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
-/// Releases the data directory lock and the receive-root lease without
-/// exiting. Production never calls this: push and serve listener threads and
-/// blocking store work can outlive suspend_sessions, so both fences have to
-/// hold until the process is gone. The restart e2e tests boot a second App
-/// in the same process and need it.
+/// Releases the data directory lock and the receive-root lease. main calls
+/// it as the last step of a clean shutdown, right before the process exits,
+/// so a standby (or the same host's next container) starts without waiting
+/// for the lease to go stale; the restart e2e tests, which boot a second
+/// App in the same process, call it too. Nothing may write after it.
 pub fn release_data_lock(app: &App) {
     #[cfg(unix)]
     let _ = rustix::fs::flock(&app._data_lock, rustix::fs::FlockOperation::Unlock);
@@ -1051,9 +1050,9 @@ pub fn release_data_lock(app: &App) {
     );
 }
 
-/// One heartbeat: renews the lease, or records the loss and asks the process
-/// to stop when another instance holds it. Returns whether the lease is
-/// still ours.
+/// One heartbeat: renews the lease, or records the loss when another
+/// instance holds it. Returns whether the lease is still ours; the keeper
+/// turns a loss into a hard stop.
 pub fn renew_lease(app: &App, now: u64) -> bool {
     if app.lease_lost.load(Ordering::Relaxed) {
         return false;
@@ -1069,7 +1068,6 @@ pub fn renew_lease(app: &App, now: u64) -> bool {
                 "another instance holds the receive-root lease; stopping so it can serve alone"
             );
             app.lease_lost.store(true, Ordering::Relaxed);
-            app.request_shutdown();
             false
         }
         Err(error) => {
@@ -1081,14 +1079,19 @@ pub fn renew_lease(app: &App, now: u64) -> bool {
     }
 }
 
-/// Heartbeats the lease for the life of the process.
+/// Heartbeats the lease for the life of the process. A loss is a hard stop:
+/// the other instance is re-attaching this one's staging, so a graceful
+/// drain that lets in-flight uploads and pre-minted pushes keep writing
+/// would be two writers for as long as the longest transfer. Workers
+/// checkpoint, then the process exits; the standby resumes from there.
 pub async fn lease_keeper(app: Arc<App>) {
     let mut tick = tokio::time::interval(crate::lease::RENEW_EVERY);
     tick.tick().await;
     loop {
         tick.tick().await;
         if !renew_lease(&app, now_unix()) {
-            return;
+            suspend_sessions(&app).await;
+            std::process::exit(1);
         }
     }
 }
@@ -1376,6 +1379,7 @@ mod outbound_stage_tests {
         let app = crate::api::testing::build(directory.path());
         let stage = app.config.outbound_dir.join(".vot-crash.stage");
         std::fs::write(&stage, b"staged").unwrap();
+        release_data_lock(&app);
         drop(app);
 
         let _app = crate::api::testing::build(directory.path());
@@ -2015,6 +2019,7 @@ mod health_tests {
             renewed_at: 1,
         };
         release_data_lock(&first);
+        assert!(!path.exists(), "a clean shutdown yields the lease");
         std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
         let standby = build(config).unwrap();
         assert!(!renew_lease(&first, crate::store::now_unix()));
@@ -2039,6 +2044,22 @@ mod health_tests {
             .contains("votport_lease_held 1\n"));
     }
 
+    #[test]
+    fn a_boot_that_fails_after_taking_the_lease_gives_it_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::api::testing::config(directory.path());
+        // A directory where the database file belongs makes Store::open
+        // fail, which is after the lease is taken.
+        std::fs::create_dir_all(config.data_dir.join("votport.db")).unwrap();
+        assert!(build(config.clone()).is_err());
+        assert!(
+            !crate::lease::path(&config.receive_dir).exists(),
+            "the failed boot must not leave its lease behind"
+        );
+        std::fs::remove_dir_all(config.data_dir.join("votport.db")).unwrap();
+        build(config).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_second_instance_on_the_same_data_directory_refuses_to_boot() {
@@ -2049,6 +2070,7 @@ mod health_tests {
             Err(error) => error,
         };
         assert!(error.contains("held by another votport process"), "{error}");
+        release_data_lock(&first);
         drop(first);
         crate::api::testing::build(directory.path());
     }
@@ -2475,6 +2497,7 @@ mod push_tests {
     async fn push_identity_is_public_and_stable_across_restarts() {
         let directory = tempfile::tempdir().unwrap();
         let first = build(push_config(directory.path())).unwrap();
+        let first_handle = Arc::clone(&first);
         let first_identity = identity(first).await;
         assert_eq!(first_identity["address"], "push.example.test:8322");
         assert_eq!(
@@ -2489,6 +2512,8 @@ mod push_tests {
         let key = std::fs::read(directory.path().join("data/push.key")).unwrap();
         let issuer = std::fs::read(directory.path().join("data/push-issuer.key")).unwrap();
 
+        release_data_lock(&first_handle);
+        drop(first_handle);
         let second = build(push_config(directory.path())).unwrap();
         assert_eq!(identity(second).await, first_identity);
         assert_eq!(
