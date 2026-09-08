@@ -11,7 +11,7 @@
     <TextBlock x:Name="EmptyText" Grid.Row="1" Text="Nothing under way. Ship files or receive a delivery."
         Foreground="{ThemeResource VotMutedBrush}" VerticalAlignment="Center" HorizontalAlignment="Center" />
     <ListView x:Name="List" Grid.Row="1" SelectionMode="None" IsItemClickEnabled="True"
-        ItemClick="List_ItemClick">
+        ItemClick="List_ItemClick" Padding="0,0,20,0">
       <ListView.ItemTemplate>
         <DataTemplate x:DataType="local:TransferItem">
           <Grid Padding="14" Margin="0,4" Background="{ThemeResource VotPanelBrush}" CornerRadius="8" RowSpacing="8">

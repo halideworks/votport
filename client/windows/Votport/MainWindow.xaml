@@ -39,7 +39,7 @@
         </NavigationViewItem>
         <NavigationViewItem Content="Settings" Tag="settings" Icon="Setting" />
       </NavigationView.MenuItems>
-      <Frame x:Name="Pages" Padding="20" />
+      <Frame x:Name="Pages" Padding="20,20,0,20" />
     </NavigationView>
   </Grid>
 </Window>

@@ -1,7 +1,7 @@
 <Page x:Class="Votport.ReceivePage"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
-  <StackPanel Spacing="12">
+  <StackPanel Spacing="12" Margin="0,0,20,0">
     <TextBlock Text="RECEIVE" Style="{StaticResource SectionLabel}" />
     <TextBox x:Name="LinkBox" PlaceholderText="Delivery link" />
     <TextBlock x:Name="PreviewText" Visibility="Collapsed" TextWrapping="Wrap"
