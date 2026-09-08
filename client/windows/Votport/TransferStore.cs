@@ -88,7 +88,7 @@ public sealed class TransferItem : INotifyPropertyChanged
                 foreach (var file in value.Files)
                     if (filesByIndex.TryGetValue(file.Index, out var row)) row.Update(file);
             }
-            view = value; Changed(); Changed(nameof(Status)); Changed(nameof(Fraction)); Changed(nameof(Detail)); Changed(nameof(HasDetail)); Changed(nameof(Route)); Changed(nameof(HasRoute)); Changed(nameof(HasTotal)); Changed(nameof(ResumeLabel)); }
+            view = value; Changed(); Changed(nameof(Status)); Changed(nameof(Fraction)); Changed(nameof(Finishing)); Changed(nameof(Detail)); Changed(nameof(HasDetail)); Changed(nameof(Route)); Changed(nameof(HasRoute)); Changed(nameof(HasTotal)); Changed(nameof(ResumeLabel)); }
     }
 
     /// The path in the person's words, once the core chose it.
@@ -108,6 +108,7 @@ public sealed class TransferItem : INotifyPropertyChanged
     public bool HasDetail => view?.Detail is not null;
     public string Icon => Kind == Kinds.Send ? "" : "";
     public string Status => Format.StatusLine(this);
+    public bool Finishing => view?.Finishing == true;
     public double Fraction => view is null || view.TotalBytes is null || view.TotalBytes == 0
         ? 0
         : 100.0 * view.MovedBytes / view.TotalBytes.Value;
@@ -137,7 +138,7 @@ public sealed class FileRow : INotifyPropertyChanged
     internal FileRow(FileView file) { this.file = file; }
 
     public string Path => file.Path;
-    public double Fraction => file.Bytes == 0 ? 100 : 100.0 * file.Moved / file.Bytes;
+    public double Fraction => file.ProgressPercent;
     public string Label => file.Label;
     public bool Verified => file.State == FileState.Verified;
 }
@@ -439,6 +440,11 @@ public static class Format
     {
         if (item.Interrupted) return "Interrupted before it finished";
         if (item.View is not TransferView view) return item.Running ? "Starting" : "Failed";
+        if (view.Phase == Phase.Done && view.FinishedUnixSeconds is ulong finished)
+        {
+            var time = DateTimeOffset.FromUnixTimeSeconds((long)finished).ToLocalTime();
+            return $"{view.Status}, finished at {time:T}";
+        }
         return view.Status;
     }
 }

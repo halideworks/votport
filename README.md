@@ -444,7 +444,7 @@ does not publish partial files.
 
 ## Roadmap
 
-VOT is pinned at `a93f5d86a4da23744f8f8268054414b812b72c46`. This revision adds mounted-share compatibility, Windows UDP segmentation fixes, macOS socket and loopback fixes, and length-aware object coverage. Server, desktop core, and browser WASM use the same revision. Linux CIFS/SMB and NFS receive paths use Fast; Balanced and Strict are incompatible with these filesystems. See [network filesystem requirements and alternatives](docs/deployment.md#network-filesystems).
+VOT is pinned at `ed8a20b7acb2e58d0dd5c794e20dcfaa66be40d0`. This revision adds batched receive checkpoints, streaming completion hooks, a bounded 16-object fetch window, and progress updates shared across QUIC connections. Server, desktop core, and browser WASM use the same revision. Linux CIFS/SMB and NFS receive paths use Fast; Balanced and Strict are incompatible with these filesystems. See [network filesystem requirements and alternatives](docs/deployment.md#network-filesystems).
 
 Native push remains disabled unless `VOTPORT_PUSH_BIND` is set. Browser uploads use HTTP through the reverse proxy, with bounded parallel range acceptance and the existing 8 MiB range ceiling.
 

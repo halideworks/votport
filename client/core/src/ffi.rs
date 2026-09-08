@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::api::{split_link, split_link_as, LinkKind};
 use crate::error::{human_bytes, human_seconds, Error};
@@ -63,6 +63,8 @@ pub struct FileView {
     pub path: String,
     pub bytes: u64,
     pub moved: u64,
+    /// A full bar means publication completed, including empty files.
+    pub progress_percent: u8,
     pub state: FileState,
     /// The words at the end of the row: the size, the bytes moved of the
     /// size, "landed", or "verified".
@@ -70,6 +72,16 @@ pub struct FileView {
 }
 
 impl FileView {
+    fn progress_percent(&self) -> u8 {
+        if matches!(self.state, FileState::Landed | FileState::Verified) {
+            100
+        } else if self.bytes == 0 {
+            0
+        } else {
+            (u128::from(self.moved) * 100 / u128::from(self.bytes)).min(99) as u8
+        }
+    }
+
     fn label(&self) -> String {
         match self.state {
             FileState::Waiting => human_bytes(self.bytes),
@@ -101,6 +113,9 @@ pub struct TransferView {
     pub rate_bytes_per_second: Option<u64>,
     /// Seconds left, shown only once the rate has held for a while.
     pub eta_seconds: Option<u64>,
+    /// Completion time for formatting in the shell's local timezone.
+    pub finished_unix_seconds: Option<u64>,
+    pub finishing: bool,
     /// One plain sentence for the person when `phase` is `Failed`.
     pub headline: Option<String>,
     /// The full error text behind the headline, for a detail line or a log.
@@ -843,13 +858,18 @@ const TICK: Duration = Duration::from_secs(1);
 struct Model {
     kind: journal::Kind,
     view: TransferView,
+    started: Instant,
+    elapsed: Option<Duration>,
+    attempt_bytes: u64,
+    transfer_started: Option<Instant>,
+    transfer_elapsed: Duration,
+    carrier_moved: u64,
     files: Vec<FileView>,
     positions: HashMap<u64, usize>,
     dirty: HashSet<usize>,
     files_reset: bool,
     file_moved: u128,
     files_complete: usize,
-    materializing: bool,
     /// Sum of the planned sizes, the total on the HTTP paths and the push.
     planned_total: Option<u64>,
     /// Whether a carrier reports bytes for the whole package (QUIC), in which
@@ -874,19 +894,26 @@ impl Model {
                 total_bytes: None,
                 rate_bytes_per_second: None,
                 eta_seconds: None,
+                finished_unix_seconds: None,
+                finishing: false,
                 headline: None,
                 detail: None,
                 status: String::new(),
                 route: None,
                 rate_text: None,
             },
+            started: Instant::now(),
+            elapsed: None,
+            attempt_bytes: 0,
+            transfer_started: None,
+            transfer_elapsed: Duration::ZERO,
+            carrier_moved: 0,
             files: Vec::new(),
             positions: HashMap::new(),
             dirty: HashSet::new(),
             files_reset: true,
             file_moved: 0,
             files_complete: 0,
-            materializing: false,
             planned_total: None,
             carrier_bytes: false,
             samples: VecDeque::new(),
@@ -894,15 +921,18 @@ impl Model {
         }
     }
 
-    /// Folds one event in at time `now`. Returns whether a phase changed,
-    /// which always crosses the FFI regardless of the update interval.
+    /// Folds one event in at time `now`. Phase and finishing transitions
+    /// always cross the FFI regardless of the update interval.
     fn apply(&mut self, event: Event, now: Instant) -> bool {
-        let before = self.view.phase;
+        let before = (self.view.phase, self.finishing());
         match event {
+            Event::Transferred { bytes } => {
+                self.attempt_bytes = self.attempt_bytes.saturating_add(bytes);
+                if bytes > 0 && self.view.transport == Some(Transport::Http) {
+                    self.note_transfer_bytes(now);
+                }
+            }
             Event::Selected { files } | Event::Planned { files } => {
-                // Fetch announces its authoritative manifest after the bundle
-                // lands; that second plan starts destination materialization.
-                self.materializing = self.view.transport == Some(Transport::Fetch);
                 self.files = files
                     .into_iter()
                     .map(|file| FileView {
@@ -910,6 +940,7 @@ impl Model {
                         path: file.path,
                         bytes: file.bytes,
                         moved: 0,
+                        progress_percent: 0,
                         state: FileState::Waiting,
                         label: String::new(),
                     })
@@ -936,12 +967,19 @@ impl Model {
                 self.view.total_bytes = Some(total);
             }
             Event::Transport(transport) => {
-                self.materializing = false;
+                self.transfer_started.get_or_insert(now);
                 self.view.transport = Some(transport);
                 self.view.phase = Phase::Transferring;
             }
             Event::SessionCreated { .. } | Event::Rebegin => {}
             Event::Bytes { moved, total } => {
+                if moved > self.carrier_moved {
+                    self.note_transfer_bytes(now);
+                    self.carrier_moved = moved;
+                }
+                if self.view.transport == Some(Transport::Push) {
+                    self.attempt_bytes = moved;
+                }
                 self.carrier_bytes = true;
                 // A push counts framing too, so it can run past the package.
                 let cap = total.or(self.planned_total).unwrap_or(u64::MAX);
@@ -994,10 +1032,25 @@ impl Model {
                     self.view.moved_bytes = total;
                 }
                 self.view.phase = Phase::Done;
+                self.finish(now);
             }
         }
         self.measure(now);
-        before != self.view.phase
+        before != (self.view.phase, self.finishing())
+    }
+
+    fn finishing(&self) -> bool {
+        self.view.phase == Phase::Transferring
+            && self
+                .view
+                .total_bytes
+                .is_some_and(|total| self.view.moved_bytes >= total)
+    }
+
+    fn note_transfer_bytes(&mut self, now: Instant) {
+        if let Some(started) = self.transfer_started {
+            self.transfer_elapsed = now.saturating_duration_since(started);
+        }
     }
 
     fn update_file(&mut self, index: usize, update: impl FnOnce(&mut FileView)) {
@@ -1052,7 +1105,7 @@ impl Model {
                 let since = *self.rate_since.get_or_insert(now);
                 let held = now.duration_since(since) >= ETA_AFTER;
                 self.view.eta_seconds = match self.view.total_bytes {
-                    Some(total) if held => {
+                    Some(total) if held && self.view.moved_bytes < total => {
                         Some(total.saturating_sub(self.view.moved_bytes).div_ceil(rate))
                     }
                     _ => None,
@@ -1068,6 +1121,7 @@ impl Model {
     /// The view as a shell draws it, with the status line and the route
     /// written for the current state.
     fn snapshot(&mut self) -> TransferView {
+        self.view.finishing = self.finishing();
         self.view.route = self.view.transport.map(|via| route_name(via).to_owned());
         self.view.rate_text = self
             .view
@@ -1079,6 +1133,7 @@ impl Model {
         if view.files_reset {
             for file in &mut self.files {
                 file.label = file.label();
+                file.progress_percent = file.progress_percent();
             }
             view.files = self.files.clone();
             self.dirty.clear();
@@ -1089,6 +1144,7 @@ impl Model {
                 .map(|position| {
                     let file = &mut self.files[position];
                     file.label = file.label();
+                    file.progress_percent = file.progress_percent();
                     file.clone()
                 })
                 .collect();
@@ -1113,17 +1169,16 @@ impl Model {
                 let count = self.files.len();
                 let noun = if count == 1 { "file" } else { "files" };
                 let fetching = view.transport == Some(Transport::Fetch);
-                let mut parts = vec![if fetching {
-                    if self.materializing {
-                        "Saving files".to_owned()
-                    } else {
-                        format!("Downloading {count} {noun}")
-                    }
+                let mut parts = vec![if view.finishing {
+                    "Verifying and finishing"
+                } else if sending {
+                    "Shipping"
                 } else {
-                    if sending { "Shipping" } else { "Receiving" }.to_owned()
-                }];
-                let action = if fetching { "saved" } else { "verified" };
-                if view.transport == Some(Transport::Push) {
+                    "Receiving"
+                }
+                .to_owned()];
+                let action = if fetching { "complete" } else { "verified" };
+                if view.transport == Some(Transport::Push) && !view.finishing {
                     parts[0] = format!("Shipping {count} {noun}");
                 } else {
                     parts.push(format!(
@@ -1138,7 +1193,7 @@ impl Model {
                         human_bytes(total)
                     ));
                 }
-                if let Some(rate) = view.rate_bytes_per_second {
+                if let Some(rate) = view.rate_bytes_per_second.filter(|_| !view.finishing) {
                     parts.push(format!("{}/s", human_bytes(rate)));
                 }
                 if let Some(eta) = view.eta_seconds {
@@ -1149,11 +1204,22 @@ impl Model {
             Phase::Done => {
                 let count = self.files.len();
                 let noun = if count == 1 { "file" } else { "files" };
-                if sending {
-                    format!("Shipped and verified, {count} {noun}")
+                let action = if sending {
+                    "Shipped and verified"
                 } else {
-                    format!("Landed and verified, {count} {noun}")
-                }
+                    "Landed and verified"
+                };
+                let bytes = self.planned_total.unwrap_or(view.moved_bytes);
+                let elapsed = self.elapsed.unwrap_or_default();
+                let rate = (u128::from(self.attempt_bytes) * 1_000
+                    / self.transfer_elapsed.as_millis().max(1))
+                .min(u128::from(u64::MAX)) as u64;
+                format!(
+                    "{action}, {count} {noun}, {}, {}, {}/s average",
+                    human_bytes(bytes),
+                    human_seconds(elapsed.as_secs()),
+                    human_bytes(rate)
+                )
             }
             Phase::Cancelled => "Cancelled".to_owned(),
             Phase::Paused => match view.total_bytes {
@@ -1165,6 +1231,16 @@ impl Model {
                 None => "Paused".to_owned(),
             },
             Phase::Failed => view.headline.clone().unwrap_or_else(|| "Failed".to_owned()),
+        }
+    }
+
+    fn finish(&mut self, now: Instant) {
+        if self.elapsed.is_none() {
+            self.elapsed = Some(now.saturating_duration_since(self.started));
+            self.view.finished_unix_seconds = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|time| time.as_secs());
         }
     }
 
@@ -1181,6 +1257,9 @@ impl Model {
                 Phase::Failed
             }
         };
+        if error.is_none() {
+            self.finish(Instant::now());
+        }
         self.view.rate_bytes_per_second = None;
         self.view.eta_seconds = None;
     }
@@ -1264,11 +1343,11 @@ impl Observer for Forward {
         let mut model = model
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let phase_changed = model.apply(event, now);
+        let state_changed = model.apply(event, now);
         let due = self
             .last_update
             .is_none_or(|last| now.duration_since(last) >= UPDATE_INTERVAL);
-        if phase_changed || due {
+        if state_changed || due {
             self.push(&mut model, now);
         }
         if model.view.phase == Phase::Transferring {
@@ -1298,6 +1377,35 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn row_bar_finishes_only_after_publication_including_empty_files() {
+        let now = Instant::now();
+        let mut model = Model::new(journal::Kind::Receive);
+        model.apply(planned(&[0, 100]), now);
+        let initial = model.snapshot();
+        assert_eq!(initial.files[0].progress_percent, 0);
+        model.apply(
+            Event::Downloading {
+                index: 1,
+                received: 100,
+                total: 100,
+            },
+            now,
+        );
+        assert_eq!(model.snapshot().files[0].progress_percent, 99);
+        for index in [0, 1] {
+            model.apply(
+                Event::FileVerified {
+                    index,
+                    path: index.to_string(),
+                },
+                now,
+            );
+        }
+        let saved = model.snapshot();
+        assert!(saved.files.iter().all(|file| file.progress_percent == 100));
     }
 
     #[test]
@@ -1435,7 +1543,7 @@ mod tests {
         assert!(model
             .snapshot()
             .status
-            .contains("Downloading 2 files, 1 of 2 files saved"));
+            .contains("Receiving, 1 of 2 files complete"));
         model.apply(
             Event::FileVerified {
                 index: 0,
@@ -1443,7 +1551,7 @@ mod tests {
             },
             now,
         );
-        assert!(model.snapshot().status.contains("1 of 2 files saved"));
+        assert!(model.snapshot().status.contains("1 of 2 files complete"));
         model.apply(
             Event::Downloading {
                 index: 0,
@@ -1455,7 +1563,7 @@ mod tests {
         assert!(model
             .snapshot()
             .status
-            .contains("Downloading 2 files, 0 of 2 files saved"));
+            .contains("Receiving, 0 of 2 files complete"));
         model.apply(
             Event::FileVerified {
                 index: 0,
@@ -1487,7 +1595,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_distinguishes_bundle_transfer_from_saving_files() {
+    fn fetch_keeps_one_completion_counter_while_receiving() {
         let now = Instant::now();
         let mut model = Model::new(journal::Kind::Receive);
         model.apply(planned(&[100, 200]), now);
@@ -1495,7 +1603,7 @@ mod tests {
         assert!(model
             .snapshot()
             .status
-            .starts_with("Downloading 2 files, 0 of 2 files saved"));
+            .starts_with("Receiving, 0 of 2 files complete"));
         model.apply(
             Event::Bytes {
                 moved: 300,
@@ -1503,11 +1611,10 @@ mod tests {
             },
             now,
         );
-        model.apply(planned(&[100, 200]), now);
         assert!(model
             .snapshot()
             .status
-            .starts_with("Saving files, 0 of 2 files saved"));
+            .starts_with("Verifying and finishing, 0 of 2 files complete"));
         model.apply(
             Event::FileVerified {
                 index: 0,
@@ -1518,12 +1625,12 @@ mod tests {
         assert!(model
             .snapshot()
             .status
-            .starts_with("Saving files, 1 of 2 files saved"));
+            .starts_with("Verifying and finishing, 1 of 2 files complete"));
         model.apply(Event::Transport(Transport::Http), now);
         assert!(model
             .snapshot()
             .status
-            .starts_with("Receiving, 1 of 2 files verified"));
+            .starts_with("Verifying and finishing, 1 of 2 files verified"));
     }
 
     #[test]
@@ -1566,6 +1673,74 @@ mod tests {
     }
 
     #[test]
+    fn completion_summary_includes_publication_time_and_stays_fixed() {
+        let mut model = Model::new(journal::Kind::Receive);
+        let start = model.started;
+        model.apply(planned(&[12_000_000_000]), start);
+        model.apply(Event::Transport(Transport::Fetch), start);
+        model.apply(
+            Event::Bytes {
+                moved: 6_000_000_000,
+                total: Some(12_000_000_000),
+            },
+            start + Duration::from_secs(5),
+        );
+        model.apply(
+            Event::Bytes {
+                moved: 12_000_000_000,
+                total: Some(12_000_000_000),
+            },
+            start + Duration::from_secs(10),
+        );
+        assert_eq!(model.view.eta_seconds, None);
+        assert_eq!(model.view.finished_unix_seconds, None);
+        let finishing = model.snapshot();
+        assert!(finishing.finishing);
+        assert!(finishing.status.starts_with("Verifying and finishing"));
+        model.apply(
+            Event::Transferred {
+                bytes: 12_000_000_000,
+            },
+            start + Duration::from_secs(60),
+        );
+        model.apply(
+            Event::Finished { files: 1 },
+            start + Duration::from_secs(60),
+        );
+        let done = model.snapshot();
+        assert_eq!(
+            done.status,
+            "Landed and verified, 1 file, 12.0 GB, 1 min 0 s, 1.2 GB/s average"
+        );
+        assert!(done.finished_unix_seconds.is_some());
+        model.end(None, false);
+        assert_eq!(model.snapshot().status, done.status);
+        assert_eq!(model.view.finished_unix_seconds, done.finished_unix_seconds);
+    }
+
+    #[test]
+    fn resumed_average_excludes_bytes_retained_before_this_attempt() {
+        let mut model = Model::new(journal::Kind::Receive);
+        let start = model.started;
+        model.apply(planned(&[12_000_000_000]), start);
+        model.apply(Event::Transport(Transport::Fetch), start);
+        model.apply(
+            Event::Bytes {
+                moved: 12_000_000_000,
+                total: Some(12_000_000_000),
+            },
+            start + Duration::from_secs(10),
+        );
+        model.apply(Event::Transferred { bytes: 600_000_000 }, start);
+        model.apply(
+            Event::Finished { files: 1 },
+            start + Duration::from_secs(60),
+        );
+        assert!(model.snapshot().status.ends_with("60.0 MB/s average"));
+        assert!(!model.snapshot().finishing);
+    }
+
+    #[test]
     fn status_says_what_a_card_shows_in_every_phase() {
         let t0 = Instant::now();
         let mut model = Model::new(journal::Kind::Send);
@@ -1594,7 +1769,9 @@ mod tests {
         model.apply(Event::Finished { files: 1 }, t0);
         model.end(None, false);
         let view = model.snapshot();
-        assert_eq!(view.status, "Shipped and verified, 1 file");
+        assert!(view
+            .status
+            .starts_with("Shipped and verified, 1 file, 10.0 KB, "));
         assert_eq!(view.rate_text, None);
         assert_eq!(view.files[0].label, "landed");
 
@@ -1606,7 +1783,10 @@ mod tests {
         assert!(view.status.starts_with("Receiving, "), "{}", view.status);
         assert_eq!(view.route.as_deref(), Some("Standard route (HTTP)"));
         model.end(None, false);
-        assert_eq!(model.snapshot().status, "Landed and verified, 2 files");
+        assert!(model
+            .snapshot()
+            .status
+            .starts_with("Landed and verified, 2 files, 3 bytes, "));
         model.end(Some(&Error::Cancelled), false);
         assert_eq!(model.snapshot().status, "Cancelled");
         model.end(Some(&Error::Cancelled), true);
@@ -1750,12 +1930,18 @@ mod tests {
             covered: 2,
             total: 10,
         });
+        forward.event(Event::Chunk {
+            index: 0,
+            covered: 10,
+            total: 10,
+        });
+        assert!(count.0.lock().unwrap().last().unwrap().finishing);
         assert!(!forward.cancelled());
         transfer.cancel();
         assert!(forward.cancelled());
         forward.finish(Some(&Error::Cancelled));
         let seen = count.0.lock().unwrap();
-        // Planned (first ever), Transport (phase change), the cancel; the two
+        // Planned, Transport, finishing, and cancel always cross; the two
         // chunks inside the interval are paced out unless the clock stalled.
         assert!(matches!(seen[0].phase, Phase::Preparing), "{seen:?}");
         assert!(matches!(seen[1].phase, Phase::Transferring), "{seen:?}");

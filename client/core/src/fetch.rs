@@ -12,20 +12,20 @@
 //! path's name, existence, and temp-then-rename guards: a QUIC fetch is a
 //! different transport, not a different trust boundary.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
 use vot_cli::authz::Holder;
-use vot_cli::{fetch_bundle_with, parse_rendezvous, Error as VotError, FetchOptions};
+use vot_cli::{fetch_bundle_with_seams, parse_rendezvous, Error as VotError, FetchOptions};
 
 use crate::api::Client;
 use crate::error::{Error, Result};
 use crate::identity::Device;
-use crate::package::{package_path_string, read_manifest};
-use crate::progress::{with_progress, Event, Observer, PlannedFile, Transport, PROGRESS_QUANTUM};
+use crate::package::{package_path_string, read_manifest, StoredEntry};
+use crate::progress::{with_events, Event, Observer, PlannedFile, Transport, PROGRESS_QUANTUM};
 use crate::receive::{
     local_path_of, require_space, reusable_file, write_verified, Delivery, Received, Resumed,
 };
@@ -229,38 +229,113 @@ pub(crate) fn try_fetch_with_resume(
     }
 
     observer.event(Event::Transport(Transport::Fetch));
-    // ponytail: once the ticket is minted a cancel is not honoured: vot-cli
-    // removes the resume store when the bundle is whole, so stopping after
-    // that would discard a complete download and mint a fresh ticket on the
-    // next run. Threading vot-cli's CancellationHandle through FetchOptions
-    // is the VOT change that makes a mid-fetch cancel possible.
-    let fetched = with_progress(observer, |progress| {
-        fetch_bundle_with(
-            FetchOptions {
-                address: reachable,
-                holder: Some(holder),
-                serve_identity: Some(identity),
-                pin: Some(pin),
-                rails: direct_rails(reachable, cfg!(target_os = "macos")),
-                provers: None,
-                extensions: BTreeSet::new(),
-                progress: Some((PROGRESS_QUANTUM, progress)),
-            },
-            &stage,
-        )
-    });
-    if let Err(error) = fetched {
-        // A stage no retry can resume (no store, or a corrupt one) would refuse
-        // every retry, and each retry mints a fresh ticket against the download
-        // cap. Clear it so the next attempt starts clean; a transport failure
-        // leaves a valid store and the stage is kept for resume.
-        if stage_unresumable(&error) {
-            let _ = fs::remove_dir_all(&stage);
-        }
-        return Err(error.into());
+    let expected: HashMap<_, _> = metadata
+        .files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| {
+            Ok((
+                file.name.clone(),
+                (index, decode_digest(&file.root)?, file.bytes),
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let mut references = HashMap::new();
+    for (_, root, _) in expected.values() {
+        *references.entry(*root).or_insert(0usize) += 1;
     }
-
-    let received = materialize(&stage, dest, observer, resume)?;
+    let cancellation = vot_cli::CancellationHandle::default();
+    let received = with_events(
+        |event| {
+            if observer.cancelled() {
+                cancellation.cancel();
+            }
+            if let Some(event) = event {
+                observer.event(event);
+            }
+        },
+        |sender| {
+            std::thread::scope(|scope| -> Result<Received> {
+                let state = StreamingSave {
+                    bundle: stage.clone(),
+                    dest: dest.to_path_buf(),
+                    references,
+                    pending: Vec::new(),
+                    files: Vec::new(),
+                    resume,
+                };
+                let (ready, jobs) = std::sync::mpsc::sync_channel(16);
+                let mut save_observer = StreamObserver {
+                    sender: sender.clone(),
+                    cancellation: cancellation.clone(),
+                };
+                let saver = scope.spawn(move || state.run(jobs, &mut save_observer));
+                let expected = Arc::new(expected);
+                let manifest_expected = Arc::clone(&expected);
+                let progress_sender = sender.clone();
+                let seams = vot_cli::ReceiveSeams {
+                    manifest: Some(Arc::new(move |_, _, entries| {
+                        validate_stream_manifest(&manifest_expected, entries)
+                    })),
+                    complete: Some(Arc::new(move |_, object| {
+                        for entry in &object.entries {
+                            let &(index, root, length) = expected
+                                .get(&package_path_string(&entry.path))
+                                .ok_or(VotError::InvalidBundle)?;
+                            ready
+                                .send((
+                                    index,
+                                    StoredEntry {
+                                        path: entry.path.clone(),
+                                        root,
+                                        length,
+                                    },
+                                ))
+                                .map_err(|_| VotError::InvalidBundle)?;
+                        }
+                        Ok(())
+                    })),
+                    cancellation: cancellation.clone(),
+                    ..Default::default()
+                };
+                let fetched = fetch_bundle_with_seams(
+                    FetchOptions {
+                        address: reachable,
+                        holder: Some(holder),
+                        serve_identity: Some(identity),
+                        pin: Some(pin),
+                        rails: direct_rails(reachable, cfg!(target_os = "macos")),
+                        provers: None,
+                        extensions: BTreeSet::new(),
+                        progress: Some((
+                            PROGRESS_QUANTUM,
+                            Box::new(move |moved, total| {
+                                let _ = progress_sender.send(Event::Bytes { moved, total });
+                            }),
+                        )),
+                    },
+                    &stage,
+                    seams,
+                );
+                // A local saving failure must retain the stage even when its hook
+                // reports InvalidBundle through the transport's error type.
+                let received = saver
+                    .join()
+                    .map_err(|_| Error::Other("the saving worker failed".into()))??;
+                let (_, moved) = fetched.map_err(|error| {
+                    if stage_unresumable(&error) {
+                        let _ = fs::remove_dir_all(&stage);
+                    }
+                    Error::from(error)
+                })?;
+                let _ = sender.send(Event::Transferred { bytes: moved });
+                let _ = sender.send(Event::Finished {
+                    files: received.files.len(),
+                });
+                Ok(received)
+            })
+        },
+    )?;
     // The files are on disk and verified; a failure to clear the stage must not
     // fail the receive. A leftover whole bundle is removed on the next run.
     let _ = fs::remove_dir_all(&stage);
@@ -299,6 +374,7 @@ fn stage_unresumable(error: &VotError) -> bool {
 /// Copies each object a fetched bundle holds to its loose path, re-hashing to
 /// the announced root. Refuses the whole bundle before writing a byte on a
 /// packed entry, a name that would escape `dest`, or a file already present.
+#[cfg(test)]
 fn materialize(
     bundle: &Path,
     dest: &Path,
@@ -306,8 +382,6 @@ fn materialize(
     resume: bool,
 ) -> Result<Received> {
     let entries = read_manifest(bundle)?;
-    let objects = bundle.join("objects");
-    #[cfg(windows)]
     let references = entries
         .iter()
         .fold(std::collections::HashMap::new(), |mut counts, entry| {
@@ -327,34 +401,61 @@ fn materialize(
             .collect(),
     });
 
+    let entries: Vec<_> = entries.into_iter().enumerate().collect();
+    let files = materialize_entries(bundle, dest, &entries, observer, resume, &references, false)?;
+    observer.event(Event::Finished { files: files.len() });
+    Ok(Received { files })
+}
+
+fn materialize_entries(
+    bundle: &Path,
+    dest: &Path,
+    entries: &[(usize, StoredEntry)],
+    observer: &mut dyn Observer,
+    resume: bool,
+    references: &HashMap<[u8; 32], usize>,
+    streaming: bool,
+) -> Result<Vec<std::path::PathBuf>> {
+    #[cfg(not(windows))]
+    let _ = (references, streaming);
+    let objects = bundle.join("objects");
     let names = entries
         .iter()
-        .map(|entry| crate::receive::package_name(&entry.path))
+        .map(|(_, entry)| crate::receive::package_name(&entry.path))
         .collect::<Result<Vec<_>>>()?;
     let paths = crate::receive::local_paths(dest, names.iter().map(String::as_str))?;
     let planned = entries
         .iter()
         .zip(paths)
-        .map(|(entry, path)| {
+        .map(|((index, entry), path)| {
             let path = path?;
             let complete = reusable_file(&path, entry.root, entry.length, resume, observer)?;
-            Ok((path, entry.root, entry.length, complete))
+            Ok((
+                *index,
+                &entry.path,
+                path,
+                entry.root,
+                entry.length,
+                complete,
+            ))
         })
         .collect::<Result<Vec<_>>>()?;
     fs::create_dir_all(dest)?;
     let mut files = Vec::with_capacity(planned.len());
     #[cfg(target_os = "macos")]
     let mut pending = Vec::<(usize, std::path::PathBuf, crate::receive::PendingFile)>::new();
-    for (index, (path, root, length, complete)) in planned.into_iter().enumerate() {
+    for (index, package_path, path, root, length, complete) in planned {
         if observer.cancelled() {
             return Err(Error::Cancelled);
         }
         if !complete {
-            local_path_of(dest, &entries[index].path)?;
+            local_path_of(dest, package_path)?;
             let object = objects.join(object_name(&root));
             #[cfg(windows)]
             let linked = references[&root] == 1
-                && link_verified_object(&object, dest, &path, root, length, observer)?;
+                && link_verified_object_during_fetch(
+                    &object, dest, &path, root, length, observer, streaming,
+                )?;
             #[cfg(not(windows))]
             let linked = false;
             if !linked {
@@ -422,8 +523,7 @@ fn materialize(
     }
     #[cfg(target_os = "macos")]
     publish_batch(&mut pending, dest, observer, &mut files)?;
-    observer.event(Event::Finished { files: files.len() });
-    Ok(Received { files })
+    Ok(files)
 }
 
 // Each file reaches the drive before one full barrier flushes the same device.
@@ -456,13 +556,14 @@ fn publish_batch(
 // A unique object can keep its durable bytes when published on NTFS. Shared
 // roots stay independent copies so editing one delivered file cannot edit another.
 #[cfg(windows)]
-fn link_verified_object(
+fn link_verified_object_during_fetch(
     source: &Path,
     destination_root: &Path,
     destination: &Path,
     root: [u8; 32],
     length: u64,
     observer: &mut dyn Observer,
+    streaming: bool,
 ) -> Result<bool> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -479,7 +580,12 @@ fn link_verified_object(
         .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE)
         .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(source)?;
+        .open(source);
+    let held = match held {
+        Ok(held) => held,
+        Err(error) if streaming && error.raw_os_error() == Some(32) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
     if !vot_platform_fs::same_file_handle(&held, source)? {
         return Err(Error::Other(
             "the staged object changed before verification".to_owned(),
@@ -522,11 +628,306 @@ fn base64_decode(value: &str) -> Result<Vec<u8>> {
         .map_err(|error| Error::Other(format!("the capability is not valid base64: {error}")))
 }
 
+#[cfg(all(test, windows))]
+fn link_verified_object(
+    source: &Path,
+    dest: &Path,
+    path: &Path,
+    root: [u8; 32],
+    length: u64,
+    observer: &mut dyn Observer,
+) -> Result<bool> {
+    link_verified_object_during_fetch(source, dest, path, root, length, observer, false)
+}
+
+struct StreamObserver {
+    sender: std::sync::mpsc::Sender<Event>,
+    cancellation: vot_cli::CancellationHandle,
+}
+
+impl Observer for StreamObserver {
+    fn event(&mut self, event: Event) {
+        if !matches!(event, Event::Transferred { .. }) {
+            let _ = self.sender.send(event);
+        }
+    }
+    fn cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+}
+
+struct StreamingSave {
+    bundle: std::path::PathBuf,
+    dest: std::path::PathBuf,
+    references: HashMap<[u8; 32], usize>,
+    pending: Vec<(usize, StoredEntry)>,
+    files: Vec<(usize, std::path::PathBuf)>,
+    resume: bool,
+}
+
+impl StreamingSave {
+    fn run(
+        mut self,
+        jobs: std::sync::mpsc::Receiver<(usize, StoredEntry)>,
+        observer: &mut dyn Observer,
+    ) -> Result<Received> {
+        loop {
+            match jobs.recv_timeout(std::time::Duration::from_millis(25)) {
+                Ok(job) => {
+                    self.pending.push(job);
+                    if self.pending.len() == 16 {
+                        self.flush(observer)?;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if observer.cancelled() {
+                        return Err(Error::Cancelled);
+                    }
+                    self.flush(observer)?;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        self.flush(observer)?;
+        self.files.sort_unstable_by_key(|(index, _)| *index);
+        Ok(Received {
+            files: self.files.into_iter().map(|(_, path)| path).collect(),
+        })
+    }
+
+    fn flush(&mut self, observer: &mut dyn Observer) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let files = materialize_entries(
+            &self.bundle,
+            &self.dest,
+            &self.pending,
+            observer,
+            self.resume,
+            &self.references,
+            true,
+        )?;
+        self.files
+            .extend(self.pending.iter().map(|(index, _)| *index).zip(files));
+        self.pending.clear();
+        Ok(())
+    }
+}
+
+fn validate_stream_manifest(
+    expected: &HashMap<String, (usize, [u8; 32], u64)>,
+    entries: &[vot_cli::EntryRecord],
+) -> std::result::Result<(), VotError> {
+    if entries.len() != expected.len() {
+        return Err(VotError::InvalidBundle);
+    }
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        let name =
+            crate::receive::package_name(&entry.path).map_err(|_| VotError::InvalidBundle)?;
+        let Some(&(_, root, length)) = expected.get(&name) else {
+            return Err(VotError::InvalidBundle);
+        };
+        if !seen.insert(name)
+            || entry.logical_root != root
+            || entry.logical_length != length
+            || entry.storage != vot_cli::Storage::Direct
+            || entry.suite != vot_object::Suite::Blake3Bao64
+        {
+            return Err(VotError::InvalidBundle);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::entries::admit;
     use crate::package::build;
+
+    #[test]
+    fn saving_worker_publishes_before_input_closes_and_returns_delivery_order() {
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("source");
+        let stage = home.path().join("bundle");
+        let dest = home.path().join("dest");
+        fs::create_dir(&source).unwrap();
+        let mut admitted = Vec::new();
+        for name in ["a", "b"] {
+            let path = source.join(name);
+            fs::write(&path, name.as_bytes()).unwrap();
+            admitted.push(admit(name, path, false).unwrap());
+        }
+        build(admitted, &stage).unwrap();
+        fs::create_dir(stage.join("objects")).unwrap();
+        let entries = read_manifest(&stage).unwrap();
+        for entry in &entries {
+            fs::copy(
+                source.join(package_path_string(&entry.path)),
+                stage.join("objects").join(object_name(&entry.root)),
+            )
+            .unwrap();
+        }
+        let state = StreamingSave {
+            bundle: stage,
+            dest: dest.clone(),
+            references: entries.iter().map(|e| (e.root, 1)).collect(),
+            pending: Vec::new(),
+            files: Vec::new(),
+            resume: false,
+        };
+        let (ready, jobs) = std::sync::mpsc::sync_channel(16);
+        let (events, reports) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            state
+                .run(
+                    jobs,
+                    &mut StreamObserver {
+                        sender: events,
+                        cancellation: vot_cli::CancellationHandle::default(),
+                    },
+                )
+                .expect("the saving worker publishes verified files")
+        });
+        ready.send((1, entries[1].clone())).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let event = reports
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .expect("one ready file must publish while the next file is still downloading");
+            if matches!(event, Event::FileVerified { index: 1, .. }) {
+                break;
+            }
+        }
+        assert_eq!(fs::read(dest.join("b")).unwrap(), b"b");
+        assert!(!dest.join("a").exists());
+        ready.send((0, entries[0].clone())).unwrap();
+        drop(ready);
+        let received = handle.join().unwrap();
+        assert_eq!(received.files, vec![dest.join("a"), dest.join("b")]);
+    }
+
+    #[test]
+    fn streaming_manifest_requires_exact_direct_file_membership() {
+        let entry = vot_cli::EntryRecord {
+            path: vot_manifest::PackagePath::portable(["a".to_owned()]).unwrap(),
+            suite: vot_object::Suite::Blake3Bao64,
+            logical_root: [7; 32],
+            logical_length: 9,
+            storage: vot_cli::Storage::Direct,
+        };
+        let expected = HashMap::from([("a".into(), (0, [7; 32], 9))]);
+        assert!(validate_stream_manifest(&expected, std::slice::from_ref(&entry)).is_ok());
+        assert!(validate_stream_manifest(&expected, &[]).is_err());
+        for field in 0..4 {
+            let mut changed = entry.clone();
+            match field {
+                0 => {
+                    changed.path =
+                        vot_manifest::PackagePath::portable(["other".to_owned()]).unwrap()
+                }
+                1 => changed.logical_root[0] ^= 1,
+                2 => changed.logical_length += 1,
+                _ => {
+                    changed.storage = vot_cli::Storage::Pack {
+                        root: [8; 32],
+                        length: 20,
+                        offset: 0,
+                    }
+                }
+            }
+            assert!(validate_stream_manifest(&expected, &[changed]).is_err());
+        }
+        let expected =
+            HashMap::from([("a".into(), (0, [7; 32], 9)), ("b".into(), (1, [7; 32], 9))]);
+        assert!(validate_stream_manifest(&expected, &[entry.clone(), entry]).is_err());
+    }
+
+    #[test]
+    fn streaming_saves_available_files_before_the_bundle_is_whole_and_resumes() {
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("source");
+        let stage = home.path().join("bundle");
+        let dest = home.path().join("dest");
+        fs::create_dir(&source).unwrap();
+        let mut admitted = Vec::new();
+        for (name, bytes) in [
+            ("a", b"shared".as_slice()),
+            ("b", b"shared"),
+            ("empty", b""),
+            ("later", b"later"),
+        ] {
+            let path = source.join(name);
+            fs::write(&path, bytes).unwrap();
+            admitted.push(admit(name, path, false).unwrap());
+        }
+        build(admitted, &stage).unwrap();
+        fs::create_dir(stage.join("objects")).unwrap();
+        let entries = read_manifest(&stage).unwrap();
+        let mut references = HashMap::new();
+        for entry in &entries {
+            *references.entry(entry.root).or_insert(0) += 1;
+        }
+        let pending: Vec<_> = entries
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter(|(_, e)| package_path_string(&e.path) != "later")
+            .collect();
+        for (_, entry) in &pending {
+            fs::copy(
+                source.join(package_path_string(&entry.path)),
+                stage.join("objects").join(object_name(&entry.root)),
+            )
+            .unwrap();
+        }
+        let mut state = StreamingSave {
+            bundle: stage.clone(),
+            dest: dest.clone(),
+            references,
+            pending,
+            files: Vec::new(),
+            resume: false,
+        };
+        let mut events = Vec::new();
+        state.flush(&mut |event| events.push(event)).unwrap();
+        assert_eq!(state.files.len(), 3);
+        assert!(!dest.join("later").exists());
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, Event::Finished { .. } | Event::Planned { .. })));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::FileVerified { .. }))
+                .count(),
+            3
+        );
+        fs::write(dest.join("a"), b"edited").unwrap();
+        assert_eq!(fs::read(dest.join("b")).unwrap(), b"shared");
+        let later = entries
+            .iter()
+            .cloned()
+            .enumerate()
+            .find(|(_, e)| package_path_string(&e.path) == "later")
+            .unwrap();
+        state.pending.push(later.clone());
+        assert!(state.flush(&mut crate::progress::Silent).is_err());
+        assert!(stage.exists());
+        assert!(!dest.join("later").exists());
+        fs::copy(
+            source.join("later"),
+            stage.join("objects").join(object_name(&later.1.root)),
+        )
+        .unwrap();
+        state.flush(&mut crate::progress::Silent).unwrap();
+        assert_eq!(fs::read(dest.join("later")).unwrap(), b"later");
+        state.pending.push(later);
+        state.resume = true;
+        state.flush(&mut crate::progress::Silent).unwrap();
+    }
 
     #[test]
     fn resumed_materialize_verifies_existing_files_and_skips_their_objects() {
@@ -690,6 +1091,20 @@ mod tests {
             .find(|entry| package_path_string(&entry.path) == "unique")
             .unwrap();
         let object = stage.join("objects").join(object_name(&unique.root));
+        {
+            let _writer = vot_platform_fs::guard_staging_file(&object).unwrap();
+            assert!(!link_verified_object_during_fetch(
+                &object,
+                &dest,
+                &dest.join("busy"),
+                unique.root,
+                unique.length,
+                &mut crate::progress::Silent,
+                true
+            )
+            .unwrap());
+            assert!(!dest.join("busy").exists());
+        }
         assert!(vot_platform_fs::same_file_regular(&object, &dest.join("unique")).unwrap());
         assert!(
             !vot_platform_fs::same_file_regular(&dest.join("copy1"), &dest.join("copy2")).unwrap()

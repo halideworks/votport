@@ -175,6 +175,7 @@ fn send_entries(
                 return Ok(Outcome::Rebegin);
             }
             offset += length;
+            observer.event(Event::Transferred { bytes: length });
             observer.event(Event::Chunk {
                 index: info.index,
                 covered: progress.covered_bytes,

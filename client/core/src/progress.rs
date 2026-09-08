@@ -30,6 +30,8 @@ pub enum Event {
     /// The transfer committed to a path. The QUIC paths report bytes only as
     /// [`Event::Bytes`]; the HTTP paths report them per file.
     Transport(Transport),
+    /// New bytes transferred in this attempt, excluding retained bytes and local copies.
+    Transferred { bytes: u64 },
     /// Bytes a QUIC carrier moved so far, and the package length when the
     /// fetch knows it (a push never does).
     Bytes { moved: u64, total: Option<u64> },
@@ -83,14 +85,34 @@ pub(crate) fn with_progress<T: Send>(
     observer: &mut dyn Observer,
     work: impl FnOnce(vot_cli::Progress) -> T + Send,
 ) -> T {
-    let (sender, receiver) = std::sync::mpsc::channel::<(u64, Option<u64>)>();
-    let progress: vot_cli::Progress = Box::new(move |moved, total| {
-        let _ = sender.send((moved, total));
-    });
+    with_events(
+        |event| {
+            if let Some(event) = event {
+                observer.event(event);
+            }
+        },
+        |sender| {
+            let progress: vot_cli::Progress = Box::new(move |moved, total| {
+                let _ = sender.send(Event::Bytes { moved, total });
+            });
+            work(progress)
+        },
+    )
+}
+
+pub(crate) fn with_events<T: Send>(
+    mut event: impl FnMut(Option<Event>),
+    work: impl FnOnce(std::sync::mpsc::Sender<Event>) -> T + Send,
+) -> T {
+    let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
-        let handle = scope.spawn(move || work(progress));
-        for (moved, total) in receiver {
-            observer.event(Event::Bytes { moved, total });
+        let handle = scope.spawn(move || work(sender));
+        loop {
+            match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(report) => event(Some(report)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => event(None),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         }
         handle
             .join()
@@ -112,5 +134,28 @@ impl Observer for Silent {
 impl<F: FnMut(Event)> Observer for F {
     fn event(&mut self, event: Event) {
         self(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_bridge_polls_during_network_silence() {
+        let (stop, stopped) = std::sync::mpsc::sync_channel(1);
+        with_events(
+            |event| {
+                if event.is_none() {
+                    let _ = stop.try_send(());
+                }
+            },
+            move |sender| {
+                stopped
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("cancellation poll while idle");
+                drop(sender);
+            },
+        );
     }
 }

@@ -40,7 +40,7 @@
                 <Button Content="Remove" Visibility="{x:Bind NotRunning, Mode=OneWay}" Click="Remove_Click" />
               </StackPanel>
             </Grid>
-            <ProgressBar Grid.Row="1" Value="{x:Bind Fraction, Mode=OneWay}" Maximum="100" Foreground="{ThemeResource VotProgressBrush}" />
+            <ProgressBar IsIndeterminate="{x:Bind Finishing, Mode=OneWay}" Grid.Row="1" Value="{x:Bind Fraction, Mode=OneWay}" Maximum="100" Foreground="{ThemeResource VotProgressBrush}" />
             <StackPanel Grid.Row="2" Visibility="{x:Bind Expanded, Mode=OneWay}" Spacing="4">
               <TextBlock Text="{x:Bind Route, Mode=OneWay}" Visibility="{x:Bind HasRoute, Mode=OneWay}" FontSize="12"
                   Foreground="{ThemeResource VotMutedBrush}" />

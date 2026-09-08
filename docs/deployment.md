@@ -47,7 +47,7 @@ Balanced, then replicate to the share under your storage system's backup
 and durability policy. Keep the local copy until that policy is satisfied.
 Votport does not offer Strict as a selectable receive profile. If Strict
 is required, use a VOT receiver and local storage qualified for that
-profile. See the [VOT mounted-share support and alternatives](https://github.com/halideworks/VOT/blob/a93f5d86a4da23744f8f8268054414b812b72c46/docs/mounted-shares.md)
+profile. See the [VOT mounted-share support and alternatives](https://github.com/halideworks/VOT/blob/ed8a20b7acb2e58d0dd5c794e20dcfaa66be40d0/docs/mounted-shares.md)
 for platform requirements and the limits of each profile. macOS SMB is not
 qualified by this upstream release.
 
@@ -596,7 +596,7 @@ Measured single-stream upload rose about a quarter (256 MiB baseline,
 still verifies serially and is the next candidate.
 
 Do not raise `CHUNK_BYTES` in votport until VOT changes its server verify
-path to support larger ranges; the `a93f5d86` pin does not. Any VOT re-pin
+path to support larger ranges; the `ed8a20b7` pin does not. Any VOT re-pin
 moves the VOT dependencies and Dockerfile `ARG` together, then relocks
 Cargo.lock. Measure with:
 
