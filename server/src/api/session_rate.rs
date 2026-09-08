@@ -84,6 +84,119 @@ impl SessionRate {
     }
 }
 
+/// Per-grant outbound request budget. A whole delivery preparation or a
+/// single-file grant costs one full unit; one request for a file in a
+/// multi-file grant costs one divided by that grant's file count. The
+/// fixed-point bucket keeps that accounting bounded for very large grants.
+pub struct DownloadRate {
+    buckets: Mutex<HashMap<String, DownloadBucket>>,
+}
+
+struct DownloadBucket {
+    /// Credits multiplied by `WINDOW_NANOS`, so refills need no floating point.
+    tokens: u128,
+    last: Instant,
+    /// Loaded once for an individual-file grant and reused for every index.
+    file_count: Option<usize>,
+}
+
+const DOWNLOAD_CAPACITY: u128 = 2_000;
+const DOWNLOAD_WINDOW: Duration = Duration::from_secs(600);
+const DOWNLOAD_WINDOW_NANOS: u128 = 600_000_000_000;
+const DOWNLOAD_SCALE: u128 = 1_000_000;
+const DOWNLOAD_TABLE_CAP: usize = 4096;
+const DOWNLOAD_MAX_TOKENS: u128 = DOWNLOAD_CAPACITY * DOWNLOAD_SCALE * DOWNLOAD_WINDOW_NANOS;
+
+impl Default for DownloadRate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DownloadRate {
+    pub fn new() -> Self {
+        Self {
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Charges one full-grant equivalent, for a legacy file, batch, bundle,
+    /// or fetch preparation.
+    pub fn allow(&self, key: &str) -> bool {
+        self.allow_at(key, DOWNLOAD_SCALE, None, Instant::now())
+    }
+
+    /// Charges one divided by the immutable file count. The loader runs only
+    /// on a cache miss and outside the bucket mutex; a second lock check in
+    /// `allow_at` handles two first requests racing for the same grant.
+    pub fn allow_individual<F, E>(&self, key: &str, load_count: F) -> Result<bool, E>
+    where
+        F: FnOnce() -> Result<usize, E>,
+    {
+        self.allow_individual_at(key, load_count, Instant::now())
+    }
+
+    fn allow_individual_at<F, E>(&self, key: &str, load_count: F, now: Instant) -> Result<bool, E>
+    where
+        F: FnOnce() -> Result<usize, E>,
+    {
+        let cached = self
+            .buckets
+            .lock()
+            .expect("download rate poisoned")
+            .get(key)
+            .and_then(|bucket| bucket.file_count);
+        let file_count = match cached {
+            Some(count) => count,
+            None => load_count()?.max(1),
+        };
+        let cost = DOWNLOAD_SCALE.div_ceil(file_count as u128);
+        Ok(self.allow_at(key, cost, Some(file_count), now))
+    }
+
+    fn allow_at(&self, key: &str, cost: u128, file_count: Option<usize>, now: Instant) -> bool {
+        let cost = cost.saturating_mul(DOWNLOAD_WINDOW_NANOS);
+        let mut buckets = self.buckets.lock().expect("download rate poisoned");
+        if !buckets.contains_key(key) {
+            buckets
+                .retain(|_, bucket| now.saturating_duration_since(bucket.last) < DOWNLOAD_WINDOW);
+            if buckets.len() >= DOWNLOAD_TABLE_CAP {
+                let victim = buckets
+                    .iter()
+                    .min_by_key(|(_, bucket)| bucket.last)
+                    .map(|(key, _)| key.clone());
+                if let Some(victim) = victim {
+                    buckets.remove(&victim);
+                }
+            }
+            buckets.insert(
+                key.to_owned(),
+                DownloadBucket {
+                    tokens: DOWNLOAD_MAX_TOKENS,
+                    last: now,
+                    file_count,
+                },
+            );
+        }
+        let bucket = buckets.get_mut(key).expect("download bucket inserted");
+        let elapsed = now.saturating_duration_since(bucket.last).as_nanos();
+        let refill = elapsed.saturating_mul(DOWNLOAD_CAPACITY * DOWNLOAD_SCALE);
+        bucket.tokens = bucket
+            .tokens
+            .saturating_add(refill)
+            .min(DOWNLOAD_MAX_TOKENS);
+        bucket.last = bucket.last.max(now);
+        if bucket.file_count.is_none() {
+            bucket.file_count = file_count;
+        }
+        if bucket.tokens < cost {
+            return false;
+        }
+        bucket.tokens -= cost;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +258,114 @@ mod tests {
         assert!(rate.allow("10.0.0.1"));
         let attempts = rate.attempts.lock().unwrap();
         assert_eq!(attempts.get("10.0.0.1").map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn one_hundred_thousand_files_cost_one_full_grant() {
+        let rate = DownloadRate::new();
+        let now = Instant::now();
+        let mut loads = 0;
+        for _ in 0..100_000 {
+            assert!(rate
+                .allow_individual_at(
+                    "grant",
+                    || {
+                        loads += 1;
+                        Ok::<_, ()>(100_000)
+                    },
+                    now,
+                )
+                .unwrap());
+        }
+        assert_eq!(loads, 1);
+        for _ in 0..(DOWNLOAD_CAPACITY as usize - 1) {
+            assert!(rate.allow_at("grant", DOWNLOAD_SCALE, None, now));
+        }
+        assert!(!rate.allow_at("grant", DOWNLOAD_SCALE, None, now));
+    }
+
+    #[test]
+    fn single_file_and_batch_costs_exhaust_the_window_budget() {
+        let rate = DownloadRate::new();
+        let now = Instant::now();
+        for _ in 0..DOWNLOAD_CAPACITY {
+            assert!(rate.allow_at("single", DOWNLOAD_SCALE, None, now));
+        }
+        assert!(!rate.allow_at("single", DOWNLOAD_SCALE, None, now));
+        for _ in 0..DOWNLOAD_CAPACITY {
+            assert!(rate.allow_at("batch", DOWNLOAD_SCALE, None, now));
+        }
+        assert!(!rate.allow_at("batch", DOWNLOAD_SCALE, None, now));
+    }
+
+    #[test]
+    fn a_full_window_refills_the_bucket() {
+        let rate = DownloadRate::new();
+        let now = Instant::now();
+        for _ in 0..DOWNLOAD_CAPACITY {
+            assert!(rate.allow_at("grant", DOWNLOAD_SCALE, None, now));
+        }
+        assert!(!rate.allow_at("grant", DOWNLOAD_SCALE, None, now));
+        assert!(rate.allow_at("grant", DOWNLOAD_SCALE, None, now + DOWNLOAD_WINDOW));
+    }
+
+    #[test]
+    fn the_download_table_evicts_the_oldest_key_at_capacity() {
+        let rate = DownloadRate::new();
+        let now = Instant::now();
+        for index in 0..DOWNLOAD_TABLE_CAP {
+            let key = format!("grant-{index}");
+            assert!(rate.allow_at(
+                &key,
+                DOWNLOAD_SCALE,
+                None,
+                now + Duration::from_nanos(index as u64),
+            ));
+        }
+        assert!(rate.allow_at(
+            "new-grant",
+            DOWNLOAD_SCALE,
+            None,
+            now + Duration::from_nanos(DOWNLOAD_TABLE_CAP as u64),
+        ));
+        let buckets = rate.buckets.lock().unwrap();
+        assert_eq!(buckets.len(), DOWNLOAD_TABLE_CAP);
+        assert!(!buckets.contains_key("grant-0"));
+        assert!(buckets.contains_key("new-grant"));
+    }
+
+    #[test]
+    fn a_slow_file_count_load_cannot_rewind_bucket_clock() {
+        let rate = DownloadRate::new();
+        let start = Instant::now();
+        let newer = start + DOWNLOAD_WINDOW / 2;
+        let later = newer + DOWNLOAD_WINDOW / 2;
+
+        assert!(rate
+            .allow_individual_at(
+                "grant",
+                || {
+                    // A concurrent request wins the race while this request
+                    // is loading the immutable file count.
+                    for _ in 0..(DOWNLOAD_CAPACITY as usize - 1) {
+                        assert!(rate.allow_at("grant", DOWNLOAD_SCALE, None, newer));
+                    }
+                    Ok::<_, ()>(2)
+                },
+                start,
+            )
+            .unwrap());
+        assert_eq!(rate.buckets.lock().unwrap()["grant"].last, newer);
+
+        // With the newer timestamp retained, the half-window refill leaves
+        // exactly half the budget for full-unit requests; rewinding would
+        // refill the whole window instead.
+        assert!(rate
+            .allow_individual_at("grant", || Ok::<_, ()>(2), later)
+            .unwrap());
+        for _ in 0..(DOWNLOAD_CAPACITY / 2) {
+            assert!(rate.allow_at("grant", DOWNLOAD_SCALE, None, later));
+        }
+        assert!(!rate.allow_at("grant", DOWNLOAD_SCALE, None, later));
     }
 }

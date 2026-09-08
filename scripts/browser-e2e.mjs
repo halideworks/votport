@@ -108,7 +108,106 @@ await page.waitForSelector("#new-link:not([hidden])");
 const linkUrl = (await page.textContent("#new-link-url")).trim();
 console.log("link:", linkUrl);
 
+const senderSource = fs.readFileSync(new URL("../web/assets/upload.js", import.meta.url), "utf8");
+const senderTestSource = senderSource.replace(
+  "  showResumeNote();\n})();",
+  "  showResumeNote();\n  window.__votportPreviewTest = { renderNote, setStatus, showDone };\n})();",
+);
+if (senderTestSource === senderSource) throw new Error("could not instrument sender preview test");
+await page.route("**/assets/upload.js", (route) => route.fulfill({
+  status: 200,
+  contentType: "text/javascript",
+  body: senderTestSource,
+}));
+const linkToken = new URL(linkUrl).pathname.split("/").filter(Boolean).pop();
+const previewInfo = {
+  usable: true,
+  label: "large-selection-test",
+  needs_password: false,
+  authorized: true,
+  max_entries: 1_000_000,
+  max_bytes: 1_000_000_000,
+  allow_hidden: true,
+  chunk_bytes: 8 * 1024 * 1024,
+  push: false,
+};
+const previewInfoRoute = (route) => {
+  if (new URL(route.request().url()).pathname === `/api/r/${linkToken}`) {
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(previewInfo) });
+  }
+  return route.continue();
+};
+await page.route("**/api/r/*", previewInfoRoute);
 await page.goto(linkUrl);
+await page.waitForSelector("#uploader:not([hidden])", { timeout: 15000 });
+
+const previewFiles = Array.from({ length: 100_000 }, (_, index) => ({
+  name: `preview-${String(index).padStart(6, "0")}.exr`,
+  mimeType: "application/octet-stream",
+  buffer: Buffer.from("x"),
+}));
+await page.setInputFiles("#file-input", previewFiles, { timeout: 180000 });
+const pickedPreview = await page.evaluate(() => ({
+  totals: document.getElementById("totals").textContent,
+  rows: document.querySelectorAll("#file-list > li").length,
+  fileRows: document.querySelectorAll("#file-list > li[data-path]").length,
+  sendDisabled: document.getElementById("send").disabled,
+}));
+if (!pickedPreview.totals.replaceAll(",", "").includes("100000 file(s)")
+  || !pickedPreview.totals.replaceAll(",", "").includes("Showing first 200 of 100000 selected files")
+  || pickedPreview.rows !== 200 || pickedPreview.fileRows !== 200 || pickedPreview.sendDisabled) {
+  throw new Error(`large picked preview failed: ${JSON.stringify(pickedPreview)}`);
+}
+console.log("100,000-file picked preview retains the full selection and 200 rows: ok");
+await page.click("#clear-files");
+
+await page.setInputFiles("#file-input", Array.from({ length: 201 }, (_, index) => ({
+  name: `count-${String(index).padStart(3, "0")}.exr`,
+  mimeType: "application/octet-stream",
+  buffer: Buffer.from("x"),
+})));
+const countPreview = await page.evaluate(() => {
+  window.__votportPreviewTest.setStatus("count-200.exr", "delivered ✓", true);
+  window.__votportPreviewTest.renderNote();
+  const progressNote = document.getElementById("progress-note").textContent;
+  document.getElementById("cancel").click();
+  const cancelDetail = document.getElementById("confirm-cancel-detail").textContent;
+  window.__votportPreviewTest.setStatus("count-200.exr", "Preparing");
+  window.__votportPreviewTest.renderNote();
+  const retryNote = document.getElementById("progress-note").textContent;
+  const files = Array.from({ length: 201 }, (_, index) => ({
+    path: `count-${String(index).padStart(3, "0")}.exr`, bytes: 1,
+    suite: "sha256", root: "a".repeat(64), receipt: false,
+  }));
+  let copiedProof = "";
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: { writeText: async (text) => { copiedProof = text; } },
+  });
+  window.__votportPreviewTest.showDone({ files });
+  document.getElementById("copy-proof").click();
+  return {
+    copiedProof,
+    progressNote,
+    retryNote,
+    cancelDetail,
+    doneSummary: document.getElementById("done-summary").textContent,
+    doneRows: document.querySelectorAll("#done-list > li").length,
+  };
+});
+if (!countPreview.progressNote.includes("1 of 201 files verified")
+  || !countPreview.retryNote.includes("0 of 201 files verified")
+  || !countPreview.cancelDetail.includes("The one already delivered is kept.")
+  || !countPreview.doneSummary.includes("201 files")
+  || !countPreview.doneSummary.includes("Showing first 200 of 201 delivered files below.")
+  || !countPreview.copiedProof.includes("count-200.exr")
+  || countPreview.doneRows !== 200) {
+  throw new Error(`large count state failed: ${JSON.stringify(countPreview)}`);
+}
+console.log("hidden progress/cancel counts and 200-row completed preview: ok");
+await page.unroute("**/assets/upload.js");
+await page.unroute("**/api/r/*", previewInfoRoute);
+await page.reload();
 await page.waitForSelector("#uploader:not([hidden])", { timeout: 15000 });
 await page.route("**/api/r/*/session", (route) => route.fulfill({ status: 503 }));
 await page.setInputFiles("#file-input", path.join(dir, "Résumé Draft.pdf"));

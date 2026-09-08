@@ -17,6 +17,7 @@ use axum::body::Bytes;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
+use vot_sdk::coverage::ObjectCoverage;
 use vot_sdk::object::{InMemoryObjectBuilder, ObjectId, Suite};
 use vot_sdk::package::{EntryStorage, PackageEntry, PackageIngest};
 use vot_sdk::verify::verify_range;
@@ -31,7 +32,7 @@ use crate::store::{
 pub const MAX_SEAL_BYTES: usize = 1024 * 1024;
 pub const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_PAGES: u64 = 4096;
-pub const MAX_ENTRIES: usize = 20_000;
+pub const MAX_ENTRIES: usize = 2_000_000;
 /// Covered bytes the client sends per chunk request.
 pub const CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 /// Body cap for one chunk request (data + proof + slack).
@@ -326,11 +327,118 @@ impl PushControl {
     }
 }
 
+// Staging identity and verified coverage outlive the bounded set of open sinks.
+struct StagedFile {
+    destination: PathBuf,
+    staging: PathBuf,
+    journal: PathBuf,
+    incarnation: [u8; 16],
+    coverage: Mutex<ObjectCoverage>,
+    active: Option<NativeFile>,
+    reopened: bool,
+    preserve: bool,
+}
+
+impl StagedFile {
+    fn new(native: NativeFile, destination: PathBuf, coverage: ObjectCoverage) -> Self {
+        let mut staged = Self {
+            destination,
+            staging: native.staging_path().to_path_buf(),
+            journal: native.journal_path().to_path_buf(),
+            incarnation: native.incarnation(),
+            coverage: Mutex::new(coverage),
+            active: Some(native),
+            reopened: false,
+            preserve: false,
+        };
+        staged.park();
+        staged
+    }
+
+    fn reopen(&mut self) -> Result<(), SessionError> {
+        if self.active.is_none() {
+            let coverage = self.coverage.get_mut().expect("staging coverage poisoned");
+            self.active = Some(
+                NativeFile::resume(
+                    coverage.object_id(),
+                    &self.destination,
+                    &self.staging,
+                    &self.journal,
+                    self.incarnation,
+                    CommitProfile::Balanced,
+                    coverage.runs(),
+                )
+                .map_err(|error| SessionError::internal(format!("reopen staging: {error}")))?,
+            );
+            self.reopened |= coverage.covered_bytes() > 0;
+        }
+        Ok(())
+    }
+
+    fn native(&self) -> Result<&NativeFile, SessionError> {
+        self.active
+            .as_ref()
+            .ok_or_else(|| SessionError::internal("staging is not open"))
+    }
+
+    fn record(&self, verified: &vot_sdk::verify::VerifiedSlice<'_>) -> Result<(), SessionError> {
+        self.coverage
+            .lock()
+            .expect("staging coverage poisoned")
+            .accept(verified)
+            .map_err(|error| {
+                SessionError::internal(format!("record verified coverage: {error:?}"))
+            })?;
+        Ok(())
+    }
+
+    fn park(&mut self) {
+        if let Some(native) = self.active.take() {
+            self.preserve |= native.recovery_required();
+            native.abandon();
+        }
+    }
+
+    fn abandon(mut self) {
+        self.preserve = true;
+        self.park();
+    }
+
+    fn staging_path(&self) -> &std::path::Path {
+        &self.staging
+    }
+    fn journal_path(&self) -> &std::path::Path {
+        &self.journal
+    }
+    fn incarnation(&self) -> [u8; 16] {
+        self.incarnation
+    }
+
+    fn progress(&self) -> vot_sdk_file::Progress {
+        let coverage = self.coverage.lock().expect("staging coverage poisoned");
+        vot_sdk_file::Progress {
+            covered_bytes: coverage.covered_bytes(),
+            prefix_bytes: coverage.contiguous_prefix(),
+            total_bytes: coverage.object_id().length,
+            fragments: coverage.fragment_count(),
+        }
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if self.active.is_none() && !self.preserve {
+            // Reacquire the journal identity before the SDK removes its files.
+            let _ = self.reopen();
+        }
+    }
+}
+
 struct FileState {
     display_path: String,
     stored_components: Vec<String>,
     object: ObjectId,
-    native: Option<NativeFile>,
+    native: Option<StagedFile>,
     published: bool,
     receipt: bool,
     /// When this file's first range was accepted, for the publish timing.
@@ -529,7 +637,10 @@ fn spawn_worker_from(
                     }
                     let entries: Vec<usize> = batch.iter().map(|item| item.entry).collect();
                     let published_before: Vec<bool> = match &phase {
-                        Phase::Receiving { files } => files.iter().map(|f| f.published).collect(),
+                        Phase::Receiving { files } => entries
+                            .iter()
+                            .map(|index| files.get(*index).is_some_and(|file| file.published))
+                            .collect(),
                         _ => Vec::new(),
                     };
                     let outcomes = accept_batch(&setup, &mut phase, &batch);
@@ -542,9 +653,12 @@ fn spawn_worker_from(
                                 }
                             }
                         }
-                        for (index, file) in files.iter().enumerate() {
-                            let was = published_before.get(index).copied().unwrap_or(false);
-                            if file.published && !was {
+                        let mut logged = HashSet::new();
+                        for (index, was) in entries.iter().zip(&published_before) {
+                            let Some(file) = files.get(*index) else {
+                                continue;
+                            };
+                            if file.published && !was && logged.insert(*index) {
                                 log.push(LogEvent {
                                     at: now,
                                     kind: "published".to_owned(),
@@ -677,6 +791,10 @@ fn handle_seal(setup: &WorkerSetup, phase: &mut Phase, bytes: &[u8]) -> Result<u
     Ok(pages)
 }
 
+fn entry_count_within_limit(count: usize) -> bool {
+    count <= MAX_ENTRIES
+}
+
 fn handle_page(phase: &mut Phase, bytes: &[u8]) -> Result<u64, SessionError> {
     let Phase::Pages {
         ingest,
@@ -692,7 +810,7 @@ fn handle_page(phase: &mut Phase, bytes: &[u8]) -> Result<u64, SessionError> {
         SessionError::bad(format!("manifest page rejected: {:?}", error.code()))
     })?;
     let new_entries = page.into_entries();
-    if entries.len() + new_entries.len() > MAX_ENTRIES {
+    if !entry_count_within_limit(entries.len() + new_entries.len()) {
         return Err(SessionError::bad(format!(
             "package exceeds {MAX_ENTRIES} entries"
         )));
@@ -888,21 +1006,18 @@ fn persist_session(setup: &WorkerSetup, files: &[FileState]) {
 
 /// Updates each in-progress file's covered prefix at a checkpoint.
 fn checkpoint_session(setup: &WorkerSetup, files: &[FileState]) {
-    let id = hex::encode(setup.session_id);
-    for (entry, file) in files.iter().enumerate() {
+    let progress = files.iter().enumerate().map(|(entry, file)| {
         let prefix = file
             .native
             .as_ref()
             .map_or(file.object.length, |native| native.progress().prefix_bytes);
-        if let Err(error) = setup.store.update_upload_file_progress(
-            &id,
-            entry,
-            prefix,
-            file.published,
-            file.receipt,
-        ) {
-            tracing::warn!(%error, entry, "checkpoint upload session failed");
-        }
+        (entry, prefix, file.published, file.receipt)
+    });
+    if let Err(error) = setup
+        .store
+        .update_upload_file_progress(&hex::encode(setup.session_id), progress)
+    {
+        tracing::warn!(%error, "checkpoint upload session failed");
     }
 }
 
@@ -953,7 +1068,9 @@ pub fn resume_worker(
             .map_err(|error| format!("{}: {error}", file.display_path))?;
             kept.push(file.staging_path.clone());
             kept.push(file.journal_path.clone());
-            Some(native)
+            let coverage = ObjectCoverage::from_runs(&file.object, runs)
+                .map_err(|error| format!("{}: {error:?}", file.display_path))?;
+            Some(StagedFile::new(native, destination, coverage))
         };
         files.push(FileState {
             display_path: file.display_path.clone(),
@@ -1120,8 +1237,12 @@ fn open_destination_for(
                 return Ok(FileState {
                     display_path,
                     stored_components: stored,
-                    object,
-                    native: Some(native),
+                    object: object.clone(),
+                    native: Some(StagedFile::new(
+                        native,
+                        destination,
+                        ObjectCoverage::new(&object),
+                    )),
                     published: false,
                     receipt: false,
                     first_range_at: None,
@@ -1201,10 +1322,11 @@ fn accept_range(
             error.code()
         ))
     })?;
-    let native = file
+    let staged = file
         .native
         .as_ref()
         .ok_or_else(|| SessionError::internal("file state lost"))?;
+    let native = staged.native()?;
     let deadline = Instant::now() + RANGE_IN_FLIGHT_BUDGET;
     let acceptance = loop {
         match native.accept(&verified) {
@@ -1220,6 +1342,7 @@ fn accept_range(
             }
         }
     };
+    staged.record(&verified)?;
     Ok(AcceptCore {
         accepted: matches!(acceptance.status, RangeStatus::Accepted),
         replay: matches!(acceptance.status, RangeStatus::Replay),
@@ -1252,14 +1375,29 @@ fn accept_batch(
             })
             .collect();
     };
+    let opening: Vec<_> = batch
+        .iter()
+        .map(|item| {
+            files
+                .get_mut(item.entry)
+                .ok_or_else(|| SessionError::bad(format!("no entry {}", item.entry)))
+                .and_then(|file| match file.native.as_mut() {
+                    Some(staged) => staged.reopen(),
+                    None if file.published => Ok(()),
+                    None => Err(SessionError::internal("file state lost")),
+                })
+        })
+        .collect();
     // Verify and accept every range against the shared files. Disjoint
     // ranges of one file, and ranges of different files, all proceed at once.
     let cores: Vec<Result<AcceptCore, SessionError>> = std::thread::scope(|scope| {
         let handles: Vec<_> = batch
             .iter()
-            .map(|item| {
+            .zip(opening)
+            .map(|(item, opened)| {
                 let files = &*files;
                 scope.spawn(move || {
+                    opened?;
                     accept_range(files, item.entry, item.offset, &item.proof, &item.data)
                 })
             })
@@ -1270,7 +1408,7 @@ fn accept_batch(
             .collect()
     });
     // Publish each completed file once, in order, with exclusive access.
-    batch
+    let outcomes = batch
         .iter()
         .zip(cores)
         .map(|(item, core)| {
@@ -1288,7 +1426,16 @@ fn accept_batch(
                 rebegin: false,
             })
         })
-        .collect()
+        .collect();
+    for item in batch {
+        if let Some(staged) = files
+            .get_mut(item.entry)
+            .and_then(|file| file.native.as_mut())
+        {
+            staged.park();
+        }
+    }
+    outcomes
 }
 
 struct Publication {
@@ -1409,6 +1556,7 @@ fn publish_push_entry(
     publications: &mut PublishedPushFiles,
     after_publish: impl FnOnce(),
 ) -> Result<(), SessionError> {
+    prepare_publication(file)?;
     let _publication_namespace = PUBLICATION_NAMESPACE
         .lock()
         .expect("publication namespace poisoned");
@@ -1417,7 +1565,13 @@ fn publish_push_entry(
     publications.capture(publication)
 }
 
-fn publish_file(setup: &WorkerSetup, file: &mut FileState) -> Result<Publication, SessionError> {
+fn prepare_publication(file: &mut FileState) -> Result<(), SessionError> {
+    let staged = file
+        .native
+        .as_mut()
+        .ok_or_else(|| SessionError::internal("file state lost"))?;
+    staged.reopen()?;
+    file.rehash |= staged.reopened;
     // Outside the publication lock: a multi-GiB rehash must not stall every
     // other session's publish. Nothing writes this staging meanwhile, since
     // publish runs on the session's worker after its accepts have joined.
@@ -1436,6 +1590,11 @@ fn publish_file(setup: &WorkerSetup, file: &mut FileState) -> Result<Publication
         })?;
         file.rehash = false;
     }
+    Ok(())
+}
+
+fn publish_file(setup: &WorkerSetup, file: &mut FileState) -> Result<Publication, SessionError> {
+    prepare_publication(file)?;
     let _publication_namespace = PUBLICATION_NAMESPACE
         .lock()
         .expect("publication namespace poisoned");
@@ -1452,7 +1611,11 @@ fn publish_file_locked(
         .native
         .as_mut()
         .ok_or_else(|| SessionError::internal("file state lost"))?;
-    native.publish().map_err(|error| {
+    let active = native
+        .active
+        .as_mut()
+        .ok_or_else(|| SessionError::internal("staging is not open"))?;
+    active.publish().map_err(|error| {
         SessionError::conflict(format!(
             "publish {} failed: {error}; the name may have been taken mid-upload, retry the upload",
             file.display_path
@@ -1460,7 +1623,7 @@ fn publish_file_locked(
     })?;
     // Best effort: the file is delivered and verified either way, and the
     // record notes whether its receipt exists.
-    let receipt = if let Some(observation) = native.publish_observation() {
+    let receipt = if let Some(observation) = active.publish_observation() {
         match setup
             .signer
             .write_sidecar(&destination, &file.object, setup.session_id, observation)
@@ -2143,7 +2306,9 @@ fn validate_push_manifest(
             "push manifest does not match the admitted package",
         ));
     }
-    if entries.is_empty() || entries.len() > MAX_ENTRIES || summary.entries != entries.len() as u64
+    if entries.is_empty()
+        || !entry_count_within_limit(entries.len())
+        || summary.entries != entries.len() as u64
     {
         return Err(SessionError::bad(format!(
             "package entry count is outside 1..={MAX_ENTRIES}"
@@ -2313,11 +2478,17 @@ fn reprove_staging(
                 ))
             })?;
         for file in &mut files {
-            file.native
+            let staged = file
+                .native
                 .as_mut()
-                .ok_or_else(|| SessionError::internal("push file state lost"))?
+                .ok_or_else(|| SessionError::internal("push file state lost"))?;
+            staged.reopen()?;
+            staged
+                .native()?
                 .accept(&verified)
                 .map_err(|error| SessionError::internal(format!("write failed: {error}")))?;
+            staged.record(&verified)?;
+            staged.park();
         }
         offset = cover
             .covered_offset
@@ -3524,6 +3695,147 @@ mod push_tests {
     }
 
     #[test]
+    fn six_figure_entry_counts_fit_without_a_large_fixture() {
+        for count in [0, 100_000, 999_999, 1_000_000, 1_999_998, 2_000_000] {
+            assert!(entry_count_within_limit(count));
+        }
+        for count in [2_000_001, usize::MAX] {
+            assert!(!entry_count_within_limit(count));
+        }
+    }
+
+    #[test]
+    fn dormant_staging_preserves_ranges_and_cleans_up_under_low_descriptor_limit() {
+        const CHILD: &str = "VOTPORT_STAGING_FD_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "session::push_tests::dormant_staging_preserves_ranges_and_cleans_up_under_low_descriptor_limit", "--nocapture"])
+                .env(CHILD, "1").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+            for _ in 0..3000 {
+                if child.try_wait().unwrap().is_some() {
+                    let output = child.wait_with_output().unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("staging descriptor subprocess exceeded 30 seconds");
+        }
+        let mut limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        limit.current = Some(64);
+        rustix::process::setrlimit(rustix::process::Resource::Nofile, limit).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let data = vec![23u8; 3 * 65_536];
+        let object = object(Suite::Blake3Bao64, &data);
+        let setup = setup(directory.path(), object.clone());
+        fs::create_dir_all(&setup.dest_dir).unwrap();
+        let files = (0..128)
+            .map(|index| {
+                open_destination_for(&setup, vec![format!("file-{index}")], object.clone()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(files
+            .iter()
+            .all(|file| file.native.as_ref().unwrap().active.is_none()));
+        let mut phase = Phase::Receiving { files };
+        let send = |phase: &mut Phase, entry, offset| {
+            let proof = vot_proof_blake3::prove(&data, offset, 65_536).unwrap();
+            let batch = [BatchChunk {
+                entry,
+                offset: proof.covered_offset,
+                proof: proof.proof.into(),
+                data: proof.data.into(),
+                reply: oneshot::channel().0,
+                _lease: SessionLease {
+                    activity: Arc::new(SessionActivity {
+                        in_flight: AtomicUsize::new(1),
+                        last_active: Mutex::new(Instant::now()),
+                        received: AtomicU64::new(0),
+                    }),
+                },
+            }];
+            accept_batch(&setup, phase, &batch).pop().unwrap()
+        };
+        for index in 0..128 {
+            let progress = send(&mut phase, index, 131_072).unwrap();
+            assert_eq!(progress.covered_bytes, 65_536);
+        }
+        assert_eq!(send(&mut phase, 0, 0).unwrap().covered_bytes, 131_072);
+        assert!(send(&mut phase, 0, 131_072).unwrap().replay);
+        assert!(send(&mut phase, 0, 65_536).unwrap().complete);
+        assert_eq!(fs::read(setup.dest_dir.join("file-0")).unwrap(), data);
+        let Phase::Receiving { files } = &mut phase else {
+            unreachable!()
+        };
+        let persisted = persisted_session(&setup, files);
+        assert!(persisted.files[0].published);
+        assert_eq!(persisted.files[1].prefix_bytes, 0);
+        assert!(!persisted.files[1].staging_path.as_os_str().is_empty());
+        let kept = files[1].native.take().unwrap();
+        let staging = kept.staging.clone();
+        let journal = kept.journal.clone();
+        let incarnation = kept.incarnation;
+        kept.abandon();
+        assert!(staging.exists() && journal.exists());
+        let reopened = NativeFile::resume(
+            &object,
+            setup.dest_dir.join("file-1"),
+            &staging,
+            &journal,
+            incarnation,
+            CommitProfile::Balanced,
+            [(131_072, 65_536)],
+        )
+        .unwrap();
+        assert_eq!(reopened.progress().covered_bytes, 65_536);
+        drop(reopened);
+        assert!(!staging.exists() && !journal.exists());
+        let tampered = files[2].native.as_ref().unwrap().staging.clone();
+        let mut file = fs::OpenOptions::new().write(true).open(tampered).unwrap();
+        file.seek(SeekFrom::Start(131_072)).unwrap();
+        std::io::Write::write_all(&mut file, b"wrong").unwrap();
+        drop(file);
+        send(&mut phase, 2, 0).unwrap();
+        assert!(send(&mut phase, 2, 65_536).is_err());
+        assert!(!setup.dest_dir.join("file-2").exists());
+        drop(phase);
+        let source = directory.path().join("quic-source");
+        fs::write(&source, &data).unwrap();
+        let mut destinations = (0..32)
+            .map(|index| {
+                open_destination_for(&setup, vec![format!("quic-{index}")], object.clone()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        reprove_staging(&source, &object, destinations.iter_mut().collect(), || true).unwrap();
+        for destination in &mut destinations {
+            let staged = destination.native.as_ref().unwrap();
+            assert!(staged.active.is_none());
+            assert_eq!(staged.progress().prefix_bytes, object.length);
+            let path = staged.destination.clone();
+            publish_file(&setup, destination).unwrap();
+            assert_eq!(fs::read(path).unwrap(), data);
+        }
+        drop(destinations);
+        assert!(
+            !fs::read_dir(&setup.dest_dir).unwrap().any(|entry| matches!(
+                entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .and_then(|part| part.to_str()),
+                Some("stage" | "journal")
+            ))
+        );
+    }
+
+    #[test]
     fn push_manifest_rejects_mismatch_pack_raw_path_and_entry_cap() {
         let directory = tempfile::tempdir().unwrap();
         let logical = object(Suite::Blake3Bao64, b"payload");
@@ -3562,12 +3874,7 @@ mod push_tests {
         let raw = record(vot_manifest::PackagePath::raw([b"file"]).unwrap(), &logical);
         assert!(validate_push_manifest(&setup, summary, &[raw]).is_err());
 
-        let too_many = vec![direct; MAX_ENTRIES + 1];
-        let oversized = vot_cli::PackageSummary {
-            entries: too_many.len() as u64,
-            ..summary
-        };
-        assert!(validate_push_manifest(&setup, oversized, &too_many).is_err());
+        assert!(!entry_count_within_limit(MAX_ENTRIES + 1));
     }
 
     #[test]
@@ -3843,6 +4150,12 @@ mod parallel_accept_tests {
             CommitProfile::Balanced,
         )
         .unwrap();
+        let mut native = StagedFile::new(
+            native,
+            directory.path().join("obj"),
+            ObjectCoverage::new(&object),
+        );
+        native.reopen().unwrap();
         let files = vec![FileState {
             display_path: "obj".to_owned(),
             stored_components: vec!["obj".to_owned()],

@@ -17,6 +17,7 @@ const $ = (id) => document.getElementById(id);
 const token = window.location.pathname.split('/').filter(Boolean).pop();
 
 const UPLOADS_IN_FLIGHT = 8;
+const MAX_VISIBLE_FILE_ROWS = 200;
 let chunkBytes = 2 * 1024 * 1024;
 let maxBytes = null;
 // Server-reported hash of the sender assets at page load; a mismatch later
@@ -41,6 +42,7 @@ async function reloadIfServerUpdated() {
   } catch { /* the original error stands */ }
 }
 const picked = new Map(); // relative path -> File
+let deliveredPaths = new Set(); // paths delivered so far, including hidden rows
 let uploading = false;
 let cancelled = false;
 let allowHidden = true; // the server's VOTPORT_ALLOW_HIDDEN, from the link info
@@ -443,7 +445,10 @@ function addNamed(pairs) {
     keys.set(key, joined);
     accepted.push([joined, file]);
   }
-  for (const [joined, file] of accepted) picked.set(joined, file);
+  for (const [joined, file] of accepted) {
+    picked.set(joined, file);
+    deliveredPaths.delete(joined);
+  }
   $('upload-error').hidden = true;
   renderPicked();
 }
@@ -470,9 +475,12 @@ function renderPicked() {
   rows = new Map();
   pickedKeys = new Map();
   let total = 0;
+  let visible = 0;
   for (const [path, file] of picked) {
     total += file.size;
     pickedKeys.set(pathKeyString(path.split('/')), path);
+    if (visible >= MAX_VISIBLE_FILE_ROWS) continue;
+    visible += 1;
     const item = document.createElement('li');
     item.dataset.path = path;
     const name = document.createElement('span');
@@ -486,7 +494,10 @@ function renderPicked() {
   }
   const limitError = sizeLimitMessage(total);
   $('totals').hidden = picked.size === 0;
-  $('totals').textContent = `${picked.size} file(s), ${formatBytes(total)} total${maxBytes === null ? '' : ` · limit ${formatBytes(maxBytes)}`}`;
+  const preview = picked.size > visible
+    ? ` · Showing first ${visible.toLocaleString()} of ${picked.size.toLocaleString()} selected files`
+    : '';
+  $('totals').textContent = `${picked.size} file(s), ${formatBytes(total)} total${maxBytes === null ? '' : ` · limit ${formatBytes(maxBytes)}`}${preview}`;
   $('clear-files').hidden = picked.size === 0;
   if (limitError) {
     fail(limitError);
@@ -502,6 +513,8 @@ function renderPicked() {
 // is sent, sending with its own meter, paused while the pool or network
 // recovers, verified once the server has published it with a receipt.
 function setStatus(path, text, done = false, fraction = null) {
+  if (done) deliveredPaths.add(path);
+  else deliveredPaths.delete(path);
   const item = rows.get(path);
   if (!item) return;
   item.querySelector('.status').textContent = text;
@@ -651,7 +664,7 @@ function renderNote() {
     }
   }
   parts.push(`${formatBytes(sentForNote)} of ${formatBytes(totalForNote)}`);
-  const verified = $('file-list').querySelectorAll('.done').length;
+  const verified = deliveredPaths.size;
   if (picked.size > 1) parts.push(`${verified} of ${picked.size} files verified`);
   $('progress-note').textContent = parts.join(' · ');
 }
@@ -1083,9 +1096,14 @@ function showDone(report) {
   const bytes = report.files.reduce((sum, file) => sum + file.bytes, 0);
   const at = new Date().toLocaleString();
   const count = report.files.length;
+  deliveredPaths = new Set(report.files.map((file) => file.path));
+  const visible = Math.min(count, MAX_VISIBLE_FILE_ROWS);
+  const preview = count > visible
+    ? ` Showing first ${visible.toLocaleString()} of ${count.toLocaleString()} delivered files below.`
+    : '';
   // The per-file identities below are what the server attested; the host
   // and time are the sender's own record of when it shipped.
-  const summary = `${count} file${count === 1 ? '' : 's'} · ${formatBytes(bytes)} · delivered to ${window.location.host}, verified on receipt, ${at}`;
+  const summary = `${count} file${count === 1 ? '' : 's'} · ${formatBytes(bytes)} · delivered to ${window.location.host}, verified on receipt, ${at}.${preview}`;
   $('done-summary').textContent = summary;
   const proof = [
     summary,
@@ -1096,7 +1114,7 @@ function showDone(report) {
   copy.onclick = () => copyToClipboard(copy, proof);
   const list = $('done-list');
   list.replaceChildren();
-  for (const file of report.files) {
+  for (const file of report.files.slice(0, MAX_VISIBLE_FILE_ROWS)) {
     appendObjectCard(
       list,
       { name: file.path, suite: file.suite, root: file.root },
@@ -1112,9 +1130,9 @@ function showDone(report) {
 // -------------------------------------------------------------------- wiring
 
 $('cancel').addEventListener('click', () => {
-  // Delivered rows are marked .done in the staged list as each file lands;
-  // #done-list only exists after the whole transfer finishes.
-  const delivered = $('file-list').querySelectorAll('.done').length;
+  // Delivered files are tracked separately from visible rows, so hidden rows
+  // still produce an honest cancellation summary.
+  const delivered = deliveredPaths.size;
   $('confirm-cancel-detail').textContent = delivered
     ? `Files still in progress are discarded.${keptPhrase(delivered)}`
     : 'Files still in progress are discarded. Nothing already delivered is affected.';
@@ -1136,6 +1154,7 @@ $('file-input').addEventListener('change', (event) => addFiles(event.target.file
 $('clear-files').addEventListener('click', () => {
   if (uploading) return;
   picked.clear();
+  deliveredPaths.clear();
   $('file-input').value = '';
   $('folder-input').value = '';
   renderPicked();
@@ -1242,7 +1261,7 @@ $('upload-form').addEventListener('submit', async (event) => {
     // A refusal is not a network story: the server said why, and whether
     // anything landed decides the advice.
     const unverified = error.status === 422 || error.status === 409;
-    const kept = $('file-list').querySelectorAll('.done').length;
+    const kept = deliveredPaths.size;
     const keptNote = keptPhrase(kept);
     fail(error.cancelled
       ? error.message
