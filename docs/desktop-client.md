@@ -968,3 +968,12 @@ Both native apps built and launched after installation. The Mac console
 remained locked, so its native menu was not visually qualified. Share drafts
 remain local to the current view, so navigating away still discards the
 form and selection, as it did before this navigation change.
+
+HTTP receive keeps a per-file `.vot-<name>.lease` sidecar beside an interrupted
+partial. Retry can reuse the server's signed download allowance for up to
+24 hours, bounded by the delivery's expiry. The sidecar is scoped to the
+server URL, file URL, and object root, is locked while receiving, and is
+removed after successful publication. Passwords are requested again on Retry.
+An exhausted delivery still serves metadata and password verification for
+recovery; fresh downloads, QUIC capability minting, bundles, and batches
+remain subject to the download cap. Revocation and expiry still refuse access.

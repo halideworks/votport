@@ -228,7 +228,7 @@ Every published file gets a sidecar, `<name>.vot-receipt`: a canonical
 [vot-receipt](https://github.com/halideworks/VOT) CBOR envelope, ed25519-signed
 with a key votport generates in the data directory (`receipt.key`), attesting
 that exactly that object (suite, BLAKE3 root, length) reached **Published**
-assurance under the Balanced commit profile, with the session, provider
+assurance under the receive filesystem's commit profile (Balanced locally, Fast on Linux SMB/NFS), with the session, provider
 incarnation, sequence, and UTC timestamp of the observation. The verifying
 public key is shown on **System** (and returned by `GET /api/admin/links` as
 `receipt_key`); the receipt's embedded key id is the same 32-byte public key.
@@ -288,8 +288,7 @@ hashed, verified range by range, independent of every proxy in between.
 4. **Deliver:** browse nested project directories and admin-uploaded files,
    select one or more files and issue one expiring, revocable download link,
    or share a project folder directly and issue one expiring, revocable
-   download link. Manual mixed selection is limited to 64 files; direct folder
-   shares can include up to 50,000 files.
+   download link. Manual selection and direct folder shares can include up to 1,000,000 files.
    Library upload requests retry within the current browser or desktop
    operation. Selecting a file again starts a fresh upload, so a changed
    file cannot reuse another attempt's partial bytes even when its name,
@@ -314,7 +313,7 @@ newer).
 Create a tenant-scoped automation token on **Deliver**. The raw token is shown
 once, so copy it immediately; revoke it and create another if it is lost.
 Use the token to share a server-relative outbound directory from the CLI (up
-to 50,000 files per share):
+to 1,000,000 files per share):
 
 ```sh
 export VOTPORT_URL=https://drop.example.com
@@ -340,7 +339,7 @@ publishes each file the moment its coverage is complete.
 
 That serial verify is what leaves headroom on a fast NIC. Raising the range
 size or verifying in parallel needs VOT changes on the server verify path;
-the VOT pin at `0a129ea` does not include them. Do not raise `CHUNK_BYTES`
+the current VOT pin does not include a larger range ceiling. Do not raise `CHUNK_BYTES`
 in votport ahead of that work.
 
 Measure on this box:

@@ -2483,12 +2483,7 @@ pub async fn outbound_metadata(
             .ok_or_else(ApiError::not_found)?;
         let grant = page.grant;
         let files_total = page.file_count;
-        if grant.revoked_at.is_some()
-            || grant.expires_at <= now_unix()
-            || grant
-                .max_downloads
-                .is_some_and(|max| grant.downloads >= max)
-        {
+        if grant.revoked_at.is_some() || grant.expires_at <= now_unix() {
             return Err(ApiError::not_found());
         }
         let _operation = begin_outbound_operation(&app, &grant.tenant)?;
@@ -2539,7 +2534,7 @@ pub async fn outbound_metadata(
         )
             .into_response());
     }
-    let grant = active_grant(&app, &token)?;
+    let grant = readable_grant(&app, &token)?;
     let _operation = begin_outbound_operation(&app, &grant.tenant)?;
     let authorized = grant_authorized(&app, &grant, &headers);
     if grant.password_hash.is_some() && !authorized {
@@ -2599,7 +2594,7 @@ pub async fn outbound_metadata(
             "batch_url": format!("/api/s/{token}/batch"),
             // Present only when the VOT serve listener is bound: where a VOT
             // client dials and where it mints its capability.
-            "fetch": app.serve.as_ref().map(|serve| json!({
+            "fetch": app.serve.as_ref().filter(|_| !grant.max_downloads.is_some_and(|max| grant.downloads >= max)).map(|serve| json!({
                 "address": serve.address,
                 "certificate_digest": hex::encode(serve.certificate_digest),
                 "mint_url": format!("/api/s/{token}/fetch"),
@@ -2703,7 +2698,7 @@ pub async fn verify_outbound_password(
     headers: HeaderMap,
     Json(request): Json<VerifyOutboundRequest>,
 ) -> ApiResult<Response> {
-    let grant = active_grant(&app, &token)?;
+    let grant = readable_grant(&app, &token)?;
     let _operation = begin_outbound_operation(&app, &grant.tenant)?;
     let ip = super::client_ip(&headers, &peer, &app.config.trusted_proxies);
     super::upload::check_password(
@@ -3472,7 +3467,7 @@ pub async fn outbound_bundle(
     Ok(response)
 }
 
-pub(crate) fn active_grant(app: &App, token: &str) -> ApiResult<OutboundGrant> {
+fn readable_grant(app: &App, token: &str) -> ApiResult<OutboundGrant> {
     if !valid_token(token) {
         return Err(ApiError::not_found());
     }
@@ -3481,11 +3476,17 @@ pub(crate) fn active_grant(app: &App, token: &str) -> ApiResult<OutboundGrant> {
         .outbound_grant_by_token_hash(&hash_token(token))
         .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
-    if grant.revoked_at.is_some()
-        || grant.expires_at <= now_unix()
-        || grant
-            .max_downloads
-            .is_some_and(|max| grant.downloads >= max)
+    if grant.revoked_at.is_some() || grant.expires_at <= now_unix() {
+        return Err(ApiError::not_found());
+    }
+    Ok(grant)
+}
+
+pub(crate) fn active_grant(app: &App, token: &str) -> ApiResult<OutboundGrant> {
+    let grant = readable_grant(app, token)?;
+    if grant
+        .max_downloads
+        .is_some_and(|max| grant.downloads >= max)
     {
         return Err(ApiError::not_found());
     }
