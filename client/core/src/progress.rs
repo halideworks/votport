@@ -98,8 +98,9 @@ pub(crate) fn with_progress<T: Send>(
     })
 }
 
-/// How many carrier bytes pass between two [`Event::Bytes`] reports.
-pub(crate) const PROGRESS_QUANTUM: u64 = 1 << 20;
+/// Report every placement; the FFI throttles screen updates by time. A byte
+/// threshold leaves small-file transfers without a rate between crossings.
+pub(crate) const PROGRESS_QUANTUM: u64 = 1;
 
 /// An observer that drops every event, for callers that do not want progress.
 pub struct Silent;

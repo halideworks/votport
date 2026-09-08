@@ -75,7 +75,20 @@ public sealed class TransferItem : INotifyPropertyChanged
     internal TransferView? View
     {
         get => view;
-        set { view = value; Changed(); Changed(nameof(Status)); Changed(nameof(Fraction)); Changed(nameof(Files)); Changed(nameof(Detail)); Changed(nameof(HasDetail)); Changed(nameof(Route)); Changed(nameof(HasRoute)); Changed(nameof(HasTotal)); Changed(nameof(ResumeLabel)); }
+        set {
+            if (value is null || value.FilesReset)
+            {
+                Files = value?.Files.Select(file => new FileRow(file)).ToList() ?? new();
+                filesByIndex.Clear();
+                foreach (var row in Files) filesByIndex.TryAdd(row.Index, row);
+                Changed(nameof(Files));
+            }
+            else
+            {
+                foreach (var file in value.Files)
+                    if (filesByIndex.TryGetValue(file.Index, out var row)) row.Update(file);
+            }
+            view = value; Changed(); Changed(nameof(Status)); Changed(nameof(Fraction)); Changed(nameof(Detail)); Changed(nameof(HasDetail)); Changed(nameof(Route)); Changed(nameof(HasRoute)); Changed(nameof(HasTotal)); Changed(nameof(ResumeLabel)); }
     }
 
     /// The path in the person's words, once the core chose it.
@@ -98,7 +111,8 @@ public sealed class TransferItem : INotifyPropertyChanged
     public double Fraction => view is null || view.TotalBytes is null || view.TotalBytes == 0
         ? 0
         : 100.0 * view.MovedBytes / view.TotalBytes.Value;
-    public IEnumerable<FileRow> Files => view?.Files.Select(file => new FileRow(file)) ?? Enumerable.Empty<FileRow>();
+    public List<FileRow> Files { get; private set; } = new();
+    private readonly Dictionary<ulong, FileRow> filesByIndex = new();
     public bool Done => view?.Phase == Phase.Done;
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -108,9 +122,17 @@ public sealed class TransferItem : INotifyPropertyChanged
 }
 
 /// One file of a transfer, drawn from the core's row.
-public sealed class FileRow
+public sealed class FileRow : INotifyPropertyChanged
 {
-    private readonly FileView file;
+    private FileView file;
+    public ulong Index => file.Index;
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    internal void Update(FileView value)
+    {
+        file = value;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(null));
+    }
 
     internal FileRow(FileView file) { this.file = file; }
 

@@ -104,8 +104,10 @@ struct TransferCard: View {
                             .foregroundStyle(Tokens.muted)
                             .textSelection(.enabled)
                     }
-                    ForEach(view.files, id: \.index) { file in
-                        FileRowView(file: file)
+                    if !item.files.isEmpty {
+                        TransferFileList(files: item.files)
+                            .equatable()
+                            .frame(height: min(CGFloat(item.files.count) * 32, 280))
                     }
                 }
             }
@@ -126,9 +128,26 @@ struct TransferCard: View {
     }
 }
 
+// Membership changes only on reset, which creates new row objects.
+struct TransferFileList: View, Equatable {
+    let files: [TransferFile]
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.files.count == rhs.files.count && lhs.files.first === rhs.files.first
+    }
+
+    var body: some View {
+        List(files) { row in
+            FileRowView(row: row)
+        }
+        .listStyle(.plain)
+    }
+}
+
 /// One file of a transfer, drawn from the core's row.
 struct FileRowView: View {
-    let file: FileView
+    @ObservedObject var row: TransferFile
+    private var file: FileView { row.view }
 
     var body: some View {
         HStack {

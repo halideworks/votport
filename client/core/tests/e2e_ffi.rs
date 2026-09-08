@@ -47,13 +47,31 @@ fn journalled(id: &Option<String>) -> bool {
     ffi::pending().iter().any(|entry| entry.id == id)
 }
 
+fn record(views: &mut Vec<TransferView>, mut view: TransferView) {
+    if !view.files_reset {
+        let mut files = views
+            .last()
+            .map(|last| last.files.clone())
+            .unwrap_or_default();
+        for changed in view.files {
+            let row = files
+                .iter_mut()
+                .find(|file| file.index == changed.index)
+                .unwrap();
+            *row = changed;
+        }
+        view.files = files;
+    }
+    views.push(view);
+}
+
 /// Records every view the core hands over, as a shell would draw them.
 #[derive(Default)]
 struct Recorder(Mutex<Vec<TransferView>>);
 
 impl TransferListener for Recorder {
     fn update(&self, view: TransferView) {
-        self.0.lock().unwrap().push(view);
+        record(&mut self.0.lock().unwrap(), view);
     }
 }
 
@@ -69,7 +87,7 @@ impl TransferListener for CancelOnTransferring {
         if view.phase == Phase::Transferring && !self.transfer.is_cancelled() {
             self.transfer.cancel();
         }
-        self.views.lock().unwrap().push(view);
+        record(&mut self.views.lock().unwrap(), view);
     }
 }
 
