@@ -50,6 +50,16 @@ impl From<Error> for PortError {
     }
 }
 
+impl PortError {
+    pub(crate) fn sign_in(error: Error) -> Self {
+        Self::Failed {
+            headline: error.headline(),
+            detail: error.to_string(),
+            signed_out: false,
+        }
+    }
+}
+
 /// The port an operator is signed in to, as a shell shows it. Never the
 /// cookie.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -89,25 +99,149 @@ fn drop_stored() {
 /// The origin `base` names, trimmed of a trailing slash, when it is an
 /// `http` or `https` URL with a host and nothing after it.
 fn origin(base: &str) -> Result<String> {
-    let trimmed = base.trim().trim_end_matches('/');
-    let rest = trimmed
-        .strip_prefix("https://")
-        .or_else(|| trimmed.strip_prefix("http://"))
-        .ok_or_else(|| Error::BadLink {
-            link: base.to_owned(),
-        })?;
-    if rest.is_empty() || rest.contains(['/', '?', '#', '@']) {
-        return Err(Error::BadLink {
-            link: base.to_owned(),
-        });
+    let invalid = || Error::BadLink {
+        link: base.to_owned(),
+    };
+    let url = reqwest::Url::parse(base.trim()).map_err(|_| invalid())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
     }
-    Ok(trimmed.to_owned())
+    Ok(url.origin().ascii_serialization())
 }
 
 #[derive(Deserialize)]
 struct SessionInfo {
     #[serde(default)]
     tenant: String,
+}
+
+/// One browser sign-in started by this process, bound to its original port.
+#[derive(uniffi::Object)]
+pub struct SsoLogin {
+    base: String,
+    verifier: String,
+    state: String,
+    authorization_url: String,
+    started: std::time::Instant,
+    active: std::sync::Mutex<bool>,
+}
+
+pub fn begin_sso(base: &str) -> Result<std::sync::Arc<SsoLogin>> {
+    use rand::RngCore as _;
+    use sha2::Digest as _;
+    let base = origin(base)?;
+    let client = Client::authentication(&base)?;
+    let available: serde_json::Value = client.admin_get("/api/admin/sso", "")?;
+    if available["available"] != true {
+        return Err(Error::Other(
+            "SSO is not configured on this port".to_owned(),
+        ));
+    }
+    let mut verifier = [0; 32];
+    let mut state = [0; 16];
+    rand::rngs::OsRng.fill_bytes(&mut verifier);
+    rand::rngs::OsRng.fill_bytes(&mut state);
+    let verifier = hex::encode(verifier);
+    let state = hex::encode(state);
+    let challenge = hex::encode(sha2::Sha256::digest(verifier.as_bytes()));
+    let authorization_url =
+        format!("{base}/api/admin/sso/start?desktop_challenge={challenge}&desktop_state={state}");
+    Ok(std::sync::Arc::new(SsoLogin {
+        base,
+        verifier,
+        state,
+        authorization_url,
+        started: std::time::Instant::now(),
+        active: std::sync::Mutex::new(true),
+    }))
+}
+
+impl SsoLogin {
+    fn code(&self, callback: &str) -> Result<String> {
+        let invalid =
+            || Error::Other("This sign-in was not started by this app; start again".to_owned());
+        let url = reqwest::Url::parse(callback).map_err(|_| invalid())?;
+        let query: Vec<_> = url.query_pairs().collect();
+        let code = url.path().strip_prefix('/').ok_or_else(invalid)?;
+        if url.scheme() != "votport"
+            || url.host_str() != Some("signin")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.port().is_some()
+            || url.fragment().is_some()
+            || code.len() != 32
+            || !code.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || query.len() != 1
+            || query[0].0 != "state"
+            || query[0].1 != self.state
+        {
+            return Err(invalid());
+        }
+        Ok(code.to_owned())
+    }
+
+    fn complete_inner(&self, callback: &str) -> Result<Port> {
+        let code = self.code(callback)?;
+        if self.started.elapsed() >= std::time::Duration::from_secs(600)
+            || !*self.active.lock().expect("SSO state poisoned")
+        {
+            return Err(Error::Other(
+                "Sign-in expired or was cancelled; start again".to_owned(),
+            ));
+        }
+        #[derive(Deserialize)]
+        struct Exchange {
+            cookie: String,
+        }
+        let client = Client::authentication(&self.base)?;
+        let exchange: Exchange = client.admin_send(
+            reqwest::Method::POST,
+            "/api/admin/sso/exchange",
+            "",
+            Some(&serde_json::json!({ "code": code, "verifier": self.verifier })),
+        )?;
+        let session: SessionInfo = client.admin_get("/api/admin/session", &exchange.cookie)?;
+        // Cancellation can run during the network calls; only the final private
+        // write holds the state lock, so a cancelled flow cannot replace a port.
+        let mut active = self.active.lock().expect("SSO state poisoned");
+        if !*active || self.started.elapsed() >= std::time::Duration::from_secs(600) {
+            return Err(Error::Other(
+                "Sign-in expired or was cancelled; start again".to_owned(),
+            ));
+        }
+        store(&Stored {
+            base: self.base.clone(),
+            cookie: exchange.cookie,
+            tenant: session.tenant.clone(),
+        })?;
+        *active = false;
+        Ok(Port {
+            base: self.base.clone(),
+            tenant: session.tenant,
+        })
+    }
+}
+
+#[uniffi::export]
+impl SsoLogin {
+    pub fn authorization_url(&self) -> String {
+        self.authorization_url.clone()
+    }
+
+    pub fn cancel(&self) {
+        *self.active.lock().expect("SSO state poisoned") = false;
+    }
+
+    pub fn complete(&self, callback: String) -> std::result::Result<Port, PortError> {
+        self.complete_inner(&callback).map_err(PortError::sign_in)
+    }
 }
 
 /// Signs in to the votport at `base` with the admin password and keeps the
@@ -1083,6 +1217,45 @@ mod tests {
     }
 
     #[test]
+    fn sso_callbacks_are_bound_to_the_local_attempt() {
+        let state = "ab".repeat(16);
+        let code = "cd".repeat(16);
+        let login = SsoLogin {
+            base: "https://original.example".into(),
+            verifier: "ef".repeat(32),
+            state: state.clone(),
+            authorization_url: String::new(),
+            started: std::time::Instant::now(),
+            active: std::sync::Mutex::new(true),
+        };
+        let callback = format!("votport://signin/{code}?state={state}");
+        assert_eq!(login.code(&callback).unwrap(), code);
+        for invalid in [
+            format!("https://signin/{code}?state={state}"),
+            format!("votport://other/{code}?state={state}"),
+            format!("votport://user@signin/{code}?state={state}"),
+            format!("votport://signin:80/{code}?state={state}"),
+            format!("{callback}#fragment"),
+            format!("{callback}&state={state}"),
+            format!("{callback}&base=https://other.example"),
+            format!("votport://signin/{code}?state=wrong"),
+            format!("votport://signin/short?state={state}"),
+            format!("votport://signin/{}?state={state}", "x".repeat(32)),
+            format!("votport://signin/{code}"),
+        ] {
+            assert!(login.code(&invalid).is_err(), "{invalid}");
+        }
+        login.cancel();
+        assert!(login.complete_inner(&callback).is_err());
+        let expired = SsoLogin {
+            started: std::time::Instant::now() - std::time::Duration::from_secs(600),
+            active: std::sync::Mutex::new(true),
+            ..login
+        };
+        assert!(expired.complete_inner(&callback).is_err());
+    }
+
+    #[test]
     fn an_origin_is_a_scheme_and_a_host_and_nothing_else() {
         assert_eq!(
             origin(" https://drop.example/ ").unwrap(),
@@ -1092,11 +1265,15 @@ mod tests {
             origin("http://127.0.0.1:18080").unwrap(),
             "http://127.0.0.1:18080"
         );
+        assert_eq!(origin("http://[::1]:18080/").unwrap(), "http://[::1]:18080");
         for bad in [
             "drop.example",
             "https://",
             "https://drop.example/r/abc",
             "ftp://x",
+            "https://user:password@drop.example",
+            "https://drop.example?other=1",
+            "https://drop.example#fragment",
         ] {
             assert!(matches!(origin(bad), Err(Error::BadLink { .. })), "{bad}");
         }

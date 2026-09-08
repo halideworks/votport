@@ -107,6 +107,7 @@ pub struct App {
     /// OIDC configuration when SSO is enabled; the client discovers lazily.
     pub sso_config: Option<crate::config::OidcConfig>,
     pub sso_client: SsoSlot,
+    pub desktop_sign_ins: crate::api::sso::DesktopSignIns,
     pub push: Option<PushState>,
     /// The VOT serve listener for Deliver over QUIC, when bound.
     pub serve: Option<crate::api::serve::ServeState>,
@@ -842,6 +843,7 @@ fn build_under_lease(
         http,
         sso_config: config.oidc.clone(),
         sso_client: SsoSlot::new(),
+        desktop_sign_ins: crate::api::sso::DesktopSignIns::default(),
         push,
         serve,
         serve_metrics: crate::api::serve::ServeMetrics::default(),
@@ -2398,6 +2400,7 @@ pub fn router(app: Arc<App>) -> Router {
         // SSO sign-in (phase 3 of docs/multi-tenancy.md).
         .route("/api/admin/sso", get(api::sso_available))
         .route("/api/admin/sso/start", get(api::sso_start))
+        .route("/api/admin/sso/exchange", post(api::sso::sso_exchange))
         .route("/api/admin/callback", get(api::sso_callback))
         // Public upload API.
         // SCIM 2.0 provisioning, bearer-authenticated, no cookie or CSRF header.

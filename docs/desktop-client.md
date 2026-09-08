@@ -203,8 +203,9 @@ connection; a 401 becomes `Error::NotSignedIn` and a refused password
 server's own reason ("Label must be 1..=200 characters."). The CLI gains `signin`
 (password from a flag or stdin), `signout`, `port`, `requests`,
 `issue-request`, `close-request`, `deliveries`, `revoke-delivery`,
-`library`, `issue-delivery`, and `upload`. SSO sign-in still needs the three server
-touches under "The shells" and is not in the core yet. Watch folders (phase C6) are in the core and the CLI
+`library`, `issue-delivery`, and `upload`. The macOS and Windows shells also
+offer browser SSO through the core's `begin_sso` and `SsoLogin` handoff.
+Watch folders (phase C6) are in the core and the CLI
 as well (`watch.rs`): the list of watches lives in `watches.json` under
 the state directory (a folder, a request link, and the link's password
 when it has one, since an unattended send must hold it); a watcher thread
@@ -731,14 +732,13 @@ screens the admin pages have, over the same JSON routes, so the
 password path needs no new server surface: create a request link and
 send it, issue a deliver grant from the library or from a folder the app
 uploads, watch transfers land. Mutating admin routes also require the
-`X-Votport` header, which the core sends. SSO needs a small server
-addition, because the OIDC callback (`/api/admin/callback`) reads the
-state cookie set by `/api/admin/sso/start`, so it must land in the
-browser that started it: three touches, a flag on the start route
-carried in the signed state, a branch in the callback that redirects to
-`votport://signin/<one-time code>` instead of the admin page, and an
-exchange route that turns the code into the admin cookie within a
-minute. The CLI signs in with the password; an automation token serves
+`X-Votport` header, which the core sends. Browser SSO carries the app's
+challenge and nonce in the signed start cookie. The OIDC callback stays
+in that browser, then opens `votport://signin/<one-time code>?state=<nonce>`.
+The app exchanges the code at its original port with its private verifier
+within a minute, validates the session, and stores the cookie. Cancellation
+or a failed exchange preserves the existing port. Duplicate callbacks are
+ignored while the first completes. The CLI signs in with the password; an automation token serves
 only scripted grant creation on `/api/automation/share`. Tenant
 switching follows the admin session's tenant.
 

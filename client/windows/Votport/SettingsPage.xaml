@@ -22,6 +22,11 @@
             <PasswordBox x:Name="AdminPasswordBox" Grid.Column="1" PlaceholderText="Admin password" />
             <Button x:Name="SignInButton" Grid.Column="2" Content="Sign in" Click="SignIn_Click" Style="{StaticResource AccentButtonStyle}" />
           </Grid>
+          <Button x:Name="SsoButton" Content="Sign in with SSO" Click="Sso_Click" />
+          <StackPanel x:Name="SsoPending" Orientation="Horizontal" Spacing="8" Visibility="Collapsed">
+            <TextBlock Text="Complete sign-in in your browser." VerticalAlignment="Center" />
+            <Button Content="Cancel sign-in" Click="CancelSso_Click" />
+          </StackPanel>
         </StackPanel>
         <Grid x:Name="SignedIn" ColumnSpacing="8" Visibility="Collapsed">
           <Grid.ColumnDefinitions>

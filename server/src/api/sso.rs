@@ -23,8 +23,9 @@ use openidconnect::{
     PkceCodeChallenge, RedirectUrl, Scope,
 };
 use openidconnect::{OAuth2TokenResponse as _, TokenResponse as _};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::Digest as _;
 
 use crate::app::App;
 use crate::auth;
@@ -275,6 +276,112 @@ pub async fn sso_available(State(app): State<std::sync::Arc<App>>) -> Response {
         .into_response()
 }
 
+#[derive(Deserialize, Default)]
+pub struct StartParams {
+    desktop_challenge: Option<String>,
+    desktop_state: Option<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct DesktopFlow {
+    challenge: [u8; 32],
+    state: String,
+}
+
+impl StartParams {
+    fn desktop(self) -> Result<Option<DesktopFlow>, &'static str> {
+        match (self.desktop_challenge, self.desktop_state) {
+            (None, None) => Ok(None),
+            (Some(challenge), Some(state)) => {
+                if challenge.len() != 64 {
+                    return Err("invalid desktop challenge");
+                }
+                let challenge = hex::decode(challenge)
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or("invalid desktop challenge")?;
+                if state.len() != 32 || !state.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err("invalid desktop state");
+                }
+                Ok(Some(DesktopFlow { challenge, state }))
+            }
+            _ => Err("desktop challenge and state are both required"),
+        }
+    }
+}
+
+struct DesktopHandoff {
+    flow: DesktopFlow,
+    identity: auth::AdminIdentity,
+    expires: u64,
+}
+
+#[derive(Default)]
+pub struct DesktopSignIns(std::sync::Mutex<std::collections::HashMap<String, DesktopHandoff>>);
+
+impl DesktopSignIns {
+    fn issue(&self, flow: DesktopFlow, identity: auth::AdminIdentity, now: u64) -> Option<String> {
+        let mut pending = self.0.lock().expect("desktop sign-ins poisoned");
+        pending.retain(|_, login| login.expires > now);
+        if pending.len() >= 1024 {
+            return None;
+        }
+        let code = auth::random_token();
+        let target = format!("votport://signin/{code}?state={}", flow.state);
+        pending.insert(
+            code,
+            DesktopHandoff {
+                flow,
+                identity,
+                expires: now + 60,
+            },
+        );
+        Some(target)
+    }
+
+    fn exchange(&self, code: &str, verifier: &str, now: u64) -> Option<auth::AdminIdentity> {
+        if code.len() != 32 || verifier.len() != 64 {
+            return None;
+        }
+        let digest = sha2::Sha256::digest(verifier.as_bytes());
+        let mut pending = self.0.lock().expect("desktop sign-ins poisoned");
+        pending.retain(|_, login| login.expires > now);
+        let login = pending.get(code)?;
+        if !auth::constant_time_eq(&login.flow.challenge, &digest) {
+            return None;
+        }
+        pending.remove(code).map(|login| login.identity)
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ExchangeParams {
+    code: String,
+    verifier: String,
+}
+
+pub async fn sso_exchange(
+    State(app): State<std::sync::Arc<App>>,
+    axum::Json(params): axum::Json<ExchangeParams>,
+) -> super::ApiResult<Response> {
+    let identity = app
+        .desktop_sign_ins
+        .exchange(&params.code, &params.verifier, crate::store::now_unix())
+        .ok_or_else(|| {
+            super::ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "sign-in expired or was already used; start again",
+            )
+        })?;
+    let cookie = super::admin::issue_admin_cookie(&app, &identity)?;
+    let cookie = cookie.split(';').next().unwrap_or_default();
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        axum::Json(json!({ "cookie": cookie })),
+    )
+        .into_response())
+}
+
 const STATE_COOKIE: &str = "votport_sso_x";
 const STATE_SECS: u64 = 600;
 
@@ -299,6 +406,7 @@ fn sign_payload(secret: &[u8; 32], expires: u64, payload: &str) -> String {
 async fn start_flow(
     app: &std::sync::Arc<App>,
     config: crate::config::OidcConfig,
+    desktop: Option<DesktopFlow>,
 ) -> Result<Response, Response> {
     let public_url = app.config.public_url.clone().ok_or_else(|| {
         (
@@ -337,6 +445,7 @@ async fn start_flow(
         "state": state.secret(),
         "nonce": nonce.secret(),
         "verifier": verifier.secret(),
+        "desktop": desktop,
     })
     .to_string();
     let expires = crate::store::now_unix() + STATE_SECS;
@@ -368,9 +477,16 @@ async fn start_flow(
         .into_response())
 }
 
-pub async fn sso_start(State(app): State<std::sync::Arc<App>>) -> Response {
+pub async fn sso_start(
+    State(app): State<std::sync::Arc<App>>,
+    Query(params): Query<StartParams>,
+) -> Response {
+    let desktop = match params.desktop() {
+        Ok(desktop) => desktop,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
     match app.sso_config.clone() {
-        Some(config) => start_flow(&app, config)
+        Some(config) => start_flow(&app, config, desktop)
             .await
             .unwrap_or_else(|response| response),
         None => (StatusCode::NOT_FOUND, "SSO is not configured").into_response(),
@@ -625,18 +741,42 @@ pub async fn sso_callback(
         Ok(identity) => identity,
         Err(message) => return home(message),
     };
+    if !flow["desktop"].is_null() {
+        let desktop = match serde_json::from_value::<DesktopFlow>(flow["desktop"].clone()) {
+            Ok(desktop) => desktop,
+            Err(_) => return home("invalid desktop sign-in state"),
+        };
+        let Some(target) = app
+            .desktop_sign_ins
+            .issue(desktop, identity, crate::store::now_unix())
+        else {
+            return home("too many pending desktop sign-ins; try again shortly");
+        };
+        return (
+            StatusCode::FOUND,
+            [
+                (header::SET_COOKIE, clear_state_cookie(&app)),
+                (header::LOCATION, target),
+                (header::CACHE_CONTROL, "no-store".to_owned()),
+            ],
+        )
+            .into_response();
+    }
     let admin_cookie = match super::admin::issue_admin_cookie(&app, &identity) {
         Ok(cookie) => cookie,
         Err(_) => return home("could not complete sign-in"),
     };
-    let clear_state = clear_state_cookie(&app);
+    browser_login_response(&app, admin_cookie)
+}
+
+fn browser_login_response(app: &App, admin_cookie: String) -> Response {
     (
-        [
-            (header::SET_COOKIE, admin_cookie),
-            (header::SET_COOKIE, clear_state),
-            (header::LOCATION, "/".to_owned()),
-        ],
         StatusCode::FOUND,
+        [(header::LOCATION, "/"), (header::CACHE_CONTROL, "no-store")],
+        axum::response::AppendHeaders([
+            (header::SET_COOKIE, admin_cookie),
+            (header::SET_COOKIE, clear_state_cookie(app)),
+        ]),
     )
         .into_response()
 }
@@ -645,6 +785,106 @@ pub async fn sso_callback(
 mod tests {
     use super::*;
     use crate::auth::AdminIdentity;
+
+    #[test]
+    fn desktop_handoffs_bind_proof_expire_and_are_single_use() {
+        let verifier = "ab".repeat(32);
+        let flow = DesktopFlow {
+            challenge: sha2::Sha256::digest(verifier.as_bytes()).into(),
+            state: "cd".repeat(16),
+        };
+        let handoffs = std::sync::Arc::new(DesktopSignIns::default());
+        let target = handoffs
+            .issue(flow.clone(), AdminIdentity::local_admin(), 100)
+            .unwrap();
+        let code = target
+            .strip_prefix("votport://signin/")
+            .unwrap()
+            .split('?')
+            .next()
+            .unwrap();
+        assert!(target.ends_with(&format!("?state={}", flow.state)));
+        assert!(handoffs.exchange(code, "short", 101).is_none());
+        assert!(handoffs.exchange("short", &verifier, 101).is_none());
+        assert!(handoffs.exchange(code, &"ef".repeat(32), 101).is_none());
+        let successes = std::thread::scope(|scope| {
+            let first = scope.spawn(|| handoffs.exchange(code, &verifier, 159));
+            let second = scope.spawn(|| handoffs.exchange(code, &verifier, 159));
+            usize::from(first.join().unwrap().is_some())
+                + usize::from(second.join().unwrap().is_some())
+        });
+        assert_eq!(successes, 1);
+        assert!(handoffs.exchange(code, &verifier, 159).is_none());
+        let target = handoffs
+            .issue(flow.clone(), AdminIdentity::local_admin(), 100)
+            .unwrap();
+        let code = target
+            .strip_prefix("votport://signin/")
+            .unwrap()
+            .split('?')
+            .next()
+            .unwrap();
+        assert!(handoffs.exchange(code, &verifier, 160).is_none());
+        for _ in 0..1024 {
+            assert!(handoffs
+                .issue(flow.clone(), AdminIdentity::local_admin(), 200)
+                .is_some());
+        }
+        assert!(handoffs
+            .issue(flow.clone(), AdminIdentity::local_admin(), 259)
+            .is_none());
+        assert!(handoffs
+            .issue(flow, AdminIdentity::local_admin(), 260)
+            .is_some());
+    }
+
+    #[test]
+    fn desktop_start_requires_a_complete_valid_binding() {
+        assert!(StartParams::default().desktop().unwrap().is_none());
+        let challenge = "ab".repeat(32);
+        let state = "cd".repeat(16);
+        assert!(StartParams {
+            desktop_challenge: Some(challenge.clone()),
+            desktop_state: Some(state.clone())
+        }
+        .desktop()
+        .unwrap()
+        .is_some());
+        for (desktop_challenge, desktop_state) in [
+            (Some(challenge.clone()), None),
+            (None, Some(state.clone())),
+            (Some("x".repeat(64)), Some(state.clone())),
+            (Some("00".into()), Some(state.clone())),
+            (Some(challenge.clone()), Some("x".repeat(32))),
+            (Some(challenge), Some("00".into())),
+        ] {
+            assert!(StartParams {
+                desktop_challenge,
+                desktop_state
+            }
+            .desktop()
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn browser_login_keeps_both_session_and_state_cookies() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let response = browser_login_response(&app, "votport_admin=test-session".into());
+        let cookies: Vec<_> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            cookies,
+            ["votport_admin=test-session", &clear_state_cookie(&app)]
+        );
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(response.headers()[header::LOCATION], "/");
+    }
 
     #[test]
     fn azp_ok_when_absent_or_matching() {

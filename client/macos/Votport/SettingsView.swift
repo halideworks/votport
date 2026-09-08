@@ -134,6 +134,7 @@ struct HomePortSection: View {
                 HStack {
                     TextField("https://drop.example", text: $base)
                         .textFieldStyle(.roundedBorder)
+                        .disabled(port.signingInBrowser)
                     PasswordField("Admin password", text: $password)
                         .textFieldStyle(.roundedBorder)
                         .frame(width: 180)
@@ -142,7 +143,18 @@ struct HomePortSection: View {
                         password = ""
                     }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(base.trimmingCharacters(in: .whitespaces).isEmpty || password.isEmpty || port.busy)
+                    .disabled(base.trimmingCharacters(in: .whitespaces).isEmpty || password.isEmpty || port.busy || port.signingInBrowser)
+                }
+                HStack {
+                    if port.signingInBrowser {
+                        Text("Complete sign-in in your browser.")
+                            .font(Type.caption)
+                            .foregroundStyle(Tokens.muted)
+                        Button("Cancel sign-in") { port.cancelSso() }
+                    } else {
+                        Button("Sign in with SSO") { port.beginSso(base: base) }
+                            .disabled(base.trimmingCharacters(in: .whitespaces).isEmpty || port.busy)
+                    }
                 }
                 if let problem = port.problem(for: .port) {
                     Text(problem)

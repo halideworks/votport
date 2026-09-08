@@ -213,14 +213,20 @@ impl Client {
     /// # Errors
     /// A TLS or client build failure.
     pub fn new(base: impl Into<String>) -> Result<Self> {
+        Self::with_timeout(base, None)
+    }
+
+    pub(crate) fn authentication(base: impl Into<String>) -> Result<Self> {
+        Self::with_timeout(base, Some(std::time::Duration::from_secs(20)))
+    }
+
+    fn with_timeout(base: impl Into<String>, timeout: Option<std::time::Duration>) -> Result<Self> {
         let http = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("votport-client/", env!("CARGO_PKG_VERSION")))
-            // No total-request timeout: an 8 MiB chunk on a slow uplink, or a
-            // finish that rehashes a resumed file, legitimately runs long. A
-            // dead connection is bounded by the connect timeout and by the
-            // retry on a stalled request instead.
-            .timeout(None)
+            // Transfers can legitimately run long; only authentication uses
+            // a total-request timeout.
+            .timeout(timeout)
             .connect_timeout(std::time::Duration::from_secs(20))
             .build()
             .map_err(|source| Error::Http {

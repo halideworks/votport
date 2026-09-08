@@ -383,6 +383,12 @@ public static class Launch
     /// A votport: link opened from a web page prefills the page it names.
     public static void OpenUrl(Uri url)
     {
+        if (url.Scheme == "votport" && url.Host == "signin")
+        {
+            PortStore.Shared.CompleteSso(url);
+            App.Window?.Show("settings");
+            return;
+        }
         if (WebLink(url) is not (string kind, string link)) return;
         if (kind == "r")
         {

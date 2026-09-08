@@ -41,7 +41,11 @@ public sealed partial class SettingsPage : Page
         {
             PortText.Text = signed.Tenant.Length == 0 ? $"Signed in to {signed.Base}" : $"Signed in to {signed.Base} (tenant {signed.Tenant})";
         }
-        SignInButton.IsEnabled = !port.Busy && BaseBox.Text.Trim().Length > 0 && AdminPasswordBox.Password.Length > 0;
+        SignInButton.IsEnabled = !port.Busy && !port.SigningInBrowser && BaseBox.Text.Trim().Length > 0 && AdminPasswordBox.Password.Length > 0;
+        BaseBox.IsEnabled = !port.SigningInBrowser;
+        SsoButton.IsEnabled = !port.Busy && BaseBox.Text.Trim().Length > 0;
+        SsoButton.Visibility = port.SigningInBrowser ? Visibility.Collapsed : Visibility.Visible;
+        SsoPending.Visibility = port.SigningInBrowser ? Visibility.Visible : Visibility.Collapsed;
         var portProblem = port.ProblemFor(PortStore.Scope.Port);
         PortProblem.Text = portProblem ?? "";
         PortProblem.Visibility = portProblem is null ? Visibility.Collapsed : Visibility.Visible;
@@ -74,6 +78,9 @@ public sealed partial class SettingsPage : Page
         PortStore.Shared.SignIn(BaseBox.Text.Trim(), AdminPasswordBox.Password);
         AdminPasswordBox.Password = "";
     }
+
+    private void Sso_Click(object sender, RoutedEventArgs e) => PortStore.Shared.BeginSso(BaseBox.Text.Trim());
+    private void CancelSso_Click(object sender, RoutedEventArgs e) => PortStore.Shared.CancelSso();
 
     private void SignOut_Click(object sender, RoutedEventArgs e) => PortStore.Shared.SignOut();
 
