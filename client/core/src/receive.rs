@@ -608,7 +608,67 @@ pub(crate) fn local_path(dest: &Path, name: &str) -> Result<PathBuf> {
             }
         }
     }
+    let anchor = resolve_directory(dest)?;
+    let parent = resolve_directory(path.parent().unwrap_or(dest))?;
+    if !parent.starts_with(&anchor) {
+        return Err(Error::Other(format!(
+            "the parent directory of {name:?} leaves the receive destination"
+        )));
+    }
     Ok(path)
+}
+
+// Resolve existing directory links while retaining directories not created yet.
+// The selected root is trusted; only a delivered path's parents are confined.
+fn resolve_directory(path: &Path) -> Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(canonical) => {
+            if !fs::metadata(&canonical)?.is_dir() {
+                return Err(Error::Other(format!(
+                    "{} is not a directory",
+                    path.display()
+                )));
+            }
+            return Ok(canonical);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let absolute = std::path::absolute(path)?;
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::Prefix(_) => {
+                resolved.push(component);
+                continue;
+            }
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            std::path::Component::CurDir => continue,
+            _ => resolved.push(component),
+        }
+        match fs::canonicalize(&resolved) {
+            Ok(canonical) => {
+                if !fs::metadata(&canonical)?.is_dir() {
+                    return Err(Error::Other(format!(
+                        "{} is not a directory",
+                        resolved.display()
+                    )));
+                }
+                resolved = canonical;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::symlink_metadata(&resolved) {
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(_) => return Err(error.into()),
+                    Err(other) => return Err(other.into()),
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(resolved)
 }
 
 /// Joins a bundle manifest's package path to `dest`, refused the same way as a
@@ -735,6 +795,57 @@ mod tests {
                 assert!(matches!(result, Err(Error::Exists { .. })), "{result:?}");
             }
         }
+    }
+
+    #[test]
+    fn receive_paths_allow_missing_directories_and_reject_file_parents() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = home.path().join("new/root");
+        assert_eq!(
+            local_path(&dest, "nested/file").unwrap(),
+            dest.join("nested/file")
+        );
+        assert!(!dest.exists());
+        fs::write(home.path().join("file"), b"untouched").unwrap();
+        assert!(local_path(home.path(), "file/child").is_err());
+        assert!(resolve_directory(&home.path().join("missing/../file")).is_err());
+        assert_eq!(fs::read(home.path().join("file")).unwrap(), b"untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receive_paths_confine_nested_links_but_allow_root_and_inside_aliases() {
+        use std::os::unix::fs::symlink;
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let outside = home.path().join("root-other");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let alias = home.path().join("selected-alias");
+        symlink(&root, &alias).unwrap();
+        assert_eq!(
+            local_path(&alias, "new/file").unwrap(),
+            alias.join("new/file")
+        );
+        symlink(&outside, root.join("escape")).unwrap();
+        let error = local_path(&root, "escape/file").unwrap_err();
+        assert!(error.worth_retrying());
+        let announced = admit("escape/file", PathBuf::new(), true).unwrap();
+        assert!(local_path_of(&root, &announced.path).is_err());
+        fs::create_dir(root.join("real")).unwrap();
+        symlink(root.join("real"), root.join("inside")).unwrap();
+        assert_eq!(
+            local_path(&root, "inside/new/file").unwrap(),
+            root.join("inside/new/file")
+        );
+        symlink(outside.join("missing"), root.join("dangling")).unwrap();
+        assert!(local_path(&root, "dangling/file").is_err());
+        let unusual_root = root.join("missing/../inside");
+        assert_eq!(
+            resolve_directory(&unusual_root).unwrap(),
+            fs::canonicalize(root.join("real")).unwrap()
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
     }
 
     fn receive_from(

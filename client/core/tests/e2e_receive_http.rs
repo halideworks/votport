@@ -165,3 +165,51 @@ fn an_interrupted_download_resumes_from_the_partial() {
         "resumed from {PREFIX}, but the first mark was {first}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_receive_refuses_an_escaping_parent_link_before_writing() {
+    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
+        return;
+    };
+    let server = common::start_server(&bin, &[]);
+    let token = common::deliver(
+        &server.base,
+        &[("nested/file", b"bytes".to_vec())],
+        None,
+        None,
+    );
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let outside = home.path().join("outside");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("nested")).unwrap();
+    let result = receive_over_http(
+        &server.base,
+        Delivery {
+            token: token.clone(),
+            password: None,
+        },
+        &root,
+        &mut Silent,
+    );
+    assert!(matches!(result, Err(Error::Other(_))), "{result:?}");
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    std::fs::remove_file(root.join("nested")).unwrap();
+    let alias = home.path().join("chosen-alias");
+    std::os::unix::fs::symlink(&root, &alias).unwrap();
+    let received = receive_over_http(
+        &server.base,
+        Delivery {
+            token,
+            password: None,
+        },
+        &alias,
+        &mut Silent,
+    )
+    .unwrap();
+    assert_eq!(received.files, vec![alias.join("nested/file")]);
+    assert_eq!(std::fs::read(root.join("nested/file")).unwrap(), b"bytes");
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+}
