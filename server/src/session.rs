@@ -3774,29 +3774,8 @@ mod push_tests {
     }
 
     #[test]
+    #[ignore = "changes the process descriptor limit; CI runs this test alone"]
     fn dormant_staging_preserves_ranges_and_cleans_up_under_low_descriptor_limit() {
-        const CHILD: &str = "VOTPORT_STAGING_FD_TEST_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "session::push_tests::dormant_staging_preserves_ranges_and_cleans_up_under_low_descriptor_limit", "--nocapture"])
-                .env(CHILD, "1").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
-            for _ in 0..3000 {
-                if child.try_wait().unwrap().is_some() {
-                    let output = child.wait_with_output().unwrap();
-                    assert!(
-                        output.status.success(),
-                        "{}{}",
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("staging descriptor subprocess exceeded 30 seconds");
-        }
         let mut limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
         limit.current = Some(64);
         rustix::process::setrlimit(rustix::process::Resource::Nofile, limit).unwrap();

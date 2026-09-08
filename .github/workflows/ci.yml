@@ -51,7 +51,9 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo test
+        run: |
+          cargo test
+          cargo test --lib -- --ignored --exact session::push_tests::dormant_staging_preserves_ranges_and_cleans_up_under_low_descriptor_limit
 
   client:
     runs-on: ubuntu-24.04
