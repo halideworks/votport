@@ -441,7 +441,9 @@ pub fn clean_staging(root: &Path, keep: &std::collections::HashSet<PathBuf>) {
         if is_dir && is_push_staging_name(name) {
             // `walk` only labels entries as directories using `file_type`, so
             // symlinks are never handed to `remove_dir_all` and never followed.
-            let _ = std::fs::remove_dir_all(path);
+            if !keep.contains(path) {
+                let _ = std::fs::remove_dir_all(path);
+            }
             return false;
         }
         if !is_dir && is_staging_file(name) && !keep.contains(path) {

@@ -268,6 +268,9 @@ mod log_tests {
 /// Shared control for one native-push admission and its eventual connection.
 #[derive(Clone, Default)]
 pub struct PushControl {
+    pub(crate) resume_key: Option<String>,
+    directory_lock: Arc<Mutex<Option<fs::File>>>,
+    parked: Arc<AtomicBool>,
     cancellation: vot_cli::CancellationHandle,
     connected: Arc<AtomicBool>,
     aborted: Arc<AtomicBool>,
@@ -288,6 +291,36 @@ impl PushControl {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn resumable(key: String, lock: Option<fs::File>) -> Self {
+        let parked = lock.is_none();
+        Self {
+            resume_key: Some(key),
+            directory_lock: Arc::new(Mutex::new(lock)),
+            parked: Arc::new(AtomicBool::new(parked)),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn staging_dir(&self, setup: &WorkerSetup) -> PathBuf {
+        self.resume_key.as_ref().map_or_else(
+            || push_staging_dir(setup),
+            |key| setup.dest_dir.join(format!(".vot-push-{key}")),
+        )
+    }
+
+    pub(crate) fn park(&self) -> bool {
+        if self.resume_key.is_none() {
+            return false;
+        }
+        self.parked.store(true, Ordering::Release);
+        self.connected.store(false, Ordering::Release);
+        self.directory_lock
+            .lock()
+            .expect("push directory poisoned")
+            .take();
+        true
     }
 
     /// Claims creation of the shared receive state; later rails join it.
@@ -952,6 +985,12 @@ impl PersistTracker {
     }
 }
 
+pub(crate) fn persist_push(setup: &WorkerSetup, key: String) -> Result<(), String> {
+    let mut session = persisted_session(setup, &[]);
+    session.push_key = Some(key);
+    setup.store.insert_upload_session(&session)
+}
+
 /// Builds the resume record for a session's current files. Published files
 /// carry no staging handle; boot re-attach skips them.
 fn persisted_session(setup: &WorkerSetup, files: &[FileState]) -> PersistedUploadSession {
@@ -992,6 +1031,7 @@ fn persisted_session(setup: &WorkerSetup, files: &[FileState]) -> PersistedUploa
         })
         .collect();
     PersistedUploadSession {
+        push_key: None,
         id: hex::encode(setup.session_id),
         link_id: setup.link_id.clone(),
         tenant: setup.tenant.clone(),
@@ -1670,29 +1710,71 @@ fn publish_file_locked(
 /// Runs on a re-attached file before publish: the resumed prefix was
 /// bookkeeping, and this is what makes the published bytes verified.
 fn staged_object_matches(path: &std::path::Path, object: &ObjectId) -> Result<(), String> {
+    if staged_object_valid(path, object, || true)? {
+        Ok(())
+    } else {
+        Err("staged bytes do not match the announced object".to_owned())
+    }
+}
+
+fn staged_object_valid(
+    path: &std::path::Path,
+    object: &ObjectId,
+    active: impl Fn() -> bool,
+) -> Result<bool, String> {
     let suite = Suite::try_from(object.suite).map_err(|_| "unsupported suite".to_owned())?;
-    let mut input = fs::File::open(path).map_err(|error| format!("open staging: {error}"))?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+        );
+    }
+    let mut input = options
+        .open(path)
+        .map_err(|error| format!("open staging: {error}"))?;
+    let metadata = input
+        .metadata()
+        .map_err(|error| format!("stat staging: {error}"))?;
+    if !metadata.is_file() {
+        return Err("staging is not a regular file".to_owned());
+    }
+    if metadata.len() != object.length {
+        return Ok(false);
+    }
     let mut builder = InMemoryObjectBuilder::new(suite, Some(object.length), object.length)
         .map_err(|error| format!("object builder: {:?}", error.code()))?;
     let mut buf = vec![0u8; 1024 * 1024];
-    loop {
+    let mut remaining = object.length;
+    while remaining > 0 {
+        if !active() {
+            return Err("staging verification cancelled".to_owned());
+        }
+        let limit = usize::try_from(remaining.min(buf.len() as u64)).unwrap_or(buf.len());
         let count = input
-            .read(&mut buf)
+            .read(&mut buf[..limit])
             .map_err(|error| format!("read staging: {error}"))?;
         if count == 0 {
-            break;
+            return Ok(false);
         }
+        remaining -= count as u64;
         builder
             .update(&buf[..count])
             .map_err(|error| format!("hash staging: {:?}", error.code()))?;
     }
+    if input
+        .read(&mut buf[..1])
+        .map_err(|error| format!("read staging: {error}"))?
+        != 0
+    {
+        return Ok(false);
+    }
     let prepared = builder
         .finish()
         .map_err(|error| format!("hash staging: {:?}", error.code()))?;
-    if prepared.object_id() != object {
-        return Err("staged bytes do not match the announced object".to_owned());
-    }
-    Ok(())
+    Ok(prepared.object_id() == object)
 }
 
 fn handle_finish(
@@ -1960,6 +2042,15 @@ impl PushReceive {
                 .compare_exchange(previous, now, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
+            if let Some(lock) = self
+                .control
+                .directory_lock
+                .lock()
+                .expect("push directory poisoned")
+                .as_ref()
+            {
+                let _ = lock.set_modified(std::time::SystemTime::now());
+            }
             let id = hex::encode(self.setup.session_id);
             let _ = self.app.sessions.mark_active(&id);
             self.app
@@ -2053,6 +2144,24 @@ impl PushReceive {
             return Ok(None);
         }
         let path = self.staging.join("objects").join(hex::encode(key.root));
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                if staged_object_valid(&path, &ObjectId::from(key), || {
+                    self.mark_active();
+                    !self.control.is_cancelled()
+                })
+                .map_err(SessionError::internal)?
+                {
+                    self.complete_object(object)?;
+                    return Ok(None);
+                }
+                fs::remove_file(&path).map_err(|error| {
+                    SessionError::internal(format!("remove incomplete push object: {error}"))
+                })?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(SessionError::internal(format!("stat push object: {error}"))),
+        }
         let sink = vot_scheduler::FileSink::create_new(&path, key.length)
             .map_err(|error| SessionError::internal(format!("create push object: {error}")))?;
         Ok(Some(Box::new(PushFileSink {
@@ -2173,8 +2282,9 @@ impl PushReceive {
 impl Drop for PushReceive {
     fn drop(&mut self) {
         let sid = hex::encode(self.setup.session_id);
-        let inner = self.inner.lock().expect("push receive poisoned");
-        if !inner.succeeded {
+        let mut inner = self.inner.lock().expect("push receive poisoned");
+        let succeeded = inner.succeeded;
+        if !succeeded {
             let (outcome, detail) = if self.control.is_aborted() {
                 ("cancelled", "cancelled by the sender".to_owned())
             } else {
@@ -2196,14 +2306,23 @@ impl Drop for PushReceive {
                 0,
             );
         }
+        inner.entries.clear();
         drop(inner);
+        crate::app::remove_push_ticket(&self.app, &sid);
+        if !succeeded && self.control.park() {
+            let _ = self.app.sessions.mark_active(&sid);
+            return;
+        }
+        if let Err(error) = self.setup.store.delete_upload_session(&sid) {
+            tracing::warn!(%error, "delete completed push session");
+        }
         if let Err(error) = fs::remove_dir_all(&self.staging) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(path = %self.staging.display(), %error, "remove push staging");
             }
         }
         self.app.sessions.remove(&sid);
-        crate::app::remove_push_ticket(&self.app, &sid);
+        self.control.park();
     }
 }
 
@@ -2249,6 +2368,37 @@ impl vot_cli::ReceiveSink for PushFileSink {
     }
 }
 
+pub(crate) fn lock_push_directory(directory: &std::path::Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::DIRECTORY).bits() as i32,
+        );
+    }
+    lock_push_handle(options.open(directory)?, directory)
+}
+
+fn lock_push_handle(file: fs::File, directory: &std::path::Path) -> std::io::Result<fs::File> {
+    file.try_lock().map_err(std::io::Error::other)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let held = file.metadata()?;
+        let named = fs::symlink_metadata(directory)?;
+        if !named.is_dir() || held.dev() != named.dev() || held.ino() != named.ino() {
+            return Err(std::io::Error::other(
+                "push directory changed while locking",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = directory;
+    Ok(file)
+}
+
 /// The staging directory supplied to [`vot_cli::PushAdmission`].
 #[must_use]
 pub fn push_staging_dir(setup: &WorkerSetup) -> PathBuf {
@@ -2273,7 +2423,7 @@ pub(crate) fn push_seams(
     runtime: tokio::runtime::Handle,
 ) -> (vot_cli::ReceiveSeams, PushSeamHandle) {
     let receive = Arc::new(PushReceive {
-        staging: push_staging_dir(&setup),
+        staging: control.staging_dir(&setup),
         app,
         setup,
         control,
@@ -3033,29 +3183,43 @@ impl Sessions {
         if inner.pinned_links.contains(&link_id) {
             return Err(InsertError::LinkPinned);
         }
-        if inner.map.len() >= max_sessions
-            || inner
+        let replacing = match &kind {
+            SessionKind::Push(control) => control.resume_key.as_ref().and_then(|key| {
+                inner
+                    .map
+                    .iter()
+                    .find_map(|(id, handle)| match &handle.kind {
+                        SessionKind::Push(old) if old.resume_key.as_ref() == Some(key) => {
+                            Some((id.clone(), old.parked.load(Ordering::Acquire)))
+                        }
+                        _ => None,
+                    })
+            }),
+            SessionKind::Http => None,
+        };
+        if replacing.as_ref().is_some_and(|(_, parked)| !parked) {
+            return Err(InsertError::Capacity);
+        }
+        let old_id = replacing.as_ref().map(|(id, _)| id);
+        let handles = || {
+            inner
                 .map
-                .values()
-                .filter(|handle| handle.link_id == link_id)
-                .count()
-                >= max_link_sessions
+                .iter()
+                .filter(|(id, _)| Some(*id) != old_id)
+                .map(|(_, handle)| handle)
+        };
+        if handles().count() >= max_sessions
+            || handles().filter(|handle| handle.link_id == link_id).count() >= max_link_sessions
         {
             return Err(InsertError::Capacity);
         }
-        let tenant_sessions = inner
-            .map
-            .values()
-            .filter(|handle| handle.tenant == tenant)
-            .count();
+        let tenant_sessions = handles().filter(|handle| handle.tenant == tenant).count();
         if max_tenant_sessions.is_some_and(|max| tenant_sessions as u64 >= max) {
             return Err(InsertError::TenantSessionLimit);
         }
         if let Some(max_total) = max_total_bytes {
             let received = received.unwrap_or(0);
-            let already_reserved = inner
-                .map
-                .values()
+            let already_reserved = handles()
                 .filter(|handle| handle.tenant == tenant)
                 .fold(0_u64, |total, handle| {
                     total.saturating_add(handle.reserved_bytes)
@@ -3067,6 +3231,9 @@ impl Sessions {
             {
                 return Err(InsertError::ByteQuota);
             }
+        }
+        if let Some((old_id, _)) = replacing {
+            inner.map.remove(&old_id);
         }
         inner.map.insert(
             id,
@@ -3163,6 +3330,12 @@ impl Sessions {
             .map
             .get(id)
             .map(|handle| handle.link_id.clone())
+    }
+
+    pub(crate) fn contains_push_key(&self, key: &str) -> bool {
+        self.inner.lock().expect("sessions poisoned").map.values().any(|handle| {
+            matches!(&handle.kind, SessionKind::Push(control) if control.resume_key.as_deref() == Some(key))
+        })
     }
 
     pub fn contains_push(&self, id: &str) -> bool {
@@ -3504,6 +3677,47 @@ mod pin_tests {
     }
 
     #[test]
+    fn parked_push_replacement_excludes_its_own_slot_and_bytes_only() {
+        let sessions = Sessions::new();
+        let old = PushControl::resumable("same".to_owned(), None);
+        let mut first = admission("first", 60, 100, 1);
+        first.kind = SessionKind::Push(old);
+        first.max_sessions = 1;
+        first.max_link_sessions = 1;
+        sessions
+            .insert_admitted(first, dummy_sender(), || Ok(0))
+            .unwrap();
+        let make_retry = || {
+            let mut next = admission("next", 60, 100, 1);
+            next.kind = SessionKind::Push(PushControl::resumable("same".to_owned(), None));
+            next.max_sessions = 1;
+            next.max_link_sessions = 1;
+            next
+        };
+        assert_eq!(
+            sessions.insert_admitted(make_retry(), dummy_sender(), || Ok(41)),
+            Err(InsertError::ByteQuota)
+        );
+        assert!(sessions.contains_push("first"));
+        sessions
+            .insert_admitted(make_retry(), dummy_sender(), || Ok(40))
+            .unwrap();
+        assert!(!sessions.contains_push("first"));
+        assert!(sessions.contains_push("next"));
+        assert_eq!(
+            sessions.inner.lock().unwrap().map["next"].reserved_bytes,
+            60
+        );
+        let mut foreign = make_retry();
+        foreign.id = "foreign".to_owned();
+        foreign.kind = SessionKind::Push(PushControl::resumable("other".to_owned(), None));
+        assert_eq!(
+            sessions.insert_admitted(foreign, dummy_sender(), || Ok(0)),
+            Err(InsertError::Capacity)
+        );
+    }
+
+    #[test]
     fn push_touch_is_rejected_without_changing_activity() {
         let sessions = Sessions::new();
         let mut push = admission("push", 0, 100, 1);
@@ -3685,6 +3899,14 @@ mod push_tests {
 
     fn setup(directory: &std::path::Path, expected_package: ObjectId) -> WorkerSetup {
         let app = crate::api::testing::build(directory);
+        setup_with_app(directory, expected_package, &app)
+    }
+
+    fn setup_with_app(
+        directory: &std::path::Path,
+        expected_package: ObjectId,
+        app: &crate::app::App,
+    ) -> WorkerSetup {
         WorkerSetup {
             store: Arc::clone(&app.store),
             link_id: "link".to_owned(),
@@ -3699,6 +3921,183 @@ mod push_tests {
             started_at: 1,
             quiet_after_secs: 5,
             ended: mpsc::unbounded_channel().0,
+        }
+    }
+
+    #[test]
+    fn staged_validation_distinguishes_bad_content_from_io_and_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("object");
+        let expected = object(Suite::Blake3Bao64, b"complete");
+        for (bytes, valid) in [
+            (b"complete".as_slice(), true),
+            (b"corrupt!", false),
+            (b"short", false),
+            (b"complete!", false),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(
+                staged_object_valid(&path, &expected, || true).unwrap(),
+                valid
+            );
+        }
+        fs::write(&path, b"complete").unwrap();
+        assert!(staged_object_valid(&path, &expected, || false).is_err());
+        assert!(!staged_object_valid(&path, &expected, || {
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(b"!")
+                .unwrap();
+            true
+        })
+        .unwrap());
+        fs::remove_file(&path).unwrap();
+        assert!(staged_object_valid(&path, &expected, || true).is_err());
+        fs::create_dir(&path).unwrap();
+        assert!(staged_object_valid(&path, &expected, || true).is_err());
+        #[cfg(unix)]
+        {
+            fs::remove_dir(&path).unwrap();
+            let target = directory.path().join("target");
+            fs::write(&target, b"complete").unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            assert!(staged_object_valid(&path, &expected, || true).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_directory_lock_refuses_a_detached_handle_and_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let stage = directory.path().join("stage");
+        fs::create_dir(&stage).unwrap();
+        let stale = fs::File::open(&stage).unwrap();
+        fs::remove_dir(&stage).unwrap();
+        fs::create_dir(&stage).unwrap();
+        assert!(lock_push_handle(stale, &stage).is_err());
+        let held = lock_push_directory(&stage).unwrap();
+        assert!(lock_push_directory(&stage).is_err());
+        drop(held);
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&stage, &alias).unwrap();
+        assert!(lock_push_directory(&alias).is_err());
+    }
+
+    #[tokio::test]
+    async fn push_retry_rehashes_objects_and_reproves_them_before_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = [b"first payload".as_slice(), b"second payload".as_slice()];
+        let objects = data.map(|bytes| object(Suite::Blake3Bao64, bytes));
+        let expected = ObjectId {
+            suite: 1,
+            root: [9; 32],
+            length: data.iter().map(|bytes| bytes.len() as u64).sum(),
+        };
+        let application = crate::api::testing::build(directory.path());
+        let first_setup = setup_with_app(directory.path(), expected.clone(), &application);
+        let mut retry_setup = setup_with_app(directory.path(), expected.clone(), &application);
+        retry_setup.session_id = [8; 16];
+        application
+            .store
+            .insert_link(crate::store::Link {
+                id: "link".to_owned(),
+                tenant: String::new(),
+                label: "retry".to_owned(),
+                dest: String::new(),
+                password_hash: None,
+                created_at: 0,
+                expires_at: None,
+                max_bytes: None,
+                active: true,
+                legal_hold: false,
+                notify_on_upload: false,
+                uploads: Vec::new(),
+                events: Vec::new(),
+            })
+            .unwrap();
+        let key = hex::encode([3; 16]);
+        let stage = first_setup.dest_dir.join(format!(".vot-push-{key}"));
+        fs::create_dir_all(&stage).unwrap();
+        let records = objects
+            .iter()
+            .enumerate()
+            .map(|(index, object)| {
+                record(
+                    vot_manifest::PackagePath::portable([format!("file-{index}")]).unwrap(),
+                    object,
+                )
+            })
+            .collect::<Vec<_>>();
+        let summary = vot_cli::PackageSummary {
+            root: expected.root,
+            logical_length: expected.length,
+            entries: 2,
+        };
+        let receive_objects = objects
+            .iter()
+            .map(|object| vot_cli::ReceiveObject {
+                object: vot_codec::frames::ObjectId {
+                    suite: object.suite,
+                    root: object.root,
+                    length: object.length,
+                },
+                entries: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        persist_push(&first_setup, key.clone()).unwrap();
+        let control =
+            PushControl::resumable(key.clone(), Some(lock_push_directory(&stage).unwrap()));
+        let (seams, handle) = push_seams(
+            application.clone(),
+            first_setup,
+            control,
+            tokio::runtime::Handle::current(),
+        );
+        let receive = handle.0.upgrade().unwrap();
+        receive.prepare_manifest(summary, &records).unwrap();
+        let sink = receive.choose_sink(&receive_objects[0]).unwrap().unwrap();
+        sink.write_at(0, data[0]).unwrap();
+        sink.flush().unwrap();
+        receive.complete_object(&receive_objects[0]).unwrap();
+        drop(sink);
+        let sink = receive.choose_sink(&receive_objects[1]).unwrap().unwrap();
+        sink.write_at(0, b"wrong").unwrap();
+        drop(sink);
+        drop(receive);
+        drop(seams);
+        assert!(handle.0.upgrade().is_none());
+        assert!(stage
+            .join("objects")
+            .join(hex::encode(objects[0].root))
+            .exists());
+        persist_push(&retry_setup, key.clone()).unwrap();
+        let control = PushControl::resumable(key, Some(lock_push_directory(&stage).unwrap()));
+        let (seams, handle) = push_seams(
+            application.clone(),
+            retry_setup,
+            control,
+            tokio::runtime::Handle::current(),
+        );
+        let receive = handle.0.upgrade().unwrap();
+        receive.prepare_manifest(summary, &records).unwrap();
+        assert!(receive.choose_sink(&receive_objects[0]).unwrap().is_none());
+        let sink = receive.choose_sink(&receive_objects[1]).unwrap().unwrap();
+        sink.write_at(0, data[1]).unwrap();
+        sink.flush().unwrap();
+        receive.complete_object(&receive_objects[1]).unwrap();
+        drop(sink);
+        drop(receive);
+        drop(seams);
+        assert!(!stage.exists());
+        assert!(application.store.load_push_sessions().unwrap().is_empty());
+        for (index, bytes) in data.iter().enumerate() {
+            assert_eq!(
+                fs::read(directory.path().join(format!("receive/file-{index}"))).unwrap(),
+                *bytes
+            );
         }
     }
 

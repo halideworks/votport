@@ -352,8 +352,11 @@ an absent value on an older record means `"http"`.
   for new records; serde default `None`, read as `http`, for legacy rows). No
   migration.
 - In-memory `push_tickets: Mutex<HashMap<[u8; 16], PushTicket>>` on `App`,
-  swept with sessions. Not persisted: a restart invalidates in-flight
-  pushes the same way it invalidates HTTP sessions today.
+  swept with sessions. Tickets are not persisted. A new preflight uses a fresh
+  session ID and capability while reusing complete objects from the same device,
+  request, and package. Schema 25 records the staging key in `upload_sessions`
+  so the quota reservation and objects survive a restart. Idle cleanup removes
+  parked state; every reused object is rehashed and reproved before publication.
 - `push-issuer.key` is always under `data_dir`. `push.key` and `push.crt` are
   generated there unless the operator supplies certificate and key paths,
   which are used in place.

@@ -226,3 +226,25 @@ assert actual.hexdigest() == "346e0c94b96619546b6540fbebacfb1107cba03679023545a9
 print("All 100001 files verified")
 PY
 ```
+
+## Native push object recovery (2026-09-08)
+
+On Linux loopback, a native CLI sent 20,000 unique 256-byte files with the
+server and client limited to 1,024 file descriptors. Both processes were
+SIGKILLed when `votport_push_bytes_total` reached 4,620,032 of 5,120,000
+payload bytes. The retained object directory contained 18,047 complete files.
+
+After the dead receiver lease and the original 120-second push capability
+expired, the server restarted against the same data and receive directories.
+The same device retried the same request and package. The new server counted
+499,968 payload bytes, exactly the 1,953 incomplete objects. All 20,000 output
+names and file contents matched, every receipt file was present, and the push
+staging directory and persisted session were removed on completion. The
+SHA-256 of ordered filename, NUL, and content was
+`81993ee33779037c6c9acca88f5d5cc667d225f86c83c0819a1611e7110aafa5`.
+
+The fixture used `frame-{index:06}.bin` for indices 0 through 19,999, with
+`frame-{index:06}\n` repeated and truncated to 256 bytes. It was sent as one
+folder through `votport send`. This client creates 20,000 manifest entries;
+it does not add a separate entry for the containing directory. This is a
+recovery check, not a throughput benchmark or a power-loss qualification.

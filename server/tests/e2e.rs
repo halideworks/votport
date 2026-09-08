@@ -4022,14 +4022,14 @@ async fn native_push_foreign_capability_increments_metric() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn native_push_root_mismatch_cleans_up_and_releases_quota() {
+async fn native_push_root_mismatch_parks_quota_and_allows_retry() {
     let server = start_push_server().await;
     let client = reqwest::Client::builder()
         .cookie_store(true)
         .build()
         .unwrap();
     let fixture = tempfile::tempdir().unwrap();
-    let (_bundle, summary, files) = push_fixture(fixture.path(), 51);
+    let (bundle, summary, files) = push_fixture(fixture.path(), 51);
     let (wrong_bundle, wrong_summary, _) = push_fixture(fixture.path(), 61);
     assert_eq!(wrong_summary.logical_length, summary.logical_length);
     let token = create_open_link(
@@ -4048,10 +4048,17 @@ async fn native_push_root_mismatch_cleans_up_and_releases_quota() {
     let failed = push_bundle_blocking(&server, &wrong_bundle, &capability, &holder_key).await;
     assert!(failed.is_err(), "a bundle with the wrong root is refused");
 
-    let staging = server
-        .receive_dir
-        .join("inbox")
-        .join(format!(".vot-push-{session}"));
+    let persisted = server
+        .application
+        .store
+        .load_push_sessions()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.id == session)
+        .unwrap();
+    let staging = persisted
+        .dest_dir
+        .join(format!(".vot-push-{}", persisted.push_key.unwrap()));
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let link = server
@@ -4060,9 +4067,8 @@ async fn native_push_root_mismatch_cleans_up_and_releases_quota() {
                 .link_by_id(&token)
                 .unwrap()
                 .unwrap();
-            if server.application.sessions.total() == 0
-                && link.uploads.is_empty()
-                && !staging.exists()
+            if link.uploads.is_empty()
+                && std::fs::File::open(&staging).is_ok_and(|file| file.try_lock().is_ok())
             {
                 break;
             }
@@ -4082,22 +4088,20 @@ async fn native_push_root_mismatch_cleans_up_and_releases_quota() {
     for (path, _) in files {
         assert!(!server.receive_dir.join("inbox").join(path).exists());
     }
-    assert!(!staging.exists());
+    assert!(staging.exists());
+    assert_eq!(server.application.sessions.total(), 1);
 
-    // The exact link cap was occupied by the failed session. A new preflight
-    // succeeding proves both the session and its reserved bytes were released.
+    // Retry replaces the parked reservation while retaining the link's cap.
     let retry = preflight_push(&client, &server.base, &token, &holder, summary).await;
-    let retry_session = retry["session"].as_str().unwrap();
-    let response = client
-        .post(format!("{}/api/session/{retry_session}/abort", server.base))
-        .send()
+    assert_ne!(retry["session"], session);
+    let (capability, holder_key) = write_push_credentials(fixture.path(), &retry, &holder);
+    push_bundle_blocking(&server, &bundle, &capability, &holder_key)
         .await
         .unwrap();
-    assert_eq!(response.status(), 200);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn native_push_abort_removes_partial_transfer() {
+async fn native_push_abort_retains_recoverable_objects() {
     let server = start_push_server().await;
     let client = reqwest::Client::builder()
         .cookie_store(true)
@@ -4115,10 +4119,17 @@ async fn native_push_abort_removes_partial_transfer() {
     let response = preflight_push(&client, &server.base, &token, &holder, summary).await;
     let session = response["session"].as_str().unwrap().to_owned();
     let (capability, holder_key) = write_push_credentials(fixture.path(), &response, &holder);
-    let staging = server
-        .receive_dir
-        .join("inbox")
-        .join(format!(".vot-push-{session}"));
+    let persisted = server
+        .application
+        .store
+        .load_push_sessions()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.id == session)
+        .unwrap();
+    let staging = persisted
+        .dest_dir
+        .join(format!(".vot-push-{}", persisted.push_key.unwrap()));
 
     let abort = async {
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -4152,7 +4163,7 @@ async fn native_push_abort_removes_partial_transfer() {
     assert!(pushed.is_err(), "aborted push stops the sender");
 
     tokio::time::timeout(Duration::from_secs(10), async {
-        while server.application.sessions.total() != 0 || staging.exists() {
+        while !std::fs::File::open(&staging).is_ok_and(|file| file.try_lock().is_ok()) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -4169,6 +4180,20 @@ async fn native_push_abort_removes_partial_transfer() {
     assert!(link.events.last().unwrap().received_bytes > 0);
     assert!(!server.receive_dir.join("inbox/a-first.bin").exists());
     assert!(!server.receive_dir.join("inbox/z-later.bin").exists());
+    assert_eq!(server.application.sessions.total(), 1);
+    let retry = preflight_push(&client, &server.base, &token, &holder, summary).await;
+    let (capability, holder_key) = write_push_credentials(fixture.path(), &retry, &holder);
+    push_bundle_blocking(&server, &bundle, &capability, &holder_key)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(server.receive_dir.join("inbox/a-first.bin")).unwrap(),
+        vec![83_u8; 1024 * 1024]
+    );
+    assert_eq!(
+        std::fs::read(server.receive_dir.join("inbox/z-later.bin")).unwrap(),
+        vec![84_u8; 32 * 1024 * 1024]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4197,12 +4222,19 @@ async fn native_push_store_failure_rolls_back_published_files() {
     let pushed = push_bundle_blocking(&server, &bundle, &capability, &holder_key).await;
     assert!(pushed.is_err(), "store failure rejects native push");
 
-    let staging = server
-        .receive_dir
-        .join("inbox")
-        .join(format!(".vot-push-{session}"));
+    let persisted = server
+        .application
+        .store
+        .load_push_sessions()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.id == session)
+        .unwrap();
+    let staging = persisted
+        .dest_dir
+        .join(format!(".vot-push-{}", persisted.push_key.unwrap()));
     tokio::time::timeout(Duration::from_secs(10), async {
-        while server.application.sessions.total() != 0 || staging.exists() {
+        while !std::fs::File::open(&staging).is_ok_and(|file| file.try_lock().is_ok()) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -4221,6 +4253,27 @@ async fn native_push_store_failure_rolls_back_published_files() {
         assert!(!destination.exists());
         assert!(!PathBuf::from(format!("{}.vot-receipt", destination.display())).exists());
     }
+    assert_eq!(server.application.sessions.total(), 1);
+    rusqlite::Connection::open(server._data.path().join("votport.db"))
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_push_record;")
+        .unwrap();
+    let retry = preflight_push(&client, &server.base, &token, &holder, summary).await;
+    let (capability, holder_key) = write_push_credentials(fixture.path(), &retry, &holder);
+    push_bundle_blocking(&server, &bundle, &capability, &holder_key)
+        .await
+        .unwrap();
+    assert_eq!(
+        server
+            .application
+            .store
+            .link_by_id(&token)
+            .unwrap()
+            .unwrap()
+            .uploads
+            .len(),
+        1
+    );
 }
 
 // ---------------------------------------------------------------------------

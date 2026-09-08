@@ -263,6 +263,7 @@ pub struct Branding {
 /// re-attach after a restart instead of the transfer starting over.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersistedUploadSession {
+    pub push_key: Option<String>,
     pub id: String,
     pub link_id: String,
     pub tenant: String,
@@ -437,7 +438,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 24;
+pub(crate) const SCHEMA_VERSION: u64 = 25;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -1191,6 +1192,19 @@ impl Store {
                 transaction.execute_batch("ALTER TABLE upload_session_files ADD COLUMN commit_profile TEXT NOT NULL DEFAULT 'balanced' CHECK (commit_profile IN ('fast', 'balanced', 'strict'));")
                     .map_err(|error| format!("schema: {error}"))?;
             }
+        }
+        if stored < 25 {
+            let present: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('upload_sessions') WHERE name = 'push_key')",
+                [], |row| row.get(0),
+            ).map_err(|error| format!("schema: {error}"))?;
+            if !present {
+                transaction
+                    .execute_batch("ALTER TABLE upload_sessions ADD COLUMN push_key TEXT;")
+                    .map_err(|error| format!("schema: {error}"))?;
+            }
+            transaction.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS upload_sessions_push_key ON upload_sessions(push_key) WHERE push_key IS NOT NULL;")
+                .map_err(|error| format!("schema: {error}"))?;
         }
         transaction
             .execute(
@@ -2145,8 +2159,8 @@ impl Store {
             .execute(
                 "INSERT OR REPLACE INTO upload_sessions
                  (id, link_id, tenant, dest_dir, dest_rel, package_suite,
-                  package_root, package_length, max_total_bytes, started_at, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                  package_root, package_length, max_total_bytes, started_at, created_at, push_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 rusqlite::params![
                     session.id,
                     session.link_id,
@@ -2161,6 +2175,7 @@ impl Store {
                         .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
                     i64::try_from(session.started_at).unwrap_or(i64::MAX),
                     i64::try_from(now_unix()).unwrap_or(i64::MAX),
+                    session.push_key,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -2240,15 +2255,24 @@ impl Store {
 
     /// Every persisted session with its files, for boot re-attach.
     pub fn load_upload_sessions(&self) -> Result<Vec<PersistedUploadSession>, String> {
+        self.load_sessions(false)
+    }
+
+    pub fn load_push_sessions(&self) -> Result<Vec<PersistedUploadSession>, String> {
+        self.load_sessions(true)
+    }
+
+    fn load_sessions(&self, push_only: bool) -> Result<Vec<PersistedUploadSession>, String> {
         self.with(|connection| {
             let mut sessions = Vec::new();
             let mut statement = connection.prepare(
                 "SELECT id, link_id, tenant, dest_dir, dest_rel, package_suite,
-                        package_root, package_length, max_total_bytes, started_at
-                 FROM upload_sessions ORDER BY created_at",
+                        package_root, package_length, max_total_bytes, started_at, push_key
+                 FROM upload_sessions WHERE NOT ?1 OR push_key IS NOT NULL ORDER BY created_at",
             )?;
-            let rows = statement.query_map([], |row| {
+            let rows = statement.query_map([push_only], |row| {
                 Ok(PersistedUploadSession {
+                    push_key: row.get(10)?,
                     id: row.get(0)?,
                     link_id: row.get(1)?,
                     tenant: row.get(2)?,
@@ -8001,6 +8025,7 @@ mod settings_tests {
         assert!(store.load_upload_sessions().unwrap().is_empty());
 
         let mut session = PersistedUploadSession {
+            push_key: None,
             id: "abcd1234".to_owned(),
             link_id: "link-1".to_owned(),
             tenant: String::new(),
