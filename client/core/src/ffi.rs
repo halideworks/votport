@@ -11,7 +11,7 @@
 //! main thread. The listener is called from the core's thread; a shell hops to
 //! its UI thread before touching a view.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -89,6 +89,8 @@ pub struct TransferView {
     pub phase: Phase,
     /// Set once the transfer commits to a path.
     pub transport: Option<Transport>,
+    /// Replace the file list when true; otherwise merge these rows by index.
+    pub files_reset: bool,
     pub files: Vec<FileView>,
     pub moved_bytes: u64,
     /// The package length, once known. A push never learns what the receiver
@@ -834,6 +836,13 @@ const TICK: Duration = Duration::from_secs(1);
 struct Model {
     kind: journal::Kind,
     view: TransferView,
+    files: Vec<FileView>,
+    positions: HashMap<u64, usize>,
+    dirty: HashSet<usize>,
+    files_reset: bool,
+    file_moved: u128,
+    files_complete: usize,
+    materializing: bool,
     /// Sum of the planned sizes, the total on the HTTP paths and the push.
     planned_total: Option<u64>,
     /// Whether a carrier reports bytes for the whole package (QUIC), in which
@@ -852,6 +861,7 @@ impl Model {
             view: TransferView {
                 phase: Phase::Preparing,
                 transport: None,
+                files_reset: true,
                 files: Vec::new(),
                 moved_bytes: 0,
                 total_bytes: None,
@@ -863,6 +873,13 @@ impl Model {
                 route: None,
                 rate_text: None,
             },
+            files: Vec::new(),
+            positions: HashMap::new(),
+            dirty: HashSet::new(),
+            files_reset: true,
+            file_moved: 0,
+            files_complete: 0,
+            materializing: false,
             planned_total: None,
             carrier_bytes: false,
             samples: VecDeque::new(),
@@ -876,7 +893,10 @@ impl Model {
         let before = self.view.phase;
         match event {
             Event::Selected { files } | Event::Planned { files } => {
-                self.view.files = files
+                // Fetch announces its authoritative manifest after the bundle
+                // lands; that second plan starts destination materialization.
+                self.materializing = self.view.transport == Some(Transport::Fetch);
+                self.files = files
                     .into_iter()
                     .map(|file| FileView {
                         index: file.index as u64,
@@ -887,11 +907,29 @@ impl Model {
                         label: String::new(),
                     })
                     .collect();
-                let total = self.view.files.iter().map(|file| file.bytes).sum();
+                self.positions.clear();
+                for (position, file) in self.files.iter().enumerate() {
+                    self.positions.entry(file.index).or_insert(position);
+                }
+                self.dirty.clear();
+                self.files_reset = true;
+                self.file_moved = 0;
+                self.files_complete = 0;
+                self.carrier_bytes = false;
+                self.view.moved_bytes = 0;
+                self.samples.clear();
+                self.rate_since = None;
+                let total = self
+                    .files
+                    .iter()
+                    .map(|file| u128::from(file.bytes))
+                    .sum::<u128>()
+                    .min(u128::from(u64::MAX)) as u64;
                 self.planned_total = Some(total);
                 self.view.total_bytes = Some(total);
             }
             Event::Transport(transport) => {
+                self.materializing = false;
                 self.view.transport = Some(transport);
                 self.view.phase = Phase::Transferring;
             }
@@ -915,36 +953,36 @@ impl Model {
                 received: covered,
                 total,
             } => {
-                if let Some(file) = self.file_mut(index) {
+                self.update_file(index, |file| {
                     file.moved = covered.min(total);
                     file.bytes = total;
                     file.state = FileState::Moving;
-                }
-                self.sum_files();
+                });
             }
             Event::EntryComplete { index, .. } => {
-                if let Some(file) = self.file_mut(index) {
+                self.update_file(index, |file| {
                     file.moved = file.bytes;
                     file.state = FileState::Landed;
-                }
-                self.sum_files();
+                });
             }
             Event::FileVerified { index, .. } => {
-                if let Some(file) = self.file_mut(index) {
+                self.update_file(index, |file| {
                     file.moved = file.bytes;
                     file.state = FileState::Verified;
-                }
-                self.sum_files();
+                });
             }
             Event::Finished { .. } => {
                 // A push reports no per-file completion; the whole package is
                 // at the receiver once the carrier finished.
-                for file in &mut self.view.files {
+                for file in &mut self.files {
                     file.moved = file.bytes;
                     if file.state != FileState::Verified {
                         file.state = FileState::Landed;
                     }
                 }
+                self.file_moved = self.files.iter().map(|file| u128::from(file.moved)).sum();
+                self.files_complete = self.files.len();
+                self.dirty.extend(0..self.files.len());
                 if let Some(total) = self.view.total_bytes {
                     self.view.moved_bytes = total;
                 }
@@ -955,16 +993,24 @@ impl Model {
         before != self.view.phase
     }
 
-    fn file_mut(&mut self, index: usize) -> Option<&mut FileView> {
-        self.view
-            .files
-            .iter_mut()
-            .find(|file| file.index == index as u64)
-    }
-
-    fn sum_files(&mut self) {
-        if !self.carrier_bytes {
-            self.view.moved_bytes = self.view.files.iter().map(|file| file.moved).sum();
+    fn update_file(&mut self, index: usize, update: impl FnOnce(&mut FileView)) {
+        if let Some(&position) = self.positions.get(&(index as u64)) {
+            let file = &mut self.files[position];
+            self.files_complete -= usize::from(matches!(
+                file.state,
+                FileState::Landed | FileState::Verified
+            ));
+            self.file_moved -= u128::from(file.moved);
+            update(file);
+            self.file_moved += u128::from(file.moved);
+            self.files_complete += usize::from(matches!(
+                file.state,
+                FileState::Landed | FileState::Verified
+            ));
+            self.dirty.insert(position);
+            if !self.carrier_bytes {
+                self.view.moved_bytes = self.file_moved.min(u128::from(u64::MAX)) as u64;
+            }
         }
     }
 
@@ -1020,11 +1066,27 @@ impl Model {
             .view
             .rate_bytes_per_second
             .map(|rate| format!("{}/s", human_bytes(rate)));
-        for file in &mut self.view.files {
-            file.label = file.label();
-        }
         self.view.status = self.status();
-        self.view.clone()
+        let mut view = self.view.clone();
+        view.files_reset = std::mem::take(&mut self.files_reset);
+        if view.files_reset {
+            for file in &mut self.files {
+                file.label = file.label();
+            }
+            view.files = self.files.clone();
+            self.dirty.clear();
+        } else {
+            view.files = self
+                .dirty
+                .drain()
+                .map(|position| {
+                    let file = &mut self.files[position];
+                    file.label = file.label();
+                    file.clone()
+                })
+                .collect();
+        }
+        view
     }
 
     /// The one line under a card's subject. The web pages' words: files are
@@ -1041,7 +1103,27 @@ impl Model {
                 }
             }
             Phase::Transferring => {
-                let mut parts = vec![if sending { "Shipping" } else { "Receiving" }.to_owned()];
+                let count = self.files.len();
+                let noun = if count == 1 { "file" } else { "files" };
+                let fetching = view.transport == Some(Transport::Fetch);
+                let mut parts = vec![if fetching {
+                    if self.materializing {
+                        "Saving files".to_owned()
+                    } else {
+                        format!("Downloading {count} {noun}")
+                    }
+                } else {
+                    if sending { "Shipping" } else { "Receiving" }.to_owned()
+                }];
+                let action = if fetching { "saved" } else { "verified" };
+                if view.transport == Some(Transport::Push) {
+                    parts[0] = format!("Shipping {count} {noun}");
+                } else {
+                    parts.push(format!(
+                        "{} of {count} {noun} {action}",
+                        self.files_complete
+                    ));
+                }
                 if let Some(total) = view.total_bytes {
                     parts.push(format!(
                         "{} of {}",
@@ -1058,7 +1140,7 @@ impl Model {
                 parts.join(", ")
             }
             Phase::Done => {
-                let count = view.files.len();
+                let count = self.files.len();
                 let noun = if count == 1 { "file" } else { "files" };
                 if sending {
                     format!("Shipped and verified, {count} {noun}")
@@ -1229,7 +1311,7 @@ mod tests {
             t0,
         );
         assert_eq!(model.view.moved_bytes, 40);
-        assert_eq!(model.view.files[0].state, FileState::Moving);
+        assert_eq!(model.files[0].state, FileState::Moving);
         model.apply(
             Event::EntryComplete {
                 index: 0,
@@ -1238,7 +1320,7 @@ mod tests {
             t0,
         );
         assert_eq!(model.view.moved_bytes, 100);
-        assert_eq!(model.view.files[0].state, FileState::Landed);
+        assert_eq!(model.files[0].state, FileState::Landed);
         assert!(model.apply(Event::Finished { files: 2 }, t0));
         assert_eq!(model.view.phase, Phase::Done);
         assert_eq!(model.view.moved_bytes, 150);
@@ -1263,7 +1345,7 @@ mod tests {
             t0,
         );
         assert_eq!(model.view.moved_bytes, 60);
-        assert_eq!(model.view.files[0].state, FileState::Waiting);
+        assert_eq!(model.files[0].state, FileState::Waiting);
         // Push framing runs past the package; the bar never does.
         model.apply(
             Event::Bytes {
@@ -1285,6 +1367,156 @@ mod tests {
             (model.view.moved_bytes, model.view.total_bytes),
             (130, Some(200))
         );
+    }
+
+    #[test]
+    fn file_updates_reset_merge_and_preserve_aggregate() {
+        let now = Instant::now();
+        let mut model = Model::new(journal::Kind::Receive);
+        assert!(model.snapshot().files_reset);
+        model.apply(planned(&[100, 200]), now);
+        let initial = model.snapshot();
+        assert!(initial.files_reset);
+        assert_eq!(initial.files.len(), 2);
+        for received in [80, 20, 50] {
+            model.apply(
+                Event::Downloading {
+                    index: 1,
+                    received,
+                    total: 200,
+                },
+                now,
+            );
+        }
+        model.apply(
+            Event::Downloading {
+                index: 99,
+                received: 90,
+                total: 100,
+            },
+            now,
+        );
+        let delta = model.snapshot();
+        assert!(!delta.files_reset);
+        assert_eq!(delta.files.len(), 1);
+        assert_eq!(
+            (
+                delta.files[0].index,
+                delta.files[0].moved,
+                delta.moved_bytes
+            ),
+            (1, 50, 50)
+        );
+        assert_eq!(delta.files[0].label, "50 bytes of 200 bytes");
+        assert!(model.snapshot().files.is_empty());
+        model.apply(
+            Event::Bytes {
+                moved: 17,
+                total: Some(300),
+            },
+            now,
+        );
+        model.apply(
+            Event::FileVerified {
+                index: 0,
+                path: "0".into(),
+            },
+            now,
+        );
+        assert_eq!(model.snapshot().moved_bytes, 17);
+        model.apply(Event::Transport(Transport::Fetch), now);
+        assert!(model
+            .snapshot()
+            .status
+            .contains("Downloading 2 files, 1 of 2 files saved"));
+        model.apply(
+            Event::FileVerified {
+                index: 0,
+                path: "0".into(),
+            },
+            now,
+        );
+        assert!(model.snapshot().status.contains("1 of 2 files saved"));
+        model.apply(
+            Event::Downloading {
+                index: 0,
+                received: 4,
+                total: 100,
+            },
+            now,
+        );
+        assert!(model
+            .snapshot()
+            .status
+            .contains("Downloading 2 files, 0 of 2 files saved"));
+        model.apply(
+            Event::FileVerified {
+                index: 0,
+                path: "0".into(),
+            },
+            now,
+        );
+        model.apply(Event::Finished { files: 2 }, now);
+        let done = model.snapshot();
+        assert_eq!(done.files.len(), 2);
+        assert_eq!(done.moved_bytes, 300);
+        assert_eq!(model.files[0].state, FileState::Verified);
+        assert_eq!(model.files[1].state, FileState::Landed);
+        assert!(model.snapshot().files.is_empty());
+        model.apply(planned(&[10]), now);
+        let reset = model.snapshot();
+        assert!(reset.files_reset);
+        assert_eq!(reset.files.len(), 1);
+        assert_eq!(reset.moved_bytes, 0);
+        model.apply(
+            Event::Downloading {
+                index: 0,
+                received: 4,
+                total: 10,
+            },
+            now,
+        );
+        assert_eq!(model.snapshot().moved_bytes, 4);
+    }
+
+    #[test]
+    fn fetch_distinguishes_bundle_transfer_from_saving_files() {
+        let now = Instant::now();
+        let mut model = Model::new(journal::Kind::Receive);
+        model.apply(planned(&[100, 200]), now);
+        model.apply(Event::Transport(Transport::Fetch), now);
+        assert!(model
+            .snapshot()
+            .status
+            .starts_with("Downloading 2 files, 0 of 2 files saved"));
+        model.apply(
+            Event::Bytes {
+                moved: 300,
+                total: Some(300),
+            },
+            now,
+        );
+        model.apply(planned(&[100, 200]), now);
+        assert!(model
+            .snapshot()
+            .status
+            .starts_with("Saving files, 0 of 2 files saved"));
+        model.apply(
+            Event::FileVerified {
+                index: 0,
+                path: "0".into(),
+            },
+            now,
+        );
+        assert!(model
+            .snapshot()
+            .status
+            .starts_with("Saving files, 1 of 2 files saved"));
+        model.apply(Event::Transport(Transport::Http), now);
+        assert!(model
+            .snapshot()
+            .status
+            .starts_with("Receiving, 1 of 2 files verified"));
     }
 
     #[test]
@@ -1334,7 +1566,7 @@ mod tests {
         model.apply(planned(&[10_000]), t0);
         model.apply(Event::Transport(Transport::Push), t0);
         let view = model.snapshot();
-        assert_eq!(view.status, "Shipping, 0 bytes of 10.0 KB");
+        assert_eq!(view.status, "Shipping 1 file, 0 bytes of 10.0 KB");
         assert_eq!(view.route.as_deref(), Some("Direct route (QUIC)"));
         assert_eq!(view.files[0].label, "10.0 KB");
         model.view.rate_bytes_per_second = Some(1_000);
@@ -1342,7 +1574,7 @@ mod tests {
         let view = model.snapshot();
         assert_eq!(
             view.status,
-            "Shipping, 0 bytes of 10.0 KB, 1.0 KB/s, about 3 min 20 s left"
+            "Shipping 1 file, 0 bytes of 10.0 KB, 1.0 KB/s, about 3 min 20 s left"
         );
         assert_eq!(view.rate_text.as_deref(), Some("1.0 KB/s"));
         model.apply(
@@ -1564,5 +1796,69 @@ mod tests {
             before,
             "no view after the drop"
         );
+    }
+}
+
+#[cfg(test)]
+mod large_sequence_benchmark {
+    use super::*;
+    use crate::progress::PlannedFile;
+
+    #[test]
+    #[ignore = "benchmark; run explicitly with --release --nocapture"]
+    fn native_progress_100k() {
+        for run in 1..=3 {
+            let mut model = Model::new(journal::Kind::Receive);
+            let now = Instant::now();
+            model.apply(
+                Event::Planned {
+                    files: (0..100_000)
+                        .map(|index| PlannedFile {
+                            index,
+                            path: format!("sequence/frame-{index:06}.exr"),
+                            bytes: 1024,
+                        })
+                        .collect(),
+                },
+                now,
+            );
+            model.apply(Event::Transport(Transport::Http), now);
+            assert_eq!(model.snapshot().files.len(), 100_000);
+            let mut expected = vec![0_u64; 100_000];
+            let start = Instant::now();
+            for update in 0..20_000 {
+                let index = update * 7919 % 100_000;
+                model.apply(
+                    Event::Downloading {
+                        index,
+                        received: 512,
+                        total: 1024,
+                    },
+                    now + Duration::from_millis(update as u64),
+                );
+                expected[index] = 512;
+            }
+            let events_ms = start.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(model.view.moved_bytes, expected.iter().sum::<u64>());
+            let _ = std::hint::black_box(model.snapshot());
+            let start = Instant::now();
+            let mut snapshot_rows = 0;
+            for (update, expected_moved) in expected.iter_mut().enumerate().take(100) {
+                model.apply(
+                    Event::Downloading {
+                        index: update,
+                        received: 768,
+                        total: 1024,
+                    },
+                    now + Duration::from_millis(20_000 + update as u64),
+                );
+                *expected_moved = 768;
+                let snapshot = std::hint::black_box(model.snapshot());
+                snapshot_rows += snapshot.files.len();
+            }
+            let snapshots_ms = start.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(model.view.moved_bytes, expected.iter().sum::<u64>());
+            println!("run={run} files=100000 events=20000 events_ms={events_ms:.3} snapshots=100 snapshots_ms={snapshots_ms:.3} snapshot_rows={snapshot_rows}");
+        }
     }
 }

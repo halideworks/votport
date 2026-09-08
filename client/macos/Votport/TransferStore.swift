@@ -16,6 +16,8 @@ struct TransferItem: Identifiable {
     let subject: String
     let link: String
     let started: Date
+    var files: [TransferFile] = []
+    var filesByIndex: [UInt64: TransferFile] = [:]
     var view: TransferView?
     var running = true
     /// The landed paths, for Reveal in Finder after a receive.
@@ -31,6 +33,17 @@ struct TransferItem: Identifiable {
     var journalled = false
 
     var canResume: Bool { !running && journalled }
+}
+
+@MainActor
+final class TransferFile: ObservableObject, Identifiable {
+    let id: UInt64
+    @Published var view: FileView
+
+    init(view: FileView) {
+        id = view.index
+        self.view = view
+    }
 }
 
 /// Every transfer of this app session, newest first, and the one place a
@@ -122,6 +135,8 @@ final class TransferStore: ObservableObject {
         items[index].running = true
         items[index].interrupted = false
         items[index].view = nil
+        items[index].files = []
+        items[index].filesByIndex = [:]
         items[index].landed = []
         run(id) { transfer, listener in
             let report = try? VotportCore.resume(
@@ -184,6 +199,15 @@ final class TransferStore: ObservableObject {
 
     func apply(_ view: TransferView, to id: UUID) {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        if view.filesReset {
+            let rows = view.files.map { TransferFile(view: $0) }
+            items[index].files = rows
+            items[index].filesByIndex = Dictionary(rows.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        } else {
+            for file in view.files {
+                items[index].filesByIndex[file.index]?.view = file
+            }
+        }
         items[index].view = view
     }
 

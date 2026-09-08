@@ -46,8 +46,8 @@
                   Foreground="{ThemeResource VotMutedBrush}" />
               <TextBlock Text="{x:Bind Detail, Mode=OneWay}" Visibility="{x:Bind HasDetail, Mode=OneWay}" FontSize="12"
                   Foreground="{ThemeResource VotMutedBrush}" TextWrapping="Wrap" IsTextSelectionEnabled="True" />
-              <ItemsControl ItemsSource="{x:Bind Files, Mode=OneWay}">
-              <ItemsControl.ItemTemplate>
+              <ListView ItemsSource="{x:Bind Files, Mode=OneWay}" MaxHeight="280" SelectionMode="None" IsItemClickEnabled="False">
+              <ListView.ItemTemplate>
                 <DataTemplate x:DataType="local:FileRow">
                   <Grid ColumnSpacing="10" Margin="0,2">
                     <Grid.ColumnDefinitions>
@@ -56,12 +56,12 @@
                       <ColumnDefinition Width="150" />
                     </Grid.ColumnDefinitions>
                     <TextBlock Text="{x:Bind Path}" Style="{StaticResource Mono}" FontSize="12" />
-                    <ProgressBar Grid.Column="1" Value="{x:Bind Fraction}" Maximum="100" VerticalAlignment="Center" />
-                    <TextBlock Grid.Column="2" Text="{x:Bind Label}" FontSize="12" TextAlignment="Right" Foreground="{ThemeResource VotMutedBrush}" />
+                    <ProgressBar Grid.Column="1" Value="{x:Bind Fraction, Mode=OneWay}" Maximum="100" VerticalAlignment="Center" />
+                    <TextBlock Grid.Column="2" Text="{x:Bind Label, Mode=OneWay}" FontSize="12" TextAlignment="Right" Foreground="{ThemeResource VotMutedBrush}" />
                   </Grid>
                 </DataTemplate>
-              </ItemsControl.ItemTemplate>
-              </ItemsControl>
+              </ListView.ItemTemplate>
+              </ListView>
             </StackPanel>
           </Grid>
         </DataTemplate>
