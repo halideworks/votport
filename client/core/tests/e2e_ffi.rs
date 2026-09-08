@@ -20,7 +20,7 @@ use votport_client_core::{Error, LinkKind, Transport};
 
 /// Points the state directory at a temporary directory. The environment is
 /// process-wide and setting it while another thread reads it is a race, so
-/// this binary runs its two scenarios in sequence from one test, after one
+/// this binary runs its scenarios in sequence from one test, after one
 /// set, and each asserts on its own journal ids.
 fn isolate_state() -> tempfile::TempDir {
     let state = tempfile::tempdir().unwrap();
@@ -35,6 +35,8 @@ fn the_ffi_end_to_end() {
         return;
     };
     let _state = isolate_state();
+    a_two_file_receive_resumes_past_its_verified_first_file(&bin);
+    a_quic_resume_reuses_a_verified_file(&bin);
     a_shell_sends_a_folder_and_receives_a_delivery_through_the_view_model(&bin);
     a_cancel_before_the_download_lands_nothing_and_a_partial_resumes_next_time(&bin);
 }
@@ -471,4 +473,140 @@ fn a_cancel_before_the_download_lands_nothing_and_a_partial_resumes_next_time(bi
     let last = resumed.0.lock().unwrap().last().cloned().unwrap();
     assert_eq!(last.phase, Phase::Done);
     assert_eq!(last.files[0].state, FileState::Verified);
+}
+
+fn a_two_file_receive_resumes_past_its_verified_first_file(bin: &str) {
+    struct BlockSecond(std::path::PathBuf);
+    impl TransferListener for BlockSecond {
+        fn update(&self, view: TransferView) {
+            if view.phase == Phase::Transferring {
+                std::fs::write(&self.0, b"blocker").unwrap();
+            }
+        }
+    }
+    let server = common::start_server(bin, &[]);
+    let token = common::deliver(
+        &server.base,
+        &[
+            ("first.bin", b"first".to_vec()),
+            ("nested/second.bin", b"second".to_vec()),
+        ],
+        None,
+        None,
+    );
+    let dest = tempfile::tempdir().unwrap();
+    let first = dest.path().join("first.bin");
+    let blocker = dest.path().join("nested");
+    let handle = Transfer::new();
+    let received = ffi::receive(
+        format!("{}/s/{token}", server.base),
+        None,
+        dest.path().display().to_string(),
+        handle.clone(),
+        Arc::new(BlockSecond(blocker.clone())),
+    );
+    assert!(received.is_err(), "{received:?}");
+    assert_eq!(std::fs::read(&first).unwrap(), b"first");
+    assert!(handle.journal_kept());
+    let id = handle.journal_id().unwrap();
+    let fresh = ffi::receive(
+        format!("{}/s/{token}", server.base),
+        None,
+        dest.path().display().to_string(),
+        Transfer::new(),
+        Arc::new(Recorder::default()),
+    );
+    assert!(matches!(fresh, Err(Error::Exists { .. })));
+    std::fs::write(&first, b"wrong").unwrap();
+    let changed = ffi::resume(
+        id.clone(),
+        None,
+        Transfer::new(),
+        Arc::new(Recorder::default()),
+    );
+    assert!(matches!(changed, Err(Error::Exists { .. })));
+    assert_eq!(std::fs::read(&first).unwrap(), b"wrong");
+    std::fs::remove_file(&first).unwrap();
+    std::os::unix::fs::symlink(&blocker, &first).unwrap();
+    let linked = ffi::resume(
+        id.clone(),
+        None,
+        Transfer::new(),
+        Arc::new(Recorder::default()),
+    );
+    assert!(matches!(linked, Err(Error::Exists { .. })));
+    assert_eq!(std::fs::read(&blocker).unwrap(), b"blocker");
+    std::fs::remove_file(&first).unwrap();
+    std::fs::write(&first, b"first").unwrap();
+    std::fs::remove_file(&blocker).unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let resumed = ffi::resume(id, None, Transfer::new(), recorder.clone()).unwrap();
+    assert!(matches!(resumed, ffi::ResumeReport::Received(report) if report.files.len() == 2));
+    assert_eq!(std::fs::read(&first).unwrap(), b"first");
+    assert_eq!(
+        std::fs::read(dest.path().join("nested/second.bin")).unwrap(),
+        b"second"
+    );
+    assert!(!journalled(&handle.journal_id()));
+    let views = recorder.0.lock().unwrap();
+    let last = views.last().unwrap();
+    assert!(last
+        .files
+        .iter()
+        .all(|file| file.state == FileState::Verified));
+    let transport = views
+        .iter()
+        .find(|view| view.phase == Phase::Transferring)
+        .unwrap();
+    assert_eq!(transport.files[0].state, FileState::Verified);
+}
+
+fn a_quic_resume_reuses_a_verified_file(bin: &str) {
+    let port = common::free_port();
+    let server = common::start_server(
+        bin,
+        &[
+            ("VOTPORT_SERVE_BIND", format!("127.0.0.1:{port}")),
+            ("VOTPORT_SERVE_ADVERTISE", format!("localhost:{port}")),
+        ],
+    );
+    let token = common::deliver(
+        &server.base,
+        &[("first", b"first".to_vec()), ("second", b"second".to_vec())],
+        None,
+        Some(1),
+    );
+    let home = tempfile::tempdir().unwrap();
+    let dest = home.path().join("out");
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::write(dest.join("first"), b"first").unwrap();
+    let handle = Transfer::new();
+    let fresh = ffi::receive(
+        format!("{}/s/{token}", server.base),
+        None,
+        dest.display().to_string(),
+        handle.clone(),
+        Arc::new(Recorder::default()),
+    );
+    assert!(matches!(fresh, Err(Error::Exists { .. })), "{fresh:?}");
+    assert!(handle.journal_kept() && journalled(&handle.journal_id()));
+    let recorder = Arc::new(Recorder::default());
+    let resumed = ffi::resume(
+        handle.journal_id().unwrap(),
+        None,
+        Transfer::new(),
+        recorder.clone(),
+    )
+    .unwrap();
+    assert!(matches!(resumed, ffi::ResumeReport::Received(report) if report.files.len() == 2));
+    assert_eq!(std::fs::read(dest.join("first")).unwrap(), b"first");
+    assert_eq!(std::fs::read(dest.join("second")).unwrap(), b"second");
+    let views = recorder.0.lock().unwrap();
+    let last = views.last().unwrap();
+    assert_eq!(last.transport, Some(Transport::Fetch));
+    assert!(last
+        .files
+        .iter()
+        .all(|file| file.state == FileState::Verified));
+    assert!(!journalled(&handle.journal_id()));
 }

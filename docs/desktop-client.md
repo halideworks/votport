@@ -104,6 +104,12 @@ shell can forget what it removes. Both shells list the journal at launch
 as interrupted cards with Resume (and a password field when the entry
 needs one), offer Retry on a failed card the core kept, and forget an
 entry on Remove; the CLI gains `votport status` and `votport resume`.
+
+Retry or Resume rehashes existing regular files and skips those whose length
+and content match the delivery. Changed files and nonregular files are refused;
+a fresh receive still refuses existing files. Checking large completed files
+can take time before the remaining downloads begin.
+
 Decision 4's SQLite journal is this directory of files; the design's
 resume-without-asking at launch is an offer instead, since a resume may
 need the password again. Both apps now bundle Plus Jakarta Sans and

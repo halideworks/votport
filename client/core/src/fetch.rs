@@ -27,7 +27,8 @@ use crate::identity::Device;
 use crate::package::{package_path_string, read_manifest};
 use crate::progress::{with_progress, Event, Observer, PlannedFile, Transport, PROGRESS_QUANTUM};
 use crate::receive::{
-    local_path, local_path_of, require_space, write_verified, Delivery, Received, Resumed,
+    local_path, local_path_of, require_space, reusable_file, write_verified, Delivery, Received,
+    Resumed,
 };
 use crate::send_push::{probe_any, Probe};
 
@@ -86,6 +87,17 @@ pub fn try_fetch(
     dest: &Path,
     observer: &mut dyn Observer,
 ) -> Result<Outcome> {
+    try_fetch_with_resume(client, delivery, device, dest, observer, false)
+}
+
+pub(crate) fn try_fetch_with_resume(
+    client: &Client,
+    delivery: &Delivery,
+    device: &Device,
+    dest: &Path,
+    observer: &mut dyn Observer,
+    resume: bool,
+) -> Result<Outcome> {
     let mut metadata = client.outbound_metadata(&delivery.token, None)?;
 
     // A password delivery serves nothing until the password is proven; the
@@ -109,15 +121,41 @@ pub fn try_fetch(
         return Ok(Outcome::Unreachable);
     };
 
+    // The delivery's own file list, so a screen has rows while the carrier
+    // moves the bundle; materialize announces the manifest's list after.
+    observer.event(Event::Planned {
+        files: metadata
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| PlannedFile {
+                index,
+                path: file.name.clone(),
+                bytes: file.bytes,
+            })
+            .collect(),
+    });
     // Refuse a receive that would overwrite before reserving a fetch ticket,
     // the way the HTTP path refuses before downloading: a mint counts an
     // undelivered ticket against the delivery's download cap for the
     // capability's lifetime, so a refusal after the mint would lock the
     // delivery out. materialize re-checks on the authoritative manifest names.
+    let mut remaining = 0u64;
     for file in &metadata.files {
         let path = local_path(dest, &file.name)?;
-        if path.exists() {
-            return Err(Error::Exists { path });
+        if file.suite != "blake3" {
+            return Err(Error::UnknownSuite {
+                suite: file.suite.clone(),
+            });
+        }
+        if !reusable_file(
+            &path,
+            decode_digest(&file.root)?,
+            file.bytes,
+            resume,
+            observer,
+        )? {
+            remaining = remaining.saturating_add(file.bytes);
         }
     }
     // The bundle is staged beside the destination and then copied into it,
@@ -137,7 +175,7 @@ pub fn try_fetch(
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let total: u64 = metadata.files.iter().map(|file| file.bytes).sum();
-    if require_space(staging_parent, total.saturating_mul(2)).is_err() {
+    if require_space(staging_parent, total.saturating_add(remaining)).is_err() {
         return Ok(Outcome::Unreachable);
     }
 
@@ -192,20 +230,6 @@ pub fn try_fetch(
         fs::remove_dir_all(&stage)?;
     }
 
-    // The delivery's own file list, so a screen has rows while the carrier
-    // moves the bundle; materialize announces the manifest's list after.
-    observer.event(Event::Planned {
-        files: metadata
-            .files
-            .iter()
-            .enumerate()
-            .map(|(index, file)| PlannedFile {
-                index,
-                path: file.name.clone(),
-                bytes: file.bytes,
-            })
-            .collect(),
-    });
     observer.event(Event::Transport(Transport::Fetch));
     // ponytail: once the ticket is minted a cancel is not honoured: vot-cli
     // removes the resume store when the bundle is whole, so stopping after
@@ -238,7 +262,7 @@ pub fn try_fetch(
         return Err(error.into());
     }
 
-    let received = materialize(&stage, dest, observer)?;
+    let received = materialize(&stage, dest, observer, resume)?;
     // The files are on disk and verified; a failure to clear the stage must not
     // fail the receive. A leftover whole bundle is removed on the next run.
     let _ = fs::remove_dir_all(&stage);
@@ -277,19 +301,15 @@ fn stage_unresumable(error: &VotError) -> bool {
 /// Copies each object a fetched bundle holds to its loose path, re-hashing to
 /// the announced root. Refuses the whole bundle before writing a byte on a
 /// packed entry, a name that would escape `dest`, or a file already present.
-fn materialize(bundle: &Path, dest: &Path, observer: &mut dyn Observer) -> Result<Received> {
+fn materialize(
+    bundle: &Path,
+    dest: &Path,
+    observer: &mut dyn Observer,
+    resume: bool,
+) -> Result<Received> {
     let entries = read_manifest(bundle)?;
     let objects = bundle.join("objects");
 
-    let planned = entries
-        .iter()
-        .map(|entry| local_path_of(dest, &entry.path).map(|path| (path, entry.root, entry.length)))
-        .collect::<Result<Vec<_>>>()?;
-    for (path, _, _) in &planned {
-        if path.exists() {
-            return Err(Error::Exists { path: path.clone() });
-        }
-    }
     observer.event(Event::Planned {
         files: entries
             .iter()
@@ -302,36 +322,49 @@ fn materialize(bundle: &Path, dest: &Path, observer: &mut dyn Observer) -> Resul
             .collect(),
     });
 
+    let planned = entries
+        .iter()
+        .map(|entry| {
+            let path = local_path_of(dest, &entry.path)?;
+            let complete = reusable_file(&path, entry.root, entry.length, resume, observer)?;
+            Ok((path, entry.root, entry.length, complete))
+        })
+        .collect::<Result<Vec<_>>>()?;
     fs::create_dir_all(dest)?;
     let mut files = Vec::with_capacity(planned.len());
-    for (index, (path, root, length)) in planned.into_iter().enumerate() {
-        let object = objects.join(object_name(&root));
-        let mut source = |offset: u64| -> Result<Resumed> {
-            let mut file = File::open(&object).map_err(|source| Error::Read {
-                path: object.clone(),
-                source,
-            })?;
-            if offset > 0 {
-                file.seek(SeekFrom::Start(offset))
-                    .map_err(|source| Error::Read {
-                        path: object.clone(),
-                        source,
-                    })?;
-            }
-            Ok(Resumed {
-                reader: Box::new(file),
-                start: offset,
-            })
-        };
-        write_verified(
-            &mut source,
-            &path,
-            root,
-            &hex::encode(root),
-            length,
-            index,
-            observer,
-        )?;
+    for (index, (path, root, length, complete)) in planned.into_iter().enumerate() {
+        if observer.cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if !complete {
+            let object = objects.join(object_name(&root));
+            let mut source = |offset: u64| -> Result<Resumed> {
+                let mut file = File::open(&object).map_err(|source| Error::Read {
+                    path: object.clone(),
+                    source,
+                })?;
+                if offset > 0 {
+                    file.seek(SeekFrom::Start(offset))
+                        .map_err(|source| Error::Read {
+                            path: object.clone(),
+                            source,
+                        })?;
+                }
+                Ok(Resumed {
+                    reader: Box::new(file),
+                    start: offset,
+                })
+            };
+            write_verified(
+                &mut source,
+                &path,
+                root,
+                &hex::encode(root),
+                length,
+                index,
+                observer,
+            )?;
+        }
         observer.event(Event::FileVerified {
             index,
             path: path.display().to_string(),
@@ -367,6 +400,51 @@ mod tests {
     use super::*;
     use crate::entries::admit;
     use crate::package::build;
+
+    #[test]
+    fn resumed_materialize_verifies_existing_files_and_skips_their_objects() {
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("source");
+        let stage = home.path().join("bundle");
+        let dest = home.path().join("dest");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&dest).unwrap();
+        let mut admitted = Vec::new();
+        for (name, bytes) in [
+            ("first", b"first".as_slice()),
+            ("second", b"second".as_slice()),
+        ] {
+            let path = source.join(name);
+            fs::write(&path, bytes).unwrap();
+            admitted.push(admit(name, path, false).unwrap());
+        }
+        build(admitted, &stage).unwrap();
+        fs::create_dir_all(stage.join("objects")).unwrap();
+        for entry in read_manifest(&stage).unwrap() {
+            if package_path_string(&entry.path) == "second" {
+                fs::write(
+                    stage.join("objects").join(object_name(&entry.root)),
+                    b"second",
+                )
+                .unwrap();
+            }
+        }
+        fs::write(dest.join("first"), b"wrong").unwrap();
+        assert!(matches!(
+            materialize(&stage, &dest, &mut crate::progress::Silent, true),
+            Err(Error::Exists { .. })
+        ));
+        assert!(!dest.join("second").exists());
+        fs::write(dest.join("first"), b"first").unwrap();
+        assert!(matches!(
+            materialize(&stage, &dest, &mut crate::progress::Silent, false),
+            Err(Error::Exists { .. })
+        ));
+        let received = materialize(&stage, &dest, &mut crate::progress::Silent, true).unwrap();
+        assert_eq!(received.files.len(), 2);
+        assert_eq!(fs::read(dest.join("first")).unwrap(), b"first");
+        assert_eq!(fs::read(dest.join("second")).unwrap(), b"second");
+    }
 
     #[test]
     fn object_name_is_the_hex_root_with_an_obj_suffix() {
