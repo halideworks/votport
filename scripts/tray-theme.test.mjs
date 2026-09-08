@@ -28,3 +28,18 @@ test('context menu uses native WinUI styling and hides its rich panel host', asy
   assert.doesNotMatch(panel, /RequestedTheme|BackgroundProperty|ForegroundProperty/);
   assert.doesNotMatch(tray, /TrackPopupMenu|CreatePopupMenu/);
 });
+
+test('both tray surfaces take foreground ownership and strip native frame styles', async () => {
+  const panel = await readFile(new URL('../client/windows/Votport/TrayPanel.xaml.cs', import.meta.url), 'utf8');
+  for (const method of ['ShowContextMenu', 'ShowNearTray']) {
+    const body = panel.slice(panel.indexOf('public void ' + method), panel.indexOf('\n    }', panel.indexOf('public void ' + method)));
+    assert.match(body, /BringToForeground\(\)/);
+  }
+  assert.match(panel, /SetForegroundWindow\(WinRT.Interop.WindowNative.GetWindowHandle\(this\)\)/);
+  const frameMask = Number(panel.match(/GetWindowLong\(window, -16\) & ~(0x[0-9A-F]+)/)[1]);
+  const edgeMask = Number(panel.match(/GetWindowLong\(window, -20\) & ~(0x[0-9A-F]+)/)[1]);
+  assert.equal(0x14480000 & ~frameMask, 0x14000000);
+  assert.equal(0x108 & ~edgeMask, 0x8);
+  assert.match(panel, /SetWindowPos\(window, IntPtr.Zero, 0, 0, 0, 0, 0x37\)/);
+  assert.match(panel, /menu.Opened.*open.Focus\(FocusState.Pointer\)/);
+});

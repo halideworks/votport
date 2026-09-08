@@ -948,8 +948,10 @@ happens to files.
 Windows right-click uses a standard WinUI menu with transfer status, Open,
 and Quit. Left-click retains the transfer panel and its controls. The menu
 uses system light/dark and accessibility resources with no custom border;
-the panel also suppresses the Windows 11 DWM outline. macOS uses a native
-menu-bar menu with transfer actions in submenus. Both use platform spacing
+the panel removes native dialog-frame and edge styles as well as the
+Windows 11 DWM outline. Both surfaces explicitly take foreground ownership
+so outside clicks dismiss them. Pointer-opened menus use pointer focus.
+macOS uses a native menu-bar menu with transfer actions in submenus. Both use platform spacing
 and appearance instead of a branded popup header.
 
 Windows UI validation signed in to a test server, opened Share directly,
@@ -958,6 +960,10 @@ confirmed operator navigation disappeared after sign-out. The tray changed
 between light and dark while the app stayed running; system appearance was
 restored after the test. First right-click, Open, Escape, click-away,
 left-click panel restoration, and Quit passed in the running Windows app.
+The initial synthetic callback test missed background-app activation and
+a native frame left by the presenter. Real tray-icon clicks with the main
+window hidden now verify foreground ownership and dismissal into another
+window for both buttons; screenshots confirm removal of the frame.
 Both native apps built and launched after installation. The Mac console
 remained locked, so its native menu was not visually qualified. Share drafts
 remain local to the current view, so navigating away still discards the

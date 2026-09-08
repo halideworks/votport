@@ -3,9 +3,6 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:local="using:Votport"
     Title="votport">
-  <Window.SystemBackdrop>
-    <MicaBackdrop />
-  </Window.SystemBackdrop>
   <!-- No FontFamily on the Grid: the XAML compiler fails silently on it. -->
   <Grid x:Name="MenuHost">
   <Grid x:Name="PanelContent" Background="{ThemeResource VotBgBrush}" Padding="14" RowSpacing="10">
