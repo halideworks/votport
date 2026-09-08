@@ -479,6 +479,13 @@ pub fn port() -> Option<port::Port> {
     port::current()
 }
 
+/// Starts a browser sign-in bound to this app and port. Blocks for the
+/// availability check; the shell opens the returned authorization URL.
+#[uniffi::export]
+pub fn begin_sso(base: String) -> std::result::Result<Arc<port::SsoLogin>, port::PortError> {
+    port::begin_sso(&base).map_err(port::PortError::sign_in)
+}
+
 /// Signs in to the votport at `base` with the admin password. Blocks for
 /// the round trips; a shell runs it off its main thread.
 ///

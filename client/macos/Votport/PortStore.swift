@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import OSLog
 import VotportCore
@@ -20,6 +21,10 @@ final class PortStore: ObservableObject {
     /// Calls in flight; `busy` follows it, so two overlapping calls do not
     /// re-enable a form when the first one lands.
     private var inFlight = 0
+    @Published private(set) var signingInBrowser = false
+    private var ssoAttempt: UUID?
+    private var ssoLogin: SsoLogin?
+    private var ssoCompleting = false
     /// The last failure's headline, for the line under the form that made
     /// the call, named by `problemScope`.
     @Published var problem: String?
@@ -51,7 +56,11 @@ final class PortStore: ObservableObject {
     }
 
     func signIn(base: String, password: String) {
-        run(.port) { try VotportCore.signIn(base: base, password: password) } then: { [weak self] result in
+        let previous = clearSso()
+        run(.port) {
+            previous?.cancel()
+            return try VotportCore.signIn(base: base, password: password)
+        } then: { [weak self] result in
             guard let self else { return }
             switch result {
             case .success(let port):
@@ -64,8 +73,77 @@ final class PortStore: ObservableObject {
         }
     }
 
+    func beginSso(base: String) {
+        let previous = clearSso()
+        let attempt = UUID()
+        ssoAttempt = attempt
+        signingInBrowser = true
+        run(.port) {
+            previous?.cancel()
+            let login = try VotportCore.beginSso(base: base)
+            return (login, login.authorizationUrl())
+        } then: { [weak self] result in
+            guard let self, self.ssoAttempt == attempt else { return }
+            switch result {
+            case .success(let (login, address)):
+                self.ssoLogin = login
+                guard let url = URL(string: address), NSWorkspace.shared.open(url) else {
+                    self.cancelSso()
+                    self.problem = "Could not open your browser; try again"
+                    return
+                }
+            case .failure(let error):
+                self.signingInBrowser = false
+                self.ssoAttempt = nil
+                self.take(error, .port)
+            }
+        }
+    }
+
+    private func clearSso() -> SsoLogin? {
+        let login = ssoLogin
+        ssoLogin = nil
+        ssoAttempt = nil
+        ssoCompleting = false
+        signingInBrowser = false
+        return login
+    }
+
+    func cancelSso() {
+        let login = clearSso()
+        run(.port) { login?.cancel() } then: { _ in }
+    }
+
+    func completeSso(_ url: URL) {
+        guard !ssoCompleting else { return }
+        guard let login = ssoLogin, let attempt = ssoAttempt else {
+            problem = "Start browser sign-in from this app first"
+            problemScope = .port
+            return
+        }
+        ssoCompleting = true
+        run(.port) { try login.complete(callback: url.absoluteString) } then: { [weak self] result in
+            guard let self, self.ssoAttempt == attempt else { return }
+            self.ssoLogin = nil
+            self.ssoAttempt = nil
+            self.ssoCompleting = false
+            self.signingInBrowser = false
+            switch result {
+            case .success(let port):
+                self.port = port
+                self.problem = nil
+                self.refresh()
+            case .failure(let error): self.take(error, .port)
+            }
+        }
+    }
+
     func signOut() {
-        run(.port) { VotportCore.signOut() } then: { [weak self] _ in
+        let previous = clearSso()
+        run(.port) {
+            previous?.cancel()
+            VotportCore.signOut()
+        } then: { [weak self] _ in
             self?.port = nil
             self?.requests = []
             self?.deliveries = []

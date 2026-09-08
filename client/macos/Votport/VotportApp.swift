@@ -136,6 +136,11 @@ struct MainWindow: View {
             if !signedIn && (section == nil || section?.operator_ == true) { section = .settings }
         }
         .onOpenURL { url in
+            if url.scheme == "votport", url.host == "signin" {
+                port.completeSso(url)
+                section = .settings
+                return
+            }
             // votport://r/<token>?base=<origin> opens Send with the request
             // link; votport://s/<token>?base=<origin> opens Receive with the
             // delivery link. The web pages offer both as "Open in the app".

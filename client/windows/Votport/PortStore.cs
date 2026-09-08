@@ -30,6 +30,10 @@ public sealed class PortStore
     /// Calls in flight; Busy follows it, so two overlapping calls do not
     /// re-enable a form when the first one lands.
     private int inFlight;
+    public bool SigningInBrowser => ssoAttempt is not null;
+    private Guid? ssoAttempt;
+    private SsoLogin? ssoLogin;
+    private bool ssoCompleting;
     /// The port, the lists, the problem, or busy changed; pages redraw.
     public event Action? Changed;
 
@@ -47,21 +51,91 @@ public sealed class PortStore
         });
     }
 
-    public void SignIn(string @base, string password) =>
-        Run(Scope.Port, () => VotportClientCoreMethods.SignIn(@base, password), port =>
+    public void SignIn(string @base, string password)
+    {
+        var previous = ClearSso();
+        Run(Scope.Port, () => { previous?.Cancel(); return VotportClientCoreMethods.SignIn(@base, password); }, port =>
         {
             Port = port;
             Problem = null;
             Refresh();
         });
+    }
 
-    public void SignOut() =>
-        Run(Scope.Port, () => { VotportClientCoreMethods.SignOut(); return true; }, _ =>
+    public void BeginSso(string origin)
+    {
+        var previous = ClearSso();
+        var attempt = Guid.NewGuid();
+        ssoAttempt = attempt;
+        Run(Scope.Port, () => {
+            previous?.Cancel();
+            var login = VotportClientCoreMethods.BeginSso(origin);
+            return (login, address: login.AuthorizationUrl());
+        }, result => {
+            if (ssoAttempt != attempt) return;
+            ssoLogin = result.login;
+            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(result.address) { UseShellExecute = true }); }
+            catch (Exception) {
+                CancelSso();
+                Problem = "Could not open your browser; try again";
+                ProblemScope = Scope.Port;
+            }
+        }, () => { if (ssoAttempt == attempt) ssoAttempt = null; });
+    }
+
+    private SsoLogin? ClearSso()
+    {
+        var login = ssoLogin;
+        ssoLogin = null;
+        ssoAttempt = null;
+        ssoCompleting = false;
+        return login;
+    }
+
+    public void CancelSso()
+    {
+        var login = ClearSso();
+        Run(Scope.Port, () => { login?.Cancel(); return true; }, _ => { });
+    }
+
+    public void CompleteSso(Uri url)
+    {
+        if (ssoCompleting) return;
+        if (ssoLogin is not SsoLogin login || ssoAttempt is not Guid attempt)
+        {
+            Problem = "Start browser sign-in from this app first";
+            ProblemScope = Scope.Port;
+            Changed?.Invoke();
+            return;
+        }
+        ssoCompleting = true;
+        Run(Scope.Port, () => login.Complete(url.AbsoluteUri), port => {
+            if (ssoAttempt != attempt) return;
+            ssoLogin = null;
+            ssoAttempt = null;
+            ssoCompleting = false;
+            Port = port;
+            Problem = null;
+            Refresh();
+        }, () => {
+            if (ssoAttempt != attempt) return;
+            ssoLogin = null;
+            ssoAttempt = null;
+            ssoCompleting = false;
+        });
+    }
+
+    public void SignOut()
+    {
+        var previous = ClearSso();
+        Run(Scope.Port, () => { previous?.Cancel(); VotportClientCoreMethods.SignOut(); return true; }, _ =>
         {
             Port = null;
             Requests.Clear();
             Deliveries.Clear();
         });
+
+    }
 
     /// Reloads the request links and deliveries.
     public void Refresh() =>

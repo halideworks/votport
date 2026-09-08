@@ -350,6 +350,13 @@ disclosure when SSO is configured; the form stays in the page. Without SSO
 the form stays expanded even if `VOTPORT_PUBLIC_PASSWORD_LOGIN=0`. An
 unreachable IdP may mute the SSO button, never the password form.
 
+The macOS and Windows apps use the same provider configuration. In Settings,
+enter the port address and choose **Sign in with SSO**. Finish sign-in in the
+default browser and allow it to open Votport. The app receives a one-use code
+valid for 60 seconds, bound to a secret kept by the app that started sign-in;
+the URL contains no session cookie. Cancel in the app to abandon the attempt.
+A server restart invalidates an unfinished handoff, so start again if needed.
+
 A single `VOTPORT_OIDC_CLIENT_ID` is the supported shape. When an id token
 carries `azp`, it must equal that client id. The crate already checks issuer,
 audience, and nonce. A second client or a hosted-domain (`hd`) allow-list is
