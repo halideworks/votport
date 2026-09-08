@@ -140,6 +140,7 @@ pub(crate) fn try_fetch_with_resume(
     let paths =
         crate::receive::local_paths(dest, metadata.files.iter().map(|file| file.name.as_str()))?;
     for (file, path) in metadata.files.iter().zip(paths) {
+        let path = path?;
         if file.suite != "blake3" {
             return Err(Error::UnknownSuite {
                 suite: file.suite.clone(),
@@ -326,17 +327,16 @@ fn materialize(
             .collect(),
     });
 
-    let paths = {
-        let names = entries
-            .iter()
-            .map(|entry| crate::receive::package_name(&entry.path))
-            .collect::<Result<Vec<_>>>()?;
-        crate::receive::local_paths(dest, names.iter().map(String::as_str))?
-    };
+    let names = entries
+        .iter()
+        .map(|entry| crate::receive::package_name(&entry.path))
+        .collect::<Result<Vec<_>>>()?;
+    let paths = crate::receive::local_paths(dest, names.iter().map(String::as_str))?;
     let planned = entries
         .iter()
         .zip(paths)
         .map(|(entry, path)| {
+            let path = path?;
             let complete = reusable_file(&path, entry.root, entry.length, resume, observer)?;
             Ok((path, entry.root, entry.length, complete))
         })

@@ -169,6 +169,7 @@ fn receive_over_http_inner(
         .iter()
         .zip(paths)
         .map(|(file, path)| {
+            let path = path?;
             if file.suite != BLAKE3 {
                 return Err(Error::UnknownSuite {
                     suite: file.suite.clone(),
@@ -671,23 +672,20 @@ pub(crate) fn local_path(dest: &Path, name: &str) -> Result<PathBuf> {
 
 // This cache is only preflight; publication checks the current parent again.
 pub(crate) fn local_paths<'a>(
-    dest: &Path,
-    names: impl IntoIterator<Item = &'a str>,
-) -> Result<Vec<PathBuf>> {
+    dest: &'a Path,
+    names: impl IntoIterator<Item = &'a str> + 'a,
+) -> Result<impl Iterator<Item = Result<PathBuf>> + 'a> {
     let anchor = resolve_directory(dest)?;
     let mut parents = std::collections::HashSet::new();
-    names
-        .into_iter()
-        .map(|name| {
-            let path = joined_path(dest, name)?;
-            let parent = path.parent().unwrap_or(dest);
-            if !parents.contains(parent) {
-                validate_parent_under(&anchor, &path)?;
-                parents.insert(parent.to_path_buf());
-            }
-            Ok(path)
-        })
-        .collect()
+    Ok(names.into_iter().map(move |name| {
+        let path = joined_path(dest, name)?;
+        let parent = path.parent().unwrap_or(dest);
+        if !parents.contains(parent) {
+            validate_parent_under(&anchor, &path)?;
+            parents.insert(parent.to_path_buf());
+        }
+        Ok(path)
+    }))
 }
 
 fn joined_path(dest: &Path, name: &str) -> Result<PathBuf> {
@@ -1072,14 +1070,20 @@ mod tests {
         );
         assert!(!dest.exists());
         assert_eq!(
-            local_paths(&dest, ["nested/a", "nested/b", "other/c"]).unwrap(),
+            local_paths(&dest, ["nested/a", "nested/b", "other/c"])
+                .unwrap()
+                .collect::<Result<Vec<_>>>()
+                .unwrap(),
             [
                 dest.join("nested/a"),
                 dest.join("nested/b"),
                 dest.join("other/c")
             ]
         );
-        assert!(local_paths(&dest, ["nested/a", "../escape"]).is_err());
+        assert!(local_paths(&dest, ["nested/a", "../escape"])
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .is_err());
         fs::write(home.path().join("file"), b"untouched").unwrap();
         assert!(local_path(home.path(), "file/child").is_err());
         assert!(resolve_directory(&home.path().join("missing/../file")).is_err());
@@ -1106,7 +1110,10 @@ mod tests {
         assert!(error.worth_retrying());
         let announced = admit("escape/file", PathBuf::new(), true).unwrap();
         assert!(local_path_of(&root, &announced.path).is_err());
-        assert!(local_paths(&root, ["ok", "escape/file"]).is_err());
+        assert!(local_paths(&root, ["ok", "escape/file"])
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .is_err());
         fs::create_dir(root.join("real")).unwrap();
         symlink(root.join("real"), root.join("inside")).unwrap();
         assert_eq!(
@@ -1121,7 +1128,10 @@ mod tests {
             fs::canonicalize(root.join("real")).unwrap()
         );
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
-        let planned = local_paths(&root, ["real/a", "real/b"]).unwrap();
+        let planned = local_paths(&root, ["real/a", "real/b"])
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
         fs::remove_dir(root.join("real")).unwrap();
         symlink(&outside, root.join("real")).unwrap();
         assert!(validate_parent(&root, &planned[0]).is_err());
