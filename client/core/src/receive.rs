@@ -163,17 +163,18 @@ fn receive_over_http_inner(
     // failing on a later one: a suite the client does not fetch, a root that
     // is not a 32-byte hash, a name that would escape the destination, or a
     // file already present that a receive would overwrite.
+    let paths = local_paths(dest, metadata.files.iter().map(|file| file.name.as_str()))?;
     let planned = metadata
         .files
         .iter()
-        .map(|file| {
+        .zip(paths)
+        .map(|(file, path)| {
             if file.suite != BLAKE3 {
                 return Err(Error::UnknownSuite {
                     suite: file.suite.clone(),
                 });
             }
             let root = decode_root(&file.root)?;
-            let path = local_path(dest, &file.name)?;
             let complete = reusable_file(&path, root, file.bytes, resume, observer)?;
             Ok((file, path, root, complete))
         })
@@ -204,6 +205,7 @@ fn receive_over_http_inner(
             return Err(Error::Cancelled);
         }
         if !complete {
+            validate_parent(dest, &path)?;
             fs::create_dir_all(path.parent().unwrap_or(dest))?;
             let lease_path = part_path(&path).with_extension("lease");
             let mut lease_file = open_journal(&lease_path)?;
@@ -326,6 +328,37 @@ pub(crate) fn write_verified(
     index: usize,
     observer: &mut dyn Observer,
 ) -> Result<()> {
+    let pending = prepare_verified(
+        source,
+        destination,
+        announced,
+        announced_hex,
+        total,
+        index,
+        observer,
+    )?;
+    pending.journal.sync_all()?;
+    pending.publish()
+}
+
+pub(crate) struct PendingFile {
+    pub(crate) journal: File,
+    builder: ObjectBuilder,
+    destination: PathBuf,
+    announced: [u8; 32],
+    announced_hex: String,
+    temporary: PathBuf,
+}
+
+pub(crate) fn prepare_verified(
+    source: &mut dyn FnMut(u64) -> Result<Resumed>,
+    destination: &Path,
+    announced: [u8; 32],
+    announced_hex: &str,
+    total: u64,
+    index: usize,
+    observer: &mut dyn Observer,
+) -> Result<PendingFile> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -371,27 +404,38 @@ pub(crate) fn write_verified(
         index,
         observer,
     )?;
-    match verify_and_rename(
+    Ok(PendingFile {
+        journal,
         builder,
-        destination,
+        destination: destination.to_owned(),
         announced,
-        announced_hex,
-        &temporary,
-        &journal,
-    ) {
-        Ok(()) => Ok(()),
-        // A stream that ended short (the builder's LengthMismatch) leaves a
-        // usable prefix, so the partial stays to resume. Any other failure
-        // means finish already produced a complete file: a wrong root is
-        // poison, and a landed file or a rename race leaves a full-size partial
-        // the next run would only discard, so all of these remove it.
-        Err(error) => {
-            if !matches!(error, Error::Object(vot_object::Error::LengthMismatch))
-                && vot_platform_fs::same_file_handle(&journal, &temporary).unwrap_or(false)
-            {
-                let _ = fs::remove_file(&temporary);
+        announced_hex: announced_hex.to_owned(),
+        temporary,
+    })
+}
+
+impl PendingFile {
+    pub(crate) fn publish(self) -> Result<()> {
+        match verify_and_rename(
+            self.builder,
+            &self.destination,
+            self.announced,
+            &self.announced_hex,
+            &self.temporary,
+            &self.journal,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // A short stream retains its usable prefix; a complete but
+                // rejected file retains nothing under the owned journal name.
+                if !matches!(error, Error::Object(vot_object::Error::LengthMismatch))
+                    && vot_platform_fs::same_file_handle(&self.journal, &self.temporary)
+                        .unwrap_or(false)
+                {
+                    let _ = fs::remove_file(&self.temporary);
+                }
+                Err(error)
             }
-            Err(error)
         }
     }
 }
@@ -531,7 +575,6 @@ fn stream_to_temp(
     sink.set_len(resume_from)?;
     sink.seek(SeekFrom::Start(resume_from))?;
     hash_copy(reader, builder, sink, resume_from, total, index, observer)?;
-    sink.sync_all()?;
     Ok(())
 }
 
@@ -621,6 +664,33 @@ fn hash_copy(
 /// component, no reserved or non-portable shape) with hidden names allowed, so
 /// a delivered dotfile lands while a traversal cannot.
 pub(crate) fn local_path(dest: &Path, name: &str) -> Result<PathBuf> {
+    let path = joined_path(dest, name)?;
+    validate_parent(dest, &path)?;
+    Ok(path)
+}
+
+// This cache is only preflight; publication checks the current parent again.
+pub(crate) fn local_paths<'a>(
+    dest: &Path,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<PathBuf>> {
+    let anchor = resolve_directory(dest)?;
+    let mut parents = std::collections::HashSet::new();
+    names
+        .into_iter()
+        .map(|name| {
+            let path = joined_path(dest, name)?;
+            let parent = path.parent().unwrap_or(dest);
+            if !parents.contains(parent) {
+                validate_parent_under(&anchor, &path)?;
+                parents.insert(parent.to_path_buf());
+            }
+            Ok(path)
+        })
+        .collect()
+}
+
+fn joined_path(dest: &Path, name: &str) -> Result<PathBuf> {
     let entry = admit(name, PathBuf::new(), true).map_err(|rejected| Error::BadName {
         name: name.to_owned(),
         reason: rejected.reason,
@@ -636,14 +706,22 @@ pub(crate) fn local_path(dest: &Path, name: &str) -> Result<PathBuf> {
             }
         }
     }
-    let anchor = resolve_directory(dest)?;
-    let parent = resolve_directory(path.parent().unwrap_or(dest))?;
-    if !parent.starts_with(&anchor) {
+    Ok(path)
+}
+
+pub(crate) fn validate_parent(dest: &Path, path: &Path) -> Result<()> {
+    validate_parent_under(&resolve_directory(dest)?, path)
+}
+
+fn validate_parent_under(anchor: &Path, path: &Path) -> Result<()> {
+    let parent = resolve_directory(path.parent().unwrap_or(anchor))?;
+    if !parent.starts_with(anchor) {
         return Err(Error::Other(format!(
-            "the parent directory of {name:?} leaves the receive destination"
+            "the parent directory of {:?} leaves the receive destination",
+            path.display()
         )));
     }
-    Ok(path)
+    Ok(())
 }
 
 // Resolve existing directory links while retaining directories not created yet.
@@ -703,6 +781,10 @@ fn resolve_directory(path: &Path) -> Result<PathBuf> {
 /// delivery-announced name. A fetched manifest was built with the portable
 /// profile but not votport's own name policy, so it is re-checked here.
 pub(crate) fn local_path_of(dest: &Path, path: &PackagePath) -> Result<PathBuf> {
+    local_path(dest, &package_name(path)?)
+}
+
+pub(crate) fn package_name(path: &PackagePath) -> Result<String> {
     let mut parts = Vec::new();
     for component in path.iter() {
         match component {
@@ -714,7 +796,7 @@ pub(crate) fn local_path_of(dest: &Path, path: &PackagePath) -> Result<PathBuf> 
             }
         }
     }
-    local_path(dest, &parts.join("/"))
+    Ok(parts.join("/"))
 }
 
 fn decode_root(hex_root: &str) -> Result<[u8; 32]> {
@@ -989,6 +1071,15 @@ mod tests {
             dest.join("nested/file")
         );
         assert!(!dest.exists());
+        assert_eq!(
+            local_paths(&dest, ["nested/a", "nested/b", "other/c"]).unwrap(),
+            [
+                dest.join("nested/a"),
+                dest.join("nested/b"),
+                dest.join("other/c")
+            ]
+        );
+        assert!(local_paths(&dest, ["nested/a", "../escape"]).is_err());
         fs::write(home.path().join("file"), b"untouched").unwrap();
         assert!(local_path(home.path(), "file/child").is_err());
         assert!(resolve_directory(&home.path().join("missing/../file")).is_err());
@@ -1015,6 +1106,7 @@ mod tests {
         assert!(error.worth_retrying());
         let announced = admit("escape/file", PathBuf::new(), true).unwrap();
         assert!(local_path_of(&root, &announced.path).is_err());
+        assert!(local_paths(&root, ["ok", "escape/file"]).is_err());
         fs::create_dir(root.join("real")).unwrap();
         symlink(root.join("real"), root.join("inside")).unwrap();
         assert_eq!(
@@ -1029,6 +1121,10 @@ mod tests {
             fs::canonicalize(root.join("real")).unwrap()
         );
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        let planned = local_paths(&root, ["real/a", "real/b"]).unwrap();
+        fs::remove_dir(root.join("real")).unwrap();
+        symlink(&outside, root.join("real")).unwrap();
+        assert!(validate_parent(&root, &planned[0]).is_err());
     }
 
     fn receive_from(
