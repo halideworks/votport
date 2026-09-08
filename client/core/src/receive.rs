@@ -41,7 +41,11 @@ pub struct Received {
 const BLAKE3: &str = "blake3";
 
 /// How much of a download is read at once before it is hashed and written.
-const READ_CHUNK: usize = 64 * 1024;
+const READ_CHUNK: usize = 4 * 1024 * 1024;
+
+fn receive_buffer(total: u64) -> Vec<u8> {
+    vec![0; (total.min(READ_CHUNK as u64) as usize).max(1)]
+}
 
 /// Fetches `delivery` from `base` into `dest`, over QUIC when the delivery
 /// offers a fetch endpoint and the serve answers, over HTTP otherwise.
@@ -521,7 +525,7 @@ pub(crate) fn reusable_file(
         return Err(exists());
     }
     let mut builder = ObjectBuilder::new(Suite::Blake3Bao64, Some(total))?;
-    let mut buffer = vec![0u8; READ_CHUNK];
+    let mut buffer = receive_buffer(total);
     let mut reader = (&mut file).take(total);
     for _ in 0..=total {
         if observer.cancelled() {
@@ -550,7 +554,7 @@ fn feed_partial(file: &mut File, builder: &mut ObjectBuilder, total: u64) -> Res
         return Ok(0);
     }
     file.rewind()?;
-    let mut buffer = vec![0u8; READ_CHUNK];
+    let mut buffer = receive_buffer(total);
     let mut fed = 0u64;
     loop {
         let read = file.read(&mut buffer)?;
@@ -636,7 +640,7 @@ fn hash_copy(
     index: usize,
     observer: &mut dyn Observer,
 ) -> Result<()> {
-    let mut buffer = vec![0u8; READ_CHUNK];
+    let mut buffer = receive_buffer(total);
     let mut received = base;
     loop {
         // A cancel keeps the partial for the next run to resume.
@@ -807,6 +811,19 @@ fn decode_root(hex_root: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receive_buffers_bound_memory_and_still_read_past_empty_files() {
+        for (total, expected) in [
+            (0, 1),
+            (1, 1),
+            (256, 256),
+            (4_194_304, 4_194_304),
+            (u64::MAX, 4_194_304),
+        ] {
+            assert_eq!(receive_buffer(total).len(), expected);
+        }
+    }
 
     #[test]
     fn interrupted_download_keeps_only_the_current_files_lease() {
