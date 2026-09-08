@@ -244,6 +244,9 @@ fn an_operator_runs_the_port_from_the_core() {
         ]
     );
     let heard = uploads.0.lock().unwrap().clone();
+    assert!(heard[..heard.len() - 1]
+        .iter()
+        .all(|view| view.landed.is_empty()));
     assert!(
         heard.iter().any(|v| v
             .status
@@ -284,6 +287,44 @@ fn an_operator_runs_the_port_from_the_core() {
         )),
         ("\"reel.bin\" is already on the port.".to_owned(), false)
     );
+    let first = local.path().join("first-before-stop.txt");
+    std::fs::write(&first, b"first").unwrap();
+    for cancelled in [false, true] {
+        let heard = Uploads::default();
+        let checks = Cell::new(0);
+        let folder = if cancelled {
+            "cancel-sequence"
+        } else {
+            "dailies/shots"
+        };
+        let result = port::upload(
+            &[
+                first.to_string_lossy().into_owned(),
+                shots.join("reel.bin").to_string_lossy().into_owned(),
+            ],
+            folder,
+            &|| {
+                let previous = checks.get();
+                checks.set(previous + 1);
+                cancelled && previous > 0
+            },
+            &heard,
+        );
+        assert!(
+            matches!(result, Err(Error::Cancelled)) == cancelled,
+            "{result:?}"
+        );
+        assert!(result.is_err());
+        let views = heard.0.lock().unwrap();
+        assert!(views[..views.len() - 1]
+            .iter()
+            .all(|view| view.landed.is_empty()));
+        assert_eq!(
+            views.last().unwrap().landed,
+            vec![format!("{folder}/first-before-stop.txt")]
+        );
+        assert_eq!(views.last().unwrap().files_done, 1);
+    }
     let uploaded = ffi::issue_delivery(DeliverySpec {
         paths: vec!["dailies/shots/reel.bin".to_owned()],
         label: "Reel".to_owned(),

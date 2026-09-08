@@ -87,7 +87,9 @@ pub struct App {
     /// Per-IP native-push rail limit, separate from HTTP session creation.
     pub push_rate: crate::api::session_rate::SessionRate,
     /// Per-grant rate limit on outbound preparation and downloads.
-    pub outbound_rate: crate::api::session_rate::SessionRate,
+    pub outbound_rate: crate::api::session_rate::DownloadRate,
+    /// Bounds parsed grant bodies and their preparation lifetime.
+    pub outbound_grant_permits: Arc<tokio::sync::Semaphore>,
     /// Per-IP rate limit on automation share creation.
     pub automation_rate: crate::api::session_rate::SessionRate,
     /// Grants currently preparing or streaming, capped globally and per grant.
@@ -825,7 +827,10 @@ fn build_under_lease(
         push_rate: crate::api::session_rate::SessionRate::with_limit(200),
         // The same arithmetic as push: twenty fetches at eight rails each.
         serve_rate: crate::api::session_rate::SessionRate::with_limit(200),
-        outbound_rate: crate::api::session_rate::SessionRate::with_limit(2000),
+        outbound_rate: crate::api::session_rate::DownloadRate::new(),
+        outbound_grant_permits: Arc::new(tokio::sync::Semaphore::new(
+            crate::api::outbound::LIBRARY_GRANT_CONCURRENCY,
+        )),
         automation_rate: crate::api::session_rate::SessionRate::with_limit(60),
         outbound_active: Mutex::new(HashSet::new()),
         outbound_stage_budget: Arc::new(crate::api::outbound::StageBudget::new()),
@@ -2306,7 +2311,9 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route(
             "/api/admin/outbound-grants",
-            get(api::list_outbound_grants).post(api::create_outbound_grant),
+            get(api::list_outbound_grants).merge(post(api::create_outbound_grant).layer(
+                DefaultBodyLimit::max(api::outbound::MAX_GRANT_REQUEST_BYTES),
+            )),
         )
         .route(
             "/api/admin/outbound-grants/{id}",

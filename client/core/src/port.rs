@@ -561,8 +561,8 @@ pub struct UploadView {
     pub total_bytes: u64,
     pub files_done: u64,
     pub files_total: u64,
-    /// The library paths landed so far, in order; the whole upload once
-    /// `files_done` reaches `files_total`.
+    /// Empty during progress; the final update carries every landed path,
+    /// including when the upload stops with an error or cancellation.
     pub landed: Vec<String>,
     /// The one line a screen shows: "Uploading reel.mov, 1.2 GB of 4.0 GB
     /// (2 of 5 files)", then "Added 5 files to the port, 4.0 GB".
@@ -610,9 +610,9 @@ impl UploadView {
 /// pieces under one upload id per file. Requests retried in this call keep
 /// that id; a new call starts a fresh stage. A file published before its
 /// reply was lost is refused as already on the port, which it is. `stop` is
-/// read between chunks. Every view handed to `listener` carries the library
-/// paths landed so far, so a failure or a cancel midway still tells the
-/// shell what is on the port.
+/// read between chunks. The final listener update carries all landed paths
+/// on success, failure, or cancellation. Intermediate updates omit that list
+/// so progress does not repeatedly copy a large sequence's completed paths.
 ///
 /// # Errors
 /// [`Error::NotSignedIn`], [`Error::AlreadyOnPort`] for a path the library
@@ -658,7 +658,8 @@ pub fn upload(
         landed: Vec::new(),
         status: String::new(),
     };
-    run(|client, cookie| {
+    let mut landed = Vec::with_capacity(selected.len());
+    let result = run(|client, cookie| {
         let mut made = Vec::with_capacity(selected.len());
         for (file, &bytes) in selected.iter().zip(&sizes) {
             let library_path = format!("{folder}/{}", file.relative);
@@ -681,17 +682,19 @@ pub fn upload(
             )?;
             view.moved_bytes = done_before + bytes;
             view.files_done += 1;
-            view.landed.push(library_path.clone());
+            landed.push(library_path.clone());
             made.push(LibraryFile {
                 path: library_path,
                 bytes,
                 size: human_bytes(bytes),
             });
         }
-        view.status = view.status();
-        listener.update(view.clone());
         Ok(made)
-    })
+    });
+    view.landed = landed;
+    view.status = view.status();
+    listener.update(view);
+    result
 }
 
 fn upload_file(

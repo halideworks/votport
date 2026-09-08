@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use axum::body::{Body, Bytes};
-use axum::extract::{ConnectInfo, Path as AxumPath, Query, State};
+use axum::extract::{ConnectInfo, FromRequest, Path as AxumPath, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -60,12 +60,15 @@ const OUTBOUND_UPLOAD_ID: &str = "x-votport-upload-id";
 const MAX_OUTBOUND_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_LIBRARY_DIRECTORY_INPUT_BYTES: usize = 1024;
 const MAX_LIBRARY_DIRECTORY_ENTRIES: usize = 1000;
-const MAX_LIBRARY_SELECTION_FILES: usize = 64;
-const MAX_LIBRARY_PROJECT_FILES: usize = 50_000;
+const MAX_LIBRARY_SELECTION_FILES: usize = 1_000_000;
+const MAX_LIBRARY_PROJECT_FILES: usize = 1_000_000;
+const OUTBOUND_GRANT_PREVIEW_FILES: usize = 64;
+pub const MAX_GRANT_REQUEST_BYTES: usize = 256 * 1024 * 1024;
 const MAX_LIBRARY_SEARCH_CHARS: usize = 100;
 const MAX_LIBRARY_SEARCH_RESULTS: usize = 200;
 const RETAINED_LIBRARY_SEARCH_RESULTS: usize = MAX_LIBRARY_SEARCH_RESULTS + 1;
 const LIBRARY_HASH_CONCURRENCY: usize = 4;
+pub(crate) const LIBRARY_GRANT_CONCURRENCY: usize = 4;
 const MIN_STAGE_FREE_BYTES: u64 = 1024 * 1024 * 1024;
 const ZIP_LOCAL_HEADER_BYTES: u64 = 30;
 const ZIP_CENTRAL_HEADER_BYTES: u64 = 46;
@@ -1363,7 +1366,12 @@ pub async fn list_outbound_grants(
     let (limit, offset) = outbound_grants_paging(query)?;
     let (grants, total) = app
         .store
-        .outbound_grants_page(&identity.tenant, limit, offset, MAX_LIBRARY_SELECTION_FILES)
+        .outbound_grants_page(
+            &identity.tenant,
+            limit,
+            offset,
+            OUTBOUND_GRANT_PREVIEW_FILES,
+        )
         .map_err(super::store_unavailable)?;
     let has_more = u64::try_from(offset)
         .unwrap_or(u64::MAX)
@@ -1515,10 +1523,19 @@ fn require_automation_admin(app: &App, headers: &HeaderMap) -> ApiResult<auth::A
 pub async fn create_outbound_grant(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    Json(request): Json<CreateOutboundRequest>,
+    request: Request,
 ) -> ApiResult<Response> {
     let identity = admin::require_operator(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
+    let _grant_permit = app.outbound_grant_permits.try_acquire().map_err(|_| {
+        ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many grant preparations; try again later",
+        )
+    })?;
+    let Json(request) = Json::<CreateOutboundRequest>::from_request(request, &app)
+        .await
+        .map_err(|error| ApiError::new(error.status(), error.body_text()))?;
     if !(1..=30).contains(&request.expires_days) {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -3142,7 +3159,15 @@ async fn outbound_file_inner(
     let (grant, leased, file) = active_download_grant(&app, &token, index, &headers)?;
     let operation = begin_outbound_operation_owned(&app, &grant.tenant)?;
     require_grant_access(&app, &grant, &headers)?;
-    if !app.outbound_rate.allow(&grant.token_hash) {
+    let allowed = app
+        .outbound_rate
+        .allow_individual(&grant.token_hash, || {
+            app.store
+                .outbound_grant_files_page_by_token_hash(&grant.token_hash, index, 0)
+                .map(|page| page.map_or(1, |page| page.file_count.max(1)))
+        })
+        .map_err(super::store_unavailable)?;
+    if !allowed {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many downloads; try again later",
@@ -4129,7 +4154,7 @@ fn public_grant(grant: OutboundGrant) -> serde_json::Value {
 }
 
 fn public_grant_with_file_count(grant: OutboundGrant, file_count: usize) -> serde_json::Value {
-    let files_truncated = file_count > MAX_LIBRARY_SELECTION_FILES;
+    let files_truncated = file_count > OUTBOUND_GRANT_PREVIEW_FILES;
     let files = if files_truncated {
         Vec::new()
     } else {
@@ -6261,6 +6286,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn indexed_file_downloads_charge_fractional_grant_units() {
+        let (_directory, app, cookie, first) = fixture().await;
+        for (path, bytes) in [
+            ("rate/one.bin", first.as_slice()),
+            ("rate/two.bin", b"second file".as_slice()),
+        ] {
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::post(format!("/api/admin/outbound-files?path={path}"))
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .body(Body::from(bytes.to_vec()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let created = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"paths":["rate/one.bin","rate/two.bin"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let token = body(created).await["url"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        // Leave one full unit. Two indexed requests must each cost half a
+        // unit; a full-unit endpoint wiring would refuse the second request.
+        let key = hash_token(&token);
+        for _ in 0..1_999 {
+            assert!(app.outbound_rate.allow(&key));
+        }
+        for (index, expected) in [first, b"second file".to_vec()].into_iter().enumerate() {
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::get(format!("/api/s/{token}/files/{index}"))
+                        .extension(ConnectInfo(std::net::SocketAddr::from((
+                            [127, 0, 0, 1],
+                            31,
+                        ))))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn library_upload_list_multi_file_grant_and_mutation_failure() {
         let (_directory, app, cookie, first) = fixture().await;
         let upload = |path: &str, bytes: &[u8]| {
@@ -7216,7 +7307,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body(response).await["files"].as_array().unwrap().len(), 65);
 
         #[cfg(unix)]
         {
@@ -7328,6 +7420,144 @@ mod tests {
         assert_eq!(history["grants"][0]["file_count"], 1001);
         assert_eq!(history["grants"][0]["files_truncated"], true);
         assert_eq!(history["grants"][0]["files"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn grant_admission_bounds_request_bodies_and_releases_for_valid_grants() {
+        let (_directory, app, cookie, _bytes) = fixture().await;
+        let held = app
+            .outbound_grant_permits
+            .clone()
+            .try_acquire_many_owned(LIBRARY_GRANT_CONCURRENCY as u32)
+            .unwrap();
+        let pending =
+            Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::app::router(app.clone()).oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(pending)
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("grant admission attempted to read a refused body")
+        .unwrap();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        drop(held);
+
+        let root = app.config.outbound_dir.join("admitted");
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = (0..65)
+            .map(|index| {
+                let path = root.join(format!("file-{index:02}.bin"));
+                std::fs::write(&path, b"x").unwrap();
+                format!("admitted/file-{index:02}.bin")
+            })
+            .collect::<Vec<_>>();
+        let accepted = crate::app::router(app)
+            .oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "paths": paths, "expires_days": 1 }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert_eq!(body(accepted).await["grant"]["file_count"], 65);
+    }
+
+    #[tokio::test]
+    async fn grant_admission_permit_survives_parsing_while_hashers_wait() {
+        let (_directory, app, cookie, _bytes) = fixture().await;
+        std::fs::write(app.config.outbound_dir.join("held.bin"), b"x").unwrap();
+        let hash_held = LIBRARY_HASH_PERMITS
+            .acquire_many(LIBRARY_HASH_CONCURRENCY as u32)
+            .await
+            .unwrap();
+        let request = Request::post("/api/admin/outbound-grants")
+            .header("cookie", &cookie)
+            .header("x-votport", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"paths":["held.bin"],"expires_days":1}"#))
+            .unwrap();
+        let mut response = Box::pin(crate::app::router(app.clone()).oneshot(request));
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            std::future::Future::poll(response.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(
+            app.outbound_grant_permits.available_permits(),
+            LIBRARY_GRANT_CONCURRENCY - 1
+        );
+        drop(hash_held);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), response)
+            .await
+            .expect("grant hashing did not resume")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            app.outbound_grant_permits.available_permits(),
+            LIBRARY_GRANT_CONCURRENCY
+        );
+    }
+
+    #[tokio::test]
+    async fn large_selection_bodies_require_authentication_before_reading() {
+        let (_directory, app, cookie, _first) = fixture().await;
+        let pending =
+            Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::app::router(app.clone()).oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("content-type", "application/json")
+                    .body(pending)
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("unauthenticated request attempted to read its body")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let paths = (0..100_001)
+            .map(|index| format!("sequence/frame-{index:06}.exr"))
+            .collect::<Vec<_>>();
+        let response = crate::app::router(app)
+            .oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "paths": paths,
+                            "expires_days": 1,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The selection passes count/body limits and reaches file validation.
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{}",
+            body(response).await
+        );
     }
 
     #[test]

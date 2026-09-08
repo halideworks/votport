@@ -2188,33 +2188,38 @@ impl Store {
         transaction.commit().map_err(|error| error.to_string())
     }
 
-    /// Updates one file's covered prefix and published and receipt flags,
-    /// the periodic checkpoint from the worker. Under-claiming is always
-    /// safe: the sender re-sends from the reported prefix on resume.
+    /// Checkpoints file prefixes and publication flags in one transaction.
+    /// Under-claiming is safe: resume re-sends from the previous checkpoint.
     pub fn update_upload_file_progress(
         &self,
         session_id: &str,
-        entry: usize,
-        prefix_bytes: u64,
-        published: bool,
-        receipt: bool,
+        progress: impl IntoIterator<Item = (usize, u64, bool, bool)>,
     ) -> Result<(), String> {
-        self.with(|connection| {
-            connection
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        {
+            let mut update = transaction
                 .prepare_cached(
                     "UPDATE upload_session_files
                      SET prefix_bytes = ?3, published = ?4, receipt = ?5
                      WHERE session_id = ?1 AND entry = ?2",
-                )?
-                .execute(rusqlite::params![
-                    session_id,
-                    i64::try_from(entry).unwrap_or(i64::MAX),
-                    i64::try_from(prefix_bytes).unwrap_or(i64::MAX),
-                    i64::from(published),
-                    i64::from(receipt),
-                ])
-                .map(|_| ())
-        })
+                )
+                .map_err(|error| error.to_string())?;
+            for (entry, prefix_bytes, published, receipt) in progress {
+                update
+                    .execute(rusqlite::params![
+                        session_id,
+                        i64::try_from(entry).unwrap_or(i64::MAX),
+                        i64::try_from(prefix_bytes).unwrap_or(i64::MAX),
+                        i64::from(published),
+                        i64::from(receipt),
+                    ])
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     /// Every persisted session with its files, for boot re-attach.
@@ -7967,7 +7972,7 @@ mod settings_tests {
         assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
         assert!(store.load_upload_sessions().unwrap().is_empty());
 
-        let session = PersistedUploadSession {
+        let mut session = PersistedUploadSession {
             id: "abcd1234".to_owned(),
             link_id: "link-1".to_owned(),
             tenant: String::new(),
@@ -7997,9 +8002,17 @@ mod settings_tests {
                 receipt: false,
             }],
         };
+        let mut second = session.files[0].clone();
+        second.entry = 1;
+        second.display_path = "b.bin".to_owned();
+        second.stored_components = vec!["b.bin".to_owned()];
+        session.files.push(second);
         store.insert_upload_session(&session).unwrap();
         store
-            .update_upload_file_progress(&session.id, 0, 64 * 1024, true, true)
+            .update_upload_file_progress(
+                &session.id,
+                [(0, 64 * 1024, true, true), (1, 32, false, false)],
+            )
             .unwrap();
 
         let loaded = store.load_upload_sessions().unwrap();
@@ -8008,11 +8021,27 @@ mod settings_tests {
         expected.files[0].prefix_bytes = 64 * 1024;
         expected.files[0].published = true;
         expected.files[0].receipt = true;
+        expected.files[1].prefix_bytes = 32;
         assert_eq!(loaded[0], expected);
 
         // Re-inserting the same id replaces its file rows, no duplication.
         store.insert_upload_session(&session).unwrap();
-        assert_eq!(store.load_upload_sessions().unwrap()[0].files.len(), 1);
+        assert_eq!(store.load_upload_sessions().unwrap()[0].files.len(), 2);
+        store
+            .with(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER fail_second_checkpoint BEFORE UPDATE ON upload_session_files
+             WHEN NEW.entry = 1 BEGIN SELECT RAISE(FAIL, 'checkpoint failure'); END;",
+                )
+            })
+            .unwrap();
+        assert!(store
+            .update_upload_file_progress(&session.id, [(0, 64, true, true), (1, 32, false, false)])
+            .is_err());
+        assert_eq!(store.load_upload_sessions().unwrap(), vec![session.clone()]);
+        store
+            .with(|connection| connection.execute_batch("DROP TRIGGER fail_second_checkpoint"))
+            .unwrap();
 
         store.delete_upload_session(&session.id).unwrap();
         assert!(store.load_upload_sessions().unwrap().is_empty());

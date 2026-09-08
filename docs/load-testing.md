@@ -186,3 +186,43 @@ working tree. A 30-second observer timeout fails a run that does not render
 the expected option count. Before the cap, the median navigation was 197.8 ms
 (244.1 ms median across the final five navigations), with 50,000 final options.
 After the cap, those medians were 104.0 ms and 95.3 ms, with 200 final options.
+
+## Native HTTP file-count acceptance
+
+On 2026-09-08 UTC, one isolated native CLI upload published 100,001 tiny files
+and one directory, totaling 1,188,903 bytes. The Linux harness set its soft
+`RLIMIT_NOFILE` to 1,024 before launching both debug binaries. Dormant staging
+was enabled; this run preceded transaction batching for progress checkpoints.
+The CLI completed preparation and HTTP upload in 801.664 seconds; fixture
+creation took 3.063 seconds. Every received file matched its expected bytes.
+The server's final `/proc` memory high-water mark was 778,428 KiB. These are
+single-run results for this tiny-file fixture on the development host.
+
+Create an isolated server and request link, setting the server launch shell's
+soft descriptor limit to 1,024. Set `SEQUENCE_DIR` to a new fixture directory,
+`REQUEST_LINK` to that request, and `RECEIVED_SEQUENCE_DIR` to its received
+sequence directory. Generate, send, and verify the fixture:
+
+```sh
+python3 - "$SEQUENCE_DIR" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+root.mkdir()
+for index in range(100001):
+    (root / f"entry-{index:05d}.txt").write_bytes(f"entry {index}\n".encode())
+PY
+(ulimit -Sn 1024; /path/to/native/votport send "$REQUEST_LINK" "$SEQUENCE_DIR")
+python3 - "$RECEIVED_SEQUENCE_DIR" <<'PY'
+import hashlib, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+assert len(list(root.glob("entry-*.txt"))) == 100001
+actual = hashlib.sha256()
+for index in range(100001):
+    name = f"entry-{index:05d}.txt"
+    data = (root / name).read_bytes()
+    assert data == f"entry {index}\n".encode(), name
+    actual.update(name.encode() + b"\0" + data)
+assert actual.hexdigest() == "346e0c94b96619546b6540fbebacfb1107cba03679023545a96e5e935f6df1ce"
+print("All 100001 files verified")
+PY
+```
