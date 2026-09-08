@@ -127,8 +127,27 @@ await page.waitForFunction(() =>
   && document.getElementById("upload-error").textContent === "Transfer cancelled."
   && document.activeElement === document.getElementById("send"),
 );
+await Promise.all([
+  page.waitForResponse((response) => response.url().endsWith("/session") && response.status() === 503),
+  page.keyboard.press("Enter"),
+]);
+await page.focus("#cancel");
+await page.keyboard.press("Enter");
+await page.keyboard.press("Escape");
+await page.waitForFunction(() =>
+  !document.getElementById("confirm-cancel").open
+  && document.getElementById("confirm-cancel").returnValue !== "cancel"
+  && !document.getElementById("progress-card").hidden,
+);
+await page.keyboard.press("Enter");
+await page.keyboard.press("Tab");
+await page.keyboard.press("Enter");
+await page.waitForFunction(() =>
+  document.getElementById("progress-card").hidden
+  && document.activeElement === document.getElementById("send"),
+);
 await page.unroute("**/api/r/*/session");
-console.log("cancel restores keyboard focus: ok");
+console.log("cancel restores focus and Escape preserves the retried transfer: ok");
 await page.route("**/api/r/*/session", (route) => route.fulfill({ status: 403 }));
 await page.reload();
 await page.waitForSelector("#uploader:not([hidden])", { timeout: 15000 });
@@ -142,14 +161,37 @@ await page.waitForFunction(() =>
 );
 console.log("failed upload preserves external focus: ok");
 await page.unroute("**/api/r/*/session");
+await page.route("**/api/r/*/session", async (route) => {
+  await page.click("#cancel");
+  await route.fulfill({ status: 403 });
+});
+await page.click("#send");
+await page.waitForFunction(() =>
+  document.getElementById("progress-card").hidden
+  && !document.getElementById("upload-error").hidden
+  && !document.getElementById("confirm-cancel").open
+  && document.activeElement === document.getElementById("send"),
+);
+console.log("failed upload dismisses cancellation and restores focus: ok");
+await page.unroute("**/api/r/*/session");
 await page.reload();
 await page.waitForSelector("#uploader:not([hidden])", { timeout: 15000 });
 await page.setInputFiles("#file-input", [
   path.join(dir, "Résumé Draft.pdf"),
   path.join(dir, "archive.tar"),
 ]);
+await page.route("**/api/r/*/session", async (route) => {
+  await page.click("#cancel");
+  await route.continue();
+});
 await page.click("#send");
 await page.waitForSelector("#done-card:not([hidden])", { timeout: 120000 });
+await page.waitForFunction(() =>
+  !document.getElementById("confirm-cancel").open
+  && document.activeElement === document.getElementById("copy-proof"),
+);
+await page.unroute("**/api/r/*/session");
+console.log("completion dismisses cancellation and focuses proof: ok");
 console.log(
   "uploaded:",
   (await page.textContent("#done-list")).trim().replace(/\s+/g, " "),
@@ -186,6 +228,34 @@ if (browserEngine === "chromium") {
     throw new Error(`copy mismatch: ${copied}`);
   }
 }
+
+for (const focus of ["cancel", "pick", "external-focus"]) {
+  await page.goto(linkUrl);
+  await page.waitForSelector("#uploader:not([hidden])");
+  await page.setInputFiles("#file-input", {
+    name: `${focus}.txt`, mimeType: "text/plain", buffer: Buffer.from("focus check\n"),
+  });
+  await page.route("**/api/r/*/session", async (route) => {
+    await page.evaluate((id) => {
+      if (id === "external-focus") {
+        const button = document.createElement("button");
+        button.id = id;
+        button.textContent = "External focus";
+        document.body.append(button);
+      }
+      document.getElementById(id).focus();
+    }, focus);
+    await route.continue();
+  });
+  await page.click("#send");
+  await page.waitForSelector("#done-card:not([hidden])", { timeout: 30000 });
+  const expected = focus === "external-focus" ? focus : "copy-proof";
+  if (await page.evaluate(() => document.activeElement.id) !== expected) {
+    throw new Error(`completion did not preserve focus from ${focus}`);
+  }
+  await page.unroute("**/api/r/*/session");
+}
+console.log("completion moves hidden focus and preserves external focus: ok");
 
 // Public receipt check against the same deployment: key GET is public, and
 // the sidecar on disk must verify with a root matching the done-list card.
