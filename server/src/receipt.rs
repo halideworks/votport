@@ -3,7 +3,7 @@
 //! Each published file gets `<name>.vot-receipt`: a canonical vot-receipt
 //! CBOR envelope, ed25519-signed with a key generated in the data directory,
 //! attesting that this exact object (suite, root, length) reached Published
-//! assurance under the Balanced commit profile. The key id is the 32-byte
+//! assurance under its selected commit profile. The key id is the 32-byte
 //! public key itself, so a receipt is verifiable against the key the admin
 //! page displays with nothing else.
 
@@ -67,8 +67,9 @@ impl ReceiptSigner {
         object: &ObjectId,
         session_id: [u8; 16],
         observation: PublishObservation,
+        profile: vot_sdk_file::CommitProfile,
     ) -> Result<PathBuf, String> {
-        let bytes = self.encode(object, session_id, observation)?;
+        let bytes = self.encode(object, session_id, observation, profile)?;
         let mut sidecar = destination.as_os_str().to_owned();
         sidecar.push(".vot-receipt");
         let sidecar = PathBuf::from(sidecar);
@@ -83,15 +84,21 @@ impl ReceiptSigner {
         object: &ObjectId,
         session_id: [u8; 16],
         observation: PublishObservation,
+        profile: vot_sdk_file::CommitProfile,
     ) -> Result<Vec<u8>, String> {
+        let profile = match profile {
+            vot_sdk_file::CommitProfile::Fast => CommitProfile::Fast,
+            vot_sdk_file::CommitProfile::Balanced => CommitProfile::Balanced,
+            vot_sdk_file::CommitProfile::Strict => CommitProfile::Strict,
+        };
         let receipt = Receipt {
             subject_kind: SubjectKind::Object,
             suite_id: object.suite,
             subject_digest: object.root,
             subject_length: object.length,
             assurance: AssuranceLevel::Published,
-            profile: CommitProfile::Balanced,
-            actual_predecessor: required_predecessor(CommitProfile::Balanced),
+            profile,
+            actual_predecessor: required_predecessor(profile),
             provider: PROVIDER,
             provider_version: PROVIDER_VERSION,
             session_id,
@@ -206,6 +213,7 @@ mod tests {
                     incarnation: [3; 16],
                     sequence: 7,
                 },
+                vot_sdk_file::CommitProfile::Balanced,
             )
             .unwrap();
         assert_eq!(sidecar, directory.path().join("payload.bin.vot-receipt"));
@@ -219,6 +227,49 @@ mod tests {
         let verified = vot_receipt::verify_ed25519(&decoded, &key).unwrap();
         assert_eq!(verified.receipt().subject_digest, [9; 32]);
         assert_eq!(verified.receipt().sequence, 7);
+    }
+
+    #[test]
+    fn receipts_preserve_fast_and_balanced_assurance() {
+        let directory = tempfile::tempdir().unwrap();
+        let signer = ReceiptSigner::load_or_create(directory.path()).unwrap();
+        for (name, profile, expected) in [
+            (
+                "fast",
+                vot_sdk_file::CommitProfile::Fast,
+                CommitProfile::Fast,
+            ),
+            (
+                "balanced",
+                vot_sdk_file::CommitProfile::Balanced,
+                CommitProfile::Balanced,
+            ),
+        ] {
+            let sidecar = signer
+                .write_sidecar(
+                    &directory.path().join(name),
+                    &ObjectId {
+                        suite: 1,
+                        root: [9; 32],
+                        length: 1,
+                    },
+                    [2; 16],
+                    PublishObservation {
+                        incarnation: [3; 16],
+                        sequence: 7,
+                    },
+                    profile,
+                )
+                .unwrap();
+            let bytes = std::fs::read(sidecar).unwrap();
+            let decoded = vot_receipt::decode_authenticated(&bytes).unwrap();
+            let verified = vot_receipt::verify_ed25519(&decoded, &signer.verifying_key()).unwrap();
+            assert_eq!(verified.receipt().profile, expected);
+            assert_eq!(
+                verified.receipt().actual_predecessor,
+                required_predecessor(expected)
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -280,6 +331,7 @@ mod tests {
                     incarnation: [3; 16],
                     sequence: 7,
                 },
+                vot_sdk_file::CommitProfile::Balanced,
             )
             .unwrap_err();
 

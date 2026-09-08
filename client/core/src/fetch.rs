@@ -30,10 +30,7 @@ use crate::receive::{
     local_path, local_path_of, require_space, reusable_file, write_verified, Delivery, Received,
     Resumed,
 };
-use crate::send_push::{probe_any, Probe};
-
-/// Rails dialled at once. Matches the push default until the listener cap lands.
-const FETCH_RAILS: usize = 4;
+use crate::send_push::{direct_rails, probe_any, Probe};
 
 /// The resume store vot-cli writes inside a bundle while fetching and removes
 /// once the bundle is whole. Its presence means a fetch owns the stage.
@@ -243,7 +240,7 @@ pub(crate) fn try_fetch_with_resume(
                 holder: Some(holder),
                 serve_identity: Some(identity),
                 pin: Some(pin),
-                rails: FETCH_RAILS,
+                rails: direct_rails(reachable, cfg!(target_os = "macos")),
                 provers: None,
                 extensions: BTreeSet::new(),
                 progress: Some((PROGRESS_QUANTUM, progress)),

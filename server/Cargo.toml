@@ -16,16 +16,16 @@ publish = false
 quiche = { git = "https://github.com/halideworks/quiche.git", rev = "ce7e5b71f3198125ab92a1626390bbe3a2c7faa0" }
 
 [dependencies]
-vot-sdk = { git = "https://github.com/halideworks/VOT", rev = "0a129ea8b7ef47578b956f3c70a8274bf623cb79" }
-vot-sdk-file = { git = "https://github.com/halideworks/VOT", rev = "0a129ea8b7ef47578b956f3c70a8274bf623cb79" }
-vot-receipt = { git = "https://github.com/halideworks/VOT", rev = "0a129ea8b7ef47578b956f3c70a8274bf623cb79" }
-vot-cli = { git = "https://github.com/halideworks/VOT", rev = "0a129ea8b7ef47578b956f3c70a8274bf623cb79", default-features = false, features = ["wire"] }
-vot-capability = { git = "https://github.com/halideworks/VOT", rev = "0a129ea8b7ef47578b956f3c70a8274bf623cb79" }
-vot-manifest = { git = "https://github.com/halideworks/VOT", rev = "0a129ea8b7ef47578b956f3c70a8274bf623cb79" }
-vot-platform-fs = { git = "https://github.com/halideworks/VOT", rev = "0a129ea8b7ef47578b956f3c70a8274bf623cb79" }
-vot-proof-blake3 = { git = "https://github.com/halideworks/VOT", rev = "0a129ea8b7ef47578b956f3c70a8274bf623cb79" }
-vot-proof-sha256 = { git = "https://github.com/halideworks/VOT", rev = "0a129ea8b7ef47578b956f3c70a8274bf623cb79" }
-vot-scheduler = { git = "https://github.com/halideworks/VOT", rev = "0a129ea8b7ef47578b956f3c70a8274bf623cb79" }
+vot-sdk = { git = "https://github.com/halideworks/VOT", rev = "a93f5d86a4da23744f8f8268054414b812b72c46" }
+vot-sdk-file = { git = "https://github.com/halideworks/VOT", rev = "a93f5d86a4da23744f8f8268054414b812b72c46" }
+vot-receipt = { git = "https://github.com/halideworks/VOT", rev = "a93f5d86a4da23744f8f8268054414b812b72c46" }
+vot-cli = { git = "https://github.com/halideworks/VOT", rev = "a93f5d86a4da23744f8f8268054414b812b72c46", default-features = false, features = ["wire"] }
+vot-capability = { git = "https://github.com/halideworks/VOT", rev = "a93f5d86a4da23744f8f8268054414b812b72c46" }
+vot-manifest = { git = "https://github.com/halideworks/VOT", rev = "a93f5d86a4da23744f8f8268054414b812b72c46" }
+vot-platform-fs = { git = "https://github.com/halideworks/VOT", rev = "a93f5d86a4da23744f8f8268054414b812b72c46" }
+vot-proof-blake3 = { git = "https://github.com/halideworks/VOT", rev = "a93f5d86a4da23744f8f8268054414b812b72c46" }
+vot-proof-sha256 = { git = "https://github.com/halideworks/VOT", rev = "a93f5d86a4da23744f8f8268054414b812b72c46" }
+vot-scheduler = { git = "https://github.com/halideworks/VOT", rev = "a93f5d86a4da23744f8f8268054414b812b72c46" }
 
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs", "io-util"] }
@@ -63,7 +63,7 @@ http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "cookies"] }
 tempfile = "3"
-vot-transport-api = { git = "https://github.com/halideworks/VOT", rev = "0a129ea8b7ef47578b956f3c70a8274bf623cb79" }
+vot-transport-api = { git = "https://github.com/halideworks/VOT", rev = "a93f5d86a4da23744f8f8268054414b812b72c46" }
 
 [profile.release]
 lto = "thin"

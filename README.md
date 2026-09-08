@@ -439,11 +439,9 @@ does not publish partial files.
 
 ## Roadmap
 
-VOT is pinned at `0a129ea8b7ef47578b956f3c70a8274bf623cb79` (includes upstream PR #391, plus ADR-0046 parallel range acceptance, ADR-0047 receiver re-attach, ADR-0051, the fetch window of up to sixteen objects, the concurrent sink gate (#406), settled-work fetch progress (#405), admit-before-handout on a rail (#407), and completion syncs on a per-plan flusher (#408, ADR-0052)). The pin also carries the vot-cli client seams for the desktop client (ADR-0053, #411), which the server does not use.
-That pin adds the holder-dialed push engine, and votport's native push receive
-path is shipped but disabled unless `VOTPORT_PUSH_BIND` is set. Browser uploads
-still travel over HTTP through the reverse proxy. Native push does not change
-`CHUNK_BYTES` or enable parallel HTTP verification.
+VOT is pinned at `a93f5d86a4da23744f8f8268054414b812b72c46`. This revision adds mounted-share compatibility, Windows UDP segmentation fixes, macOS socket and loopback fixes, and length-aware object coverage. Server, desktop core, and browser WASM use the same revision. Linux CIFS/SMB and NFS receive paths use Fast; Balanced and Strict are incompatible with these filesystems. See [network filesystem requirements and alternatives](docs/deployment.md#network-filesystems).
+
+Native push remains disabled unless `VOTPORT_PUSH_BIND` is set. Browser uploads use HTTP through the reverse proxy, with bounded parallel range acceptance and the existing 8 MiB range ceiling.
 
 Product next, each as its own design first:
 

@@ -4,6 +4,8 @@
 # package wraps. Run from anywhere; needs cargo 1.97, cmake (BoringSSL), and
 # Xcode. A universal build (arm64 + x86_64) is a release concern, later.
 set -eu
+# Match the deployment floor of the Swift app and its native dependencies.
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
 here=$(cd "$(dirname "$0")" && pwd)
 client="$here/.."
 target="${CARGO_TARGET_DIR:-$client/target}"

@@ -283,6 +283,7 @@ pub struct PersistedUploadFile {
     pub staging_path: PathBuf,
     pub journal_path: PathBuf,
     pub incarnation: [u8; 16],
+    pub profile: vot_sdk_file::CommitProfile,
     /// Contiguous covered offset from zero; the restart resumes from here.
     pub prefix_bytes: u64,
     pub published: bool,
@@ -436,7 +437,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 23;
+pub(crate) const SCHEMA_VERSION: u64 = 24;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -1180,6 +1181,16 @@ impl Store {
             transaction
                 .execute_batch(SCIM_GROUPS_SCHEMA)
                 .map_err(|error| format!("schema: {error}"))?;
+        }
+        if stored < 24 {
+            let present: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('upload_session_files') WHERE name = 'commit_profile')",
+                [], |row| row.get(0),
+            ).map_err(|error| format!("schema: {error}"))?;
+            if !present {
+                transaction.execute_batch("ALTER TABLE upload_session_files ADD COLUMN commit_profile TEXT NOT NULL DEFAULT 'balanced' CHECK (commit_profile IN ('fast', 'balanced', 'strict'));")
+                    .map_err(|error| format!("schema: {error}"))?;
+            }
         }
         transaction
             .execute(
@@ -2165,8 +2176,8 @@ impl Store {
                     "INSERT INTO upload_session_files
                      (session_id, entry, display_path, stored_components, object_suite,
                       object_root, object_length, staging_path, journal_path, incarnation,
-                      prefix_bytes, published, receipt)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                      prefix_bytes, published, receipt, commit_profile)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                     rusqlite::params![
                         session.id,
                         i64::try_from(file.entry).unwrap_or(i64::MAX),
@@ -2181,6 +2192,11 @@ impl Store {
                         i64::try_from(file.prefix_bytes).unwrap_or(i64::MAX),
                         i64::from(file.published),
                         i64::from(file.receipt),
+                        match file.profile {
+                            vot_sdk_file::CommitProfile::Fast => "fast",
+                            vot_sdk_file::CommitProfile::Balanced => "balanced",
+                            vot_sdk_file::CommitProfile::Strict => "strict",
+                        },
                     ],
                 )
                 .map_err(|error| error.to_string())?;
@@ -2252,7 +2268,7 @@ impl Store {
             let mut file_statement = connection.prepare(
                 "SELECT entry, display_path, stored_components, object_suite, object_root,
                         object_length, staging_path, journal_path, incarnation,
-                        prefix_bytes, published, receipt
+                        prefix_bytes, published, receipt, commit_profile
                  FROM upload_session_files WHERE session_id = ?1 ORDER BY entry",
             )?;
             for session in &mut sessions {
@@ -2282,6 +2298,18 @@ impl Store {
                         staging_path: PathBuf::from(row.get::<_, String>(6)?),
                         journal_path: PathBuf::from(row.get::<_, String>(7)?),
                         incarnation,
+                        profile: match row.get::<_, String>(12)?.as_str() {
+                            "fast" => vot_sdk_file::CommitProfile::Fast,
+                            "balanced" => vot_sdk_file::CommitProfile::Balanced,
+                            "strict" => vot_sdk_file::CommitProfile::Strict,
+                            _ => {
+                                return Err(rusqlite::Error::FromSqlConversionFailure(
+                                    12,
+                                    rusqlite::types::Type::Text,
+                                    "invalid commit profile".into(),
+                                ))
+                            }
+                        },
                         prefix_bytes: row.get::<_, i64>(9)?.max(0) as u64,
                         published: row.get::<_, i64>(10)? != 0,
                         receipt: row.get::<_, i64>(11)? != 0,
@@ -7997,6 +8025,7 @@ mod settings_tests {
                 staging_path: PathBuf::from("/received/link-1/.vot-1-0-2.stage"),
                 journal_path: PathBuf::from("/received/link-1/.vot-1-0-2.journal"),
                 incarnation: [3u8; 16],
+                profile: vot_sdk_file::CommitProfile::Balanced,
                 prefix_bytes: 0,
                 published: false,
                 receipt: false,
@@ -8004,6 +8033,7 @@ mod settings_tests {
         };
         let mut second = session.files[0].clone();
         second.entry = 1;
+        second.profile = vot_sdk_file::CommitProfile::Fast;
         second.display_path = "b.bin".to_owned();
         second.stored_components = vec!["b.bin".to_owned()];
         session.files.push(second);
@@ -8042,6 +8072,23 @@ mod settings_tests {
         store
             .with(|connection| connection.execute_batch("DROP TRIGGER fail_second_checkpoint"))
             .unwrap();
+
+        store
+            .with(|connection| {
+                connection.execute_batch(
+                    "ALTER TABLE upload_session_files DROP COLUMN commit_profile;
+             UPDATE meta SET value = '23' WHERE key = 'schema_version';",
+                )
+            })
+            .unwrap();
+        drop(store);
+        let store = Store::open(directory.path()).unwrap();
+        let legacy = store.load_upload_sessions().unwrap();
+        assert!(legacy[0]
+            .files
+            .iter()
+            .all(|file| file.profile == vot_sdk_file::CommitProfile::Balanced));
+        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
 
         store.delete_upload_session(&session.id).unwrap();
         assert!(store.load_upload_sessions().unwrap().is_empty());

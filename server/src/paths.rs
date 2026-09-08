@@ -44,6 +44,34 @@ pub fn branding_logo_path(data_dir: &Path, tenant: &str, ext: &str) -> PathBuf {
     data_dir.join("branding").join(format!("{stem}.{ext}"))
 }
 
+/// Selects publication assurance from the destination's mounted filesystem.
+pub fn commit_profile(destination: &Path) -> std::io::Result<vot_sdk_file::CommitProfile> {
+    #[cfg(target_os = "linux")]
+    {
+        let parent = destination
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let directory = std::fs::File::open(parent)?;
+        Ok(profile_for_mount(vot_platform_fs::is_smb_or_nfs(
+            &directory,
+        )?))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = destination;
+        Ok(profile_for_mount(false))
+    }
+}
+
+fn profile_for_mount(remote: bool) -> vot_sdk_file::CommitProfile {
+    if remote {
+        vot_sdk_file::CommitProfile::Fast
+    } else {
+        vot_sdk_file::CommitProfile::Balanced
+    }
+}
+
 /// Drops group/other write bits on a directory files are received into. VOT
 /// stages next to the destination and refuses a group-writable parent, so a
 /// mount created 0775 (umask 002 hosts) would fail every upload into it.
@@ -717,4 +745,21 @@ mod tests {
             assert!(join_under(base, &components).is_err(), "{bad:?}");
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn mounted_share_profile_preserves_local_assurance() {
+    assert_eq!(profile_for_mount(true), vot_sdk_file::CommitProfile::Fast);
+    assert_eq!(
+        profile_for_mount(false),
+        vot_sdk_file::CommitProfile::Balanced
+    );
+    let directory = tempfile::tempdir().unwrap();
+    assert_eq!(
+        commit_profile(&directory.path().join("file")).unwrap(),
+        vot_sdk_file::CommitProfile::Balanced
+    );
+    #[cfg(target_os = "linux")]
+    assert!(commit_profile(&directory.path().join("missing/file")).is_err());
 }

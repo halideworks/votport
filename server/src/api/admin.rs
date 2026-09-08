@@ -1841,6 +1841,22 @@ pub async fn test_notifications(
         .into_response())
 }
 
+fn deployment_commit_profile(root: &std::path::Path) -> Option<&'static str> {
+    #[cfg(target_os = "linux")]
+    {
+        match paths::commit_profile(&root.join(".vot-profile.stage")) {
+            Ok(vot_sdk_file::CommitProfile::Fast) => Some("fast"),
+            Ok(vot_sdk_file::CommitProfile::Balanced) => Some("balanced"),
+            _ => None,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        None
+    }
+}
+
 fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
     let overlay = app
         .store
@@ -1855,7 +1871,9 @@ fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
         "public_url": app.config.public_url,
         "data_dir": app.config.data_dir,
         "receive_dir": app.config.receive_dir,
+        "receive_commit_profile": deployment_commit_profile(&app.config.receive_dir),
         "outbound_dir": app.config.outbound_dir,
+        "outbound_filesystem_profile": deployment_commit_profile(&app.config.outbound_dir),
         "web_root": app.config.web_root,
         "max_upload_bytes": app.config.max_upload_bytes,
         "allow_hidden": app.config.allow_hidden,
@@ -5640,6 +5658,22 @@ mod settings_api_tests {
     use crate::auth::{self, TenantGrant};
     use crate::store::SettingWrite;
 
+    #[test]
+    fn deployment_profiles_report_detection_and_missing_mounts() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            deployment_commit_profile(&directory.path().join("missing")),
+            None
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            deployment_commit_profile(directory.path()),
+            Some("balanced")
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(deployment_commit_profile(directory.path()), None);
+    }
+
     #[tokio::test]
     async fn sso_session_lifetime_follows_the_settings_overlay() {
         let directory = tempfile::tempdir().unwrap();
@@ -5793,6 +5827,12 @@ mod settings_api_tests {
             deployment["outbound_dir"],
             directory.path().join("outbound").to_string_lossy().as_ref()
         );
+        for field in ["receive_commit_profile", "outbound_filesystem_profile"] {
+            #[cfg(target_os = "linux")]
+            assert_eq!(deployment[field], "balanced");
+            #[cfg(not(target_os = "linux"))]
+            assert!(deployment[field].is_null());
+        }
         assert_eq!(deployment["max_upload_bytes"], 1024 * 1024);
         assert_eq!(deployment["allow_hidden"], false);
         assert_eq!(deployment["session_idle_secs"], 60);

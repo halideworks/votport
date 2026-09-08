@@ -333,6 +333,7 @@ struct StagedFile {
     staging: PathBuf,
     journal: PathBuf,
     incarnation: [u8; 16],
+    profile: CommitProfile,
     coverage: Mutex<ObjectCoverage>,
     active: Option<NativeFile>,
     reopened: bool,
@@ -340,12 +341,18 @@ struct StagedFile {
 }
 
 impl StagedFile {
-    fn new(native: NativeFile, destination: PathBuf, coverage: ObjectCoverage) -> Self {
+    fn new(
+        native: NativeFile,
+        destination: PathBuf,
+        coverage: ObjectCoverage,
+        profile: CommitProfile,
+    ) -> Self {
         let mut staged = Self {
             destination,
             staging: native.staging_path().to_path_buf(),
             journal: native.journal_path().to_path_buf(),
             incarnation: native.incarnation(),
+            profile,
             coverage: Mutex::new(coverage),
             active: Some(native),
             reopened: false,
@@ -365,7 +372,7 @@ impl StagedFile {
                     &self.staging,
                     &self.journal,
                     self.incarnation,
-                    CommitProfile::Balanced,
+                    self.profile,
                     coverage.runs(),
                 )
                 .map_err(|error| SessionError::internal(format!("reopen staging: {error}")))?,
@@ -974,6 +981,10 @@ fn persisted_session(setup: &WorkerSetup, files: &[FileState]) -> PersistedUploa
                 staging_path,
                 journal_path,
                 incarnation,
+                profile: file
+                    .native
+                    .as_ref()
+                    .map_or(CommitProfile::Balanced, |native| native.profile),
                 prefix_bytes,
                 published: file.published,
                 receipt: file.receipt,
@@ -1062,7 +1073,7 @@ pub fn resume_worker(
                 file.staging_path.clone(),
                 file.journal_path.clone(),
                 file.incarnation,
-                CommitProfile::Balanced,
+                file.profile,
                 runs,
             )
             .map_err(|error| format!("{}: {error}", file.display_path))?;
@@ -1070,7 +1081,7 @@ pub fn resume_worker(
             kept.push(file.journal_path.clone());
             let coverage = ObjectCoverage::from_runs(&file.object, runs)
                 .map_err(|error| format!("{}: {error:?}", file.display_path))?;
-            Some(StagedFile::new(native, destination, coverage))
+            Some(StagedFile::new(native, destination, coverage, file.profile))
         };
         files.push(FileState {
             display_path: file.display_path.clone(),
@@ -1232,7 +1243,10 @@ fn open_destination_for(
         // only for creating intermediate directories.
         let destination =
             paths::join_under(&setup.dest_dir, &stored).map_err(SessionError::internal)?;
-        match NativeFile::create(&object, &destination, CommitProfile::Balanced) {
+        let profile = paths::commit_profile(&destination).map_err(|error| {
+            SessionError::internal(format!("inspect destination filesystem: {error}"))
+        })?;
+        match NativeFile::create(&object, &destination, profile) {
             Ok(native) => {
                 return Ok(FileState {
                     display_path,
@@ -1242,6 +1256,7 @@ fn open_destination_for(
                         native,
                         destination,
                         ObjectCoverage::new(&object),
+                        profile,
                     )),
                     published: false,
                     receipt: false,
@@ -1624,10 +1639,13 @@ fn publish_file_locked(
     // Best effort: the file is delivered and verified either way, and the
     // record notes whether its receipt exists.
     let receipt = if let Some(observation) = active.publish_observation() {
-        match setup
-            .signer
-            .write_sidecar(&destination, &file.object, setup.session_id, observation)
-        {
+        match setup.signer.write_sidecar(
+            &destination,
+            &file.object,
+            setup.session_id,
+            observation,
+            native.profile,
+        ) {
             Ok(path) => {
                 file.receipt = true;
                 Some(path)
@@ -3684,6 +3702,57 @@ mod push_tests {
         }
     }
 
+    #[tokio::test]
+    async fn fast_profile_survives_parking_and_restart_on_local_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let object = object(Suite::Blake3Bao64, b"");
+        let setup = setup(directory.path(), object.clone());
+        fs::create_dir_all(&setup.dest_dir).unwrap();
+        let destination = setup.dest_dir.join("fast");
+        let native = NativeFile::create(&object, &destination, CommitProfile::Fast).unwrap();
+        let mut staged = StagedFile::new(
+            native,
+            destination.clone(),
+            ObjectCoverage::new(&object),
+            CommitProfile::Fast,
+        );
+        staged.reopen().unwrap();
+        staged.park();
+        let file = FileState {
+            display_path: "fast".to_owned(),
+            stored_components: vec!["fast".to_owned()],
+            object: object.clone(),
+            native: Some(staged),
+            published: false,
+            receipt: false,
+            first_range_at: None,
+            rehash: false,
+        };
+        let mut persisted = persisted_session(&setup, std::slice::from_ref(&file));
+        assert_eq!(persisted.files[0].profile, CommitProfile::Fast);
+        file.native.unwrap().abandon();
+        let signer = Arc::clone(&setup.signer);
+        let (sender, receiver) = mpsc::channel(1);
+        resume_worker(setup, receiver, &mut persisted).unwrap();
+        drop(sender);
+        assert!(persisted.files[0].published);
+        let bytes = fs::read(destination.with_extension("vot-receipt")).unwrap();
+        let decoded = vot_receipt::decode_authenticated(&bytes).unwrap();
+        let verified = vot_receipt::verify_ed25519(&decoded, &signer.verifying_key()).unwrap();
+        assert_eq!(verified.receipt().profile, vot_receipt::CommitProfile::Fast);
+        let mut baseline = NativeFile::create(
+            &object,
+            directory.path().join("baseline"),
+            CommitProfile::Fast,
+        )
+        .unwrap();
+        baseline.publish().unwrap();
+        assert_eq!(
+            verified.receipt().sequence,
+            baseline.publish_observation().unwrap().sequence
+        );
+    }
+
     fn record(path: vot_manifest::PackagePath, object: &ObjectId) -> vot_cli::EntryRecord {
         vot_cli::EntryRecord {
             path,
@@ -4154,6 +4223,7 @@ mod parallel_accept_tests {
             native,
             directory.path().join("obj"),
             ObjectCoverage::new(&object),
+            CommitProfile::Balanced,
         );
         native.reopen().unwrap();
         let files = vec![FileState {

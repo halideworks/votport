@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
+import { runInNewContext } from 'node:vm';
 
 const html = await readFile(new URL('../web/system.html', import.meta.url), 'utf8');
 const script = await readFile(new URL('../web/assets/page-system.js', import.meta.url), 'utf8');
@@ -180,5 +181,36 @@ test('deployment warnings and the snapshot download carry the CSRF header', () =
   assert.match(script, /fetch\('\/api\/admin\/backup',[\s\S]{0,80}'X-Votport': '1'/);
   for (const id of ['setting-trusted-proxies', 'setting-metrics', 'setting-oidc-admin-group']) {
     assert.match(script, new RegExp(`deploymentWarning\\(\\s*'${id}'`));
+  }
+});
+
+test('filesystem notices follow detected profiles and clear stale warnings', () => {
+  const elements = new Map();
+  const context = {
+    document: { getElementById(id) {
+      if (!elements.has(id)) elements.set(id, { textContent: '', hidden: false, classList: { toggle(name, on) { this[name] = on; } } });
+      return elements.get(id);
+    } },
+    formatBytes: String,
+  };
+  runInNewContext(script.slice(script.indexOf('const $ ='), script.indexOf('function gibValue')), context);
+  for (const profile of ['fast', 'balanced', null]) {
+    context.fillDeployment({ deployment: { receive_commit_profile: profile, outbound_filesystem_profile: profile } });
+    for (const kind of ['receive', 'outbound']) {
+      const id = `setting-${kind}-profile`;
+      const notice = elements.get(id);
+      assert.equal(notice.classList.warning, profile === 'fast');
+      assert.equal(elements.get(`${id}-docs`).hidden, profile !== 'fast');
+      if (kind === 'outbound') assert.match(notice.textContent, /^Library receipts use Fast\./);
+      if (profile === 'fast') {
+        assert.match(notice.textContent, /Fast only.*CIFS\/SMB or NFS.*Balanced and Strict are incompatible/);
+      } else {
+        const expected = profile === 'balanced' ? 'Balanced selected automatically.' : 'Filesystem detection unavailable.';
+        assert.equal(notice.textContent, kind === 'outbound'
+          ? `Library receipts use Fast.${profile === 'balanced' ? '' : ` ${expected}`}`
+          : expected);
+      }
+      assert.match(html, new RegExp(`id="${id}-docs" href="https://github.com/halideworks/votport/blob/main/docs/deployment.md#network-filesystems"`));
+    }
   }
 });
