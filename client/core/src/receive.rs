@@ -204,9 +204,34 @@ fn receive_over_http_inner(
             return Err(Error::Cancelled);
         }
         if !complete {
+            fs::create_dir_all(path.parent().unwrap_or(dest))?;
+            let lease_path = part_path(&path).with_extension("lease");
+            let mut lease_file = open_journal(&lease_path)?;
+            let mut saved = Vec::new();
+            (&mut lease_file).take(16 * 1024).read_to_end(&mut saved)?;
+            let scope = format!("{}{}", base.trim_end_matches('/'), file.download_url);
+            let mut lease = serde_json::from_slice::<(String, String, String)>(&saved)
+                .ok()
+                .filter(|(url, root, cookie)| {
+                    url == &scope && root == &file.root && crate::api::is_download_lease(cookie)
+                })
+                .map(|(_, _, cookie)| cookie);
             let mut source = |offset: u64| -> Result<Resumed> {
                 let (response, start) =
-                    client.download(&file.download_url, cookie, offset, file.bytes)?;
+                    client.download(&file.download_url, cookie, &mut lease, offset, file.bytes)?;
+                if let Some(value) = &lease {
+                    let bytes =
+                        serde_json::to_vec(&(&scope, &file.root, value)).map_err(|error| {
+                            Error::Other(format!("encoding download lease: {error}"))
+                        })?;
+                    if bytes != saved {
+                        lease_file.rewind()?;
+                        lease_file.write_all(&bytes)?;
+                        lease_file.set_len(bytes.len() as u64)?;
+                        lease_file.sync_all()?;
+                        saved = bytes;
+                    }
+                }
                 Ok(Resumed {
                     reader: Box::new(response),
                     start,
@@ -221,6 +246,9 @@ fn receive_over_http_inner(
                 index,
                 observer,
             )?;
+            if vot_platform_fs::same_file_handle(&lease_file, &lease_path)? {
+                fs::remove_file(&lease_path)?;
+            }
             observer.event(Event::FileVerified {
                 index,
                 path: path.display().to_string(),
@@ -392,7 +420,7 @@ fn open_receive_file(path: &Path, write: bool) -> Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(
+        options.mode(0o600).custom_flags(
             (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
         );
     }
@@ -699,6 +727,161 @@ fn decode_root(hex_root: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_download_keeps_only_the_current_files_lease() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let bytes = b"a verified delivery";
+        let mut builder = ObjectBuilder::new(Suite::Blake3Bao64, Some(bytes.len() as u64)).unwrap();
+        builder.update(bytes).unwrap();
+        let root = hex::encode(builder.finish().unwrap().object_id().root);
+        let metadata = serde_json::json!({
+            "has_password": true, "authorized": true,
+            "files": ([0, 1].map(|index| serde_json::json!({
+                "name": format!("file{index}"), "suite": BLAKE3, "root": root,
+                "bytes": bytes.len(), "download_url": format!("/api/s/token/files/{index}")
+            })))
+        })
+        .to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for step in 0..9 {
+                let mut stream = (0..1000)
+                    .find_map(|_| match listener.accept() {
+                        Ok((stream, _)) => Some(stream),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            None
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    })
+                    .expect("download request did not arrive");
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = String::new();
+                let mut reader = BufReader::new(&stream);
+                for _ in 0..64 {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    request.push_str(&line);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let request = request.to_ascii_lowercase();
+                if matches!(step, 2 | 3 | 6 | 7 | 8) {
+                    assert!(
+                        request.contains("votport_s_test=grant"),
+                        "{step}: {request}"
+                    );
+                }
+                let (status, extra, body, length) = match step {
+                    0 | 4 => (
+                        200,
+                        String::new(),
+                        b"{\"has_password\":true,\"authorized\":false}".to_vec(),
+                        None,
+                    ),
+                    1 | 5 => (
+                        200,
+                        "Set-Cookie: votport_s_test=grant; Path=/\r\n".to_owned(),
+                        b"{}".to_vec(),
+                        None,
+                    ),
+                    2 | 6 => (200, String::new(), metadata.as_bytes().to_vec(), None),
+                    3 => {
+                        assert!(request.starts_with("get /api/s/token/files/0 "));
+                        assert!(!request.contains("votport_d_"));
+                        (200, "Set-Cookie: unrelated=ignored\r\nSet-Cookie: votport_d_test_0=lease; Path=/api/s/token\r\n".to_owned(), bytes[..5].to_vec(), Some(bytes.len()))
+                    }
+                    7 => {
+                        assert!(request.starts_with("get /api/s/token/files/0 "));
+                        assert!(request.contains("votport_d_test_0=lease"), "{request}");
+                        assert!(!request.contains("unrelated="));
+                        assert!(request.contains("range: bytes=5-"), "{request}");
+                        (
+                            206,
+                            format!(
+                                "Content-Range: bytes 5-{}/{}\r\n",
+                                bytes.len() - 1,
+                                bytes.len()
+                            ),
+                            bytes[5..].to_vec(),
+                            None,
+                        )
+                    }
+                    8 => {
+                        assert!(request.starts_with("get /api/s/token/files/1 "));
+                        assert!(
+                            !request.contains("votport_d_"),
+                            "previous file's lease leaked: {request}"
+                        );
+                        (200, String::new(), bytes.to_vec(), None)
+                    }
+                    _ => unreachable!(),
+                };
+                write!(stream, "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n", length.unwrap_or(body.len())).unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+        let destination = tempfile::tempdir().unwrap();
+        fs::write(destination.path().join(".vot-file0.lease"), b"{truncated").unwrap();
+        fs::write(
+            destination.path().join(".vot-file1.lease"),
+            serde_json::to_vec(&(
+                format!("{base}/api/s/token/files/0"),
+                "wrong-root",
+                "votport_d_test_0=lease",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let target = destination.path().to_owned();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let interrupted = receive_over_http(
+                &base,
+                Delivery {
+                    token: "token".to_owned(),
+                    password: Some("password".to_owned()),
+                },
+                &target,
+                &mut crate::progress::Silent,
+            );
+            assert!(interrupted.is_err(), "the first response was cut");
+            let result = receive_over_http(
+                &format!("{base}/"),
+                Delivery {
+                    token: "token".to_owned(),
+                    password: Some("password".to_owned()),
+                },
+                &target,
+                &mut crate::progress::Silent,
+            );
+            let _ = sender.send(result);
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_secs(15))
+            .expect("receive stalled");
+        assert_eq!(result.unwrap().files.len(), 2);
+        server.join().unwrap();
+        for index in 0..2 {
+            assert_eq!(
+                fs::read(destination.path().join(format!("file{index}"))).unwrap(),
+                bytes
+            );
+        }
+    }
 
     #[test]
     fn resume_reuses_only_matching_regular_files() {

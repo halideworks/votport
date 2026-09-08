@@ -470,7 +470,9 @@ impl Client {
     /// cookie for a password delivery. Returns the response and the byte offset
     /// its body actually starts at: `offset` when the server honored the range
     /// with 206, or 0 when it answered the whole file with 200. The caller
-    /// reads the body incrementally. A partial response must match `offset`
+    /// reads the body incrementally. `lease` retains only this file's download
+    /// allowance across retries and must be reset for each new file.
+    /// A partial response must match `offset`
     /// and the metadata's `total` length.
     ///
     /// # Errors
@@ -479,6 +481,7 @@ impl Client {
         &self,
         path: &str,
         cookie: Option<&str>,
+        lease: &mut Option<String>,
         offset: u64,
         total: u64,
     ) -> Result<(reqwest::blocking::Response, u64)> {
@@ -486,7 +489,12 @@ impl Client {
         // The GET is idempotent, so a transient failure before the body starts
         // is retried; a break mid-stream is the caller's to handle by resuming.
         retry(true, || {
-            let mut request = with_cookie(self.http.get(&url), cookie);
+            let cookies = cookie
+                .into_iter()
+                .chain(lease.as_deref())
+                .collect::<Vec<_>>()
+                .join("; ");
+            let mut request = with_cookie(self.http.get(&url), Some(&cookies));
             if offset > 0 {
                 request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
             }
@@ -512,6 +520,17 @@ impl Client {
                 offset,
                 total,
             )?;
+            if let Some(value) = response
+                .headers()
+                .get_all(reqwest::header::SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .filter_map(|value| value.split(';').next())
+                .map(str::trim)
+                .find(|pair| is_download_lease(pair))
+            {
+                *lease = Some(value.to_owned());
+            }
             Ok((response, start))
         })
     }
@@ -761,6 +780,19 @@ fn set_cookie(response: &reqwest::blocking::Response, name: &str) -> Option<Stri
         .map(str::trim)
         .find(|pair| pair.starts_with(name) && pair[name.len()..].starts_with('='))
         .map(str::to_owned)
+}
+
+pub(crate) fn is_download_lease(pair: &str) -> bool {
+    pair.split_once('=').is_some_and(|(name, value)| {
+        name.starts_with("votport_d_")
+            && !value.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.=".contains(&byte))
+    })
 }
 
 /// Attaches `cookie` (a `name=value`) as the request's `Cookie` header, or
@@ -1116,7 +1148,7 @@ mod tests {
             let target = destination.clone();
             std::thread::spawn(move || {
                 let result = crate::receive::write_verified(&mut |offset| {
-                let (response, start) = client.download("/file", None, offset, 4)?;
+                let (response, start) = client.download("/file", None, &mut None, offset, 4)?;
                 Ok(crate::receive::Resumed { reader: Box::new(response), start })
             }, &target, [0; 32], "unused", 4, 0, &mut crate::progress::Silent);
                 let _ = sender.send(result);

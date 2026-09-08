@@ -213,3 +213,81 @@ fn a_receive_refuses_an_escaping_parent_link_before_writing() {
     assert_eq!(std::fs::read(root.join("nested/file")).unwrap(), b"bytes");
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
 }
+
+#[test]
+fn a_capped_password_delivery_resumes_without_spending_another_download() {
+    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
+        return;
+    };
+    let serve_port = common::free_port();
+    let server = common::start_server(
+        &bin,
+        &[
+            ("VOTPORT_SERVE_BIND", format!("127.0.0.1:{serve_port}")),
+            ("VOTPORT_SERVE_ADVERTISE", format!("127.0.0.1:{serve_port}")),
+        ],
+    );
+    let bytes = vec![42; 2 * 1024 * 1024];
+    let token = common::deliver(
+        &server.base,
+        &[("capped.bin", bytes.clone())],
+        Some("secret"),
+        Some(1),
+    );
+    let destination = tempfile::tempdir().unwrap();
+    struct Stop(bool);
+    impl votport_client_core::progress::Observer for Stop {
+        fn event(&mut self, event: Event) {
+            if matches!(event, Event::Downloading { .. }) {
+                self.0 = true;
+            }
+        }
+        fn cancelled(&self) -> bool {
+            self.0
+        }
+    }
+    let delivery = || Delivery {
+        token: token.clone(),
+        password: Some("secret".to_owned()),
+    };
+    assert!(matches!(
+        receive_over_http(
+            &server.base,
+            delivery(),
+            destination.path(),
+            &mut Stop(false)
+        ),
+        Err(Error::Cancelled)
+    ));
+    let device_root = tempfile::tempdir().unwrap();
+    let device = votport_client_core::Device::load_or_create_in(device_root.path()).unwrap();
+    let received = votport_client_core::receive(
+        &server.base,
+        delivery(),
+        &device,
+        destination.path(),
+        &mut Silent,
+    )
+    .unwrap();
+    assert_eq!(received.files.len(), 1);
+    assert_eq!(
+        std::fs::read(destination.path().join("capped.bin")).unwrap(),
+        bytes
+    );
+    assert!(!destination.path().join(".vot-capped.bin.lease").exists());
+    let other = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        receive_over_http(&server.base, delivery(), other.path(), &mut Silent),
+        Err(Error::Server { status: 404, .. })
+    ));
+    let http = reqwest::blocking::Client::new();
+    for suffix in ["", "?offset=0&limit=1"] {
+        let metadata: serde_json::Value = http
+            .get(format!("{}/api/s/{token}{suffix}", server.base))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(metadata["authorized"], false);
+    }
+}

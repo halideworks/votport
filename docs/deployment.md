@@ -61,6 +61,15 @@ directory fsync, and checks the received file's owner. A share that fails
 these checks is unsupported even with Fast. A slow mount also affects
 `/healthz`, which creates a file in both roots on every call.
 
+Qualification on erebus (2026-09-08, VOT `a93f5d8`): a Linux CIFS 3.1.1
+mount of Samba with `uid=1000,gid=1000,dir_mode=0755,file_mode=0644,serverino`
+and no Unix extensions passed the boot probe. The same mount with
+`nostrictsync` also passed. Each configuration received a 256 MiB HTTP upload
+across server SIGKILL/restart and a 16 MiB QUIC push; every SHA-256 matched
+and each receipt reported Fast. The restart waited for the previous
+instance's 90-second HA lease to expire. These runs qualify process-crash
+recovery, not power loss or a disconnected SMB server.
+
 ## Quick start
 
 ```sh

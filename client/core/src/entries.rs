@@ -95,15 +95,13 @@ fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String> {
     if component.eq_ignore_ascii_case(TENANT_STORAGE_DIR) {
         return Err("name is reserved for tenant storage".to_owned());
     }
-    // The `.journal` shape is checked case-insensitively, since the client's
-    // own resume temporary is `.vot-<name>.journal` and a delivered
-    // `.VOT-x.JOURNAL` would alias it on a case-insensitive filesystem (macOS,
-    // Windows). The others stay case-sensitive, matching the server rule this
-    // ports, since no client file collides with them.
+    // Resume journals and leases must not alias delivered names on
+    // case-insensitive filesystems.
     let lower = component.to_ascii_lowercase();
     if is_push_staging_name(component)
         || (component.starts_with(".vot-") && component.ends_with(".stage"))
-        || (lower.starts_with(".vot-") && lower.ends_with(".journal"))
+        || (lower.starts_with(".vot-")
+            && (lower.ends_with(".journal") || lower.ends_with(".lease")))
     {
         return Err("name is reserved for votport staging files".to_owned());
     }
@@ -176,6 +174,7 @@ mod tests {
                 "separator, control character, or DOS alias",
             ),
             (".secret", false, "hidden file names are not accepted"),
+            (".VOT-anything.LEASE", true, "reserved for votport staging"),
             (".vot-tenants.stage", true, "reserved for tenant storage"),
             (
                 ".vot-push-00112233445566778899aabbccddeeff",

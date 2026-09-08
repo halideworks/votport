@@ -264,7 +264,7 @@ Value is `app.signer.public_hex`, the same string `list_links` already returns a
 
 `suite` from existing `session::suite_name(receipt.suite_id)`. `root` is `hex::encode(receipt.subject_digest)` (64 lowercase hex). `length` is `receipt.subject_length`. The verify page maps `bytes: result.length` before `appendObjectCard`; the helper never reads `length`.
 
-`vot-receipt` at pin `0a129ea` exposes `SubjectKind` / `AssuranceLevel` / `CommitProfile` as `repr(u8)` with no serde aliases and no `Display`. Do not `format!("{:?}", …)` (`Object` / `Published` / `Balanced`). Explicit match, and tests for the strings:
+`vot-receipt` at pin `a93f5d8` exposes `SubjectKind` / `AssuranceLevel` / `CommitProfile` as `repr(u8)` with no serde aliases and no `Display`. Do not `format!("{:?}", …)` (`Object` / `Published` / `Balanced`). Explicit match, and tests for the strings:
 
 | Rust | JSON |
 | --- | --- |
