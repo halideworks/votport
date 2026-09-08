@@ -194,7 +194,7 @@ fn a_receive_refuses_an_escaping_parent_link_before_writing() {
         &root,
         &mut Silent,
     );
-    assert!(matches!(result, Err(Error::BadName { .. })), "{result:?}");
+    assert!(matches!(result, Err(Error::Other(_))), "{result:?}");
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
     std::fs::remove_file(root.join("nested")).unwrap();
     let alias = home.path().join("chosen-alias");

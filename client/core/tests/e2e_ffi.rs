@@ -37,6 +37,7 @@ fn the_ffi_end_to_end() {
     let _state = isolate_state();
     a_two_file_receive_resumes_past_its_verified_first_file(&bin);
     a_quic_resume_reuses_a_verified_file(&bin);
+    a_blocked_parent_link_keeps_the_receive_available_for_retry(&bin);
     a_shell_sends_a_folder_and_receives_a_delivery_through_the_view_model(&bin);
     a_cancel_before_the_download_lands_nothing_and_a_partial_resumes_next_time(&bin);
 }
@@ -608,5 +609,43 @@ fn a_quic_resume_reuses_a_verified_file(bin: &str) {
         .files
         .iter()
         .all(|file| file.state == FileState::Verified));
+    assert!(!journalled(&handle.journal_id()));
+}
+
+fn a_blocked_parent_link_keeps_the_receive_available_for_retry(bin: &str) {
+    let server = common::start_server(bin, &[]);
+    let token = common::deliver(
+        &server.base,
+        &[("nested/file", b"bytes".to_vec())],
+        None,
+        None,
+    );
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let outside = home.path().join("outside");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("nested")).unwrap();
+    let handle = Transfer::new();
+    let result = ffi::receive(
+        format!("{}/s/{token}", server.base),
+        None,
+        root.display().to_string(),
+        handle.clone(),
+        Arc::new(Recorder::default()),
+    );
+    assert!(result.is_err(), "{result:?}");
+    assert!(handle.journal_kept() && journalled(&handle.journal_id()));
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    std::fs::remove_file(root.join("nested")).unwrap();
+    let resumed = ffi::resume(
+        handle.journal_id().unwrap(),
+        None,
+        Transfer::new(),
+        Arc::new(Recorder::default()),
+    )
+    .unwrap();
+    assert!(matches!(resumed, ffi::ResumeReport::Received(report) if report.files.len() == 1));
+    assert_eq!(std::fs::read(root.join("nested/file")).unwrap(), b"bytes");
     assert!(!journalled(&handle.journal_id()));
 }

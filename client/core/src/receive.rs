@@ -611,10 +611,9 @@ pub(crate) fn local_path(dest: &Path, name: &str) -> Result<PathBuf> {
     let anchor = resolve_directory(dest)?;
     let parent = resolve_directory(path.parent().unwrap_or(dest))?;
     if !parent.starts_with(&anchor) {
-        return Err(Error::BadName {
-            name: name.to_owned(),
-            reason: "parent directory leaves the receive destination".to_owned(),
-        });
+        return Err(Error::Other(format!(
+            "the parent directory of {name:?} leaves the receive destination"
+        )));
     }
     Ok(path)
 }
@@ -829,7 +828,8 @@ mod tests {
             alias.join("new/file")
         );
         symlink(&outside, root.join("escape")).unwrap();
-        assert!(local_path(&root, "escape/file").is_err());
+        let error = local_path(&root, "escape/file").unwrap_err();
+        assert!(error.worth_retrying());
         let announced = admit("escape/file", PathBuf::new(), true).unwrap();
         assert!(local_path_of(&root, &announced.path).is_err());
         fs::create_dir(root.join("real")).unwrap();
