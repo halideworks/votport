@@ -206,7 +206,9 @@ fn an_operator_runs_the_port_from_the_core() {
     assert_eq!(report.files.len(), 1);
     assert_eq!(std::fs::read(&report.files[0]).unwrap(), vec![7u8; 100_000]);
     let last = recorder.0.lock().unwrap().last().cloned().unwrap();
-    assert_eq!(last.status, "Landed and verified, 1 file");
+    assert!(last
+        .status
+        .starts_with("Landed and verified, 1 file, 100 KB, "));
 
     // Uploading from this machine: a folder with a file over one chunk and an
     // empty file goes up under the named folder, the listener hears the

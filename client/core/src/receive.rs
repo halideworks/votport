@@ -655,6 +655,7 @@ fn hash_copy(
         builder.update(chunk)?;
         sink.write_all(chunk)?;
         received = received.saturating_add(read as u64);
+        observer.event(Event::Transferred { bytes: read as u64 });
         observer.event(Event::Downloading {
             index,
             received,

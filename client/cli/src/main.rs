@@ -332,8 +332,12 @@ struct CliObserver {
 
 impl Observer for CliObserver {
     fn event(&mut self, event: Event) {
+        if matches!(event, Event::Transferred { .. }) {
+            return;
+        }
         if self.json {
             let line = match &event {
+                Event::Transferred { .. } => return,
                 Event::Selected { files } | Event::Planned { files } => {
                     let name = if matches!(event, Event::Selected { .. }) {
                         "selected"
@@ -380,7 +384,7 @@ impl Observer for CliObserver {
             return;
         }
         match event {
-            Event::Transport(_) | Event::Bytes { .. } => {}
+            Event::Transport(_) | Event::Bytes { .. } | Event::Transferred { .. } => {}
             Event::Selected { .. } | Event::Planned { .. } => {}
             Event::SessionCreated { .. } => {}
             Event::Chunk { .. } => {}

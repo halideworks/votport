@@ -1,7 +1,7 @@
 # The desktop client: native apps on one Rust core
 
 Status: in progress, 2026-09-08. The VOT seams in "VOT changes" are available in
-vot-cli at pin `a93f5d86` (`build_manifest`, `build_manifest_from`,
+vot-cli at pin `ed8a20b7` (`build_manifest`, `build_manifest_from`,
 `push_from`, `fetch_bundle_with`, `probe_serve`, the proof-cache accessors,
 and the wire build on the platform-native CI job); the listener session cap
 is a separate follow-on. The core and CLI now move bytes end to end: C1 send
@@ -356,7 +356,7 @@ Server, the contract the client speaks (route table in `server/src/app.rs`):
 | `GET /api/s/{token}/{file,batch,bundle,receipt}` | HTTP delivery and receipts, the fallback. |
 | `GET /api/receipt-key`, `POST /api/verify` | Public receipt verification. |
 
-VOT at the pinned revision (`a93f5d86`), the functions the core builds on:
+VOT at the pinned revision (`ed8a20b7`), the functions the core builds on:
 
 - `push_bundle(bundle_dir, address, capability_path, key_source, identity)`
   dials `rails` sessions, each `ServeSession::begin_push_session` over a
@@ -960,3 +960,25 @@ removed after successful publication. Passwords are requested again on Retry.
 An exhausted delivery still serves metadata and password verification for
 recovery; fresh downloads, QUIC capability minting, bundles, and batches
 remain subject to the download cap. Revocation and expiry still refuse access.
+
+
+## Streaming receive and completion details
+
+Native receivers publish verified files while remaining objects download. The
+transfer card shows one receiving stage with completed-file and byte counts,
+then an animated horizontal bar labeled "Verifying and finishing" when all
+network bytes have arrived. Mac and Windows use the same core stage and counts.
+A file reaches 100 percent only after it is published or verified.
+
+Completed cards show the landed file count and size, total elapsed time,
+average transfer speed, and local completion time. Total time includes
+verification and publication. Average speed uses bytes moved in the current
+attempt and excludes post-transfer verification and publication; resumed bytes
+are excluded from its numerator.
+
+The core reads up to 4 MiB at a time while verifying, resuming, or copying a
+received file, capped by its size. Native BLAKE3 and FEC libraries retain their
+runtime SIMD dispatch. In the 100,000-file validation, each unique file held
+256 bytes: Windows completed in 8m07s and Mac in 7m06s. Every output file passed
+an independent SHA-256 comparison. A separate 12 GB fixture also passed on both
+platforms. Mac used a 1 Gbps link for these checks.

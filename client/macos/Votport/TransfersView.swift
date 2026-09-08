@@ -58,6 +58,7 @@ struct TransferCard: View {
                     Text(Format.statusLine(item))
                         .font(Type.caption.monospacedDigit())
                         .foregroundStyle(statusColor)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer()
                 if item.running {
@@ -86,7 +87,11 @@ struct TransferCard: View {
                 }
             }
             if let view = item.view {
-                if let total = view.totalBytes {
+                if view.finishing {
+                    ProgressView()
+                        .progressViewStyle(.linear)
+                        .tint(Tokens.progress)
+                } else if let total = view.totalBytes {
                     ProgressView(value: Double(view.movedBytes), total: Double(max(total, 1)))
                         .tint(view.phase == .done ? Tokens.ok : Tokens.progress)
                 } else if item.running {
@@ -156,7 +161,7 @@ struct FileRowView: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer()
-            ProgressView(value: Double(file.moved), total: Double(max(file.bytes, 1)))
+            ProgressView(value: Double(file.progressPercent), total: 100)
                 .frame(width: 120)
                 .tint(file.state == .verified ? Tokens.ok : Tokens.progress)
             Text(file.label)
@@ -168,13 +173,18 @@ struct FileRowView: View {
 }
 
 /// The core's words, joined for the places that show them. Nothing is
-/// computed or formatted here.
+/// computed here; completion time uses the local timezone.
 enum Format {
     /// The core's status line, or the two states only the shell knows: a
     /// journal entry not yet run, and a transfer the core has not answered.
     static func statusLine(_ item: TransferItem) -> String {
         if item.interrupted { return "Interrupted before it finished" }
         guard let view = item.view else { return item.running ? "Starting" : "Failed" }
+        if view.phase == .done, let finished = view.finishedUnixSeconds {
+            let time = Date(timeIntervalSince1970: TimeInterval(finished))
+                .formatted(date: .omitted, time: .standard)
+            return "\(view.status), finished at \(time)"
+        }
         return view.status
     }
 

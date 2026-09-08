@@ -130,7 +130,7 @@ fn a_watched_folder_ships_what_settles_in_it() {
         (2, true, None)
     );
     assert_eq!(last.phase, Phase::Done);
-    assert_eq!(last.status, "Shipped and verified, 2 files");
+    assert!(last.status.starts_with("Shipped and verified, 2 files, "));
     // Moved into shipped/, and on the server.
     assert!(!drop.exists());
     assert!(folder
