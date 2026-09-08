@@ -350,13 +350,17 @@ const rootFolder = page.locator(
 if (await rootFolder.count() !== 1 || await page.locator("#library-files .library-file:not(.library-folder)").count() !== 0) {
   throw new Error(`scoped library root did not show ${PROJECT} as a folder`);
 }
-await page.getByRole("button", { name: `Open folder ${PROJECT}` }).click();
+await page.getByRole("button", { name: `Open folder ${PROJECT}` }).focus();
+await page.keyboard.press("Enter");
 await page.waitForFunction(
   (project) => document.querySelector('#library-breadcrumbs [aria-current="page"]')?.textContent === project &&
     document.querySelectorAll("#library-files input[type=checkbox]").length === 12,
   PROJECT,
   { timeout: 15000 },
 );
+if (!await page.evaluate(() => document.activeElement.matches('#library-breadcrumbs [aria-current="page"]'))) {
+  throw new Error("folder navigation lost keyboard focus");
+}
 const currentDirectory = await page.textContent('#library-breadcrumbs [aria-current="page"]');
 if (currentDirectory !== PROJECT) {
   throw new Error(`scoped library breadcrumb: ${currentDirectory}`);
@@ -372,11 +376,39 @@ await page.waitForSelector(`#library-files input[aria-label="Select folder ${PRO
   state: "visible",
   timeout: 15000,
 });
+if (!await page.evaluate(() => document.activeElement.matches('#library-breadcrumbs [aria-current="page"]'))) {
+  throw new Error("breadcrumb navigation lost keyboard focus");
+}
+await page.route("**/api/admin/outbound-files?directory=*", (route) => route.fulfill({ status: 503 }), { times: 1 });
+await page.getByRole("button", { name: `Open folder ${PROJECT}` }).focus();
+await page.keyboard.press("Enter");
+await page.locator("#library-files [role=alert]").waitFor();
+if (!await page.evaluate(() => document.activeElement.matches('#library-breadcrumbs [aria-current="page"]'))) {
+  throw new Error("failed folder navigation lost keyboard focus");
+}
+await page.keyboard.press("Enter");
+await page.waitForSelector(`#library-files input[aria-label="Select folder ${PROJECT}"]`);
+await page.route("**/api/admin/outbound-files?directory=*", async (route) => {
+  await page.focus("#library-search");
+  await route.fulfill({ status: 503 });
+}, { times: 1 });
+await page.getByRole("button", { name: `Open folder ${PROJECT}` }).click();
+await page.locator("#library-files [role=alert]").waitFor();
+if (await page.evaluate(() => document.activeElement.id) !== "library-search") {
+  throw new Error("failed folder navigation stole external focus");
+}
+await page.getByRole("button", { name: "Library", exact: true }).click();
+await page.waitForSelector(`#library-files input[aria-label="Select folder ${PROJECT}"]`);
+console.log("library navigation preserves keyboard focus on success and failure: ok");
 await page.locator(`#library-files input[aria-label="Select folder ${PROJECT}"]`).click();
 await page.waitForFunction(
   () => document.getElementById("library-selection-status").textContent.startsWith("12 files selected"),
   { timeout: 15000 },
 );
+await page.route("**/api/admin/outbound-files?directory=*", async (route) => {
+  await page.focus("#library-search");
+  await route.continue();
+}, { times: 1 });
 await page.getByRole("button", { name: `Open folder ${PROJECT}` }).click();
 await page.waitForFunction(
   (project) => document.querySelector('#library-breadcrumbs [aria-current="page"]')?.textContent === project &&
@@ -386,6 +418,10 @@ await page.waitForFunction(
   PROJECT,
   { timeout: 15000 },
 );
+if (await page.evaluate(() => document.activeElement.id) !== "library-search") {
+  throw new Error("folder navigation stole external focus");
+}
+console.log("library navigation preserves focus moved during a request: ok");
 const selectedProjectFiles = await page.$$eval(
   "#library-files input[type=checkbox]",
   (checkboxes) => checkboxes.map((checkbox) => checkbox.checked),
