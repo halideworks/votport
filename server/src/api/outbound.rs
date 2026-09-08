@@ -2073,6 +2073,7 @@ async fn create_library_grant(
                         incarnation: incarnation_id,
                         sequence: 1,
                     },
+                    vot_sdk_file::CommitProfile::Fast,
                 )
                 .map_err(ApiError::internal)?;
             Ok(OutboundGrantFile {
@@ -4849,6 +4850,7 @@ mod tests {
                     incarnation: [2; 16],
                     sequence: 1,
                 },
+                vot_sdk_file::CommitProfile::Balanced,
             )
             .unwrap();
         app.store
@@ -5363,6 +5365,7 @@ mod tests {
                     incarnation: [2; 16],
                     sequence: 1,
                 },
+                vot_sdk_file::CommitProfile::Balanced,
             )
             .unwrap();
         let second_receipt = app
@@ -5374,6 +5377,7 @@ mod tests {
                     incarnation: [4; 16],
                     sequence: 2,
                 },
+                vot_sdk_file::CommitProfile::Balanced,
             )
             .unwrap();
 
@@ -6672,6 +6676,22 @@ mod tests {
             .next()
             .unwrap()
             .to_owned();
+
+        let grant = app
+            .store
+            .outbound_grant_by_token_hash(&hash_token(&token))
+            .unwrap()
+            .unwrap();
+        let bytes = base64::prelude::BASE64_STANDARD
+            .decode(&grant.files[0].receipt_b64)
+            .unwrap();
+        let decoded = vot_receipt::decode_authenticated(&bytes).unwrap();
+        let verified = vot_receipt::verify_ed25519(&decoded, &app.signer.verifying_key()).unwrap();
+        assert_eq!(verified.receipt().profile, vot_receipt::CommitProfile::Fast);
+        assert_eq!(
+            verified.receipt().actual_predecessor,
+            vot_receipt::required_predecessor(vot_receipt::CommitProfile::Fast)
+        );
 
         let snapshot = directory.path().join("backup.db");
         app.store.backup_into(&snapshot).unwrap();

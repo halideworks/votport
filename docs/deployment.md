@@ -27,24 +27,39 @@ it.
 
 ### Network filesystems
 
-`/received` and `/outbound` can be NFS mounts, which is how a facility lands
-uploads on its storage directly. VOT publishes a received file by fsyncing a
-staging file next to the destination, hard-linking it into place, checking
-the link by device and inode, and fsyncing the directory, and it refuses a
-parent that is a symlink, group- or world-writable, or owned by another uid.
-The outbound library publishes with the same hard link and refuses a
-symlinked root but has no owner or mode rule. So both volumes must be the
-real directory (not a symlink to it) on an export that supports `link(2)`,
-and `/received` must also map the container's uid 1000 to itself (no
-`all_squash` or `anonuid` onto a different id, and matching NFSv4 idmapping)
-and let the server hold the directory at 0755. votport probes both
-directories at boot with a staging file, a hard link, and a directory fsync,
-checks for `/received` that the file it created is owned by its own uid, and
-refuses to start with the failing step in the message instead of failing
-every upload later. SMB and CIFS mounts fail that probe on most servers (no
-hard links, synthesized ownership, unstable inodes) and are not supported as
-landing directories. A slow mount shows up as `/healthz` latency, since the
-health probe creates a file in both roots on every call.
+On Linux, Votport selects **Fast** for received files on detected CIFS/SMB
+and NFS mounts. **Balanced and Strict are incompatible with these
+filesystems.** Local filesystems retain Balanced. The System deployment
+panel shows the receive filesystem's supported profile.
+
+Fast still verifies content and publishes without overwriting an existing
+file, but does not promise that the remote server has persisted the data
+through power loss. Successful writes or a remote `fsync` are not evidence
+of that stronger guarantee. Received-file receipts report the actual commit
+profile. Outbound library grants hash existing files and issue Fast receipts
+without claiming durable publication. Resumable receive sessions persist
+their profile, including across restarts;
+existing sessions retain their original Balanced profile and are not
+silently downgraded.
+
+For stronger durability, receive onto a supported local filesystem using
+Balanced, then replicate to the share under your storage system's backup
+and durability policy. Keep the local copy until that policy is satisfied.
+Votport does not offer Strict as a selectable receive profile. If Strict
+is required, use a VOT receiver and local storage qualified for that
+profile. See the [VOT mounted-share support and alternatives](https://github.com/halideworks/VOT/blob/a93f5d86a4da23744f8f8268054414b812b72c46/docs/mounted-shares.md)
+for platform requirements and the limits of each profile. macOS SMB is not
+qualified by this upstream release.
+
+Fast does not bypass filesystem safety checks. Both `/received` and
+`/outbound` must be real directories on a filesystem that supports hard
+links and stable file identity. `/received` must map the container's uid
+1000 to itself and permit a directory mode of 0755; symlinked, differently
+owned, group-writable, or world-writable parents are rejected. Votport
+probes both directories at boot with a staging file, hard link, and
+directory fsync, and checks the received file's owner. A share that fails
+these checks is unsupported even with Fast. A slow mount also affects
+`/healthz`, which creates a file in both roots on every call.
 
 ## Quick start
 
@@ -565,7 +580,7 @@ Measured single-stream upload rose about a quarter (256 MiB baseline,
 still verifies serially and is the next candidate.
 
 Do not raise `CHUNK_BYTES` in votport until VOT changes its server verify
-path to support larger ranges; the `0a129ea8` pin does not. Any VOT re-pin
+path to support larger ranges; the `a93f5d86` pin does not. Any VOT re-pin
 moves the VOT dependencies and Dockerfile `ARG` together, then relocks
 Cargo.lock. Measure with:
 

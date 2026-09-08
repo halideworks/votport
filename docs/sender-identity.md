@@ -36,7 +36,7 @@ Object identity is already on every completed upload. `server/src/store.rs` `Fil
 
 `server/src/api/admin.rs` `FileView` is that record plus a live `exists` boolean. `GET /api/admin/links` also returns `receipt_key: app.signer.public_hex`. `FinishReport.files` in `session.rs` `handle_finish` is `Vec<FileRecord>`, so the sender's `#done-list` already receives `suite`, `root`, `bytes`, `receipt`, `path`.
 
-Receipts are already the right evidence. `ReceiptSigner::write_sidecar` (`server/src/receipt.rs`) writes canonical vot-receipt CBOR, ed25519-signed, `SubjectKind::Object`, `AssuranceLevel::Published`, `CommitProfile::Balanced`. The crate cap is `decode_authenticated` rejecting input longer than 65_536 bytes. The e2e `receipts_are_written_and_files_are_manageable` already round-trips `decode_authenticated` plus `verify_ed25519` against `listing["receipt_key"]`.
+Receipts are already the right evidence. `ReceiptSigner::write_sidecar` (`server/src/receipt.rs`) writes canonical vot-receipt CBOR, ed25519-signed, `SubjectKind::Object`, `AssuranceLevel::Published`, the actual commit profile (Fast on Linux CIFS/SMB or NFS, Balanced on local storage). The crate cap is `decode_authenticated` rejecting input longer than 65_536 bytes. The e2e `receipts_are_written_and_files_are_manageable` already round-trips `decode_authenticated` plus `verify_ed25519` against `listing["receipt_key"]`.
 
 The sender already hashes in module workers with vot-wasm SIMD (`hash-worker.js` `ObjectBuilder(Suite.Blake3Bao64, ...)`), keeps eight range POSTs in flight (`UPLOADS_IN_FLIGHT = 8`), and hashes every file of a drop across the pool before announcing the package. Resume is keyed on the **package** root alone, not a file object id. In `upload.js` `sendDrop`, `rootHex` is `hex(packageId.root)` from `buildPackage(items).summary.objectId`; `saveResume` / `loadResume` use `votport-resume-${token}` and match `saved.root === rootHex`. The record carries `files` and `size` for the resume note. The package root covers every entry's path and bytes, so any edit to the selection produces a new root and a fresh session; `item.objectId` is never written to the record. `CHUNK_BYTES` is 8 MiB in `session.rs` and is advertised as `chunk_bytes` on `GET /api/r/{token}` and session create. Do not raise it.
 
@@ -279,7 +279,7 @@ Value is `app.signer.public_hex`, the same string `list_links` already returns a
 | `CommitProfile::Balanced` | `"balanced"` |
 | `CommitProfile::Strict` | `"strict"` |
 
-votport only issues Object / Published / Balanced. Still match every variant so a future sidecar cannot leak Debug casing. Unknown numeric values: 422 `"This receipt could not be checked."` rather than a raw number.
+votport issues Object / Published with Fast or Balanced according to the receive filesystem. Grants for existing outbound library files use Fast because hashing those files does not establish a durable publication. Still match every variant so a future sidecar cannot leak Debug casing. Unknown numeric values: 422 `"This receipt could not be checked."` rather than a raw number.
 
 Do not `spawn_blocking`. This is not argon2. Do not write `store.audit` (unauthenticated log injection / disk fill). `tracing::info!(target: "audit", event = "receipt_checked", ok = true, suite, length)` is enough.
 

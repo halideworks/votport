@@ -33,11 +33,25 @@ function deploymentWarning(id, warn, note) {
   if (warn) $(id).textContent += ` (${note})`;
 }
 
+function deploymentProfile(id, profile, outbound = false) {
+  const messages = {
+    fast: 'Fast only: CIFS/SMB or NFS detected. Balanced and Strict are incompatible with this filesystem.',
+    balanced: 'Balanced selected automatically.',
+  };
+  let note = messages[profile] || 'Filesystem detection unavailable.';
+  if (outbound) note = `Library receipts use Fast.${profile === 'balanced' ? '' : ` ${note}`}`;
+  deploymentValue(id, note);
+  $(id).classList.toggle('warning', profile === 'fast');
+  $(`${id}-docs`).hidden = profile !== 'fast';
+}
+
 function fillDeployment(data) {
   const deployment = data.deployment;
   deploymentValue('setting-data-dir', deployment.data_dir);
   deploymentValue('setting-receive-dir', deployment.receive_dir);
   deploymentValue('setting-outbound-dir', deployment.outbound_dir);
+  deploymentProfile('setting-receive-profile', deployment.receive_commit_profile);
+  deploymentProfile('setting-outbound-profile', deployment.outbound_filesystem_profile, true);
   deploymentValue('setting-web-root', deployment.web_root);
   deploymentValue('setting-max-upload', formatBytes(deployment.max_upload_bytes));
   deploymentValue('setting-allow-hidden', deployment.allow_hidden ? 'Allowed' : 'Blocked');

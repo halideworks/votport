@@ -13,7 +13,7 @@ shipped. Later hardening added per-link legal hold in schema v6, the schema-v7
 exact-byte files projection, atomic announced-byte/session reservations, and
 reserved tenant storage. See [`multi-tenancy.md`](multi-tenancy.md) for current
 behavior. The remaining follow-on is scoped automation tokens. VOT is pinned at
-`0a129ea`. See the README roadmap for what that pin does and does not change.
+`a93f5d86`. See the README roadmap for what that pin does and does not change.
 
 ## Overview
 

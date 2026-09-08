@@ -1,7 +1,7 @@
 # The desktop client: native apps on one Rust core
 
-Status: in progress, 2026-09-05. The VOT seams in "VOT changes" landed in
-vot-cli at pin `0a129ea` (`build_manifest`, `build_manifest_from`,
+Status: in progress, 2026-09-08. The VOT seams in "VOT changes" are available in
+vot-cli at pin `a93f5d86` (`build_manifest`, `build_manifest_from`,
 `push_from`, `fetch_bundle_with`, `probe_serve`, the proof-cache accessors,
 and the wire build on the platform-native CI job); the listener session cap
 is a separate follow-on. The core and CLI now move bytes end to end: C1 send
@@ -343,7 +343,7 @@ Server, the contract the client speaks (route table in `server/src/app.rs`):
 | `GET /api/s/{token}/{file,batch,bundle,receipt}` | HTTP delivery and receipts, the fallback. |
 | `GET /api/receipt-key`, `POST /api/verify` | Public receipt verification. |
 
-VOT at the pinned revision (`0a129ea`), the functions the core builds on:
+VOT at the pinned revision (`a93f5d86`), the functions the core builds on:
 
 - `push_bundle(bundle_dir, address, capability_path, key_source, identity)`
   dials `rails` sessions, each `ServeSession::begin_push_session` over a
@@ -902,3 +902,34 @@ Studio and erebus over the wired LAN.
   browser's speed. The probe makes that visible in the transfer log and
   the operator doc gets a one-line firewall rule for the push and serve
   ports.
+
+
+## Upstream repin validation, 2026-09-08
+
+Server, native core, and browser WASM use VOT
+`a93f5d86a4da23744f8f8268054414b812b72c46`. The desktop wrappers retain four
+QUIC rails for remote peers and select one for macOS loopback, including
+IPv4-mapped loopback addresses.
+
+Mac Studio passed 65 native core tests and built the Rust core, generated
+Swift bindings, XCFramework, and app. The build script now defaults native
+libraries to the app's macOS 14 deployment floor; the rebuilt executable
+reports minimum OS 14.0. Existing Swift concurrency and imported-type
+conformance warnings remain. The installed app received a three-file
+16 MiB fixture over QUIC and all SHA-256 hashes matched. Interactive visual
+validation was unavailable while the console was locked.
+
+Windows passed 61 native core tests and built the Rust DLL, regenerated C#
+bindings, and WinUI app with zero warnings or errors. The app signed in,
+received the same fixture over QUIC directly onto a mapped SMB share, and
+reported all three files verified; their SHA-256 hashes matched. Settings
+scrollbar placement was checked in the running app after moving the right
+content gutter inside the scrolling pages. The scrollbar ends at the native
+window border, with the controls retaining their existing right spacing.
+
+Linux validation passed 504 server tests, 66 native core tests, 11 client
+integration tests using the repinned server, 89 JavaScript tests, and the
+Chromium/Firefox end-to-end suite. The CIFS notice and documentation links
+were visually checked with a simulated detected-share settings response.
+No Linux CIFS/NFS mount or macOS SMB share was qualified by these tests;
+see [mounted filesystem support](deployment.md#network-filesystems).

@@ -26,9 +26,14 @@ use crate::progress::{with_progress, Event, Observer, Transport, PROGRESS_QUANTU
 /// How long the probe waits for the receiver's handshake before falling back.
 const PROBE_BUDGET: Duration = Duration::from_secs(2);
 
-/// Rails dialled at once. The receiver's session limit is eight; four is a
-/// steady default until the listener cap lands.
-const PUSH_RAILS: usize = 4;
+/// macOS loopback avoids contention in the shared UDP path with one rail.
+pub(crate) fn direct_rails(address: SocketAddr, macos: bool) -> usize {
+    if macos && address.ip().to_canonical().is_loopback() {
+        1
+    } else {
+        4
+    }
+}
 
 /// The outcome of an attempted push.
 pub enum Outcome {
@@ -169,7 +174,7 @@ fn push(
                 address,
                 holder,
                 identity,
-                rails: PUSH_RAILS,
+                rails: direct_rails(address, cfg!(target_os = "macos")),
                 // push_from adds the PUSH extension; no FEC is offered here.
                 extensions: BTreeSet::new(),
                 progress: Some((PROGRESS_QUANTUM, progress)),
@@ -191,4 +196,27 @@ fn base64_decode(value: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(value)
         .map_err(|error| Error::Other(format!("the capability is not valid base64: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn direct_rails_limits_only_macos_loopback() {
+        for (address, loopback) in [
+            ("127.0.0.1:443", true),
+            ("[::1]:443", true),
+            ("[::ffff:127.0.0.1]:443", true),
+            ("192.168.1.2:443", false),
+            ("[fd00::1]:443", false),
+            ("[::ffff:192.168.1.2]:443", false),
+        ] {
+            let address = address.parse().unwrap();
+            assert_eq!(super::direct_rails(address, false), 4, "{address}");
+            assert_eq!(
+                super::direct_rails(address, true),
+                if loopback { 1 } else { 4 },
+                "{address}"
+            );
+        }
+    }
 }
