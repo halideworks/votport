@@ -3,11 +3,10 @@ import SwiftUI
 import VotportCore
 
 /// The port's links: the request links senders ship to, and the deliveries
-/// recipients pull. Each section opens with its issue form: the request
-/// form inline, the delivery browser as a sheet.
+/// recipients pull. Request creation is inline; sharing opens its own screen.
 struct LinksView: View {
     @EnvironmentObject private var port: PortStore
-    @State private var newDelivery = false
+    let share: () -> Void
     @State private var label = ""
     @State private var password = ""
     @State private var expiresDays = ""
@@ -17,7 +16,7 @@ struct LinksView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                Text("LINKS")
+                Text("MANAGE LINKS")
                     .font(Type.label)
                     .tracking(1.5)
                     .foregroundStyle(Tokens.muted)
@@ -33,18 +32,11 @@ struct LinksView: View {
             .padding(20)
         }
         .onAppear { port.refresh() }
-        .sheet(isPresented: $newDelivery) {
-            // Shorter than the 580 pt window, so the issued link at the
-            // bottom of the sheet is never off screen.
-            DeliverView()
-                .environmentObject(port)
-                .frame(width: 660, height: 480)
-        }
     }
 
     private var issueForm: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Issue a request link")
+            Text("Create a request link")
                 .font(Type.sans(13, .semibold, relativeTo: .body))
             HStack {
                 TextField("Label, e.g. Dailies from Alex", text: $label)
@@ -56,7 +48,7 @@ struct LinksView: View {
             HStack(alignment: .bottom) {
                 NumberField("Closes after", unit: "days", placeholder: "Never", text: $expiresDays)
                 NumberField("Accepts up to", unit: "GB", placeholder: "Port default", text: $maxGigabytes, decimal: true)
-                Button("Issue request link") { issue() }
+                Button("Create request link") { issue() }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
                     .frame(maxWidth: .infinity)
@@ -85,8 +77,7 @@ struct LinksView: View {
         .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
-    /// The way to a new delivery, as the first card of DELIVERIES: the
-    /// library browser needs the room of a sheet.
+    /// Sharing is also reachable beside the existing delivery links.
     private var deliveryCard: some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
@@ -97,7 +88,7 @@ struct LinksView: View {
                     .foregroundStyle(Tokens.muted)
             }
             Spacer()
-            Button("New delivery") { newDelivery = true }
+            Button("Share files") { share() }
                 .buttonStyle(.borderedProminent)
         }
         .padding(14)

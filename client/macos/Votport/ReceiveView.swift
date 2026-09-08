@@ -18,6 +18,10 @@ struct ReceiveView: View {
                 .tracking(1.5)
                 .foregroundStyle(Tokens.muted)
 
+            Text("Download files from a delivery link to this Mac.")
+                .font(Type.callout)
+                .foregroundStyle(Tokens.muted)
+
             TextField("Delivery link", text: $link)
                 .textFieldStyle(.roundedBorder)
                 .onChange(of: link) { _, value in previewer.update(value) }

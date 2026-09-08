@@ -1,6 +1,5 @@
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
-using Microsoft.UI.Xaml.Media.Animation;
 using Windows.ApplicationModel.DataTransfer;
 using uniffi.votport_client_core;
 
@@ -75,7 +74,7 @@ public sealed partial class LinksPage : Page
 
     private void NewDelivery_Click(object sender, RoutedEventArgs e)
     {
-        Frame.Navigate(typeof(DeliverPage), null, new SuppressNavigationTransitionInfo());
+        App.Window?.Show("share");
     }
 
     private void CloseRequest_Click(object sender, RoutedEventArgs e)

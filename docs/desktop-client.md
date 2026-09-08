@@ -933,3 +933,32 @@ Chromium/Firefox end-to-end suite. The CIFS notice and documentation links
 were visually checked with a simulated detected-share settings response.
 No Linux CIFS/NFS mount or macOS SMB share was qualified by these tests;
 see [mounted filesystem support](deployment.md#network-filesystems).
+
+
+## Desktop navigation and tray appearance, 2026-09-08
+
+Send fulfills an existing request link. Receive downloads an existing
+delivery link. Signed-in operators also see Share, which opens the file
+and library picker directly, and Manage links, which creates request links
+and lists existing requests and deliveries. Share and Manage links link
+back to each other; signing out removes both from navigation. Supporting
+copy retains the home-port terminology while the actions describe what
+happens to files.
+
+Windows right-click uses a standard WinUI menu with transfer status, Open,
+and Quit. Left-click retains the transfer panel and its controls. The menu
+uses system light/dark and accessibility resources with no custom border;
+the panel also suppresses the Windows 11 DWM outline. macOS uses a native
+menu-bar menu with transfer actions in submenus. Both use platform spacing
+and appearance instead of a branded popup header.
+
+Windows UI validation signed in to a test server, opened Share directly,
+created a delivery from a library file, returned to Manage links, and
+confirmed operator navigation disappeared after sign-out. The tray changed
+between light and dark while the app stayed running; system appearance was
+restored after the test. First right-click, Open, Escape, click-away,
+left-click panel restoration, and Quit passed in the running Windows app.
+Both native apps built and launched after installation. The Mac console
+remained locked, so its native menu was not visually qualified. Share drafts
+remain local to the current view, so navigating away still discards the
+form and selection, as it did before this navigation change.

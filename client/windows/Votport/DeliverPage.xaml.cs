@@ -3,7 +3,6 @@ using System.ComponentModel;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
-using Microsoft.UI.Xaml.Media.Animation;
 using Windows.ApplicationModel.DataTransfer;
 using Windows.Storage;
 using Windows.Storage.Pickers;
@@ -32,7 +31,7 @@ public sealed class LibraryEntry : INotifyPropertyChanged
     public Action? ChosenChanged { get; set; }
 }
 
-/// A new delivery, reached from Links. Files dropped or chosen here go up
+/// Share files through a delivery link. Files dropped or chosen here go up
 /// to the port first and come back ticked; what is already on the port is
 /// browsed one directory at a time and ticked the same way. Then the
 /// delivery is issued and its one link copied.
@@ -68,7 +67,7 @@ public sealed partial class DeliverPage : Page
     {
         var port = PortStore.Shared;
         // The button carries the count, so the row has one control to read.
-        IssueButton.Content = chosen.Count == 0 ? "Tick the files to deliver" : chosen.Count == 1 ? "Deliver 1 file" : $"Deliver {chosen.Count} files";
+        IssueButton.Content = chosen.Count == 0 ? "Choose files to share" : chosen.Count == 1 ? "Share 1 file" : $"Share {chosen.Count} files";
         IssueButton.IsEnabled = !port.Busy && chosen.Count > 0 && LabelBox.Text.Trim().Length > 0;
         var busy = uploading is not null;
         ChooseButton.IsEnabled = !busy;
@@ -261,7 +260,6 @@ public sealed partial class DeliverPage : Page
 
     private void Back_Click(object sender, RoutedEventArgs e)
     {
-        if (Frame.CanGoBack) Frame.GoBack(new SuppressNavigationTransitionInfo());
-        else Frame.Navigate(typeof(LinksPage), null, new SuppressNavigationTransitionInfo());
+        App.Window?.Show("links");
     }
 }

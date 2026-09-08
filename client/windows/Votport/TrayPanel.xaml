@@ -7,7 +7,8 @@
     <MicaBackdrop />
   </Window.SystemBackdrop>
   <!-- No FontFamily on the Grid: the XAML compiler fails silently on it. -->
-  <Grid Background="{ThemeResource VotBgBrush}" Padding="14" RowSpacing="10">
+  <Grid x:Name="MenuHost">
+  <Grid x:Name="PanelContent" Background="{ThemeResource VotBgBrush}" Padding="14" RowSpacing="10">
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto" />
       <RowDefinition Height="*" />
@@ -23,7 +24,7 @@
       <TextBlock Grid.Column="1" Text="votport" FontWeight="SemiBold" VerticalAlignment="Center" FontFamily="{StaticResource VotSansFont}" />
       <TextBlock x:Name="Headline" Grid.Column="2" FontSize="12" Foreground="{ThemeResource VotMutedBrush}" VerticalAlignment="Center" FontFamily="{StaticResource VotSansFont}" />
     </Grid>
-    <TextBlock x:Name="EmptyText" Grid.Row="1" Text="Nothing under way. Ship files or receive a delivery from the window."
+    <TextBlock x:Name="EmptyText" Grid.Row="1" Text="Nothing under way. Send files or receive a delivery from the window."
         FontSize="12" Foreground="{ThemeResource VotMutedBrush}" TextWrapping="Wrap" Margin="0,6" FontFamily="{StaticResource VotSansFont}" />
     <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
     <ItemsControl x:Name="List" FontFamily="{StaticResource VotSansFont}">
@@ -66,5 +67,6 @@
       <HyperlinkButton Content="Open votport" Click="Open_Click" Padding="0" FontFamily="{StaticResource VotSansFont}" />
       <HyperlinkButton Grid.Column="1" Content="Quit" Click="Quit_Click" Padding="0" FontFamily="{StaticResource VotSansFont}" />
     </Grid>
+  </Grid>
   </Grid>
 </Window>

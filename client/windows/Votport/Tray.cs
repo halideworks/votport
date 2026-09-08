@@ -1,39 +1,29 @@
 using System.Runtime.InteropServices;
-using Microsoft.UI.Dispatching;
 
 namespace Votport;
 
 /// The tray icon, through the shell's own notification area API on a hidden
-/// message window: a left click opens the panel with what is under way, a
-/// right click shows the active transfers with their rates, Open, and Quit.
+/// message window: left click opens transfers, right click opens the menu.
 public sealed class Tray : IDisposable
 {
     private const uint WmApp = 0x8000;
     private const uint WmTray = WmApp + 1;
     private const uint WmLButtonUp = 0x0202;
     private const uint WmRButtonUp = 0x0205;
-    private const uint WmCommand = 0x0111;
     private const uint NifMessage = 0x1, NifIcon = 0x2, NifTip = 0x4;
     private const uint NimAdd = 0, NimModify = 1, NimDelete = 2;
-    private const uint MfString = 0x0, MfGrayed = 0x1, MfSeparator = 0x800;
-    private const uint TpmReturnCmd = 0x100, TpmRightButton = 0x2;
-    private const int IdOpen = 1, IdQuit = 2, IdStatusBase = 100;
 
     private readonly WndProc procedure;
     private readonly IntPtr window;
     private readonly IntPtr icon;
-    private readonly Action open;
     private readonly Action panel;
-    private readonly Action quit;
-    private readonly Func<IReadOnlyList<string>> statusLines;
+    private readonly Action menu;
     private bool disposed;
 
-    public Tray(string iconPath, Action open, Action panel, Action quit, Func<IReadOnlyList<string>> statusLines)
+    public Tray(string iconPath, Action panel, Action menu)
     {
-        this.open = open;
         this.panel = panel;
-        this.quit = quit;
-        this.statusLines = statusLines;
+        this.menu = menu;
         procedure = Procedure;
         var instance = GetModuleHandle(null);
         var cls = new WndClass
@@ -75,34 +65,10 @@ public sealed class Tray : IDisposable
         {
             var mouse = (uint)(lParam.ToInt64() & 0xffff);
             if (mouse == WmLButtonUp) panel();
-            else if (mouse == WmRButtonUp) ShowMenu();
+            else if (mouse == WmRButtonUp) menu();
             return IntPtr.Zero;
         }
         return DefWindowProc(hwnd, message, wParam, lParam);
-    }
-
-    private void ShowMenu()
-    {
-        var menu = CreatePopupMenu();
-        var lines = statusLines();
-        if (lines.Count == 0)
-        {
-            AppendMenu(menu, MfString | MfGrayed, IdStatusBase, "No active transfers");
-        }
-        for (var i = 0; i < lines.Count; i++)
-        {
-            AppendMenu(menu, MfString | MfGrayed, IdStatusBase + 1 + i, lines[i]);
-        }
-        AppendMenu(menu, MfSeparator, 0, null);
-        AppendMenu(menu, MfString, IdOpen, "Open votport");
-        AppendMenu(menu, MfString, IdQuit, "Quit");
-        GetCursorPos(out var point);
-        // The foreground call makes the menu close when the user clicks away.
-        SetForegroundWindow(window);
-        var chosen = TrackPopupMenu(menu, TpmReturnCmd | TpmRightButton, point.X, point.Y, 0, window, IntPtr.Zero);
-        DestroyMenu(menu);
-        if (chosen == IdOpen) open();
-        else if (chosen == IdQuit) quit();
     }
 
     public void Dispose()
@@ -152,21 +118,12 @@ public sealed class Tray : IDisposable
         public IntPtr hBalloonIcon;
     }
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct Point { public int X; public int Y; }
-
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern ushort RegisterClass(ref WndClass cls);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr CreateWindowEx(uint exStyle, string cls, string name, uint style, int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr instance, IntPtr param);
     [DllImport("user32.dll")] private static extern bool DestroyWindow(IntPtr hwnd);
-    [DllImport("user32.dll")] private static extern IntPtr DefWindowProc(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr DefWindowProc(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr LoadImage(IntPtr instance, string name, uint type, int cx, int cy, uint load);
     [DllImport("user32.dll")] private static extern bool DestroyIcon(IntPtr icon);
-    [DllImport("user32.dll")] private static extern IntPtr CreatePopupMenu();
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern bool AppendMenu(IntPtr menu, uint flags, int id, string? text);
-    [DllImport("user32.dll")] private static extern bool DestroyMenu(IntPtr menu);
-    [DllImport("user32.dll")] private static extern int TrackPopupMenu(IntPtr menu, uint flags, int x, int y, int reserved, IntPtr hwnd, IntPtr rect);
-    [DllImport("user32.dll")] private static extern bool GetCursorPos(out Point point);
-    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hwnd);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr GetModuleHandle(string? module);
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)] private static extern bool Shell_NotifyIcon(uint message, ref NotifyIconData data);
 }
