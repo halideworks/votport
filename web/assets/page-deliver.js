@@ -648,7 +648,10 @@ function renderLibrary(response) {
     updateProjectSuggestions(libraryProjectSuggestions);
   }
   updateLibrarySelectionStatus();
+  const restoreFocus = $('library-files').contains(document.activeElement)
+    || $('library-breadcrumbs').contains(document.activeElement);
   renderLibraryView();
+  if (restoreFocus) $('library-breadcrumbs').querySelector('[aria-current=page]').focus();
 }
 
 async function refreshLibrary() {
@@ -667,7 +670,9 @@ async function refreshLibrary() {
     message.className = 'error';
     message.setAttribute('role', 'alert');
     message.textContent = error.message;
+    const restoreFocus = $('library-files').contains(document.activeElement);
     $('library-files').replaceChildren(message);
+    if (restoreFocus) $('library-breadcrumbs').querySelector('[aria-current=page]').focus();
   }
 }
 
