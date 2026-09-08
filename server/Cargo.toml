@@ -58,6 +58,7 @@ tar = { version = "0.4", default-features = false }
 x509-parser = "0.18"
 
 [dev-dependencies]
+vot-codec = { git = "https://github.com/halideworks/VOT", rev = "a93f5d86a4da23744f8f8268054414b812b72c46" }
 async-trait = "0.1"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }

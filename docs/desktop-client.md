@@ -105,6 +105,18 @@ as interrupted cards with Resume (and a password field when the entry
 needs one), offer Retry on a failed card the core kept, and forget an
 entry on Remove; the CLI gains `votport status` and `votport resume`.
 
+Native push retries retain complete receiver objects until the configured session
+idle timeout (30 minutes by default). The same device, request link, and package
+can reuse them after reconnecting or restarting the server, including after the
+old capability expires. The receiver rehashes each object and recreates its
+verified destination before skipping retransmission. Incomplete objects restart
+from zero. Changing the package or device starts a separate reservation.
+
+Interrupted and cancelled pushes retain their quota reservation until retry,
+success, or idle cleanup. Retry replaces that reservation with a fresh session
+ID; an abort from an older attempt cannot cancel it. Expired or closed request
+links still refuse new attempts.
+
 Retry or Resume rehashes existing regular files and skips those whose length
 and content match the delivery. Changed files and nonregular files are refused;
 a fresh receive still refuses existing files. Checking large completed files
@@ -296,8 +308,8 @@ and, later, of votdock's fleet.
   published atomically with a receipt, verified against the package root.
 - Resume: a transfer survives an app quit, a sleep, a network change, and
   a reboot, and picks up where the persisted state says it left off. Over
-  push this needs the receiver work in phase C3; decision 4 states what
-  version one resumes on each path.
+  push this retains complete objects within the receiver's idle window;
+  decision 4 states what resumes on each path.
 - Native: SwiftUI on macOS, WinUI 3 on Windows. Drag and drop from Finder
   and Explorer, system notifications, dark and light following the OS,
   the app store's idea of a well-behaved app on each platform.
@@ -493,53 +505,25 @@ first complaint is the hash pass.
 
 | Path | Unit of resume | Survives |
 | --- | --- | --- |
-| Push (QUIC), version one | Package. A cut push restarts from the first object; only files from earlier fully recorded uploads dedupe. | A brief stall within QUIC's own loss recovery. Not an app quit, not a reboot, not a network change, not a server restart. |
-| Push (QUIC), after phase C3 | Object. Staging is keyed by link, package root, and holder key and survives a disconnect; once the old session is gone, a re-preflight for the same three adopts it and the sink factory skips objects whose staged bytes are complete and verified. | App quit, reboot, network change, and the ticket's expiry (the re-preflight mints a new one). Server restart still ends the session; the boot sweep keeps staging a live link can adopt and the next preflight adopts it. |
+| Push (QUIC) | Complete object, rehashed and reproved before reuse. Staging is scoped to request link, package, and holder key. | App quit, reboot, network change, ticket expiry, and server restart while the request remains open and staging has not reached the idle timeout. |
 | HTTP session | File, at the checkpointed prefix. | App quit, reboot, server restart (PR #132). |
 | Fetch (QUIC) | Range within an object, through `vot-resume`, within the capability's hour. After the hour a re-mint is a new reservation against `max_downloads`. | App quit, reboot, and a server restart within the hour (the ticket is warmed at boot). |
-| HTTP receive | Byte range per file. | Everything; it is a GET with `Range`. |
+| HTTP receive | Byte range per file, with a persisted download lease. | App quit and restart within the lease lifetime, bounded by grant expiry and revocation. |
 
-Version one's push therefore resumes nothing across a disconnect, and
-the transfer log says so ("connection lost, package restarted"). The
-capability's expiry (`VOTPORT_SESSION_IDLE_SECS`, 1800 s by default,
-returned as `expires_at`) is checked at admission only, so a push that
-stays connected completes however long it runs; the exposure is a
-disconnect, and version one restarts the package rather than routing
-large drops over HTTP, because the HTTP path is the browser's speed and
-the point of the app is the other one. Phase C3 lands before the shells
-ship and is receiver work in votport. Today the receive's drop removes
-the staging directory and the ticket, and staging is keyed by session
-id, so nothing outlives a disconnect. C3 keys staging by link, package
-root, and holder key, keeps it across a disconnect and a server restart
-(the boot sweep in `paths::clean_staging` keeps push staging a live
-link can still adopt and removes the rest; the reserved-name guard
-moves to the new key's shape), and lets a new preflight for the same
-three adopt it, so the ticket's lifetime is not the load-bearing part:
-the capability expiry is fixed at mint as the idle window and cannot be
-refreshed while bytes move, so a 500 GB push that reboots after forty
-minutes re-preflights, receives a fresh capability, and re-dials into
-the same staging. Two constraints come from the code. The old session
-must be gone first: VOT keys its shared plan by the staging directory,
-so rails of a new preflight into a directory whose session is still
-draining would join the dying plan and be abandoned with it; the core
-therefore aborts the cut session (`POST /api/session/{sid}/abort`) and
-C3 refuses a preflight whose staging still has a live session. And a
-skipped object never reaches the completion hook, so the C3 sink
-factory runs the destination open and the staged re-prove itself
-before answering skip, and the kept staging includes VOT's `resume.vot`
-marker, without which the engine refuses the directory. And VOT opens
-whatever already sits at `objects/<root>` before it calls the factory
-and unlinks that file by handle after the factory answers, so a re-sent
-incomplete object is staged under a fresh name, and a skipped object's
-bytes survive only in the destination staging the re-prove filled,
-until publish; a second disconnect after that drops the unpublished
-destinations and the object is sent again. The factory then skips
-every object whose staged bytes are complete and verified, and the
-core sends the rest. Within-object resume is the
-later VOT item: the receiver's `HAVE` frame already describes verified
-64 KiB group coverage within one object (`spec/object.md` section 10) and
-has no implementation outside the codec; implementing it on the push
-receiver lets a re-dialled push skip covered groups.
+Push capabilities expire at the fixed admission deadline, but a connected push
+can finish after that deadline. A retry obtains a new capability and session ID.
+The receiver keeps complete objects and the quota reservation until success or
+the session idle timeout, 1800 seconds by default. Startup restores the
+reservation and retains staging for an open request within that window.
+
+A directory lock remains held until every rail and destination handle from the
+old attempt is gone. A preflight that cannot acquire that lock is refused.
+The reusable objects live under `objects/`; the transport uses a disposable
+`engine/` subdirectory so a missing or completed `resume.vot` marker cannot
+prevent another attempt. Before returning skip, the sink factory rehashes the
+object and runs destination reproof because the transport does not call the
+completion hook for a skipped object. Partial objects are retransmitted in full.
+Within-object push resume remains a separate VOT protocol change.
 
 The core persists every transfer in a SQLite journal in the state
 directory: the drop (paths, lengths, mtimes, roots, leaves file), the
@@ -674,9 +658,8 @@ are coalesced to ten per second before they cross the FFI.
    backoff and resumes per file. Over push the receiver keeps the cut
    session until its rails time out (30 s) and the ticket admits joiners
    until then, so the core first sends `POST /api/session/{sid}/abort`
-   for the cut session, then re-preflights. In version one that restarts
-   the package; after C3 the re-preflight adopts the surviving staging
-   and only the incomplete objects move.
+   for the cut session. Explicit Retry re-preflights, adopts the surviving
+   staging once the old rails have ended, and sends only incomplete objects.
 
 ### Receive, step by step
 

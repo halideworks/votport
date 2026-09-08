@@ -610,7 +610,23 @@ pub async fn create_push_session(
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or_else(|| ApiError::internal("session id shape"))?;
-    let control = session::PushControl::new();
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"votport push resume v1");
+    hash.update((prepared.link.id.len() as u64).to_be_bytes());
+    hash.update(prepared.link.id.as_bytes());
+    hash.update(prepared.expected.suite.to_be_bytes());
+    hash.update(prepared.expected.root);
+    hash.update(prepared.expected.length.to_be_bytes());
+    hash.update(holder);
+    let key = hex::encode(&hash.finalize()[..16]);
+    let directory = prepared.dest_dir.join(format!(".vot-push-{key}"));
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| ApiError::internal(format!("create push directory: {error}")))?;
+    crate::paths::tighten_dir(&directory);
+    let lock = session::lock_push_directory(&directory)
+        .map_err(|error| ApiError::new(StatusCode::CONFLICT, error.to_string()))?;
+    let control = session::PushControl::resumable(key.clone(), Some(lock));
     let setup = session::WorkerSetup {
         store: Arc::clone(&app.store),
         link_id: prepared.link.id.clone(),
@@ -627,15 +643,38 @@ pub async fn create_push_session(
         ended: app.session_ended.clone(),
     };
     let (sender, _receiver) = mpsc::channel(1);
-    register_session(
+    if let Err(error) = register_session(
         &app,
         &prepared,
         &session_id,
         sender,
         session::SessionKind::Push(control.clone()),
     )
-    .await?;
+    .await
+    {
+        let _ = std::fs::remove_dir(&directory);
+        return Err(error);
+    }
 
+    if let Err(error) = session::persist_push(&setup, key) {
+        control.park();
+        return Err(ApiError::internal(format!("persist push session: {error}")));
+    }
+    let engine = directory.join("engine");
+    let prepared_engine = (|| -> std::io::Result<()> {
+        match std::fs::remove_dir_all(&engine) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        std::fs::create_dir(&engine)
+    })();
+    if let Err(error) = prepared_engine {
+        control.park();
+        return Err(ApiError::internal(format!(
+            "prepare push transport: {error}"
+        )));
+    }
     let issued = (|| -> ApiResult<(Vec<u8>, [u8; 16], u64)> {
         let now = now_unix();
         let token = vot_cli::authz::issue_push(
@@ -661,7 +700,7 @@ pub async fn create_push_session(
     let (capability, token_id, expires_at) = match issued {
         Ok(issued) => issued,
         Err(error) => {
-            app.sessions.remove(&session_id);
+            control.park();
             return Err(error);
         }
     };
@@ -669,10 +708,10 @@ pub async fn create_push_session(
         session_id: session_id.clone(),
         expires_at,
         expected_package: setup.expected_package.clone(),
-        directory: session::push_staging_dir(&setup),
+        directory: engine,
         setup: Some(setup),
         seams: None,
-        control,
+        control: control.clone(),
     };
     let inserted = match app
         .push_tickets
@@ -687,7 +726,7 @@ pub async fn create_push_session(
         std::collections::hash_map::Entry::Occupied(_) => false,
     };
     if !inserted {
-        app.sessions.remove(&session_id);
+        control.park();
         return Err(ApiError::internal("native push token id collision"));
     }
     tracing::info!(
@@ -902,7 +941,10 @@ pub async fn upload_abort(
                     .get(&key)
                     .is_some_and(|ticket| ticket.setup.is_some())
                 {
-                    tickets.remove(&key).and_then(|ticket| ticket.setup)
+                    tickets.remove(&key).and_then(|ticket| {
+                        let parked = ticket.control.park();
+                        ticket.setup.map(|setup| (setup, parked))
+                    })
                 } else {
                     None
                 }
@@ -913,8 +955,10 @@ pub async fn upload_abort(
         if !ticket_found {
             app.sessions.abort_push(&sid);
         }
-        if let Some(setup) = setup {
-            app.sessions.remove(&sid);
+        if let Some((setup, parked)) = setup {
+            if !parked {
+                app.sessions.remove(&sid);
+            }
             session::record_unconnected_push(setup, true);
         }
         return Json(json!({ "ok": true }));
@@ -1281,6 +1325,71 @@ mod push_preflight_tests {
     }
 
     #[tokio::test]
+    async fn push_retry_replaces_parked_quota_and_old_abort_cannot_cancel_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = testing::config(directory.path());
+        config.push_bind = Some("127.0.0.1:0".parse().unwrap());
+        config.push_advertise = Some("push.example.test:8322".to_owned());
+        config.max_total_sessions = 1;
+        config.max_link_sessions = 1;
+        let application = app::build(config).unwrap();
+        application.store.insert_link(open_link("retry")).unwrap();
+        let holder = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
+        let first = post_push(application.clone(), "retry", request_body(&holder, 7)).await;
+        assert!(first.status().is_success());
+        let first = response_json(first).await["session"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let busy = post_push(application.clone(), "retry", request_body(&holder, 7)).await;
+        assert_eq!(busy.status(), StatusCode::CONFLICT);
+        let before = application.store.load_push_sessions().unwrap();
+        assert_eq!(before.len(), 1);
+        let stage = before[0].dest_dir.join(format!(
+            ".vot-push-{}",
+            before[0].push_key.as_ref().unwrap()
+        ));
+        std::fs::create_dir(stage.join("objects")).unwrap();
+        std::fs::write(stage.join("objects/retained"), b"verified bytes").unwrap();
+        let _ = upload_abort(State(application.clone()), Path(first.clone())).await;
+        assert!(application.sessions.contains_push(&first));
+        let second = post_push(application.clone(), "retry", request_body(&holder, 7)).await;
+        assert!(second.status().is_success());
+        let second = response_json(second).await["session"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(first, second);
+        assert!(!application.sessions.contains_push(&first));
+        assert!(application.sessions.contains_push(&second));
+        assert_eq!(
+            std::fs::read(stage.join("objects/retained")).unwrap(),
+            b"verified bytes"
+        );
+        let after = application.store.load_push_sessions().unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, second);
+        assert_eq!(after[0].push_key, before[0].push_key);
+        let _ = upload_abort(State(application.clone()), Path(first)).await;
+        assert!(!application
+            .push_tickets
+            .lock()
+            .unwrap()
+            .values()
+            .find(|ticket| ticket.session_id == second)
+            .unwrap()
+            .control
+            .is_cancelled());
+        let foreign = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+        assert!(
+            !post_push(application.clone(), "retry", request_body(&foreign, 7))
+                .await
+                .status()
+                .is_success()
+        );
+    }
+
+    #[tokio::test]
     async fn preflight_issues_an_exact_capability_and_blocks_http_dispatch() {
         let directory = tempfile::tempdir().unwrap();
         let application = push_app(directory.path());
@@ -1506,7 +1615,7 @@ mod push_preflight_tests {
     }
 
     #[tokio::test]
-    async fn push_admission_reserves_and_abort_releases_tenant_bytes() {
+    async fn push_admission_reserves_tenant_bytes_until_idle_cleanup() {
         let directory = tempfile::tempdir().unwrap();
         let application = push_app(directory.path());
         application
@@ -1547,8 +1656,16 @@ mod push_preflight_tests {
             .await
             .unwrap();
         assert_eq!(abort.status(), StatusCode::OK);
-        assert_eq!(application.sessions.total(), 0);
+        assert_eq!(application.sessions.total(), 1);
         assert!(application.push_tickets.lock().unwrap().is_empty());
+        assert_eq!(
+            post_push(application.clone(), "quota", request_body(&holder, 4))
+                .await
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        application.sessions.sweep(0);
+        assert_eq!(application.sessions.total(), 0);
         assert_eq!(
             application
                 .store

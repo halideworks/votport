@@ -970,6 +970,40 @@ fn resume_upload_session(
         quiet_after_secs: session::quiet_after_secs(config.session_idle_secs),
         ended: ended.clone(),
     };
+    if let Some(key) = &session.push_key {
+        if key.len() != 32 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("invalid push staging key".to_owned());
+        }
+        let control = session::PushControl::resumable(key.clone(), None);
+        let directory = control.staging_dir(&setup);
+        let lock = session::lock_push_directory(&directory).map_err(|error| error.to_string())?;
+        let modified = lock
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .map_err(|error| error.to_string())?;
+        if modified.elapsed().unwrap_or_default().as_secs() >= config.session_idle_secs {
+            return Err("push staging expired".to_owned());
+        }
+        let (sender, _) = tokio::sync::mpsc::channel(1);
+        sessions
+            .insert_admitted(
+                session::SessionAdmission {
+                    id: session.id.clone(),
+                    link_id: session.link_id.clone(),
+                    tenant: session.tenant.clone(),
+                    reserved_bytes: session.package.length,
+                    max_total_bytes: None,
+                    max_tenant_sessions: None,
+                    max_link_sessions: usize::MAX,
+                    max_sessions: usize::MAX,
+                    kind: session::SessionKind::Push(control),
+                },
+                sender,
+                || Ok(0),
+            )
+            .map_err(|error| format!("register push session: {error:?}"))?;
+        return Ok(vec![directory]);
+    }
     let (sender, receiver) = tokio::sync::mpsc::channel(8);
     let (kept, already) = session::resume_worker(setup, receiver, session)?;
     sessions
@@ -2485,6 +2519,109 @@ mod push_tests {
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
 
+    #[tokio::test]
+    async fn push_restart_preserves_quota_and_cleanup_waits_for_the_directory_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        app.store
+            .insert_link(crate::store::Link {
+                id: "resume".to_owned(),
+                tenant: String::new(),
+                label: "resume".to_owned(),
+                dest: String::new(),
+                password_hash: None,
+                created_at: 0,
+                expires_at: None,
+                max_bytes: None,
+                active: true,
+                legal_hold: false,
+                notify_on_upload: false,
+                uploads: Vec::new(),
+                events: Vec::new(),
+            })
+            .unwrap();
+        let key = hex::encode([4; 16]);
+        let stage = app.config.receive_dir.join(format!(".vot-push-{key}"));
+        std::fs::create_dir_all(stage.join("objects")).unwrap();
+        let object_path = stage.join("objects/retained.stage");
+        std::fs::write(&object_path, b"staged bytes").unwrap();
+        let mut persisted = crate::store::PersistedUploadSession {
+            id: hex::encode([5; 16]),
+            push_key: Some(key.clone()),
+            link_id: "resume".to_owned(),
+            tenant: String::new(),
+            dest_dir: app.config.receive_dir.clone(),
+            dest_rel: String::new(),
+            package: vot_sdk::object::ObjectId {
+                suite: 1,
+                root: [7; 32],
+                length: 12,
+            },
+            max_total_bytes: Some(12),
+            started_at: crate::store::now_unix(),
+            files: Vec::new(),
+        };
+        app.store.insert_upload_session(&persisted).unwrap();
+        let kept = resume_upload_sessions(
+            &app.config,
+            &app.store,
+            &app.signer,
+            &app.sessions,
+            &app.session_ended,
+        );
+        assert!(app.sessions.contains_push_key(&key));
+        let (sender, _) = tokio::sync::mpsc::channel(1);
+        assert_eq!(
+            app.sessions.insert_admitted(
+                session::SessionAdmission {
+                    id: "extra".to_owned(),
+                    link_id: "resume".to_owned(),
+                    tenant: String::new(),
+                    reserved_bytes: 1,
+                    max_total_bytes: Some(12),
+                    max_tenant_sessions: None,
+                    max_link_sessions: usize::MAX,
+                    max_sessions: usize::MAX,
+                    kind: session::SessionKind::Http,
+                },
+                sender,
+                || Ok(0)
+            ),
+            Err(session::InsertError::ByteQuota)
+        );
+        crate::paths::clean_staging(&app.config.receive_dir, &kept);
+        assert_eq!(std::fs::read(&object_path).unwrap(), b"staged bytes");
+        sweep_push_staging(&app);
+        assert!(object_path.exists());
+        let lock = session::lock_push_directory(&stage).unwrap();
+        app.sessions.sweep(0);
+        assert!(!app.sessions.contains_push_key(&key));
+        sweep_push_staging(&app);
+        assert!(object_path.exists());
+        drop(lock);
+        sweep_push_staging(&app);
+        assert!(!stage.exists());
+        assert!(app.store.load_push_sessions().unwrap().is_empty());
+        app.store.insert_upload_session(&persisted).unwrap();
+        sweep_push_staging(&app);
+        assert!(app.store.load_push_sessions().unwrap().is_empty());
+        std::fs::create_dir(&stage).unwrap();
+        let lock = session::lock_push_directory(&stage).unwrap();
+        lock.set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+        drop(lock);
+        assert!(resume_upload_session(
+            &app.config,
+            &app.store,
+            &app.signer,
+            &app.sessions,
+            &app.session_ended,
+            &mut persisted
+        )
+        .is_err());
+        assert!(!app.sessions.contains_push_key(&key));
+    }
+
     fn push_config(directory: &std::path::Path) -> Config {
         let mut config = crate::api::testing::config(directory);
         config.push_bind = Some("127.0.0.1:0".parse().unwrap());
@@ -3575,11 +3712,52 @@ fn sweep_push_tickets(app: &App) {
     }
     for (session_id, control, setup, connected) in cancelled {
         control.cancel();
-        if !connected {
+        if !connected && !control.park() {
             app.sessions.remove(&session_id);
         }
         if let Some(setup) = setup {
             session::record_unconnected_push(setup, false);
+        }
+    }
+}
+
+fn sweep_push_staging(app: &App) {
+    let sessions = match app.store.load_push_sessions() {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            tracing::warn!(%error, "load push staging for cleanup");
+            return;
+        }
+    };
+    for session in sessions {
+        let Some(key) = &session.push_key else {
+            continue;
+        };
+        if app.sessions.contains_push_key(key) {
+            continue;
+        }
+        let directory = session.dest_dir.join(format!(".vot-push-{key}"));
+        let _lock = match session::lock_push_directory(&directory) {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !app.sessions.contains_push_key(key) {
+                    if let Err(error) = app.store.delete_upload_session(&session.id) {
+                        tracing::warn!(%error, "delete missing push staging record");
+                    }
+                }
+                continue;
+            }
+            Err(_) => continue,
+        };
+        if app.sessions.contains_push_key(key) {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_dir_all(&directory).and_then(|()| {
+            app.store
+                .delete_upload_session(&session.id)
+                .map_err(std::io::Error::other)
+        }) {
+            tracing::warn!(%error, "remove expired push staging");
         }
     }
 }
@@ -3595,6 +3773,7 @@ pub async fn session_sweeper(app: Arc<App>) {
                 crate::api::serve::prune(&app);
                 let sweep_app = Arc::clone(&app);
                 if let Err(error) = tokio::task::spawn_blocking(move || {
+                    sweep_push_staging(&sweep_app);
                     crate::api::outbound::sweep_upload_stages(&sweep_app, std::time::SystemTime::now());
                 }).await {
                     tracing::warn!(%error, "library upload cleanup task failed");

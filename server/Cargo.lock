@@ -4663,6 +4663,7 @@ dependencies = [
  "tracing-subscriber",
  "vot-capability",
  "vot-cli",
+ "vot-codec",
  "vot-manifest",
  "vot-platform-fs",
  "vot-proof-blake3",
