@@ -1118,7 +1118,7 @@ impl Model {
                 let action = if fetching { "saved" } else { "verified" };
                 if view.transport == Some(Transport::Push) {
                     parts[0] = format!("Shipping {count} {noun}");
-                } else {
+                } else if !fetching || self.materializing {
                     parts.push(format!(
                         "{} of {count} {noun} {action}",
                         self.files_complete
@@ -1425,10 +1425,9 @@ mod tests {
         );
         assert_eq!(model.snapshot().moved_bytes, 17);
         model.apply(Event::Transport(Transport::Fetch), now);
-        assert!(model
-            .snapshot()
-            .status
-            .contains("Downloading 2 files, 1 of 2 files saved"));
+        assert!(model.snapshot().status.starts_with("Downloading 2 files"));
+        assert!(!model.snapshot().status.contains("saved"));
+        assert_eq!(model.files_complete, 1);
         model.apply(
             Event::FileVerified {
                 index: 0,
@@ -1436,7 +1435,7 @@ mod tests {
             },
             now,
         );
-        assert!(model.snapshot().status.contains("1 of 2 files saved"));
+        assert_eq!(model.files_complete, 1);
         model.apply(
             Event::Downloading {
                 index: 0,
@@ -1445,10 +1444,7 @@ mod tests {
             },
             now,
         );
-        assert!(model
-            .snapshot()
-            .status
-            .contains("Downloading 2 files, 0 of 2 files saved"));
+        assert_eq!(model.files_complete, 0);
         model.apply(
             Event::FileVerified {
                 index: 0,
@@ -1485,10 +1481,8 @@ mod tests {
         let mut model = Model::new(journal::Kind::Receive);
         model.apply(planned(&[100, 200]), now);
         model.apply(Event::Transport(Transport::Fetch), now);
-        assert!(model
-            .snapshot()
-            .status
-            .starts_with("Downloading 2 files, 0 of 2 files saved"));
+        assert!(model.snapshot().status.starts_with("Downloading 2 files"));
+        assert!(!model.snapshot().status.contains("saved"));
         model.apply(
             Event::Bytes {
                 moved: 300,
