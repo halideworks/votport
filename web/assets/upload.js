@@ -1074,6 +1074,9 @@ async function runUpload() {
 }
 
 function showDone(report) {
+  $('confirm-cancel').close('keep');
+  const restoreFocus = $('progress-card').contains(document.activeElement)
+    || $('upload-form').contains(document.activeElement);
   $('progress-card').hidden = true;
   $('upload-form').hidden = true;
   $('done-card').hidden = false;
@@ -1089,6 +1092,7 @@ function showDone(report) {
     ...report.files.map((file) => `${file.path}  ${file.suite}:${file.root}`),
   ].join('\n');
   const copy = $('copy-proof');
+  if (restoreFocus) copy.focus();
   copy.onclick = () => copyToClipboard(copy, proof);
   const list = $('done-list');
   list.replaceChildren();
@@ -1114,6 +1118,7 @@ $('cancel').addEventListener('click', () => {
   $('confirm-cancel-detail').textContent = delivered
     ? `Files still in progress are discarded.${keptPhrase(delivered)}`
     : 'Files still in progress are discarded. Nothing already delivered is affected.';
+  $('confirm-cancel').returnValue = 'keep';
   $('confirm-cancel').showModal();
 });
 
@@ -1246,6 +1251,7 @@ $('upload-form').addEventListener('submit', async (event) => {
         : expired
           ? `${error.message}.${keptNote} The partial transfer was discarded, reselect the same files to send them again from the start.`
           : `${error.message}.${keptNote} Reselect the same files to resume where this stopped.`);
+    $('confirm-cancel').close('keep');
     const restoreFocus = $('progress-card').contains(document.activeElement);
     $('progress-card').hidden = true;
     $('send').disabled = false;
