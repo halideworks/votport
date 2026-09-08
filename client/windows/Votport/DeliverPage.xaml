@@ -10,20 +10,19 @@
       <RowDefinition Height="*" />
       <RowDefinition Height="Auto" />
     </Grid.RowDefinitions>
-    <!-- The title row reads as a path back: a chevron and LINKS as a link,
-         then the page's own label in the same section type. -->
-    <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,0,0,4">
-      <HyperlinkButton x:Name="BackButton" Padding="0" Click="Back_Click" VerticalAlignment="Center" AutomationProperties.Name="Links">
-        <StackPanel Orientation="Horizontal" Spacing="6">
-          <FontIcon Glyph="&#xE76B;" FontSize="10" VerticalAlignment="Center" />
-          <TextBlock Text="LINKS" FontSize="11" FontWeight="SemiBold" CharacterSpacing="150" VerticalAlignment="Center" />
-        </StackPanel>
-      </HyperlinkButton>
-      <TextBlock Text="/" Style="{StaticResource SectionLabel}" Margin="0" VerticalAlignment="Center" />
-      <TextBlock Text="NEW DELIVERY" Style="{StaticResource SectionLabel}" Margin="0" VerticalAlignment="Center" />
-    </StackPanel>
-    <!-- Files from this machine go up to the port first, then get ticked
-         below like anything already there. -->
+    <Grid ColumnSpacing="8">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="*" />
+        <ColumnDefinition Width="Auto" />
+      </Grid.ColumnDefinitions>
+      <StackPanel Spacing="4">
+        <TextBlock Text="SHARE" Style="{StaticResource SectionLabel}" Margin="0" />
+        <TextBlock Text="Choose files from this PC or your home port, then create a delivery link." FontSize="12"
+            Foreground="{ThemeResource VotMutedBrush}" TextWrapping="Wrap" />
+      </StackPanel>
+      <HyperlinkButton x:Name="BackButton" Grid.Column="1" Content="Manage links" Click="Back_Click" Padding="0" />
+    </Grid>
+
     <Border x:Name="DropZone" Grid.Row="1" AllowDrop="True" DragOver="DropZone_DragOver" Drop="DropZone_Drop"
         Background="{ThemeResource VotPanelBrush}" BorderBrush="{ThemeResource VotBorderBrush}" BorderThickness="1"
         CornerRadius="6" Padding="12,10">

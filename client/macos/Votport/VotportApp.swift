@@ -18,24 +18,23 @@ struct VotportApp: App {
                 .frame(minWidth: 720, minHeight: 460)
         }
         .defaultSize(width: 900, height: 580)
-        // A window-style extra draws a real panel: progress, the status
-        // lines, and the controls, not a menu of grey text.
+        // The menu bar uses the system menu layout and appearance.
         MenuBarExtra {
             MenuPanel()
                 .environmentObject(store)
         } label: {
             Image(systemName: store.active.isEmpty ? "sailboat" : "sailboat.fill")
         }
-        .menuBarExtraStyle(.window)
+        .menuBarExtraStyle(.menu)
     }
 }
 
-/// The sections; the transfer list is the rest of the app. Links appears
-/// once the operator is signed in to a port.
+/// Sharing and link management appear once the operator signs in to a port.
 enum Screen: String, CaseIterable, Identifiable {
-    case send = "Ship"
+    case send = "Send"
     case receive = "Receive"
-    case links = "Links"
+    case share = "Share"
+    case links = "Manage links"
     case transfers = "Transfers"
     case settings = "Settings"
 
@@ -49,6 +48,7 @@ enum Screen: String, CaseIterable, Identifiable {
         // The same glyph as the Windows shell's Send icon.
         case .send: return "paperplane"
         case .receive: return "arrow.down.doc"
+        case .share: return "square.and.arrow.up"
         case .links: return "link"
         case .transfers: return "list.bullet.rectangle"
         case .settings: return "gearshape"
@@ -57,7 +57,7 @@ enum Screen: String, CaseIterable, Identifiable {
 
     /// Whether the screen needs a signed-in port.
     var operator_: Bool {
-        self == .links
+        self == .share || self == .links
     }
 }
 
@@ -108,7 +108,8 @@ struct MainWindow: View {
             switch section ?? .send {
             case .send: SendView()
             case .receive: ReceiveView()
-            case .links: LinksView()
+            case .share: DeliverView(manageLinks: { section = .links })
+            case .links: LinksView(share: { section = .share })
             case .transfers: TransfersView()
             case .settings: SettingsView()
             }

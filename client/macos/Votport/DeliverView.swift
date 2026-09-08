@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 import VotportCore
 
-/// A new delivery, as a sheet over Links. Files dropped or chosen here go
+/// Share files through a delivery link. Files dropped or chosen here go
 /// up to the port first and come back ticked; what is already on the port
 /// is browsed one directory at a time and ticked the same way. Then the
 /// delivery is issued and its one link copied.
@@ -10,7 +10,7 @@ struct DeliverView: View {
     private static let dropPrompt = "Drop files or folders here"
 
     @EnvironmentObject private var port: PortStore
-    @Environment(\.dismiss) private var dismiss
+    let manageLinks: () -> Void
     @State private var directory = ""
     @State private var listing: Library?
     @State private var chosen: Set<String> = []
@@ -30,14 +30,17 @@ struct DeliverView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
-                Text("NEW DELIVERY")
+                Text("SHARE")
                     .font(Type.label)
                     .tracking(1.5)
                     .foregroundStyle(Tokens.muted)
                 Spacer()
-                Button("Done") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
+                Button("Manage links") { manageLinks() }
             }
+
+            Text("Choose files from this Mac or your home port, then create a delivery link.")
+                .font(Type.callout)
+                .foregroundStyle(Tokens.muted)
 
             dropZone
             crumbs
@@ -204,7 +207,7 @@ struct DeliverView: View {
                 NumberField("Expires after", unit: "days", placeholder: "7", text: $expiresDays)
                 NumberField("Downloads allowed", unit: "downloads", placeholder: "Unlimited", text: $maxDownloads)
                 // The button carries the count, so the row has one control to read.
-                Button(chosen.isEmpty ? "Tick the files to deliver" : (chosen.count == 1 ? "Deliver 1 file" : "Deliver \(chosen.count) files")) { issue() }
+                Button(chosen.isEmpty ? "Choose files to share" : (chosen.count == 1 ? "Share 1 file" : "Share \(chosen.count) files")) { issue() }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
                     .frame(maxWidth: .infinity)

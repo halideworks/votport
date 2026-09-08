@@ -4,12 +4,12 @@
     xmlns:local="using:Votport">
   <ScrollViewer Padding="0,0,20,0">
     <StackPanel Spacing="16">
-      <TextBlock Text="LINKS" Style="{StaticResource SectionLabel}" />
+      <TextBlock Text="MANAGE LINKS" Style="{StaticResource SectionLabel}" />
 
       <TextBlock Text="REQUESTS" Style="{StaticResource SectionLabel}" Margin="0" />
       <!-- Issue a request link -->
       <StackPanel Padding="14" Spacing="8" Background="{ThemeResource VotPanelBrush}" CornerRadius="8">
-        <TextBlock Text="Issue a request link" FontWeight="SemiBold" />
+        <TextBlock Text="Create a request link" FontWeight="SemiBold" />
         <Grid ColumnSpacing="8">
           <Grid.ColumnDefinitions>
             <ColumnDefinition Width="*" />
@@ -36,7 +36,7 @@
               <TextBlock Text="Accepts up to (GB)" FontSize="12" Foreground="{ThemeResource VotMutedBrush}" />
             </NumberBox.Header>
           </NumberBox>
-          <Button x:Name="IssueButton" Grid.Column="2" Content="Issue request link" Click="Issue_Click" Style="{StaticResource AccentButtonStyle}"
+          <Button x:Name="IssueButton" Grid.Column="2" Content="Create request link" Click="Issue_Click" Style="{StaticResource AccentButtonStyle}"
               HorizontalAlignment="Stretch" VerticalAlignment="Bottom" />
         </Grid>
         <StackPanel x:Name="IssuedPanel" Orientation="Horizontal" Spacing="8" Visibility="Collapsed">
@@ -79,7 +79,7 @@
           <TextBlock Text="Issue a delivery" FontWeight="SemiBold" />
           <TextBlock Text="Drop files, or pick what is already on the port; the recipient gets one link." FontSize="12" Foreground="{ThemeResource VotMutedBrush}" />
         </StackPanel>
-        <Button x:Name="NewDeliveryButton" Grid.Column="1" Content="New delivery" Click="NewDelivery_Click"
+        <Button x:Name="NewDeliveryButton" Grid.Column="1" Content="Share files" Click="NewDelivery_Click"
             Style="{StaticResource AccentButtonStyle}" VerticalAlignment="Center" />
       </Grid>
       <TextBlock x:Name="NoDeliveries" Text="No deliveries issued yet." Foreground="{ThemeResource VotMutedBrush}" />

@@ -362,6 +362,7 @@ Browser tooling requires Node.js 20.19+, 22.13+, or 24+.
 ```sh
 # server (needs Rust ≥ 1.97)
 (cd server && cargo test) # unit + full-protocol integration tests
+(cd server && cargo test --lib -- --ignored --exact session::push_tests::dormant_staging_preserves_ranges_and_cleans_up_under_low_descriptor_limit)
 (cd server && cargo run)  # needs VOTPORT_ADMIN_PASSWORD, VOTPORT_DATA_DIR, etc.
 
 # browser JS
@@ -373,6 +374,11 @@ npm test
 # browser wasm bundle (needs wasm32 target + wasm-bindgen-cli 0.2.126)
 scripts/build-wasm.sh /path/to/VOT-checkout
 ```
+
+The descriptor-limit test runs alone because it changes the process limit.
+Spawning it from the parallel suite can briefly inherit another test's journal
+lock before exec, causing a parked staging file to refuse reopening. CI runs
+both commands.
 
 The server pins `vot-sdk` / `vot-sdk-file` to an exact VOT commit in
 `server/Cargo.toml`; the Dockerfile builds `vot-wasm` from the same commit so

@@ -15,9 +15,13 @@ struct SendView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("SHIP")
+            Text("SEND")
                 .font(Type.label)
                 .tracking(1.5)
+                .foregroundStyle(Tokens.muted)
+
+            Text("Send files to an existing request link.")
+                .font(Type.callout)
                 .foregroundStyle(Tokens.muted)
 
             HStack {
@@ -26,7 +30,7 @@ struct SendView: View {
                     .onChange(of: link) { _, value in previewer.update(value) }
                 // Signed in to a port: its open request links, one click.
                 if !port.requests.isEmpty {
-                    Menu("Ship to") {
+                    Menu("Your requests") {
                         ForEach(port.requests) { request in
                             Button(request.label) { link = request.url }
                         }
@@ -53,7 +57,7 @@ struct SendView: View {
                     Button("Clear") { paths.removeAll() }
                 }
                 Spacer()
-                Button("Ship") { send() }
+                Button("Send") { send() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(!previewer.ready || paths.isEmpty)
             }

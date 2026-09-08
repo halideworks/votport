@@ -13,16 +13,14 @@ public sealed partial class MainWindow : Window
         InitializeComponent();
         tray = new Tray(
             Path.Combine(AppContext.BaseDirectory, "Assets", "tray.ico"),
-            open: () => DispatcherQueue.TryEnqueue(Raise),
             panel: () => DispatcherQueue.TryEnqueue(ShowPanel),
-            quit: () => DispatcherQueue.TryEnqueue(App.Quit),
-            statusLines: () => TransferStore.Shared.Items.Where(item => item.Running).Select(Format.MenuLine).ToList());
+            menu: () => DispatcherQueue.TryEnqueue(ShowTrayMenu));
         PortStore.Shared.Changed += () =>
         {
             var signedIn = PortStore.Shared.SignedIn;
-            LinksItem.Visibility = signedIn ? Visibility.Visible : Visibility.Collapsed;
-            // Signing out while on Links (or its Deliver page) lands on Settings.
-            if (!signedIn && Nav.SelectedItem is NavigationViewItem current && (string)current.Tag == "links") Show("settings");
+            ShareItem.Visibility = LinksItem.Visibility = signedIn ? Visibility.Visible : Visibility.Collapsed;
+            // Signing out from either operator page lands on Settings.
+            if (!signedIn && Nav.SelectedItem is NavigationViewItem current && ((string)current.Tag == "links" || (string)current.Tag == "share")) Show("settings");
         };
         TransferStore.Shared.ActiveChanged += count =>
         {
@@ -117,6 +115,12 @@ public sealed partial class MainWindow : Window
     private TrayPanel? panel;
 
     /// The tray panel, made on first use and shown above the tray.
+    private void ShowTrayMenu()
+    {
+        panel ??= new TrayPanel();
+        panel.ShowContextMenu();
+    }
+
     private void ShowPanel()
     {
         panel ??= new TrayPanel();
@@ -126,6 +130,7 @@ public sealed partial class MainWindow : Window
     private static Type PageFor(string? tag) => tag switch
     {
         "receive" => typeof(ReceivePage),
+        "share" => typeof(DeliverPage),
         "links" => typeof(LinksPage),
         "transfers" => typeof(TransfersPage),
         "settings" => typeof(SettingsPage),

@@ -1,5 +1,6 @@
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
 using Windows.Graphics;
 
 namespace Votport;
@@ -12,10 +13,12 @@ public sealed partial class TrayPanel : Window
 {
     private const int WidthDip = 380;
     private const int MaxHeightDip = 520;
+    private MenuFlyout? contextMenu;
 
     public TrayPanel()
     {
         InitializeComponent();
+        MenuHost.Loaded += (_, _) => contextMenu?.ShowAt(MenuHost, new Windows.Foundation.Point(0, 0));
         List.ItemsSource = TransferStore.Shared.Items;
         if (AppWindow.Presenter is OverlappedPresenter presenter)
         {
@@ -24,7 +27,17 @@ public sealed partial class TrayPanel : Window
             presenter.IsMaximizable = false;
             presenter.IsMinimizable = false;
             presenter.SetBorderAndTitleBar(false, false);
+            presenter.PreferredMinimumWidth = 1;
+            presenter.PreferredMinimumHeight = 1;
         }
+        var window = WinRT.Interop.WindowNative.GetWindowHandle(this);
+        // The presenter leaves WS_DLGFRAME and WS_EX_WINDOWEDGE on the HWND.
+        SetWindowLong(window, -16, GetWindowLong(window, -16) & ~0x00CC0000); // caption, sizing frame, system menu
+        SetWindowLong(window, -20, GetWindowLong(window, -20) & ~0x00020300); // window, client, static edges
+        SetWindowPos(window, IntPtr.Zero, 0, 0, 0, 0, 0x37); // frame changed; preserve bounds, order, activation
+        // Windows 11 draws a DWM outline; older Windows ignores this attribute.
+        uint borderColor = 0xFFFFFFFE; // DWMWA_COLOR_NONE
+        DwmSetWindowAttribute(WinRT.Interop.WindowNative.GetWindowHandle(this), 34 /* DWMWA_BORDER_COLOR */, ref borderColor, sizeof(uint));
         AppWindow.IsShownInSwitchers = false;
         Activated += (_, e) =>
         {
@@ -58,9 +71,44 @@ public sealed partial class TrayPanel : Window
 
     private void HidePanel()
     {
-        AppWindow.Hide();
+        if (!shown) return;
         shown = false;
+        AppWindow.Hide();
+        var menu = contextMenu;
+        contextMenu = null;
+        menu?.Hide();
+        PanelContent.Visibility = Visibility.Visible;
         hiddenAt = Environment.TickCount64;
+    }
+
+    public void ShowContextMenu()
+    {
+        HidePanel();
+        var menu = new MenuFlyout();
+        var style = new Style { TargetType = typeof(MenuFlyoutPresenter) };
+        style.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(0)));
+        menu.MenuFlyoutPresenterStyle = style;
+        var lines = TransferStore.Shared.Items.Where(item => item.Running).Take(6).Select(Format.MenuLine).ToList();
+        if (lines.Count == 0) lines.Add("No active transfers");
+        foreach (var line in lines) menu.Items.Add(new MenuFlyoutItem { Text = line, IsEnabled = false });
+        menu.Items.Add(new MenuFlyoutSeparator());
+        var open = new MenuFlyoutItem { Text = "Open votport" };
+        open.Click += Open_Click;
+        menu.Opened += (_, _) => open.Focus(FocusState.Pointer);
+        menu.Items.Add(open);
+        var quit = new MenuFlyoutItem { Text = "Quit" };
+        quit.Click += Quit_Click;
+        menu.Items.Add(quit);
+        menu.Closed += (_, _) => { if (!closing && contextMenu == menu) HidePanel(); };
+        contextMenu = menu;
+        PanelContent.Visibility = Visibility.Collapsed;
+        GetCursorPos(out var cursor);
+        AppWindow.MoveAndResize(new RectInt32(cursor.X, cursor.Y, 1, 1));
+        var loaded = MenuHost.IsLoaded;
+        shown = true;
+        AppWindow.Show();
+        BringToForeground();
+        if (loaded) menu.ShowAt(MenuHost, new Windows.Foundation.Point(0, 0));
     }
 
     /// A click on the tray icon while the panel is open: the click's
@@ -95,7 +143,14 @@ public sealed partial class TrayPanel : Window
         AppWindow.MoveAndResize(new RectInt32(x, y, width, height));
         AppWindow.Show();
         shown = true;
+        BringToForeground();
+    }
+
+    private void BringToForeground()
+    {
         Activate();
+        // Tray activation must own foreground focus to receive click-away deactivation.
+        SetForegroundWindow(WinRT.Interop.WindowNative.GetWindowHandle(this));
     }
 
     private void Pause_Click(object sender, RoutedEventArgs e)
@@ -136,6 +191,11 @@ public sealed partial class TrayPanel : Window
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     private struct Point { public int X; public int Y; }
 
+    [System.Runtime.InteropServices.DllImport("dwmapi.dll")] private static extern int DwmSetWindowAttribute(IntPtr window, uint attribute, ref uint value, uint size);
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)] private static extern int GetWindowLong(IntPtr window, int index);
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)] private static extern int SetWindowLong(IntPtr window, int index, int value);
+    [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);
+    [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr window);
     [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern bool GetCursorPos(out Point point);
     [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern IntPtr MonitorFromPoint(Point point, uint flags);
     [System.Runtime.InteropServices.DllImport("shcore.dll")] private static extern int GetDpiForMonitor(IntPtr monitor, int type, out uint dpiX, out uint dpiY);

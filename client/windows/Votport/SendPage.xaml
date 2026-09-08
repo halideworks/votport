@@ -10,7 +10,10 @@
       <RowDefinition Height="*" />
       <RowDefinition Height="Auto" />
     </Grid.RowDefinitions>
-    <TextBlock Text="SHIP" Style="{StaticResource SectionLabel}" />
+    <StackPanel Spacing="4">
+      <TextBlock Text="SEND" Style="{StaticResource SectionLabel}" Margin="0" />
+      <TextBlock Text="Send files to an existing request link." FontSize="12" Foreground="{ThemeResource VotMutedBrush}" />
+    </StackPanel>
     <Grid Grid.Row="1" ColumnSpacing="8">
       <Grid.ColumnDefinitions>
         <ColumnDefinition Width="*" />
@@ -18,7 +21,7 @@
       </Grid.ColumnDefinitions>
       <TextBox x:Name="LinkBox" PlaceholderText="Request link" />
       <!-- Signed in to a port: its open request links, one click. -->
-      <DropDownButton x:Name="ShipToButton" Grid.Column="1" Content="Ship to" Visibility="Collapsed">
+      <DropDownButton x:Name="ShipToButton" Grid.Column="1" Content="Your requests" Visibility="Collapsed">
         <DropDownButton.Flyout>
           <MenuFlyout x:Name="ShipToMenu" />
         </DropDownButton.Flyout>
@@ -51,7 +54,7 @@
       <Button Content="Choose Folder" Click="ChooseFolder_Click" />
       <Button Content="Paste" Click="Paste_Click" />
       <Button x:Name="ClearButton" Content="Clear" Click="Clear_Click" Visibility="Collapsed" />
-      <Button x:Name="SendButton" Content="Ship" Click="Send_Click" IsEnabled="False"
+      <Button x:Name="SendButton" Content="Send" Click="Send_Click" IsEnabled="False"
           Style="{StaticResource AccentButtonStyle}" HorizontalAlignment="Right" />
     </StackPanel>
   </Grid>

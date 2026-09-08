@@ -2,7 +2,8 @@
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
   <StackPanel Spacing="12" Margin="0,0,20,0">
-    <TextBlock Text="RECEIVE" Style="{StaticResource SectionLabel}" />
+    <TextBlock Text="RECEIVE" Style="{StaticResource SectionLabel}" Margin="0" />
+    <TextBlock Text="Download files from a delivery link to this PC." FontSize="12" Foreground="{ThemeResource VotMutedBrush}" />
     <TextBox x:Name="LinkBox" PlaceholderText="Delivery link" />
     <TextBlock x:Name="PreviewText" Visibility="Collapsed" TextWrapping="Wrap"
         Foreground="{ThemeResource VotMutedBrush}" />
