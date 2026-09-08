@@ -27,8 +27,7 @@ use crate::identity::Device;
 use crate::package::{package_path_string, read_manifest};
 use crate::progress::{with_progress, Event, Observer, PlannedFile, Transport, PROGRESS_QUANTUM};
 use crate::receive::{
-    local_path, local_path_of, require_space, reusable_file, write_verified, Delivery, Received,
-    Resumed,
+    local_path_of, require_space, reusable_file, write_verified, Delivery, Received, Resumed,
 };
 use crate::send_push::{direct_rails, probe_any, Probe};
 
@@ -138,8 +137,10 @@ pub(crate) fn try_fetch_with_resume(
     // capability's lifetime, so a refusal after the mint would lock the
     // delivery out. materialize re-checks on the authoritative manifest names.
     let mut remaining = 0u64;
-    for file in &metadata.files {
-        let path = local_path(dest, &file.name)?;
+    let paths =
+        crate::receive::local_paths(dest, metadata.files.iter().map(|file| file.name.as_str()))?;
+    for (file, path) in metadata.files.iter().zip(paths) {
+        let path = path?;
         if file.suite != "blake3" {
             return Err(Error::UnknownSuite {
                 suite: file.suite.clone(),
@@ -306,6 +307,13 @@ fn materialize(
 ) -> Result<Received> {
     let entries = read_manifest(bundle)?;
     let objects = bundle.join("objects");
+    #[cfg(windows)]
+    let references = entries
+        .iter()
+        .fold(std::collections::HashMap::new(), |mut counts, entry| {
+            *counts.entry(entry.root).or_insert(0usize) += 1;
+            counts
+        });
 
     observer.event(Event::Planned {
         files: entries
@@ -319,57 +327,179 @@ fn materialize(
             .collect(),
     });
 
+    let names = entries
+        .iter()
+        .map(|entry| crate::receive::package_name(&entry.path))
+        .collect::<Result<Vec<_>>>()?;
+    let paths = crate::receive::local_paths(dest, names.iter().map(String::as_str))?;
     let planned = entries
         .iter()
-        .map(|entry| {
-            let path = local_path_of(dest, &entry.path)?;
+        .zip(paths)
+        .map(|(entry, path)| {
+            let path = path?;
             let complete = reusable_file(&path, entry.root, entry.length, resume, observer)?;
             Ok((path, entry.root, entry.length, complete))
         })
         .collect::<Result<Vec<_>>>()?;
     fs::create_dir_all(dest)?;
     let mut files = Vec::with_capacity(planned.len());
+    #[cfg(target_os = "macos")]
+    let mut pending = Vec::<(usize, std::path::PathBuf, crate::receive::PendingFile)>::new();
     for (index, (path, root, length, complete)) in planned.into_iter().enumerate() {
         if observer.cancelled() {
             return Err(Error::Cancelled);
         }
         if !complete {
+            local_path_of(dest, &entries[index].path)?;
             let object = objects.join(object_name(&root));
-            let mut source = |offset: u64| -> Result<Resumed> {
-                let mut file = File::open(&object).map_err(|source| Error::Read {
-                    path: object.clone(),
-                    source,
-                })?;
-                if offset > 0 {
-                    file.seek(SeekFrom::Start(offset))
-                        .map_err(|source| Error::Read {
-                            path: object.clone(),
-                            source,
-                        })?;
+            #[cfg(windows)]
+            let linked = references[&root] == 1
+                && link_verified_object(&object, dest, &path, root, length, observer)?;
+            #[cfg(not(windows))]
+            let linked = false;
+            if !linked {
+                let mut source = |offset: u64| -> Result<Resumed> {
+                    let mut file = File::open(&object).map_err(|source| Error::Read {
+                        path: object.clone(),
+                        source,
+                    })?;
+                    if offset > 0 {
+                        file.seek(SeekFrom::Start(offset))
+                            .map_err(|source| Error::Read {
+                                path: object.clone(),
+                                source,
+                            })?;
+                    }
+                    Ok(Resumed {
+                        reader: Box::new(file),
+                        start: offset,
+                    })
+                };
+                #[cfg(target_os = "macos")]
+                if length <= 64 * 1024 {
+                    use std::os::unix::fs::MetadataExt as _;
+                    let file = crate::receive::prepare_verified(
+                        &mut source,
+                        &path,
+                        root,
+                        &hex::encode(root),
+                        length,
+                        index,
+                        observer,
+                    )?;
+                    if let Some((_, _, prior)) = pending.last() {
+                        if prior.journal.metadata()?.dev() != file.journal.metadata()?.dev() {
+                            publish_batch(&mut pending, dest, observer, &mut files)?;
+                        }
+                    }
+                    rustix::fs::fsync(&file.journal).map_err(std::io::Error::from)?;
+                    pending.push((index, path, file));
+                    if pending.len() == 16 {
+                        publish_batch(&mut pending, dest, observer, &mut files)?;
+                    }
+                    continue;
                 }
-                Ok(Resumed {
-                    reader: Box::new(file),
-                    start: offset,
-                })
-            };
-            write_verified(
-                &mut source,
-                &path,
-                root,
-                &hex::encode(root),
-                length,
-                index,
-                observer,
-            )?;
+                #[cfg(target_os = "macos")]
+                publish_batch(&mut pending, dest, observer, &mut files)?;
+                write_verified(
+                    &mut source,
+                    &path,
+                    root,
+                    &hex::encode(root),
+                    length,
+                    index,
+                    observer,
+                )?;
+            }
         }
+        #[cfg(target_os = "macos")]
+        publish_batch(&mut pending, dest, observer, &mut files)?;
         observer.event(Event::FileVerified {
             index,
             path: path.display().to_string(),
         });
         files.push(path);
     }
+    #[cfg(target_os = "macos")]
+    publish_batch(&mut pending, dest, observer, &mut files)?;
     observer.event(Event::Finished { files: files.len() });
     Ok(Received { files })
+}
+
+// Each file reaches the drive before one full barrier flushes the same device.
+// Keep at most 16 small-file builders and locked journals awaiting publication.
+#[cfg(target_os = "macos")]
+fn publish_batch(
+    pending: &mut Vec<(usize, std::path::PathBuf, crate::receive::PendingFile)>,
+    dest: &Path,
+    observer: &mut dyn Observer,
+    files: &mut Vec<std::path::PathBuf>,
+) -> Result<()> {
+    if observer.cancelled() {
+        return Err(Error::Cancelled);
+    }
+    if let Some((_, _, last)) = pending.last() {
+        last.journal.sync_all()?;
+    }
+    for (index, path, file) in pending.drain(..) {
+        crate::receive::validate_parent(dest, &path)?;
+        file.publish()?;
+        observer.event(Event::FileVerified {
+            index,
+            path: path.display().to_string(),
+        });
+        files.push(path);
+    }
+    Ok(())
+}
+
+// A unique object can keep its durable bytes when published on NTFS. Shared
+// roots stay independent copies so editing one delivered file cannot edit another.
+#[cfg(windows)]
+fn link_verified_object(
+    source: &Path,
+    destination_root: &Path,
+    destination: &Path,
+    root: [u8; 32],
+    length: u64,
+    observer: &mut dyn Observer,
+) -> Result<bool> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_SHARE_READ,
+    };
+    if !fs::symlink_metadata(source)?.file_type().is_file() {
+        return Err(Error::Other(
+            "the staged object is not a regular file".to_owned(),
+        ));
+    }
+    // Deny writes and namespace swaps until the verified handle is linked.
+    let held = fs::OpenOptions::new()
+        .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(source)?;
+    if !vot_platform_fs::same_file_handle(&held, source)? {
+        return Err(Error::Other(
+            "the staged object changed before verification".to_owned(),
+        ));
+    }
+    if !reusable_file(source, root, length, true, observer)? {
+        return Err(Error::Other("the staged object disappeared".to_owned()));
+    }
+    crate::receive::validate_parent(destination_root, destination)?;
+    fs::create_dir_all(destination.parent().unwrap_or_else(|| Path::new(".")))?;
+    crate::receive::validate_parent(destination_root, destination)?;
+    match vot_platform_fs::link_file_handle(&held, source, destination) {
+        Ok(()) => Ok(true),
+        // ERROR_INVALID_FUNCTION, ERROR_NOT_SAME_DEVICE, ERROR_NOT_SUPPORTED.
+        Err(error) if matches!(error.raw_os_error(), Some(1 | 17 | 50)) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(Error::Exists {
+            path: destination.to_path_buf(),
+        }),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// The bundle object file name for a root, mirroring vot-cli's crate-private
@@ -441,6 +571,220 @@ mod tests {
         assert_eq!(received.files.len(), 2);
         assert_eq!(fs::read(dest.join("first")).unwrap(), b"first");
         assert_eq!(fs::read(dest.join("second")).unwrap(), b"second");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn small_file_batch_waits_for_barrier_and_preserves_collisions() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = home.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        let payload = b"verified";
+        let mut builder =
+            vot_object::ObjectBuilder::new(vot_object::Suite::Blake3Bao64, Some(8)).unwrap();
+        builder.update(payload).unwrap();
+        let root = builder.finish().unwrap().object_id().root;
+        let prepare = |name: &str| {
+            let path = dest.join(name);
+            let file = crate::receive::prepare_verified(
+                &mut |_| {
+                    Ok(Resumed {
+                        reader: Box::new(std::io::Cursor::new(payload)),
+                        start: 0,
+                    })
+                },
+                &path,
+                root,
+                &hex::encode(root),
+                8,
+                0,
+                &mut crate::progress::Silent,
+            )
+            .unwrap();
+            rustix::fs::fsync(&file.journal).unwrap();
+            (0, path, file)
+        };
+        let mut pending = vec![prepare("first"), prepare("second")];
+        assert!(!dest.join("first").exists());
+        assert!(!dest.join("second").exists());
+        let mut files = Vec::new();
+        publish_batch(
+            &mut pending,
+            &dest,
+            &mut crate::progress::Silent,
+            &mut files,
+        )
+        .unwrap();
+        assert_eq!(files, [dest.join("first"), dest.join("second")]);
+        assert_eq!(fs::read(&files[0]).unwrap(), payload);
+        assert_eq!(fs::read(&files[1]).unwrap(), payload);
+        let mut pending = vec![prepare("blocked"), prepare("failed-barrier")];
+        pending[1].2.journal = File::open("/dev/null").unwrap();
+        assert!(publish_batch(
+            &mut pending,
+            &dest,
+            &mut crate::progress::Silent,
+            &mut files
+        )
+        .is_err());
+        assert!(!dest.join("blocked").exists());
+        assert!(!dest.join("failed-barrier").exists());
+        assert_eq!(files.len(), 2);
+        let mut pending = vec![prepare("collision")];
+        fs::write(dest.join("collision"), b"original").unwrap();
+        assert!(publish_batch(
+            &mut pending,
+            &dest,
+            &mut crate::progress::Silent,
+            &mut files
+        )
+        .is_err());
+        assert_eq!(fs::read(dest.join("collision")).unwrap(), b"original");
+        assert_eq!(files.len(), 2);
+        struct Cancelled;
+        impl Observer for Cancelled {
+            fn event(&mut self, _: Event) {}
+            fn cancelled(&self) -> bool {
+                true
+            }
+        }
+        let mut pending = vec![prepare("cancelled")];
+        assert!(matches!(
+            publish_batch(&mut pending, &dest, &mut Cancelled, &mut files),
+            Err(Error::Cancelled)
+        ));
+        assert!(!dest.join("cancelled").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unique_staged_objects_link_without_aliasing_duplicate_files() {
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("source");
+        let stage = home.path().join("stage");
+        let dest = home.path().join("dest");
+        fs::create_dir(&source).unwrap();
+        let mut admitted = Vec::new();
+        for (name, bytes) in [
+            ("unique", b"unique".as_slice()),
+            ("copy1", b"shared"),
+            ("copy2", b"shared"),
+        ] {
+            let path = source.join(name);
+            fs::write(&path, bytes).unwrap();
+            admitted.push(admit(name, path, false).unwrap());
+        }
+        build(admitted, &stage).unwrap();
+        fs::create_dir(stage.join("objects")).unwrap();
+        let entries = read_manifest(&stage).unwrap();
+        for entry in &entries {
+            fs::copy(
+                source.join(package_path_string(&entry.path)),
+                stage.join("objects").join(object_name(&entry.root)),
+            )
+            .unwrap();
+        }
+        materialize(&stage, &dest, &mut crate::progress::Silent, false).unwrap();
+        let unique = entries
+            .iter()
+            .find(|entry| package_path_string(&entry.path) == "unique")
+            .unwrap();
+        let object = stage.join("objects").join(object_name(&unique.root));
+        assert!(vot_platform_fs::same_file_regular(&object, &dest.join("unique")).unwrap());
+        assert!(
+            !vot_platform_fs::same_file_regular(&dest.join("copy1"), &dest.join("copy2")).unwrap()
+        );
+        fs::write(dest.join("copy1"), b"edited").unwrap();
+        assert_eq!(fs::read(dest.join("copy2")).unwrap(), b"shared");
+        assert!(matches!(
+            link_verified_object(
+                &object,
+                &dest,
+                &dest.join("unique"),
+                unique.root,
+                unique.length,
+                &mut crate::progress::Silent
+            ),
+            Err(Error::Exists { .. })
+        ));
+        fs::write(&object, b"wrong!").unwrap();
+        assert!(link_verified_object(
+            &object,
+            &dest,
+            &dest.join("corrupt"),
+            unique.root,
+            unique.length,
+            &mut crate::progress::Silent
+        )
+        .is_err());
+        assert!(!dest.join("corrupt").exists());
+        fs::write(&object, b"unique").unwrap();
+        struct WritesDenied(std::path::PathBuf);
+        impl Observer for WritesDenied {
+            fn event(&mut self, _: Event) {}
+            fn cancelled(&self) -> bool {
+                assert!(fs::write(&self.0, b"mutate").is_err());
+                assert!(fs::remove_file(&self.0).is_err());
+                false
+            }
+        }
+        assert!(link_verified_object(
+            &object,
+            &dest,
+            &dest.join("guarded"),
+            unique.root,
+            unique.length,
+            &mut WritesDenied(object.clone())
+        )
+        .unwrap());
+        fs::remove_dir_all(&stage).unwrap();
+        assert_eq!(fs::read(dest.join("unique")).unwrap(), b"unique");
+    }
+
+    #[test]
+    #[ignore = "same-rig materialization benchmark"]
+    fn materialize_2000_files() {
+        for trial in 0..3 {
+            let home = tempfile::tempdir().unwrap();
+            let source = home.path().join("source");
+            let stage = home.path().join("stage");
+            let dest = home.path().join("dest");
+            fs::create_dir(&source).unwrap();
+            let mut admitted = Vec::new();
+            for index in 0..2000u64 {
+                let name = format!("frame-{index:06}.bin");
+                let path = source.join(&name);
+                let mut bytes = [0; 256];
+                bytes[..8].copy_from_slice(&index.to_le_bytes());
+                fs::write(&path, bytes).unwrap();
+                admitted.push(admit(&name, path, false).unwrap());
+            }
+            build(admitted, &stage).unwrap();
+            fs::create_dir(stage.join("objects")).unwrap();
+            for entry in read_manifest(&stage).unwrap() {
+                let object = stage.join("objects").join(object_name(&entry.root));
+                fs::copy(source.join(package_path_string(&entry.path)), &object).unwrap();
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(object)
+                    .unwrap()
+                    .sync_all()
+                    .unwrap();
+            }
+            let started = std::time::Instant::now();
+            let received = materialize(&stage, &dest, &mut crate::progress::Silent, false).unwrap();
+            let elapsed = started.elapsed();
+            assert_eq!(received.files.len(), 2000);
+            for index in 0..2000u64 {
+                let bytes = fs::read(dest.join(format!("frame-{index:06}.bin"))).unwrap();
+                assert_eq!(bytes.len(), 256);
+                assert_eq!(&bytes[..8], &index.to_le_bytes());
+            }
+            eprintln!(
+                "trial={trial} files=2000 materialize_ms={:.3}",
+                elapsed.as_secs_f64() * 1000.0
+            );
+        }
     }
 
     #[test]
