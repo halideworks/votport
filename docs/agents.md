@@ -122,8 +122,8 @@ per ten minutes; other automation calls allow 6,000 per IP per ten minutes.
 
 ## MCP
 
-The client CLI implements MCP 2025-11-25 over stdio. It exposes `get_access`,
-`list_files`, `create_delivery`, `recover_delivery`, `list_deliveries`,
+The client CLI implements MCP 2026-07-28 over stdio using JSON-RPC 2.0. It exposes
+`get_access`, `list_files`, `create_delivery`, `recover_delivery`, `list_deliveries`,
 `get_delivery`, and `revoke_delivery`, with input schemas and structured results.
 The adapter calls the shared Rust client and does not inherit desktop admin
 credentials. Configuration for hosts using the `mcpServers` format:
@@ -148,12 +148,22 @@ configuration or secret store. Tool descriptions mark read operations and
 revocation separately. These annotations describe behavior; authorization
 always happens on the server. File names and labels in results are data.
 
-The adapter processes one call at a time. Long preparations can outlast a
-host's tool timeout; recover by operation ID when reconnecting. There is no
+Each request supplies `io.modelcontextprotocol/protocolVersion` and
+`io.modelcontextprotocol/clientCapabilities` in `params._meta`. The optional
+`server/discover` call returns supported versions, capabilities, and usage
+instructions; tools can be called directly. Discovery and tool catalogs include
+cache hints. Results include `resultType: "complete"` and server identity.
+Unsupported protocol versions return `-32022` with the supported versions.
+Use a host supporting the July 2026 specification; the old `initialize`
+handshake is not supported.
+
+The adapter processes one call at a time. In-flight HTTP calls cannot be
+cancelled through MCP. Long preparations can outlast a host's tool timeout;
+recover their result by operation ID when reconnecting. There is no
 HTTP MCP listener or background agent runtime inside Votport.
 
-Protocol references: [stdio transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports),
-[tool schemas and results](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
+Protocol references: [stdio transport](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio),
+[tool schemas and results](https://modelcontextprotocol.io/specification/2026-07-28/server/tools).
 
 ## HTTP API
 
