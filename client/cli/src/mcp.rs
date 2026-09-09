@@ -74,22 +74,26 @@ fn dispatch(message: Value, initialized: &mut bool) -> Option<Value> {
         _ if !*initialized => return Some(rpc_error(id, -32000, "Initialize first")),
         "tools/list" => json!({"tools": definitions()}),
         "tools/call" => {
-            let name = message["params"]["name"].as_str().unwrap_or_default();
+            let Some(name) = message["params"]["name"].as_str() else {
+                return Some(rpc_error(id, -32602, "Tool name must be a string"));
+            };
             let args = message["params"]
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            if !args.is_object() {
+                return Some(rpc_error(id, -32602, "Tool arguments must be an object"));
+            }
             let Some(definition) = definitions().into_iter().find(|t| t["name"] == name) else {
                 return Some(rpc_error(id, -32602, "Unknown tool"));
             };
-            if !valid_arguments(&args, &definition["inputSchema"]) {
-                return Some(rpc_error(
-                    id,
-                    -32602,
+            let result = if valid_arguments(&args, &definition["inputSchema"]) {
+                call(name, &args)
+            } else {
+                Err(super::agent::invalid(
                     "Arguments do not match the tool schema",
-                ));
-            }
-            let result = call(name, &args);
+                ))
+            };
             let (value, failed) = match result {
                 Ok(value) => (value, false),
                 Err(error) => (error, true),
@@ -121,8 +125,9 @@ fn valid_arguments(args: &Value, schema: &Value) -> bool {
         };
         match spec["type"].as_str() {
             Some("string") => value.as_str().is_some_and(|s| {
-                s.len() <= spec["maxLength"].as_u64().unwrap_or(1024) as usize
-                    && s.len() >= spec["minLength"].as_u64().unwrap_or(0) as usize
+                let length = s.chars().count();
+                length <= spec["maxLength"].as_u64().unwrap_or(1024) as usize
+                    && length >= spec["minLength"].as_u64().unwrap_or(0) as usize
             }),
             Some("integer") => value.as_u64().is_some_and(|n| {
                 n >= spec["minimum"].as_u64().unwrap_or(0)
@@ -141,7 +146,7 @@ fn definitions() -> Vec<Value> {
     let offset = json!({"type": "integer", "minimum": 0});
     vec![
         tool("get_access", "Inspect this agent's tenant, folder, permissions and credential expiry.", json!({}), &[], true, false),
-        tool("list_files", "List one library directory within the token's folder. Omit directory to start at that folder. Follow next_cursor with after.", json!({"directory": string, "after": string, "limit": limit}), &[], true, false),
+        tool("list_files", "List one library directory within the token's folder. Omit directory to start at that folder. Follow next_cursor with after.", json!({"directory": string, "after": {"type": "string", "maxLength": 4096}, "limit": limit}), &[], true, false),
         tool("create_delivery", "Create an expiring link for a server-relative folder. Choose operation_id once and reuse it with identical parameters after a timeout. Returns the same delivery on retry. Passwords are supplied through VOTPORT_SHARE_PASSWORD.", json!({"directory": string, "operation_id": id, "label": {"type": "string", "maxLength": 200}, "expires_days": {"type": "integer", "minimum": 1, "maximum": 30}, "max_downloads": {"type": "integer", "minimum": 1, "maximum": 10000}, "notify_on_download": {"type": "boolean"}}), &["directory", "operation_id", "expires_days"], false, false),
         tool("recover_delivery", "Recover the URL and delivery for an operation_id, including after reconnecting or restarting. Requires deliveries:create.", json!({"operation_id": id}), &["operation_id"], true, false),
         tool("list_deliveries", "List deliveries created by this token, oldest first. Follow next_cursor with after.", json!({"after": offset, "limit": limit}), &[], true, false),
@@ -212,8 +217,48 @@ mod tests {
         assert_eq!(responses.len(), 5);
         assert_eq!(responses[0]["result"]["protocolVersion"], "2025-11-25");
         assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 7);
-        assert_eq!(responses[2]["error"]["code"], -32602);
-        assert_eq!(responses[3]["error"]["code"], -32602);
+        for response in &responses[2..4] {
+            assert_eq!(response["result"]["isError"], true);
+            assert_eq!(
+                response["result"]["structuredContent"]["code"],
+                "invalid_request"
+            );
+            assert!(response.get("error").is_none());
+        }
         assert_eq!(responses[4]["error"]["code"], -32700);
+        for params in [
+            json!({}),
+            json!({"name": "list_files", "arguments": []}),
+            json!({"name": "unknown"}),
+        ] {
+            let response = dispatch(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params}),
+                &mut true,
+            )
+            .unwrap();
+            assert_eq!(response["error"]["code"], -32602);
+        }
+        let files = definitions()
+            .into_iter()
+            .find(|tool| tool["name"] == "list_files")
+            .unwrap();
+        let component = "d".repeat(200);
+        let cursor = format!("{}/{}", [component.as_str(); 5].join("/"), "a".repeat(255));
+        assert!(valid_arguments(
+            &json!({"after": cursor}),
+            &files["inputSchema"]
+        ));
+        assert!(!valid_arguments(
+            &json!({"after": "x".repeat(4097)}),
+            &files["inputSchema"]
+        ));
+        let create = definitions()
+            .into_iter()
+            .find(|tool| tool["name"] == "create_delivery")
+            .unwrap();
+        assert!(valid_arguments(
+            &json!({"directory": "project", "operation_id": "unicode-label", "expires_days": 1, "label": "測".repeat(200)}),
+            &create["inputSchema"]
+        ));
     }
 }

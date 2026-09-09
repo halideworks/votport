@@ -12,6 +12,9 @@ pub const PERMISSIONS: [&str; 4] = [
     "deliveries:revoke",
 ];
 
+// A cursor includes the admitted directory and its child filename.
+const MAX_FILE_CURSOR_BYTES: usize = 4096;
+
 pub(super) fn default_permissions() -> Vec<String> {
     vec!["deliveries:create".to_owned()]
 }
@@ -156,7 +159,7 @@ pub async fn files(
     check_directory(&app, &token, &directory)?;
     let limit = page_limit(query.limit)?;
     let after = query.after.unwrap_or_default();
-    if after.len() > MAX_LIBRARY_DIRECTORY_INPUT_BYTES {
+    if after.len() > MAX_FILE_CURSOR_BYTES {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "cursor is too long",
@@ -812,5 +815,49 @@ mod tests {
         let file = directory.path().join("file");
         std::fs::write(&file, b"not a directory").unwrap();
         assert!(direct_library_entries_page(directory.path(), &file, "", 10).is_err());
+    }
+
+    #[tokio::test]
+    async fn file_cursors_cover_children_of_the_longest_admitted_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let component = "d".repeat(200);
+        let relative = format!("project/{}", [component.as_str(); 5].join("/"));
+        assert!(relative.len() <= MAX_LIBRARY_DIRECTORY_INPUT_BYTES);
+        let folder = app.config.outbound_dir.join(&relative);
+        std::fs::create_dir_all(&folder).unwrap();
+        let first_name = "a".repeat(255);
+        let second_name = "b".repeat(255);
+        std::fs::write(folder.join(&first_name), b"a").unwrap();
+        std::fs::write(folder.join(&second_name), b"b").unwrap();
+        let raw = token(&app, &["library:read"]);
+        let path = format!("/api/automation/files?directory={relative}&limit=1");
+        let (status, first) = request(&app, "GET", &path, &raw, json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        let cursor = first["next_cursor"].as_str().unwrap();
+        assert!(cursor.len() > MAX_LIBRARY_DIRECTORY_INPUT_BYTES);
+        let (status, second) = request(
+            &app,
+            "GET",
+            &format!("{path}&after={cursor}"),
+            &raw,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            second["files"][0]["path"],
+            format!("{relative}/{second_name}")
+        );
+        assert_eq!(second["has_more"], false);
+        let (status, _) = request(
+            &app,
+            "GET",
+            &format!("{path}&after={}", "x".repeat(MAX_FILE_CURSOR_BYTES + 1)),
+            &raw,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

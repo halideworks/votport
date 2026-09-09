@@ -738,9 +738,10 @@ in that browser, then opens `votport://signin/<one-time code>?state=<nonce>`.
 The app exchanges the code at its original port with its private verifier
 within a minute, validates the session, and stores the cookie. Cancellation
 or a failed exchange preserves the existing port. Duplicate callbacks are
-ignored while the first completes. The CLI signs in with the password; an automation token serves
-only scripted grant creation on `/api/automation/share`. Tenant
-switching follows the admin session's tenant.
+ignored while the first completes. The CLI signs in with the password.
+[Agent access](agents.md) uses separate scoped tokens for library browsing,
+delivery creation and recovery, activity, and revocation through JSON CLI and
+MCP tools. Tenant switching follows the admin session's tenant.
 
 ### votport server changes
 
