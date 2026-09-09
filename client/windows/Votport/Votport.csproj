@@ -20,6 +20,7 @@
     <EnableMsixTooling>true</EnableMsixTooling>
     <!-- Unpackaged for development; -p:WindowsPackageType=MSIX packages. -->
     <WindowsPackageType Condition="'$(WindowsPackageType)' == ''">None</WindowsPackageType>
+    <DefineConstants Condition="'$(WindowsPackageType)' == 'None'">$(DefineConstants);VOTPORT_UNPACKAGED</DefineConstants>
     <AppxBundle>Never</AppxBundle>
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
     <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>

@@ -984,6 +984,9 @@ an independent SHA-256 comparison. A separate 12 GB fixture also passed on both
 platforms. Mac used a 1 Gbps link for these checks.
 
 Completion notifications on Windows and macOS use the same quiet Still water chord.
-The sound is bundled with the app and played by the native notification system,
-so system notification permissions and sound settings still apply. Turning off
-transfer notifications in the app disables these notifications and their sound.
+The sound is bundled with the app. macOS and packaged Windows use native
+notification audio. Unpackaged Windows development builds mute the toast and
+play the asset through the System Sounds audio session. This fallback checks
+notification availability and the shell's notification state, but does not
+provide full parity with modern Do Not Disturb or per-app sound settings.
+Turning off transfer notifications in the app disables both the toast and sound.
