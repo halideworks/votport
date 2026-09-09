@@ -35,7 +35,21 @@
         <NavigationViewItem x:Name="LinksItem" Content="Manage links" Tag="links" Icon="Link" Visibility="Collapsed" />
         <NavigationViewItem Content="Transfers" Tag="transfers" Icon="List">
           <NavigationViewItem.InfoBadge>
-            <InfoBadge x:Name="ActiveBadge" Visibility="Collapsed" />
+            <InfoBadge x:Name="ActiveBadge" Visibility="Collapsed">
+              <InfoBadge.Template>
+                <ControlTemplate TargetType="InfoBadge">
+                  <!-- Draw the curve as a vector instead of clipping a rounded panel. -->
+                  <Grid x:Name="RootGrid" MinWidth="16" Height="16">
+                    <Rectangle Fill="{TemplateBinding Background}" RadiusX="8" RadiusY="8" />
+                    <TextBlock x:Name="ValueTextBlock"
+                        Text="{Binding RelativeSource={RelativeSource TemplatedParent}, Path=Value, Mode=OneWay}"
+                        Foreground="{TemplateBinding Foreground}" FontSize="{ThemeResource InfoBadgeValueFontSize}"
+                        Margin="{ThemeResource ValueInfoBadgeTextMargin}"
+                        HorizontalAlignment="Center" VerticalAlignment="Center" />
+                  </Grid>
+                </ControlTemplate>
+              </InfoBadge.Template>
+            </InfoBadge>
           </NavigationViewItem.InfoBadge>
         </NavigationViewItem>
         <NavigationViewItem Content="Settings" Tag="settings" Icon="Setting" />
