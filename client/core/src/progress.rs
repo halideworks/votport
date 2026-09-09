@@ -27,6 +27,8 @@ pub enum Transport {
 /// Something worth reporting during a send.
 #[derive(Debug, Clone)]
 pub enum Event {
+    /// Delivery evidence is recorded, pending retry, or unavailable.
+    Evidence { status: String },
     /// The transfer committed to a path. The QUIC paths report bytes only as
     /// [`Event::Bytes`]; the HTTP paths report them per file.
     Transport(Transport),

@@ -700,6 +700,14 @@ pub async fn mint_fetch(
                 "holder_key must be 32 hex bytes of an ed25519 public key",
             )
         })?;
+    if super::outbound::workflows::require_recipient(&app, &grant, &headers)?
+        .is_some_and(|key| key != hex::encode(holder))
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "fetch holder must be the authenticated recipient",
+        ));
+    }
     let now = now_unix();
     let remaining = grant.expires_at.saturating_sub(now);
     if remaining == 0 {
@@ -740,15 +748,17 @@ pub async fn mint_fetch(
         .store
         .put_fetch_ticket(
             &FetchTicket {
+                holder: hex::encode(holder),
+                grant_token_hash: grant.token_hash.clone(),
+                policy_revision: super::outbound::workflows::release(&app, &grant)?
+                    .map_or(0, |job| job.project.revision),
                 token_id: hex::encode(token_id),
                 grant_id: grant.id.clone(),
                 manifest_root: hex::encode(root),
                 expires_at,
                 delivered_at: None,
             },
-            grant.downloads,
-            grant.max_downloads,
-            now,
+            now_unix(),
         )
         .map_err(super::store_unavailable)?;
     if !reserved {
@@ -846,6 +856,9 @@ pub(crate) fn admit_fetch(
             return refuse(app, ServeRefusalReason::Unknown, peer);
         }
     };
+    if ticket.grant_token_hash != grant.token_hash {
+        return refuse(app, ServeRefusalReason::Closed, peer);
+    }
     if !grant_open(&grant, presentation.now) {
         // A rail that dials after the primary's completion closed a capped
         // grant is this fetch's own straggler, not a refused delivery: the
@@ -897,6 +910,17 @@ pub(crate) fn admit_fetch(
     {
         return refuse(app, ServeRefusalReason::Busy, peer);
     }
+    let hold = SessionHold {
+        registry: Arc::clone(&serve.registry),
+        token,
+    };
+    if !app
+        .store
+        .admit_fetch_ticket(&ticket, presentation.now)
+        .unwrap_or(false)
+    {
+        return refuse(app, ServeRefusalReason::Closed, peer);
+    }
     tracing::info!(
         target: "audit", event = "serve_admitted", grant_id = %grant.id, %peer,
         "fetch session admitted"
@@ -909,10 +933,6 @@ pub(crate) fn admit_fetch(
         &json!({ "peer": peer.to_string() }),
     );
     let observer = {
-        let hold = SessionHold {
-            registry: Arc::clone(&serve.registry),
-            token,
-        };
         let app = Arc::clone(app);
         let runtime = runtime.clone();
         let grant_id = grant.id.clone();

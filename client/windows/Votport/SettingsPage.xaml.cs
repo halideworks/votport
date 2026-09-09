@@ -132,6 +132,9 @@ public sealed partial class SettingsPage : Page
         if (AgentCreate.IsChecked == true) permissions.Add("deliveries:create");
         if (AgentActivity.IsChecked == true) permissions.Add("deliveries:read");
         if (AgentRevoke.IsChecked == true) permissions.Add("deliveries:revoke");
+        if (AgentJobsRead.IsChecked == true) permissions.Add("jobs:read");
+        if (AgentJobsCreate.IsChecked == true) permissions.Add("jobs:create");
+        if (AgentJobsCancel.IsChecked == true) permissions.Add("jobs:cancel");
         if (AgentLabel.Text.Trim().Length == 0 || AgentDirectory.Text.Trim().Length == 0 || !uint.TryParse(AgentDays.Text, out var days) || days is < 1 or > 365 || permissions.Count == 0)
         {
             AgentProblem.Text = "Enter a label, folder, expiry from 1 to 365 days, and at least one allowed action.";

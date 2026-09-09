@@ -1,5 +1,6 @@
 // votport public verified download page. VOTPORT PROPRIETARY LICENSE.
 
+import { deliveryMetadata, initDeliveryEvidence } from '/assets/delivery-evidence.js';
 import { applyBranding } from '/assets/branding.js';
 import { appendObjectCard, formatBytes } from '/assets/object-card.js';
 import {
@@ -20,6 +21,7 @@ import {
 const $ = (id) => document.getElementById(id);
 const token = window.location.pathname.split('/').filter(Boolean).pop();
 let metadataHasPassword = false;
+let evidenceMetadata = null;
 let metadataFiles = [];
 let renderedFileCount = 0;
 let metadataTotal = 0;
@@ -40,8 +42,7 @@ function manifestStatus() {
     : `${metadataTotal} file${metadataTotal === 1 ? '' : 's'}, each verified by the server before it is sent`;
 }
 
-// The browser cannot verify bytes; the server does that before serving. A
-// finished save is exactly that: the file landed on this device.
+// Saving and the optional signed verification of saved files have separate status.
 function landedBadge(row) {
   row.classList.add('saved');
   const badge = document.createElement('span');
@@ -240,11 +241,9 @@ async function startAnchorDownloads() {
 async function fetchMetadataPage(offset, limit = FILE_RENDER_BATCH_SIZE) {
   let response;
   try {
-    response = await fetch(publicMetadataPageUrl(token, offset, limit), {
-      credentials: 'same-origin',
-    });
-  } catch {
-    throw new Error('The download could not be loaded. Check your connection and try again.');
+    response = await deliveryMetadata(publicMetadataPageUrl(token, offset, limit), token);
+  } catch (error) {
+    throw new Error(error.message || 'The download could not be loaded. Check your connection and try again.');
   }
   let body = null;
   try { body = await response.json(); } catch { /* non-JSON error page */ }
@@ -428,6 +427,7 @@ async function loadMetadata() {
   metadataFiles = next.files;
   metadataTotal = next.total;
   metadataHasMore = next.hasMore;
+  evidenceMetadata = body;
   batchUrl = body.batch_url || null;
   totalBytes = Number.isFinite(body.total_bytes) ? body.total_bytes : 0;
   renderNextFileBatch();
@@ -571,3 +571,5 @@ $('download-password-form').addEventListener('submit', async (event) => {
 });
 
 loadMetadata();
+
+initDeliveryEvidence(async () => ({ ...evidenceMetadata, files: metadataHasMore ? await loadRemainingMetadata() : metadataFiles }));

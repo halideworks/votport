@@ -35,6 +35,9 @@ fn desktop_issued_token_runs_an_isolated_verified_delivery_workflow() {
             "deliveries:create",
             "deliveries:read",
             "deliveries:revoke",
+            "jobs:read",
+            "jobs:create",
+            "jobs:cancel",
         ]
         .map(str::to_owned)
         .to_vec(),
@@ -97,6 +100,64 @@ fn desktop_issued_token_runs_an_isolated_verified_delivery_workflow() {
         .unwrap()
         .revoked_at
         .is_some());
+    let admin = votport_client_core::api::Client::new(&server.base).unwrap();
+    let cookie = admin.admin_login(common::ADMIN_PASSWORD).unwrap();
+    let project: serde_json::Value = admin.admin_send(reqwest::Method::PUT, "/api/workflows/projects", &cookie, Some(&json!({
+        "id":"project", "directory":"project", "label":"Agent project", "required_metadata":["client"],
+        "members":{format!("automation:{}",issued.automation_token.id):"sender"}
+    }))).unwrap();
+    assert_eq!(agent.projects().unwrap()["projects"][0]["id"], "project");
+    let request = json!({"operation_id":"durable-1","project_id":"project","label":"Durable delivery","metadata":{"client":"Example"},"expires_days":1});
+    let queued = agent.create_job(&request).unwrap();
+    let job_id = queued["job"]["id"].as_str().unwrap();
+    assert_eq!(agent.create_job(&request).unwrap()["job"]["id"], job_id);
+    let wait = |id: &str, state: &str| {
+        for _ in 0..200 {
+            let job = agent.job(id).unwrap();
+            if job["job"]["state"] == state {
+                return job;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("job {id} did not reach {state}");
+    };
+    let ready = wait(job_id, "ready");
+    assert!(ready["url"].is_string());
+    assert_eq!(
+        agent.jobs(None, 50).unwrap()["jobs"][0]["job"]["id"],
+        job_id
+    );
+    assert!(agent.job_evidence(job_id, 0, 50).unwrap()["evidence"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(!agent.events(0, 100).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let mut invalid_sequence = project;
+    invalid_sequence["sequence"] =
+        json!({"prefix":"missing-","suffix":".exr","first":1,"last":1,"padding":4});
+    admin
+        .admin_send::<serde_json::Value>(
+            reqwest::Method::PUT,
+            "/api/workflows/projects",
+            &cookie,
+            Some(&invalid_sequence),
+        )
+        .unwrap();
+    let mut request = request;
+    request["operation_id"] = json!("durable-failure");
+    let failed = agent.create_job(&request).unwrap();
+    let failed_id = failed["job"]["id"].as_str().unwrap();
+    wait(failed_id, "failed");
+    assert!(agent.job_action(failed_id, "retry").is_ok());
+    wait(failed_id, "failed");
+    assert_eq!(
+        agent.job_action(failed_id, "cancel").unwrap()["job"]["state"],
+        "cancelled"
+    );
+    assert!(agent.job_action(job_id, "approve").is_err());
     ffi::revoke_automation_token(issued.automation_token.id).unwrap();
     assert!(matches!(
         agent.session(),

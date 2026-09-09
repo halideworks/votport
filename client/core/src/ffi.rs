@@ -98,6 +98,7 @@ impl FileView {
 /// shell.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct TransferView {
+    pub evidence_status: Option<String>,
     pub phase: Phase,
     /// Set once the transfer commits to a path.
     pub transport: Option<Transport>,
@@ -257,6 +258,7 @@ impl Transfer {
 /// a failure worth trying again, offered at the next launch.
 #[uniffi::export]
 pub fn pending() -> Vec<journal::Entry> {
+    crate::evidence::start_retry_worker();
     journal::pending()
 }
 
@@ -886,6 +888,7 @@ impl Model {
         Self {
             kind,
             view: TransferView {
+                evidence_status: None,
                 phase: Phase::Preparing,
                 transport: None,
                 files_reset: true,
@@ -926,6 +929,17 @@ impl Model {
     fn apply(&mut self, event: Event, now: Instant) -> bool {
         let before = (self.view.phase, self.finishing());
         match event {
+            Event::Evidence { status } => {
+                self.view.evidence_status = Some(
+                    match status.as_str() {
+                        "recorded" => "Verification reported",
+                        "pending" => "Verification report queued for retry",
+                        _ => "Verification report unavailable",
+                    }
+                    .to_owned(),
+                );
+                return true;
+            }
             Event::Transferred { bytes } => {
                 self.attempt_bytes = self.attempt_bytes.saturating_add(bytes);
                 if bytes > 0 && self.view.transport == Some(Transport::Http) {

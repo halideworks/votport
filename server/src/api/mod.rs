@@ -3,6 +3,7 @@
 //! Licensed under the VOTPORT PROPRIETARY LICENSE.
 
 pub mod admin;
+pub mod evidence;
 pub mod outbound;
 pub mod replica;
 pub mod scim;
@@ -365,6 +366,7 @@ pub(crate) mod testing {
             smtp_to: None,
             public_url: Some("https://drop.example.com".to_owned()),
             max_upload_bytes: 1024 * 1024,
+            workflow_snapshot_bytes: 4 * 1024 * 1024,
             allow_hidden: false,
             session_idle_secs: 60,
             audit_retention_days: 400,

@@ -126,6 +126,7 @@ pub struct App {
     /// must never produce two snapshots or apply two restores concurrently.
     pub backup_lock: Arc<tokio::sync::Mutex<()>>,
     pub shutdown: Arc<tokio::sync::Notify>,
+    pub workflow_ready: tokio::sync::Notify,
     /// Exclusive flock on `<data_dir>/lock`, held for the life of the
     /// process: a second instance over the same data directory (an
     /// active-passive standby started too early) refuses to boot instead of
@@ -786,9 +787,7 @@ fn build_under_lease(
     clean_outbound_proofs(&config.data_dir, &store, now_unix());
     store.migrate_tenant_storage(&config.receive_dir)?;
     let secret = crate::auth::load_secret(&config.data_dir)?;
-    let signer = Arc::new(crate::receipt::ReceiptSigner::load_or_create(
-        &config.data_dir,
-    )?);
+    let signer = Arc::clone(&store.event_signer);
     // Upload sessions suspended by the last shutdown re-attach their
     // staging; every other staging file from a crash or kill has no live
     // session to sweep it, so remove those once at startup.
@@ -856,6 +855,7 @@ fn build_under_lease(
         push_tickets: Mutex::new(HashMap::new()),
         backup_lock: Arc::new(tokio::sync::Mutex::new(())),
         shutdown: Arc::new(tokio::sync::Notify::new()),
+        workflow_ready: tokio::sync::Notify::new(),
         _data_lock: data_lock,
         lease_holder,
         lease_acquired_at: lease.acquired_at,
@@ -2449,6 +2449,72 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/r/{token}/push", post(api::create_push_session))
         .route("/api/r/{token}/session", post(api::create_session))
         .route("/api/s/{token}", get(api::outbound_metadata))
+        .route(
+            "/api/s/{token}/evidence-challenge",
+            post(api::evidence::challenge),
+        )
+        .route(
+            "/api/workflows/projects",
+            get(api::outbound::workflows::projects)
+                .put(api::outbound::workflows::put_project)
+                .layer(DefaultBodyLimit::max(256 * 1024)),
+        )
+        .route(
+            "/api/workflows/jobs",
+            get(api::outbound::workflows::list)
+                .post(api::outbound::workflows::create)
+                .layer(DefaultBodyLimit::max(256 * 1024)),
+        )
+        .route(
+            "/api/workflows/jobs/{id}",
+            get(api::outbound::workflows::get)
+                .post(api::outbound::workflows::change)
+                .layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/workflows/jobs/{id}/evidence",
+            get(api::outbound::workflows::evidence),
+        )
+        .route(
+            "/api/workflows/events",
+            get(api::outbound::workflows::events),
+        )
+        .route(
+            "/api/workflows/storage",
+            get(api::outbound::workflows::storage::list)
+                .put(api::outbound::workflows::storage::put)
+                .layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/api/workflows/webhook",
+            get(api::outbound::workflows::webhook)
+                .put(api::outbound::workflows::put_webhook)
+                .layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/workflows/webhook/attempts",
+            get(api::outbound::workflows::webhook_attempts),
+        )
+        .route(
+            "/api/workflows/webhook/replay/{id}",
+            post(api::outbound::workflows::replay_webhook),
+        )
+        .route(
+            "/api/s/{token}/recipient-challenge",
+            post(api::outbound::workflows::recipient_challenge).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/s/{token}/recipient-verify",
+            post(api::outbound::workflows::recipient_verify).layer(DefaultBodyLimit::max(16384)),
+        )
+        .route(
+            "/api/evidence",
+            post(api::evidence::submit).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/api/admin/outbound/{id}/evidence",
+            get(api::evidence::list),
+        )
         .route("/api/s/{token}/logo", get(api::outbound_logo))
         .route("/api/s/{token}/verify", post(api::verify_outbound_password))
         .route("/api/s/{token}/fetch", post(api::serve::mint_fetch))

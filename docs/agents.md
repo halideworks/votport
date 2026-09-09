@@ -20,6 +20,9 @@ point to the client CLI on the agent's machine.
 | `deliveries:create` | Share a folder and recover URLs for this token's operations. |
 | `deliveries:read` | List this token's deliveries and inspect their files, receipts, and download starts. |
 | `deliveries:revoke` | Revoke this token's deliveries. Files stay in the library. |
+| `jobs:read` | Read projects, jobs, signed events and evidence allowed by project membership. |
+| `jobs:create` | Create or retry jobs as a project sender. |
+| `jobs:cancel` | Cancel jobs within the permitted project scope. |
 
 The server enforces these permissions on every call. Reading and revoking a
 delivery requires ownership by this exact token, even when another token has
@@ -124,7 +127,10 @@ per ten minutes; other automation calls allow 6,000 per IP per ten minutes.
 
 The client CLI implements MCP 2026-07-28 over stdio using JSON-RPC 2.0. It exposes
 `get_access`, `list_files`, `create_delivery`, `recover_delivery`, `list_deliveries`,
-`get_delivery`, and `revoke_delivery`, with input schemas and structured results.
+`get_delivery`, `revoke_delivery`, `list_projects`, `list_jobs`, `get_job`,
+`create_job`, `retry_job`, `cancel_job`, `list_events`, and `get_job_evidence`,
+with input schemas and structured results. The 15 tools include durable project
+workflows described in [Delivery workflows](delivery-workflows.md).
 The adapter calls the shared Rust client and does not inherit desktop admin
 credentials. Configuration for hosts using the `mcpServers` format:
 
@@ -158,7 +164,9 @@ Use a host supporting the July 2026 specification; the old `initialize`
 handshake is not supported.
 
 The adapter processes one call at a time. In-flight HTTP calls cannot be
-cancelled through MCP. Long preparations can outlast a host's tool timeout;
+cancelled through MCP. Durable jobs return before preparation finishes and can
+be polled or cancelled through their job tools. Ordinary share preparation can
+outlast a host's tool timeout;
 recover their result by operation ID when reconnecting. There is no
 HTTP MCP listener or background agent runtime inside Votport.
 

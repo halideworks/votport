@@ -332,6 +332,9 @@ pub fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String
     }
     // Reserved even with VOTPORT_ALLOW_HIDDEN: a sender file of this shape
     // would publish fine and then be deleted by the next boot's staging sweep.
+    if component.eq_ignore_ascii_case(".votport-workflows") {
+        return Err("name is reserved for delivery workflows".into());
+    }
     if component.eq_ignore_ascii_case(TENANT_STORAGE_DIR) {
         return Err("name is reserved for tenant storage".to_owned());
     }

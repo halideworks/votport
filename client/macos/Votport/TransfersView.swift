@@ -183,7 +183,7 @@ enum Format {
         if view.phase == .done, let finished = view.finishedUnixSeconds {
             let time = Date(timeIntervalSince1970: TimeInterval(finished))
                 .formatted(date: .omitted, time: .standard)
-            return "\(view.status), finished at \(time)"
+            return "\(view.status), finished at \(time)" + (view.evidenceStatus.map { ". " + $0 } ?? "")
         }
         return view.status
     }

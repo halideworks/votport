@@ -67,17 +67,40 @@ impl Device {
     /// A read or write failure.
     pub fn load_or_create_in(dir: &std::path::Path) -> Result<Self> {
         let path = dir.join("device.key");
-        // A file of exactly 32 bytes is the key; anything else (an empty file
-        // left by an interrupted first write, say) is treated as absent and
-        // regenerated, since a device key is machine-local and disposable.
-        if let Ok(bytes) = std::fs::read(&path) {
-            if let Ok(seed) = <[u8; 32]>::try_from(bytes.as_slice()) {
-                return Ok(Self {
-                    key: SigningKey::from_bytes(&seed),
-                });
+        let read = || -> Result<Option<Self>> {
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let seed = <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                        crate::Error::Other("device key is damaged; restore it from backup before accepting enrolled deliveries".into())
+                    })?;
+                    Ok(Some(Self {
+                        key: SigningKey::from_bytes(&seed),
+                    }))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match std::fs::symlink_metadata(&path) {
+                        Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                        Ok(meta) if meta.is_file() => Ok(None),
+                        _ => Err(error.into()),
+                    }
+                }
+                Err(error) => Err(error.into()),
             }
+        };
+        if let Some(device) = read()? {
+            return Ok(device);
         }
         std::fs::create_dir_all(dir)?;
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("device-key.lock"))?;
+        lock.lock()?;
+        if let Some(device) = read()? {
+            return Ok(device);
+        }
         let key = SigningKey::generate(&mut rand::rngs::OsRng);
         write_private(&path, &key.to_bytes())?;
         Ok(Self { key })
@@ -102,25 +125,35 @@ impl Device {
 /// place, so an interrupted write never leaves a short `path` for the next run
 /// to reject, and two concurrent first-time writers do not share a temp.
 pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    use std::io::Write;
+    let temp = path.with_extension(format!(
+        "{}-{}.tmp",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temp)?;
+        options.mode(0o600);
+    }
+    let result = (|| -> Result<()> {
+        let mut file = options.open(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&temp, bytes)?;
-    }
-    std::fs::rename(&temp, path)?;
+    result?;
     Ok(())
 }
 
@@ -148,13 +181,56 @@ mod tests {
     }
 
     #[test]
-    fn a_short_key_file_is_regenerated_not_refused() {
+    fn a_damaged_enrolled_key_is_not_silently_replaced() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path()).unwrap();
-        // An interrupted first write leaves an empty file; the next load must
-        // regenerate rather than refuse forever.
         std::fs::write(dir.path().join("device.key"), b"").unwrap();
-        let device = Device::load_or_create_in(dir.path()).expect("regenerated");
-        assert_eq!(device.holder_key_hex().len(), 64);
+        assert!(Device::load_or_create_in(dir.path()).is_err());
+        assert_eq!(std::fs::read(dir.path().join("device.key")).unwrap(), b"");
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(dir.path().join("device.key")).unwrap();
+            std::os::unix::fs::symlink("missing-key", dir.path().join("device.key")).unwrap();
+            assert!(Device::load_or_create_in(dir.path()).is_err());
+            assert!(std::fs::symlink_metadata(dir.path().join("device.key"))
+                .unwrap()
+                .is_symlink());
+        }
+    }
+
+    #[test]
+    fn concurrent_first_loads_keep_one_enrollable_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        for _ in 0..16 {
+            let path = dir.path().to_owned();
+            let barrier = barrier.clone();
+            let sender = sender.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                sender
+                    .send(Device::load_or_create_in(&path).unwrap().holder_key_hex())
+                    .unwrap();
+            });
+        }
+        drop(sender);
+        let first = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        for _ in 1..16 {
+            assert_eq!(
+                receiver
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap(),
+                first
+            );
+        }
+        assert_eq!(
+            Device::load_or_create_in(dir.path())
+                .unwrap()
+                .holder_key_hex(),
+            first
+        );
     }
 }

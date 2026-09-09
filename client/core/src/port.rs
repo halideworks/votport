@@ -339,7 +339,7 @@ fn signed() -> Result<(Client, Stored)> {
 
 /// Runs an operator call, dropping the stored session when the server says
 /// it ended so the shells stop offering operator screens.
-fn run<T>(call: impl FnOnce(&Client, &str) -> Result<T>) -> Result<T> {
+pub(crate) fn run<T>(call: impl FnOnce(&Client, &str) -> Result<T>) -> Result<T> {
     let (client, stored) = signed()?;
     match call(&client, &stored.cookie) {
         Err(Error::NotSignedIn) => {

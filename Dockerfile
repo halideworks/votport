@@ -37,6 +37,7 @@ RUN mkdir -p /src/server/src \
     && printf 'fn main() {}\n' > /src/server/src/main.rs \
     && cd /src/server \
     && cargo build --release --locked
+COPY protocol /src/protocol
 COPY server/src /src/server/src
 RUN touch /src/server/src/main.rs /src/server/src/lib.rs \
     && cd /src/server \

@@ -21,9 +21,14 @@ import {
 } from '/assets/admin-common.js';
 import { startStatusPoll } from '/assets/status-strip.js';
 
+import { initWorkflows } from '/assets/workflow-admin.js';
+
 const $ = (id) => document.getElementById(id);
 const permissionLabels = {
   'library:read': 'browse files',
+  'jobs:read': 'read jobs and verification',
+  'jobs:create': 'create and retry jobs',
+  'jobs:cancel': 'cancel jobs',
   'deliveries:create': 'create deliveries',
   'deliveries:read': 'read delivery activity',
   'deliveries:revoke': 'revoke deliveries',
@@ -886,3 +891,5 @@ function renderStatus(status) {
 startStatusPoll({ render: renderStatus, active: (status) => status.outbound.active > 0 });
 await Promise.all([requireSession(), refreshGrants(), refreshLibrary(), refreshAutomationTokens()]);
 await revealGrant();
+
+initWorkflows();
