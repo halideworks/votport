@@ -12,6 +12,7 @@ enum Notifier {
         let content = UNMutableNotificationContent()
         content.title = item.subject
         content.body = Format.statusLine(item)
+        content.sound = UNNotificationSound(named: UNNotificationSoundName("completion.wav"))
         switch view.phase {
         case .done, .failed: break
         default: return

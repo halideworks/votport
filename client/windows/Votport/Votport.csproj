@@ -20,6 +20,7 @@
     <EnableMsixTooling>true</EnableMsixTooling>
     <!-- Unpackaged for development; -p:WindowsPackageType=MSIX packages. -->
     <WindowsPackageType Condition="'$(WindowsPackageType)' == ''">None</WindowsPackageType>
+    <DefineConstants Condition="'$(WindowsPackageType)' == 'None'">$(DefineConstants);VOTPORT_UNPACKAGED</DefineConstants>
     <AppxBundle>Never</AppxBundle>
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
     <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>
@@ -35,6 +36,9 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="Assets\*.png;Assets\*.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\..\design\sounds\completion.wav" Link="Assets\completion.wav">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <!-- The OFL fonts from client/design/fonts with their licence texts,
