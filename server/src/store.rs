@@ -159,10 +159,19 @@ pub struct AutomationToken {
     /// Library directory this token may share, itself or below; None means
     /// any directory in the tenant's library.
     pub directory: Option<String>,
+    pub permissions: Vec<String>,
     pub created_at: u64,
     pub expires_at: u64,
     pub revoked_at: Option<u64>,
     pub last_used_at: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AutomationOperation {
+    pub token_id: String,
+    pub operation_id: String,
+    pub request_hash: String,
+    pub grant_id: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -438,7 +447,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 25;
+pub(crate) const SCHEMA_VERSION: u64 = 26;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -1206,6 +1215,27 @@ impl Store {
             transaction.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS upload_sessions_push_key ON upload_sessions(push_key) WHERE push_key IS NOT NULL;")
                 .map_err(|error| format!("schema: {error}"))?;
         }
+        if stored < 26 {
+            let present: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('automation_tokens') WHERE name = 'permissions')",
+                [], |row| row.get(0),
+            ).map_err(|error| format!("schema: {error}"))?;
+            if !present {
+                transaction.execute_batch("ALTER TABLE automation_tokens ADD COLUMN permissions TEXT NOT NULL DEFAULT '[\"deliveries:create\"]';")
+                    .map_err(|error| format!("schema: {error}"))?;
+            }
+            transaction
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS automation_operations (
+                token_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                grant_id TEXT NOT NULL UNIQUE,
+                PRIMARY KEY (token_id, operation_id)
+            );",
+                )
+                .map_err(|error| format!("schema: {error}"))?;
+        }
         transaction
             .execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
@@ -1326,8 +1356,8 @@ impl Store {
                 .execute(
                     "INSERT INTO automation_tokens
                          (id, token_hash, tenant, label, created_at, expires_at, revoked_at,
-                          last_used_at, directory)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                          last_used_at, directory, permissions)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     rusqlite::params![
                         token.id,
                         token.token_hash,
@@ -1342,6 +1372,7 @@ impl Store {
                             .last_used_at
                             .map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
                         token.directory,
+                        serde_json::to_string(&token.permissions).unwrap(),
                     ],
                 )
                 .map(|_| ())
@@ -1352,7 +1383,7 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, token_hash, tenant, label, created_at, expires_at, revoked_at,
-                        last_used_at, directory
+                        last_used_at, directory, permissions
                  FROM automation_tokens
                  WHERE tenant = ?1 ORDER BY created_at, rowid",
             )?;
@@ -1374,7 +1405,7 @@ impl Store {
                      SET last_used_at = ?2
                      WHERE token_hash = ?1 AND revoked_at IS NULL AND expires_at > ?2
                      RETURNING id, token_hash, tenant, label, created_at, expires_at,
-                               revoked_at, last_used_at, directory",
+                               revoked_at, last_used_at, directory, permissions",
                     rusqlite::params![token_hash, at],
                     map_automation_token,
                 )
@@ -1391,6 +1422,42 @@ impl Store {
                     rusqlite::params![tenant, id, i64::try_from(at).unwrap_or(i64::MAX)],
                 )
                 .map(|changed| changed > 0)
+        })
+    }
+
+    pub fn automation_operation(
+        &self,
+        token_id: &str,
+        operation_id: &str,
+    ) -> Result<Option<AutomationOperation>, String> {
+        self.with(|connection| connection.query_row(
+            "SELECT token_id, operation_id, request_hash, grant_id FROM automation_operations WHERE token_id = ?1 AND operation_id = ?2",
+            rusqlite::params![token_id, operation_id],
+            |row| Ok(AutomationOperation { token_id: row.get(0)?, operation_id: row.get(1)?, request_hash: row.get(2)?, grant_id: row.get(3)? }),
+        ).optional())
+    }
+
+    pub fn automation_delivery(
+        &self,
+        token_id: &str,
+        grant_id: &str,
+    ) -> Result<Option<(String, String)>, String> {
+        self.with(|connection| connection.query_row(
+            "SELECT o.operation_id, g.token_hash FROM automation_operations o JOIN outbound_grants g ON g.id = o.grant_id WHERE o.token_id = ?1 AND o.grant_id = ?2",
+            rusqlite::params![token_id, grant_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional())
+    }
+
+    pub fn automation_deliveries(
+        &self,
+        token_id: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, String)>, String> {
+        self.with(|connection| {
+            let mut statement = connection.prepare("SELECT o.rowid, o.grant_id, g.token_hash FROM automation_operations o JOIN outbound_grants g ON g.id = o.grant_id WHERE o.token_id = ?1 AND o.rowid > ?2 ORDER BY o.rowid LIMIT ?3")?;
+            let rows = statement.query_map(rusqlite::params![token_id, after, limit as i64], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            rows.collect()
         })
     }
 
@@ -2063,6 +2130,8 @@ impl Store {
                 .map_err(|error| error.to_string())?;
             transaction
                 .execute("DELETE FROM outbound_grants WHERE tenant = ?1", [key])
+                .map_err(|error| error.to_string())?;
+            transaction.execute("DELETE FROM automation_operations WHERE token_id IN (SELECT id FROM automation_tokens WHERE tenant = ?1)", [key])
                 .map_err(|error| error.to_string())?;
             transaction
                 .execute("DELETE FROM automation_tokens WHERE tenant = ?1", [key])
@@ -2919,6 +2988,14 @@ impl Store {
     // ------------------------------------------------------ outbound grants
 
     pub fn insert_outbound_grant(&self, grant: OutboundGrant) -> Result<(), String> {
+        self.insert_outbound_grant_with_operation(grant, None)
+    }
+
+    pub fn insert_outbound_grant_with_operation(
+        &self,
+        grant: OutboundGrant,
+        operation: Option<&AutomationOperation>,
+    ) -> Result<(), String> {
         let (bytes_hi, bytes_lo) = split_bytes(grant.bytes);
         let files_json = serde_json::to_string(&grant.files).unwrap_or_else(|_| "[]".to_owned());
         let file_count = i64::try_from(grant.files.len().max(1)).unwrap_or(i64::MAX);
@@ -2998,6 +3075,19 @@ impl Store {
                 .map_err(|error| error.to_string())?;
         }
         drop(child);
+        if let Some(operation) = operation {
+            let active: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM automation_tokens WHERE id = ?1 AND revoked_at IS NULL AND expires_at > ?2)",
+                rusqlite::params![operation.token_id, now_unix() as i64], |row| row.get(0),
+            ).map_err(|error| error.to_string())?;
+            if !active {
+                return Err("automation token expired or revoked".to_owned());
+            }
+            transaction.execute(
+                "INSERT INTO automation_operations (token_id, operation_id, request_hash, grant_id) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![operation.token_id, operation.operation_id, operation.request_hash, grant_id],
+            ).map_err(|error| error.to_string())?;
+        }
         transaction.commit().map_err(|error| error.to_string())
     }
 
@@ -4227,6 +4317,15 @@ fn map_automation_token(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationT
         tenant: row.get("tenant")?,
         label: row.get("label")?,
         directory: row.get("directory")?,
+        permissions: serde_json::from_str(&row.get::<_, String>("permissions")?).map_err(
+            |error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            },
+        )?,
         created_at: row.get::<_, i64>("created_at")?.max(0) as u64,
         expires_at: row.get::<_, i64>("expires_at")?.max(0) as u64,
         revoked_at: row
@@ -5007,6 +5106,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn automation_schema_migrates_existing_tokens_without_broadening_permissions() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .insert_automation_token(test_automation_token("agent", "tenant"))
+            .unwrap();
+        store.with(|connection| connection.execute_batch("ALTER TABLE automation_tokens DROP COLUMN permissions; DROP TABLE automation_operations; UPDATE meta SET value = '25' WHERE key = 'schema_version';")).unwrap();
+        drop(store);
+        let reopened = Store::open(directory.path()).unwrap();
+        let token = reopened
+            .authenticate_automation_token("hash-agent", 15)
+            .unwrap()
+            .unwrap();
+        assert_eq!(token.tenant, "tenant");
+        assert_eq!(token.permissions, ["deliveries:create"]);
+        assert!(reopened
+            .automation_operation("agent", "missing")
+            .unwrap()
+            .is_none());
+    }
+
     fn test_automation_token(id: &str, tenant: &str) -> AutomationToken {
         AutomationToken {
             id: id.to_owned(),
@@ -5014,6 +5135,7 @@ mod tests {
             tenant: tenant.to_owned(),
             label: format!("Token {id}"),
             directory: None,
+            permissions: vec!["deliveries:create".to_owned()],
             created_at: 10,
             expires_at: 20,
             revoked_at: None,
@@ -6957,6 +7079,7 @@ mod tenant_tests {
                 tenant: String::new(),
                 label: "Token".to_owned(),
                 directory: None,
+                permissions: vec!["deliveries:create".to_owned()],
                 created_at: 10,
                 expires_at: 20,
                 revoked_at: None,

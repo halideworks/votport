@@ -16,6 +16,8 @@ targets:
     platform: macOS
     sources:
       - Votport
+      - path: VotportCore/votport-cli
+        buildPhase: resources
       - path: ../design/sounds/completion.wav
         buildPhase: resources
       # The OFL fonts, copied as a folder into Resources/fonts.

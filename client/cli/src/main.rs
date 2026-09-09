@@ -4,6 +4,9 @@
 //! request link, over QUIC push when the link offers it and the receiver's
 //! carrier answers, over HTTP otherwise.
 
+mod agent;
+mod mcp;
+
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -15,10 +18,39 @@ use votport_client_core::{
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "agent") {
+        return match agent::run(&args[1..]) {
+            Ok(value) => {
+                println!("{value}");
+                ExitCode::SUCCESS
+            }
+            Err(value) => {
+                println!("{value}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if args.first().is_some_and(|arg| arg == "mcp") {
+        return match mcp::run(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("votport mcp: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("votport: {message}");
+            if args.iter().any(|arg| arg == "--json") {
+                println!(
+                    "{}",
+                    serde_json::json!({"event": "error", "error": message, "code": "command_failed"})
+                );
+            } else {
+                eprintln!("votport: {message}");
+            }
             ExitCode::FAILURE
         }
     }
@@ -55,6 +87,17 @@ fn run(args: &[String]) -> Result<(), String> {
 }
 
 fn print_usage() {
+    eprintln!("votport agent session
+votport agent files [<directory>] [--after <cursor>] [--limit <n>]
+votport agent share <directory> --operation-id <id> [--expires-days <n>] [--label <label>] [--max-downloads <n>]
+votport agent recover <operation-id>
+votport agent deliveries [--after <cursor>] [--limit <n>]
+votport agent delivery <id> [--offset <n>] [--limit <n>]
+votport agent revoke <id>
+votport mcp
+
+Agent commands always return JSON and use VOTPORT_URL and VOTPORT_AUTOMATION_TOKEN.
+");
     eprintln!(
         "votport send <link> <path>...      [--password <p>] [--json]\n\
          votport receive <link> <dir>       [--password <p>] [--json]\n\
@@ -336,48 +379,40 @@ impl Observer for CliObserver {
             return;
         }
         if self.json {
+            use serde_json::json;
             let line = match &event {
                 Event::Transferred { .. } => return,
                 Event::Selected { files } | Event::Planned { files } => {
-                    let name = if matches!(event, Event::Selected { .. }) {
-                        "selected"
-                    } else {
-                        "planned"
-                    };
-                    let files: Vec<String> = files
-                        .iter()
-                        .map(|file| {
-                            format!(
-                                "{{\"index\":{},\"path\":{:?},\"bytes\":{}}}",
-                                file.index, file.path, file.bytes
-                            )
-                        })
-                        .collect();
-                    format!("{{\"event\":{name:?},\"files\":[{}]}}", files.join(","))
+                    json!({"event": if matches!(event, Event::Selected { .. }) { "selected" } else { "planned" }, "files": files.iter().map(|f| json!({"index": f.index, "path": f.path, "bytes": f.bytes})).collect::<Vec<_>>()})
                 }
                 Event::Transport(transport) => {
-                    format!("{{\"event\":\"transport\",\"via\":{:?}}}", transport_name(*transport))
+                    json!({"event": "transport", "via": transport_name(*transport)})
                 }
-                Event::Bytes { moved, total } => match total {
-                    Some(total) => format!("{{\"event\":\"bytes\",\"moved\":{moved},\"total\":{total}}}"),
-                    None => format!("{{\"event\":\"bytes\",\"moved\":{moved}}}"),
-                },
+                Event::Bytes { moved, total } => {
+                    json!({"event": "bytes", "moved": moved, "total": total})
+                }
                 Event::SessionCreated { session } => {
-                    format!("{{\"event\":\"session\",\"session\":{session:?}}}")
+                    json!({"event": "session", "session": session})
                 }
-                Event::Chunk { index, covered, total } => format!(
-                    "{{\"event\":\"chunk\",\"entry\":{index},\"covered\":{covered},\"total\":{total}}}"
-                ),
+                Event::Chunk {
+                    index,
+                    covered,
+                    total,
+                } => json!({"event": "chunk", "entry": index, "covered": covered, "total": total}),
                 Event::EntryComplete { index, path } => {
-                    format!("{{\"event\":\"entry\",\"index\":{index},\"path\":{path:?}}}")
+                    json!({"event": "entry", "index": index, "path": path})
                 }
-                Event::Rebegin => "{\"event\":\"rebegin\"}".to_owned(),
-                Event::Finished { files } => format!("{{\"event\":\"finished\",\"files\":{files}}}"),
-                Event::Downloading { index, received, total } => format!(
-                    "{{\"event\":\"downloading\",\"index\":{index},\"received\":{received},\"total\":{total}}}"
-                ),
+                Event::Rebegin => json!({"event": "rebegin"}),
+                Event::Finished { files } => json!({"event": "finished", "files": files}),
+                Event::Downloading {
+                    index,
+                    received,
+                    total,
+                } => {
+                    json!({"event": "downloading", "index": index, "received": received, "total": total})
+                }
                 Event::FileVerified { index, path } => {
-                    format!("{{\"event\":\"verified\",\"index\":{index},\"path\":{path:?}}}")
+                    json!({"event": "verified", "index": index, "path": path})
                 }
             };
             println!("{line}");

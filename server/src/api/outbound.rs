@@ -15,6 +15,9 @@ use axum::Json;
 use base64::Engine as _;
 use futures_util::{Stream, StreamExt as _};
 use serde::Deserialize;
+
+pub mod automation;
+pub use automation::automation_share;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncSeekExt as _, AsyncWriteExt as _, ReadBuf, SeekFrom};
@@ -1037,12 +1040,20 @@ fn library_directory_components_safe(root: &Path, path: &Path) -> bool {
 fn direct_library_entries(
     root: &Path,
     directory: &Path,
-) -> (Vec<String>, Vec<serde_json::Value>, bool) {
+) -> io::Result<(Vec<String>, Vec<serde_json::Value>, bool)> {
+    direct_library_entries_page(root, directory, "", MAX_LIBRARY_DIRECTORY_ENTRIES)
+}
+
+fn direct_library_entries_page(
+    root: &Path,
+    directory: &Path,
+    after: &str,
+    limit: usize,
+) -> io::Result<(Vec<String>, Vec<serde_json::Value>, bool)> {
     let mut entries = BinaryHeap::new();
-    let Ok(read_dir) = std::fs::read_dir(directory) else {
-        return (Vec::new(), Vec::new(), false);
-    };
-    for entry in read_dir.flatten() {
+    let read_dir = std::fs::read_dir(directory)?;
+    for entry in read_dir {
+        let entry = entry?;
         let path = entry.path();
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
@@ -1068,18 +1079,18 @@ fn direct_library_entries(
         if !is_directory && !meta.file_type().is_file() {
             continue;
         }
-        entries.push((
-            relative.to_string_lossy().replace('\\', "/"),
-            is_directory,
-            meta.len(),
-        ));
-        if entries.len() > MAX_LIBRARY_DIRECTORY_ENTRIES + 1 {
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if relative.as_str() <= after {
+            continue;
+        }
+        entries.push((relative, is_directory, meta.len()));
+        if entries.len() > limit + 1 {
             entries.pop();
         }
     }
-    let truncated = entries.len() > MAX_LIBRARY_DIRECTORY_ENTRIES;
+    let truncated = entries.len() > limit;
     let mut entries = entries.into_sorted_vec();
-    entries.truncate(MAX_LIBRARY_DIRECTORY_ENTRIES);
+    entries.truncate(limit);
     let mut directories = Vec::new();
     let mut files = Vec::new();
     for (path, is_directory, bytes) in entries {
@@ -1089,7 +1100,7 @@ fn direct_library_entries(
             files.push(json!({ "path": path, "bytes": bytes }));
         }
     }
-    (directories, files, truncated)
+    Ok((directories, files, truncated))
 }
 
 fn list_library_directory(
@@ -1105,7 +1116,7 @@ fn list_library_directory(
         }
         return Err(());
     }
-    Ok(direct_library_entries(root, directory))
+    direct_library_entries(root, directory).map_err(|_| ())
 }
 
 fn search_library_dir(
@@ -1396,6 +1407,8 @@ pub struct AutomationTokenRequest {
     /// Optional library directory the token is confined to.
     #[serde(default)]
     directory: Option<String>,
+    #[serde(default = "automation::default_permissions")]
+    permissions: Vec<String>,
 }
 
 pub async fn list_automation_tokens(
@@ -1454,6 +1467,7 @@ pub async fn create_automation_token(
             Some(directory.trim_matches('/').to_owned())
         }
     };
+    let permissions = automation::validate_permissions(request.permissions)?;
     let raw = auth::random_token();
     let created_at = now_unix();
     let token = AutomationToken {
@@ -1462,6 +1476,7 @@ pub async fn create_automation_token(
         tenant: identity.tenant.clone(),
         label,
         directory,
+        permissions,
         created_at,
         expires_at: created_at.saturating_add(request.expires_days * 86_400),
         revoked_at: None,
@@ -1475,7 +1490,7 @@ pub async fn create_automation_token(
         &identity.subject,
         "automation_token_created",
         &token.id,
-        &json!({ "label": token.label, "expires_at": token.expires_at, "directory": token.directory }),
+        &json!({ "label": token.label, "expires_at": token.expires_at, "directory": token.directory, "permissions": token.permissions }),
     );
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
@@ -1568,6 +1583,7 @@ pub async fn create_outbound_grant(
             &paths,
             MAX_LIBRARY_PROJECT_FILES,
             GrantOptions {
+                automation: None,
                 label: request
                     .label
                     .filter(|label| !label.trim().is_empty())
@@ -1594,6 +1610,7 @@ pub async fn create_outbound_grant(
             paths,
             MAX_LIBRARY_SELECTION_FILES,
             GrantOptions {
+                automation: None,
                 label: request.label,
                 password_hash,
                 expires_days: request.expires_days,
@@ -1733,122 +1750,6 @@ pub async fn create_outbound_grant(
         .into_response())
 }
 
-#[derive(Deserialize)]
-pub struct AutomationShareRequest {
-    directory: String,
-    #[serde(default)]
-    label: Option<String>,
-    #[serde(default)]
-    password: Option<String>,
-    #[serde(default)]
-    max_downloads: Option<u64>,
-    #[serde(default)]
-    notify_on_download: bool,
-    expires_days: u64,
-}
-
-pub async fn automation_share(
-    State(app): State<Arc<App>>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
-    headers: HeaderMap,
-    Json(request): Json<AutomationShareRequest>,
-) -> ApiResult<Response> {
-    let ip = super::client_ip(&headers, &peer, &app.config.trusted_proxies);
-    // Refusals are audited so a leaked or revoked token being tried shows up
-    // in the log, not only as a silent 401 to the caller. The rate-limit
-    // branch is deliberately not audited: past the budget each request would
-    // otherwise cost an unauthenticated SQLite write.
-    let refused = |reason: &str| {
-        app.store.audit(
-            "",
-            "",
-            "automation_refused",
-            &ip,
-            &json!({ "reason": reason }),
-        );
-    };
-    if !app.automation_rate.allow(&ip) {
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many automation shares; try again later",
-        ));
-    }
-    let bearer =
-        automation_bearer(&headers).inspect_err(|_| refused("missing or malformed bearer"))?;
-    let token = app
-        .store
-        .authenticate_automation_token(&hash_token(&bearer), now_unix())
-        .map_err(super::store_unavailable)?
-        .ok_or_else(|| {
-            refused("unknown, expired, or revoked token");
-            ApiError::unauthorized()
-        })?;
-    let _operation = begin_outbound_operation(&app, &token.tenant)?;
-    // Length first: it needs no filesystem, and it bounds the audit subject
-    // below before the scope check can write it.
-    if request.directory.len() > MAX_LIBRARY_DIRECTORY_INPUT_BYTES {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "directory is too long",
-        ));
-    }
-    if let Some(scope) = token.directory.as_deref() {
-        if !within_scope(scope, &request.directory) {
-            app.store.audit(
-                &token.tenant,
-                &format!("automation:{}", token.id),
-                "automation_refused",
-                &request.directory,
-                &json!({ "reason": "directory outside token scope", "scope": scope }),
-            );
-            return Err(ApiError::new(
-                StatusCode::FORBIDDEN,
-                "directory is outside this token's scope",
-            ));
-        }
-    }
-    if !(1..=30).contains(&request.expires_days) {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "expires_days must be 1..=30",
-        ));
-    }
-    validate_max_downloads(request.max_downloads)?;
-    let directory_label = library_directory_label(&request.directory);
-    let directory = automation_directory(&app, &token.tenant, &request.directory)?;
-    let root = library_root(&app, &token.tenant);
-    let paths = tokio::task::spawn_blocking(move || {
-        enumerate_automation_files(&root, &directory, MAX_LIBRARY_PROJECT_FILES)
-    })
-    .await
-    .map_err(|_| ApiError::internal("enumerate outbound files failed"))??;
-    let identity = auth::AdminIdentity {
-        subject: format!("automation:{}", token.id),
-        tenant: token.tenant,
-        role: "admin".to_owned(),
-        grants: Vec::new(),
-        credential_version: 1,
-    };
-    create_library_grant(
-        &app,
-        &headers,
-        &identity,
-        &paths,
-        MAX_LIBRARY_PROJECT_FILES,
-        GrantOptions {
-            label: request
-                .label
-                .filter(|label| !label.trim().is_empty())
-                .or(Some(directory_label)),
-            password_hash: hash_optional_password(request.password.as_deref())?,
-            expires_days: request.expires_days,
-            max_downloads: request.max_downloads,
-            notify_on_download: request.notify_on_download,
-        },
-    )
-    .await
-}
-
 /// True when `directory` is `scope` or a path below it, comparing whole
 /// components so "project" does not admit "project-old".
 fn within_scope(scope: &str, directory: &str) -> bool {
@@ -1967,6 +1868,7 @@ fn enumerate_automation_files(
 }
 
 struct GrantOptions {
+    automation: Option<(crate::store::AutomationOperation, String)>,
     label: Option<String>,
     password_hash: Option<String>,
     expires_days: u64,
@@ -2084,14 +1986,22 @@ async fn create_library_grant(
         .collect::<ApiResult<Vec<_>>>()?;
     let first = files.first().cloned().ok_or_else(ApiError::not_found)?;
     let created_at = now_unix();
-    let token = auth::random_token();
+    let token = options
+        .automation
+        .as_ref()
+        .map(|(_, token)| token.clone())
+        .unwrap_or_else(auth::random_token);
     let label = options
         .label
         .unwrap_or_else(|| first.name.clone())
         .trim()
         .to_owned();
     let grant = OutboundGrant {
-        id: auth::random_token(),
+        id: options
+            .automation
+            .as_ref()
+            .map(|(op, _)| op.grant_id.clone())
+            .unwrap_or_else(auth::random_token),
         token_hash: hash_token(&token),
         tenant: identity.tenant.clone(),
         link_id: String::new(),
@@ -2128,7 +2038,10 @@ async fn create_library_grant(
             return Err(ApiError::not_found());
         }
         app.store
-            .insert_outbound_grant(grant.clone())
+            .insert_outbound_grant_with_operation(
+                grant.clone(),
+                options.automation.as_ref().map(|(op, _)| op),
+            )
             .map_err(ApiError::internal)?;
     }
     app.store.audit(
@@ -2136,12 +2049,12 @@ async fn create_library_grant(
         &identity.subject,
         "outbound_grant_created",
         &grant.id,
-        &json!({ "files": grant.files.len(), "notify_on_download": grant.notify_on_download }),
+        &json!({ "files": grant.files.len(), "notify_on_download": grant.notify_on_download, "operation_id": options.automation.as_ref().map(|(op, _)| &op.operation_id) }),
     );
     let base = admin::base_url(app, headers);
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({ "grant": public_grant(grant), "url": format!("{base}/s/{token}") })),
+        Json(json!({ "grant": public_grant(grant), "url": format!("{base}/s/{token}"), "operation_id": options.automation.as_ref().map(|(op, _)| &op.operation_id) })),
     )
         .into_response())
 }
@@ -4177,6 +4090,7 @@ fn public_automation_token(token: &AutomationToken) -> serde_json::Value {
         "tenant": token.tenant,
         "label": token.label,
         "directory": token.directory,
+        "permissions": token.permissions,
         "created_at": token.created_at,
         "expires_at": token.expires_at,
         "revoked_at": token.revoked_at,
@@ -7353,7 +7267,7 @@ mod tests {
             std::fs::write(directory.path().join(format!("file-{index:04}.bin")), b"x").unwrap();
         }
         let (directories, files, truncated) =
-            direct_library_entries(directory.path(), directory.path());
+            direct_library_entries(directory.path(), directory.path()).unwrap();
         assert!(directories.is_empty());
         assert_eq!(files.len(), MAX_LIBRARY_DIRECTORY_ENTRIES);
         assert!(truncated);

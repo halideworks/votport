@@ -139,6 +139,8 @@ pub struct ApiError {
     status: StatusCode,
     message: String,
     content_range: Option<String>,
+    code: &'static str,
+    retry_after_seconds: Option<u64>,
 }
 
 impl ApiError {
@@ -147,7 +149,29 @@ impl ApiError {
             status,
             message: message.into(),
             content_range: None,
+            retry_after_seconds: None,
+            code: match status.as_u16() {
+                400 | 422 => "invalid_request",
+                401 => "unauthorized",
+                403 => "forbidden",
+                404 => "not_found",
+                409 => "conflict",
+                413 => "too_large",
+                429 => "rate_limited",
+                503 => "unavailable",
+                _ => "request_failed",
+            },
         }
+    }
+
+    pub fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after_seconds = Some(seconds);
+        self
+    }
+
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.code = code;
+        self
     }
 
     fn unauthorized() -> Self {
@@ -175,7 +199,18 @@ impl From<SessionError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let range = self.content_range;
-        let mut response = (self.status, Json(json!({ "error": self.message }))).into_response();
+        let retryable =
+            self.status == StatusCode::TOO_MANY_REQUESTS || self.status.is_server_error();
+        let mut response = (
+            self.status,
+            Json(json!({ "error": self.message, "code": self.code, "retryable": retryable, "retry_after_seconds": self.retry_after_seconds })),
+        )
+            .into_response();
+        if let Some(seconds) = self.retry_after_seconds {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+        }
         if let Some(range) = range {
             if let Ok(value) = HeaderValue::try_from(range) {
                 response.headers_mut().insert(header::CONTENT_RANGE, value);

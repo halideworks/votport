@@ -43,6 +43,31 @@
         <TextBlock x:Name="PortProblem" Visibility="Collapsed" TextWrapping="Wrap" />
       </StackPanel>
 
+      <Expander x:Name="AgentAccess" Header="Agent access" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" Expanding="AgentAccess_Expanding" Collapsed="AgentAccess_Collapsed" Visibility="Collapsed">
+        <StackPanel Spacing="8">
+          <TextBlock Text="Give an agent access to a library folder and the deliveries it creates." TextWrapping="Wrap" />
+          <TextBox x:Name="AgentLabel" Header="Agent label" MaxLength="100" />
+          <TextBox x:Name="AgentDirectory" Header="Library folder (required)" MaxLength="512" />
+          <TextBox x:Name="AgentDays" Header="Expires after (days, 1 to 365)" Text="30" />
+          <CheckBox x:Name="AgentBrowse" Content="Browse files" IsChecked="True" />
+          <CheckBox x:Name="AgentCreate" Content="Create delivery links" IsChecked="True" />
+          <CheckBox x:Name="AgentActivity" Content="Read delivery activity and receipts" IsChecked="True" />
+          <CheckBox x:Name="AgentRevoke" Content="Revoke its delivery links" />
+          <StackPanel Orientation="Horizontal" Spacing="8">
+            <Button x:Name="AgentIssue" Content="Issue token" Click="AgentIssue_Click" />
+            <Button Content="Refresh" Click="AgentRefresh_Click" />
+          </StackPanel>
+          <StackPanel x:Name="AgentResult" Visibility="Collapsed" Spacing="8">
+            <TextBlock Text="Copy this token now. It is shown only once." />
+            <TextBox x:Name="AgentTokenValue" Header="Token" IsReadOnly="True" />
+            <Button Content="Copy token" Click="AgentCopy_Click" />
+            <Button Content="Copy MCP configuration" Click="AgentConfig_Click" />
+          </StackPanel>
+          <TextBlock x:Name="AgentProblem" TextWrapping="Wrap" Visibility="Collapsed" />
+          <StackPanel x:Name="AgentTokens" Spacing="12" />
+        </StackPanel>
+      </Expander>
+
       <!-- Watch folders -->
       <StackPanel Padding="14" Spacing="8" Background="{ThemeResource VotPanelBrush}" CornerRadius="8">
         <TextBlock Text="WATCH FOLDERS" Style="{StaticResource SectionLabel}" Margin="0" />

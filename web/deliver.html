@@ -125,10 +125,10 @@
       <button id="outbound-grants-load-more" type="button" hidden>Load more</button>
 
       <details>
-        <summary>Automation tokens</summary>
+        <summary>Agent access and automation tokens</summary>
         <section class="card" aria-labelledby="automation-token-create-title">
           <h2 id="automation-token-create-title">Create automation token</h2>
-          <p class="muted">This token can create download links for this tenant only and, if a folder is set, only under that folder.</p>
+          <p class="muted">Choose what this agent may do in this tenant. Delivery access is limited to links created by this token.</p>
           <form id="automation-token-form">
             <div class="grid">
               <label>Label
@@ -141,6 +141,13 @@
                 <input id="automation-token-directory" class="mono" maxlength="512" placeholder="any folder" />
               </label>
             </div>
+            <fieldset id="automation-token-permissions">
+              <legend>Allowed actions</legend>
+              <label><input type="checkbox" value="library:read" checked /> Browse files in the folder</label>
+              <label><input type="checkbox" value="deliveries:create" checked /> Create delivery links</label>
+              <label><input type="checkbox" value="deliveries:read" checked /> Read delivery activity and receipts</label>
+              <label><input type="checkbox" value="deliveries:revoke" /> Revoke its delivery links</label>
+            </fieldset>
             <button type="submit" id="automation-token-submit">Issue token</button>
             <p id="automation-token-error" class="error" role="alert" hidden></p>
           </form>
@@ -152,6 +159,12 @@
           </label>
           <button id="automation-token-copy" type="button">Copy token</button>
           <p id="automation-token-note" class="muted">Copy it now. This raw token is shown once and cannot be retrieved later.</p>
+          <details>
+            <summary>Connect an MCP client</summary>
+            <p class="muted">Use the Votport client CLI as the command. This configuration contains your token; keep it private.</p>
+            <pre id="automation-mcp-config" class="mono"></pre>
+            <button id="automation-mcp-copy" type="button">Copy MCP configuration</button>
+          </details>
         </div>
         <div id="automation-tokens" aria-live="polite"></div>
       </details>

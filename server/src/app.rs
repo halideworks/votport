@@ -92,6 +92,7 @@ pub struct App {
     pub outbound_grant_permits: Arc<tokio::sync::Semaphore>,
     /// Per-IP rate limit on automation share creation.
     pub automation_rate: crate::api::session_rate::SessionRate,
+    pub automation_read_rate: crate::api::session_rate::SessionRate,
     /// Grants currently preparing or streaming, capped globally and per grant.
     pub outbound_active: Mutex<HashSet<String>>,
     /// Concurrent byte reservations for outbound staging on the data filesystem.
@@ -833,6 +834,7 @@ fn build_under_lease(
             crate::api::outbound::LIBRARY_GRANT_CONCURRENCY,
         )),
         automation_rate: crate::api::session_rate::SessionRate::with_limit(60),
+        automation_read_rate: crate::api::session_rate::SessionRate::with_limit(6000),
         outbound_active: Mutex::new(HashSet::new()),
         outbound_stage_budget: Arc::new(crate::api::outbound::StageBudget::new()),
         staging_permits: Arc::new(tokio::sync::Semaphore::new(
@@ -2452,7 +2454,27 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/s/{token}/fetch", post(api::serve::mint_fetch))
         .route("/api/s/{token}/bundle", get(api::outbound::outbound_bundle))
         .route("/api/s/{token}/batch", get(api::outbound::outbound_batch))
-        .route("/api/automation/share", post(api::automation_share))
+        .nest(
+            "/api/automation",
+            Router::new()
+                .route("/share", post(api::automation_share))
+                .route("/session", get(api::outbound::automation::session))
+                .route("/files", get(api::outbound::automation::files))
+                .route("/deliveries", get(api::outbound::automation::deliveries))
+                .route(
+                    "/deliveries/{id}",
+                    get(api::outbound::automation::delivery)
+                        .delete(api::outbound::automation::revoke),
+                )
+                .route("/operations/{id}", get(api::outbound::automation::recover))
+                .layer(axum::middleware::map_response(
+                    api::outbound::automation::normalize_response,
+                ))
+                .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+                    axum::http::header::CACHE_CONTROL,
+                    axum::http::HeaderValue::from_static("no-store"),
+                )),
+        )
         .route("/api/s/{token}/receipt", get(api::outbound_receipt))
         .route(
             "/api/s/{token}/file",

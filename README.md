@@ -308,6 +308,15 @@ Senders can drop folders as well as files; browser support requires
 WebAssembly SIMD and module workers (Safari 16.4, Chrome 91, Firefox 114 or
 newer).
 
+### Agent access
+
+Agents can browse a scoped library folder, create and recover expiring delivery
+links, inspect object identities and download activity, and revoke their own
+links. Issue a token with explicit permissions from **Deliver** or the desktop
+app's **Settings > Agent access**. The client CLI provides JSON `agent` commands
+and `votport mcp`; desktop builds bundle the CLI and can copy its MCP
+configuration. See [agent setup, API, and retry semantics](docs/agents.md).
+
 ### Automation shares
 
 Create a tenant-scoped automation token on **Deliver**. The raw token is shown
@@ -451,9 +460,6 @@ Native push remains disabled unless `VOTPORT_PUSH_BIND` is set. Browser uploads 
 Product next, each as its own design first:
 
 * Content dedup when two entries share an object root
-* Automation tokens beyond `POST /api/automation/share` (tokens are per
-  tenant, expiring, revocable, rate limited, optionally confined to a library
-  folder, with use and refusal audited)
 * Legal hold versus upload retention (a do-not-sweep flag)
 
 Not on the table: Postgres, a second store backend, horizontal replicas, SAML.

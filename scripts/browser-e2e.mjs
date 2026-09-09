@@ -464,6 +464,42 @@ const currentDirectory = await page.textContent('#library-breadcrumbs [aria-curr
 if (currentDirectory !== PROJECT) {
   throw new Error(`scoped library breadcrumb: ${currentDirectory}`);
 }
+
+await page.getByText("Agent access and automation tokens", { exact: true }).click();
+await page.fill("#automation-token-label", `browser agent ${run}`);
+await page.fill("#automation-token-directory", PROJECT);
+await page.uncheck('#automation-token-permissions input[value="deliveries:create"]');
+await page.uncheck('#automation-token-permissions input[value="deliveries:read"]');
+await page.click("#automation-token-submit");
+await page.waitForSelector("#automation-token-result:not([hidden])");
+const agentToken = await page.inputValue("#automation-token-value");
+const agentConfig = JSON.parse(await page.textContent("#automation-mcp-config"));
+if (agentConfig.mcpServers.votport.env.VOTPORT_AUTOMATION_TOKEN !== agentToken ||
+    agentConfig.mcpServers.votport.env.VOTPORT_URL !== base ||
+    agentConfig.mcpServers.votport.args[0] !== "mcp") {
+  throw new Error("agent MCP configuration does not match the issued token and server");
+}
+const agentHeaders = { Authorization: `Bearer ${agentToken}` };
+const access = await (await page.request.get(`${base}/api/automation/session`, { headers: agentHeaders })).json();
+if (access.automation_token.directory !== PROJECT ||
+    JSON.stringify(access.automation_token.permissions) !== '["library:read"]') {
+  throw new Error("agent token does not have the selected folder and permissions");
+}
+const agentFiles = await (await page.request.get(`${base}/api/automation/files?limit=1`, { headers: agentHeaders })).json();
+if (agentFiles.files.length !== 1 || !agentFiles.has_more) throw new Error("agent file pagination failed");
+const refusedShare = await page.request.post(`${base}/api/automation/share`, {
+  headers: agentHeaders, data: { directory: PROJECT, expires_days: 7, operation_id: `browser-${run}` },
+});
+if (refusedShare.status() !== 403) throw new Error("browse-only token created a delivery");
+const agentCard = page.locator("#automation-tokens .card").filter({ has: page.getByRole("heading", { name: `browser agent ${run}`, exact: true }) });
+await agentCard.getByRole("button", { name: "Revoke", exact: true }).click();
+await page.click("#confirm-ok");
+await agentCard.locator(".badge").filter({ hasText: "revoked" }).waitFor();
+const revokedAccess = await page.request.get(`${base}/api/automation/session`, { headers: agentHeaders });
+if (revokedAccess.status() !== 401) throw new Error("revoked agent token still authenticates");
+await page.getByText("Agent access and automation tokens", { exact: true }).click();
+console.log("agent access: selected permissions, MCP config, pagination, and revocation ok");
+
 const projectFiles = await page.$$eval("#library-files .library-file:not(.library-folder) .mono", (els) =>
   els.map((el) => el.textContent).sort(),
 );

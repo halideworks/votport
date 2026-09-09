@@ -12,8 +12,17 @@ async fn main() {
     let mut arguments = std::env::args().skip(1);
     let command = arguments.next();
     if command.as_deref() == Some("share") {
-        if let Err(error) = share(arguments.collect()).await {
-            eprintln!("{error}");
+        let arguments: Vec<String> = arguments.collect();
+        let json = arguments.iter().any(|arg| arg == "--json");
+        if let Err(error) = share(arguments).await {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"error": error, "code": "command_failed"})
+                );
+            } else {
+                eprintln!("{error}");
+            }
             std::process::exit(2);
         }
         return;
@@ -105,6 +114,8 @@ struct ShareArgs {
     expires_days: u64,
     label: Option<String>,
     max_downloads: Option<u64>,
+    operation_id: Option<String>,
+    json: bool,
 }
 
 fn parse_share_args(arguments: Vec<String>) -> Result<ShareArgs, String> {
@@ -112,9 +123,28 @@ fn parse_share_args(arguments: Vec<String>) -> Result<ShareArgs, String> {
     let mut expires_days = 7;
     let mut label = None;
     let mut max_downloads = None;
+    let mut operation_id = None;
+    let mut json = false;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
+            "--json" => json = true,
+            "--operation-id" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--operation-id requires a value".to_owned())?;
+                if value.is_empty()
+                    || value.len() > 128
+                    || matches!(value.as_str(), "." | "..")
+                    || !value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+                {
+                    return Err("--operation-id must contain 1..=128 letters, digits, dots, hyphens or underscores".to_owned());
+                }
+                operation_id = Some(value);
+            }
+
             "--expires" => {
                 let value = arguments
                     .next()
@@ -172,6 +202,8 @@ fn parse_share_args(arguments: Vec<String>) -> Result<ShareArgs, String> {
         expires_days,
         label,
         max_downloads,
+        operation_id,
+        json,
     })
 }
 
@@ -214,6 +246,7 @@ async fn share(arguments: Vec<String>) -> Result<(), String> {
         .ok()
         .filter(|value| !value.is_empty());
     let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(30 * 60))
         .build()
         .map_err(|error| format!("create HTTP client: {error}"))?;
@@ -226,6 +259,7 @@ async fn share(arguments: Vec<String>) -> Result<(), String> {
             "label": request.label,
             "password": password,
             "max_downloads": request.max_downloads,
+            "operation_id": request.operation_id,
         }))
         .send()
         .await
@@ -244,7 +278,11 @@ async fn share(arguments: Vec<String>) -> Result<(), String> {
     let url = body["url"]
         .as_str()
         .ok_or_else(|| "share response did not include a URL".to_owned())?;
-    println!("{url}");
+    if request.json {
+        println!("{body}");
+    } else {
+        println!("{url}");
+    }
     Ok(())
 }
 
@@ -285,6 +323,9 @@ mod cli_tests {
                 "14d".to_owned(),
                 "--label".to_owned(),
                 "Client delivery".to_owned(),
+                "--operation-id".to_owned(),
+                "render-001".to_owned(),
+                "--json".to_owned(),
             ])
             .unwrap(),
             ShareArgs {
@@ -292,12 +333,22 @@ mod cli_tests {
                 expires_days: 14,
                 label: Some("Client delivery".to_owned()),
                 max_downloads: None,
+                operation_id: Some("render-001".to_owned()),
+                json: true,
             }
         );
     }
 
     #[test]
     fn share_arguments_reject_escape_and_bad_expiry() {
+        for id in ["", ".", "..", "x/y", "has space", &"a".repeat(129)] {
+            assert!(parse_share_args(vec![
+                "project".to_owned(),
+                "--operation-id".to_owned(),
+                id.to_owned(),
+            ])
+            .is_err());
+        }
         assert!(parse_share_args(vec!["../project".to_owned()]).is_err());
         assert!(parse_share_args(vec!["/project".to_owned()]).is_err());
         assert!(parse_share_args(vec![

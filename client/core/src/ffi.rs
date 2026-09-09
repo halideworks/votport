@@ -2055,3 +2055,25 @@ mod large_sequence_benchmark {
         }
     }
 }
+
+#[uniffi::export]
+pub fn automation_tokens() -> std::result::Result<Vec<port::AutomationToken>, port::PortError> {
+    port::automation_tokens().map_err(port::PortError::from)
+}
+
+#[uniffi::export]
+pub fn create_automation_token(
+    spec: port::AutomationTokenSpec,
+) -> std::result::Result<port::IssuedAutomationToken, port::PortError> {
+    port::create_automation_token(spec).map_err(port::PortError::from)
+}
+
+#[uniffi::export]
+pub fn revoke_automation_token(id: String) -> std::result::Result<(), port::PortError> {
+    port::revoke_automation_token(&id).map_err(port::PortError::from)
+}
+
+#[uniffi::export]
+pub fn automation_mcp_config(command: String, base: String, token: String) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({"mcpServers": {"votport": {"command": command, "args": ["mcp"], "env": {"VOTPORT_URL": base, "VOTPORT_AUTOMATION_TOKEN": token}}}})).unwrap()
+}

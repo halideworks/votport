@@ -7,6 +7,7 @@
 //! hashing every file to the root the delivery announced before it lands.
 
 pub mod api;
+pub mod automation;
 pub mod entries;
 pub mod error;
 pub mod fetch;
