@@ -25,6 +25,7 @@ public static class Notifier
             var toast = new AppNotificationBuilder()
                 .AddText(item.Subject)
                 .AddText(Format.StatusLine(item))
+                .SetAudioUri(new Uri("ms-appx:///Assets/completion.wav"))
                 .BuildNotification();
             AppNotificationManager.Default.Show(toast);
         }

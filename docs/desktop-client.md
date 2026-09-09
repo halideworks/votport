@@ -982,3 +982,8 @@ runtime SIMD dispatch. In the 100,000-file validation, each unique file held
 256 bytes: Windows completed in 8m07s and Mac in 7m06s. Every output file passed
 an independent SHA-256 comparison. A separate 12 GB fixture also passed on both
 platforms. Mac used a 1 Gbps link for these checks.
+
+Completion notifications on Windows and macOS use the same quiet two-note chime.
+The sound is bundled with the app and played by the native notification system,
+so system notification permissions and sound settings still apply. Turning off
+transfer notifications in the app disables these notifications and their sound.
