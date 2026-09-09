@@ -1302,3 +1302,65 @@ mod tests {
         );
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct AutomationToken {
+    pub id: String,
+    pub label: String,
+    pub directory: Option<String>,
+    pub permissions: Vec<String>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub revoked_at: Option<u64>,
+    pub last_used_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, uniffi::Record)]
+pub struct AutomationTokenSpec {
+    pub label: String,
+    pub directory: Option<String>,
+    pub expires_days: u32,
+    pub permissions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, uniffi::Record)]
+pub struct IssuedAutomationToken {
+    pub token: String,
+    pub automation_token: AutomationToken,
+}
+
+pub fn automation_tokens() -> Result<Vec<AutomationToken>> {
+    #[derive(Deserialize)]
+    struct Tokens {
+        tokens: Vec<AutomationToken>,
+    }
+    run(|client, cookie| {
+        client
+            .admin_get::<Tokens>("/api/admin/automation-tokens", cookie)
+            .map(|reply| reply.tokens)
+    })
+}
+
+pub fn create_automation_token(spec: AutomationTokenSpec) -> Result<IssuedAutomationToken> {
+    run(|client, cookie| {
+        client.admin_send(
+            reqwest::Method::POST,
+            "/api/admin/automation-tokens",
+            cookie,
+            Some(&serde_json::to_value(&spec).map_err(|e| Error::Other(e.to_string()))?),
+        )
+    })
+}
+
+pub fn revoke_automation_token(id: &str) -> Result<()> {
+    run(|client, cookie| {
+        client
+            .admin_send::<serde_json::Value>(
+                reqwest::Method::DELETE,
+                &format!("/api/admin/automation-tokens/{}", url_segment(id)),
+                cookie,
+                None,
+            )
+            .map(|_| ())
+    })
+}

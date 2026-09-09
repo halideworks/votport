@@ -10,7 +10,7 @@ $project = "$here\Votport"
 
 Push-Location $client
 try {
-    cargo build --release -p votport-client-core
+    cargo build --release -p votport-client-core -p votport-client
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
     uniffi-bindgen-cs --library "$target\release\votport_client_core.dll" --out-dir "$target\bindings-cs"
     if ($LASTEXITCODE -ne 0) { throw "uniffi-bindgen-cs failed" }
@@ -20,4 +20,5 @@ try {
 New-Item -ItemType Directory -Force "$project\Generated" | Out-Null
 Copy-Item "$target\bindings-cs\votport_client_core.cs" "$project\Generated\"
 Copy-Item "$target\release\votport_client_core.dll" "$project\Generated\"
+Copy-Item "$target\release\votport.exe" "$project\Generated\votport-cli.exe"
 Write-Host "core ready in $project\Generated"

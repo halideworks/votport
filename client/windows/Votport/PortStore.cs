@@ -21,7 +21,8 @@ public sealed class PortStore
     /// The last failure's headline, for the line under the form that made
     /// the call, named by ProblemScope.
     public string? Problem { get; private set; }
-    public enum Scope { Port, Watch, Links, Deliver }
+    public enum Scope { Port, Watch, Links, Deliver, Agents }
+    internal IReadOnlyList<AutomationToken> AutomationTokens { get; private set; } = Array.Empty<AutomationToken>();
     public Scope ProblemScope { get; private set; }
 
     /// The headline to show under a form, when the failure was its own.
@@ -131,6 +132,7 @@ public sealed class PortStore
         Run(Scope.Port, () => { previous?.Cancel(); VotportClientCoreMethods.SignOut(); return true; }, _ =>
         {
             Port = null;
+            AutomationTokens = Array.Empty<AutomationToken>();
             Requests.Clear();
             Deliveries.Clear();
         });
@@ -182,6 +184,30 @@ public sealed class PortStore
             Problem = null;
             done(issued);
         }, () => done(null));
+
+    public void RefreshAutomationTokens()
+    {
+        var expected = Port;
+        Run(Scope.Agents, () => VotportClientCoreMethods.AutomationTokens(), tokens =>
+        {
+            if (Port == expected) AutomationTokens = tokens;
+        });
+    }
+
+    internal void CreateAutomationToken(AutomationTokenSpec spec, Action<IssuedAutomationToken?> done)
+    {
+        var expected = Port;
+        Run(Scope.Agents, () => VotportClientCoreMethods.CreateAutomationToken(spec), issued =>
+        {
+            if (Port != expected) { done(null); return; }
+            AutomationTokens = AutomationTokens.Append(issued.AutomationToken).ToArray();
+            done(issued);
+        }, () => done(null));
+    }
+
+    public void RevokeAutomationToken(string id) => Run(Scope.Agents,
+        () => { VotportClientCoreMethods.RevokeAutomationToken(id); return true; },
+        _ => RefreshAutomationTokens());
 
     public void AddWatch(string dir, string link, string? password, Action<bool> done) =>
         Run(Scope.Watch, () => VotportClientCoreMethods.AddWatch(dir, link, password), _ =>
@@ -235,6 +261,7 @@ public sealed class PortStore
                     if (signedOut)
                     {
                         Port = null;
+                        AutomationTokens = Array.Empty<AutomationToken>();
                         Requests.Clear();
                         Deliveries.Clear();
                     }

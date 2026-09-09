@@ -24,6 +24,7 @@ struct SettingsView: View {
                     .foregroundStyle(Tokens.muted)
 
                 HomePortSection()
+                if port.signedIn { AgentAccessSection() }
 
                 WatchFoldersSection()
 
@@ -268,6 +269,89 @@ struct WatchFoldersSection: View {
         panel.prompt = "Watch"
         if panel.runModal() == .OK {
             folder = panel.url
+        }
+    }
+}
+
+
+struct AgentAccessSection: View {
+    @EnvironmentObject private var port: PortStore
+    @State private var expanded = false
+    @State private var label = ""
+    @State private var directory = ""
+    @State private var days = 30
+    @State private var browse = true
+    @State private var create = true
+    @State private var activity = true
+    @State private var revoke = false
+    @State private var issued: IssuedAutomationToken?
+    @State private var revokeId: String?
+
+    private var permissions: [String] {
+        [("library:read", browse), ("deliveries:create", create), ("deliveries:read", activity), ("deliveries:revoke", revoke)].compactMap { $0.1 ? $0.0 : nil }
+    }
+
+    var body: some View {
+        DisclosureGroup("Agent access", isExpanded: $expanded) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Give an agent access to a library folder and the deliveries it creates.")
+                    .font(Type.caption).foregroundStyle(Tokens.muted)
+                TextField("Agent label", text: $label).textFieldStyle(.roundedBorder)
+                TextField("Library folder (required)", text: $directory).textFieldStyle(.roundedBorder)
+                Stepper("Expires after \(days) days", value: $days, in: 1...365)
+                Toggle("Browse files", isOn: $browse)
+                Toggle("Create delivery links", isOn: $create)
+                Toggle("Read delivery activity and receipts", isOn: $activity)
+                Toggle("Revoke its delivery links", isOn: $revoke)
+                HStack {
+                    Button("Issue token") {
+                        port.createAutomationToken(AutomationTokenSpec(label: label, directory: directory, expiresDays: UInt32(days), permissions: permissions)) { result in
+                            if let result { issued = result }
+                        }
+                    }.disabled(port.busy || label.trimmingCharacters(in: .whitespaces).isEmpty || directory.trimmingCharacters(in: .whitespaces).isEmpty || permissions.isEmpty)
+                    Button("Refresh") { port.refreshAutomationTokens() }.disabled(port.busy)
+                }
+                if let issued {
+                    Text("Copy this token now. It is shown only once.").font(Type.caption)
+                    Text(issued.token).font(Type.monoBody).textSelection(.enabled)
+                    Button("Copy token") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(issued.token, forType: .string)
+                    }
+                    if let command = Bundle.main.url(forResource: "votport-cli", withExtension: nil), let base = port.port?.base {
+                        Button("Copy MCP configuration") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(automationMcpConfig(command: command.path, base: base, token: issued.token), forType: .string)
+                        }
+                    }
+                }
+                if let problem = port.problem(for: .agents) {
+                    Text(problem).foregroundStyle(Tokens.danger)
+                }
+                ForEach(port.automationTokens, id: \.id) { token in
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack {
+                            Text(token.label)
+                            Spacer()
+                            if token.revokedAt == nil {
+                                Button("Revoke token", role: .destructive) { revokeId = token.id }.disabled(port.busy)
+                                    .accessibilityLabel("Revoke token for \(token.label)")
+                            } else { Text("Revoked").foregroundStyle(Tokens.muted) }
+                        }
+                        Text(token.directory ?? "Any folder").font(Type.monoBody)
+                        Text(token.permissions.map { ["library:read": "Browse files", "deliveries:create": "Create deliveries", "deliveries:read": "Read activity", "deliveries:revoke": "Revoke deliveries"][$0] ?? $0 }.joined(separator: ", ")).font(Type.caption)
+                        Text("Expires \(Date(timeIntervalSince1970: Double(token.expiresAt)).formatted())").font(Type.caption)
+                        if let at = token.lastUsedAt {
+                            Text("Last used \(Date(timeIntervalSince1970: Double(at)).formatted())").font(Type.caption)
+                        }
+                    }
+                }
+            }.padding(.top, 10)
+        }
+        .padding(14).background(Tokens.panel).clipShape(RoundedRectangle(cornerRadius: 8))
+        .onChange(of: expanded) { _, open in if open { port.refreshAutomationTokens() } else { issued = nil } }
+        .confirmationDialog("Revoke this agent's token? Its automation will stop working.", isPresented: Binding(get: { revokeId != nil }, set: { if !$0 { revokeId = nil } })) {
+            Button("Revoke token", role: .destructive) { if let id = revokeId { port.revokeAutomationToken(id) }; revokeId = nil }
         }
     }
 }

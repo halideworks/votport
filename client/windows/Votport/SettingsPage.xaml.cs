@@ -35,6 +35,37 @@ public sealed partial class SettingsPage : Page
         ClearButton.Visibility = folder.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
 
         var port = PortStore.Shared;
+        AgentAccess.Visibility = port.SignedIn ? Visibility.Visible : Visibility.Collapsed;
+        AgentIssue.IsEnabled = !port.Busy;
+        if (!port.SignedIn) { AgentTokenValue.Text = ""; AgentResult.Visibility = Visibility.Collapsed; }
+        var agentProblem = port.ProblemFor(PortStore.Scope.Agents);
+        AgentProblem.Text = agentProblem ?? "";
+        AgentProblem.Visibility = agentProblem is null ? Visibility.Collapsed : Visibility.Visible;
+        AgentProblem.Foreground = Theme.Brush(this, "VotDanger");
+        AgentTokens.Children.Clear();
+        if (port.SignedIn) foreach (var token in port.AutomationTokens)
+        {
+            var row = new StackPanel { Spacing = 3 };
+            row.Children.Add(new TextBlock { Text = token.Label });
+            row.Children.Add(new TextBlock { Text = token.Directory ?? "Any folder" });
+            row.Children.Add(new TextBlock { Text = string.Join(", ", token.Permissions.Select(p => p switch { "library:read" => "Browse files", "deliveries:create" => "Create deliveries", "deliveries:read" => "Read activity", "deliveries:revoke" => "Revoke deliveries", _ => p })), TextWrapping = TextWrapping.Wrap });
+            row.Children.Add(new TextBlock { Text = $"Expires {DateTimeOffset.FromUnixTimeSeconds((long)token.ExpiresAt):g}" });
+            if (token.LastUsedAt is ulong used) row.Children.Add(new TextBlock { Text = $"Last used {DateTimeOffset.FromUnixTimeSeconds((long)used):g}" });
+            if (token.RevokedAt is not null) row.Children.Add(new TextBlock { Text = "Revoked" });
+            else
+            {
+                var button = new Button { Content = "Revoke token", IsEnabled = !port.Busy };
+                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(button, $"Revoke token for {token.Label}");
+                button.Click += async (_, _) =>
+                {
+                    var confirm = new ContentDialog { XamlRoot = XamlRoot, Title = "Revoke agent token", Content = "This agent's automation will stop working.", PrimaryButtonText = "Revoke", CloseButtonText = "Cancel" };
+                    if (await confirm.ShowAsync() == ContentDialogResult.Primary) port.RevokeAutomationToken(token.Id);
+                };
+                row.Children.Add(button);
+            }
+            AgentTokens.Children.Add(row);
+        }
+
         SignedOut.Visibility = port.SignedIn ? Visibility.Collapsed : Visibility.Visible;
         SignedIn.Visibility = port.SignedIn ? Visibility.Visible : Visibility.Collapsed;
         if (port.Port is Port signed)
@@ -71,6 +102,48 @@ public sealed partial class SettingsPage : Page
             item.Click += (_, _) => WatchLinkBox.Text = request.Url;
             ShipToMenu.Items.Add(item);
         }
+    }
+
+    private void AgentAccess_Expanding(Expander sender, ExpanderExpandingEventArgs args) => PortStore.Shared.RefreshAutomationTokens();
+    private void AgentAccess_Collapsed(Expander sender, ExpanderCollapsedEventArgs args)
+    {
+        AgentTokenValue.Text = "";
+        AgentResult.Visibility = Visibility.Collapsed;
+    }
+    private void AgentRefresh_Click(object sender, RoutedEventArgs e) => PortStore.Shared.RefreshAutomationTokens();
+    private void AgentCopy_Click(object sender, RoutedEventArgs e)
+    {
+        var data = new Windows.ApplicationModel.DataTransfer.DataPackage();
+        data.SetText(AgentTokenValue.Text);
+        Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(data);
+    }
+    private void AgentConfig_Click(object sender, RoutedEventArgs e)
+    {
+        if (PortStore.Shared.Port is not Port port) return;
+        var config = VotportClientCoreMethods.AutomationMcpConfig(System.IO.Path.Combine(AppContext.BaseDirectory, "votport-cli.exe"), port.Base, AgentTokenValue.Text);
+        var data = new Windows.ApplicationModel.DataTransfer.DataPackage();
+        data.SetText(config);
+        Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(data);
+    }
+    private void AgentIssue_Click(object sender, RoutedEventArgs e)
+    {
+        var permissions = new List<string>();
+        if (AgentBrowse.IsChecked == true) permissions.Add("library:read");
+        if (AgentCreate.IsChecked == true) permissions.Add("deliveries:create");
+        if (AgentActivity.IsChecked == true) permissions.Add("deliveries:read");
+        if (AgentRevoke.IsChecked == true) permissions.Add("deliveries:revoke");
+        if (AgentLabel.Text.Trim().Length == 0 || AgentDirectory.Text.Trim().Length == 0 || !uint.TryParse(AgentDays.Text, out var days) || days is < 1 or > 365 || permissions.Count == 0)
+        {
+            AgentProblem.Text = "Enter a label, folder, expiry from 1 to 365 days, and at least one allowed action.";
+            AgentProblem.Visibility = Visibility.Visible;
+            return;
+        }
+        PortStore.Shared.CreateAutomationToken(new AutomationTokenSpec(AgentLabel.Text.Trim(), AgentDirectory.Text.Trim(), days, permissions.ToArray()), issued =>
+        {
+            if (issued is null) return;
+            AgentTokenValue.Text = issued.Token;
+            AgentResult.Visibility = Visibility.Visible;
+        });
     }
 
     private void SignIn_Click(object sender, RoutedEventArgs e)

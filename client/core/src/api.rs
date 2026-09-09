@@ -673,6 +673,28 @@ impl Client {
         })?;
         json(response, path).map_err(signed_out)
     }
+
+    pub(crate) fn automation(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        token: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let mut request = self
+            .http
+            .request(method, self.url(path))
+            .bearer_auth(token)
+            .timeout(std::time::Duration::from_secs(30 * 60));
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request.send().map_err(|source| Error::Http {
+            url: path.to_owned(),
+            source,
+        })?;
+        json(response, path)
+    }
 }
 
 /// The server's answer to one outbound chunk.

@@ -22,6 +22,12 @@ import {
 import { startStatusPoll } from '/assets/status-strip.js';
 
 const $ = (id) => document.getElementById(id);
+const permissionLabels = {
+  'library:read': 'browse files',
+  'deliveries:create': 'create deliveries',
+  'deliveries:read': 'read delivery activity',
+  'deliveries:revoke': 'revoke deliveries',
+};
 
 function grantStatus(grant) {
   if (grant.revoked_at) return 'revoked';
@@ -69,6 +75,7 @@ function renderAutomationTokens(tokens) {
         ? `last used ${formatWhen(token.last_used_at)}`
         : 'never used',
       token.directory ? `folder ${token.directory}` : 'any folder',
+      token.permissions.map((permission) => permissionLabels[permission] || permission).join(', '),
     ];
     meta.textContent = parts.join(' · ');
     card.append(meta);
@@ -693,18 +700,27 @@ $('automation-token-form').addEventListener('submit', async (event) => {
     error.hidden = false;
     return;
   }
+  const permissions = [...$('automation-token-permissions').querySelectorAll('input:checked')].map((input) => input.value);
+  if (!permissions.length) {
+    error.textContent = 'Choose at least one allowed action.';
+    error.hidden = false;
+    return;
+  }
   const submit = $('automation-token-submit');
   submit.disabled = true;
   try {
     const response = await api('/api/admin/automation-tokens', {
       method: 'POST',
-      body: JSON.stringify({ label, expires_days: expires, directory: directory || null }),
+      body: JSON.stringify({ label, expires_days: expires, directory: directory || null, permissions }),
     });
     if (!response.token) throw new Error('server did not return the automation token');
     $('automation-token-form').reset();
     $('automation-token-value').value = response.token;
     $('automation-token-result').hidden = false;
     $('automation-token-copy').onclick = () => copyToClipboard($('automation-token-copy'), response.token);
+    const config = JSON.stringify({ mcpServers: { votport: { command: 'votport', args: ['mcp'], env: { VOTPORT_URL: window.location.origin, VOTPORT_AUTOMATION_TOKEN: response.token } } } }, null, 2);
+    $('automation-mcp-config').textContent = config;
+    $('automation-mcp-copy').onclick = () => copyToClipboard($('automation-mcp-copy'), config);
     await refreshAutomationTokens();
   } catch (requestError) {
     error.textContent = requestError.message;

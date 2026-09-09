@@ -15,6 +15,7 @@ final class PortStore: ObservableObject {
     @Published private(set) var port: VotportCore.Port?
     @Published private(set) var requests: [RequestLink] = []
     @Published private(set) var deliveries: [Delivery] = []
+    @Published private(set) var automationTokens: [AutomationToken] = []
     @Published private(set) var watches: [Watch] = []
     /// A core call is in flight; the screens disable their primary action.
     @Published private(set) var busy = false
@@ -31,7 +32,7 @@ final class PortStore: ObservableObject {
     @Published private(set) var problemScope: Scope?
 
     /// Which form a failure belongs under.
-    enum Scope { case port, watch, links, deliver }
+    enum Scope { case port, watch, links, deliver, agents }
 
     /// The headline to show under a form, when the failure was its own.
     func problem(for scope: Scope) -> String? {
@@ -147,6 +148,40 @@ final class PortStore: ObservableObject {
             self?.port = nil
             self?.requests = []
             self?.deliveries = []
+            self?.automationTokens = []
+        }
+    }
+
+    func refreshAutomationTokens() {
+        let expected = port
+        run(.agents) { try VotportCore.automationTokens() } then: { [weak self] result in
+            guard let self, self.port == expected else { return }
+            switch result {
+            case .success(let tokens): self.automationTokens = tokens
+            case .failure(let error): self.take(error, .agents)
+            }
+        }
+    }
+
+    func createAutomationToken(_ spec: AutomationTokenSpec, done: @escaping (IssuedAutomationToken?) -> Void) {
+        let expected = port
+        run(.agents) { try VotportCore.createAutomationToken(spec: spec) } then: { [weak self] result in
+            guard let self, self.port == expected else { done(nil); return }
+            switch result {
+            case .success(let issued):
+                self.automationTokens.append(issued.automationToken)
+                done(issued)
+            case .failure(let error): self.take(error, .agents); done(nil)
+            }
+        }
+    }
+
+    func revokeAutomationToken(_ id: String) {
+        run(.agents) { try VotportCore.revokeAutomationToken(id: id) } then: { [weak self] result in
+            switch result {
+            case .success: self?.refreshAutomationTokens()
+            case .failure(let error): self?.take(error, .agents)
+            }
         }
     }
 
@@ -274,6 +309,7 @@ final class PortStore: ObservableObject {
             port = nil
             requests = []
             deliveries = []
+            automationTokens = []
         }
         log.notice("port call failed: \(detail, privacy: .public)")
     }
