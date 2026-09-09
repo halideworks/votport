@@ -284,11 +284,14 @@ struct AgentAccessSection: View {
     @State private var create = true
     @State private var activity = true
     @State private var revoke = false
+    @State private var jobsRead = false
+    @State private var jobsCreate = false
+    @State private var jobsCancel = false
     @State private var issued: IssuedAutomationToken?
     @State private var revokeId: String?
 
     private var permissions: [String] {
-        [("library:read", browse), ("deliveries:create", create), ("deliveries:read", activity), ("deliveries:revoke", revoke)].compactMap { $0.1 ? $0.0 : nil }
+        [("library:read", browse), ("deliveries:create", create), ("deliveries:read", activity), ("deliveries:revoke", revoke), ("jobs:read", jobsRead), ("jobs:create", jobsCreate), ("jobs:cancel", jobsCancel)].compactMap { $0.1 ? $0.0 : nil }
     }
 
     var body: some View {
@@ -303,6 +306,9 @@ struct AgentAccessSection: View {
                 Toggle("Create delivery links", isOn: $create)
                 Toggle("Read delivery activity and receipts", isOn: $activity)
                 Toggle("Revoke its delivery links", isOn: $revoke)
+                Toggle("Read project jobs and verification", isOn: $jobsRead)
+                Toggle("Create and retry project jobs", isOn: $jobsCreate)
+                Toggle("Cancel project jobs", isOn: $jobsCancel)
                 HStack {
                     Button("Issue token") {
                         port.createAutomationToken(AutomationTokenSpec(label: label, directory: directory, expiresDays: UInt32(days), permissions: permissions)) { result in

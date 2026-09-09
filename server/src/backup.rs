@@ -308,7 +308,7 @@ fn validate_private_ancestry(root: &Path, stop: Option<&Path>) -> Result<(), Str
     Ok(())
 }
 
-fn validate_endpoint(value: &str) -> Result<(), String> {
+pub(crate) fn validate_endpoint(value: &str) -> Result<(), String> {
     if value.len() > 2048 {
         return Err("invalid S3 endpoint".into());
     }
@@ -331,7 +331,7 @@ fn validate_endpoint(value: &str) -> Result<(), String> {
     }
     Ok(())
 }
-fn validate_bucket(value: &str) -> Result<(), String> {
+pub(crate) fn validate_bucket(value: &str) -> Result<(), String> {
     if value.is_empty()
         || value.len() > 63
         || !value
@@ -477,7 +477,7 @@ fn write_status(data_dir: &Path, mut status: BackupStatus) -> Result<(), String>
     atomic_write_private(&data_dir.join(STATUS_FILE), &bytes)
 }
 
-fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path.parent().ok_or("private file has no parent")?;
     let name = path
         .file_name()

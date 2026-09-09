@@ -52,6 +52,7 @@
             </InfoBadge>
           </NavigationViewItem.InfoBadge>
         </NavigationViewItem>
+        <NavigationViewItem Content="Workflows" Tag="workflows" Icon="Accept" />
         <NavigationViewItem Content="Settings" Tag="settings" Icon="Setting" />
       </NavigationView.MenuItems>
       <Frame x:Name="Pages" Padding="20,20,0,20" />

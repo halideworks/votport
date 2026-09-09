@@ -54,6 +54,34 @@ impl ReceiptSigner {
         Ok(Self { key, public_hex })
     }
 
+    pub(crate) fn delivery_token(&self, id: &str) -> String {
+        use ed25519_dalek::Signer;
+        use sha2::{Digest, Sha256};
+        let message = format!("votport-job-token-v1\0{id}");
+        hex::encode(Sha256::digest(self.key.sign(message.as_bytes()).to_bytes()))[..32].into()
+    }
+
+    pub(crate) fn sign_delivery_export(&self, document: &serde_json::Value) -> String {
+        use ed25519_dalek::Signer;
+        let mut bytes = b"votport-delivery-export-v1\0".to_vec();
+        bytes.extend(serde_json::to_vec(document).expect("export serializes"));
+        hex::encode(self.key.sign(&bytes).to_bytes())
+    }
+
+    pub(crate) fn sign_delivery_event(&self, document: &serde_json::Value) -> String {
+        use ed25519_dalek::Signer;
+        let mut bytes = b"votport-delivery-event-v1\0".to_vec();
+        bytes.extend(serde_json::to_vec(document).expect("event serializes"));
+        hex::encode(self.key.sign(&bytes).to_bytes())
+    }
+
+    pub fn evidence_challenge(
+        &self,
+        challenge: crate::delivery_protocol::Challenge,
+    ) -> crate::delivery_protocol::SignedChallenge {
+        crate::delivery_protocol::SignedChallenge::issue(challenge, &self.key)
+    }
+
     /// Verifying key for checking issued receipts; avoids re-parsing the
     /// hex on every request.
     pub fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {

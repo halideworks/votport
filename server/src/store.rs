@@ -17,6 +17,12 @@ use vot_sdk::object::ObjectId;
 
 use crate::config::Config;
 
+mod evidence;
+mod webhooks;
+mod workflows;
+pub use evidence::*;
+pub use webhooks::*;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileRecord {
     /// Path as named inside the uploaded package.
@@ -109,6 +115,9 @@ pub struct LogEvent {
 /// A fetch capability minted for a grant. See the manifests schema.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FetchTicket {
+    pub holder: String,
+    pub grant_token_hash: String,
+    pub policy_revision: u64,
     pub token_id: String,
     pub grant_id: String,
     pub manifest_root: String,
@@ -447,7 +456,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 26;
+pub(crate) const SCHEMA_VERSION: u64 = 27;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -735,6 +744,7 @@ pub static AUDIT_INSERT_FAILURES: std::sync::atomic::AtomicU64 =
 
 pub struct Store {
     connection: Mutex<Connection>,
+    pub(crate) event_signer: std::sync::Arc<crate::receipt::ReceiptSigner>,
     path: PathBuf,
 }
 
@@ -761,6 +771,20 @@ impl Store {
         crate::paths::tighten_private_file(&shm)?;
         let connection =
             Connection::open(&path).map_err(|error| format!("open {}: {error}", path.display()))?;
+        connection
+            .create_scalar_function(
+                "votport_within",
+                2,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                    | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+                |context| {
+                    Ok(crate::workflow::within(
+                        &context.get::<String>(0)?,
+                        &context.get::<String>(1)?,
+                    ))
+                },
+            )
+            .map_err(|e| e.to_string())?;
         connection
             .pragma_update(None, "journal_mode", "WAL")
             .map_err(|error| error.to_string())?;
@@ -794,6 +818,9 @@ impl Store {
         }
         let store = Self {
             connection: Mutex::new(connection),
+            event_signer: std::sync::Arc::new(crate::receipt::ReceiptSigner::load_or_create(
+                data_dir,
+            )?),
             path: path.clone(),
         };
         // v1/v2 databases predate tenant scoping: existing links belong to
@@ -1235,6 +1262,36 @@ impl Store {
             );",
                 )
                 .map_err(|error| format!("schema: {error}"))?;
+        }
+        if stored < 27 {
+            transaction
+                .execute_batch(evidence::SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
+        }
+        if stored < 27 {
+            transaction
+                .execute_batch(workflows::SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
+            transaction
+                .execute_batch(webhooks::SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
+        }
+        if stored < 27 {
+            for (name, definition) in [
+                ("holder", "TEXT NOT NULL DEFAULT ''"),
+                ("grant_token_hash", "TEXT NOT NULL DEFAULT ''"),
+                ("policy_revision", "INTEGER NOT NULL DEFAULT 0"),
+                ("admitted_at", "INTEGER"),
+            ] {
+                let present: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('outbound_fetch_tickets') WHERE name=?1)", [name], |row| row.get(0)).map_err(|e| e.to_string())?;
+                if !present {
+                    transaction
+                        .execute_batch(&format!(
+                            "ALTER TABLE outbound_fetch_tickets ADD COLUMN {name} {definition}"
+                        ))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
         }
         transaction
             .execute(
@@ -2121,6 +2178,27 @@ impl Store {
             }
         };
         if matches!(removal, TenantRemoval::Deleted | TenantRemoval::Absent) {
+            workflows::remove_storage_tenant(&transaction, key)?;
+            for table in [
+                "delivery_manifests",
+                "delivery_evidence",
+                "delivery_policy_cache",
+            ] {
+                transaction.execute(&format!("DELETE FROM {table} WHERE grant_id IN (SELECT id FROM outbound_grants WHERE tenant=?1)"), [key]).map_err(|e| e.to_string())?;
+            }
+            transaction
+                .execute("DELETE FROM delivery_events WHERE tenant=?1", [key])
+                .map_err(|e| e.to_string())?;
+            for table in [
+                "delivery_jobs",
+                "delivery_projects",
+                "delivery_webhooks",
+                "delivery_webhook_attempts",
+            ] {
+                transaction
+                    .execute(&format!("DELETE FROM {table} WHERE tenant=?1"), [key])
+                    .map_err(|e| e.to_string())?;
+            }
             transaction
                 .execute(
                     "DELETE FROM outbound_grant_files
@@ -2996,6 +3074,16 @@ impl Store {
         grant: OutboundGrant,
         operation: Option<&AutomationOperation>,
     ) -> Result<(), String> {
+        self.insert_workflow_grant(grant, operation, None)
+    }
+
+    pub fn insert_workflow_grant(
+        &self,
+        grant: OutboundGrant,
+        operation: Option<&AutomationOperation>,
+        job: Option<&crate::workflow::Job>,
+    ) -> Result<(), String> {
+        let delivery_digest = evidence::grant_digest(&grant);
         let (bytes_hi, bytes_lo) = split_bytes(grant.bytes);
         let files_json = serde_json::to_string(&grant.files).unwrap_or_else(|_| "[]".to_owned());
         let file_count = i64::try_from(grant.files.len().max(1)).unwrap_or(i64::MAX);
@@ -3004,6 +3092,16 @@ impl Store {
         let transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
+        workflows::check_grant_creation(&transaction, &grant, job)?;
+        if let Some(job) = job {
+            workflows::finish_job(
+                &transaction,
+                &self.event_signer,
+                job,
+                &grant,
+                &delivery_digest,
+            )?;
+        }
         transaction.execute(
                 "INSERT INTO outbound_grants
                  (id, token_hash, password_hash, tenant, link_id, upload_id, package_root, name, suite,
@@ -3075,6 +3173,12 @@ impl Store {
                 .map_err(|error| error.to_string())?;
         }
         drop(child);
+        transaction
+            .execute(
+                "INSERT INTO delivery_manifests(grant_id,digest) VALUES (?1,?2)",
+                rusqlite::params![grant_id, delivery_digest],
+            )
+            .map_err(|e| e.to_string())?;
         if let Some(operation) = operation {
             let active: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM automation_tokens WHERE id = ?1 AND revoked_at IS NULL AND expires_at > ?2)",
@@ -3245,40 +3349,51 @@ impl Store {
     /// deliveries recorded plus the tickets still live and undelivered leave
     /// room under `max_downloads`. One statement, so two mints racing for
     /// the last delivery cannot both reserve it. Returns whether it did.
-    pub fn put_fetch_ticket(
-        &self,
-        ticket: &FetchTicket,
-        downloads: u64,
-        max_downloads: Option<u64>,
-        now: u64,
-    ) -> Result<bool, String> {
-        self.with(|connection| {
-            connection
-                .execute(
-                    "INSERT INTO outbound_fetch_tickets (token_id, grant_id, manifest_root, expires_at, delivered_at)
-                     SELECT ?1, ?2, ?3, ?4, NULL
-                     WHERE ?6 IS NULL
-                        OR ?5 + (SELECT COUNT(*) FROM outbound_fetch_tickets
-                                 WHERE grant_id = ?2 AND expires_at > ?7 AND delivered_at IS NULL) < ?6",
-                    rusqlite::params![
-                        ticket.token_id,
-                        ticket.grant_id,
-                        ticket.manifest_root,
-                        ticket.expires_at as i64,
-                        downloads as i64,
-                        max_downloads.map(|max| max as i64),
-                        now as i64
-                    ],
-                )
-                .map(|changed| changed == 1)
-        })
+    pub fn put_fetch_ticket(&self, ticket: &FetchTicket, now: u64) -> Result<bool, String> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+        let job = workflows::release_in(&tx, &ticket.grant_id)?;
+        if job.as_ref().map_or(0, |job| job.project.revision) != ticket.policy_revision
+            || job.as_ref().is_some_and(|job| {
+                !job.request.recipients.is_empty()
+                    && !job.request.recipients.contains(&ticket.holder)
+            })
+        {
+            return Ok(false);
+        }
+        let changed = tx.execute(
+            "INSERT INTO outbound_fetch_tickets(token_id,grant_id,manifest_root,expires_at,delivered_at,holder,grant_token_hash,policy_revision)
+             SELECT ?1,?2,?3,?4,NULL,?5,?6,?7 FROM outbound_grants g WHERE g.id=?2 AND g.token_hash=?6 AND g.revoked_at IS NULL AND g.expires_at>?8
+             AND (g.max_downloads IS NULL OR g.downloads+(SELECT COUNT(*) FROM outbound_fetch_tickets WHERE grant_id=?2 AND (admitted_at IS NOT NULL OR (grant_token_hash=?6 AND policy_revision=?7)) AND expires_at>?8 AND delivered_at IS NULL)<g.max_downloads)",
+            rusqlite::params![ticket.token_id,ticket.grant_id,ticket.manifest_root,ticket.expires_at as i64,ticket.holder,ticket.grant_token_hash,ticket.policy_revision as i64,now as i64]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(changed == 1)
+    }
+
+    pub fn admit_fetch_ticket(&self, ticket: &FetchTicket, now: u64) -> Result<bool, String> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let job = workflows::release_in(&tx, &ticket.grant_id)?;
+        if job.as_ref().map_or(0, |job| job.project.revision) != ticket.policy_revision
+            || job.as_ref().is_some_and(|job| {
+                !job.request.recipients.is_empty()
+                    && !job.request.recipients.contains(&ticket.holder)
+            })
+        {
+            return Ok(false);
+        }
+        let changed = tx.execute("UPDATE outbound_fetch_tickets SET admitted_at=COALESCE(admitted_at,?4) WHERE token_id=?1 AND grant_id=?2 AND grant_token_hash=?3 AND expires_at>?4 AND EXISTS(SELECT 1 FROM outbound_grants WHERE id=?2 AND token_hash=?3 AND revoked_at IS NULL AND expires_at>?4 AND (max_downloads IS NULL OR downloads<max_downloads))", rusqlite::params![ticket.token_id,ticket.grant_id,ticket.grant_token_hash,now as i64]).map_err(|error|error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(changed == 1)
     }
 
     pub fn fetch_ticket(&self, token_id: &str) -> Result<Option<FetchTicket>, String> {
         self.with(|connection| {
             connection
                 .query_row(
-                    "SELECT token_id, grant_id, manifest_root, expires_at, delivered_at
+                    "SELECT token_id, grant_id, manifest_root, expires_at, delivered_at, holder, grant_token_hash, policy_revision
                      FROM outbound_fetch_tickets WHERE token_id = ?1",
                     [token_id],
                     map_fetch_ticket,
@@ -3294,7 +3409,7 @@ impl Store {
         self.with(|connection| {
             connection
                 .prepare_cached(
-                    "SELECT token_id, grant_id, manifest_root, expires_at, delivered_at
+                    "SELECT token_id, grant_id, manifest_root, expires_at, delivered_at, holder, grant_token_hash, policy_revision
                      FROM outbound_fetch_tickets WHERE expires_at > ?1",
                 )?
                 .query_map([now as i64], map_fetch_ticket)?
@@ -3546,6 +3661,10 @@ impl Store {
             .transaction()
             .map_err(|error| error.to_string())?;
         let result = (|| {
+            let retired: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM delivery_jobs WHERE id=?1 AND tenant=?2 AND state IN ('retiring','retired'))",rusqlite::params![id,tenant],|row| row.get(0)).map_err(|error| error.to_string())?;
+            if retired {
+                return Err("delivery has been retired; create a new job".into());
+            }
             let existing: Option<i64> = transaction
                 .query_row(
                     "SELECT expires_at FROM outbound_grants
@@ -4197,6 +4316,9 @@ fn row_to_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<Link> {
 
 fn map_fetch_ticket(row: &rusqlite::Row<'_>) -> rusqlite::Result<FetchTicket> {
     Ok(FetchTicket {
+        holder: row.get(5)?,
+        grant_token_hash: row.get(6)?,
+        policy_revision: row.get::<_, i64>(7)?.max(0) as u64,
         token_id: row.get(0)?,
         grant_id: row.get(1)?,
         manifest_root: row.get(2)?,
@@ -7863,6 +7985,7 @@ mod settings_tests {
             smtp_to: None,
             public_url: None,
             max_upload_bytes: 1024,
+            workflow_snapshot_bytes: 4 * 1024 * 1024,
             allow_hidden: false,
             session_idle_secs: 60,
             audit_retention_days: 400,

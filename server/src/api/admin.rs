@@ -564,6 +564,7 @@ pub async fn admin_session(
         "ok": true,
         "tenant": identity.tenant,
         "grants": identity.grants,
+        "role": identity.role,
         "pages": pages,
     })))
 }
@@ -5285,6 +5286,7 @@ mod ops_tests {
             smtp_to: None,
             public_url: None,
             max_upload_bytes: 1024 * 1024,
+            workflow_snapshot_bytes: 4 * 1024 * 1024,
             allow_hidden: false,
             session_idle_secs: 60,
             audit_retention_days: 400,

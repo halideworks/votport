@@ -73,7 +73,15 @@ fn receive_inner(
     let client = Client::new(base)?;
     match try_fetch_with_resume(&client, &delivery, device, dest, observer, resume)? {
         Outcome::Fetched(received) => Ok(received),
-        Outcome::Unreachable => receive_over_http_inner(base, delivery, dest, observer, resume),
+        Outcome::Unreachable { metadata, cookie } => receive_over_http_inner(
+            &client,
+            delivery,
+            Some(device),
+            dest,
+            observer,
+            resume,
+            Some((*metadata, cookie)),
+        ),
     }
 }
 
@@ -101,7 +109,15 @@ pub(crate) fn receive_with_device_or_http_mode(
 ) -> Result<Received> {
     match Device::load_or_create() {
         Ok(device) => receive_inner(base, delivery, &device, dest, observer, resume),
-        Err(_) => receive_over_http_inner(base, delivery, dest, observer, resume),
+        Err(_) => receive_over_http_inner(
+            &Client::new(base)?,
+            delivery,
+            None,
+            dest,
+            observer,
+            resume,
+            None,
+        ),
     }
 }
 
@@ -117,23 +133,39 @@ pub fn receive_over_http(
     dest: &Path,
     observer: &mut dyn Observer,
 ) -> Result<Received> {
-    receive_over_http_inner(base, delivery, dest, observer, false)
+    let device = Device::load_or_create().ok();
+    receive_over_http_inner(
+        &Client::new(base)?,
+        delivery,
+        device.as_ref(),
+        dest,
+        observer,
+        false,
+        None,
+    )
 }
 
 fn receive_over_http_inner(
-    base: &str,
+    client: &Client,
     delivery: Delivery,
+    device: Option<&Device>,
     dest: &Path,
     observer: &mut dyn Observer,
     resume: bool,
+    authorized: Option<(crate::api::OutboundMetadata, Option<String>)>,
 ) -> Result<Received> {
-    let client = Client::new(base)?;
-    let mut metadata = client.outbound_metadata(&delivery.token, None)?;
+    let base = client.base();
+    let (mut metadata, mut cookie) = match authorized {
+        Some(authorized) => authorized,
+        None => (
+            client.outbound_metadata_for_device(&delivery.token, None, device)?,
+            None,
+        ),
+    };
 
     // The grant cookie a verify returns, echoed onto the reads and downloads
     // that follow. It is not kept in a jar, so a many-file delivery does not
     // accumulate the per-file lease cookies the downloads set.
-    let mut cookie: Option<String> = None;
     if metadata.has_password && !metadata.authorized {
         let password = delivery
             .password
@@ -142,13 +174,14 @@ fn receive_over_http_inner(
         let granted = client.verify_outbound(&delivery.token, password)?;
         // The verified cookie authorizes a second read, which carries the
         // files the pre-password read withheld.
-        metadata = client.outbound_metadata(&delivery.token, Some(&granted))?;
+        metadata = client.outbound_metadata_for_device(&delivery.token, Some(&granted), device)?;
         cookie = Some(granted);
         if !metadata.authorized {
             return Err(Error::PasswordRequired);
         }
     }
 
+    let evidence = crate::evidence::prepare_receive(client, &metadata, device, observer)?;
     observer.event(Event::Planned {
         files: metadata
             .files
@@ -263,6 +296,7 @@ fn receive_over_http_inner(
         }
         files.push(path);
     }
+    crate::evidence::complete(base, evidence, observer);
     observer.event(Event::Finished { files: files.len() });
     Ok(Received { files })
 }

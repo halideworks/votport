@@ -443,7 +443,7 @@ public static class Format
         if (view.Phase == Phase.Done && view.FinishedUnixSeconds is ulong finished)
         {
             var time = DateTimeOffset.FromUnixTimeSeconds((long)finished).ToLocalTime();
-            return $"{view.Status}, finished at {time:T}";
+            return $"{view.Status}, finished at {time:T}" + (view.EvidenceStatus is string evidence ? $". {evidence}" : "");
         }
         return view.Status;
     }

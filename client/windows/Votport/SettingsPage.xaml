@@ -53,6 +53,9 @@
           <CheckBox x:Name="AgentCreate" Content="Create delivery links" IsChecked="True" />
           <CheckBox x:Name="AgentActivity" Content="Read delivery activity and receipts" IsChecked="True" />
           <CheckBox x:Name="AgentRevoke" Content="Revoke its delivery links" />
+          <CheckBox x:Name="AgentJobsRead" Content="Read project jobs and verification" />
+          <CheckBox x:Name="AgentJobsCreate" Content="Create and retry project jobs" />
+          <CheckBox x:Name="AgentJobsCancel" Content="Cancel project jobs" />
           <StackPanel Orientation="Horizontal" Spacing="8">
             <Button x:Name="AgentIssue" Content="Issue token" Click="AgentIssue_Click" />
             <Button Content="Refresh" Click="AgentRefresh_Click" />

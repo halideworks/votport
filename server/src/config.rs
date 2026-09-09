@@ -65,6 +65,8 @@ pub struct Config {
     pub public_url: Option<String>,
     /// Hard cap on the total bytes of a single upload session.
     pub max_upload_bytes: u64,
+    /// Total bytes reserved by retained delivery snapshots.
+    pub workflow_snapshot_bytes: u64,
     /// Allow uploaded file names whose components start with a dot.
     pub allow_hidden: bool,
     /// Seconds an upload session may sit idle before it is discarded.
@@ -355,6 +357,11 @@ pub fn from_env() -> Result<Config, String> {
         Err(_) => DEFAULT_MAX_UPLOAD_BYTES,
     };
 
+    let workflow_snapshot_bytes = match env::var("VOTPORT_WORKFLOW_SNAPSHOT_BYTES") {
+        Ok(value) => parse_bytes(&value)
+            .map_err(|error| format!("VOTPORT_WORKFLOW_SNAPSHOT_BYTES: {error}"))?,
+        Err(_) => max_upload_bytes.saturating_mul(4),
+    };
     let allow_hidden = env::var("VOTPORT_ALLOW_HIDDEN").is_ok_and(|value| value == "1");
 
     let upload_retention_days = match env::var("VOTPORT_UPLOAD_RETENTION_DAYS") {
@@ -554,6 +561,7 @@ pub fn from_env() -> Result<Config, String> {
         smtp_to: optional("VOTPORT_NOTIFY_SMTP_TO"),
         public_url,
         max_upload_bytes,
+        workflow_snapshot_bytes,
         allow_hidden,
         session_idle_secs,
         audit_retention_days,

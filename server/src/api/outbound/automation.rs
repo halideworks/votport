@@ -5,8 +5,11 @@ use crate::store::AutomationOperation;
 use hmac::{Hmac, Mac};
 use serde::Serialize;
 
-pub const PERMISSIONS: [&str; 4] = [
+pub const PERMISSIONS: [&str; 7] = [
     "library:read",
+    "jobs:create",
+    "jobs:read",
+    "jobs:cancel",
     "deliveries:create",
     "deliveries:read",
     "deliveries:revoke",
@@ -36,7 +39,7 @@ pub(super) fn validate_permissions(mut permissions: Vec<String>) -> ApiResult<Ve
     Ok(permissions)
 }
 
-fn authenticate(
+pub(super) fn authenticate(
     app: &App,
     headers: &HeaderMap,
     peer: std::net::SocketAddr,
@@ -90,7 +93,11 @@ fn authenticate(
     Ok((token, bearer))
 }
 
-fn check_directory(app: &App, token: &AutomationToken, directory: &str) -> ApiResult<()> {
+pub(super) fn check_directory(
+    app: &App,
+    token: &AutomationToken,
+    directory: &str,
+) -> ApiResult<()> {
     if directory.len() > MAX_LIBRARY_DIRECTORY_INPUT_BYTES {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -324,6 +331,7 @@ pub async fn automation_share(
         &paths,
         MAX_LIBRARY_PROJECT_FILES,
         GrantOptions {
+            workflow: None,
             automation: Some((operation, raw)),
             label: request
                 .label

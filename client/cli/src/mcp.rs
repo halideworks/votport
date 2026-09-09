@@ -160,6 +160,20 @@ fn valid_arguments(args: &Value, schema: &Value) -> bool {
                     && n <= spec["maximum"].as_u64().unwrap_or(u64::MAX)
             }),
             Some("boolean") => value.is_boolean(),
+            Some("object") => value.as_object().is_some_and(|object| {
+                object.len() <= spec["maxProperties"].as_u64().unwrap_or(50) as usize
+                    && object.iter().all(|(key, value)| {
+                        key.len() <= 100 && value.as_str().is_some_and(|value| value.len() <= 4096)
+                    })
+            }),
+            Some("array") => value.as_array().is_some_and(|items| {
+                items.len() <= spec["maxItems"].as_u64().unwrap_or(500) as usize
+                    && items.iter().all(|value| {
+                        value.as_str().is_some_and(|value| {
+                            value.len() == 64 && value.bytes().all(|c| c.is_ascii_hexdigit())
+                        })
+                    })
+            }),
             _ => false,
         }
     })
@@ -178,6 +192,14 @@ fn definitions() -> Vec<Value> {
         tool("list_deliveries", "List deliveries created by this token, oldest first. Follow next_cursor with after.", json!({"after": offset, "limit": limit}), &[], true, false),
         tool("get_delivery", "Inspect a delivery owned by this token, including paginated object identities, signed receipts and per-file download starts. Counters do not prove recipient verification.", json!({"id": id, "offset": offset, "limit": limit}), &["id"], true, false),
         tool("revoke_delivery", "Revoke this token's delivery link. Repeating the call is safe. Files stay in the library.", json!({"id": id}), &["id"], false, true),
+        tool("list_projects", "List the project's delivery rules, required metadata, enrolled recipient keys and agent roles. Requires jobs:read and project membership.", json!({}), &[], true, false),
+        tool("list_jobs", "List durable jobs visible to this agent. Follow next with after.", json!({"after": id, "limit": limit}), &[], true, false),
+        tool("get_job", "Read preparation, approval, checks, failures and a released delivery URL.", json!({"id": id}), &["id"], true, false),
+        tool("create_job", "Queue a project delivery. Reuse operation_id with identical arguments after a timeout. Optional schedule/deadline are Unix seconds. Approval is a separate human action. Requires jobs:create and project sender role.", json!({"operation_id": id,"project_id": id,"label": {"type":"string","minLength":1,"maxLength":200},"metadata": {"type":"object","maxProperties":50,"additionalProperties":{"type":"string","maxLength":4096}},"recipients":{"type":"array","maxItems":500,"items":{"type":"string","minLength":64,"maxLength":64}},"expires_days":{"type":"integer","minimum":1,"maximum":365},"not_before": offset,"deadline": offset,"import_storage_id": id,"import_prefix": string}), &["operation_id","project_id","label","expires_days"], false, false),
+        tool("retry_job", "Retry a failed job without changing its request, frozen manifest or approval. Requires jobs:create.", json!({"id":id}), &["id"], false, false),
+        tool("cancel_job", "Cancel a job and stop subsequent file admissions. Already admitted streams and delivered files cannot be recalled. Requires jobs:cancel.", json!({"id":id}), &["id"], false, true),
+        tool("list_events", "Read signed delivery events. Follow next with after; gaps may represent projects outside this agent's scope.", json!({"after":offset,"limit":limit}), &[], true, false),
+        tool("get_job_evidence", "Read signed recipient verification and explicit acceptance for a job's exact manifest. These are device statements; request counters are separate.", json!({"id":id,"after":offset,"limit":limit}), &["id"], true, false),
     ]
 }
 
@@ -197,6 +219,34 @@ fn call(name: &str, args: &Value) -> Result<Value, Value> {
     let limit = args["limit"].as_u64().unwrap_or(50);
     let result = match name {
         "get_access" => client.session(),
+        "list_projects" => client.projects(),
+        "list_jobs" => client.jobs(args["after"].as_str(), limit),
+        "get_job" => client.job(args["id"].as_str().unwrap()),
+        "retry_job" => client.job_action(args["id"].as_str().unwrap(), "retry"),
+        "cancel_job" => client.job_action(args["id"].as_str().unwrap(), "cancel"),
+        "list_events" => client.events(args["after"].as_u64().unwrap_or(0), limit),
+        "get_job_evidence" => client.job_evidence(
+            args["id"].as_str().unwrap(),
+            args["after"].as_u64().unwrap_or(0),
+            limit,
+        ),
+        "create_job" => {
+            let mut request = args.clone();
+            let storage = request.as_object_mut().unwrap().remove("import_storage_id");
+            let prefix = request.as_object_mut().unwrap().remove("import_prefix");
+            match (storage, prefix) {
+                (Some(storage), Some(prefix)) => {
+                    request["import"] = json!({"storage_id":storage,"prefix":prefix})
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(super::agent::invalid(
+                        "import_storage_id and import_prefix must be supplied together",
+                    ))
+                }
+            }
+            client.create_job(&request)
+        }
         "list_files" => client.files(args["directory"].as_str(), args["after"].as_str(), limit),
         "create_delivery" => {
             let mut request = args.clone();
@@ -272,7 +322,10 @@ mod tests {
                 "votport"
             );
         }
-        assert_eq!(responses[0]["result"]["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(
+            responses[0]["result"]["tools"].as_array().unwrap().len(),
+            15
+        );
         assert_eq!(
             responses[1]["result"]["supportedVersions"],
             json!([PROTOCOL_VERSION])

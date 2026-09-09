@@ -47,6 +47,22 @@
     </form>
   </section>
 
+  <details id="delivery-evidence" class="card">
+    <summary>Verify saved files and accept this delivery</summary>
+    <p>Browser download requests do not prove that files were saved. Choose the saved files to verify them, then explicitly accept the exact delivery manifest.</p>
+    <button id="evidence-copy-key" type="button">Copy this browser's device key</button>
+    <p class="muted">For an enrolled-recipient delivery, give this key to the sender. Browser and desktop device keys are separate.</p>
+    <label>Saved files<input id="evidence-files" type="file" multiple /></label>
+    <div class="actions">
+    <button id="evidence-verify" type="button">Verify saved files</button>
+    <button id="evidence-retry" type="button" class="ghost">Retry pending reports</button>
+    <button id="evidence-refresh" type="button" class="ghost">Show verification records</button>
+    <a id="evidence-open-app" href="#" class="button">Open in Votport</a>
+    </div>
+    <p id="evidence-status" role="status"></p>
+    <div id="evidence-records"></div>
+  </details>
+
   <section id="download-content" hidden aria-live="polite">
     <!-- One primary action. The ids stay: the browser e2e drives them. -->
     <div id="separate-download" class="hero-action">

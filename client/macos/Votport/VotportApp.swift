@@ -37,6 +37,7 @@ enum Screen: String, CaseIterable, Identifiable {
     case links = "Manage links"
     case transfers = "Transfers"
     case settings = "Settings"
+    case workflows = "Workflows"
 
     // The sidebar's selection binding holds a Screen, so the row id must be
     // the Screen itself: a string id matches no selection and the rows
@@ -52,6 +53,7 @@ enum Screen: String, CaseIterable, Identifiable {
         case .links: return "link"
         case .transfers: return "list.bullet.rectangle"
         case .settings: return "gearshape"
+        case .workflows: return "checkmark.seal"
         }
     }
 
@@ -112,6 +114,7 @@ struct MainWindow: View {
             case .links: LinksView(share: { section = .share })
             case .transfers: TransfersView()
             case .settings: SettingsView()
+            case .workflows: WorkflowsView()
             }
         }
         .background(Tokens.bg)

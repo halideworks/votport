@@ -4661,6 +4661,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
  "vot-capability",
  "vot-cli",
  "vot-codec",

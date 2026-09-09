@@ -110,6 +110,47 @@ fn verify_token(secret: &[u8; 32], context: &[&[u8]], token: &str) -> bool {
     constant_time_eq(expected.as_bytes(), mac.as_bytes())
 }
 
+pub fn issue_recipient(
+    secret: &[u8; 32],
+    grant: &str,
+    token_hash: &str,
+    revision: u64,
+    holder: &str,
+) -> String {
+    issue_token(
+        secret,
+        &[
+            b"recipient",
+            grant.as_bytes(),
+            token_hash.as_bytes(),
+            revision.to_string().as_bytes(),
+            holder.as_bytes(),
+        ],
+        24 * 3600,
+    )
+}
+
+pub fn verify_recipient(
+    secret: &[u8; 32],
+    grant: &str,
+    token_hash: &str,
+    revision: u64,
+    holder: &str,
+    token: &str,
+) -> bool {
+    verify_token(
+        secret,
+        &[
+            b"recipient",
+            grant.as_bytes(),
+            token_hash.as_bytes(),
+            revision.to_string().as_bytes(),
+            holder.as_bytes(),
+        ],
+        token,
+    )
+}
+
 /// One tenant the principal may act in, with its role.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TenantGrant {

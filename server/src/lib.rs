@@ -10,6 +10,8 @@ pub mod app;
 pub mod auth;
 pub mod backup;
 pub mod config;
+#[path = "../../protocol/delivery.rs"]
+pub mod delivery_protocol;
 pub mod lease;
 pub mod notify;
 pub mod paths;
@@ -17,3 +19,5 @@ pub mod receipt;
 pub mod session;
 pub mod standby;
 pub mod store;
+
+pub mod workflow;

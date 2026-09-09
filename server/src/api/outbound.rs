@@ -17,6 +17,7 @@ use futures_util::{Stream, StreamExt as _};
 use serde::Deserialize;
 
 pub mod automation;
+pub mod workflows;
 pub use automation::automation_share;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -986,9 +987,10 @@ fn list_library_dir(root: &Path, dir: &Path, files: &mut Vec<serde_json::Value>)
             continue;
         }
         let name = entry.file_name();
-        let is_stage = name
-            .to_str()
-            .is_some_and(|name| name.starts_with(".vot-") && name.ends_with(".stage"));
+        let is_stage = name.to_str().is_some_and(|name| {
+            name.eq_ignore_ascii_case(".votport-workflows")
+                || (name.starts_with(".vot-") && name.ends_with(".stage"))
+        });
         if dir == root && name == crate::paths::TENANT_STORAGE_DIR {
             continue;
         }
@@ -1583,6 +1585,7 @@ pub async fn create_outbound_grant(
             &paths,
             MAX_LIBRARY_PROJECT_FILES,
             GrantOptions {
+                workflow: None,
                 automation: None,
                 label: request
                     .label
@@ -1610,6 +1613,7 @@ pub async fn create_outbound_grant(
             paths,
             MAX_LIBRARY_SELECTION_FILES,
             GrantOptions {
+                workflow: None,
                 automation: None,
                 label: request.label,
                 password_hash,
@@ -1868,6 +1872,7 @@ fn enumerate_automation_files(
 }
 
 struct GrantOptions {
+    workflow: Option<crate::workflow::Job>,
     automation: Option<(crate::store::AutomationOperation, String)>,
     label: Option<String>,
     password_hash: Option<String>,
@@ -1891,12 +1896,21 @@ async fn create_library_grant(
             format!("paths must contain 1..={max_files} files"),
         ));
     }
-    let root = library_root(app, &identity.tenant);
+    let root = options
+        .workflow
+        .as_ref()
+        .filter(|job| job.uses_snapshot())
+        .map(|job| workflows::payload_root(app, &identity.tenant, &job.id))
+        .unwrap_or_else(|| library_root(app, &identity.tenant));
     let mut selections = Vec::with_capacity(requested.len());
     let mut selected = std::collections::HashSet::with_capacity(requested.len());
     let mut total_bytes = 0u64;
     for name in requested {
-        let path = safe_library_path(app, &identity.tenant, name)?;
+        let path = if let Some(job) = options.workflow.as_ref().filter(|job| job.uses_snapshot()) {
+            workflows::payload_path(app, &identity.tenant, &job.id, name)?
+        } else {
+            safe_library_path(app, &identity.tenant, name)?
+        };
         if !library_components_safe(&root, &path) {
             return Err(ApiError::not_found());
         }
@@ -1978,8 +1992,25 @@ async fn create_library_grant(
                     vot_sdk_file::CommitProfile::Fast,
                 )
                 .map_err(ApiError::internal)?;
+            let name = options
+                .workflow
+                .as_ref()
+                .filter(|job| !job.uses_snapshot())
+                .and_then(|job| {
+                    file.name
+                        .strip_prefix(&format!("{}/", job.project.directory))
+                })
+                .unwrap_or(&file.name)
+                .to_owned();
             Ok(OutboundGrantFile {
+                name,
                 receipt_b64: base64::prelude::BASE64_STANDARD.encode(receipt),
+                source: options
+                    .workflow
+                    .as_ref()
+                    .filter(|job| job.uses_snapshot())
+                    .map(|job| format!("workflow:{}/{}", job.id, file.name))
+                    .unwrap_or_else(|| file.source.clone()),
                 ..file
             })
         })
@@ -1987,9 +2018,13 @@ async fn create_library_grant(
     let first = files.first().cloned().ok_or_else(ApiError::not_found)?;
     let created_at = now_unix();
     let token = options
-        .automation
+        .workflow
         .as_ref()
-        .map(|(_, token)| token.clone())
+        .map(|job| {
+            app.signer
+                .delivery_token(&format!("{}:{}", job.id, job.token_generation))
+        })
+        .or_else(|| options.automation.as_ref().map(|(_, token)| token.clone()))
         .unwrap_or_else(auth::random_token);
     let label = options
         .label
@@ -1998,9 +2033,15 @@ async fn create_library_grant(
         .to_owned();
     let grant = OutboundGrant {
         id: options
-            .automation
+            .workflow
             .as_ref()
-            .map(|(op, _)| op.grant_id.clone())
+            .map(|job| job.id.clone())
+            .or_else(|| {
+                options
+                    .automation
+                    .as_ref()
+                    .map(|(op, _)| op.grant_id.clone())
+            })
             .unwrap_or_else(auth::random_token),
         token_hash: hash_token(&token),
         tenant: identity.tenant.clone(),
@@ -2038,9 +2079,10 @@ async fn create_library_grant(
             return Err(ApiError::not_found());
         }
         app.store
-            .insert_outbound_grant_with_operation(
+            .insert_workflow_grant(
                 grant.clone(),
                 options.automation.as_ref().map(|(op, _)| op),
+                options.workflow.as_ref(),
             )
             .map_err(ApiError::internal)?;
     }
@@ -2334,12 +2376,31 @@ pub async fn update_outbound_grant(
         return Ok(Json(json!({ "ok": true })).into_response());
     }
     if request.rotate == Some(true) {
-        let token = auth::random_token();
-        if !app
+        let job = app
             .store
-            .rotate_outbound_grant_token(&identity.tenant, &id, &hash_token(&token))
-            .map_err(ApiError::internal)?
-        {
+            .delivery_job(&id)
+            .map_err(super::store_unavailable)?
+            .filter(|job| job.tenant == identity.tenant);
+        let token = job
+            .as_ref()
+            .map(|job| {
+                app.signer
+                    .delivery_token(&format!("{}:{}", job.id, job.token_generation + 1))
+            })
+            .unwrap_or_else(auth::random_token);
+        let changed = if let Some(job) = job {
+            app.store.rotate_delivery_job_token(
+                &identity.tenant,
+                &id,
+                job.token_generation,
+                &hash_token(&token),
+            )
+        } else {
+            app.store
+                .rotate_outbound_grant_token(&identity.tenant, &id, &hash_token(&token))
+        }
+        .map_err(ApiError::internal)?;
+        if !changed {
             return Err(ApiError::not_found());
         }
         app.store.audit(
@@ -2400,6 +2461,7 @@ pub async fn outbound_metadata(
             return Err(ApiError::not_found());
         }
         let _operation = begin_outbound_operation(&app, &grant.tenant)?;
+        let recipient = workflows::require_recipient(&app, &grant, &headers)?;
         let authorized = grant_authorized(&app, &grant, &headers);
         if grant.password_hash.is_some() && !authorized {
             return Ok((
@@ -2408,6 +2470,17 @@ pub async fn outbound_metadata(
             )
                 .into_response());
         }
+        let manifest = app
+            .store
+            .delivery_manifest(&grant.id)
+            .map_err(super::store_unavailable)?;
+        let evidence_authorization = super::evidence::metadata_authorization(
+            &app,
+            &grant,
+            &headers,
+            &manifest,
+            recipient.as_deref(),
+        )?;
         let files = page
             .files
             .into_iter()
@@ -2433,6 +2506,9 @@ pub async fn outbound_metadata(
                 "downloads": grant.downloads,
                 "max_downloads": grant.max_downloads,
                 "receipt_key": app.signer.public_hex,
+                "grant_id": grant.id,
+                "delivery_manifest": manifest,
+                "evidence_authorization": evidence_authorization,
                 "receipt_url": format!("/api/s/{token}/receipt"),
                 "download_url": format!("/api/s/{token}/file"),
                 "bundle_url": format!("/api/s/{token}/bundle"),
@@ -2449,6 +2525,7 @@ pub async fn outbound_metadata(
     }
     let grant = readable_grant(&app, &token)?;
     let _operation = begin_outbound_operation(&app, &grant.tenant)?;
+    let recipient = workflows::require_recipient(&app, &grant, &headers)?;
     let authorized = grant_authorized(&app, &grant, &headers);
     if grant.password_hash.is_some() && !authorized {
         return Ok((
@@ -2457,6 +2534,17 @@ pub async fn outbound_metadata(
         )
             .into_response());
     }
+    let manifest = app
+        .store
+        .delivery_manifest(&grant.id)
+        .map_err(super::store_unavailable)?;
+    let evidence_authorization = super::evidence::metadata_authorization(
+        &app,
+        &grant,
+        &headers,
+        &manifest,
+        recipient.as_deref(),
+    )?;
     let files = if grant.files.is_empty() {
         vec![json!({
             "name": grant.name,
@@ -2501,6 +2589,9 @@ pub async fn outbound_metadata(
             "downloads": grant.downloads,
             "max_downloads": grant.max_downloads,
             "receipt_key": app.signer.public_hex,
+                "grant_id": grant.id,
+                "delivery_manifest": manifest,
+                "evidence_authorization": evidence_authorization,
             "receipt_url": format!("/api/s/{token}/receipt"),
             "download_url": format!("/api/s/{token}/file"),
             "bundle_url": format!("/api/s/{token}/bundle"),
@@ -2760,6 +2851,7 @@ pub async fn outbound_batch(
     .await?;
     let file = first_file;
     drop(_pin);
+    require_grant_access(&app, &grant, &headers)?;
     // Downloads are recorded per file as its last byte is handed to the
     // transport, not all up front: an interrupted batch must leave the
     // files it never sent still downloadable individually. The stale-copy
@@ -3120,6 +3212,7 @@ async fn outbound_file_inner(
         if !leased {
             record_download(&app, &grant, &[index]).await?;
         }
+        require_grant_access(&app, &grant, &headers)?;
         let length = range.map_or(source.object.length, |(start, end)| end - start + 1);
         let filename = safe_filename(&source.name);
         let mut response = Body::from_stream(stream).into_response();
@@ -3354,6 +3447,7 @@ pub async fn outbound_bundle(
     // endpoint records per delivered file instead.
     let indexes: Vec<usize> = (0..count).collect();
     record_download(&app, &grant, &indexes).await?;
+    require_grant_access(&app, &grant, &headers)?;
     let stream = ReaderStream::with_capacity(
         BundleReader {
             file,
@@ -3380,7 +3474,7 @@ pub async fn outbound_bundle(
     Ok(response)
 }
 
-fn readable_grant(app: &App, token: &str) -> ApiResult<OutboundGrant> {
+pub(crate) fn readable_grant(app: &App, token: &str) -> ApiResult<OutboundGrant> {
     if !valid_token(token) {
         return Err(ApiError::not_found());
     }
@@ -3392,6 +3486,7 @@ fn readable_grant(app: &App, token: &str) -> ApiResult<OutboundGrant> {
     if grant.revoked_at.is_some() || grant.expires_at <= now_unix() {
         return Err(ApiError::not_found());
     }
+    workflows::release(app, &grant)?;
     Ok(grant)
 }
 
@@ -3534,6 +3629,7 @@ pub(crate) fn require_grant_access(
     grant: &OutboundGrant,
     headers: &HeaderMap,
 ) -> ApiResult<()> {
+    workflows::require_recipient(app, grant, headers)?;
     if grant_authorized(app, grant, headers) {
         Ok(())
     } else {
@@ -3912,7 +4008,12 @@ pub(crate) fn source_info_indexed_with_file(
     indexed_file: Option<&OutboundGrantFile>,
 ) -> ApiResult<Source> {
     if let Some(file) = indexed_file.or_else(|| grant.files.get(index)) {
-        let path = safe_library_path(app, &grant.tenant, &file.source)?;
+        let path =
+            if let Some(relative) = file.source.strip_prefix(&format!("workflow:{}/", grant.id)) {
+                workflows::payload_path(app, &grant.tenant, &grant.id, relative)?
+            } else {
+                safe_library_path(app, &grant.tenant, &file.source)?
+            };
         if !library_components_safe(&library_root(app, &grant.tenant), &path) {
             return Err(ApiError::not_found());
         }

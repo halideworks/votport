@@ -107,6 +107,76 @@ impl Automation {
         self.call(Method::DELETE, &format!("/deliveries/{id}"), &[], None)
     }
 
+    pub fn projects(&self) -> Result<Value> {
+        self.workflow_call(Method::GET, "/projects", &[], None)
+    }
+
+    pub fn jobs(&self, after: Option<&str>, limit: u64) -> Result<Value> {
+        self.workflow_call(
+            Method::GET,
+            "/jobs",
+            &[
+                ("after", after.unwrap_or_default().into()),
+                ("limit", limit.to_string()),
+            ],
+            None,
+        )
+    }
+
+    pub fn job(&self, id: &str) -> Result<Value> {
+        validate_id(id)?;
+        self.workflow_call(Method::GET, &format!("/jobs/{id}"), &[], None)
+    }
+
+    pub fn create_job(&self, request: &Value) -> Result<Value> {
+        validate_id(request["operation_id"].as_str().ok_or_else(|| {
+            Error::Other("operation_id is required; reuse it after a timeout".into())
+        })?)?;
+        self.workflow_call(Method::POST, "/jobs", &[], Some(request))
+    }
+
+    pub fn job_action(&self, id: &str, action: &str) -> Result<Value> {
+        validate_id(id)?;
+        if !["retry", "cancel"].contains(&action) {
+            return Err(Error::Other("agents may retry or cancel jobs".into()));
+        }
+        self.workflow_call(
+            Method::POST,
+            &format!("/jobs/{id}"),
+            &[],
+            Some(&json!({"action": action})),
+        )
+    }
+
+    pub fn events(&self, after: u64, limit: u64) -> Result<Value> {
+        self.workflow_call(
+            Method::GET,
+            "/events",
+            &[("after", after.to_string()), ("limit", limit.to_string())],
+            None,
+        )
+    }
+
+    pub fn job_evidence(&self, id: &str, after: u64, limit: u64) -> Result<Value> {
+        validate_id(id)?;
+        self.workflow_call(
+            Method::GET,
+            &format!("/jobs/{id}/evidence"),
+            &[("after", after.to_string()), ("limit", limit.to_string())],
+            None,
+        )
+    }
+
+    fn workflow_call(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<&Value>,
+    ) -> Result<Value> {
+        self.call_path(method, &format!("/api/workflows{path}"), query, body)
+    }
+
     fn call(
         &self,
         method: Method,
@@ -114,8 +184,18 @@ impl Automation {
         query: &[(&str, String)],
         body: Option<&Value>,
     ) -> Result<Value> {
-        let mut url = Url::parse("https://automation.invalid/api/automation/").unwrap();
-        url.set_path(&format!("/api/automation{path}"));
+        self.call_path(method, &format!("/api/automation{path}"), query, body)
+    }
+
+    fn call_path(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<&Value>,
+    ) -> Result<Value> {
+        let mut url = Url::parse("https://automation.invalid/").unwrap();
+        url.set_path(path);
         if !query.is_empty() {
             url.query_pairs_mut()
                 .extend_pairs(query.iter().map(|(key, value)| (*key, value)));

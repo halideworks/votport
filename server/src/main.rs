@@ -74,6 +74,12 @@ async fn main() {
     tokio::spawn(app::lease_keeper(application.clone()));
     tokio::spawn(app::upload_ended_notifier(application.clone()));
     tokio::spawn(votport::backup::scheduler(application.clone()));
+    tokio::spawn(votport::api::outbound::workflows::worker(
+        application.clone(),
+    ));
+    tokio::spawn(votport::api::outbound::workflows::event_worker(
+        application.clone(),
+    ));
     let router = app::router(application.clone());
     let listener = match tokio::net::TcpListener::bind(bind).await {
         Ok(listener) => listener,

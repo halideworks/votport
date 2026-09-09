@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 pub struct Client {
     http: reqwest::blocking::Client,
     base: String,
+    recipient_cookie: std::sync::Mutex<Option<String>>,
 }
 
 /// What `GET /api/r/{token}` tells a sender about a link.
@@ -174,6 +175,14 @@ pub struct FetchEndpoint {
 /// receiver verifies; then a second read carries the files.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OutboundMetadata {
+    #[serde(default)]
+    pub grant_id: Option<String>,
+    #[serde(default)]
+    pub delivery_manifest: Option<String>,
+    #[serde(default)]
+    pub evidence_authorization: Option<crate::delivery_protocol::SignedChallenge>,
+    #[serde(default)]
+    pub receipt_key: Option<String>,
     pub has_password: bool,
     #[serde(default)]
     pub authorized: bool,
@@ -208,6 +217,158 @@ pub struct FetchMint {
 }
 
 impl Client {
+    fn outbound_cookie(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+        cookie: Option<&str>,
+    ) -> reqwest::blocking::RequestBuilder {
+        let recipient = self
+            .recipient_cookie
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let value = cookie
+            .into_iter()
+            .chain(recipient.as_deref())
+            .collect::<Vec<_>>()
+            .join("; ");
+        with_cookie(request, Some(&value))
+    }
+
+    pub fn outbound_metadata_for_device(
+        &self,
+        token: &str,
+        cookie: Option<&str>,
+        device: Option<&crate::identity::Device>,
+    ) -> Result<OutboundMetadata> {
+        match self.outbound_metadata_with_holder(
+            token,
+            cookie,
+            device.map(|device| device.holder_key_hex()).as_deref(),
+        ) {
+            Err(Error::Server {
+                status: 403,
+                ref body,
+                ..
+            }) if serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .is_some_and(|value| {
+                    value.get("code").and_then(|v| v.as_str()) == Some("recipient_required")
+                }) =>
+            {
+                let device = device.ok_or_else(|| Error::Other("this delivery requires an enrolled device key; enable writable application storage".into()))?;
+                self.authorize_recipient(token, device)?;
+                self.outbound_metadata_with_holder(token, cookie, Some(&device.holder_key_hex()))
+            }
+            result => result,
+        }
+    }
+
+    fn authorize_recipient(&self, token: &str, device: &crate::identity::Device) -> Result<()> {
+        let challenge: crate::delivery_protocol::SignedChallenge =
+            self.run("recipient challenge", true, || {
+                self.http
+                    .post(self.url(&format!("/api/s/{token}/recipient-challenge")))
+                    .timeout(std::time::Duration::from_secs(10))
+                    .header("X-Votport", "1")
+                    .json(&serde_json::json!({"holder": device.holder_key_hex()}))
+            })?;
+        if challenge.challenge.holder != device.holder_key_hex()
+            || challenge.challenge.origin.trim_end_matches('/') != self.base
+            || !challenge.verify(&challenge.issuer)
+        {
+            return Err(Error::Other(
+                "recipient challenge does not match this device and server".into(),
+            ));
+        }
+        let proof = crate::delivery_protocol::AccessProof::sign(challenge, &device.signing_key());
+        let response = self
+            .http
+            .post(self.url(&format!("/api/s/{token}/recipient-verify")))
+            .timeout(std::time::Duration::from_secs(10))
+            .header("X-Votport", "1")
+            .json(&proof)
+            .send()
+            .map_err(|e| Error::Other(e.without_url().to_string()))?;
+        if !response.status().is_success() {
+            return Err(Error::Other(
+                "recipient device authorization was refused".into(),
+            ));
+        }
+        let cookie = response
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter_map(|value| value.split(';').next())
+            .find(|pair| pair.starts_with("votport_recipient_"))
+            .ok_or_else(|| Error::Other("recipient authorization returned no session".into()))?
+            .to_owned();
+        *self
+            .recipient_cookie
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(cookie);
+        Ok(())
+    }
+
+    pub(crate) fn base(&self) -> &str {
+        &self.base
+    }
+
+    pub fn evidence_challenge(
+        &self,
+        token: &str,
+        cookie: Option<&str>,
+        holder: &str,
+    ) -> Result<crate::delivery_protocol::SignedChallenge> {
+        let response = self
+            .outbound_cookie(
+                self.http
+                    .post(self.url(&format!("/api/s/{token}/evidence-challenge"))),
+                cookie,
+            )
+            .timeout(std::time::Duration::from_secs(5))
+            .header("X-Votport", "1")
+            .json(&serde_json::json!({"holder": holder}))
+            .send()
+            .map_err(|e| Error::Other(e.without_url().to_string()))?;
+        response
+            .error_for_status()
+            .map_err(|e| Error::Other(e.without_url().to_string()))?
+            .json()
+            .map_err(|e| Error::Other(e.to_string()))
+    }
+
+    pub fn submit_evidence(&self, evidence: &crate::delivery_protocol::Evidence) -> Result<()> {
+        let response = self
+            .http
+            .post(self.url("/api/evidence"))
+            .header("X-Votport", "1")
+            .json(evidence)
+            .send()
+            .map_err(|e| Error::Other(e.without_url().to_string()))?;
+        if !response.status().is_success() {
+            return Err(Error::Server {
+                status: response.status().as_u16(),
+                what: "submit delivery acknowledgement".into(),
+                body: String::new(),
+            });
+        }
+        #[derive(Deserialize)]
+        struct Recorded {
+            id: String,
+            recorded: bool,
+        }
+        let result: Recorded = response
+            .json()
+            .map_err(|e| Error::Other(e.without_url().to_string()))?;
+        if !result.recorded || result.id != evidence.id() {
+            return Err(Error::Other(
+                "server did not confirm this acknowledgement".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// A client for `base` (the origin, e.g. `https://drop.example`).
     ///
     /// # Errors
@@ -220,7 +381,10 @@ impl Client {
         Self::with_timeout(base, Some(std::time::Duration::from_secs(20)))
     }
 
-    fn with_timeout(base: impl Into<String>, timeout: Option<std::time::Duration>) -> Result<Self> {
+    pub(crate) fn with_timeout(
+        base: impl Into<String>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Self> {
         let http = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("votport-client/", env!("CARGO_PKG_VERSION")))
@@ -235,6 +399,7 @@ impl Client {
             })?;
         Ok(Self {
             http,
+            recipient_cookie: std::sync::Mutex::new(None),
             base: base.into().trim_end_matches('/').to_owned(),
         })
     }
@@ -429,9 +594,23 @@ impl Client {
     /// A network failure or a non-success status (404 for an unknown or
     /// expired delivery).
     pub fn outbound_metadata(&self, token: &str, cookie: Option<&str>) -> Result<OutboundMetadata> {
+        self.outbound_metadata_with_holder(token, cookie, None)
+    }
+
+    fn outbound_metadata_with_holder(
+        &self,
+        token: &str,
+        cookie: Option<&str>,
+        holder: Option<&str>,
+    ) -> Result<OutboundMetadata> {
         let url = self.url(&format!("/api/s/{token}"));
         self.run("delivery metadata", true, || {
-            with_cookie(self.http.get(&url), cookie)
+            let request = self.outbound_cookie(self.http.get(&url), cookie);
+            if let Some(holder) = holder {
+                request.header("X-Votport-Device", holder)
+            } else {
+                request
+            }
         })
     }
 
@@ -500,7 +679,7 @@ impl Client {
                 .chain(lease.as_deref())
                 .collect::<Vec<_>>()
                 .join("; ");
-            let mut request = with_cookie(self.http.get(&url), Some(&cookies));
+            let mut request = self.outbound_cookie(self.http.get(&url), Some(&cookies));
             if offset > 0 {
                 request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
             }
@@ -557,7 +736,7 @@ impl Client {
         let url = self.url(&format!("/api/s/{token}/fetch"));
         // Mints a capability and reserves a ticket, so not replayed.
         self.run("mint fetch", false, || {
-            with_cookie(
+            self.outbound_cookie(
                 self.http.post(&url).json(&FetchRequest { holder_key }),
                 cookie,
             )
@@ -685,6 +864,7 @@ impl Client {
             .http
             .request(method, self.url(path))
             .bearer_auth(token)
+            .header("X-Votport", "1")
             .timeout(std::time::Duration::from_secs(30 * 60));
         if let Some(body) = body {
             request = request.json(body);
@@ -1167,6 +1347,7 @@ mod tests {
             let client = super::Client {
                 http: reqwest::blocking::Client::builder().no_proxy().timeout(Duration::from_secs(2)).build().unwrap(),
                 base,
+                recipient_cookie: std::sync::Mutex::new(None),
             };
             let dir = tempfile::tempdir().unwrap();
             let destination = dir.path().join("file");

@@ -62,6 +62,7 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("receive") => receive(&args[1..]),
         Some("inspect") => inspect(&args[1..]),
         Some("status") => status(),
+        Some("evidence") => evidence(&args[1..]),
         Some("resume") => resume(&args[1..]),
         Some("signin") => signin(&args[1..]),
         Some("signout") => {
@@ -86,6 +87,31 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn evidence(args: &[String]) -> Result<(), String> {
+    use votport_client_core::evidence;
+    let value = match args.first().map(String::as_str) {
+        Some("list") if args.len() == 1 => serde_json::to_value(evidence::delivery_verifications())
+            .map_err(|error| error.to_string())?,
+        Some("device-key") if args.len() == 1 => {
+            serde_json::json!({"holder": evidence::recipient_device_key().map_err(|error| error.to_string())?})
+        }
+        Some("retry") if args.len() == 1 => {
+            let result = evidence::retry_evidence();
+            serde_json::json!({"pending":result.pending,"recorded":result.recorded,"failed":result.failed})
+        }
+        Some("accept") if args.len() == 2 => {
+            serde_json::json!({"status":evidence::accept_delivery(args[1].clone()).map_err(|error| error.to_string())?})
+        }
+        _ => {
+            return Err(
+                "evidence needs list, device-key, retry, or accept <verification-id>".into(),
+            )
+        }
+    };
+    println!("{value}");
+    Ok(())
+}
+
 fn print_usage() {
     eprintln!("votport agent session
 votport agent files [<directory>] [--after <cursor>] [--limit <n>]
@@ -94,8 +120,18 @@ votport agent recover <operation-id>
 votport agent deliveries [--after <cursor>] [--limit <n>]
 votport agent delivery <id> [--offset <n>] [--limit <n>]
 votport agent revoke <id>
+votport agent projects
+votport agent jobs [--after <cursor>] [--limit <n>]
+votport agent create-job <request.json | ->
+votport agent job | retry-job | cancel-job <id>
+votport agent events [--after <cursor>] [--limit <n>]
+votport agent job-evidence <id> [--after <cursor>] [--limit <n>]
+votport evidence list | device-key | retry
+votport evidence accept <verification-id>
 votport mcp
 
+Verification reports are queued durably. Long-running desktop apps retry automatically;
+short-lived CLI processes can flush pending reports with votport evidence retry.
 Agent commands always return JSON and use VOTPORT_URL and VOTPORT_AUTOMATION_TOKEN.
 ");
     eprintln!(
@@ -381,6 +417,9 @@ impl Observer for CliObserver {
         if self.json {
             use serde_json::json;
             let line = match &event {
+                Event::Evidence { status } => {
+                    json!({"event": "delivery_evidence", "status": status})
+                }
                 Event::Transferred { .. } => return,
                 Event::Selected { files } | Event::Planned { files } => {
                     json!({"event": if matches!(event, Event::Selected { .. }) { "selected" } else { "planned" }, "files": files.iter().map(|f| json!({"index": f.index, "path": f.path, "bytes": f.bytes})).collect::<Vec<_>>()})
@@ -419,6 +458,7 @@ impl Observer for CliObserver {
             return;
         }
         match event {
+            Event::Evidence { status } => println!("  delivery evidence: {status}"),
             Event::Transport(_) | Event::Bytes { .. } | Event::Transferred { .. } => {}
             Event::Selected { .. } | Event::Planned { .. } => {}
             Event::SessionCreated { .. } => {}

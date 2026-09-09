@@ -41,7 +41,10 @@ pub enum Outcome {
     Fetched(Received),
     /// The delivery does not serve, or the serve did not answer the probe; the
     /// caller should receive over HTTP instead.
-    Unreachable,
+    Unreachable {
+        metadata: Box<crate::api::OutboundMetadata>,
+        cookie: Option<String>,
+    },
 }
 
 /// Fetches `delivery` into `dest` over QUIC, erroring rather than falling back
@@ -61,7 +64,7 @@ pub fn receive_over_fetch(
     let client = Client::new(base)?;
     match try_fetch(&client, &delivery, device, dest, observer)? {
         Outcome::Fetched(received) => Ok(received),
-        Outcome::Unreachable => Err(Error::Other(
+        Outcome::Unreachable { .. } => Err(Error::Other(
             "the delivery does not serve a QUIC fetch, or the destination cannot stage one"
                 .to_owned(),
         )),
@@ -94,7 +97,7 @@ pub(crate) fn try_fetch_with_resume(
     observer: &mut dyn Observer,
     resume: bool,
 ) -> Result<Outcome> {
-    let mut metadata = client.outbound_metadata(&delivery.token, None)?;
+    let mut metadata = client.outbound_metadata_for_device(&delivery.token, None, Some(device))?;
 
     // A password delivery serves nothing until the password is proven; the
     // grant cookie the verify returns also authorizes the mint.
@@ -105,7 +108,8 @@ pub(crate) fn try_fetch_with_resume(
             .as_deref()
             .ok_or(Error::PasswordRequired)?;
         let granted = client.verify_outbound(&delivery.token, password)?;
-        metadata = client.outbound_metadata(&delivery.token, Some(&granted))?;
+        metadata =
+            client.outbound_metadata_for_device(&delivery.token, Some(&granted), Some(device))?;
         cookie = Some(granted);
         if !metadata.authorized {
             return Err(Error::PasswordRequired);
@@ -114,7 +118,10 @@ pub(crate) fn try_fetch_with_resume(
 
     // A delivery without a fetch endpoint does not serve: fall back to HTTP.
     let Some(endpoint) = metadata.fetch.as_ref() else {
-        return Ok(Outcome::Unreachable);
+        return Ok(Outcome::Unreachable {
+            metadata: Box::new(metadata),
+            cookie,
+        });
     };
 
     // The delivery's own file list, so a screen has rows while the carrier
@@ -174,16 +181,27 @@ pub(crate) fn try_fetch_with_resume(
         .unwrap_or_else(|| Path::new("."));
     let total: u64 = metadata.files.iter().map(|file| file.bytes).sum();
     if require_space(staging_parent, total.saturating_add(remaining)).is_err() {
-        return Ok(Outcome::Unreachable);
+        return Ok(Outcome::Unreachable {
+            metadata: Box::new(metadata),
+            cookie,
+        });
     }
 
     let probe_digest = decode_digest(&endpoint.certificate_digest)?;
     let Ok(addresses) = parse_rendezvous(&endpoint.address) else {
-        return Ok(Outcome::Unreachable);
+        return Ok(Outcome::Unreachable {
+            metadata: Box::new(metadata),
+            cookie,
+        });
     };
     let reachable = match probe_any(&addresses, probe_digest) {
         Probe::Reachable(address) => address,
-        Probe::Unreachable => return Ok(Outcome::Unreachable),
+        Probe::Unreachable => {
+            return Ok(Outcome::Unreachable {
+                metadata: Box::new(metadata),
+                cookie,
+            })
+        }
         Probe::Mismatch => return Err(Error::Package(VotError::ServeIdentityMismatch)),
     };
 
@@ -228,6 +246,7 @@ pub(crate) fn try_fetch_with_resume(
         fs::remove_dir_all(&stage)?;
     }
 
+    let evidence = crate::evidence::prepare_receive(client, &metadata, Some(device), observer)?;
     observer.event(Event::Transport(Transport::Fetch));
     let expected: HashMap<_, _> = metadata
         .files
@@ -329,9 +348,6 @@ pub(crate) fn try_fetch_with_resume(
                     Error::from(error)
                 })?;
                 let _ = sender.send(Event::Transferred { bytes: moved });
-                let _ = sender.send(Event::Finished {
-                    files: received.files.len(),
-                });
                 Ok(received)
             })
         },
@@ -339,6 +355,10 @@ pub(crate) fn try_fetch_with_resume(
     // The files are on disk and verified; a failure to clear the stage must not
     // fail the receive. A leftover whole bundle is removed on the next run.
     let _ = fs::remove_dir_all(&stage);
+    crate::evidence::complete(client.base(), evidence, observer);
+    observer.event(Event::Finished {
+        files: received.files.len(),
+    });
     Ok(Outcome::Fetched(received))
 }
 

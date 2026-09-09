@@ -8,8 +8,11 @@
 
 pub mod api;
 pub mod automation;
+#[path = "../../../protocol/delivery.rs"]
+pub mod delivery_protocol;
 pub mod entries;
 pub mod error;
+pub mod evidence;
 pub mod fetch;
 pub mod ffi;
 pub mod identity;
@@ -22,6 +25,7 @@ pub mod send_http;
 pub mod send_push;
 pub mod transfer;
 pub mod watch;
+pub mod workflows;
 
 uniffi::setup_scaffolding!();
 

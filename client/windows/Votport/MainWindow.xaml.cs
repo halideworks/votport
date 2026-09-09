@@ -134,6 +134,7 @@ public sealed partial class MainWindow : Window
         "links" => typeof(LinksPage),
         "transfers" => typeof(TransfersPage),
         "settings" => typeof(SettingsPage),
+        "workflows" => typeof(WorkflowsPage),
         _ => typeof(SendPage),
     };
 
