@@ -56,7 +56,7 @@ async function saveStorage() {
   await page.locator('#workflow-save-storage button[type=submit]').click();
   assert.equal((await response).status(), 200);
   await page.waitForFunction(() => document.querySelector('#ws-auth').value === 'keep');
-  await page.waitForFunction(() => !document.querySelector('#storage-test').disabled && !document.querySelector('#workflow-save-storage').inert);
+  await page.waitForFunction(() => !document.querySelector('#storage-test').disabled && !document.querySelector('#workflow-save-storage button[type=submit]').disabled);
 }
 try {
   await api('admin/login', { password: process.env.ADMIN_PASSWORD });
@@ -139,12 +139,14 @@ try {
   let releaseSave, saveStarted;
   const pendingSave = new Promise((resolve) => releaseSave = resolve), savingStarted = new Promise((resolve) => saveStarted = resolve);
   await page.route('**/api/workflows/storage', async (route) => {
-    if (route.request().method() !== 'PUT') return route.continue();
+    if (route.request().method() !== 'PUT') return route.fulfill({ status: 503, json: { error: 'List refresh failed fixture' } });
     const response = await route.fetch(); saveStarted(); await pendingSave; await route.fulfill({ response });
   });
   const saving = saveStorage(); await savingStarted;
   assert.ok(await page.locator('#workflow-save-storage').evaluate((form) => form.inert), 'Inputs stay locked until the saved revision is available');
   releaseSave(); await saving; await page.unroute('**/api/workflows/storage');
+  await page.getByText('List refresh failed fixture', { exact: true }).waitFor();
+  await page.fill('#ws-label', `${id} recovered`); await saveStorage();
   const storageId = id.replaceAll('-', '_');
   const storage = (await api('workflows/storage')).storage.find((item) => item.id === storageId);
   assert.equal(storage.credential_source, 'saved'); assert.ok(!JSON.stringify(storage).includes('votport-fixture-secret'));

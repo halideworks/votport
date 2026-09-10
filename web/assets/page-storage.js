@@ -77,18 +77,17 @@ $('workflow-save-storage').addEventListener('submit', (event) => {
   event.preventDefault(); const submit = event.submitter;
   if (submit.disabled) return;
   submit.disabled = true; $('workflow-save-storage').inert = true; $('storage-new').disabled = true;
-  const generation = editorGeneration;
   guard(async () => {
     const storage = Object.fromEntries(['id', 'label', 'endpoint', 'bucket', 'region', 'prefix'].map((key) => [key, value(`ws-${key}`)]));
     Object.assign(storage, { revision: current?.revision || 0, kms_key_id: value('ws-encryption') === 'kms' ? value('ws-kms') : null, tenants: [...$('ws-tenants').querySelectorAll('input:checked')].map((input) => input.value), path_style: $('ws-path').checked, enabled: $('ws-enabled').checked });
     if (!storage.tenants.length && storage.enabled) throw new Error('Choose at least one tenant that can use this connection.');
     const credentials = value('ws-auth') === 'keep' ? null : value('ws-auth') === 'server' ? { mode: 'server' } : { mode: 'access_key', access_key_id: value('ws-access-key'), secret_access_key: $('ws-secret-key').value, session_token: $('ws-session-token').value || null };
     const saved = await api('/api/workflows/storage', { method: 'PUT', body: JSON.stringify({ storage, credentials }) });
-    if (generation === editorGeneration) $('ws-access-key').value = $('ws-secret-key').value = $('ws-session-token').value = '';
-    await refresh();
+    saved.credential_source = credentials ? credentials.mode === 'server' ? 'server' : 'saved' : current?.credential_source || 'server';
     $('workflow-save-storage').inert = false;
-    if (generation === editorGeneration) edit(connections.find((connection) => connection.id === saved.id));
+    edit(saved);
     notice(`“${saved.label}” saved. Test the saved connection before using it in a workflow.`);
+    await refresh();
   }).finally(() => { submit.disabled = false; $('workflow-save-storage').inert = false; $('storage-new').disabled = false; });
 });
 $('storage-test').onclick = () => guard(async () => {
