@@ -1961,6 +1961,64 @@ async fn create_library_grant(
     .await
     .into_iter()
     .collect::<ApiResult<Vec<_>>>()?;
+    if let Some(received) = options
+        .workflow
+        .as_ref()
+        .and_then(|job| job.received.as_ref())
+    {
+        let upload = app
+            .store
+            .link_upload(&identity.tenant, &received.link_id, &received.upload_id)
+            .map_err(ApiError::internal)?
+            .ok_or_else(ApiError::not_found)?;
+        let expected: std::collections::BTreeMap<_, _> = upload
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file))
+            .collect();
+        if expected.len() != hashed.len() {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "incoming inventory changed",
+            ));
+        }
+        for file in &hashed {
+            let original = expected
+                .get(file.name.as_str())
+                .filter(|original| !original.deleted && original.bytes == file.bytes)
+                .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "incoming file changed"))?;
+            match original.suite.as_str() {
+                "blake3" if original.root == file.root => {}
+                "sha256" => {
+                    let object = ObjectId {
+                        suite: 2,
+                        root: hex::decode(&original.root)
+                            .ok()
+                            .and_then(|bytes| bytes.try_into().ok())
+                            .ok_or_else(ApiError::not_found)?,
+                        length: original.bytes,
+                    };
+                    let path = root.join(&file.name);
+                    let proof_root = proof_root.clone();
+                    tokio::task::spawn_blocking(move || build_catalog(&proof_root, &path, &object))
+                        .await
+                        .map_err(|_| ApiError::internal("verify incoming snapshot failed"))?
+                        .map_err(|_| {
+                            ApiError::new(
+                                StatusCode::CONFLICT,
+                                "incoming content changed since verification",
+                            )
+                        })?;
+                }
+                _ => {
+                    return Err(ApiError::new(
+                        StatusCode::CONFLICT,
+                        "incoming content changed since verification",
+                    ))
+                }
+            }
+        }
+    }
     let files = hashed
         .into_iter()
         .map(|file| {

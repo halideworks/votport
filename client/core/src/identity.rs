@@ -52,6 +52,12 @@ pub struct Device {
 }
 
 impl Device {
+    /// Uses a signing key managed by the caller.
+    #[must_use]
+    pub fn from_signing_key(key: SigningKey) -> Self {
+        Self { key }
+    }
+
     /// Loads the device key from the state directory, creating it on first use.
     ///
     /// # Errors

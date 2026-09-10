@@ -912,6 +912,10 @@ pub async fn delete_tenant(
         .filter(|ext| !ext.is_empty());
     use crate::store::TenantRemoval;
     let row_deleted = match app.store.remove_tenant(&key) {
+        Ok(TenantRemoval::HasRoutes) => {
+            app.sessions.unpin_tenant(&key);
+            return Err(ApiError::new(StatusCode::CONFLICT, "cancel this tenant's trade routes and wait for destination acknowledgments before deleting it"));
+        }
         Ok(TenantRemoval::Deleted) => true,
         Ok(TenantRemoval::HasLinks) => {
             app.sessions.unpin_tenant(&key);
@@ -2363,10 +2367,12 @@ struct LinkView {
     events: Vec<crate::store::SessionEvent>,
     /// Sessions receiving into this link right now.
     receiving: Vec<crate::session::ActiveTransfer>,
+    workflow: Option<crate::workflow::ReceiveWorkflow>,
 }
 
 #[derive(Serialize)]
 struct UploadView {
+    route: Option<serde_json::Value>,
     id: String,
     started_at: u64,
     completed_at: u64,
@@ -2440,13 +2446,22 @@ fn link_view(
     link: Link,
     base: &str,
     transfers: &[crate::session::ActiveTransfer],
-) -> LinkView {
+) -> ApiResult<LinkView> {
+    let workflow = app
+        .store
+        .receive_workflow(&link.tenant, &link.id)
+        .map_err(super::store_unavailable)?;
+    let mut routes = app
+        .store
+        .received_route_statuses(&link.tenant, &link.id)
+        .map_err(super::store_unavailable)?;
     let usable = link.usable_now();
     let tenant = link.tenant.clone();
     let uploads = link
         .uploads
         .into_iter()
         .map(|upload| UploadView {
+            route: routes.remove(&upload.id),
             files: upload
                 .files
                 .into_iter()
@@ -2478,7 +2493,8 @@ fn link_view(
         .filter(|transfer| transfer.link_id == link.id)
         .cloned()
         .collect();
-    LinkView {
+    Ok(LinkView {
+        workflow,
         url: format!("{base}/r/{}", link.id),
         usable,
         receiving,
@@ -2494,7 +2510,7 @@ fn link_view(
         notify_on_upload: link.notify_on_upload,
         uploads,
         events: link.events,
-    }
+    })
 }
 
 pub async fn list_links(
@@ -2554,7 +2570,7 @@ pub async fn list_links(
             .links
             .into_iter()
             .map(|link| link_view(&app, link, &base, &transfers))
-            .collect();
+            .collect::<ApiResult<_>>()?;
         return Ok(Json(json!({
             "links": links,
             "receive_dir": app.config.receive_dir,
@@ -2569,7 +2585,7 @@ pub async fn list_links(
         .map_err(super::store_unavailable)?
         .into_iter()
         .map(|link| link_view(&app, link, &base, &transfers))
-        .collect();
+        .collect::<ApiResult<_>>()?;
     Ok(Json(json!({
         "links": links,
         "receive_dir": app.config.receive_dir,
@@ -2590,6 +2606,7 @@ pub struct CreateLinkRequest {
     max_bytes: Option<u64>,
     #[serde(default)]
     notify_on_upload: bool,
+    workflow: Option<crate::workflow::ReceiveWorkflow>,
 }
 
 pub async fn create_link(
@@ -2683,14 +2700,17 @@ pub async fn create_link(
         events: Vec::new(),
     };
     let base = base_url(&app, &headers);
-    let view = link_view(&app, link.clone(), &base, &[]);
-    app.store.insert_link(link).map_err(|error| match error {
-        crate::store::InsertLinkError::NamedTenantGone => ApiError::new(
-            StatusCode::GONE,
-            "this session's tenant no longer exists; sign in again",
-        ),
-        crate::store::InsertLinkError::Store(message) => ApiError::internal(message),
-    })?;
+    let mut view = link_view(&app, link.clone(), &base, &[])?;
+    view.workflow = request.workflow.clone();
+    app.store
+        .insert_link_with_workflow(link, request.workflow.as_ref())
+        .map_err(|error| match error {
+            crate::store::InsertLinkError::NamedTenantGone => ApiError::new(
+                StatusCode::GONE,
+                "this session's tenant no longer exists; sign in again",
+            ),
+            crate::store::InsertLinkError::Store(message) => ApiError::internal(message),
+        })?;
     tracing::info!(target: "audit", event = "link_created", id = %view.id, label = %view.label, dest = %view.dest, "request link created");
     app.store.audit(
         &identity.tenant,
@@ -2710,6 +2730,7 @@ pub struct UpdateLinkRequest {
     legal_hold: Option<bool>,
     #[serde(default)]
     notify_on_upload: Option<bool>,
+    workflow: Option<crate::workflow::ReceiveWorkflow>,
 }
 
 pub async fn update_link(
@@ -2724,12 +2745,26 @@ pub async fn update_link(
         request.active.is_some(),
         request.legal_hold.is_some(),
         request.notify_on_upload.is_some(),
+        request.workflow.is_some(),
     ];
     if fields.iter().filter(|field| **field).count() != 1 {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "exactly one link lifecycle or policy field is required",
         ));
+    }
+    if let Some(workflow) = request.workflow {
+        app.store
+            .set_receive_workflow(&identity.tenant, &id, &workflow)
+            .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
+        app.store.audit(
+            &identity.tenant,
+            &identity.subject,
+            "receive_workflow_changed",
+            &id,
+            &json!({"project_id":workflow.project_id}),
+        );
+        return Ok(Json(json!({"ok":true})));
     }
     if let Some(legal_hold) = request.legal_hold {
         if app
@@ -2831,6 +2866,16 @@ pub async fn delete_link(
     }
     if app
         .store
+        .receive_workflow_pending(&identity.tenant, &id)
+        .map_err(super::store_unavailable)?
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "incoming workflows still need these files; finish or cancel them first",
+        ));
+    }
+    if app
+        .store
         .link_has_active_outbound_grants(&identity.tenant, &id, now_unix())
         .map_err(ApiError::internal)?
     {
@@ -2907,6 +2952,16 @@ pub async fn delete_upload_record(
             "uploads are in flight; try again when they finish",
         ));
     }
+    if app
+        .store
+        .receive_workflow_pending(&identity.tenant, &id)
+        .map_err(super::store_unavailable)?
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "incoming workflows still need these files; finish or cancel them first",
+        ));
+    }
     let link = app
         .store
         .link(&identity.tenant, &id)
@@ -2981,6 +3036,16 @@ pub async fn delete_received_file(
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "uploads are in flight; try again when they finish",
+        ));
+    }
+    if app
+        .store
+        .receive_workflow_pending(&identity.tenant, &id)
+        .map_err(super::store_unavailable)?
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "incoming workflows still need these files; finish or cancel them first",
         ));
     }
     let link = app
@@ -3502,7 +3567,7 @@ mod handler_tests {
             "http://localhost",
             &[],
         );
-        let json = serde_json::to_value(view).unwrap();
+        let json = serde_json::to_value(view.unwrap()).unwrap();
         assert_eq!(json["uploads"][0]["transport"], "http");
     }
 

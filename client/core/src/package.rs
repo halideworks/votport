@@ -119,12 +119,23 @@ impl PreparedEntry {
                 return Ok(prepared);
             }
         }
-        let bytes = fs::read(&self.source).map_err(|source| Error::Read {
+        use std::io::Read;
+        let mut file = fs::File::open(&self.source).map_err(|source| Error::Read {
             path: self.source.clone(),
             source,
         })?;
         let mut builder = ObjectBuilder::new(Suite::Blake3Bao64, Some(self.length))?;
-        builder.update(&bytes)?;
+        let mut buffer = vec![0; 1024 * 1024];
+        loop {
+            let count = file.read(&mut buffer).map_err(|source| Error::Read {
+                path: self.source.clone(),
+                source,
+            })?;
+            if count == 0 {
+                break;
+            }
+            builder.update(&buffer[..count])?;
+        }
         Ok(builder.finish()?)
     }
 }
@@ -156,6 +167,18 @@ pub fn build(entries: Vec<Entry>, manifest_root: &Path) -> Result<Prepared> {
     let (summary, served): (PackageSummary, BTreeMap<[u8; 32], ServedSource>) =
         build_manifest_from(pairs, manifest_root, Suite::Blake3Bao64)?;
 
+    load_prepared(summary, served, manifest_root)
+}
+
+/// Opens a locally generated manifest with its already prepared file sources.
+///
+/// # Errors
+/// Missing or invalid manifest files, or an entry without a file source.
+pub fn load_prepared(
+    summary: PackageSummary,
+    served: BTreeMap<[u8; 32], ServedSource>,
+    manifest_root: &Path,
+) -> Result<Prepared> {
     let manifest_dir = manifest_root.join(MANIFEST_DIRECTORY);
     let seal_bytes = fs::read(manifest_dir.join(MANIFEST_SEAL))?;
     let seal = decode_seal(&seal_bytes)
@@ -248,6 +271,12 @@ mod tests {
             "a multi-group object keeps leaves"
         );
         assert!(big_object.prover().is_ok());
+        let mut without_cache = big_object.clone();
+        without_cache.leaves = None;
+        assert_eq!(
+            without_cache.prover().unwrap().object_id().root,
+            big_object.root
+        );
 
         let small_object = prepared
             .objects

@@ -19,6 +19,9 @@ pub struct WorkflowProject {
     pub recipients: Vec<WorkflowRecipient>,
     pub require_approval: bool,
     pub scan_required: bool,
+    pub receive: bool,
+    pub destinations: Vec<String>,
+    pub release: String,
 }
 
 #[derive(Clone, Debug, Serialize, uniffi::Record)]
@@ -35,6 +38,8 @@ pub struct WorkflowJobSpec {
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct WorkflowJob {
+    pub destinations: Vec<String>,
+    pub received: bool,
     pub id: String,
     pub label: String,
     pub project: String,
@@ -68,6 +73,8 @@ fn job(value: Value) -> crate::Result<WorkflowJob> {
         error: Option<String>,
         approved_by: Option<String>,
         created_at: u64,
+        checks: Value,
+        received: Option<Value>,
     }
     #[derive(Deserialize)]
     struct Request {
@@ -76,10 +83,33 @@ fn job(value: Value) -> crate::Result<WorkflowJob> {
     #[derive(Deserialize)]
     struct Project {
         label: String,
+        destinations: Vec<String>,
     }
     let value: Envelope =
         serde_json::from_value(value).map_err(|error| Error::Other(error.to_string()))?;
+    let destinations = value
+        .job
+        .project
+        .destinations
+        .iter()
+        .map(|id| {
+            let leg = &value.job.checks["destinations"][id];
+            let revocation = &value.job.checks["route_revocations"][id];
+            let status = match revocation["state"].as_str() {
+                Some("acknowledged") => "Revocation acknowledged",
+                Some("pending") => "Revocation awaiting destination",
+                _ => match leg["state"].as_str() {
+                    Some("complete") => "Verified copy complete",
+                    Some("sending") => "Transferring files",
+                    _ => leg["error"].as_str().unwrap_or("Copy pending"),
+                },
+            };
+            format!("{id}: {status}")
+        })
+        .collect();
     Ok(WorkflowJob {
+        destinations,
+        received: value.job.received.is_some(),
         id: value.job.id,
         label: value.job.request.label,
         project: value.job.project.label,
@@ -177,4 +207,24 @@ pub fn change_workflow_job(
         )?)
     })
     .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jobs_expose_reception_and_each_destinations_control_status() {
+        let result = job(json!({"url":"https://port.example/s/link","job":{"id":"job","request":{"label":"Received masters"},"project":{"label":"Studio","destinations":["nyc","s3","shared"]},"state":"retrying","manifest":"root","error":null,"approved_by":null,"created_at":1,"received":{"upload_id":"upload"},"checks":{"destinations":{"nyc":{"state":"complete"},"s3":{"state":"failed","error":"Bucket unavailable"}},"route_revocations":{"nyc":{"state":"pending"}}}}})).unwrap();
+        assert!(result.received);
+        assert!(result.url.is_some());
+        assert_eq!(
+            result.destinations,
+            vec![
+                "nyc: Revocation awaiting destination",
+                "s3: Bucket unavailable",
+                "shared: Copy pending"
+            ]
+        );
+    }
 }

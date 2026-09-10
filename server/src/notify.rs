@@ -226,6 +226,33 @@ pub async fn upload_ended(app: Arc<App>, ended: crate::session::SessionEnded) {
     .await;
 }
 
+pub async fn workflow_failed(app: Arc<App>, job: crate::workflow::Job) {
+    let retrying = job.state == "retrying";
+    let title = format!(
+        "{}: delivery {} for \"{}\"",
+        title_brand(&app, &job.tenant),
+        if retrying {
+            "retry scheduled"
+        } else {
+            "needs attention"
+        },
+        job.request.label
+    );
+    let body = format!(
+        "{}\n{}",
+        job.error
+            .as_deref()
+            .unwrap_or("A destination did not complete"),
+        if job.released() {
+            "The local download link remains released."
+        } else {
+            "The download link remains held."
+        }
+    );
+    let payload = json!({"event":"workflow_failed", "job_id":job.id, "label":job.request.label, "state":job.state, "error":job.error, "retry_at":job.checks["retry_at"], "released":job.released()});
+    send_all(app, title, body, payload, "workflow_failed", Some(&job.id)).await;
+}
+
 async fn send_all(
     app: Arc<App>,
     title: String,

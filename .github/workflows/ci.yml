@@ -233,7 +233,7 @@ jobs:
           data_dir="$e2e_root/data"
           receive_dir="$e2e_root/receive"
           outbound_dir="$e2e_root/library"
-          mkdir -p "$data_dir" "$receive_dir" "$outbound_dir"
+          mkdir -p "$data_dir" "$receive_dir" "$outbound_dir" "$e2e_root/shared"
           cleanup() {
             status=$?
             if [ "$status" -ne 0 ]; then
@@ -257,6 +257,7 @@ jobs:
             -v "$data_dir:/data" \
             -v "$receive_dir:/received" \
             -v "$outbound_dir:/outbound" \
+            -v "$e2e_root/shared:$e2e_root/shared" \
             votport:ci
 
           for attempt in $(seq 1 60); do

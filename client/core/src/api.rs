@@ -14,6 +14,7 @@ pub struct Client {
     http: reqwest::blocking::Client,
     base: String,
     recipient_cookie: std::sync::Mutex<Option<String>>,
+    route: Option<String>,
 }
 
 /// What `GET /api/r/{token}` tells a sender about a link.
@@ -43,12 +44,16 @@ pub struct PackageAnnouncement {
 #[derive(Debug, Serialize)]
 struct CreateSessionRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
+    route: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     password: Option<&'a str>,
     package: PackageAnnouncement,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreatedSession {
+    #[serde(default)]
+    pub resume: bool,
     pub session: String,
     pub chunk_bytes: u64,
 }
@@ -132,6 +137,8 @@ pub struct PushPackageAnnouncement {
 
 #[derive(Debug, Serialize)]
 struct CreatePushRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     password: Option<&'a str>,
     holder_key: String,
@@ -377,6 +384,20 @@ impl Client {
         Self::with_timeout(base, None)
     }
 
+    /// Creates a peer sender with a bound on each HTTP request.
+    ///
+    /// # Errors
+    /// TLS or HTTP client setup failure.
+    pub fn for_route(base: impl Into<String>, route: String) -> Result<Self> {
+        let mut client = Self::with_timeout(base, Some(std::time::Duration::from_secs(300)))?;
+        client.route = Some(route);
+        Ok(client)
+    }
+
+    pub(crate) fn is_route(&self) -> bool {
+        self.route.is_some()
+    }
+
     pub(crate) fn authentication(base: impl Into<String>) -> Result<Self> {
         Self::with_timeout(base, Some(std::time::Duration::from_secs(20)))
     }
@@ -400,6 +421,7 @@ impl Client {
         Ok(Self {
             http,
             recipient_cookie: std::sync::Mutex::new(None),
+            route: None,
             base: base.into().trim_end_matches('/').to_owned(),
         })
     }
@@ -449,6 +471,7 @@ impl Client {
         let url = self.url(&format!("/api/r/{token}/session"));
         self.run("create session", false, || {
             self.http.post(&url).json(&CreateSessionRequest {
+                route: self.route.as_deref(),
                 password,
                 package: package.clone(),
             })
@@ -532,7 +555,7 @@ impl Client {
             })?;
             let status = response.status();
             if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-                let body = response.text().unwrap_or_default();
+                let body = error_body(response);
                 if body.contains("not fully received") {
                     return Err(Error::Rebegin);
                 }
@@ -578,6 +601,7 @@ impl Client {
         let url = self.url(&format!("/api/r/{token}/push"));
         self.run("create push session", false, || {
             self.http.post(&url).json(&CreatePushRequest {
+                route: self.route.as_deref(),
                 password,
                 holder_key: holder_key.to_owned(),
                 package: package.clone(),
@@ -638,7 +662,7 @@ impl Client {
                 })?;
             let status = response.status();
             if !status.is_success() {
-                let body = response.text().unwrap_or_default();
+                let body = error_body(response);
                 return Err(Error::Server {
                     status: status.as_u16(),
                     what: "delivery verify".to_owned(),
@@ -689,7 +713,7 @@ impl Client {
             })?;
             let status = response.status();
             if !status.is_success() {
-                let body = response.text().unwrap_or_default();
+                let body = error_body(response);
                 return Err(Error::Server {
                     status: status.as_u16(),
                     what: "download".to_owned(),
@@ -807,7 +831,7 @@ impl Client {
             return Err(Error::Server {
                 status: status.as_u16(),
                 what: "sign in".to_owned(),
-                body: response.text().unwrap_or_default(),
+                body: error_body(response),
             });
         }
         set_cookie(&response, ADMIN_COOKIE)
@@ -1085,17 +1109,53 @@ fn json<T: for<'de> Deserialize<'de>>(
 ) -> Result<T> {
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().unwrap_or_default();
+        let body = error_body(response);
         return Err(Error::Server {
             status: status.as_u16(),
             what: what.to_owned(),
             body,
         });
     }
-    response.json().map_err(|source| Error::Http {
-        url: what.to_owned(),
-        source,
-    })
+    let url = response.url().to_string();
+    let bytes = bounded_body(response, 256 * 1024 * 1024).map_err(|error| {
+        if let Error::Io(error) = error {
+            if error
+                .get_ref()
+                .is_some_and(|source| source.is::<reqwest::Error>())
+            {
+                return Error::Http {
+                    url,
+                    source: *error
+                        .into_inner()
+                        .expect("checked source")
+                        .downcast::<reqwest::Error>()
+                        .expect("checked type"),
+                };
+            }
+            Error::Io(error)
+        } else {
+            error
+        }
+    })?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| Error::Other(format!("invalid {what} response: {error}")))
+}
+
+fn bounded_body(reader: impl std::io::Read, limit: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    reader.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(Error::Other("server response exceeds its limit".into()));
+    }
+    Ok(bytes)
+}
+
+fn error_body(response: reqwest::blocking::Response) -> String {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    let _ = response.take(8192).read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Which way a link moves bytes.
@@ -1170,6 +1230,82 @@ pub fn split_link_as(link: &str, kind: LinkKind) -> Result<Link> {
 mod tests {
     use super::{split_link, split_link_as, LinkKind};
     use crate::error::Error;
+
+    #[test]
+    fn response_body_limits_accept_the_boundary_and_refuse_excess() {
+        assert_eq!(super::bounded_body(&b"{}"[..], 2).unwrap(), b"{}");
+        assert!(super::bounded_body(&b"{}x"[..], 2).is_err());
+        assert!(super::bounded_body(std::io::empty(), 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stalled_json_body_keeps_its_network_error_and_retries() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let mut stream = (0..400)
+                    .find_map(|_| {
+                        if let Ok((stream, _)) = listener.accept() {
+                            Some(stream)
+                        } else {
+                            std::thread::sleep(Duration::from_millis(5));
+                            None
+                        }
+                    })
+                    .expect("retry reached the server");
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut request = BufReader::new(&stream);
+                for _ in 0..64 {
+                    let mut line = String::new();
+                    assert!(request.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{",
+                    )
+                    .unwrap();
+                if attempt == 0 {
+                    std::thread::sleep(Duration::from_millis(200));
+                } else {
+                    stream.write_all(b"}").unwrap();
+                }
+            }
+        });
+        let http = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let mut attempts = 0;
+        let value: serde_json::Value = super::retry(true, || {
+            attempts += 1;
+            assert!(
+                attempts <= 2,
+                "retry must terminate after the successful response"
+            );
+            let result = super::json(http.get(&url).send().unwrap(), "session");
+            if attempts == 1 {
+                assert!(matches!(&result, Err(Error::Http { source, .. }) if source.is_timeout()));
+            }
+            result
+        })
+        .unwrap();
+        assert_eq!(value, serde_json::json!({}));
+        assert_eq!(attempts, 2);
+        server.join().unwrap();
+    }
 
     #[test]
     fn credential_posts_do_not_follow_redirects() {
@@ -1348,6 +1484,7 @@ mod tests {
                 http: reqwest::blocking::Client::builder().no_proxy().timeout(Duration::from_secs(2)).build().unwrap(),
                 base,
                 recipient_cookie: std::sync::Mutex::new(None),
+                route: None,
             };
             let dir = tempfile::tempdir().unwrap();
             let destination = dir.path().join("file");

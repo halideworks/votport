@@ -61,6 +61,49 @@ impl ReceiptSigner {
         hex::encode(Sha256::digest(self.key.sign(message.as_bytes()).to_bytes()))[..32].into()
     }
 
+    pub(crate) fn sign_route(
+        &self,
+        document: crate::route_protocol::RouteDocument,
+    ) -> crate::route_protocol::SignedRoute {
+        crate::route_protocol::SignedRoute::sign(document, &self.key)
+    }
+
+    pub(crate) fn route_device(&self) -> votport_client_core::Device {
+        use hmac::{Hmac, Mac as _};
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&self.key.to_bytes())
+            .expect("HMAC accepts a 32-byte seed");
+        mac.update(b"votport-route-holder-v1\0");
+        votport_client_core::Device::from_signing_key(SigningKey::from_bytes(
+            &mac.finalize().into_bytes().into(),
+        ))
+    }
+
+    pub(crate) fn revoke_route(
+        &self,
+        source: crate::route_protocol::SignedRoute,
+        receiver: String,
+        route_id: &str,
+    ) -> crate::route_protocol::RouteRevocation {
+        crate::route_protocol::RouteRevocation::sign(source, receiver, route_id, &self.key)
+    }
+
+    pub(crate) fn route_revoked(
+        &self,
+        request: crate::route_protocol::RouteRevocation,
+        revoked_at: u64,
+    ) -> crate::route_protocol::RouteRevoked {
+        crate::route_protocol::RouteRevoked::sign(request, revoked_at, &self.key)
+    }
+
+    pub(crate) fn route_receipt(
+        &self,
+        source: crate::route_protocol::SignedRoute,
+        upload_id: String,
+        received_at: u64,
+    ) -> crate::route_protocol::RouteReceipt {
+        crate::route_protocol::RouteReceipt::sign(source, upload_id, received_at, &self.key)
+    }
+
     pub(crate) fn sign_delivery_export(&self, document: &serde_json::Value) -> String {
         use ed25519_dalek::Signer;
         let mut bytes = b"votport-delivery-export-v1\0".to_vec();
@@ -225,6 +268,17 @@ mod tests {
         let signer = ReceiptSigner::load_or_create(directory.path()).unwrap();
         let reloaded = ReceiptSigner::load_or_create(directory.path()).unwrap();
         assert_eq!(signer.public_hex, reloaded.public_hex, "key is persistent");
+        assert_eq!(
+            signer.route_device().holder_key_hex(),
+            reloaded.route_device().holder_key_hex()
+        );
+        assert_ne!(signer.public_hex, signer.route_device().holder_key_hex());
+        let other_directory = tempfile::tempdir().unwrap();
+        let other = ReceiptSigner::load_or_create(other_directory.path()).unwrap();
+        assert_ne!(
+            signer.route_device().holder_key_hex(),
+            other.route_device().holder_key_hex()
+        );
 
         let destination = directory.path().join("payload.bin");
         let object = ObjectId {

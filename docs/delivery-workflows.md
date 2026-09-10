@@ -102,11 +102,10 @@ may finish; previously delivered bytes cannot be recalled.
 Create a job with a stable `operation_id`. Repeating the same request under the
 same actor returns the same job. Reusing that ID with different fields fails.
 Jobs retain their request and policy revision across server restarts and recover
-interrupted preparation or export. Recovery is bounded to five preparation
-attempts; failed jobs remain visible and can be explicitly retried or cancelled.
+interrupted preparation or export. Recovery is bounded to five worker attempts per retry cycle; failed jobs remain visible and can be explicitly retried or cancelled.
 
 States include `queued`, `preparing`, `awaiting_approval`, `exporting`, `ready`,
-`failed`, `cancelled`, `retiring`, and `retired`. Download URLs are exposed only
+`retrying`, `failed`, `cancelled`, `retiring`, and `retired`. Download URLs are exposed only
 for a released job under its current policy and grant lifecycle. A scheduled job
 starts at or after `not_before`. When an acceptance deadline passes, a durable
 `delivery_deadline_missed` event is emitted once if any selected recipient has
@@ -141,6 +140,74 @@ S3 objects instead of the project's library files. MCP `create_job` accepts the
 same information using `import_storage_id` and `import_prefix` together.
 Follow returned cursors even when a filtered job/event page is empty.
 
+## Reception workflows and trade routes
+
+Enable **Use this project for incoming files** in a project, then select it
+under **Receive > After files arrive > Reception project**. Existing requests
+also have a **Reception workflow** editor. The selection applies to subsequent
+completed uploads. Required metadata and recipient selections belong to the
+receiving project. Incomplete uploads remain visible without starting copies.
+
+A complete upload queues its reception job in the same database transaction.
+The worker snapshots verified files and applies the receiving project's checks,
+approval and destination choices. Pending jobs protect source records against
+deletion; after a snapshot is prepared, retention can remove the original.
+Failures remain visible and can be retried or cancelled. Raw sharing cannot
+bypass a reception job's release policy.
+
+**Storage > Add storage > Destination type** offers S3, a shared folder, or
+another Votport. A shared folder must already be mounted and visible to the
+server process, including through a container mount when applicable. Votport
+connections save the other port's receive URL and optional password privately.
+**Test saved connection** checks access without sending files.
+
+Select up to 16 destinations in **Workflows > Projects > Destinations**.
+The release choice is explicit:
+
+- **After all destinations finish** holds the local download link until each
+  selected destination completes. This is the default.
+- **After local checks and approval** releases the local link and copies in the
+  background. A failed destination does not retract that local release.
+
+Two destination legs can run concurrently. Completed legs are retained across
+retries. Failed exports use persistent exponential backoff, with an initial
+failure notification and signed events for the existing webhook queue. After
+five worker attempts, explicit **Retry** starts another cycle. Native peer
+transfers use QUIC when available and HTTP otherwise. Both reuse verified
+receiver checkpoints. A receipt already committed at the receiver prevents a
+lost completion response from creating another upload.
+
+For a hypothetical LA and NYC installation, LA signs a source statement for
+its frozen manifest. NYC verifies the arriving files and records its own signed
+custody receipt in the upload completion transaction. Forwarding from NYC
+includes the parent receipt's digest and its complete signed ancestry. Receivers
+verify the chain and reject loops; a route allows at most eight sending ports.
+**Workflows > Jobs > Download custody evidence** exports the peer receipt,
+ancestors and any revocation acknowledgment. **Receive > Trade route > evidence**
+exports evidence retained by the receiving port. File publication receipts
+continue to identify their actual storage commit profile; custody signatures do
+not add a power-loss guarantee to that profile.
+
+Ports retain separate SQLite databases. The exchange includes file identities,
+label, informational metadata and signed custody evidence. It does not copy
+users, credentials, request links, tenant names, memberships or project policy.
+The destination receive request selects its own tenant, quota and reception
+project. An LA tenant does not create or select a same-named NYC tenant.
+
+Cancelling, revoking or expiring the LA delivery queues a source-signed
+revocation independently of payload work. NYC stops route-managed sharing and
+forwarding and signs an acknowledgment. Subsequent managed ports receive their
+own revocation requests. The UI distinguishes pending and acknowledged status;
+an offline port retries with capped backoff until it responds. Already-downloaded
+files, S3 exports, shared-folder copies and independent manual copies cannot be
+recalled. Deleting a source tenant requires its outgoing route acknowledgments.
+If a destination tenant was deleted first, its port can sign that the exact
+route is absent without retaining the deleted tenant's metadata.
+
+Internal organization routes with selected administration or policy syncing
+are a later management feature. Current routes use the same independent
+permission boundary for internal sites and external vendors.
+
 ## Storage, templates and quarantine
 
 Open **Storage > Add storage** to connect Amazon S3 or an S3-compatible service.
@@ -154,7 +221,7 @@ the same configuration revision.
 
 **Test saved connection** checks bucket listing without writing objects. Exports
 also need write permission and, when configured, permission to use the KMS key.
-Choose storage as a project's export destination or a new delivery's source.
+Choose connections under a project's **Destinations**, or choose S3 as a new delivery's source.
 
 With server credentials selected, a storage ID `media` can use:
 
@@ -193,7 +260,7 @@ Install and operate the scanner daemon separately. Missing, failing or timed-out
 checkers withhold release. Checks have a five-minute timeout per file and a
 64 KiB output bound. Inspect job errors and retry after correcting the problem.
 
-Media/scanning jobs and S3 imports use private snapshots. A global reservation
+Media/scanning jobs, S3 imports and reception workflows use private snapshots. A global reservation
 budget is controlled by `VOTPORT_WORKFLOW_SNAPSHOT_BYTES`, defaulting to four
 times the maximum upload size. Private files are retired seven days after a
 failed/cancelled job, or seven days after grant expiry/revocation. Job history,
@@ -292,3 +359,30 @@ The small-file QUIC result prompted four additional alternating pairs with a
 did not reproduce. The VM showed substantial timing variation, so these results
 do not establish a universal speedup or a zero-regression guarantee. All payloads
 were independently compared after transfer.
+
+On September 10, 2026, reception routes were compared with `25230c1` on
+Erebus using isolated NVMe fixtures and release binaries. Three alternating
+runs per revision measured governed delivery preparation through CLI exit,
+and fresh uploads from CLI start through completion. Every received file was
+independently SHA-256 compared. No reception project was selected for these
+ordinary-upload comparisons.
+
+| Operation / fixture / transport | Baseline median | Reception routes median |
+| --- | ---: | ---: |
+| Delivery / 256 MiB / HTTP | 0.415 s | 0.420 s |
+| Delivery / 1,000 x 4 KiB / HTTP | 6.388 s | 6.981 s |
+| Delivery / 256 MiB / QUIC | 0.800 s | 0.826 s |
+| Delivery / 1,000 x 4 KiB / QUIC | 1.485 s | 1.706 s |
+| Upload / 256 MiB / HTTP | 0.764 s | 0.831 s |
+| Upload / 1,000 x 4 KiB / HTTP | 3.995 s | 4.908 s |
+| Upload / 256 MiB / QUIC | 0.816 s | 0.883 s |
+| Upload / 1,000 x 4 KiB / QUIC | 4.634 s | 4.578 s |
+
+The initial native small-file upload included a 37.796 s route-build outlier.
+Four additional alternating pairs had medians of 5.666 s before and 3.990 s
+after, with another 14.787 s route-build outlier. These variable samples do not
+establish a speed improvement or rule out a latency regression. Reception
+completion adds transactional queue work; copying, checks and network exports
+run in the worker. Peer sends reuse prepared manifests and retained checkpoints.
+The uncached proof builder now streams input in 1 MiB buffers instead of reading
+the entire file into memory.

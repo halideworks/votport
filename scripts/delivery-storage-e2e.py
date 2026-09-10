@@ -122,7 +122,7 @@ def main():
     def wait_job(job_id, expected):
         for _ in range(1200):
             value = api('workflows/jobs/' + job_id)
-            if value['job']['state'] in ('ready', 'failed', 'awaiting_approval'):
+            if value['job']['state'] == expected or value['job']['state'] in ('ready', 'failed', 'awaiting_approval'):
                 assert value['job']['state'] == expected, value
                 return value
             time.sleep(.05)
@@ -144,7 +144,7 @@ def main():
             'credentials': {'mode': 'access_key', 'access_key_id': access, 'secret_access_key': secret} if args.saved_credentials else None}, 'PUT')
         assert api('workflows/storage/fixture/test', {'revision': config['revision']})['ok']
         api('workflows/projects', {'id': 'storage', 'label': 'Storage checks', 'directory': 'storage',
-            'required_metadata': ['client'], 'export_storage': 'fixture'}, 'PUT')
+            'required_metadata': ['client'], 'destinations': ['fixture']}, 'PUT')
         request = {'operation_id': 's3-import-export', 'project_id': 'storage', 'label': 'S3 delivery',
             'metadata': {'client': 'Fixture'}, 'expires_days': 1, 'import': {'storage_id': 'fixture', 'prefix': 'source'}}
         faults['mutate'] = '/' + bucket + '/source/literal%23#[1].bin'
@@ -158,8 +158,8 @@ def main():
         s3('PUT', 'source/literal%23#[1].bin', files['literal%23#[1].bin'])
         faults['reject_completion'] = True
         api('workflows/jobs/' + job_id, {'action': 'retry'})
-        failed = wait_job(job_id, 'failed')
-        assert 'completion manifest' in failed['job']['error'], failed
+        failed = wait_job(job_id, 'retrying')
+        assert 'completion manifest' in failed['job']['checks']['destinations']['fixture']['error'], failed
         assert not failed.get('url')
         faults['reject_completion'] = False
         api('workflows/jobs/' + job_id, {'action': 'retry'})
@@ -176,7 +176,7 @@ def main():
         # Retry after a lost completion response must accept the identical commit object.
         import sqlite3
         with sqlite3.connect(args.root / 'data/votport.db') as database:
-            database.execute("UPDATE delivery_jobs SET state='exporting',owner='',document=json_remove(json_set(document,'$.state','exporting'),'$.checks.export_manifest_key') WHERE id=?", (job_id,))
+            database.execute("UPDATE delivery_jobs SET state='exporting',owner='',document=json_remove(json_set(document,'$.state','exporting'),'$.checks.destinations.fixture') WHERE id=?", (job_id,))
         assert wait_job(job_id, 'ready')['job']['manifest'] == manifest
         assert json.loads(s3('GET', prefix + '/complete.json')) == completion
         puts = [path for method, path, _ in trace if method == 'PUT']

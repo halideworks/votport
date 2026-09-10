@@ -1,3 +1,4 @@
+pub mod routes;
 pub mod storage;
 
 use super::*;
@@ -135,7 +136,7 @@ fn public_job(app: &App, headers: &HeaderMap, job: Job) -> serde_json::Value {
     let token = app
         .signer
         .delivery_token(&format!("{}:{}", job.id, job.token_generation));
-    let url = (job.state == "ready"
+    let url = (job.released()
         && app.store.delivery_release(&job.id).is_ok()
         && app
             .store
@@ -412,6 +413,17 @@ pub async fn worker(app: Arc<App>) {
                             tokio::select! { _ = app.shutdown.notified() => return, _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {} }
                         }
                     }
+                    if let Ok(Some(current)) = app.store.delivery_job(&job.id) {
+                        if current.state == "failed"
+                            || (current.state == "retrying"
+                                && job.checks["first_failure_at"].is_null())
+                        {
+                            let notify_app = Arc::clone(&app);
+                            tokio::spawn(async move {
+                                crate::notify::workflow_failed(notify_app, current).await;
+                            });
+                        }
+                    }
                     drop(operation);
                     continue;
                 }
@@ -432,15 +444,28 @@ async fn prepare(app: &Arc<App>, mut job: Job) -> ApiResult<()> {
         .delivery_project(&job.tenant, &job.project.id)
         .map_err(crate::api::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
+    if job.received.is_some() {
+        if !project.receive {
+            return Err(conflict(
+                "project no longer accepts incoming workflows".into(),
+            ));
+        }
+        project
+            .validate_job(&job.request, job.created_at)
+            .map_err(conflict)?;
+    }
     if project != job.project {
         return Err(conflict("project changed; submit a new job".into()));
+    }
+    if job.uses_snapshot() {
+        create_library_dirs(&library_root(app, &job.tenant))?;
     }
     let import_revision = if job.request.import.is_some() {
         storage::import(app, &job).await?
     } else {
         None
     };
-    let paths = if job.uses_snapshot() {
+    let mut paths = if job.uses_snapshot() {
         freeze_files(app, &job).await?
     } else {
         let root = library_root(app, &job.tenant);
@@ -451,6 +476,8 @@ async fn prepare(app: &Arc<App>, mut job: Job) -> ApiResult<()> {
         .await
         .map_err(|_| ApiError::internal("enumerate job files failed"))??
     };
+    // Custody digests use filename order, independently of the transport's case-folded order.
+    paths.sort();
     if let Some(sequence) = &job.project.sequence {
         let prefix = format!("{}/", job.project.directory);
         let names: std::collections::BTreeSet<_> = paths
@@ -482,6 +509,16 @@ async fn prepare(app: &Arc<App>, mut job: Job) -> ApiResult<()> {
         .map_err(crate::api::store_unavailable)?
         .ok_or_else(ApiError::not_found)?
         .checks;
+    if let Some(received) = &job.received {
+        if let Some(route) = app
+            .store
+            .received_route(&job.tenant, &received.upload_id)
+            .map_err(crate::api::store_unavailable)?
+        {
+            job.checks["source_receipt"] = json!(route.receipt);
+            job.checks["source_ancestry"] = json!(route.ancestry);
+        }
+    }
     if let Some(revision) = import_revision {
         job.checks["import_storage_revision"] = json!(revision);
     }
@@ -491,8 +528,8 @@ async fn prepare(app: &Arc<App>, mut job: Job) -> ApiResult<()> {
     } else {
         "not_required"
     });
-    if let Some(id) = &job.project.export_storage {
-        job.checks["export_storage_revision"] =
+    for id in &job.project.destinations {
+        job.checks["destination_revisions"][id] =
             json!(storage::authorized_storage(app, &job.tenant, id)?.revision);
     }
     check_media(app, &job, &paths).await?;
@@ -580,12 +617,54 @@ async fn freeze_files(app: &Arc<App>, job: &Job) -> ApiResult<Vec<String>> {
         if job.request.import.is_some() {
             return Err(conflict("storage import has not completed".into()));
         }
-        let source_root = library_root(&app, &job.tenant);
-        let directory = automation_directory(&app, &job.tenant, &job.project.directory)?;
-        let sources =
-            enumerate_automation_files(&source_root, &directory, MAX_LIBRARY_PROJECT_FILES)?;
-        let reserved = sources.iter().try_fold(0u64, |total, name| {
-            let path = safe_library_path(&app, &job.tenant, name)?;
+        let source_root = if job.received.is_some() {
+            app.config.receive_dir.clone()
+        } else {
+            library_root(&app, &job.tenant)
+        };
+        let sources: Vec<(String, PathBuf)> = if let Some(received) = &job.received {
+            let upload = app
+                .store
+                .link_upload(&job.tenant, &received.link_id, &received.upload_id)
+                .map_err(crate::api::store_unavailable)?
+                .ok_or_else(ApiError::not_found)?;
+            if upload.partial
+                || upload.files.is_empty()
+                || upload.files.len() > MAX_LIBRARY_PROJECT_FILES
+            {
+                return Err(conflict(
+                    "incoming package is incomplete or exceeds the workflow file limit".into(),
+                ));
+            }
+            upload
+                .files
+                .into_iter()
+                .map(|file| {
+                    if file.deleted {
+                        return Err(conflict("incoming file was deleted".into()));
+                    }
+                    let path = admin::stored_path(&app, &job.tenant, &file.stored_as)
+                        .ok_or_else(ApiError::not_found)?;
+                    Ok((file.path, path))
+                })
+                .collect::<ApiResult<_>>()?
+        } else {
+            let directory = automation_directory(&app, &job.tenant, &job.project.directory)?;
+            enumerate_automation_files(&source_root, &directory, MAX_LIBRARY_PROJECT_FILES)?
+                .into_iter()
+                .map(|source| {
+                    let path = safe_library_path(&app, &job.tenant, &source)?;
+                    let name = path
+                        .strip_prefix(&directory)
+                        .map_err(|_| ApiError::not_found())?
+                        .to_str()
+                        .ok_or_else(ApiError::not_found)?
+                        .replace('\\', "/");
+                    Ok((name, path))
+                })
+                .collect::<ApiResult<_>>()?
+        };
+        let reserved = sources.iter().try_fold(0u64, |total, (_, path)| {
             let size = std::fs::symlink_metadata(path)
                 .map_err(|_| ApiError::not_found())?
                 .len();
@@ -610,17 +689,10 @@ async fn freeze_files(app: &Arc<App>, job: &Job) -> ApiResult<Vec<String>> {
         crate::paths::tighten_private_dir(parent).map_err(ApiError::internal)?;
         let mut paths = Vec::with_capacity(sources.len());
         let mut total = 0u64;
-        for source in sources {
-            let path = safe_library_path(&app, &job.tenant, &source)?;
+        for (name, path) in sources {
             if !library_components_safe(&source_root, &path) {
                 return Err(ApiError::not_found());
             }
-            let name = path
-                .strip_prefix(&directory)
-                .map_err(|_| ApiError::not_found())?
-                .to_str()
-                .ok_or_else(ApiError::not_found)?
-                .replace('\\', "/");
             let destination = payload_path(&app, &job.tenant, &job.id, &name)?;
             let before = std::fs::symlink_metadata(&path).map_err(|_| ApiError::not_found())?;
             if !before.file_type().is_file() {
@@ -1219,6 +1291,933 @@ mod tests {
                 &app.config.admin_token_tag
             )
         )
+    }
+
+    #[tokio::test]
+    async fn reception_snapshots_gate_multiple_copies_and_retry_lost_completion() {
+        for release in [
+            crate::workflow::Release::AllDestinations,
+            crate::workflow::Release::Local,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let app = crate::api::testing::build(directory.path());
+            let cookie = admin_cookie(&app);
+            for id in ["offline", "online"] {
+                let path = directory.path().join(id);
+                if id == "online" {
+                    std::fs::create_dir(&path).unwrap();
+                }
+                let config = serde_json::from_value(json!({"id":id,"revision":0,"label":id,"kind":"folder","directory":path,"tenants":[""],"enabled":true})).unwrap();
+                app.store
+                    .save_delivery_storage("local", config, None)
+                    .unwrap();
+            }
+            let mut project = crate::workflow::tests::project();
+            project.receive = true;
+            project.require_approval = false;
+            project.release = release;
+            project.destinations = vec!["offline".into(), "online".into()];
+            let project = app
+                .store
+                .save_delivery_project("", "local", project)
+                .unwrap();
+            let workflow = crate::workflow::ReceiveWorkflow {
+                project_id: project.id.clone(),
+                metadata: crate::workflow::tests::request().metadata,
+                recipients: vec![],
+            };
+            let link = crate::store::Link {
+                id: "incoming".into(),
+                tenant: String::new(),
+                label: "Incoming".into(),
+                dest: String::new(),
+                password_hash: None,
+                created_at: now_unix(),
+                expires_at: None,
+                max_bytes: None,
+                active: true,
+                legal_hold: false,
+                notify_on_upload: false,
+                uploads: vec![],
+                events: vec![],
+            };
+            app.store
+                .insert_link_with_workflow(link.clone(), Some(&workflow))
+                .unwrap();
+            std::fs::create_dir_all(&app.config.receive_dir).unwrap();
+            let bytes = b"original";
+            std::fs::write(app.config.receive_dir.join("file.bin"), bytes).unwrap();
+            let mut builder = InMemoryObjectBuilder::new(
+                Suite::Blake3Bao64,
+                Some(bytes.len() as u64),
+                bytes.len() as u64,
+            )
+            .unwrap();
+            builder.update(bytes).unwrap();
+            let root = hex::encode(builder.finish().unwrap().object_id().root);
+            let mut upload = crate::store::UploadRecord {
+                id: "upload".into(),
+                started_at: now_unix(),
+                completed_at: now_unix(),
+                replayed_chunks: 0,
+                rejected_chunks: 0,
+                transport: Some("http".into()),
+                package_root: "package".into(),
+                total_bytes: bytes.len() as u64,
+                files: vec![crate::store::FileRecord {
+                    path: "file.bin".into(),
+                    stored_as: "file.bin".into(),
+                    bytes: bytes.len() as u64,
+                    suite: "blake3".into(),
+                    root,
+                    receipt: true,
+                    deleted: false,
+                }],
+                partial: true,
+                log: vec![],
+            };
+            app.store
+                .append_upload("", &link.id, upload.clone())
+                .unwrap();
+            assert!(app.store.delivery_jobs("", "", 100).unwrap().is_empty());
+            upload.partial = false;
+            upload.id = "complete".into();
+            app.store.append_upload("", &link.id, upload).unwrap();
+            assert!(app.store.receive_workflow_pending("", &link.id).unwrap());
+            assert!(app.store.remove_link("", &link.id).is_err());
+            assert!(app
+                .store
+                .update_link_uploads("", &link.id, |link| link.uploads.clear())
+                .is_err());
+            assert_eq!(
+                call(
+                    &app,
+                    Method::DELETE,
+                    "/api/admin/links/incoming/uploads/complete",
+                    Some(&cookie),
+                    None
+                )
+                .await
+                .0,
+                StatusCode::CONFLICT
+            );
+            let job = app
+                .store
+                .claim_delivery_job("worker", now_unix())
+                .unwrap()
+                .unwrap();
+            prepare(&app, job.clone()).await.unwrap();
+            assert_eq!(
+                std::fs::read(payload_root(&app, "", &job.id).join("file.bin")).unwrap(),
+                bytes
+            );
+            assert!(!app.store.receive_workflow_pending("", &link.id).unwrap());
+            std::fs::write(app.config.receive_dir.join("file.bin"), b"changed!").unwrap();
+            let exporting = app
+                .store
+                .claim_delivery_job("worker", now_unix())
+                .unwrap()
+                .unwrap();
+            assert_eq!(exporting.state, "exporting");
+            assert_eq!(
+                exporting.released(),
+                release == crate::workflow::Release::Local
+            );
+            let error = prepare(&app, exporting.clone()).await.unwrap_err();
+            let progress = app.store.delivery_job(&job.id).unwrap().unwrap();
+            assert_eq!(
+                progress.checks["destinations"]["offline"]["state"],
+                "failed"
+            );
+            assert_eq!(
+                progress.checks["destinations"]["online"]["state"],
+                "complete"
+            );
+            app.store
+                .fail_delivery_job(&job.id, exporting.attempts, &error.message)
+                .unwrap();
+            let retrying = app.store.delivery_job(&job.id).unwrap().unwrap();
+            assert_eq!(retrying.state, "retrying");
+            assert!(retrying.checks["first_failure_at"].is_u64());
+            assert_eq!(
+                app.store.delivery_release(&job.id).is_ok(),
+                release == crate::workflow::Release::Local
+            );
+            let key = progress.checks["destinations"]["online"]["location"]
+                .as_str()
+                .unwrap();
+            let completion = directory.path().join("online").join(key);
+            let signed = std::fs::read(&completion).unwrap();
+            assert_eq!(
+                std::fs::read(completion.parent().unwrap().join("files/file.bin")).unwrap(),
+                bytes
+            );
+            // A completion response can be lost after the remote filesystem commits it.
+            let connection =
+                rusqlite::Connection::open(app.config.data_dir.join("votport.db")).unwrap();
+            connection.execute("UPDATE delivery_jobs SET document=json_remove(document,'$.checks.destinations.online') WHERE id=?1",[&job.id]).unwrap();
+            std::fs::create_dir(directory.path().join("offline")).unwrap();
+            let retry = app
+                .store
+                .claim_delivery_job("worker", retrying.checks["retry_at"].as_u64().unwrap())
+                .unwrap()
+                .unwrap();
+            prepare(&app, retry).await.unwrap();
+            assert_eq!(std::fs::read(&completion).unwrap(), signed);
+            let ready = app.store.delivery_job(&job.id).unwrap().unwrap();
+            assert_eq!(ready.state, "ready");
+            assert!(app.store.delivery_release(&job.id).is_ok());
+            assert!(app
+                .store
+                .delivery_events("", 0, 100)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "destination_failed" && event.verify()));
+            let mut changed = app
+                .store
+                .link_upload("", &link.id, "complete")
+                .unwrap()
+                .unwrap();
+            changed.id = "changed".into();
+            app.store
+                .append_upload("", &link.id, changed.clone())
+                .unwrap();
+            let queued = app
+                .store
+                .claim_delivery_job("worker", now_unix())
+                .unwrap()
+                .unwrap();
+            assert!(prepare(&app, queued.clone())
+                .await
+                .unwrap_err()
+                .message
+                .contains("changed since verification"));
+            assert!(app
+                .store
+                .outbound_grant_by_id(&queued.id)
+                .unwrap()
+                .is_none());
+            app.store
+                .change_delivery_job("", &queued.id, "local", true, "cancel", None)
+                .unwrap();
+            let mut disabled = project.clone();
+            disabled.receive = false;
+            app.store
+                .save_delivery_project("", "local", disabled)
+                .unwrap();
+            changed.id = "disabled".into();
+            app.store.append_upload("", &link.id, changed).unwrap();
+            let refused = app
+                .store
+                .delivery_jobs("", "", 100)
+                .unwrap()
+                .into_iter()
+                .find(|job| job.request.operation_id == "disabled")
+                .unwrap();
+            assert_eq!(refused.state, "failed");
+            assert!(app
+                .store
+                .change_delivery_job("", &refused.id, "local", true, "retry", None)
+                .is_err());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn peer_routes_transfer_signed_custody_and_acknowledge_revocation() {
+        for push in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = crate::api::testing::build(&directory.path().join("la"));
+            let mut config = crate::api::testing::config(&directory.path().join("nyc"));
+            if push {
+                config.push_bind = Some("127.0.0.1:0".parse().unwrap());
+            }
+            let receiver = crate::app::build(config).unwrap();
+            crate::app::start_push_receiver(Arc::clone(&receiver));
+            let mut tenant = crate::store::Tenant {
+                key: "nyc".into(),
+                label: "Independent NYC tenant".into(),
+                admin_group: None,
+                max_total_bytes: Some(300_000),
+                max_links: None,
+                max_sessions: None,
+                created_at: now_unix(),
+            };
+            receiver.store.insert_tenant(tenant.clone()).unwrap();
+            let mut reception = crate::workflow::tests::project();
+            reception.id = "receiving".into();
+            reception.directory = "reception".into();
+            reception.receive = true;
+            reception.require_approval = false;
+            let reception = receiver
+                .store
+                .save_delivery_project("nyc", "local", reception)
+                .unwrap();
+            let token = auth::random_token();
+            receiver
+                .store
+                .insert_link(crate::store::Link {
+                    id: token.clone(),
+                    tenant: "nyc".into(),
+                    label: "NYC reception".into(),
+                    dest: String::new(),
+                    password_hash: None,
+                    created_at: now_unix(),
+                    expires_at: None,
+                    max_bytes: None,
+                    active: true,
+                    legal_hold: false,
+                    notify_on_upload: false,
+                    uploads: vec![],
+                    events: vec![],
+                })
+                .unwrap();
+            receiver
+                .store
+                .set_receive_workflow(
+                    "nyc",
+                    &token,
+                    &crate::workflow::ReceiveWorkflow {
+                        project_id: reception.id.clone(),
+                        metadata: crate::workflow::tests::request().metadata,
+                        recipients: vec![],
+                    },
+                )
+                .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let router = crate::app::router(Arc::clone(&receiver));
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await
+                .unwrap();
+            });
+            let config:storage::Storage = serde_json::from_value(json!({"id":"nyc","revision":0,"label":"NYC","kind":"votport","endpoint":origin,"enabled":true,"tenants":[""]})).unwrap();
+            source
+                .store
+                .save_delivery_storage(
+                    "local",
+                    config,
+                    Some(storage::Credentials::Votport {
+                        request_url: format!("{origin}/r/{token}"),
+                        password: None,
+                    }),
+                )
+                .unwrap();
+            let mut project = crate::workflow::tests::project();
+            project.require_approval = false;
+            project.destinations = vec!["nyc".into()];
+            let library = source.config.outbound_dir.join(&project.directory);
+            std::fs::create_dir_all(&library).unwrap();
+            let bytes = vec![71u8; 200_000];
+            for name in ["Z.bin", "a.bin"] {
+                std::fs::write(library.join(name), &bytes).unwrap();
+            }
+            let project = source
+                .store
+                .save_delivery_project("", "local", project)
+                .unwrap();
+            source
+                .store
+                .enqueue_delivery_job(
+                    "",
+                    "sender",
+                    1,
+                    None,
+                    project,
+                    crate::workflow::tests::request(),
+                )
+                .unwrap();
+            let preparing = source
+                .store
+                .claim_delivery_job("test", now_unix())
+                .unwrap()
+                .unwrap();
+            prepare(&source, preparing.clone()).await.unwrap();
+            let exporting = source
+                .store
+                .claim_delivery_job("test", now_unix())
+                .unwrap()
+                .unwrap();
+            assert!(source.store.delivery_release(&exporting.id).is_err());
+            assert!(prepare(&source, exporting.clone())
+                .await
+                .unwrap_err()
+                .message
+                .contains("destination refused the transfer"));
+            assert!(receiver
+                .store
+                .link("nyc", &token)
+                .unwrap()
+                .unwrap()
+                .uploads
+                .is_empty());
+            tenant.max_total_bytes = Some(1024 * 1024);
+            receiver.store.update_tenant(&tenant).unwrap();
+            let resumed = if !push {
+                let connection =
+                    rusqlite::Connection::open(source.config.data_dir.join("votport.db")).unwrap();
+                let route_id: String = connection
+                    .query_row(
+                        "SELECT route_id FROM outbound_routes WHERE job_id=?1",
+                        [&exporting.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let sender = Arc::clone(&source);
+                let job = exporting.clone();
+                let base = origin.clone();
+                let request_token = token.clone();
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        let grant = sender.store.outbound_grant_by_id(&job.id).unwrap().unwrap();
+                        let package =
+                            crate::api::serve::prepare_route_package(&sender, &grant).unwrap();
+                        let client =
+                            votport_client_core::api::Client::for_route(base, route_id.clone())
+                                .unwrap();
+                        let session = client
+                            .create_session(
+                                &request_token,
+                                None,
+                                votport_client_core::api::PackageAnnouncement {
+                                    suite: "blake3".into(),
+                                    root: hex::encode(package.summary.root),
+                                    length: package.summary.logical_length,
+                                },
+                            )
+                            .unwrap();
+                        client
+                            .seal(&session.session, package.seal_bytes.clone())
+                            .unwrap();
+                        for page in &package.page_bytes {
+                            client.page(&session.session, page.clone()).unwrap();
+                        }
+                        assert_eq!(client.begin(&session.session).unwrap()[0].covered_bytes, 0);
+                        let proof = package.objects[0]
+                            .prover()
+                            .unwrap()
+                            .prove(0, 65536)
+                            .unwrap();
+                        client
+                            .chunk(&session.session, 0, 0, proof.proof(), &vec![71; 65536])
+                            .unwrap();
+                        assert_eq!(
+                            client.begin(&session.session).unwrap()[0].covered_bytes,
+                            65536
+                        );
+                        (route_id, session.session)
+                    })
+                    .await
+                    .unwrap(),
+                )
+            } else {
+                None
+            };
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                prepare(&source, exporting.clone()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let ready = source.store.delivery_job(&exporting.id).unwrap().unwrap();
+            assert_eq!(ready.state, "ready");
+            let receipt: crate::route_protocol::RouteReceipt =
+                serde_json::from_value(ready.checks["route_receipts"]["nyc"].clone()).unwrap();
+            assert!(receipt.verify(&receiver.signer.public_hex));
+            assert_eq!(
+                receipt.document.source.document.issuer,
+                source.signer.public_hex
+            );
+            assert_eq!(
+                Some(&receipt.document.source.document.manifest),
+                ready.manifest.as_ref()
+            );
+            let upload = receiver
+                .store
+                .link_upload("nyc", &token, &receipt.document.upload_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                std::fs::read(
+                    admin::stored_path(&receiver, "nyc", &upload.files[0].stored_as).unwrap()
+                )
+                .unwrap(),
+                bytes
+            );
+            assert_eq!(
+                upload.transport.as_deref(),
+                Some(if push { "push" } else { "http" })
+            );
+            if let Some((route_id, session_id)) = &resumed {
+                assert_eq!(
+                    receiver
+                        .store
+                        .inbound_route(route_id)
+                        .unwrap()
+                        .unwrap()
+                        .session_id
+                        .as_ref(),
+                    Some(session_id)
+                );
+            }
+            assert_eq!(
+                receiver
+                    .store
+                    .received_route_receipt("nyc", &upload.id)
+                    .unwrap(),
+                Some(receipt.clone())
+            );
+            assert!(receiver
+                .store
+                .received_route_receipt("", &upload.id)
+                .unwrap()
+                .is_none());
+            let received_job = receiver
+                .store
+                .claim_delivery_job("test", now_unix())
+                .unwrap()
+                .unwrap();
+            prepare(&receiver, received_job.clone()).await.unwrap();
+            let forwarded = receiver
+                .store
+                .delivery_job(&received_job.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(forwarded.checks["source_receipt"], json!(receipt));
+            assert_eq!(forwarded.checks["source_ancestry"], json!([]));
+            assert_eq!(forwarded.manifest, ready.manifest);
+            // The receiver's completed operation survives a lost sender-side completion update.
+            let connection =
+                rusqlite::Connection::open(source.config.data_dir.join("votport.db")).unwrap();
+            connection.execute("UPDATE delivery_jobs SET state='exporting',document=json_set(json_remove(document,'$.checks.destinations.nyc','$.checks.route_receipts.nyc'),'$.state','exporting') WHERE id=?1",[&ready.id]).unwrap();
+            prepare(&source, exporting.clone()).await.unwrap();
+            assert_eq!(
+                receiver
+                    .store
+                    .link("nyc", &token)
+                    .unwrap()
+                    .unwrap()
+                    .uploads
+                    .len(),
+                1
+            );
+            assert!(source
+                .store
+                .claim_route_revocation(now_unix())
+                .unwrap()
+                .is_none());
+            source
+                .store
+                .change_delivery_job("", &ready.id, "local", true, "cancel", None)
+                .unwrap();
+            let control = source
+                .store
+                .claim_route_revocation(now_unix())
+                .unwrap()
+                .unwrap();
+            let mut forged = control.request.clone();
+            forged.document.source.document.label = "different".into();
+            assert_eq!(
+                call(
+                    &receiver,
+                    Method::POST,
+                    &format!("/api/route/{}/revoke", control.route_id),
+                    None,
+                    Some(json!(forged))
+                )
+                .await
+                .0,
+                StatusCode::CONFLICT
+            );
+            let path = format!("/api/route/{}/revoke", control.route_id);
+            let (status, _, body) = call(
+                &receiver,
+                Method::POST,
+                &path,
+                None,
+                Some(json!(control.request)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let ack: crate::route_protocol::RouteRevoked = serde_json::from_slice(&body).unwrap();
+            assert!(ack.verify(&control.request));
+            source
+                .store
+                .finish_route_revocation(&control, Some(&ack), now_unix())
+                .unwrap();
+            assert!(source
+                .store
+                .claim_route_revocation(now_unix() + 10000)
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                call(
+                    &receiver,
+                    Method::POST,
+                    &path,
+                    None,
+                    Some(json!(control.request))
+                )
+                .await
+                .2,
+                body
+            );
+            assert_eq!(
+                source
+                    .store
+                    .delivery_job(&ready.id)
+                    .unwrap()
+                    .unwrap()
+                    .checks["route_revocations"]["nyc"]["state"],
+                "acknowledged"
+            );
+            assert!(receiver
+                .store
+                .inbound_route(&control.route_id)
+                .unwrap()
+                .unwrap()
+                .revoked_at
+                .is_some());
+            assert_eq!(
+                receiver
+                    .store
+                    .delivery_job(&received_job.id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "cancelled"
+            );
+            assert!(receiver.store.delivery_release(&received_job.id).is_err());
+            receiver.store.remove_link("nyc", &token).unwrap();
+            assert_eq!(
+                receiver.store.remove_tenant("nyc").unwrap(),
+                crate::store::TenantRemoval::Deleted
+            );
+            let (status, _, absence) = call(
+                &receiver,
+                Method::POST,
+                &path,
+                None,
+                Some(json!(control.request)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let absence: crate::route_protocol::RouteRevoked =
+                serde_json::from_slice(&absence).unwrap();
+            assert!(absence.verify(&control.request));
+            assert_eq!(
+                call(
+                    &receiver,
+                    Method::POST,
+                    &format!("/api/route/{}/revoke", auth::random_token()),
+                    None,
+                    Some(json!(control.request))
+                )
+                .await
+                .0,
+                StatusCode::CONFLICT
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_kinds_bind_private_credentials_and_validate_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let cookie = admin_cookie(&app);
+        let folder = json!({"id":"shared", "revision":0, "label":"Shared folder", "kind":"folder", "directory":directory.path().join("shared"), "tenants":[""], "enabled":true});
+        for changes in [
+            json!({"directory":"relative"}),
+            json!({"directory":"/shared/../elsewhere"}),
+            json!({"directory":"/shared/\u{0}"}),
+            json!({"endpoint":"https://s3.example"}),
+            json!({"kms_key_id":"key"}),
+        ] {
+            let mut invalid = folder.clone();
+            invalid
+                .as_object_mut()
+                .unwrap()
+                .extend(changes.as_object().unwrap().clone());
+            assert_eq!(
+                call(
+                    &app,
+                    Method::PUT,
+                    "/api/workflows/storage",
+                    Some(&cookie),
+                    Some(json!({"storage":invalid}))
+                )
+                .await
+                .0,
+                StatusCode::CONFLICT
+            );
+        }
+        let (status, _, body) = call(
+            &app,
+            Method::PUT,
+            "/api/workflows/storage",
+            Some(&cookie),
+            Some(json!({"storage":folder})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let saved: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(saved["kind"], "folder");
+        let port = json!({"id":"west", "revision":0, "label":"West coast", "kind":"votport", "endpoint":"https://west.example", "tenants":[""], "enabled":true});
+        assert_eq!(
+            call(
+                &app,
+                Method::PUT,
+                "/api/workflows/storage",
+                Some(&cookie),
+                Some(json!({"storage":port}))
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        for url in [
+            "https://west.example/s/0123456789abcdef0123456789abcdef",
+            "https://west.example/r/short",
+            "https://user:secret@west.example/r/0123456789abcdef0123456789abcdef",
+            "https://other.example/r/0123456789abcdef0123456789abcdef",
+            "https://west.example/r/0123456789abcdef0123456789abcdef?secret=1",
+        ] {
+            assert_eq!(call(&app, Method::PUT, "/api/workflows/storage", Some(&cookie), Some(json!({"storage":port, "credentials":{"mode":"votport", "request_url":url, "password":null}}))).await.0, StatusCode::CONFLICT);
+        }
+        let credentials = json!({"mode":"votport", "request_url":"https://west.example/r/0123456789abcdef0123456789abcdef", "password":"private-request-password"});
+        let (status, _, body) = call(
+            &app,
+            Method::PUT,
+            "/api/workflows/storage",
+            Some(&cookie),
+            Some(json!({"storage":port, "credentials":credentials})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let mut saved: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        for kind in ["s3", "folder"] {
+            let mut changed = saved.clone();
+            changed["kind"] = json!(kind);
+            assert_ne!(
+                call(
+                    &app,
+                    Method::PUT,
+                    "/api/workflows/storage",
+                    Some(&cookie),
+                    Some(json!({"storage":changed}))
+                )
+                .await
+                .0,
+                StatusCode::OK
+            );
+        }
+        let mut changed = saved.clone();
+        changed["endpoint"] = json!("https://other.example");
+        assert_eq!(
+            call(
+                &app,
+                Method::PUT,
+                "/api/workflows/storage",
+                Some(&cookie),
+                Some(json!({"storage":changed}))
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        saved["label"] = json!("West renamed");
+        assert_eq!(
+            call(
+                &app,
+                Method::PUT,
+                "/api/workflows/storage",
+                Some(&cookie),
+                Some(json!({"storage":saved}))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let (status, _, body) = call(
+            &app,
+            Method::GET,
+            "/api/workflows/storage",
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            !text.contains("private-request-password")
+                && !text.contains("0123456789abcdef")
+                && !text.contains("request_url")
+        );
+        assert!(app.store.delivery_storage_has_credentials("west").unwrap());
+    }
+
+    #[tokio::test]
+    async fn shared_folder_and_votport_connection_checks_use_saved_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let cookie = admin_cookie(&app);
+        let root = directory.path().join("shared");
+        std::fs::create_dir(&root).unwrap();
+        let save = |storage, credentials| json!({"storage": storage, "credentials": credentials});
+        let folder = json!({"id":"shared", "revision":0, "label":"Shared folder", "kind":"folder", "directory":root, "tenants":[""], "enabled":true});
+        assert_eq!(
+            call(
+                &app,
+                Method::PUT,
+                "/api/workflows/storage",
+                Some(&cookie),
+                Some(save(folder, serde_json::Value::Null))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let check = json!({"revision":1});
+        assert_eq!(
+            call(
+                &app,
+                Method::POST,
+                "/api/workflows/storage/shared/test",
+                Some(&cookie),
+                Some(check.clone())
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(
+                &app,
+                Method::POST,
+                "/api/workflows/storage/shared/test",
+                Some(&cookie),
+                Some(json!({"revision":0}))
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        std::fs::remove_dir(&root).unwrap();
+        assert_eq!(
+            call(
+                &app,
+                Method::POST,
+                "/api/workflows/storage/shared/test",
+                Some(&cookie),
+                Some(check.clone())
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(directory.path(), &root).unwrap();
+            assert_eq!(
+                call(
+                    &app,
+                    Method::POST,
+                    "/api/workflows/storage/shared/test",
+                    Some(&cookie),
+                    Some(check.clone())
+                )
+                .await
+                .0,
+                StatusCode::CONFLICT
+            );
+        }
+        let receiver_dir = tempfile::tempdir().unwrap();
+        let receiver = crate::api::testing::build(receiver_dir.path());
+        let receiver_cookie = admin_cookie(&receiver);
+        let (status, _, bytes) = call(
+            &receiver,
+            Method::POST,
+            "/api/admin/links",
+            Some(&receiver_cookie),
+            Some(json!({"label":"Incoming masters", "password":"receive-secret"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let link: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let router = crate::app::router(receiver);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let request_url = format!("{origin}/r/{}", link["link"]["id"].as_str().unwrap());
+        let port = json!({"id":"west", "revision":0, "label":"West", "kind":"votport", "endpoint":origin, "tenants":[""], "enabled":true});
+        assert_eq!(call(&app, Method::PUT, "/api/workflows/storage", Some(&cookie), Some(save(port, json!({"mode":"votport", "request_url":request_url, "password":"receive-secret"})))).await.0, StatusCode::OK);
+        let (status, _, bytes) = call(
+            &app,
+            Method::POST,
+            "/api/workflows/storage/west/test",
+            Some(&cookie),
+            Some(check.clone()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        for (index, password) in [serde_json::Value::Null, json!("wrong")]
+            .into_iter()
+            .enumerate()
+        {
+            let mut port = app
+                .store
+                .delivery_storages()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == "west")
+                .unwrap();
+            port.revision = index as u64 + 1;
+            assert_eq!(
+                call(
+                    &app,
+                    Method::PUT,
+                    "/api/workflows/storage",
+                    Some(&cookie),
+                    Some(save(
+                        json!(port),
+                        json!({"mode":"votport", "request_url":request_url, "password":password})
+                    ))
+                )
+                .await
+                .0,
+                StatusCode::OK
+            );
+            assert_eq!(
+                call(
+                    &app,
+                    Method::POST,
+                    "/api/workflows/storage/west/test",
+                    Some(&cookie),
+                    Some(json!({"revision":index+2}))
+                )
+                .await
+                .0,
+                StatusCode::CONFLICT
+            );
+        }
+        server.abort();
     }
 
     #[tokio::test]

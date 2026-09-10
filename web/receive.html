@@ -84,7 +84,8 @@
             <input id="create-max" type="number" min="1" max="10000" placeholder="server default" />
           </label>
         </div>
-        <label><input id="create-notify-on-upload" name="notify_on_upload" type="checkbox" /> Notify when an upload completes or fails</label>
+        <div id="create-workflow"></div>
+        <label class="check"><input id="create-notify-on-upload" name="notify_on_upload" type="checkbox" /> Notify when an upload completes or fails</label>
         <button type="submit">Issue request</button>
         <p class="error" id="create-error" role="alert" hidden></p>
       </form>

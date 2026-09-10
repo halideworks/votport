@@ -88,13 +88,16 @@ pub(super) fn finish_job(
     current.updated_at = now_unix();
     current.state = if project.require_approval {
         "awaiting_approval"
-    } else if project.export_storage.is_some() {
+    } else if !project.destinations.is_empty() {
         "exporting"
     } else {
         "ready"
     }
     .into();
     current.checks = job.checks.clone();
+    if !project.require_approval && project.release == crate::workflow::Release::Local {
+        current.checks["released_at"] = serde_json::json!(current.updated_at);
+    }
     if current.state == "exporting" {
         connection
             .execute("UPDATE delivery_jobs SET owner='' WHERE id=?1", [&job.id])
@@ -105,6 +108,13 @@ pub(super) fn finish_job(
 }
 
 fn actor_active(connection: &Connection, job: &Job) -> Result<(), String> {
+    if job.received.is_some() {
+        return if job.project.receive {
+            Ok(())
+        } else {
+            Err("project no longer accepts incoming workflows".into())
+        };
+    }
     let active: bool = if let Some(token_id) = &job.automation_token_id {
         connection.query_row("SELECT EXISTS(SELECT 1 FROM automation_tokens WHERE id=?1 AND tenant=?2 AND revoked_at IS NULL AND expires_at>?3 AND EXISTS(SELECT 1 FROM json_each(permissions) WHERE value='jobs:create') AND (directory IS NULL OR directory=?4 OR substr(?4,1,length(directory)+1)=directory||'/'))", params![token_id,job.tenant,now_unix() as i64,job.project.directory], |row| row.get(0))
     } else {
@@ -122,6 +132,12 @@ pub(super) fn check_grant_creation(
     grant: &OutboundGrant,
     job: Option<&Job>,
 ) -> Result<(), String> {
+    super::routes::require_shareable(connection, grant)?;
+    if !grant.link_id.is_empty()
+        && received_requires_workflow(connection, &grant.tenant, &grant.link_id, &grant.upload_id)?
+    {
+        return Err("these incoming files require their project delivery link".into());
+    }
     let mut query = connection
         .prepare("SELECT document FROM delivery_projects WHERE tenant=?1")
         .map_err(|e| e.to_string())?;
@@ -158,7 +174,150 @@ pub(super) fn check_grant_creation(
     Ok(())
 }
 
+fn received_requires_workflow(
+    connection: &Connection,
+    tenant: &str,
+    link: &str,
+    upload: &str,
+) -> Result<bool, String> {
+    connection.prepare_cached("SELECT EXISTS(SELECT 1 FROM delivery_jobs WHERE tenant=?1 AND json_extract(document,'$.received.link_id')=?2 AND json_extract(document,'$.received') IS NOT NULL AND json_extract(document,'$.received.upload_id')=?3)").and_then(|mut statement|statement.query_row(params![tenant,link,upload], |row|row.get(0))).map_err(|e|e.to_string())
+}
+
+pub(super) fn receive_pending(
+    connection: &Connection,
+    tenant: &str,
+    link_id: &str,
+) -> rusqlite::Result<bool> {
+    connection.prepare_cached("SELECT EXISTS(SELECT 1 FROM delivery_jobs WHERE tenant=?1 AND json_extract(document,'$.received.link_id')=?2 AND json_extract(document,'$.received') IS NOT NULL AND state IN ('queued','preparing','failed','retrying'))")?.query_row(params![tenant,link_id], |row|row.get(0))
+}
+
+pub(super) fn set_receive_workflow(
+    connection: &Connection,
+    tenant: &str,
+    link_id: &str,
+    workflow: &crate::workflow::ReceiveWorkflow,
+) -> Result<(), String> {
+    let exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM links WHERE tenant=?1 AND id=?2)",
+            params![tenant, link_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !exists {
+        return Err("receive request missing".into());
+    }
+    if workflow.project_id.is_empty() {
+        connection
+            .execute("DELETE FROM receive_workflows WHERE link_id=?1", [link_id])
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    let project = project_in(connection, tenant, &workflow.project_id)
+        .map_err(|e| e.to_string())?
+        .ok_or("project missing")?;
+    if !project.receive {
+        return Err("enable incoming files on this project first".into());
+    }
+    project.validate_job(&workflow.request("validate", "Incoming files"), now_unix())?;
+    connection.execute("INSERT INTO receive_workflows(link_id,document) VALUES (?1,?2) ON CONFLICT(link_id) DO UPDATE SET document=excluded.document",params![link_id,serde_json::to_string(workflow).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub(super) fn queue_received(
+    connection: &Connection,
+    signer: &crate::receipt::ReceiptSigner,
+    tenant: &str,
+    link_id: &str,
+    upload: &UploadRecord,
+) -> Result<(), String> {
+    let workflow: Option<crate::workflow::ReceiveWorkflow> = connection
+        .prepare_cached("SELECT document FROM receive_workflows WHERE link_id=?1")
+        .and_then(|mut statement| {
+            statement
+                .query_row([link_id], |row| decode(row.get(0)?))
+                .optional()
+        })
+        .map_err(|e| e.to_string())?;
+    let Some(workflow) = workflow else {
+        return Ok(());
+    };
+    let project = project_in(connection, tenant, &workflow.project_id)
+        .map_err(|e| e.to_string())?
+        .ok_or("receive project missing")?;
+    let actor = format!("reception:{link_id}");
+    let exists: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM delivery_jobs WHERE tenant=?1 AND actor=?2 AND operation_id=?3)",params![tenant,actor,upload.id],|row| row.get(0)).map_err(|e| e.to_string())?;
+    if exists {
+        return Ok(());
+    }
+    let now = now_unix();
+    let request = workflow.request(
+        &upload.id,
+        &format!("{} · received", project.label)
+            .chars()
+            .take(200)
+            .collect::<String>(),
+    );
+    let mut error = project.validate_job(&request, now).err();
+    if !project.receive {
+        error = Some("project no longer accepts incoming workflows".into());
+    }
+    let count: i64 = connection.query_row("SELECT COUNT(*) FROM delivery_jobs WHERE tenant=?1 AND state IN ('queued','preparing','awaiting_approval','exporting','retrying')",[tenant],|row|row.get(0)).map_err(|e|e.to_string())?;
+    if count >= 1000 {
+        error = Some("active job limit reached; retry after other jobs finish".into());
+    }
+    let job = Job {
+        id: crate::auth::random_token(),
+        tenant: tenant.into(),
+        token_generation: 0,
+        actor,
+        credential_version: 0,
+        automation_token_id: None,
+        request,
+        project,
+        state: if error.is_some() { "failed" } else { "queued" }.into(),
+        manifest: None,
+        approved_by: None,
+        attempts: 0,
+        created_at: now,
+        updated_at: now,
+        error,
+        checks: serde_json::json!({}),
+        received: Some(crate::workflow::Received {
+            link_id: link_id.into(),
+            upload_id: upload.id.clone(),
+        }),
+    };
+    connection.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,document) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",params![job.id,tenant,job.actor,job.request.operation_id,job.project.id,job.state,now as i64,serde_json::to_string(&job).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
+    connection.execute("INSERT OR REPLACE INTO delivery_policy_cache(grant_id,protected) SELECT id,1 FROM outbound_grants WHERE tenant=?1 AND link_id=?2 AND upload_id=?3",params![tenant,link_id,upload.id]).map_err(|e|e.to_string())?;
+    evidence::delivery_event(connection,signer,tenant,&job.id,"reception_queued",&serde_json::json!({"project_id":job.project.id,"link_id":link_id,"upload_id":upload.id,"state":job.state,"error":job.error}),now).map_err(|e|e.to_string())
+}
+
 impl Store {
+    pub fn receive_workflow(
+        &self,
+        tenant: &str,
+        link_id: &str,
+    ) -> Result<Option<crate::workflow::ReceiveWorkflow>, String> {
+        self.with(|connection| connection.prepare_cached("SELECT r.document FROM receive_workflows r JOIN links l ON l.id=r.link_id WHERE l.tenant=?1 AND l.id=?2")?.query_row(params![tenant,link_id],|row| decode(row.get(0)?)).optional())
+    }
+
+    pub fn set_receive_workflow(
+        &self,
+        tenant: &str,
+        link_id: &str,
+        workflow: &crate::workflow::ReceiveWorkflow,
+    ) -> Result<(), String> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+        set_receive_workflow(&tx, tenant, link_id, workflow)?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn receive_workflow_pending(&self, tenant: &str, link_id: &str) -> Result<bool, String> {
+        self.with(|connection| receive_pending(connection, tenant, link_id))
+    }
+
     pub fn reserve_delivery_snapshot(
         &self,
         id: &str,
@@ -190,7 +349,7 @@ impl Store {
         let mut connection = self.connection.lock().expect("store poisoned");
         let tx = connection.transaction().map_err(|e| e.to_string())?;
         let cutoff = now.saturating_sub(7 * 86400);
-        let job: Option<Job> = tx.query_row("SELECT j.document FROM delivery_jobs j LEFT JOIN outbound_grants g ON g.id=j.id WHERE j.state='retiring' OR (j.state IN ('failed','cancelled') AND CAST(json_extract(j.document,'$.updated_at') AS INTEGER)<=?1) OR (j.state IN ('ready','awaiting_approval') AND (g.expires_at<=?1 OR g.revoked_at<=?1)) ORDER BY COALESCE(json_extract(j.document,'$.checks.retirement_attempt_at'),0),j.id LIMIT 1",[cutoff as i64],|row| decode(row.get(0)?)).optional().map_err(|e| e.to_string())?;
+        let job: Option<Job> = tx.query_row("SELECT j.document FROM delivery_jobs j LEFT JOIN outbound_grants g ON g.id=j.id WHERE j.state='retiring' OR (j.state IN ('failed','cancelled') AND CAST(json_extract(j.document,'$.updated_at') AS INTEGER)<=?1 AND (json_extract(j.document,'$.checks.released_at') IS NULL OR g.expires_at<=?1 OR g.revoked_at<=?1)) OR (j.state IN ('ready','awaiting_approval') AND (g.expires_at<=?1 OR g.revoked_at<=?1)) ORDER BY COALESCE(json_extract(j.document,'$.checks.retirement_attempt_at'),0),j.id LIMIT 1",[cutoff as i64],|row| decode(row.get(0)?)).optional().map_err(|e| e.to_string())?;
         let Some(mut job) = job else {
             return Ok(None);
         };
@@ -257,16 +416,51 @@ impl Store {
         for tenant in &storage.tenants {
             ensure_tenant(&tx, tenant)?;
         }
-        let previous: Option<i64> = tx
+        let previous: Option<crate::api::outbound::workflows::storage::Storage> = tx
             .query_row(
-                "SELECT revision FROM delivery_storage WHERE id=?1",
+                "SELECT document FROM delivery_storage WHERE id=?1",
                 [&storage.id],
-                |row| row.get(0),
+                |row| decode(row.get(0)?),
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        if previous.unwrap_or(0) as u64 != storage.revision {
+        if previous.as_ref().map_or(0, |value| value.revision) != storage.revision {
             return Err("storage changed; reload before saving".into());
+        }
+        if previous
+            .as_ref()
+            .is_some_and(|value| value.kind != storage.kind)
+        {
+            return Err("create a new connection to change its storage type".into());
+        }
+        use crate::api::outbound::workflows::storage::{Credentials, StorageKind};
+        match (&storage.kind, &credentials) {
+            (StorageKind::S3, Some(Credentials::Votport { .. }))
+            | (
+                StorageKind::Folder,
+                Some(Credentials::AccessKey { .. } | Credentials::Votport { .. }),
+            )
+            | (StorageKind::Votport, Some(Credentials::Server | Credentials::AccessKey { .. })) => {
+                return Err("credentials do not match the connection type".into());
+            }
+            (StorageKind::Votport, Some(Credentials::Votport { request_url, .. })) => {
+                let (origin, _) =
+                    crate::api::outbound::workflows::storage::receive_url(request_url)?;
+                if origin != storage.endpoint.trim_end_matches('/') {
+                    return Err("receive link does not belong to this Votport origin".into());
+                }
+            }
+            (StorageKind::Votport, None) if previous.is_none() => {
+                return Err("a Votport connection requires a receive link".into());
+            }
+            (StorageKind::Votport, None)
+                if previous
+                    .as_ref()
+                    .is_some_and(|value| value.endpoint != storage.endpoint) =>
+            {
+                return Err("paste a receive link to change the destination port".into());
+            }
+            _ => {}
         }
         let count: i64 = tx
             .query_row("SELECT COUNT(*) FROM delivery_storage", [], |row| {
@@ -279,7 +473,6 @@ impl Store {
         storage.revision += 1;
         tx.execute("INSERT INTO delivery_storage(id,revision,document) VALUES (?1,?2,?3) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,document=excluded.document",params![storage.id,storage.revision as i64,serde_json::to_string(&storage).expect("storage serializes")]).map_err(|e| e.to_string())?;
         if let Some(credentials) = credentials {
-            use crate::api::outbound::workflows::storage::Credentials;
             match credentials {
                 Credentials::Server => {
                     tx.execute(
@@ -288,7 +481,7 @@ impl Store {
                     )
                     .map_err(|e| e.to_string())?;
                 }
-                Credentials::AccessKey { .. } => {
+                Credentials::AccessKey { .. } | Credentials::Votport { .. } => {
                     tx.execute("INSERT INTO delivery_storage_credentials(id,document) VALUES (?1,?2) ON CONFLICT(id) DO UPDATE SET document=excluded.document", params![storage.id, serde_json::to_string(&credentials).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
                 }
             }
@@ -333,16 +526,58 @@ impl Store {
         &self,
         id: &str,
         attempt: u64,
+        destination: &str,
         key: &str,
     ) -> Result<(), String> {
         let mut connection = self.connection.lock().expect("store poisoned");
         let tx = connection.transaction().map_err(|e| e.to_string())?;
         let mut job = export_in(&tx, id, attempt)?;
-        job.state = "ready".into();
+        if !job.project.destinations.iter().any(|id| id == destination) {
+            return Err("destination is not part of this job".into());
+        }
+        job.checks["destinations"][destination] =
+            serde_json::json!({"state":"complete", "location":key, "completed_at":now_unix()});
+        if job
+            .project
+            .destinations
+            .iter()
+            .all(|id| job.checks["destinations"][id]["state"] == "complete")
+        {
+            job.state = "ready".into();
+        }
         job.updated_at = now_unix();
-        job.checks["export_manifest_key"] = serde_json::json!(key);
         save_job(&tx, &job).map_err(|e| e.to_string())?;
-        evidence::delivery_event(&tx,&self.event_signer,&job.tenant,id,"delivery_ready",&serde_json::json!({"manifest": job.manifest,"project_id": job.project.id,"export_manifest_key": key}),job.updated_at).map_err(|e| e.to_string())?;
+        evidence::delivery_event(&tx,&self.event_signer,&job.tenant,id,"destination_completed",&serde_json::json!({"manifest": job.manifest,"project_id": job.project.id,"destination": destination,"location": key}),job.updated_at).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn fail_delivery_destination(
+        &self,
+        id: &str,
+        attempt: u64,
+        destination: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+        let mut job = export_in(&tx, id, attempt)?;
+        if !job.project.destinations.iter().any(|id| id == destination) {
+            return Err("destination is not part of this job".into());
+        }
+        let error: String = error.chars().take(500).collect();
+        job.checks["destinations"][destination] =
+            serde_json::json!({"state":"failed", "error":error});
+        save_job(&tx, &job).map_err(|e| e.to_string())?;
+        evidence::delivery_event(
+            &tx,
+            &self.event_signer,
+            &job.tenant,
+            id,
+            "destination_failed",
+            &serde_json::json!({"destination":destination,"error":error,"attempt":attempt}),
+            now_unix(),
+        )
+        .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -438,7 +673,7 @@ impl Store {
         {
             return Err("project changed; reload before submitting".into());
         }
-        let count: i64 = tx.query_row("SELECT COUNT(*) FROM delivery_jobs WHERE tenant=?1 AND state IN ('queued','preparing','awaiting_approval','exporting')", [tenant], |row| row.get(0)).map_err(|e| e.to_string())?;
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM delivery_jobs WHERE tenant=?1 AND state IN ('queued','preparing','awaiting_approval','exporting','retrying')", [tenant], |row| row.get(0)).map_err(|e| e.to_string())?;
         if count >= 1000 {
             return Err("active job limit reached".into());
         }
@@ -459,6 +694,7 @@ impl Store {
             updated_at: now,
             error: None,
             checks: serde_json::json!({}),
+            received: None,
         };
         actor_active(&tx, &job)?;
         tx.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,deadline,document) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![job.id,tenant,actor,job.request.operation_id,job.project.id,job.state,job.request.not_before.unwrap_or(now) as i64,job.request.deadline.map(|t| t as i64),serde_json::to_string(&job).expect("job serializes")]).map_err(|e| e.to_string())?;
@@ -500,17 +736,20 @@ impl Store {
     pub fn claim_delivery_job(&self, owner: &str, now: u64) -> Result<Option<Job>, String> {
         let mut connection = self.connection.lock().expect("store poisoned");
         let tx = connection.transaction().map_err(|e| e.to_string())?;
-        let job: Option<Job> = tx.query_row("SELECT document FROM delivery_jobs WHERE (state='queued' AND not_before<=?1) OR (state='preparing' AND owner<>?2) OR (state='exporting' AND owner<>?2) ORDER BY not_before,id LIMIT 1", params![now as i64,owner], |row| decode(row.get(0)?)).optional().map_err(|e| e.to_string())?;
+        let job: Option<Job> = tx.query_row("SELECT document FROM delivery_jobs WHERE (state IN ('queued','retrying') AND not_before<=?1) OR (state='preparing' AND owner<>?2) OR (state='exporting' AND owner<>?2) ORDER BY not_before,id LIMIT 1", params![now as i64,owner], |row| decode(row.get(0)?)).optional().map_err(|e| e.to_string())?;
         let Some(mut job) = job else {
             return Ok(None);
         };
-        if job.state != "exporting" {
-            job.state = "preparing".into();
+        job.state = if job.manifest.is_some() {
+            "exporting"
+        } else {
+            "preparing"
         }
+        .into();
         job.attempts += 1;
         job.updated_at = now;
         job.error = None;
-        if job.attempts > 5 {
+        if retry_attempts(&job) > 5 {
             job.state = "failed".into();
             job.error = Some("job recovery limit reached; retry explicitly".into());
         }
@@ -543,7 +782,24 @@ impl Store {
         if !["preparing", "exporting"].contains(&job.state.as_str()) || job.attempts != attempt {
             return Ok(());
         }
-        job.state = "failed".into();
+        job.state = if job.state == "exporting" && retry_attempts(&job) < 5 {
+            "retrying"
+        } else {
+            "failed"
+        }
+        .into();
+        if job.state == "retrying" {
+            let retry_at = now_unix().saturating_add(30 * (1u64 << retry_attempts(&job).min(4)));
+            job.checks["retry_at"] = serde_json::json!(retry_at);
+            tx.execute(
+                "UPDATE delivery_jobs SET not_before=?2 WHERE id=?1",
+                params![id, retry_at as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if job.checks["first_failure_at"].is_null() {
+            job.checks["first_failure_at"] = serde_json::json!(now_unix());
+        }
         job.error = Some(error.chars().take(500).collect());
         job.updated_at = now_unix();
         save_job(&tx, &job).map_err(|e| e.to_string())?;
@@ -596,7 +852,10 @@ impl Store {
                 actor_active(&tx, &job)?;
                 check_job_storage(&tx, &job)?;
                 job.approved_by = Some(actor.into());
-                job.state = if project.export_storage.is_some() {
+                if project.release == crate::workflow::Release::Local {
+                    job.checks["released_at"] = serde_json::json!(now_unix());
+                }
+                job.state = if !project.destinations.is_empty() {
                     "exporting"
                 } else {
                     "ready"
@@ -616,11 +875,17 @@ impl Store {
                 if !project.allows(actor, "sender", administrator) && actor != job.actor {
                     return Err("sender permission required".into());
                 }
-                if job.state != "failed" || project.revision != job.project.revision {
+                if !["failed", "retrying"].contains(&job.state.as_str())
+                    || project.revision != job.project.revision
+                {
                     return Err("only a failed job with unchanged policy can retry".into());
                 }
                 actor_active(&tx, &job)?;
-                job.attempts = 0;
+                project.validate_job(&job.request, job.created_at)?;
+                job.attempts += 1;
+                job.checks["retry_base"] = serde_json::json!(job.attempts);
+                job.checks["first_failure_at"] = serde_json::Value::Null;
+                job.checks["retry_at"] = serde_json::Value::Null;
                 job.state = if job.manifest.is_some() {
                     "exporting"
                 } else {
@@ -648,7 +913,7 @@ impl Store {
         };
         if let Some(document) = document {
             let job: Job = serde_json::from_str(&document).map_err(|error| error.to_string())?;
-            if job.state != "ready" || revision != Some(job.project.revision as i64) {
+            if !job.released() || revision != Some(job.project.revision as i64) {
                 return Err("delivery is awaiting release under the current project policy".into());
             }
             return Ok(Some(job));
@@ -711,22 +976,24 @@ impl Store {
 }
 
 fn check_job_storage(connection: &Connection, job: &Job) -> Result<(), String> {
-    for (id, field) in [
-        (
-            job.request
-                .import
-                .as_ref()
-                .map(|value| value.storage_id.as_str()),
-            "import_storage_revision",
-        ),
-        (
-            job.project.export_storage.as_deref(),
-            "export_storage_revision",
-        ),
-    ] {
-        let Some(id) = id else {
-            continue;
-        };
+    let mut connections = job
+        .project
+        .destinations
+        .iter()
+        .map(|id| {
+            (
+                id.as_str(),
+                job.checks["destination_revisions"][id].as_u64(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if let Some(import) = &job.request.import {
+        connections.push((
+            &import.storage_id,
+            job.checks["import_storage_revision"].as_u64(),
+        ));
+    }
+    for (id, revision) in connections {
         let config = connection
             .query_row(
                 "SELECT document FROM delivery_storage WHERE id=?1",
@@ -736,12 +1003,17 @@ fn check_job_storage(connection: &Connection, job: &Job) -> Result<(), String> {
             .map_err(|_| "storage connection missing")?;
         if !config.enabled
             || !config.tenants.contains(&job.tenant)
-            || Some(config.revision) != job.checks[field].as_u64()
+            || Some(config.revision) != revision
         {
             return Err("storage authorization changed; submit a new job".into());
         }
     }
     Ok(())
+}
+
+fn retry_attempts(job: &Job) -> u64 {
+    job.attempts
+        .saturating_sub(job.checks["retry_base"].as_u64().unwrap_or(0))
 }
 
 fn export_in(connection: &Connection, id: &str, attempt: u64) -> Result<Job, String> {
@@ -804,7 +1076,7 @@ pub(super) fn release_in(connection: &Connection, grant_id: &str) -> Result<Opti
         let project = project_in(connection, &job.tenant, &job.project.id)
             .map_err(|e| e.to_string())?
             .ok_or("delivery project missing")?;
-        if job.state != "ready" || project.revision != job.project.revision {
+        if !job.released() || project.revision != job.project.revision {
             return Err("delivery is awaiting release under the current project policy".into());
         }
         return Ok(Some(job));
@@ -816,7 +1088,7 @@ pub(super) fn release_in(connection: &Connection, grant_id: &str) -> Result<Opti
     let protected = match cached {
         Some(protected) => protected,
         None => {
-            let protected: bool = connection.prepare_cached("SELECT EXISTS(SELECT 1 FROM outbound_grants g CROSS JOIN delivery_projects p CROSS JOIN outbound_grant_files f WHERE g.id=?1 AND p.tenant=g.tenant AND f.grant_id=g.id AND votport_within(json_extract(p.document,'$.directory'),f.source))").and_then(|mut statement| statement.query_row([grant_id], |row| row.get(0))).map_err(|error| error.to_string())?;
+            let protected: bool = connection.prepare_cached("SELECT EXISTS(SELECT 1 FROM outbound_grants g CROSS JOIN delivery_projects p CROSS JOIN outbound_grant_files f WHERE g.id=?1 AND p.tenant=g.tenant AND f.grant_id=g.id AND votport_within(json_extract(p.document,'$.directory'),f.source)) OR EXISTS(SELECT 1 FROM outbound_grants g JOIN delivery_jobs j ON j.tenant=g.tenant AND json_extract(j.document,'$.received.link_id')=g.link_id AND json_extract(j.document,'$.received.upload_id')=g.upload_id WHERE g.id=?1)").and_then(|mut statement| statement.query_row([grant_id], |row| row.get(0))).map_err(|error| error.to_string())?;
             // Project writes invalidate these immutable-file decisions in the same transaction.
             connection.execute("INSERT OR REPLACE INTO delivery_policy_cache(grant_id,protected) SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM outbound_grants WHERE id=?1)",params![grant_id,protected]).map_err(|error| error.to_string())?;
             protected
@@ -833,6 +1105,60 @@ pub(super) fn release_in(connection: &Connection, grant_id: &str) -> Result<Opti
 mod tests {
     use super::*;
     use crate::workflow::tests::{project, request};
+
+    #[test]
+    fn upgrade_preserves_only_already_frozen_export_attestations() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut policy = project();
+        policy.destinations = vec!["s3".into()];
+        let policy = store.save_delivery_project("", "admin", policy).unwrap();
+        for frozen in [false, true] {
+            let mut request = request();
+            request.operation_id = format!("legacy-{frozen}");
+            let job = store
+                .enqueue_delivery_job("", "sender", 1, None, policy.clone(), request)
+                .unwrap();
+            let mut document = serde_json::to_value(job).unwrap();
+            document["project"]
+                .as_object_mut()
+                .unwrap()
+                .remove("destinations");
+            document["project"]["export_storage"] = serde_json::json!("s3");
+            if frozen {
+                document["manifest"] = serde_json::json!("frozen");
+                document["checks"] =
+                    serde_json::json!({"metadata":"passed","export_storage_revision":1});
+            }
+            store
+                .with(|connection| {
+                    connection.execute(
+                        "UPDATE delivery_jobs SET document=?2 WHERE id=?1",
+                        params![document["id"].as_str().unwrap(), document.to_string()],
+                    )
+                })
+                .unwrap();
+        }
+        store.with(|connection| connection.execute_batch("UPDATE delivery_projects SET document=json_remove(json_set(document,'$.export_storage','s3'),'$.destinations'); UPDATE meta SET value='28' WHERE key='schema_version';")).unwrap();
+        drop(store);
+        let upgraded = Store::open(directory.path()).unwrap();
+        assert_eq!(
+            upgraded.delivery_project("", &policy.id).unwrap().unwrap(),
+            policy
+        );
+        for job in upgraded.delivery_jobs("", "", 100).unwrap() {
+            assert_eq!(job.project, policy);
+            if job.manifest.is_some() {
+                assert_eq!(
+                    job.checks["legacy_export_checks"],
+                    serde_json::json!({"metadata":"passed","export_storage_revision":1})
+                );
+                assert_eq!(job.checks["destination_revisions"]["s3"], 1);
+            } else {
+                assert!(job.checks.get("legacy_export_checks").is_none());
+            }
+        }
+    }
 
     fn grant(job: &Job) -> OutboundGrant {
         let mut grant = crate::store::tests::test_outbound_grant(&job.id, &job.tenant, 0);
@@ -909,6 +1235,8 @@ mod tests {
                     id: "s3".into(),
                     revision: 0,
                     label: "S3".into(),
+                    kind: Default::default(),
+                    directory: String::new(),
                     endpoint: "http://127.0.0.1:9000".into(),
                     bucket: "delivery".into(),
                     region: "us-east-1".into(),
@@ -1135,6 +1463,29 @@ mod tests {
             .unwrap();
         assert_eq!(job.id, first.id);
         assert_eq!(job.attempts, 2);
+        store
+            .fail_delivery_job(&job.id, job.attempts, "fixture interruption")
+            .unwrap();
+        let retry = store
+            .change_delivery_job("", &job.id, "sender", true, "retry", None)
+            .unwrap();
+        assert!(retry.attempts > job.attempts);
+        let stale = job;
+        let job = store
+            .claim_delivery_job("boot2", now_unix())
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry_attempts(&job), 1);
+        store
+            .fail_delivery_job(&stale.id, stale.attempts, "stale worker")
+            .unwrap();
+        assert_eq!(
+            store.delivery_job(&job.id).unwrap().unwrap().state,
+            "preparing"
+        );
+        assert!(store
+            .insert_workflow_grant(grant(&stale), None, Some(&stale))
+            .is_err());
         assert!(store
             .insert_workflow_grant(grant(&first), None, Some(&first))
             .is_err());

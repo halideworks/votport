@@ -22,6 +22,43 @@ import {
 
 const $ = (id) => document.getElementById(id);
 
+let receiveProjects = [], receiveAdministrator = false, createWorkflow = null;
+function workflowEditor(current = null) {
+  const element = document.createElement('fieldset'), legend = document.createElement('legend'); legend.textContent = 'After files arrive'; element.append(legend);
+  const label = document.createElement('label'); label.textContent = 'Reception project';
+  const select = document.createElement('select'); select.add(new window.Option('Keep files here; no workflow', ''));
+  for (const project of receiveProjects) select.add(new window.Option(project.label, project.id));
+  if (current?.project_id && !receiveProjects.some((project) => project.id === current.project_id)) select.add(new window.Option(`${current.project_id} (unavailable)`, current.project_id));
+  select.value = current?.project_id || ''; label.append(select); element.append(label);
+  const help = document.createElement('p'); help.className = 'field-help'; help.textContent = 'Completed uploads run this project’s checks, approvals and destination copies. Incomplete uploads do not start a workflow.';
+  const fields = document.createElement('div'); fields.className = 'grid';
+  const manage = document.createElement('a'); manage.href = '/workflows#projects'; manage.className = 'text-link'; manage.textContent = 'Manage reception projects →';
+  element.append(help, fields, manage);
+  function render() {
+    fields.replaceChildren(); const project = receiveProjects.find((project) => project.id === select.value);
+    for (const key of project?.required_metadata || []) {
+      const label = document.createElement('label'), input = document.createElement('input'); label.textContent = key.replace(/[_-]/g, ' ');
+      input.dataset.metadata = key; input.required = true; input.maxLength = 4096; input.value = current?.project_id === project.id ? current.metadata[key] || '' : ''; label.append(input); fields.append(label);
+    }
+    for (const recipient of project?.recipients || []) {
+      const label = document.createElement('label'), input = document.createElement('input'); label.className = 'check'; input.type = 'checkbox'; input.dataset.recipient = recipient.holder;
+      input.checked = current?.project_id === project.id ? current.recipients.includes(recipient.holder) : true; label.append(input, document.createTextNode(recipient.email)); fields.append(label);
+    }
+  }
+  select.addEventListener('change', render); render();
+  return { element, read() {
+    if (!select.value) return null;
+    const project = receiveProjects.find((project) => project.id === select.value);
+    if (!project) throw new Error('Choose an available reception project or turn off the workflow.');
+    const metadata = Object.fromEntries([...fields.querySelectorAll('[data-metadata]')].map((input) => {
+      if (!input.reportValidity()) throw new Error('Complete the required project fields.'); return [input.dataset.metadata, input.value.trim()];
+    }));
+    const recipients = [...fields.querySelectorAll('[data-recipient]:checked')].map((input) => input.dataset.recipient);
+    if (project.recipients.length && !recipients.length) throw new Error('Choose at least one enrolled recipient.');
+    return { project_id: select.value, metadata, recipients };
+  } };
+}
+
 // Connection-quality proxy: chunks the sender re-sent or the server refused.
 function chunkTrouble(record) {
   let text = '';
@@ -173,6 +210,16 @@ function renderUpload(link, upload) {
   transport.textContent = upload.transport === 'push' ? 'native push' : 'http';
   head.append(when, transport);
   head.append(button('Timeline', 'tiny ghost', () => openTimeline(link, upload)));
+  if (upload.route) {
+    head.append(button(upload.route.revoked_at ? 'Revoked trade route · evidence' : 'Trade route · evidence', 'tiny ghost', async () => {
+      try {
+        const evidence = await api(`/api/admin/links/${link.id}/uploads/${upload.id}/route`);
+        const url = window.URL.createObjectURL(new window.Blob([JSON.stringify(evidence, null, 2)], { type: 'application/json' }));
+        const anchor = document.createElement('a'); anchor.href = url; anchor.download = `trade-route-${upload.id}.json`; anchor.click();
+        setTimeout(() => window.URL.revokeObjectURL(url), 1000);
+      } catch (error) { await alertModal('Could not load custody evidence', error.message); }
+    }));
+  }
   if (upload.partial) {
     const partial = document.createElement('span');
     partial.className = 'badge off';
@@ -333,6 +380,7 @@ function applyReceiving(card, transfers, now = null) {
 // tab is hidden. The links list re-renders only when the set of receiving
 // links changes, so a finished transfer's record appears without a click.
 let receivingKey = null;
+let linksRefreshPending = false;
 function renderStatus(status) {
   const strip = $('status-strip');
   strip.hidden = false;
@@ -365,8 +413,8 @@ function renderStatus(status) {
   // first poll only records the set; a refresh in flight defers the change
   // to the next tick, and a list the operator paged through is left alone.
   const key = [...byLink.keys()].sort().join(',');
-  if (receivingKey !== null && key !== receivingKey) {
-    if (linksBusy) return;
+  if (linksRefreshPending || (receivingKey !== null && key !== receivingKey)) {
+    if (linksBusy || receptionEditing()) return;
     if (!linksExpanded) refreshLinksSafe({ fromPoll: true });
   }
   receivingKey = key;
@@ -425,6 +473,23 @@ function renderLink(link) {
   if (link.max_bytes) parts.push(`limit ${formatBytes(link.max_bytes)}`);
   meta.textContent = parts.join(' · ');
   card.append(meta);
+  if (link.workflow) {
+    const route = document.createElement('p'); route.className = 'connection-meta';
+    route.textContent = `After receiving: ${receiveProjects.find((project) => project.id === link.workflow.project_id)?.label || link.workflow.project_id}`;
+    const jobs = document.createElement('a'); jobs.href = '/workflows#jobs'; jobs.className = 'text-link'; jobs.textContent = 'Follow workflow deliveries →'; card.append(route, jobs);
+  }
+  if (receiveAdministrator) {
+    const details = document.createElement('details'), summary = document.createElement('summary'); summary.textContent = 'Reception workflow'; details.className = 'reception-workflow';
+    const editor = workflowEditor(link.workflow), result = document.createElement('p'); result.setAttribute('role', 'status'); result.className = 'muted';
+    editor.element.addEventListener('input', () => { details.dataset.dirty = 'true'; });
+    const save = button('Save reception workflow', 'ghost', async () => {
+      save.disabled = true;
+      try { const workflow = editor.read(); editor.element.disabled = true; await api(`/api/admin/links/${link.id}`, { method: 'PATCH', body: JSON.stringify({ workflow: workflow || { project_id: '', metadata: {}, recipients: [] } }) }); link.workflow = workflow; delete details.dataset.dirty; result.textContent = 'Saved. This applies to future uploads; existing jobs keep their captured rules.'; }
+      catch (error) { result.textContent = error.message; }
+      finally { save.disabled = false; editor.element.disabled = false; }
+    });
+    details.append(summary, editor.element, save, result); card.append(details);
+  }
   // Filled in by the status poll while a sender is shipping into this link.
   const receiving = document.createElement('p');
   receiving.className = 'receiving-now';
@@ -616,7 +681,12 @@ async function refreshLinks({ append = false, fromPoll = false } = {}) {
   }
 }
 
+function receptionEditing() {
+  return !!$('links').querySelector('.reception-workflow[open], .reception-workflow[data-dirty], .reception-workflow button:disabled');
+}
+
 async function refreshLinksInner({ append, fromPoll }) {
+  if (fromPoll && receptionEditing()) return;
   if (append) {
     linksExpanded = true;
   } else {
@@ -630,8 +700,6 @@ async function refreshLinksInner({ append, fromPoll }) {
     }
     linksExpanded = false;
     linksCursor = null;
-    $('links').replaceChildren();
-    $('links-load-more').hidden = true;
   }
   const params = new URLSearchParams({ limit: String(LINKS_PAGE_SIZE) });
   if (linksFilter.search) params.set('search', linksFilter.search);
@@ -641,9 +709,13 @@ async function refreshLinksInner({ append, fromPoll }) {
     params.set('before_id', linksCursor.id);
   }
   const response = await api(`/api/admin/links?${params}`);
+  await projectsReady;
+  if (fromPoll && receptionEditing()) { linksRefreshPending = true; return; }
   const { links, receive_dir } = response;
   $('receive-dir').textContent = `Receive root ${receive_dir}`;
   const container = $('links');
+  linksRefreshPending = false;
+  if (!append) container.replaceChildren();
   if (!append && !links.length) {
     if (linksFilter.search || linksFilter.status) {
       const empty = document.createElement('p');
@@ -699,9 +771,11 @@ $('create-form').addEventListener('submit', async (event) => {
         expires_days: Number.isFinite(expires) ? expires : null,
         max_bytes: Number.isFinite(maxGib) ? maxGib * 1024 ** 3 : null,
         notify_on_upload: $('create-notify-on-upload').checked,
+        workflow: createWorkflow?.read() || null,
       }),
     });
     $('create-form').reset();
+    createWorkflow = workflowEditor(); $('create-workflow').replaceChildren(createWorkflow.element);
     $('new-link').hidden = false;
     $('new-link-url').textContent = link.url;
     $('new-link-note').textContent = link.has_password
@@ -730,6 +804,13 @@ $('links-load-more').addEventListener('click', async () => {
 // The session check, the list, and the strip go out together; each is one
 // round trip, and none of them needs the others to have answered first.
 const sessionReady = requireSession();
+$('create-form').inert = true;
+const projectsReady = Promise.all([sessionReady, api('/api/workflows/projects')]).then(([session, response]) => {
+  receiveAdministrator = session.role === 'admin'; receiveProjects = response.projects.filter((project) => project.receive);
+  createWorkflow = workflowEditor(); $('create-workflow').replaceChildren(createWorkflow.element);
+}).catch((error) => { $('create-error').textContent = `Could not load reception projects: ${error.message}`; $('create-error').hidden = false; })
+  .finally(() => { $('create-form').inert = false; });
+
 $('links-query').value = linksFilter.search;
 startStatusPoll({ render: renderStatus, active: (status) => status.sessions_active > 0 });
 await Promise.all([sessionReady, refreshLinksSafe()]);

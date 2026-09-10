@@ -8,16 +8,34 @@ use object_store::{
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageKind {
+    #[default]
+    S3,
+    Folder,
+    Votport,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Storage {
     pub id: String,
     pub revision: u64,
     pub label: String,
+    #[serde(default)]
+    pub kind: StorageKind,
+    #[serde(default)]
+    pub directory: String,
+    #[serde(default)]
     pub endpoint: String,
+    #[serde(default)]
     pub bucket: String,
+    #[serde(default)]
     pub region: String,
+    #[serde(default)]
     pub prefix: String,
+    #[serde(default)]
     pub path_style: bool,
     pub kms_key_id: Option<String>,
     pub tenants: Vec<String>,
@@ -32,6 +50,10 @@ pub enum Credentials {
         access_key_id: String,
         secret_access_key: String,
         session_token: Option<String>,
+    },
+    Votport {
+        request_url: String,
+        password: Option<String>,
     },
 }
 
@@ -56,8 +78,39 @@ impl Credentials {
                 }
             }
         }
+        if let Self::Votport {
+            request_url,
+            password,
+        } = self
+        {
+            receive_url(request_url)?;
+            if password.as_ref().is_some_and(|value| value.len() > 256) {
+                return Err("request password must be at most 256 bytes".into());
+            }
+        }
         Ok(())
     }
+}
+
+pub(crate) fn receive_url(value: &str) -> Result<(String, String), String> {
+    let error = "enter a Votport receive link such as https://port.example/r/TOKEN";
+    if value.len() > 4096 || value.chars().any(char::is_control) {
+        return Err(error.into());
+    }
+    let url = reqwest::Url::parse(value).map_err(|_| error)?;
+    let token = url.path().strip_prefix("/r/").ok_or(error)?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || token.len() != 32
+        || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(error.into());
+    }
+    Ok((url.origin().ascii_serialization(), token.to_owned()))
 }
 
 #[derive(Deserialize)]
@@ -76,22 +129,75 @@ impl Storage {
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
             || self.label.trim().is_empty()
             || self.label.len() > 200
-            || self.region.is_empty()
-            || self.region.len() > 100
             || (!self.prefix.is_empty() && !crate::workflow::valid_path(&self.prefix))
             || self.tenants.len() > 500
             || self.kms_key_id.as_ref().is_some_and(|key| {
                 key.is_empty() || key.len() > 2048 || key.chars().any(char::is_control)
             })
         {
-            return Err("invalid storage ID, label, region, prefix, tenant list or KMS key".into());
+            return Err("invalid storage ID, label, prefix, tenant list or KMS key".into());
         }
-        crate::backup::validate_endpoint(&self.endpoint)?;
-        crate::backup::validate_bucket(&self.bucket)?;
+        match self.kind {
+            StorageKind::S3 => {
+                if self.region.is_empty() || self.region.len() > 100 || !self.directory.is_empty() {
+                    return Err("S3 storage requires a region and no shared folder path".into());
+                }
+                crate::backup::validate_endpoint(&self.endpoint)?;
+                crate::backup::validate_bucket(&self.bucket)?;
+            }
+            StorageKind::Folder => {
+                if self.directory.len() > 4096
+                    || self.directory.chars().any(char::is_control)
+                    || !Path::new(&self.directory).is_absolute()
+                    || Path::new(&self.directory)
+                        .components()
+                        .any(|part| matches!(part, std::path::Component::ParentDir))
+                    || !self.endpoint.is_empty()
+                    || !self.bucket.is_empty()
+                    || !self.region.is_empty()
+                    || self.kms_key_id.is_some()
+                {
+                    return Err(
+                        "shared storage requires an absolute folder path and no S3 settings".into(),
+                    );
+                }
+            }
+            StorageKind::Votport => {
+                let url =
+                    reqwest::Url::parse(&self.endpoint).map_err(|_| "invalid Votport origin")?;
+                if !matches!(url.scheme(), "http" | "https")
+                    || url.host_str().is_none()
+                    || !url.username().is_empty()
+                    || url.password().is_some()
+                    || url.query().is_some()
+                    || url.fragment().is_some()
+                    || !matches!(url.path(), "" | "/")
+                    || !self.directory.is_empty()
+                    || !self.bucket.is_empty()
+                    || !self.region.is_empty()
+                    || self.kms_key_id.is_some()
+                    || !self.prefix.is_empty()
+                {
+                    return Err(
+                        "Votport storage requires a server origin and no S3 or folder settings"
+                            .into(),
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
     fn connect(&self, store: &crate::store::Store) -> Result<Arc<dyn ObjectStore>, String> {
+        if self.kind == StorageKind::Folder {
+            let root = folder_root(self).map_err(|error| error.message)?;
+            return object_store::local::LocalFileSystem::new_with_prefix(root)
+                .map(|store| Arc::new(store.with_fsync(true)) as Arc<dyn ObjectStore>)
+                .map_err(|_| "shared folder is unavailable".into());
+        }
+        if self.kind != StorageKind::S3 {
+            return Err("this connection is not S3 storage".into());
+        }
         let prefix = format!("VOTPORT_STORAGE_{}", self.id.to_ascii_uppercase());
         let saved = store.delivery_storage_credentials(&self.id, self.revision)?;
         let explicit = matches!(saved, Some(Credentials::AccessKey { .. }));
@@ -232,23 +338,132 @@ pub async fn test_connection(
             "Storage changed. Save or reload it before testing.".into(),
         ));
     }
-    let store = config.connect(&app.store).map_err(conflict)?;
-    let prefix = if config.prefix.is_empty() {
-        None
-    } else {
-        Some(config.key("")?)
+    let message = match config.kind {
+        StorageKind::S3 => {
+            let store = config.connect(&app.store).map_err(conflict)?;
+            let prefix = if config.prefix.is_empty() {
+                None
+            } else {
+                Some(config.key("")?)
+            };
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                store.list(prefix.as_ref()).next().await.transpose()
+            })
+            .await;
+            if !matches!(result, Ok(Ok(_))) {
+                return Err(conflict("Could not list this storage location. Check the endpoint, bucket, credentials and list permission, then try again.".into()));
+            }
+            "Connection verified. Bucket listing works; exports also require permission to write objects."
+        }
+        StorageKind::Folder => {
+            let config = config.clone();
+            tokio::task::spawn_blocking(move || {
+                let root = folder_root(&config)?;
+                std::fs::read_dir(root).map_err(|_| {
+                    conflict("The shared folder cannot be read by the server.".into())
+                })?;
+                Ok::<_, ApiError>(())
+            })
+            .await
+            .map_err(|_| ApiError::internal("shared folder check failed"))??;
+            "Connection verified. The server can read this shared folder; mirroring also requires write permission."
+        }
+        StorageKind::Votport => {
+            let Some(Credentials::Votport {
+                request_url,
+                password,
+            }) = app
+                .store
+                .delivery_storage_credentials(&id, body.revision)
+                .map_err(conflict)?
+            else {
+                return Err(conflict(
+                    "Save a receive link for this Votport connection.".into(),
+                ));
+            };
+            let (origin, token) = receive_url(&request_url).map_err(conflict)?;
+            let response = app
+                .http
+                .get(format!("{origin}/api/r/{token}"))
+                .send()
+                .await
+                .map_err(|_| conflict("The destination port could not be reached.".into()))?;
+            if !response.status().is_success() {
+                return Err(conflict(
+                    "The destination did not return a usable receive request.".into(),
+                ));
+            }
+            let info = port_json(response).await?;
+            if info["usable"] != true {
+                return Err(conflict(
+                    "The destination receive request is expired or disabled.".into(),
+                ));
+            }
+            if info["needs_password"] == true {
+                let password = password.ok_or_else(|| {
+                    conflict(
+                        "This receive request needs a password. Save it with the connection."
+                            .into(),
+                    )
+                })?;
+                let response = app
+                    .http
+                    .post(format!("{origin}/api/r/{token}/verify"))
+                    .header("X-Votport", "1")
+                    .json(&json!({"password":password}))
+                    .send()
+                    .await
+                    .map_err(|_| {
+                        conflict("The destination password could not be checked.".into())
+                    })?;
+                if !response.status().is_success() {
+                    return Err(conflict(
+                        "The destination rejected the receive-request password.".into(),
+                    ));
+                }
+            }
+            "Connection verified. The destination port is accepting files into this receive request."
+        }
     };
-    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        store.list(prefix.as_ref()).next().await.transpose()
-    })
-    .await;
-    if !matches!(result, Ok(Ok(_))) {
-        return Err(conflict("Could not list this storage location. Check the endpoint, bucket, credentials and list permission, then try again.".into()));
-    }
     app.store
         .delivery_storage_credentials(&id, body.revision)
         .map_err(conflict)?;
-    Ok(([(header::CACHE_CONTROL, "no-store")], Json(json!({"ok": true, "message": "Connection verified. Bucket listing works; exports also require permission to write objects."}))).into_response())
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({"ok": true, "message": message})),
+    )
+        .into_response())
+}
+
+fn folder_root(config: &Storage) -> ApiResult<PathBuf> {
+    let root = Path::new(&config.directory);
+    for ancestor in root.ancestors() {
+        let metadata = std::fs::symlink_metadata(ancestor).map_err(|_| {
+            conflict("The shared folder must exist and be accessible to the server.".into())
+        })?;
+        if !metadata.file_type().is_dir() {
+            return Err(conflict(
+                "The shared folder path must contain directories, without symlinks.".into(),
+            ));
+        }
+    }
+    Ok(root.to_owned())
+}
+
+async fn port_json(mut response: reqwest::Response) -> ApiResult<serde_json::Value> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| conflict("The destination response was interrupted.".into()))?
+    {
+        if bytes.len() + chunk.len() > 65536 {
+            return Err(conflict("The destination response was too large.".into()));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| conflict("The destination did not return Votport request details.".into()))
 }
 
 pub(super) fn authorized_storage(app: &App, tenant: &str, id: &str) -> ApiResult<Storage> {
@@ -290,6 +505,9 @@ pub(super) async fn import(app: &Arc<App>, job: &Job) -> ApiResult<Option<u64>> 
         return Ok(None);
     };
     let config = authorized_storage(app, &job.tenant, &import.storage_id)?;
+    if config.kind != StorageKind::S3 {
+        return Err(conflict("imports require an S3 connection".into()));
+    }
     let store = config.connect(&app.store).map_err(conflict)?;
     let root = payload_root(app, &job.tenant, &job.id);
     let parent = root.parent().ok_or_else(ApiError::not_found)?;
@@ -495,23 +713,46 @@ fn sync_directory(path: &Path) -> ApiResult<()> {
 }
 
 pub(super) async fn export(app: &Arc<App>, job: &Job) -> ApiResult<()> {
-    let config = authorized_storage(
-        app,
-        &job.tenant,
-        job.project
-            .export_storage
-            .as_deref()
-            .ok_or_else(|| conflict("export storage missing".into()))?,
-    )?;
-    if job
-        .checks
-        .get("export_storage_revision")
-        .and_then(|value| value.as_u64())
-        != Some(config.revision)
-    {
-        return Err(conflict(
-            "storage configuration changed; submit a new delivery".into(),
-        ));
+    let mut pending = vec![];
+    app.store
+        .require_delivery_export(&job.id, job.attempts)
+        .map_err(conflict)?;
+    for id in &job.project.destinations {
+        if job.checks["destinations"][id]["state"] == "complete" {
+            continue;
+        }
+        let config = authorized_storage(app, &job.tenant, id)?;
+        if job.checks["destination_revisions"][id].as_u64() != Some(config.revision) {
+            return Err(conflict(
+                "storage configuration changed; submit a new delivery".into(),
+            ));
+        }
+        pending.push(config);
+    }
+    let mut failures = vec![];
+    let mut transfers = futures_util::stream::iter(pending.into_iter().map(|config| async move {
+        let result = export_destination(app, job, &config).await;
+        (config, result)
+    }))
+    .buffer_unordered(2);
+    while let Some((config, result)) = transfers.next().await {
+        if let Err(error) = result {
+            app.store
+                .fail_delivery_destination(&job.id, job.attempts, &config.id, &error.message)
+                .map_err(conflict)?;
+            failures.push(format!("{}: {}", config.label, error.message));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(conflict(failures.join("; ")))
+    }
+}
+
+async fn export_destination(app: &Arc<App>, job: &Job, config: &Storage) -> ApiResult<()> {
+    if config.kind == StorageKind::Votport {
+        return super::routes::export(app, job, config).await;
     }
     let store = config.connect(&app.store).map_err(conflict)?;
     let grant = app
@@ -530,6 +771,7 @@ pub(super) async fn export(app: &Arc<App>, job: &Job) -> ApiResult<()> {
             .require_delivery_export(&job.id, job.attempts)
             .map_err(conflict)?;
         let key = config.key(&format!("{prefix}/files/{}", file.name))?;
+        guard_folder_key(config, &key)?;
         let path = source_info_indexed_with_file(app, &grant, index, Some(file))?.path;
         upload_file(&*store, &key, &path, file).await?;
         files.push(json!({"name": file.name,"suite": file.suite,"root": file.root,"bytes": file.bytes,"key": key.to_string(),"receipt": file.receipt_b64}));
@@ -537,12 +779,13 @@ pub(super) async fn export(app: &Arc<App>, job: &Job) -> ApiResult<()> {
     app.store
         .require_delivery_export(&job.id, job.attempts)
         .map_err(conflict)?;
-    let document = json!({"format": "votport-delivery-export-v1","job_id": job.id,"manifest": manifest,"metadata": job.request.metadata,"project_id": job.project.id,"policy_revision": job.project.revision,"approved_by": job.approved_by,"checks": job.checks,"files": files,"issuer": app.signer.public_hex});
+    let document = json!({"format": "votport-delivery-export-v1","job_id": job.id,"manifest": manifest,"metadata": job.request.metadata,"project_id": job.project.id,"policy_revision": job.project.revision,"approved_by": job.approved_by,"checks": export_checks(job),"files": files,"issuer": app.signer.public_hex});
     let attestation =
         json!({"document": document,"signature": app.signer.sign_delivery_export(&document)});
     let bytes = serde_json::to_vec(&attestation)
         .map_err(|_| ApiError::internal("serialize export manifest"))?;
     let completion = config.key(&format!("{prefix}/complete.json"))?;
+    guard_folder_key(config, &completion)?;
     match store
         .put_opts(&completion, bytes.clone().into(), PutMode::Create.into())
         .await
@@ -570,13 +813,47 @@ pub(super) async fn export(app: &Arc<App>, job: &Job) -> ApiResult<()> {
         }
         Err(_) => {
             return Err(conflict(
-                "publish immutable S3 completion manifest failed".into(),
+                "publish immutable storage completion manifest failed".into(),
             ))
         }
     }
     app.store
-        .complete_delivery_export(&job.id, job.attempts, completion.as_ref())
+        .complete_delivery_export(&job.id, job.attempts, &config.id, completion.as_ref())
         .map_err(conflict)?;
+    Ok(())
+}
+
+fn export_checks(job: &Job) -> serde_json::Value {
+    if let Some(checks) = job.checks.get("legacy_export_checks") {
+        return checks.clone();
+    }
+    let mut checks = serde_json::Map::new();
+    for key in [
+        "metadata",
+        "sequence",
+        "media",
+        "malware_scan",
+        "import_storage_revision",
+        "destination_revisions",
+        "source_receipt",
+        "source_ancestry",
+    ] {
+        if let Some(value) = job.checks.get(key) {
+            checks.insert(key.into(), value.clone());
+        }
+    }
+    checks.into()
+}
+
+fn guard_folder_key(config: &Storage, key: &ObjectPath) -> ApiResult<()> {
+    if config.kind == StorageKind::Folder {
+        let root = folder_root(config)?;
+        if !library_components_safe(&root, &root.join(key.as_ref())) {
+            return Err(conflict(
+                "shared folder contains a symlink or invalid directory".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -589,7 +866,9 @@ async fn upload_file(
     let part_size = expected.bytes.div_ceil(10_000).max(8 * 1024 * 1024);
     // ponytail: at most 128 MiB per part; larger than 1.25 TiB needs a streaming multipart adapter.
     if part_size > 128 * 1024 * 1024 {
-        return Err(conflict("S3 export supports files up to 1.25 TiB".into()));
+        return Err(conflict(
+            "storage export supports files up to 1.25 TiB".into(),
+        ));
     }
     let mut file = tokio::fs::File::open(path)
         .await
@@ -603,7 +882,7 @@ async fn upload_file(
     let mut upload = store
         .put_multipart(key)
         .await
-        .map_err(|_| conflict("start S3 multipart upload failed".into()))?;
+        .map_err(|_| conflict("start storage multipart upload failed".into()))?;
     let result = async {
         let mut total = 0u64;
         loop {
@@ -633,7 +912,7 @@ async fn upload_file(
             upload
                 .put_part(bytes.into())
                 .await
-                .map_err(|_| conflict("S3 multipart upload interrupted".into()))?;
+                .map_err(|_| conflict("storage multipart upload interrupted".into()))?;
             if used == 0 {
                 break;
             }
@@ -649,7 +928,7 @@ async fn upload_file(
         upload
             .complete()
             .await
-            .map_err(|_| conflict("complete S3 multipart upload failed".into()))?;
+            .map_err(|_| conflict("complete storage multipart upload failed".into()))?;
         Ok(())
     }
     .await;

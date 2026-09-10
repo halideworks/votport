@@ -51,7 +51,20 @@ pub struct Project {
     pub media: Option<MediaCheck>,
     #[serde(default)]
     pub scan_required: bool,
-    pub export_storage: Option<String>,
+    #[serde(default)]
+    pub destinations: Vec<String>,
+    #[serde(default)]
+    pub receive: bool,
+    #[serde(default)]
+    pub release: Release,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Release {
+    #[default]
+    AllDestinations,
+    Local,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -95,11 +108,55 @@ pub struct Job {
     pub updated_at: u64,
     pub error: Option<String>,
     pub checks: serde_json::Value,
+    #[serde(default)]
+    pub received: Option<Received>,
 }
 
 impl Job {
+    pub fn released(&self) -> bool {
+        self.state == "ready"
+            || (self.checks["released_at"].as_u64().is_some()
+                && ["exporting", "retrying", "failed"].contains(&self.state.as_str()))
+    }
+
     pub fn uses_snapshot(&self) -> bool {
-        self.project.media.is_some() || self.project.scan_required || self.request.import.is_some()
+        self.received.is_some()
+            || self.project.media.is_some()
+            || self.project.scan_required
+            || self.request.import.is_some()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Received {
+    pub link_id: String,
+    pub upload_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiveWorkflow {
+    pub project_id: String,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+    #[serde(default)]
+    pub recipients: Vec<String>,
+}
+
+impl ReceiveWorkflow {
+    pub fn request(&self, operation_id: &str, label: &str) -> JobRequest {
+        JobRequest {
+            operation_id: operation_id.into(),
+            project_id: self.project_id.clone(),
+            label: label.into(),
+            metadata: self.metadata.clone(),
+            recipients: self.recipients.clone(),
+            not_before: None,
+            deadline: None,
+            expires_days: 30,
+            import: None,
+        }
     }
 }
 
@@ -205,8 +262,16 @@ impl Project {
                 return Err("invalid sequence range or filename pattern".into());
             }
         }
-        if self.export_storage.as_ref().is_some_and(|id| !valid_id(id)) {
-            return Err("invalid export storage ID".into());
+        if self.destinations.len() > 16
+            || self.destinations.iter().any(|id| !valid_id(id))
+            || self
+                .destinations
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != self.destinations.len()
+        {
+            return Err("choose at most 16 unique destinations".into());
         }
         if let Some(media) = &self.media {
             if media.video_codec.as_ref().is_some_and(|v| !valid_id(v))
@@ -326,7 +391,9 @@ pub(crate) mod tests {
             sequence: None,
             media: None,
             scan_required: false,
-            export_storage: None,
+            destinations: vec![],
+            receive: false,
+            release: Release::AllDestinations,
         }
     }
 
