@@ -7,6 +7,9 @@ const deliver = await readFile(new URL('../web/deliver.html', import.meta.url), 
 const audit = await readFile(new URL('../web/audit.html', import.meta.url), 'utf8');
 const tenants = await readFile(new URL('../web/tenants.html', import.meta.url), 'utf8');
 const system = await readFile(new URL('../web/system.html', import.meta.url), 'utf8');
+const workflows = await readFile(new URL('../web/workflows.html', import.meta.url), 'utf8');
+const storage = await readFile(new URL('../web/storage.html', import.meta.url), 'utf8');
+const automation = await readFile(new URL('../web/automation.html', import.meta.url), 'utf8');
 const receiveScript = await readFile(new URL('../web/assets/page-receive.js', import.meta.url), 'utf8');
 const deliverScript = await readFile(new URL('../web/assets/page-deliver.js', import.meta.url), 'utf8');
 const tenantsScript = await readFile(new URL('../web/assets/page-tenants.js', import.meta.url), 'utf8');
@@ -40,14 +43,14 @@ test('receive and deliver pages keep transfer concerns separate', () => {
 
 test('issued request status filter uses the shared form control styling', () => {
   assert.match(receive, /<div class="grid">[\s\S]*id="links-status"/);
-  assert.match(style, /input,\s*\.card select\s*\{[\s\S]*display: block;[\s\S]*width: 100%;[\s\S]*background: var\(--ink-3\);/);
-  assert.match(style, /input:focus,\s*\.card select:focus\s*\{[\s\S]*border-color: var\(--border-active\);/);
+  assert.match(style, /input,\s*textarea,\s*\.card select\s*\{[\s\S]*display: block;[\s\S]*width: 100%;[\s\S]*background: var\(--ink-3\);/);
+  assert.match(style, /input:focus,\s*textarea:focus,\s*\.card select:focus\s*\{[\s\S]*border-color: var\(--border-active\);/);
   assert.doesNotMatch(style, /^select\s*\{/m);
 });
 
 test('admin navigation exposes the current page and tenant selector', () => {
   assert.match(commonScript, /link\.setAttribute\('aria-current', 'page'\)/);
-  for (const page of [receive, deliver, audit, tenants, system]) {
+  for (const page of [receive, deliver, workflows, storage, automation, audit, tenants, system]) {
     assert.match(page, /<select id="tenant-switcher" aria-label="Tenant" hidden>/);
   }
 });
@@ -103,7 +106,7 @@ const request = await readFile(new URL('../web/request.html', import.meta.url), 
 const verify = await readFile(new URL('../web/verify.html', import.meta.url), 'utf8');
 
 test('no page repeats an element id', () => {
-  for (const [name, html] of Object.entries({ receive, deliver, audit, tenants, system, send, request, verify })) {
+  for (const [name, html] of Object.entries({ receive, deliver, workflows, storage, automation, audit, tenants, system, send, request, verify })) {
     const ids = [...html.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]);
     const seen = new Set();
     for (const id of ids) {
@@ -142,7 +145,7 @@ test('receive page carries the status strip and polls the status endpoint', asyn
 });
 
 test('every admin page mounts the masthead search and results deep-link into their lists', () => {
-  for (const [name, html] of [['receive', receive], ['deliver', deliver], ['audit', audit], ['tenants', tenants], ['system', system]]) {
+  for (const [name, html] of [['receive', receive], ['deliver', deliver], ['workflows', workflows], ['storage', storage], ['automation', automation], ['audit', audit], ['tenants', tenants], ['system', system]]) {
     assert.match(html, /id="global-search-input"/, `${name} has the search box`);
     assert.match(html, /id="global-search-results"/, `${name} has the results panel`);
   }
@@ -174,11 +177,11 @@ test('each transfer opens a timeline dialog built from the record', () => {
 });
 
 test('every page applies the saved theme before paint and admin pages carry the toggle', async () => {
-  for (const name of ['index', 'receive', 'deliver', 'tenants', 'audit', 'system', 'send', 'request', 'verify']) {
+  for (const name of ['index', 'receive', 'deliver', 'workflows', 'storage', 'automation', 'tenants', 'audit', 'system', 'send', 'request', 'verify']) {
     const html = await readFile(new URL(`../web/${name}.html`, import.meta.url), 'utf8');
     assert.match(html, /<script src="\/assets\/theme\.js"><\/script>/, `${name} loads theme.js`);
   }
-  for (const html of [receive, deliver, tenants, audit, system]) {
+  for (const html of [receive, deliver, workflows, storage, automation, tenants, audit, system]) {
     assert.match(html, /id="theme-toggle"/);
   }
   const css = await readFile(new URL('../web/assets/style.css', import.meta.url), 'utf8');
@@ -219,7 +222,7 @@ test('admin pages preload their module graph and fetch data alongside the sessio
     await walk(entry);
     return [...seen].sort();
   };
-  for (const [name, html] of [['receive', receive], ['deliver', deliver], ['tenants', tenants], ['audit', audit], ['system', system]]) {
+  for (const [name, html] of [['receive', receive], ['deliver', deliver], ['workflows', workflows], ['storage', storage], ['automation', automation], ['tenants', tenants], ['audit', audit], ['system', system]]) {
     const preloads = [...html.matchAll(/rel="modulepreload" href="\/assets\/([\w-]+\.js)"/g)].map((m) => m[1]).sort();
     assert.deepEqual(preloads, await graph(`page-${name}.js`), `${name} preloads its import graph`);
   }

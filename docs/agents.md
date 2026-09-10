@@ -7,8 +7,8 @@ identities, download counters, and audit trail.
 
 ## Connect
 
-In the browser, open **Deliver > Agent access and automation tokens**. In the
-macOS or Windows app, open **Settings > Agent access**. Choose a label, library
+In the browser, open **Automation**. In the macOS or Windows app, open
+**Settings > Agent access**. Choose a label, library
 folder, expiry, and allowed actions, then issue a token. Copy it immediately.
 The desktop apps include the client CLI and can copy an MCP configuration with
 its installed path. The browser can copy a configuration whose `command` must

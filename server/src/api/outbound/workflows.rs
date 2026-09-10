@@ -1221,6 +1221,202 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn storage_credentials_stay_private_and_change_with_the_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let cookie = admin_cookie(&app);
+        let config = json!({"id":"archive","revision":0,"label":"Archive","endpoint":"http://127.0.0.1:1","bucket":"archive","region":"us-east-1","prefix":"","path_style":true,"kms_key_id":null,"tenants":[""],"enabled":true});
+        let keys = json!({"mode":"access_key","access_key_id":"fixture-access","secret_access_key":"fixture-secret","session_token":"fixture-session"});
+        let payload = json!({"storage":config,"credentials":keys});
+        assert_eq!(
+            call(
+                &app,
+                Method::PUT,
+                "/api/workflows/storage",
+                None,
+                Some(payload.clone())
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let mut viewer = auth::AdminIdentity::local_admin();
+        viewer.role = "viewer".into();
+        let viewer_cookie = format!(
+            "votport_admin={}",
+            auth::issue_admin_token(&app.secret, &viewer, &app.config.admin_token_tag)
+        );
+        assert_eq!(
+            call(
+                &app,
+                Method::PUT,
+                "/api/workflows/storage",
+                Some(&viewer_cookie),
+                Some(payload.clone())
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(
+                &app,
+                Method::POST,
+                "/api/workflows/storage/archive/test",
+                Some(&viewer_cookie),
+                Some(json!({"revision":0}))
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        let saved = call(
+            &app,
+            Method::PUT,
+            "/api/workflows/storage",
+            Some(&cookie),
+            Some(payload.clone()),
+        )
+        .await;
+        assert_eq!(
+            saved.0,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&saved.2)
+        );
+        let mut config: serde_json::Value = serde_json::from_slice(&saved.2).unwrap();
+        assert_eq!(config["revision"], 1);
+        let listing = call(
+            &app,
+            Method::GET,
+            "/api/workflows/storage",
+            Some(&cookie),
+            None,
+        )
+        .await;
+        let public: serde_json::Value = serde_json::from_slice(&listing.2).unwrap();
+        assert_eq!(public["storage"][0]["credential_source"], "saved");
+        for body in [&saved.2, &listing.2] {
+            let body = String::from_utf8_lossy(body);
+            for secret in ["fixture-access", "fixture-secret", "fixture-session"] {
+                assert!(!body.contains(secret));
+            }
+        }
+        assert!(app
+            .store
+            .delivery_storage_has_credentials("archive")
+            .unwrap());
+        let stored = app
+            .store
+            .delivery_storage_credentials("archive", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::to_value(stored).unwrap(), keys);
+        assert!(app
+            .store
+            .delivery_storage_credentials("archive", 0)
+            .is_err());
+        assert_eq!(
+            call(
+                &app,
+                Method::PUT,
+                "/api/workflows/storage",
+                Some(&cookie),
+                Some(payload)
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let invalid = json!({"mode":"access_key","access_key_id":"fixture-access","secret_access_key":"","session_token":null});
+        assert_eq!(
+            call(
+                &app,
+                Method::PUT,
+                "/api/workflows/storage",
+                Some(&cookie),
+                Some(json!({"storage":config,"credentials":invalid}))
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            serde_json::to_value(
+                app.store
+                    .delivery_storage_credentials("archive", 1)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            keys
+        );
+        config["label"] = json!("Archive renamed");
+        let renamed = call(
+            &app,
+            Method::PUT,
+            "/api/workflows/storage",
+            Some(&cookie),
+            Some(json!({"storage":config})),
+        )
+        .await;
+        assert_eq!(renamed.0, StatusCode::OK);
+        config = serde_json::from_slice(&renamed.2).unwrap();
+        assert_eq!(config["revision"], 2);
+        assert_eq!(
+            serde_json::to_value(
+                app.store
+                    .delivery_storage_credentials("archive", 2)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            keys
+        );
+        assert!(app
+            .store
+            .delivery_storage_credentials("archive", 1)
+            .is_err());
+        assert_eq!(
+            call(
+                &app,
+                Method::POST,
+                "/api/workflows/storage/archive/test",
+                Some(&cookie),
+                Some(json!({"revision":1}))
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let cleared = call(
+            &app,
+            Method::PUT,
+            "/api/workflows/storage",
+            Some(&cookie),
+            Some(json!({"storage":config,"credentials":{"mode":"server"}})),
+        )
+        .await;
+        assert_eq!(cleared.0, StatusCode::OK);
+        assert!(!app
+            .store
+            .delivery_storage_has_credentials("archive")
+            .unwrap());
+        assert!(app
+            .store
+            .delivery_storage_credentials("archive", 3)
+            .unwrap()
+            .is_none());
+        assert!(app
+            .store
+            .delivery_storage_credentials("archive", 2)
+            .is_err());
+        let events = app.store.delivery_events("", 0, 100).unwrap();
+        let events = serde_json::to_string(&events).unwrap();
+        assert!(!events.contains("fixture-secret") && !events.contains("fixture-session"));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn required_checkers_fail_closed_and_bound_output() {

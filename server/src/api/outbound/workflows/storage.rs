@@ -24,6 +24,49 @@ pub struct Storage {
     pub enabled: bool,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Credentials {
+    Server,
+    AccessKey {
+        access_key_id: String,
+        secret_access_key: String,
+        session_token: Option<String>,
+    },
+}
+
+impl Credentials {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Self::AccessKey {
+            access_key_id,
+            secret_access_key,
+            session_token,
+        } = self
+        {
+            for value in [
+                Some(access_key_id),
+                Some(secret_access_key),
+                session_token.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
+                    return Err("storage credentials must be nonempty, at most 4096 characters and contain no control characters".into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SaveStorage {
+    storage: Storage,
+    credentials: Option<Credentials>,
+}
+
 impl Storage {
     pub fn validate(&self) -> Result<(), String> {
         if !crate::workflow::valid_id(&self.id)
@@ -48,25 +91,44 @@ impl Storage {
         Ok(())
     }
 
-    fn connect(&self) -> Result<Arc<dyn ObjectStore>, String> {
+    fn connect(&self, store: &crate::store::Store) -> Result<Arc<dyn ObjectStore>, String> {
         let prefix = format!("VOTPORT_STORAGE_{}", self.id.to_ascii_uppercase());
-        let mut builder = match (
-            std::env::var(format!("{prefix}_ACCESS_KEY_ID")).ok(),
-            std::env::var(format!("{prefix}_SECRET_ACCESS_KEY")).ok(),
-        ) {
-            (Some(access), Some(secret)) => AmazonS3Builder::new()
-                .with_access_key_id(access)
-                .with_secret_access_key(secret),
-            (None, None) => AmazonS3Builder::from_env(),
-            _ => return Err("storage credentials are incomplete".into()),
+        let saved = store.delivery_storage_credentials(&self.id, self.revision)?;
+        let explicit = matches!(saved, Some(Credentials::AccessKey { .. }));
+        let mut builder = if let Some(Credentials::AccessKey {
+            access_key_id,
+            secret_access_key,
+            session_token,
+        }) = saved
+        {
+            let mut builder = AmazonS3Builder::new()
+                .with_access_key_id(access_key_id)
+                .with_secret_access_key(secret_access_key);
+            if let Some(token) = session_token {
+                builder = builder.with_token(token);
+            }
+            builder
+        } else {
+            match (
+                std::env::var(format!("{prefix}_ACCESS_KEY_ID")).ok(),
+                std::env::var(format!("{prefix}_SECRET_ACCESS_KEY")).ok(),
+            ) {
+                (Some(access), Some(secret)) => AmazonS3Builder::new()
+                    .with_access_key_id(access)
+                    .with_secret_access_key(secret),
+                (None, None) => AmazonS3Builder::from_env(),
+                _ => return Err("storage credentials are incomplete".into()),
+            }
         }
         .with_config(AmazonS3ConfigKey::S3Endpoint, &self.endpoint)
         .with_bucket_name(&self.bucket)
         .with_region(&self.region)
         .with_virtual_hosted_style_request(!self.path_style)
         .with_allow_http(self.endpoint.starts_with("http://"));
-        if let Ok(token) = std::env::var(format!("{prefix}_SESSION_TOKEN")) {
-            builder = builder.with_token(token);
+        if !explicit {
+            if let Ok(token) = std::env::var(format!("{prefix}_SESSION_TOKEN")) {
+                builder = builder.with_token(token);
+            }
         }
         if let Some(key) = &self.kms_key_id {
             builder = builder.with_sse_kms_encryption(key);
@@ -90,7 +152,7 @@ impl Storage {
 pub async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Response> {
     let identity = admin::require_operator(&app, &headers)?;
     let platform_admin = identity.tenant.is_empty() && identity.role == "admin";
-    let storage = app
+    let configs = app
         .store
         .delivery_storages()
         .map_err(crate::api::store_unavailable)?
@@ -99,6 +161,17 @@ pub async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<
             platform_admin || (storage.enabled && storage.tenants.contains(&identity.tenant))
         })
         .collect::<Vec<_>>();
+    let mut storage = Vec::with_capacity(configs.len());
+    for config in configs {
+        let saved = app
+            .store
+            .delivery_storage_has_credentials(&config.id)
+            .map_err(crate::api::store_unavailable)?;
+        let mut public =
+            serde_json::to_value(config).map_err(|e| ApiError::internal(e.to_string()))?;
+        public["credential_source"] = json!(if saved { "saved" } else { "server" });
+        storage.push(public);
+    }
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(json!({"storage": storage})),
@@ -109,7 +182,7 @@ pub async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<
 pub async fn put(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    Json(storage): Json<Storage>,
+    Json(body): Json<SaveStorage>,
 ) -> ApiResult<Response> {
     let identity = admin::require_operator(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
@@ -119,12 +192,63 @@ pub async fn put(
             "platform administrator required for storage connections",
         ));
     }
-    storage.validate().map_err(conflict)?;
+    body.storage.validate().map_err(conflict)?;
     let storage = app
         .store
-        .save_delivery_storage(&identity.subject, storage)
+        .save_delivery_storage(&identity.subject, body.storage, body.credentials)
         .map_err(conflict)?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(storage)).into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestStorage {
+    revision: u64,
+}
+
+pub async fn test_connection(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<TestStorage>,
+) -> ApiResult<Response> {
+    let identity = admin::require_operator(&app, &headers)?;
+    admin::require_admin_write(&headers, &identity)?;
+    if !identity.tenant.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "platform administrator required",
+        ));
+    }
+    let config = app
+        .store
+        .delivery_storages()
+        .map_err(crate::api::store_unavailable)?
+        .into_iter()
+        .find(|config| config.id == id)
+        .ok_or_else(ApiError::not_found)?;
+    if config.revision != body.revision {
+        return Err(conflict(
+            "Storage changed. Save or reload it before testing.".into(),
+        ));
+    }
+    let store = config.connect(&app.store).map_err(conflict)?;
+    let prefix = if config.prefix.is_empty() {
+        None
+    } else {
+        Some(config.key("")?)
+    };
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        store.list(prefix.as_ref()).next().await.transpose()
+    })
+    .await;
+    if !matches!(result, Ok(Ok(_))) {
+        return Err(conflict("Could not list this storage location. Check the endpoint, bucket, credentials and list permission, then try again.".into()));
+    }
+    app.store
+        .delivery_storage_credentials(&id, body.revision)
+        .map_err(conflict)?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(json!({"ok": true, "message": "Connection verified. Bucket listing works; exports also require permission to write objects."}))).into_response())
 }
 
 pub(super) fn authorized_storage(app: &App, tenant: &str, id: &str) -> ApiResult<Storage> {
@@ -166,7 +290,7 @@ pub(super) async fn import(app: &Arc<App>, job: &Job) -> ApiResult<Option<u64>> 
         return Ok(None);
     };
     let config = authorized_storage(app, &job.tenant, &import.storage_id)?;
-    let store = config.connect().map_err(conflict)?;
+    let store = config.connect(&app.store).map_err(conflict)?;
     let root = payload_root(app, &job.tenant, &job.id);
     let parent = root.parent().ok_or_else(ApiError::not_found)?;
     create_library_dirs(&library_root(app, &job.tenant))?;
@@ -389,7 +513,7 @@ pub(super) async fn export(app: &Arc<App>, job: &Job) -> ApiResult<()> {
             "storage configuration changed; submit a new delivery".into(),
         ));
     }
-    let store = config.connect().map_err(conflict)?;
+    let store = config.connect(&app.store).map_err(conflict)?;
     let grant = app
         .store
         .outbound_grant_by_id(&job.id)

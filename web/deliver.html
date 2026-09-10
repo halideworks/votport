@@ -10,7 +10,6 @@
     <script src="/assets/theme.js"></script>
     <!-- The whole module graph fetches at once instead of one import level per round trip. -->
     <link rel="modulepreload" href="/assets/page-deliver.js" />
-    <link rel="modulepreload" href="/assets/workflow-admin.js" />
     <link rel="modulepreload" href="/assets/library-paths.js" />
     <link rel="modulepreload" href="/assets/upload-entries.js" />
     <link rel="modulepreload" href="/assets/status-strip.js" />
@@ -39,99 +38,7 @@
         </form>
       </div>
 
-      <h1>Deliver files</h1>
-
-      <details id="workflows" class="card">
-        <summary>Delivery workflows, approvals and verification</summary>
-        <p>Use a project to enforce its delivery rules. Files are released after the required checks and approval.</p>
-        <p id="workflow-error" class="error" role="alert" hidden></p>
-        <form id="workflow-create">
-          <div class="grid">
-            <label>Project<select id="workflow-project" required></select></label>
-            <label>Delivery label<input id="workflow-label" required maxlength="200" /></label>
-            <label>Expires after (days)<input id="workflow-days" type="number" min="1" max="365" value="7" required /></label>
-            <label>Scheduled start (optional)<input id="workflow-start" type="datetime-local" /></label>
-            <label>Acceptance deadline (optional)<input id="workflow-deadline" type="datetime-local" /></label>
-          </div>
-          <p id="workflow-rules" class="muted"></p>
-          <div id="workflow-metadata" class="grid"></div>
-          <fieldset id="workflow-recipients"><legend>Recipients</legend></fieldset>
-          <details><summary>Import from storage</summary>
-            <label>Storage<select id="workflow-import"><option value="">Use library files</option></select></label>
-            <label>Object prefix<input id="workflow-prefix" maxlength="1024" /></label>
-          </details>
-          <button type="submit">Queue delivery</button>
-          <button id="workflow-new-operation" type="button" class="ghost">Start a separate delivery</button>
-          <p id="workflow-result" role="status"></p>
-        </form>
-        <h2>Jobs</h2>
-        <button id="workflow-refresh" type="button" class="ghost">Refresh</button>
-        <div id="workflow-jobs"></div>
-        <button id="workflow-more" type="button" hidden>Load more jobs</button>
-        <details id="workflow-events-panel"><summary>Signed event history</summary>
-          <button id="workflow-events-next" type="button">Load next event page</button>
-          <button id="workflow-events-export" type="button" disabled>Download this event page</button>
-          <div id="workflow-events"></div>
-        </details>
-        <details id="workflow-project-panel"><summary>Project rules and delivery templates</summary>
-          <p>Saving rules protects the entire library directory, including existing links. A policy change requires a new job before further downloads.</p>
-          <label>Edit project<select id="workflow-edit-project"><option value="">New project</option></select></label>
-          <form id="workflow-save-project">
-            <div class="grid">
-              <label>Project ID<input id="wp-id" required maxlength="100" pattern="[A-Za-z0-9_-]+" /></label>
-              <label>Project name<input id="wp-label" required maxlength="200" /></label>
-              <label>Library directory<input id="wp-directory" required maxlength="1024" /></label>
-              <label>Required metadata fields (one per line)<textarea id="wp-metadata" rows="3"></textarea></label>
-              <label>Allowed email domains (one per line)<textarea id="wp-domains" rows="3"></textarea></label>
-              <label>Members (one subject and role per line)<textarea id="wp-members" rows="3" placeholder="person@example.com sender&#10;automation:TOKEN_ID sender&#10;approver@example.com approver"></textarea></label>
-              <label>Recipients (one email and device public key per line)<textarea id="wp-recipients" rows="3"></textarea></label>
-              <label>Export storage<select id="wp-export"><option value="">No export</option></select></label>
-            </div>
-            <p class="muted">Recipients copy their device key from Votport. Enrollment is your confirmation that the key belongs to that recipient.</p>
-            <label><input id="wp-approval" type="checkbox" /> Require approval from a different operator</label>
-            <label><input id="wp-scan" type="checkbox" /> Require malware scanning before release</label>
-            <details><summary>Sequence and media checks</summary><div class="grid">
-              <label>Sequence filename prefix<input id="wp-sequence-prefix" /></label>
-              <label>Filename suffix<input id="wp-sequence-suffix" placeholder=".exr" /></label>
-              <label>First frame (blank disables check)<input id="wp-first" type="number" min="0" /></label>
-              <label>Last frame<input id="wp-last" type="number" min="0" /></label>
-              <label>Frame padding<input id="wp-padding" type="number" min="1" max="10" value="4" /></label>
-              <label>Video codec<input id="wp-codec" placeholder="prores" /></label>
-              <label>Video width<input id="wp-width" type="number" min="1" /></label>
-              <label>Video height<input id="wp-height" type="number" min="1" /></label>
-              <label>Frame rate<input id="wp-rate" placeholder="24000/1001" /></label>
-            </div></details>
-            <button type="submit">Save project rules</button>
-          </form>
-        </details>
-        <details id="workflow-storage-panel"><summary>S3 storage and managed encryption</summary>
-          <p>Credentials are configured on the server. KMS encryption applies to exported objects.</p>
-          <label>Edit storage<select id="workflow-edit-storage"><option value="">New storage</option></select></label>
-          <form id="workflow-save-storage"><div class="grid">
-            <label>Storage ID<input id="ws-id" required pattern="[a-z0-9_]+" maxlength="100" /></label>
-            <label>Name<input id="ws-label" required maxlength="200" /></label>
-            <label>HTTPS endpoint<input id="ws-endpoint" type="url" required /></label>
-            <label>Bucket<input id="ws-bucket" required /></label>
-            <label>Region<input id="ws-region" required value="us-east-1" /></label>
-            <label>Root prefix<input id="ws-prefix" /></label>
-            <label>KMS key ID (optional)<input id="ws-kms" /></label>
-            <label>Allowed tenant keys (one per line, * means default tenant)<textarea id="ws-tenants" rows="3">*</textarea></label>
-          </div>
-          <label><input id="ws-path" type="checkbox" checked /> Use path-style addressing</label>
-          <label><input id="ws-enabled" type="checkbox" checked /> Enabled</label>
-          <button type="submit">Save storage</button></form>
-        </details>
-        <details id="workflow-webhook-panel"><summary>Signed webhooks and replay</summary>
-          <form id="workflow-save-webhook">
-            <label>Webhook HTTPS URL<input id="wh-url" type="url" required /></label>
-            <label><input id="wh-enabled" type="checkbox" /> Enabled</label>
-            <button type="submit">Save webhook</button>
-          </form>
-          <p id="workflow-webhook-secret" role="status"></p>
-          <button id="workflow-webhook-refresh" type="button">Refresh attempts</button>
-          <div id="workflow-webhook-attempts"></div>
-        </details>
-      </details>
+      <div class="page-heading"><div><p class="eyebrow">File delivery</p><h1>Deliver files</h1><p class="page-lead">Choose files, set access, and share one download link.</p></div><a class="text-link" href="/workflows">Use a project workflow →</a></div>
 
       <section id="status-strip" class="status-strip" aria-label="Status" hidden>
         <div class="stat">
@@ -155,10 +62,11 @@
           <span class="muted">library root</span>
         </div>
       </section>
+      <div class="delivery-layout">
       <section class="card" aria-labelledby="deliver-title">
-        <h2 id="deliver-title">Create download link</h2>
+        <h2 id="deliver-title" class="section-title"><span class="step-number">1</span> Choose files</h2>
         <form id="deliver-upload-form">
-          <label>Project subdirectory <span class="muted">optional</span>
+          <label>Upload into folder <span class="muted">optional</span>
             <input id="deliver-project" placeholder="client/alex" autocomplete="off" list="deliver-project-options" />
             <datalist id="deliver-project-options"></datalist>
           </label>
@@ -181,6 +89,10 @@
         <p id="library-selection-status" class="muted" aria-live="polite">0 files selected · 0 B</p>
         <p id="library-selection-error" class="error" role="alert" hidden></p>
         <div id="library-files" class="library-list" aria-live="polite"></div>
+      </section>
+      <section class="card delivery-options" aria-labelledby="delivery-options-title">
+        <h2 id="delivery-options-title" class="section-title"><span class="step-number">2</span> Set access and share</h2>
+        <p class="muted">Only the files you select will be included.</p>
         <form id="deliver-form">
           <div class="grid">
             <label>Link label
@@ -196,12 +108,13 @@
               <input id="deliver-max-downloads" type="number" min="1" max="10000" placeholder="unlimited" />
             </label>
           </div>
-          <label><input id="deliver-notify-on-download" name="notify_on_download" type="checkbox" /> Notify on first download and delivery completion</label>
-          <button type="submit" id="deliver-submit">Issue download link</button>
+          <label class="check"><input id="deliver-notify-on-download" name="notify_on_download" type="checkbox" /> Notify on first download and delivery completion</label>
+          <button type="submit" id="deliver-submit">Create download link</button>
           <p id="deliver-error" class="error" role="alert" hidden></p>
         </form>
       </section>
 
+      </div>
       <div id="outbound-result" class="card ok" hidden aria-live="polite">
         <h2>Download link issued</h2>
         <label>One-time address
@@ -217,53 +130,6 @@
       <div id="outbound-grants"></div>
       <button id="outbound-grants-load-more" type="button" hidden>Load more</button>
 
-      <details>
-        <summary>Agent access and automation tokens</summary>
-        <section class="card" aria-labelledby="automation-token-create-title">
-          <h2 id="automation-token-create-title">Create automation token</h2>
-          <p class="muted">Choose what this agent may do in this tenant. Delivery access is limited to links created by this token.</p>
-          <form id="automation-token-form">
-            <div class="grid">
-              <label>Label
-                <input id="automation-token-label" required maxlength="100" placeholder="Nightly backup" />
-              </label>
-              <label>Expires after <span class="muted">days</span>
-                <input id="automation-token-expires" type="number" min="1" max="365" value="30" required />
-              </label>
-              <label>Restrict to folder <span class="muted">library path, optional</span>
-                <input id="automation-token-directory" class="mono" maxlength="512" placeholder="any folder" />
-              </label>
-            </div>
-            <fieldset id="automation-token-permissions">
-              <legend>Allowed actions</legend>
-              <label><input type="checkbox" value="library:read" checked /> Browse files in the folder</label>
-              <label><input type="checkbox" value="deliveries:create" checked /> Create delivery links</label>
-              <label><input type="checkbox" value="deliveries:read" checked /> Read delivery activity and receipts</label>
-              <label><input type="checkbox" value="deliveries:revoke" /> Revoke its delivery links</label>
-              <label><input type="checkbox" value="jobs:read" /> Read project jobs, events and recipient evidence</label>
-              <label><input type="checkbox" value="jobs:create" /> Create and retry project jobs</label>
-              <label><input type="checkbox" value="jobs:cancel" /> Cancel project jobs</label>
-            </fieldset>
-            <button type="submit" id="automation-token-submit">Issue token</button>
-            <p id="automation-token-error" class="error" role="alert" hidden></p>
-          </form>
-        </section>
-        <div id="automation-token-result" class="card ok" hidden aria-live="polite">
-          <h2>Automation token issued</h2>
-          <label>Token
-            <input id="automation-token-value" class="mono" type="text" readonly aria-describedby="automation-token-note" />
-          </label>
-          <button id="automation-token-copy" type="button">Copy token</button>
-          <p id="automation-token-note" class="muted">Copy it now. This raw token is shown once and cannot be retrieved later.</p>
-          <details>
-            <summary>Connect an MCP client</summary>
-            <p class="muted">Use the Votport client CLI as the command. This configuration contains your token; keep it private.</p>
-            <pre id="automation-mcp-config" class="mono"></pre>
-            <button id="automation-mcp-copy" type="button">Copy MCP configuration</button>
-          </details>
-        </div>
-        <div id="automation-tokens" aria-live="polite"></div>
-      </details>
       <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
     </div>
 

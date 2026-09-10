@@ -246,8 +246,12 @@ impl Store {
         &self,
         actor: &str,
         mut storage: crate::api::outbound::workflows::storage::Storage,
+        credentials: Option<crate::api::outbound::workflows::storage::Credentials>,
     ) -> Result<crate::api::outbound::workflows::storage::Storage, String> {
         storage.validate()?;
+        if let Some(credentials) = &credentials {
+            credentials.validate()?;
+        }
         let mut connection = self.connection.lock().expect("store poisoned");
         let tx = connection.transaction().map_err(|e| e.to_string())?;
         for tenant in &storage.tenants {
@@ -274,9 +278,50 @@ impl Store {
         }
         storage.revision += 1;
         tx.execute("INSERT INTO delivery_storage(id,revision,document) VALUES (?1,?2,?3) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,document=excluded.document",params![storage.id,storage.revision as i64,serde_json::to_string(&storage).expect("storage serializes")]).map_err(|e| e.to_string())?;
+        if let Some(credentials) = credentials {
+            use crate::api::outbound::workflows::storage::Credentials;
+            match credentials {
+                Credentials::Server => {
+                    tx.execute(
+                        "DELETE FROM delivery_storage_credentials WHERE id=?1",
+                        [&storage.id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                Credentials::AccessKey { .. } => {
+                    tx.execute("INSERT INTO delivery_storage_credentials(id,document) VALUES (?1,?2) ON CONFLICT(id) DO UPDATE SET document=excluded.document", params![storage.id, serde_json::to_string(&credentials).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
+                }
+            }
+        }
         evidence::delivery_event(&tx,&self.event_signer,"","","storage_changed",&serde_json::json!({"actor": actor,"storage_id": storage.id,"revision": storage.revision}),now_unix()).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(storage)
+    }
+
+    pub fn delivery_storage_has_credentials(&self, id: &str) -> Result<bool, String> {
+        self.with(|connection| {
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM delivery_storage_credentials WHERE id=?1)",
+                [id],
+                |row| row.get(0),
+            )
+        })
+    }
+
+    pub fn delivery_storage_credentials(
+        &self,
+        id: &str,
+        revision: u64,
+    ) -> Result<Option<crate::api::outbound::workflows::storage::Credentials>, String> {
+        let connection = self.connection.lock().expect("store poisoned");
+        let document: Option<Option<String>> = connection.query_row("SELECT c.document FROM delivery_storage s LEFT JOIN delivery_storage_credentials c ON c.id=s.id WHERE s.id=?1 AND s.revision=?2", params![id, revision as i64], |row| row.get(0)).optional().map_err(|e| e.to_string())?;
+        document
+            .ok_or("storage changed; reload before connecting")?
+            .map(|document| {
+                serde_json::from_str(&document)
+                    .map_err(|_| "invalid saved storage credentials".to_owned())
+            })
+            .transpose()
     }
 
     pub fn require_delivery_export(&self, id: &str, attempt: u64) -> Result<Job, String> {
@@ -873,6 +918,7 @@ mod tests {
                     tenants: vec![String::new()],
                     enabled: true,
                 },
+                None,
             )
             .unwrap();
         let project = store.save_delivery_project("", "admin", project()).unwrap();
