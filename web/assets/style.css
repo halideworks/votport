@@ -2152,6 +2152,8 @@ body:has(#nav) .permission-grid { display: grid; grid-template-columns: repeat(2
  .form-row > button { justify-self: start; }
  .page-heading { margin-top: 1.25rem; }
  .page-tabs { gap: 0 1.1rem; }
- body:has(#nav) .nav { margin: 0; padding: 0; flex-basis: 100%; }
+ body:has(#nav) .nav,
+ body:has(#nav) .settings-nav { margin: 0; padding: 0; }
+ body:has(#nav) .nav { flex-basis: 100%; }
  .page-heading > button { width: 100%; }
 }

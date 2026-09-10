@@ -179,6 +179,12 @@ try {
   assert.equal((await api('workflows/projects')).projects.find((item) => item.id === id).export_storage, storageId);
   await page.getByRole('link', { name: 'Automation', exact: true }).click();
   await page.locator('#automation-token-form').waitFor(); await layout('automation');
+  for (const name of ['receive', 'audit', 'tenants', 'system']) {
+    await page.goto(`${base}/${name}`);
+    await page.locator('#nav a[aria-current=page]').waitFor();
+    await page.waitForLoadState('networkidle');
+    await layout(name);
+  }
 
   const session = await api('admin/session');
   await page.route('**/api/admin/session', (route) => route.fulfill({ json: { ...session, role: 'operator', tenant: 'named-tenant' } }));
