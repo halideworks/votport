@@ -188,7 +188,7 @@ async function testNotifications() {
     error.hidden = false;
   } finally {
     button.disabled = false;
-    button.textContent = 'Send test';
+    button.textContent = 'Test all services';
   }
 }
 

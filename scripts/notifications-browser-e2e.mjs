@@ -76,6 +76,14 @@ try {
   assert.ok(!JSON.stringify(settings).includes(endpoint));
   for (const channel of ['slack', 'teams', 'google_chat', 'discord']) assert.equal(settings[`notify_${channel}_set`], true);
   failTeams = true;
+  await page.click('#notify-test');
+  await page.locator('#notify-test-error').waitFor();
+  assert.equal(await page.locator('#notify-test').textContent(), 'Test all services');
+  failTeams = false;
+  await page.click('#notify-test');
+  await page.getByText('Delivered 4 of 4 configured notification channels.', { exact: true }).waitFor();
+  assert.equal(await page.locator('#notify-test').textContent(), 'Test all services');
+  failTeams = true;
   await card('teams').getByRole('button', { name: 'Send test', exact: true }).click();
   await card('teams').getByRole('alert').waitFor();
   assert.ok(await card('teams').getByRole('button', { name: 'Send test', exact: true }).isEnabled());
