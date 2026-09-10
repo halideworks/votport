@@ -1,4 +1,4 @@
-//! Upload-completion notifications: webhook, ntfy, Pushover, SMTP.
+//! Transfer notifications: workplace chat, webhook, ntfy, Pushover, SMTP.
 //!
 //! Best-effort and fire-and-forget: a completed transfer is already recorded
 //! and on disk, so a notification failure is logged and nothing else.
@@ -154,8 +154,27 @@ pub async fn outbound_downloaded(
 
 /// Sends a safe test message using the currently resolved (saved plus
 /// environment) notification settings and reports channel outcomes.
-pub async fn test_saved(app: Arc<App>) -> Result<NotificationReport, String> {
-    let settings = app.store.resolved_settings(&app.config)?;
+pub async fn test_saved(
+    app: Arc<App>,
+    channel: Option<&str>,
+) -> Result<NotificationReport, String> {
+    let mut settings = app.store.resolved_settings(&app.config)?;
+    if let Some(channel) = channel {
+        settings.notify_webhook = None;
+        settings.notify_ntfy = None;
+        settings.notify_pushover = None;
+        settings.smtp = None;
+        for (name, url) in [
+            ("slack", &mut settings.notify_slack),
+            ("teams", &mut settings.notify_teams),
+            ("google_chat", &mut settings.notify_google_chat),
+            ("discord", &mut settings.notify_discord),
+        ] {
+            if name != channel {
+                *url = None;
+            }
+        }
+    }
     Ok(send_resolved(
         &app,
         &settings,
@@ -244,55 +263,84 @@ async fn send_resolved(
     event: &str,
     transfer_id: Option<&str>,
 ) -> NotificationReport {
-    let mut report = NotificationReport::default();
+    let mut requests = Vec::new();
     if let Some(url) = &settings.notify_webhook {
-        report.configured += 1;
-        if log_failure(
-            "webhook",
-            event,
-            transfer_id,
-            app.http.post(url).json(&payload).send().await,
-        ) {
-            report.delivered += 1;
+        requests.push(("webhook", app.http.post(url).json(&payload)));
+    }
+    for (channel, url) in [
+        ("slack", &settings.notify_slack),
+        ("teams", &settings.notify_teams),
+        ("google_chat", &settings.notify_google_chat),
+        ("discord", &settings.notify_discord),
+    ] {
+        if let Some(url) = url {
+            let mut url = url.clone();
+            if channel == "discord" {
+                if let Ok(mut parsed) = reqwest::Url::parse(&url) {
+                    let pairs = parsed
+                        .query_pairs()
+                        .filter(|(key, _)| key != "wait")
+                        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                        .collect::<Vec<_>>();
+                    parsed
+                        .query_pairs_mut()
+                        .clear()
+                        .extend_pairs(pairs)
+                        .append_pair("wait", "true");
+                    url = parsed.into();
+                }
+            }
+            let request = app
+                .http
+                .post(url)
+                .json(&chat_payload(channel, &title, &body));
+            requests.push((channel, request));
         }
     }
     if let Some(url) = &settings.notify_ntfy {
-        report.configured += 1;
         let mut request = app
             .http
             .post(url)
-            .header("Title", title.clone())
+            .header("Title", &title)
             .body(body.clone());
         if let Some(token) = &settings.notify_ntfy_token {
             request = request.bearer_auth(token);
         }
-        if log_failure("ntfy", event, transfer_id, request.send().await) {
-            report.delivered += 1;
-        }
+        requests.push(("ntfy", request));
     }
-
     if let Some((token, user)) = &settings.notify_pushover {
-        report.configured += 1;
-        let request = app
-            .http
-            .post("https://api.pushover.net/1/messages.json")
-            .form(&[
-                ("token", token.as_str()),
-                ("user", user.as_str()),
-                ("title", title.as_str()),
-                ("message", body.as_str()),
-            ]);
-        if log_failure("pushover", event, transfer_id, request.send().await) {
-            report.delivered += 1;
-        }
+        requests.push((
+            "pushover",
+            app.http
+                .post("https://api.pushover.net/1/messages.json")
+                .form(&[
+                    ("token", token.as_str()),
+                    ("user", user.as_str()),
+                    ("title", title.as_str()),
+                    ("message", body.as_str()),
+                ]),
+        ));
     }
-
-    if let Some(smtp) = &settings.smtp {
-        report.configured += 1;
-        if log_smtp_failure(event, transfer_id, send_smtp(smtp, &title, &body).await) {
-            report.delivered += 1;
+    let http =
+        futures_util::future::join_all(requests.into_iter().map(|(channel, request)| async move {
+            log_failure(channel, event, transfer_id, request.send().await).await
+        }));
+    let smtp = async {
+        match &settings.smtp {
+            Some(smtp) => Some(log_smtp_failure(
+                event,
+                transfer_id,
+                send_smtp(smtp, &title, &body).await,
+            )),
+            None => None,
         }
-    }
+    };
+    let (http, smtp) = tokio::join!(http, smtp);
+    let report = NotificationReport {
+        configured: http.len() as u32 + u32::from(smtp.is_some()),
+        delivered: http.iter().filter(|delivered| **delivered).count() as u32
+            + u32::from(smtp == Some(true)),
+    };
     if report.delivered < report.configured {
         let outcome = if report.delivered == 0 {
             "failed"
@@ -311,7 +359,43 @@ async fn send_resolved(
     report
 }
 
-fn log_failure(
+fn chat_payload(channel: &str, title: &str, body: &str) -> serde_json::Value {
+    fn clipped(text: &str, limit: usize) -> String {
+        if text.len() <= limit {
+            text.to_owned()
+        } else {
+            format!("{}…", &text[..text.floor_char_boundary(limit - 3)])
+        }
+    }
+    let title = clipped(title, 150);
+    let body = clipped(body, 1500);
+    let text = format!("{title}\n{body}");
+    match channel {
+        "slack" => json!({
+            "text": text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"),
+            "mrkdwn": false, "unfurl_links": false, "unfurl_media": false,
+            "blocks": [
+                {"type":"header", "text":{"type":"plain_text", "text":title}},
+                {"type":"section", "text":{"type":"plain_text", "text":body}}
+            ]
+        }),
+        "teams" => json!({
+            "type":"message", "text":text,
+            "attachments":[{"contentType":"application/vnd.microsoft.card.adaptive", "content":{
+                "$schema":"http://adaptivecards.io/schemas/adaptive-card.json", "type":"AdaptiveCard", "version":"1.2",
+                "body":[
+                    {"type":"TextBlock", "text":title, "weight":"Bolder", "wrap":true},
+                    {"type":"TextBlock", "text":body, "wrap":true}
+                ]
+            }}]
+        }),
+        "google_chat" => json!({"text": text.replace('<', "‹").replace('>', "›")}),
+        "discord" => json!({"content":text, "allowed_mentions":{"parse":[]}, "flags":4}),
+        _ => unreachable!("known chat channel"),
+    }
+}
+
+async fn log_failure(
     channel: &str,
     event: &str,
     transfer_id: Option<&str>,
@@ -339,6 +423,30 @@ fn log_failure(
                 "notification failed: {error}"
             );
             false
+        }
+        Ok(mut response) if channel == "teams" => {
+            let mut body = Vec::new();
+            let accepted = loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) if body.len() + chunk.len() <= 8192 => {
+                        body.extend_from_slice(&chunk)
+                    }
+                    Ok(None) => {
+                        break !String::from_utf8_lossy(&body)
+                            .contains("Microsoft Teams endpoint returned HTTP error")
+                    }
+                    _ => break false,
+                }
+            };
+            if !accepted {
+                tracing::warn!(
+                    channel,
+                    event,
+                    outcome = "failed",
+                    "notification response rejected or unreadable"
+                );
+            }
+            accepted
         }
         Ok(_) => true,
     }
@@ -557,6 +665,227 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chat_messages_bound_unicode_and_disable_mentions() {
+        let title = "<!channel> & <@U123>";
+        let body = format!("<users/all> @everyone {}", "🎬".repeat(2000));
+        let slack = chat_payload("slack", title, &body);
+        assert_eq!(slack["blocks"][0]["text"]["type"], "plain_text");
+        assert_eq!(slack["blocks"][1]["text"]["type"], "plain_text");
+        assert!(!slack["text"].as_str().unwrap().contains("<!channel>"));
+        assert_eq!(slack["mrkdwn"], false);
+        assert_eq!(slack["unfurl_links"], false);
+        let teams = chat_payload("teams", title, &body);
+        let card = &teams["attachments"][0];
+        assert_eq!(teams["type"], "message");
+        assert_eq!(
+            card["contentType"],
+            "application/vnd.microsoft.card.adaptive"
+        );
+        assert_eq!(card["content"]["type"], "AdaptiveCard");
+        assert_eq!(card["content"]["body"][1]["wrap"], true);
+        let google = chat_payload("google_chat", title, &body);
+        assert!(!google["text"].as_str().unwrap().contains("<users/all>"));
+        let discord = chat_payload("discord", title, &body);
+        assert_eq!(discord["allowed_mentions"]["parse"], json!([]));
+        assert_eq!(discord["flags"], 4);
+        let text = discord["content"].as_str().unwrap();
+        assert!(text.len() <= 1651 && text.ends_with('…'));
+        assert_eq!(
+            chat_payload("discord", "short", "body")["content"],
+            "short\nbody"
+        );
+        let long_title = chat_payload("slack", &"🎬".repeat(100), "body");
+        assert!(
+            long_title["blocks"][0]["text"]["text"]
+                .as_str()
+                .unwrap()
+                .len()
+                <= 150
+        );
+    }
+
+    #[tokio::test]
+    async fn workplace_channels_send_concurrently_and_tests_select_only_one() {
+        use axum::{
+            extract::Path,
+            http::{StatusCode, Uri},
+            routing::post,
+            Json, Router,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let gate = release.clone();
+        let routes = Router::new().route(
+            "/{channel}",
+            post(
+                move |Path(channel): Path<String>,
+                      uri: Uri,
+                      Json(body): Json<serde_json::Value>| {
+                    let tx = tx.clone();
+                    let gate = gate.clone();
+                    async move {
+                        tx.send((channel.clone(), uri, body)).await.unwrap();
+                        tokio::time::timeout(Duration::from_secs(5), gate.acquire())
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .forget();
+                        if channel == "teams" {
+                            StatusCode::TOO_MANY_REQUESTS
+                        } else {
+                            StatusCode::OK
+                        }
+                    }
+                },
+            ),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, routes).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let channels = ["slack", "teams", "google_chat", "discord"];
+        application
+            .store
+            .put_settings(
+                "local",
+                &channels.map(|channel| {
+                    (
+                        format!("notify_{channel}"),
+                        SettingWrite::Set(format!(
+                            "http://{address}/{channel}{}",
+                            if channel == "discord" {
+                                "?wait=false&thread_id=42"
+                            } else {
+                                ""
+                            }
+                        )),
+                    )
+                }),
+            )
+            .unwrap();
+        let all = tokio::spawn(test_saved(application.clone(), None));
+        let mut received = Vec::new();
+        for _ in channels {
+            let (channel, uri, payload) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(payload.to_string().contains("notification test"));
+            if channel == "discord" {
+                assert_eq!(uri.query(), Some("thread_id=42&wait=true"));
+            }
+            received.push(channel);
+        }
+        received.sort();
+        assert_eq!(received, ["discord", "google_chat", "slack", "teams"]);
+        release.add_permits(4);
+        assert_eq!(
+            all.await.unwrap().unwrap(),
+            NotificationReport {
+                configured: 4,
+                delivered: 3
+            }
+        );
+        for channel in channels {
+            let one = tokio::spawn(test_saved(application.clone(), Some(channel)));
+            let (actual, _, _) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual, channel);
+            release.add_permits(1);
+            assert_eq!(
+                one.await.unwrap().unwrap(),
+                NotificationReport {
+                    configured: 1,
+                    delivered: u32::from(channel != "teams")
+                }
+            );
+            assert!(rx.try_recv().is_err());
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn notification_redirects_and_teams_error_bodies_are_failures() {
+        use axum::{
+            extract::Path,
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::any,
+            Router,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let routes = Router::new().route(
+            "/{case}",
+            any(move |Path(case): Path<String>, headers: HeaderMap| {
+                let observed = observed.clone();
+                async move {
+                    assert!(!headers.contains_key("referer"));
+                    match case.as_str() {
+                        "redirect" => (StatusCode::TEMPORARY_REDIRECT, [("location", "/leak")])
+                            .into_response(),
+                        "leak" => {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            "ok".into_response()
+                        }
+                        "throttled" => {
+                            "Microsoft Teams endpoint returned HTTP error 429".into_response()
+                        }
+                        "too-large" => "x".repeat(8193).into_response(),
+                        "boundary" => "x".repeat(8192).into_response(),
+                        "empty" => StatusCode::ACCEPTED.into_response(),
+                        _ => "1".into_response(),
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, routes).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        for (case, delivered) in [
+            ("redirect", 0),
+            ("throttled", 0),
+            ("too-large", 0),
+            ("boundary", 1),
+            ("empty", 1),
+            ("success", 1),
+        ] {
+            application
+                .store
+                .put_settings(
+                    "local",
+                    &[(
+                        "notify_teams".to_owned(),
+                        SettingWrite::Set(format!("http://{address}/{case}?secret=fixture")),
+                    )],
+                )
+                .unwrap();
+            assert_eq!(
+                test_saved(application.clone(), Some("teams"))
+                    .await
+                    .unwrap(),
+                NotificationReport {
+                    configured: 1,
+                    delivered
+                },
+                "{case}"
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn upload_ended_sends_failure_webhook_without_secrets() {
         let (application, _directory, rx, thread) = webhook_app();
@@ -660,7 +989,7 @@ mod tests {
     #[tokio::test]
     async fn saved_notification_test_reports_delivery_without_secrets() {
         let (application, _directory, rx, thread) = webhook_app();
-        let report = test_saved(application).await.unwrap();
+        let report = test_saved(application, None).await.unwrap();
         assert_eq!(report.configured, 1);
         assert_eq!(report.delivered, 1);
         let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();

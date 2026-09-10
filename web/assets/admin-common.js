@@ -30,7 +30,8 @@ export async function api(path, options = {}) {
 export async function requireSession() {
   let session;
   try {
-    session = await api('/api/admin/session');
+    const embedded = document.getElementById('admin-session');
+    session = embedded ? JSON.parse(embedded.textContent) : await api('/api/admin/session');
   } catch {
     window.location.replace('/');
     return new Promise(() => {}); // never resolves; page is leaving

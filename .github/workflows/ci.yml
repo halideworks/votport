@@ -246,6 +246,7 @@ jobs:
           trap cleanup EXIT
 
           docker run -d --name votport-browser-e2e \
+            --add-host=host.docker.internal:host-gateway \
             -p 127.0.0.1:8080:8080 \
             --user "$(id -u):$(id -g)" \
             -e VOTPORT_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
@@ -277,3 +278,5 @@ jobs:
             WORKFLOW_TEST_ROOT="$e2e_root" node scripts/delivery-browser-e2e.mjs
           BASE_URL=http://127.0.0.1:8080 ADMIN_PASSWORD="$ADMIN_PASSWORD" \
             WORKFLOW_TEST_ROOT="$e2e_root" node scripts/workspace-browser-e2e.mjs
+          BASE_URL=http://127.0.0.1:8080 ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+            WORKFLOW_TEST_ROOT="$e2e_root" NOTIFY_TEST_HOST=host.docker.internal NOTIFY_TEST_BIND=0.0.0.0 node scripts/notifications-browser-e2e.mjs

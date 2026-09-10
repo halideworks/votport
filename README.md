@@ -144,6 +144,10 @@ the row so env applies again. Details: [`docs/deployment.md`](docs/deployment.md
 | `VOTPORT_ALLOW_HIDDEN` | off | Set `1` to accept dot-file names from uploaders. |
 | `VOTPORT_SESSION_IDLE_SECS` | `1800` | Idle time before an unfinished upload session is discarded. |
 | `VOTPORT_WEB_ROOT` | `./web` | Static assets directory (`/app/web` in Docker). |
+| `VOTPORT_NOTIFY_SLACK_URL` | — | Slack incoming webhook. Configure and test in System > Notifications. |
+| `VOTPORT_NOTIFY_TEAMS_URL` | — | Microsoft Teams Workflows webhook. |
+| `VOTPORT_NOTIFY_GOOGLE_CHAT_URL` | — | Google Chat space webhook. |
+| `VOTPORT_NOTIFY_DISCORD_URL` | — | Discord channel webhook. |
 | `VOTPORT_NOTIFY_WEBHOOK_URL` | — | POSTed a JSON summary (`event`, `label`, `upload_id`, `total_bytes`, `files`) when an upload completes. |
 | `VOTPORT_NOTIFY_NTFY_URL` | — | Full ntfy topic URL (e.g. `https://ntfy.sh/mytopic`) sent a message per completed upload. |
 | `VOTPORT_NOTIFY_NTFY_TOKEN` | — | Bearer token for the ntfy topic, if it needs one. |

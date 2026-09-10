@@ -10,6 +10,8 @@
     <title>VOTPort &middot; System</title>
     <link rel="icon" type="image/png" href="/assets/favicon.png" />
     <link rel="stylesheet" href="/assets/style.css" />
+    <link rel="stylesheet" href="/assets/admin-navigation.css" />
+    <link rel="preload" href="/assets/fonts/PlusJakartaSans-300.woff2?v=153fc85b70298bee" as="font" type="font/woff2" crossorigin />
     <script src="/assets/theme.js"></script>
     <!-- The whole module graph fetches at once instead of one import level per round trip. -->
     <link rel="modulepreload" href="/assets/page-system.js" />
@@ -219,8 +221,45 @@
 
           <section class="settings-group" id="notifications" data-group="notifications">
             <h2>Notifications</h2>
+            <p class="page-lead">Keep your team informed about received files, failed uploads, and delivery progress. Enable notifications on the file request or download link you want to follow.</p>
+            <p class="field-help">Connections apply across this server's tenants. Webhook URLs stay private after saving. Each test uses only that connection's saved settings.</p>
+            <div class="connection-grid chat-connections">
+              <form id="chat-slack-form" class="card" data-chat-channel="slack" data-chat-name="Slack">
+                <div class="section-heading"><h3>Slack</h3><span id="chat-slack-status" class="badge">Not connected</span></div>
+                <p class="field-help">Create an incoming webhook in your Slack app, choose a channel, and paste its webhook URL. <a href="https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/" target="_blank" rel="noopener noreferrer">Setup guide</a></p>
+                <label>Webhook URL<input id="chat-slack-url" type="password" autocomplete="new-password" spellcheck="false" maxlength="8192" placeholder="Paste webhook URL" /></label>
+                <p id="chat-slack-source" class="field-help"></p>
+                <div class="actions"><button type="submit" data-chat-action="save" disabled>Save connection</button><button type="button" data-chat-action="test" class="ghost" disabled>Send test</button><button type="button" data-chat-action="disconnect" class="ghost" hidden>Disconnect</button><button type="button" data-chat-action="reset" class="link" hidden>Use environment</button></div>
+                <p id="chat-slack-note" role="status" class="field-help"></p><p id="chat-slack-error" class="error" role="alert" hidden></p>
+              </form>
+              <form id="chat-teams-form" class="card" data-chat-channel="teams" data-chat-name="Microsoft Teams">
+                <div class="section-heading"><h3>Microsoft Teams</h3><span id="chat-teams-status" class="badge">Not connected</span></div>
+                <p class="field-help">In your channel, open Workflows and create a webhook workflow. Choose Anyone for who can trigger it, then copy its webhook URL. Keep a co-owner on the workflow. <a href="https://learn.microsoft.com/en-us/microsoftteams/platform/webhooks-and-connectors/how-to/add-incoming-webhook" target="_blank" rel="noopener noreferrer">Setup guide</a></p>
+                <label>Webhook URL<input id="chat-teams-url" type="password" autocomplete="new-password" spellcheck="false" maxlength="8192" placeholder="Paste webhook URL" /></label>
+                <p id="chat-teams-source" class="field-help"></p>
+                <div class="actions"><button type="submit" data-chat-action="save" disabled>Save connection</button><button type="button" data-chat-action="test" class="ghost" disabled>Send test</button><button type="button" data-chat-action="disconnect" class="ghost" hidden>Disconnect</button><button type="button" data-chat-action="reset" class="link" hidden>Use environment</button></div>
+                <p id="chat-teams-note" role="status" class="field-help"></p><p id="chat-teams-error" class="error" role="alert" hidden></p>
+              </form>
+              <form id="chat-google-chat-form" class="card" data-chat-channel="google_chat" data-chat-name="Google Chat">
+                <div class="section-heading"><h3>Google Chat</h3><span id="chat-google-chat-status" class="badge">Not connected</span></div>
+                <p class="field-help">In your Chat space, open Apps & integrations, add a webhook, and copy its URL. Your Workspace administrator must allow incoming webhooks. <a href="https://developers.google.com/workspace/chat/quickstart/webhooks" target="_blank" rel="noopener noreferrer">Setup guide</a></p>
+                <label>Webhook URL<input id="chat-google-chat-url" type="password" autocomplete="new-password" spellcheck="false" maxlength="8192" placeholder="Paste webhook URL" /></label>
+                <p id="chat-google-chat-source" class="field-help"></p>
+                <div class="actions"><button type="submit" data-chat-action="save" disabled>Save connection</button><button type="button" data-chat-action="test" class="ghost" disabled>Send test</button><button type="button" data-chat-action="disconnect" class="ghost" hidden>Disconnect</button><button type="button" data-chat-action="reset" class="link" hidden>Use environment</button></div>
+                <p id="chat-google-chat-note" role="status" class="field-help"></p><p id="chat-google-chat-error" class="error" role="alert" hidden></p>
+              </form>
+              <form id="chat-discord-form" class="card" data-chat-channel="discord" data-chat-name="Discord">
+                <div class="section-heading"><h3>Discord</h3><span id="chat-discord-status" class="badge">Not connected</span></div>
+                <p class="field-help">In your channel settings, open Integrations, create a webhook, and copy its URL. <a href="https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks" target="_blank" rel="noopener noreferrer">Setup guide</a></p>
+                <label>Webhook URL<input id="chat-discord-url" type="password" autocomplete="new-password" spellcheck="false" maxlength="8192" placeholder="Paste webhook URL" /></label>
+                <p id="chat-discord-source" class="field-help"></p>
+                <div class="actions"><button type="submit" data-chat-action="save" disabled>Save connection</button><button type="button" data-chat-action="test" class="ghost" disabled>Send test</button><button type="button" data-chat-action="disconnect" class="ghost" hidden>Disconnect</button><button type="button" data-chat-action="reset" class="link" hidden>Use environment</button></div>
+                <p id="chat-discord-note" role="status" class="field-help"></p><p id="chat-discord-error" class="error" role="alert" hidden></p>
+              </form>
+            </div>
+            <h3>Other notification services</h3>
             <form id="notify-form" class="card">
-              <p class="muted">Sent when an upload finishes. Blank secrets stay unchanged.</p>
+              <p class="muted">Use a generic JSON webhook for custom integrations, or connect ntfy and Pushover. Blank secrets stay unchanged.</p>
               <div class="grid">
                 <div class="field">
                   <label
@@ -292,7 +331,7 @@
               <div class="actions">
                 <button type="submit" id="notify-save" disabled>Save</button>
                 <button type="button" id="notify-test" class="ghost" disabled>
-                  Send test
+                  Test all services
                 </button>
                 <span id="notify-note" class="muted"></span>
                 <span id="notify-test-note" class="muted"></span>
@@ -732,6 +771,7 @@
                 identity files only. Received and outbound files remain separate
                 operator backups.
               </p>
+              <label class="check"><input type="checkbox" id="backup-enabled" /><span>Enable automatic backups</span></label>
               <div class="grid">
                 <label
                   >Destination
@@ -740,10 +780,6 @@
                     <option value="s3">S3-compatible bucket</option>
                     <option value="both">Both</option>
                   </select>
-                </label>
-                <label class="check"
-                  ><input type="checkbox" id="backup-enabled" />
-                  Enable automatic backups
                 </label>
                 <label
                   >Every <span class="muted">minutes</span>

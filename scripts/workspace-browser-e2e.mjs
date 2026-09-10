@@ -191,7 +191,11 @@ try {
   await page.unroute('**/api/admin/audit?*');
 
   const session = await api('admin/session');
-  await page.route('**/api/admin/session', (route) => route.fulfill({ json: { ...session, role: 'operator', tenant: 'named-tenant' } }));
+  await page.route(/\/(workflows|storage)$/, async (route) => {
+    const response = await route.fetch();
+    const body = (await response.text()).replace(/(<script id="admin-session" type="application\/json">)[\s\S]*?(<\/script>)/, (_, start, end) => start + JSON.stringify({ ...session, role: 'operator', tenant: 'named-tenant' }) + end);
+    await route.fulfill({ response, body });
+  });
   await page.goto(`${base}/workflows#projects`); await page.locator('#workflow-project-list article').first().waitFor();
   assert.ok(await page.locator('#workflow-new-project').isHidden());
   assert.equal(await page.getByRole('button', { name: 'Edit project', exact: true }).count(), 0);

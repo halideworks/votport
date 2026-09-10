@@ -548,6 +548,16 @@ pub async fn admin_session(
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_admin(&app, &headers)?;
+    Ok(Json(admin_session_view(&identity)))
+}
+
+pub(crate) fn admin_page_session(app: &App, headers: &HeaderMap) -> Option<serde_json::Value> {
+    require_admin(app, headers)
+        .ok()
+        .map(|identity| admin_session_view(&identity))
+}
+
+fn admin_session_view(identity: &auth::AdminIdentity) -> serde_json::Value {
     // Which dashboard pages this principal may open. Named tenants get their
     // own links plus a tenant-filtered audit view; platform administration
     // (tenants, system) is default-tenant admin only.
@@ -567,13 +577,13 @@ pub async fn admin_session(
         pages.push("tenants");
         pages.push("system");
     }
-    Ok(Json(json!({
+    json!({
         "ok": true,
         "tenant": identity.tenant,
         "grants": identity.grants,
         "role": identity.role,
         "pages": pages,
-    })))
+    })
 }
 
 #[derive(Deserialize)]
@@ -1771,6 +1781,10 @@ pub async fn restore_backup(
 
 const SETTINGS_KEYS: &[&str] = &[
     "notify_webhook",
+    "notify_slack",
+    "notify_teams",
+    "notify_google_chat",
+    "notify_discord",
     "notify_ntfy",
     "notify_ntfy_token",
     "notify_pushover_token",
@@ -1804,13 +1818,29 @@ pub async fn get_settings(
     Ok(Json(settings_json(&app)?))
 }
 
+#[derive(Deserialize, Default)]
+pub struct NotificationTestQuery {
+    channel: Option<String>,
+}
+
 pub async fn test_notifications(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<NotificationTestQuery>,
 ) -> ApiResult<Response> {
     let identity = require_platform_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    let report = crate::notify::test_saved(Arc::clone(&app))
+    if query
+        .channel
+        .as_deref()
+        .is_some_and(|channel| !["slack", "teams", "google_chat", "discord"].contains(&channel))
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unknown notification channel",
+        ));
+    }
+    let report = crate::notify::test_saved(Arc::clone(&app), query.channel.as_deref())
         .await
         .map_err(ApiError::internal)?;
     app.store.audit(
@@ -1818,7 +1848,7 @@ pub async fn test_notifications(
         &identity.subject,
         "notification_test",
         "",
-        &json!({ "configured": report.configured, "delivered": report.delivered }),
+        &json!({ "channel": query.channel, "configured": report.configured, "delivered": report.delivered }),
     );
     if report.configured == 0 {
         return Err(ApiError::new(
@@ -1905,6 +1935,14 @@ fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
     Ok(json!({
         "notify_webhook": resolved.notify_webhook,
         "notify_webhook_source": overlay.notify_webhook_source,
+        "notify_slack_set": resolved.notify_slack.is_some(),
+        "notify_slack_source": overlay.notify_slack_source,
+        "notify_teams_set": resolved.notify_teams.is_some(),
+        "notify_teams_source": overlay.notify_teams_source,
+        "notify_google_chat_set": resolved.notify_google_chat.is_some(),
+        "notify_google_chat_source": overlay.notify_google_chat_source,
+        "notify_discord_set": resolved.notify_discord.is_some(),
+        "notify_discord_source": overlay.notify_discord_source,
         "notify_ntfy": resolved.notify_ntfy,
         "notify_ntfy_source": overlay.notify_ntfy_source,
         "notify_ntfy_token_set": resolved.notify_ntfy_token.is_some(),
@@ -1963,13 +2001,17 @@ fn write_url(key: &str, value: &serde_json::Value) -> ApiResult<crate::store::Se
             Ok(crate::store::SettingWrite::Set(String::new()))
         }
         serde_json::Value::String(text)
-            if text.starts_with("http://") || text.starts_with("https://") =>
+            if text.len() <= 8192 && !text.chars().any(char::is_control)
+                && reqwest::Url::parse(text).is_ok_and(|url| {
+                    matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+                        && url.username().is_empty() && url.password().is_none() && url.fragment().is_none()
+                }) =>
         {
             Ok(crate::store::SettingWrite::Set(text.clone()))
         }
         serde_json::Value::String(_) => Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            format!("{key} must be an http:// or https:// URL"),
+            format!("{key} must be an http:// or https:// URL of at most 8192 bytes, without credentials, fragments or control characters"),
         )),
         _ => Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2081,7 +2123,8 @@ pub async fn put_settings(
             continue;
         };
         let write = match *key {
-            "notify_webhook" | "notify_ntfy" => write_url(key, value)?,
+            "notify_webhook" | "notify_ntfy" | "notify_slack" | "notify_teams"
+            | "notify_google_chat" | "notify_discord" => write_url(key, value)?,
             "notify_ntfy_token"
             | "notify_pushover_token"
             | "notify_pushover_user"
@@ -3786,6 +3829,7 @@ mod tenant_authz_tests {
             "admin_logout",
             "admin_audit_export",
             "admin_session",
+            "admin_page_session",
             "switch_tenant",
         ];
         for file in [
@@ -5279,6 +5323,10 @@ mod ops_tests {
             admin_password_hash: crate::auth::hash_password(testing::TEST_PASSWORD).unwrap(),
             admin_token_tag: "tag".to_owned(),
             notify_webhook: None,
+            notify_slack: None,
+            notify_teams: None,
+            notify_google_chat: None,
+            notify_discord: None,
             notify_ntfy: None,
             notify_ntfy_token: None,
             notify_pushover: None,
@@ -5740,6 +5788,227 @@ mod settings_api_tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn admin_html_bootstraps_only_the_authenticated_navigation() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        for (tenant, role) in [
+            ("", "admin"),
+            ("team", "operator"),
+            ("team", "auditor"),
+            ("</script><script>oops</script>", "viewer"),
+        ] {
+            let cookie = cookie_for(&application, tenant, role);
+            let (_, expected) = send(
+                application.clone(),
+                Request::get("/api/admin/session")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(expected["tenant"], tenant);
+            let response = app::router(application.clone())
+                .oneshot(
+                    Request::get("/audit")
+                        .header(header::COOKIE, &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "private, no-store"
+            );
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let html = std::str::from_utf8(&bytes).unwrap();
+            let bootstrap = html
+                .split("<script id=\"admin-session\" type=\"application/json\">")
+                .nth(1)
+                .unwrap()
+                .split("</script>")
+                .next()
+                .unwrap();
+            assert!(!bootstrap.contains('<'));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(bootstrap).unwrap(),
+                expected
+            );
+            let nav = html
+                .split("<nav id=\"nav\" class=\"nav\">")
+                .nth(1)
+                .unwrap()
+                .split("</nav>")
+                .next()
+                .unwrap();
+            for page in [
+                "receive",
+                "deliver",
+                "workflows",
+                "storage",
+                "automation",
+                "tenants",
+                "audit",
+                "system",
+            ] {
+                assert_eq!(
+                    nav.contains(&format!("href=\"/{page}\"")),
+                    expected["pages"].as_array().unwrap().contains(&json!(page))
+                );
+            }
+            assert_eq!(nav.matches("aria-current=\"page\"").count(), 1);
+            assert!(nav.contains("href=\"/audit\" class=\"active\" aria-current=\"page\""));
+        }
+        for route in ["/audit", "/r/public-link", "/"] {
+            let response = app::router(application.clone())
+                .oneshot(Request::get(route).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                if route == "/audit" {
+                    "private, no-store"
+                } else {
+                    "no-cache"
+                }
+            );
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(!std::str::from_utf8(&bytes)
+                .unwrap()
+                .contains("id=\"admin-session\""));
+        }
+    }
+
+    #[tokio::test]
+    async fn workplace_settings_are_private_validated_and_resettable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = testing::config(directory.path());
+        for url in [
+            &mut config.notify_slack,
+            &mut config.notify_teams,
+            &mut config.notify_google_chat,
+            &mut config.notify_discord,
+        ] {
+            *url = Some("https://env.example/private-hook".to_owned());
+        }
+        let application = app::build(config).unwrap();
+        let cookie = cookie_for(&application, "", "admin");
+        let put = |body: serde_json::Value| {
+            Request::put("/api/admin/settings")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        for key in [
+            "notify_slack",
+            "notify_teams",
+            "notify_google_chat",
+            "notify_discord",
+        ] {
+            for bad in [
+                json!("https://"),
+                json!("ftp://host/file"),
+                json!("https://user:password@host/path"),
+                json!("https://host/#secret"),
+                json!("https://host/path\nsecret"),
+                json!(format!("https://host/{}", "x".repeat(8192))),
+                json!(true),
+            ] {
+                assert_eq!(
+                    send(application.clone(), put(json!({key: bad}))).await.0,
+                    StatusCode::UNPROCESSABLE_ENTITY
+                );
+            }
+            for (value, configured, source) in [
+                (
+                    json!("https://saved.example/path?token=private-hook"),
+                    true,
+                    "db",
+                ),
+                (json!(""), false, "db"),
+                (serde_json::Value::Null, true, "env"),
+            ] {
+                let (status, result) = send(application.clone(), put(json!({key: value}))).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(result[format!("{key}_set")], configured);
+                assert_eq!(result[format!("{key}_source")], source);
+                assert!(result.get(key).is_none());
+                assert!(!result.to_string().contains("private-hook"));
+            }
+        }
+        for (cookie, csrf, expected) in [
+            (String::new(), true, StatusCode::UNAUTHORIZED),
+            (
+                cookie_for(&application, "", "viewer"),
+                true,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                cookie_for(&application, "named", "admin"),
+                true,
+                StatusCode::FORBIDDEN,
+            ),
+            (cookie.clone(), false, StatusCode::FORBIDDEN),
+        ] {
+            for route in [
+                "/api/admin/settings",
+                "/api/admin/notifications/test?channel=slack",
+            ] {
+                let mut request = if route.ends_with("settings") {
+                    Request::put(route)
+                } else {
+                    Request::post(route)
+                };
+                request = request
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json");
+                if csrf {
+                    request = request.header("x-votport", "1");
+                }
+                let (status, _) = send(
+                    application.clone(),
+                    request
+                        .body(Body::from(
+                            r#"{"notify_slack":"https://saved.example/private-hook"}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await;
+                assert_eq!(status, expected);
+            }
+        }
+        let (status, _) = send(
+            application.clone(),
+            Request::post("/api/admin/notifications/test?channel=unknown")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            send(application.clone(), put(json!({"notify_slack":""})))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let (status, _) = send(
+            application,
+            Request::post("/api/admin/notifications/test?channel=slack")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
