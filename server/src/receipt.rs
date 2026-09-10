@@ -7,7 +7,7 @@
 //! public key itself, so a receipt is verifiable against the key the admin
 //! page displays with nothing else.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,8 +22,6 @@ use vot_sdk_file::PublishObservation;
 
 /// votport's provider version in issued receipts.
 const PROVIDER_VERSION: [u16; 3] = [0, 1, 0];
-/// POSIX_LOCAL in spec/registries.yaml.
-const PROVIDER: u16 = 1;
 
 pub struct ReceiptSigner {
     key: SigningKey,
@@ -134,19 +132,25 @@ impl ReceiptSigner {
     /// Writes `<destination>.vot-receipt` attesting the published object.
     pub fn write_sidecar(
         &self,
-        destination: &Path,
+        destination: &vot_platform_fs::FileLocation,
         object: &ObjectId,
         session_id: [u8; 16],
         observation: PublishObservation,
         profile: vot_sdk_file::CommitProfile,
     ) -> Result<PathBuf, String> {
-        let bytes = self.encode(object, session_id, observation, profile)?;
-        let mut sidecar = destination.as_os_str().to_owned();
-        sidecar.push(".vot-receipt");
-        let sidecar = PathBuf::from(sidecar);
+        let bytes = self.encode(
+            object,
+            session_id,
+            observation,
+            profile,
+            destination.directory().nas_contract(),
+        )?;
+        let mut name = destination.name().to_owned();
+        name.push(".vot-receipt");
+        let sidecar = destination.sibling(&name).map_err(|e| e.to_string())?;
         write_sidecar_file(&sidecar, &bytes, |file, bytes| file.write_all(bytes))
-            .map_err(|error| format!("write or publish {}: {error}", sidecar.display()))?;
-        Ok(sidecar)
+            .map_err(|error| format!("write or publish {}: {error}", sidecar.path().display()))?;
+        Ok(sidecar.path())
     }
 
     /// Encodes a signed receipt for a newly prepared object.
@@ -156,7 +160,13 @@ impl ReceiptSigner {
         session_id: [u8; 16],
         observation: PublishObservation,
         profile: vot_sdk_file::CommitProfile,
+        contract: vot_sdk_file::NasContract,
     ) -> Result<Vec<u8>, String> {
+        if contract == vot_sdk_file::NasContract::ServerAcknowledged
+            && profile == vot_sdk_file::CommitProfile::Strict
+        {
+            return Err("NAS does not support Strict receipts".to_owned());
+        }
         let profile = match profile {
             vot_sdk_file::CommitProfile::Fast => CommitProfile::Fast,
             vot_sdk_file::CommitProfile::Balanced => CommitProfile::Balanced,
@@ -170,7 +180,10 @@ impl ReceiptSigner {
             assurance: AssuranceLevel::Published,
             profile,
             actual_predecessor: required_predecessor(profile),
-            provider: PROVIDER,
+            provider: match contract {
+                vot_sdk_file::NasContract::Unqualified => 1,
+                vot_sdk_file::NasContract::ServerAcknowledged => 5,
+            },
             provider_version: PROVIDER_VERSION,
             session_id,
             incarnation_id: observation.incarnation,
@@ -191,31 +204,26 @@ impl ReceiptSigner {
 }
 
 fn write_sidecar_file(
-    sidecar: &Path,
+    sidecar: &vot_platform_fs::FileLocation,
     bytes: &[u8],
     write: impl FnOnce(&mut File, &[u8]) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    let parent = sidecar
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let temporary = parent.join(format!(".vot-{}.stage", crate::auth::random_token()));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)?;
-    let temporary_guard = TemporaryFile(temporary);
-    write(&mut file, bytes)?;
-    file.sync_all()?;
-    std::fs::hard_link(&temporary_guard.0, sidecar)
-}
-
-struct TemporaryFile(PathBuf);
-
-impl Drop for TemporaryFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
+    let private = sidecar
+        .directory()
+        .private_child(std::ffi::OsStr::new(".vot-stage"))?;
+    let temporary = private.entry(std::ffi::OsStr::new(&format!(
+        "receipt-{}.stage",
+        crate::auth::random_token()
+    )))?;
+    let mut file = temporary.create()?;
+    let result = (|| {
+        write(&mut file, bytes)?;
+        file.sync_all()?;
+        temporary.link_to(&file, sidecar)?;
+        sidecar.sync_parent()
+    })();
+    let _ = temporary.remove_owned(&file);
+    result
 }
 
 /// RFC 3339 UTC seconds from the system clock, e.g. "2026-08-20T04:05:06Z".
@@ -288,7 +296,7 @@ mod tests {
         };
         let sidecar = signer
             .write_sidecar(
-                &destination,
+                &vot_platform_fs::FileLocation::from_path(&destination).unwrap(),
                 &object,
                 [2; 16],
                 PublishObservation {
@@ -329,7 +337,8 @@ mod tests {
         ] {
             let sidecar = signer
                 .write_sidecar(
-                    &directory.path().join(name),
+                    &vot_platform_fs::FileLocation::from_path(&directory.path().join(name))
+                        .unwrap(),
                     &ObjectId {
                         suite: 1,
                         root: [9; 32],
@@ -354,6 +363,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn nas_receipts_identify_the_provider_and_refuse_strict() {
+        use vot_sdk_file::{CommitProfile, NasContract};
+        let directory = tempfile::tempdir().unwrap();
+        let signer = ReceiptSigner::load_or_create(directory.path()).unwrap();
+        let object = ObjectId {
+            suite: 1,
+            root: [7; 32],
+            length: 12,
+        };
+        for (contract, provider) in [
+            (NasContract::Unqualified, 1),
+            (NasContract::ServerAcknowledged, 5),
+        ] {
+            for profile in [
+                CommitProfile::Fast,
+                CommitProfile::Balanced,
+                CommitProfile::Strict,
+            ] {
+                let bytes = signer.encode(
+                    &object,
+                    [1; 16],
+                    PublishObservation {
+                        incarnation: [2; 16],
+                        sequence: 7,
+                    },
+                    profile,
+                    contract,
+                );
+                if contract == NasContract::ServerAcknowledged && profile == CommitProfile::Strict {
+                    assert!(bytes.is_err());
+                } else {
+                    let decoded = vot_receipt::decode_authenticated(&bytes.unwrap()).unwrap();
+                    let verified =
+                        vot_receipt::verify_ed25519(&decoded, &signer.verifying_key()).unwrap();
+                    assert_eq!(verified.receipt().provider, provider);
+                }
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn loading_an_existing_receipt_key_tightens_it() {
@@ -375,12 +425,22 @@ mod tests {
     fn partial_write_removes_final_and_temporary_sidecars() {
         let directory = tempfile::tempdir().unwrap();
         let sidecar = directory.path().join("payload.bin.vot-receipt");
-        assert!(write_sidecar_file(&sidecar, b"complete", |file, bytes| {
-            file.write_all(&bytes[..1])?;
-            Err(std::io::Error::other("injected receipt write failure"))
-        })
+        assert!(write_sidecar_file(
+            &vot_platform_fs::FileLocation::from_path(&sidecar).unwrap(),
+            b"complete",
+            |file, bytes| {
+                file.write_all(&bytes[..1])?;
+                Err(std::io::Error::other("injected receipt write failure"))
+            }
+        )
         .is_err());
         assert!(!sidecar.exists());
+        assert_eq!(
+            std::fs::read_dir(directory.path().join(".vot-stage"))
+                .unwrap()
+                .count(),
+            0
+        );
         assert!(!std::fs::read_dir(directory.path())
             .unwrap()
             .filter_map(Result::ok)
@@ -402,7 +462,7 @@ mod tests {
 
         let error = signer
             .write_sidecar(
-                &destination,
+                &vot_platform_fs::FileLocation::from_path(&destination).unwrap(),
                 &ObjectId {
                     suite: 1,
                     root: [9; 32],

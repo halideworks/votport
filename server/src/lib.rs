@@ -16,6 +16,7 @@ pub mod lease;
 pub mod notify;
 pub mod paths;
 pub mod receipt;
+pub mod receiving;
 #[path = "../../protocol/routes.rs"]
 pub mod route_protocol;
 pub mod session;

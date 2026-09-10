@@ -37,9 +37,28 @@
         </form>
       </div>
 
-      <div class="page-heading"><div><p class="eyebrow">Connections</p><h1>Storage</h1><p class="page-lead">Connect S3 buckets, shared folders and other ports for verified delivery copies.</p></div><button id="storage-new" type="button">Add storage</button></div>
+      <div class="page-heading"><div><p class="eyebrow">Connections</p><h1>Storage</h1><p class="page-lead">Manage where files arrive and connect destinations for verified copies.</p></div><button id="storage-new" type="button">Add storage</button></div>
       <p id="storage-error" class="error feedback" role="alert" hidden></p><p id="storage-notice" class="feedback" role="status" hidden></p>
       <p id="storage-access" class="info-banner" hidden>Your administrator manages these connections. Available storage can be selected when creating a workflow delivery.</p>
+      <section id="receiving-storage" class="card" aria-labelledby="receiving-title" hidden>
+        <div class="section-heading"><div><p class="eyebrow">This port</p><h2 id="receiving-title" class="section-title">Receiving storage</h2></div><span id="receiving-status" class="badge" role="status">Checking…</span></div>
+        <p id="receiving-path" class="connection-meta"></p>
+        <p id="receiving-mount" class="connection-meta"></p>
+        <p>Files arrive directly on this storage. Votport verifies bytes as they arrive, then publishes the completed file without a second payload copy.</p>
+        <p id="receiving-detail" class="field-help"></p>
+        <p id="receiving-performance" class="field-help" hidden>Receiving many small files over SMB? The Linux <code>tcpnodelay</code> mount option can reduce metadata delays. <a href="https://github.com/halideworks/votport/blob/main/docs/direct-receiving.md#smb-small-file-performance">Setup and measurements</a></p>
+        <p id="receiving-error" class="error feedback" role="alert" hidden></p>
+        <form id="receiving-qualification">
+          <fieldset id="receiving-nas-contract" hidden disabled><legend>Enable this NAS for verified receiving</legend>
+            <p class="field-help">Confirm these settings with your storage administrator for this exact share. The connection check can test file operations, but cannot prove how the server behaves during power loss.</p>
+            <label class="check"><input id="receiving-stable" type="checkbox" required /><span>The server keeps acknowledged writes and folder changes through power loss. Its SMB FLUSH or NFS COMMIT configuration provides stable storage.</span></label>
+            <label class="check"><input id="receiving-private" type="checkbox" required /><span>Server permissions make Votport’s temporary files private from creation and prevent other users from replacing the private folder or its ancestors. Other programs using this account do not modify Votport’s temporary files.</span></label>
+            <p class="field-help">Votport creates its own private control folder on the share. You do not need to reserve a separate staging volume. The server must support coordinated file locks and hard links.</p>
+          </fieldset>
+          <div class="actions"><button id="receiving-check" type="submit" class="ghost">Check storage</button><span id="receiving-result" role="status"></span></div>
+        </form>
+      </section>
+      <div class="section-heading"><h2 class="section-title">Copy destinations</h2></div>
       <div id="storage-list" class="connection-grid"><p class="muted" role="status">Loading storage…</p></div>
       <form id="workflow-save-storage" class="card editor" hidden>
         <div class="section-heading"><div><h2 id="storage-editor-title" class="section-title">Add storage</h2><p class="muted">Choose where verified files should go.</p></div><button id="storage-close" type="button" class="ghost">Cancel</button></div>

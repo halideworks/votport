@@ -202,7 +202,10 @@ async function refreshJobs(more = false) {
     if (job.request.not_before) card.append(node('p', `Scheduled ${formatWhen(job.request.not_before)}`, 'muted'));
     if (job.request.deadline) card.append(node('p', `Acceptance due ${formatWhen(job.request.deadline)}`, 'muted'));
     if (url && job.state !== 'ready') card.append(node('p', 'Local download link is released. Destination copies are still pending.', 'info-banner'));
-    if (job.received) { const source = node('a', 'View incoming request →', 'text-link'); source.href = `/receive?search=${encodeURIComponent(job.received.link_id)}#link-${job.received.link_id}`; card.append(source); }
+    if (job.received) {
+      const source = node('a', 'View incoming request →', 'text-link'); source.href = `/receive?search=${encodeURIComponent(job.received.link_id)}#link-${job.received.link_id}`; card.append(source);
+      if (job.state !== 'retired') card.append(node('p', 'This delivery uses the original received files. Keep them unchanged until the delivery is archived. Automatic archival occurs seven days after cancellation, failure, or link expiry or revocation.', 'field-help'));
+    }
     for (const id of job.project.destinations) {
       const result = job.checks.destinations?.[id], receipt = job.checks.route_receipts?.[id], revoked = job.checks.route_revocations?.[id];
       const leg = node('div', '', 'destination-status'), name = storage.find((item) => item.id === id)?.label || id;

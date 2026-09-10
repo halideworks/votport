@@ -341,7 +341,8 @@ pub fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String
     if component.eq_ignore_ascii_case(crate::lease::FILE_NAME) {
         return Err("name is reserved for the instance lease".to_owned());
     }
-    if is_push_staging_name(component)
+    if component.eq_ignore_ascii_case(".vot-stage")
+        || is_push_staging_name(component)
         || (component.starts_with(".vot-")
             && (component.ends_with(".stage") || component.ends_with(".journal")))
     {
@@ -619,6 +620,10 @@ mod tests {
         // the boot sweep deletes exactly these.
         assert!(admit_component(".vot-1a2b-0-3c4d.stage", true).is_err());
         assert!(admit_component(".vot-1a2b-0-3c4d.journal", true).is_err());
+        for name in [".vot-stage", ".VOT-STAGE", ".VoT-StAgE"] {
+            assert!(admit_component(name, true).is_err());
+            assert!(admit_component(name, false).is_err());
+        }
         assert!(admit_component(".vot-notes.txt", true).is_ok());
         assert!(admit_component(TENANT_STORAGE_DIR, true).is_err());
         assert!(admit_component(".VOT-TENANTS.STAGE", true).is_err());

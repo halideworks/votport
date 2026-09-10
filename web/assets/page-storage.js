@@ -7,6 +7,34 @@ const session = await requireSession();
 const admin = session.role === 'admin' && !session.tenant;
 $('storage-new').hidden = !admin; $('storage-access').hidden = admin;
 
+let receivingStorage = null;
+function showReceiving(storage) {
+  receivingStorage = storage;
+  $('receiving-storage').hidden = false;
+  $('receiving-performance').hidden = !['cifs', 'smb3'].includes(storage.storage?.filesystem);
+  $('receiving-path').textContent = storage.path;
+  $('receiving-mount').textContent = storage.storage ? `${storage.storage.filesystem.toUpperCase()} · ${storage.storage.source}` : 'Storage is unavailable';
+  $('receiving-status').textContent = storage.ready ? 'Ready to receive' : 'Setup required';
+  $('receiving-error').textContent = storage.error || ''; $('receiving-error').hidden = !storage.error;
+  $('receiving-detail').textContent = storage.ready ? storage.nas ? 'Verified on arrival · Server-acknowledged durability · Signed NAS receipt. Independent server-side readback is not claimed.' : 'Verified on arrival · Durable publication · Signed receipt.' : 'Receiving stays paused until storage passes its checks. The rest of administration remains available.';
+  const qualify = storage.nas && !storage.ready;
+  $('receiving-nas-contract').hidden = !qualify; $('receiving-nas-contract').disabled = !qualify;
+  $('receiving-check').textContent = qualify ? 'Check and enable receiving' : 'Check storage';
+  $('receiving-check').disabled = !storage.storage;
+}
+$('receiving-qualification').addEventListener('submit', (event) => {
+  event.preventDefault();
+  if (!receivingStorage?.storage || $('receiving-check').disabled) return;
+  $('receiving-check').disabled = true; $('receiving-qualification').inert = true;
+  $('receiving-result').textContent = 'Checking storage…';
+  guard(async () => {
+    const storage = await api('/api/admin/receiving-storage', { method: 'POST', body: JSON.stringify({ storage: receivingStorage.storage, enable: !receivingStorage.ready, stable_acknowledgments: $('receiving-stable').checked, private_namespace: $('receiving-private').checked }) });
+    showReceiving(storage);
+    if (!storage.ready) throw new Error(storage.error || 'Storage is still unavailable.');
+    $('receiving-result').textContent = 'Storage checks passed. Ready to receive.';
+  }).finally(() => { $('receiving-qualification').inert = false; showReceiving(receivingStorage); if ($('receiving-result').textContent === 'Checking storage…') $('receiving-result').textContent = ''; });
+});
+
 async function guard(action) {
   $('storage-error').hidden = true;
   try { await action(); }
@@ -135,4 +163,10 @@ $('ws-provider').onchange = provider; $('ws-region').oninput = () => { if (value
 $('ws-auth').onchange = authentication; $('ws-encryption').onchange = encryption;
 $('ws-kind').onchange = destinationKind; $('ws-port-auth').onchange = portAuthentication;
 for (const event of ['input', 'change']) $('workflow-save-storage').addEventListener(event, () => { editorGeneration += 1; $('storage-test').disabled = true; $('storage-test-result').textContent = 'Save changes before testing.'; });
-await guard(async () => { if (admin) tenants = (await api('/api/admin/tenants')).tenants; await refresh(); });
+await guard(async () => {
+  if (admin) {
+    const [tenantResult, storage] = await Promise.all([api('/api/admin/tenants'), api('/api/admin/receiving-storage')]);
+    tenants = tenantResult.tenants; showReceiving(storage);
+  }
+  await refresh();
+});

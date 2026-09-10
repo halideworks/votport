@@ -35,11 +35,11 @@ function deploymentWarning(id, warn, note) {
 
 function deploymentProfile(id, profile, outbound = false) {
   const messages = {
-    fast: 'Fast only: CIFS/SMB or NFS detected. Balanced and Strict are incompatible with this filesystem.',
-    balanced: 'Balanced selected automatically.',
+    fast: 'Network filesystem detected. Receiving qualification is managed in Storage.',
+    balanced: 'Balanced publication enabled.',
   };
-  let note = messages[profile] || 'Filesystem detection unavailable.';
-  if (outbound) note = `Library receipts use Fast.${profile === 'balanced' ? '' : ` ${note}`}`;
+  let note = messages[profile] || 'Receiving is unavailable. Review the checks in Storage.';
+  if (outbound) note = `Library receipts use Fast.${profile === 'fast' ? ` ${messages.fast}` : profile ? '' : ' Filesystem detection unavailable.'}`;
   deploymentValue(id, note);
   $(id).classList.toggle('warning', profile === 'fast');
   $(`${id}-docs`).hidden = profile !== 'fast';

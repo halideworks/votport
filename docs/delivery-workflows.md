@@ -150,9 +150,10 @@ receiving project. Incomplete uploads remain visible without starting copies;
 their completed files remain withheld from raw sharing.
 
 A complete upload queues its reception job in the same database transaction.
-The worker snapshots verified files and applies the receiving project's checks,
-approval and destination choices. Pending jobs protect source records against
-deletion; after a snapshot is prepared, retention can remove the original.
+The worker uses the verified received originals and applies the receiving project's
+checks, approval and destination choices. These jobs pin their source records and
+files until retirement, including while a resulting delivery remains active.
+Source changes fail verification; no hidden payload snapshot or copy is required.
 Failures remain visible and can be retried or cancelled. Raw sharing cannot
 bypass a reception job's release policy.
 
@@ -261,8 +262,9 @@ Install and operate the scanner daemon separately. Missing, failing or timed-out
 checkers withhold release. Checks have a five-minute timeout per file and a
 64 KiB output bound. Inspect job errors and retry after correcting the problem.
 
-Media/scanning jobs, S3 imports and reception workflows use private snapshots. A global reservation
-budget is controlled by `VOTPORT_WORKFLOW_SNAPSHOT_BYTES`, defaulting to four
+Library media/scanning jobs and S3 imports use private snapshots. Reception jobs
+check their pinned original files directly. A global snapshot reservation budget
+is controlled by `VOTPORT_WORKFLOW_SNAPSHOT_BYTES`, defaulting to four
 times the maximum upload size. Private files are retired seven days after a
 failed/cancelled job, or seven days after grant expiry/revocation. Job history,
 evidence and events remain. Tenant deletion removes that tenant's records.

@@ -27,48 +27,38 @@ it.
 
 ### Network filesystems
 
-On Linux, Votport selects **Fast** for received files on detected CIFS/SMB
-and NFS mounts. **Balanced and Strict are incompatible with these
-filesystems.** Local filesystems retain Balanced. The System deployment
-panel shows the receive filesystem's supported profile.
+Linux NFS and SMB/CIFS can receive directly with Balanced publication after a
+platform administrator qualifies the exact mounted share in **Storage > Receiving
+storage**. A new or changed NAS stays paused; administration remains available.
+Votport never silently falls back to a local directory when a qualified mount is
+missing. Local receiving continues to use Balanced.
 
-Fast still verifies content and publishes without overwriting an existing
-file, but does not promise that the remote server has persisted the data
-through power loss. Successful writes or a remote `fsync` are not evidence
-of that stronger guarantee. Received-file receipts report the actual commit
-profile. Outbound library grants hash existing files and issue Fast receipts
-without claiming durable publication. Resumable receive sessions persist
-their profile, including across restarts;
-existing sessions retain their original Balanced profile and are not
-silently downgraded.
+The server must honor stable SMB FLUSH or NFS COMMIT acknowledgments, enforce the
+private receiving namespace and ancestor permissions, and support hard links,
+stable file identity, and coordinated file locks. The UI requires explicit
+confirmation of the storage server's durability and permissions. Its operation
+probe checks file and namespace operations; it cannot prove power-loss behavior.
+Client-side `uid`, `gid`, and mode presentation alone do not qualify server ACLs.
+Unsupported mount options are refused. See [Direct receiving](direct-receiving.md)
+for the supported mount contract and deployment checks.
 
-For stronger durability, receive onto a supported local filesystem using
-Balanced, then replicate to the share under your storage system's backup
-and durability policy. Keep the local copy until that policy is satisfied.
-Votport does not offer Strict as a selectable receive profile. If Strict
-is required, use a VOT receiver and local storage qualified for that
-profile. See the [VOT mounted-share support and alternatives](https://github.com/halideworks/VOT/blob/ed8a20b7acb2e58d0dd5c794e20dcfaa66be40d0/docs/mounted-shares.md)
-for platform requirements and the limits of each profile. macOS SMB is not
-qualified by this upstream release.
+Files are verified as they arrive into Votport's private `.vot-stage` folder on
+the destination filesystem. Publication gives the same inode its final name;
+there is no second payload allocation or final copy. The application creates this
+folder itself without changing the selected shared directory's permissions.
+Native push carries verified ranges directly into the same receiver. Reception
+workflows keep and verify the original received files instead of taking another
+payload snapshot.
 
-Fast does not bypass filesystem safety checks. Both `/received` and
-`/outbound` must be real directories on a filesystem that supports hard
-links and stable file identity. `/received` must map the container's uid
-1000 to itself and permit a directory mode of 0755; symlinked, differently
-owned, group-writable, or world-writable parents are rejected. Votport
-probes both directories at boot with a staging file, hard link, and
-directory fsync, and checks the received file's owner. A share that fails
-these checks is unsupported even with Fast. A slow mount also affects
-`/healthz`, which creates a file in both roots on every call.
+NAS receipts identify provider `POSIX_NAS` (`0x0005`) and Balanced publication.
+They distinguish verified content and server-acknowledged durability from
+independent server-side readback. Strict is not offered for NAS. macOS SMB and
+Windows receiving are not qualified by this Linux server implementation; desktop
+senders can transfer to a qualified Linux port using either transport.
 
-Qualification on erebus (2026-09-08, VOT `a93f5d8`): a Linux CIFS 3.1.1
-mount of Samba with `uid=1000,gid=1000,dir_mode=0755,file_mode=0644,serverino`
-and no Unix extensions passed the boot probe. The same mount with
-`nostrictsync` also passed. Each configuration received a 256 MiB HTTP upload
-across server SIGKILL/restart and a 16 MiB QUIC push; every SHA-256 matched
-and each receipt reported Fast. The restart waited for the previous
-instance's 90-second HA lease to expire. These runs qualify process-crash
-recovery, not power loss or a disconnected SMB server.
+Keep SQLite and control data on local storage. `/outbound` still follows its
+existing library storage checks and issues Fast receipts for existing files;
+qualifying receiving storage does not change those claims.
 
 ## Quick start
 
@@ -646,9 +636,9 @@ no state outside `data/`, `/received`, and `/outbound`, so a standby host that
 mounts the same three paths and starts the same image is the live instance.
 It sees the same links, tenants, settings, cookie secret, receipt key, and
 push certificate (all under `data/`), and it re-attaches the uploads the
-previous instance suspended: staging and journal files sit beside their
-destination under `/received`, and the resume record in SQLite names them by
-path, not by host.
+previous instance suspended: staging and journal files sit in a private
+`.vot-stage` child of their destination directory under `/received`, and the
+resume record in SQLite names them by path, not by host.
 
 Layout:
 
@@ -661,22 +651,16 @@ Layout:
   `data/lock` at boot and refuses to start while another process holds it,
   which catches a standby started too early on shared block storage but not
   on NFS, where `flock` semantics vary by server.
-- The lease at `/received/.votport-lease` fences the case the lock cannot:
-  it is the one path both hosts share whether `data/` moves or is
-  replicated. An instance creates it exclusively at boot, renews it every
-  30 s, and refuses to start while another holder renewed it within the
-  last 90 s; a holder whose heartbeat finds another name in the file stops
-  itself, since that instance is now re-attaching the staging. The two
-  clocks only need to agree to within tens of seconds. `/readyz` reports the
-  holder, whether it is this instance, the seconds since renewal, and
-  whether the lease was lost; `/metrics` exposes `votport_lease_held` and
-  `votport_lease_age_seconds`. A clean stop (SIGTERM) gives the lease back
-  as its last step, so the standby, or the same host's next container,
-  starts at once; after a crash or SIGKILL the file stays and the next
-  instance can start once 90 s have passed, or sooner if the operator
-  removes the file after confirming the old process is gone. An instance
-  that loses the lease checkpoints its uploads and exits immediately rather
-  than draining, because the new holder is already re-attaching its staging.
+- `/received/.vot-stage/writer.lock` is a permanent inode holding an exclusive
+  kernel lock. NAS must coordinate that lock at the server; client-local locks
+  are refused. A second instance cannot take ownership because a heartbeat is
+  old or its wall clock differs. `.vot-stage/.votport-lease` records the holder
+  and renewal time for diagnostics, refreshed every 30 seconds. Never unlink
+  the lock file to force takeover: that would create independent lock inodes.
+  Stop or fence the old host and let the filesystem release its lock first.
+  `/readyz` and lease metrics expose ownership. Loss of ownership stops writes,
+  preserves recovery state and ends the instance. A clean shutdown releases
+  the lock; crash takeover waits for the NAS's lock recovery rules.
 - Where the data volume cannot move, run the standby in replica mode:
   `votport standby` with `VOTPORT_STANDBY_SOURCE` (the live instance's
   https URL), `VOTPORT_REPLICA_TOKEN` (the token saved under System >
@@ -806,10 +790,10 @@ browser pauses while the server is down, then re-begins on its own). Ranges
 that had landed beyond the contiguous prefix are re-sent, at most the sender's
 in-flight window. A partial that cannot be re-attached (a link deleted while
 down, staging missing or shorter than its checkpoint, or the process killed
-before the checkpoint) is dropped at boot and that file starts over. A file a
-dropped multi-file session had already published stays on disk without an
-upload record, and the re-send lands beside it under a suffixed name. Before a
-re-attached file is published, the staged bytes are re-hashed against the
+before the checkpoint) retains its files, journals and database record for
+recovery. The link receives an interruption event, and already published files
+are recorded as a partial upload so they remain visible and can be deduplicated.
+Before a re-attached file is published, the staged bytes are re-hashed against the
 announced object, so a partial altered while the server was down cannot
 publish. Long streaming downloads die with the
 process. The compose file sets `stop_grace_period: 5m` so in-flight downloads

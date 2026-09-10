@@ -51,7 +51,6 @@ pub fn start_server(bin: &str, extra_env: &[(&str, String)]) -> Server {
     let data = tempfile::tempdir().unwrap();
     let received = data.path().join("received");
     let outbound = data.path().join("outbound");
-    std::fs::create_dir_all(&received).unwrap();
     std::fs::create_dir_all(&outbound).unwrap();
     let port = free_port();
     let mut command = Command::new(bin);

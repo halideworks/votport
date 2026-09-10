@@ -7,7 +7,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{Read as _, Seek as _, SeekFrom};
+use std::io::Read as _;
+#[cfg(test)]
+use std::io::{Seek as _, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -153,6 +155,7 @@ pub struct WorkerSetup {
     pub tenant: String,
     /// Absolute directory this session publishes into.
     pub dest_dir: PathBuf,
+    pub destinations: Arc<crate::receiving::Destinations>,
     /// Prefix of `dest_dir` relative to the receive root, for records.
     pub dest_rel: String,
     pub expected_package: ObjectId,
@@ -306,7 +309,12 @@ impl PushControl {
     pub(crate) fn staging_dir(&self, setup: &WorkerSetup) -> PathBuf {
         self.resume_key.as_ref().map_or_else(
             || push_staging_dir(setup),
-            |key| setup.dest_dir.join(format!(".vot-push-{key}")),
+            |key| {
+                setup
+                    .dest_dir
+                    .join(".vot-stage")
+                    .join(format!(".vot-push-{key}"))
+            },
         )
     }
 
@@ -362,14 +370,18 @@ impl PushControl {
 
 // Staging identity and verified coverage outlive the bounded set of open sinks.
 struct StagedFile {
+    destinations: Arc<crate::receiving::Destinations>,
     destination: PathBuf,
     staging: PathBuf,
     journal: PathBuf,
     incarnation: [u8; 16],
     profile: CommitProfile,
+    nas_contract: vot_sdk_file::NasContract,
     coverage: Mutex<ObjectCoverage>,
     active: Option<NativeFile>,
+    active_directory: Option<vot_sdk_file::ReceiveDirectory>,
     reopened: bool,
+    parked_metadata: Option<(u64, u64, u64, i64, i64, i64, i64)>,
     preserve: bool,
 }
 
@@ -379,8 +391,11 @@ impl StagedFile {
         destination: PathBuf,
         coverage: ObjectCoverage,
         profile: CommitProfile,
+        destinations: Arc<crate::receiving::Destinations>,
     ) -> Self {
         let mut staged = Self {
+            nas_contract: destinations.contract(),
+            destinations,
             destination,
             staging: native.staging_path().to_path_buf(),
             journal: native.journal_path().to_path_buf(),
@@ -388,7 +403,9 @@ impl StagedFile {
             profile,
             coverage: Mutex::new(coverage),
             active: Some(native),
+            active_directory: None,
             reopened: false,
+            parked_metadata: None,
             preserve: false,
         };
         staged.park();
@@ -396,29 +413,86 @@ impl StagedFile {
     }
 
     fn reopen(&mut self) -> Result<(), SessionError> {
+        self.destinations
+            .check_live()
+            .map_err(SessionError::internal)?;
         if self.active.is_none() {
-            let coverage = self.coverage.get_mut().expect("staging coverage poisoned");
-            self.active = Some(
-                NativeFile::resume(
-                    coverage.object_id(),
-                    &self.destination,
-                    &self.staging,
-                    &self.journal,
-                    self.incarnation,
-                    self.profile,
-                    coverage.runs(),
+            let state = self.resume_state();
+            let directory = self.directory()?;
+            let native = directory
+                .resume(
+                    self.coverage
+                        .get_mut()
+                        .expect("staging coverage poisoned")
+                        .object_id(),
+                    self.destination
+                        .file_name()
+                        .ok_or_else(|| SessionError::internal("missing destination name"))?,
+                    &state,
                 )
-                .map_err(|error| SessionError::internal(format!("reopen staging: {error}")))?,
-            );
-            self.reopened |= coverage.covered_bytes() > 0;
+                .map_err(|error| SessionError::internal(format!("reopen staging: {error}")))?;
+            self.reopened |=
+                self.parked_metadata.is_none() || self.parked_metadata != Self::metadata(&native);
+            self.active = Some(native);
+            self.active_directory = Some(directory);
         }
         Ok(())
     }
 
     fn native(&self) -> Result<&NativeFile, SessionError> {
+        self.destinations
+            .check_live()
+            .map_err(SessionError::internal)?;
         self.active
             .as_ref()
             .ok_or_else(|| SessionError::internal("staging is not open"))
+    }
+
+    fn directory(&self) -> Result<vot_sdk_file::ReceiveDirectory, SessionError> {
+        self.destinations
+            .check_live()
+            .map_err(SessionError::internal)?;
+        if let Some(directory) = &self.active_directory {
+            return Ok(directory.clone());
+        }
+        self.destinations
+            .directory(
+                self.destination
+                    .parent()
+                    .ok_or_else(|| SessionError::internal("missing destination parent"))?,
+                false,
+            )
+            .map_err(SessionError::internal)
+    }
+
+    fn resume_state(&self) -> vot_sdk_file::ResumeState {
+        vot_sdk_file::ResumeState {
+            staging_name: self.staging.file_name().unwrap_or_default().to_owned(),
+            journal_name: self.journal.file_name().unwrap_or_default().to_owned(),
+            incarnation: self.incarnation,
+            profile: self.profile,
+            nas_contract: self.nas_contract,
+            runs: self
+                .coverage
+                .lock()
+                .expect("staging coverage poisoned")
+                .runs()
+                .collect(),
+        }
+    }
+
+    fn metadata(native: &NativeFile) -> Option<(u64, u64, u64, i64, i64, i64, i64)> {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = native.read_staging().ok()?.metadata().ok()?;
+        Some((
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        ))
     }
 
     fn record(&self, verified: &vot_sdk::verify::VerifiedSlice<'_>) -> Result<(), SessionError> {
@@ -435,8 +509,10 @@ impl StagedFile {
     fn park(&mut self) {
         if let Some(native) = self.active.take() {
             self.preserve |= native.recovery_required();
+            self.parked_metadata = Self::metadata(&native);
             native.abandon();
         }
+        self.active_directory = None;
     }
 
     fn abandon(mut self) {
@@ -467,7 +543,11 @@ impl StagedFile {
 
 impl Drop for StagedFile {
     fn drop(&mut self) {
-        if self.active.is_none() && !self.preserve {
+        if self.preserve || self.destinations.check_live().is_err() {
+            self.park();
+            return;
+        }
+        if self.active.is_none() {
             // Reacquire the journal identity before the SDK removes its files.
             let _ = self.reopen();
         }
@@ -527,8 +607,6 @@ fn spawn_worker_from(
         let mut persist = PersistTracker::new();
         let mut rebegin = resumed;
         let mut suspended = false;
-        // The registry dropped the sender (idle sweep or removal).
-        let mut dropped = false;
         let mut replays: u64 = 0;
         let mut rejected: u64 = 0;
         let mut last_error: Option<String> = None;
@@ -573,7 +651,6 @@ fn spawn_worker_from(
                 None => match receiver.blocking_recv() {
                     Some(cmd) => (cmd, true),
                     None => {
-                        dropped = true;
                         break;
                     }
                 },
@@ -733,7 +810,7 @@ fn spawn_worker_from(
                     // Checkpoint covered progress on a byte or time threshold,
                     // never per batch, so the fsync never paces accept.
                     if persist.should_checkpoint(received - received_before) {
-                        if let Phase::Receiving { files } = &phase {
+                        if let Phase::Receiving { files } = &mut phase {
                             checkpoint_session(&setup, files);
                         }
                     }
@@ -741,17 +818,16 @@ fn spawn_worker_from(
                 Cmd::Finish { reply, _lease } => {
                     let report =
                         handle_finish(&setup, &mut phase, replays, rejected, received, &log);
-                    // A finished session has nothing left to re-attach; a
-                    // finish refused as early keeps receiving, and its resume
-                    // record with it.
-                    if matches!(phase, Phase::Done) {
-                        forget_session(&setup);
-                    }
                     send_noted!(reply, report);
                 }
                 Cmd::Abort { reply, _lease } => {
                     log.terminal(now_unix(), "cancelled", None);
-                    commit_partial(&setup, &phase, replays, rejected, &log);
+                    let recorded = commit_partial(&setup, &mut phase, replays, rejected, &log);
+                    if recorded {
+                        forget_session(&setup);
+                    } else {
+                        preserve_phase(&setup, &mut phase);
+                    }
                     record_event(
                         &setup,
                         already + received,
@@ -761,23 +837,14 @@ fn spawn_worker_from(
                         replays,
                         rejected,
                     );
-                    // The sender gave up; nothing to re-attach.
-                    forget_session(&setup);
                     phase = Phase::Done;
-                    let _ = reply.send(Ok(()));
+                    let _ = reply.send(if recorded { Ok(()) } else { Err(SessionError::internal("cancelled transfer retains recovery metadata because recording completion failed")) });
                 }
                 Cmd::Suspend { reply } => {
                     // Checkpoint the exact prefix, then release the staging
                     // handles without removing the files: boot re-attaches
                     // them. Sessions before begin have nothing persisted.
-                    if let Phase::Receiving { files } = &mut phase {
-                        checkpoint_session(&setup, files);
-                        for file in files.iter_mut() {
-                            if let Some(native) = file.native.take() {
-                                native.abandon();
-                            }
-                        }
-                    }
+                    preserve_phase(&setup, &mut phase);
                     suspended = true;
                     phase = Phase::Done;
                     let _ = reply.send(());
@@ -787,14 +854,13 @@ fn spawn_worker_from(
                 break;
             }
         }
-        if dropped {
-            // Staging goes with the dropped handles below, so the record
-            // must not offer it for re-attach.
-            forget_session(&setup);
-        }
         if !matches!(phase, Phase::Done) && !suspended {
             log.terminal(last_seen, "interrupted", None);
-            commit_partial(&setup, &phase, replays, rejected, &log);
+            if commit_partial(&setup, &mut phase, replays, rejected, &log) {
+                forget_session(&setup);
+            } else {
+                preserve_phase(&setup, &mut phase);
+            }
             record_event(
                 &setup,
                 already + received,
@@ -865,6 +931,11 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
     // (or its page) calls it again to learn how far each entry got, and picks
     // up from there. Without this a reconnect could only start over.
     if let Phase::Receiving { files } = phase {
+        for file in files.iter_mut() {
+            if file.object.length == 0 && !file.published {
+                publish_file(setup, file, || true)?;
+            }
+        }
         return Ok(entry_infos(setup, files));
     }
     let Phase::Pages {
@@ -929,40 +1000,15 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
         .ok_or_else(|| SessionError::conflict("request link no longer exists"))?;
     let delivered = delivered_index(&prior_uploads);
 
-    fs::create_dir_all(&setup.dest_dir)
-        .map_err(|error| SessionError::internal(format!("create destination: {error}")))?;
-    paths::tighten_dir(&setup.dest_dir);
+    let destinations = entries
+        .iter()
+        .map(|entry| (entry.path().map(str::to_owned).collect(), entry.object_id()))
+        .collect::<Vec<_>>();
+    let files = prepare_files(setup, &destinations, &delivered, || true)?;
 
-    let mut files = Vec::with_capacity(entries.len());
-    for entry in &entries {
-        if let Some(existing) = find_delivered(setup, &delivered, &entry.object_id(), || true) {
-            files.push(FileState {
-                display_path: entry.path().collect::<Vec<_>>().join("/"),
-                stored_components: existing.stored_components,
-                object: entry.object_id(),
-                native: None,
-                published: true,
-                receipt: existing.receipt,
-                first_range_at: None,
-                rehash: false,
-            });
-            continue;
-        }
-        files.push(open_destination(setup, entry)?);
-    }
-
-    // Zero-length objects have complete coverage already; publish now.
-    for file in &mut files {
-        if file.object.length == 0 && !file.published {
-            publish_file(setup, file)?;
-        }
-    }
-
-    let infos = entry_infos(setup, &files);
-    // Record the session (and its staging paths) so a restart can re-attach.
-    persist_session(setup, &files);
+    persist_session(setup, &files)?;
     *phase = Phase::Receiving { files };
-    Ok(infos)
+    handle_begin(setup, phase)
 }
 
 /// Persist checkpoint pacing: write covered progress no more than this often
@@ -999,15 +1045,29 @@ impl PersistTracker {
 
 pub(crate) fn persist_push(setup: &WorkerSetup, key: String) -> Result<(), String> {
     let mut session = persisted_session(setup, &[]);
+    if let Some(previous) = setup.store.load_push_session(&key)? {
+        if previous.link_id != session.link_id
+            || previous.tenant != session.tenant
+            || previous.dest_dir != session.dest_dir
+            || previous.dest_rel != session.dest_rel
+            || previous.package != session.package
+        {
+            return Err("push recovery does not match this admission".to_owned());
+        }
+        session.files = previous.files;
+    }
     session.push_key = Some(key);
     setup.store.insert_upload_session(&session)
 }
 
 /// Builds the resume record for a session's current files. Published files
 /// carry no staging handle; boot re-attach skips them.
-fn persisted_session(setup: &WorkerSetup, files: &[FileState]) -> PersistedUploadSession {
+fn persisted_session<'a>(
+    setup: &WorkerSetup,
+    files: impl IntoIterator<Item = &'a FileState>,
+) -> PersistedUploadSession {
     let persisted = files
-        .iter()
+        .into_iter()
         .enumerate()
         .map(|(entry, file)| {
             let (staging_path, journal_path, incarnation, prefix_bytes) = match &file.native {
@@ -1036,6 +1096,10 @@ fn persisted_session(setup: &WorkerSetup, files: &[FileState]) -> PersistedUploa
                     .native
                     .as_ref()
                     .map_or(CommitProfile::Balanced, |native| native.profile),
+                nas_contract: file
+                    .native
+                    .as_ref()
+                    .map_or(setup.destinations.contract(), |native| native.nas_contract),
                 prefix_bytes,
                 published: file.published,
                 receipt: file.receipt,
@@ -1056,19 +1120,16 @@ fn persisted_session(setup: &WorkerSetup, files: &[FileState]) -> PersistedUploa
     }
 }
 
-/// Records the session so a restart can re-attach its staging. Best effort:
-/// a persist failure only loses the resume opportunity, never a byte.
-fn persist_session(setup: &WorkerSetup, files: &[FileState]) {
-    if let Err(error) = setup
+/// Admission metadata must survive before any final filename is published.
+fn persist_session(setup: &WorkerSetup, files: &[FileState]) -> Result<(), SessionError> {
+    setup
         .store
         .insert_upload_session(&persisted_session(setup, files))
-    {
-        tracing::warn!(%error, "persist upload session failed");
-    }
+        .map_err(|error| SessionError::internal(format!("persist upload admission: {error}")))
 }
 
 /// Updates each in-progress file's covered prefix at a checkpoint.
-fn checkpoint_session(setup: &WorkerSetup, files: &[FileState]) {
+fn checkpoint_session(setup: &WorkerSetup, files: &mut [FileState]) -> bool {
     let progress = files.iter().enumerate().map(|(entry, file)| {
         let prefix = file
             .native
@@ -1081,7 +1142,33 @@ fn checkpoint_session(setup: &WorkerSetup, files: &[FileState]) {
         .update_upload_file_progress(&hex::encode(setup.session_id), progress)
     {
         tracing::warn!(%error, "checkpoint upload session failed");
+        return false;
     }
+    forget_publications(files)
+}
+
+fn forget_publications(files: &mut [FileState]) -> bool {
+    let mut complete = true;
+    for file in files.iter_mut().filter(|file| file.published) {
+        let Some(staged) = file.native.as_ref() else {
+            continue;
+        };
+        let result = staged.directory().and_then(|directory| {
+            directory
+                .forget_publication(
+                    staged.destination.file_name().unwrap_or_default(),
+                    &staged.resume_state(),
+                )
+                .map_err(|error| SessionError::internal(error.to_string()))
+        });
+        if let Err(error) = result {
+            complete = false;
+            tracing::warn!(path = %file.display_path, error = %error.message, "retain publication journal for recovery");
+        } else {
+            file.native = None;
+        }
+    }
+    complete
 }
 
 /// Removes the resume record once a session is complete or cancelled.
@@ -1100,7 +1187,7 @@ fn forget_session(setup: &WorkerSetup) {
 /// The staging is reopened under the profile it was created with; the
 /// integrity of the resumed bytes is established by the rehash at publish.
 /// Returns the staging and journal paths now owned by the worker. On any
-/// failure nothing runs and the dropped handles remove their staging.
+/// failure nothing runs and existing recovery metadata remains available.
 /// `persisted` is updated with any file published here, so a caller that
 /// refuses the resume after a later failure still records those files.
 pub fn resume_worker(
@@ -1108,36 +1195,109 @@ pub fn resume_worker(
     receiver: mpsc::Receiver<Cmd>,
     persisted: &mut PersistedUploadSession,
 ) -> Result<(Vec<PathBuf>, u64), String> {
+    let (mut files, kept) = restore_files(&setup, persisted, || true)?;
+    for file in files.iter_mut().filter(|file| !file.published) {
+        if let Some(staged) = file.native.as_mut() {
+            staged.preserve = false;
+        }
+    }
+
+    let already = persisted_received(persisted);
+    spawn_worker_from(setup, receiver, Phase::Receiving { files }, true, already);
+    Ok((kept, already))
+}
+
+fn restore_files(
+    setup: &WorkerSetup,
+    persisted: &mut PersistedUploadSession,
+    active: impl Fn() -> bool,
+) -> Result<(Vec<FileState>, Vec<PathBuf>), String> {
     let mut files = Vec::with_capacity(persisted.files.len());
     let mut kept = Vec::new();
-    for file in &persisted.files {
-        let native = if file.published {
-            let destination = paths::join_under(&setup.dest_dir, &file.stored_components)?;
-            if !staged_object_valid(&destination, &file.object, || true)? {
+    for file in &mut persisted.files {
+        if !active() {
+            return Err("receive recovery cancelled".into());
+        }
+        let destination = paths::join_under(&setup.dest_dir, &file.stored_components)?;
+        let parent = destination.parent().ok_or("missing destination parent")?;
+        let directory = setup.destinations.directory(parent, false)?;
+        let name = destination.file_name().ok_or("missing destination name")?;
+        let runs = (file.prefix_bytes > 0).then_some((0, file.prefix_bytes));
+        let state = vot_sdk_file::ResumeState {
+            staging_name: file.staging_path.file_name().unwrap_or_default().to_owned(),
+            journal_name: file.journal_path.file_name().unwrap_or_default().to_owned(),
+            incarnation: file.incarnation,
+            profile: file.profile,
+            nas_contract: file.nas_contract,
+            runs: runs.into_iter().collect(),
+        };
+        let native = if file.published
+            && !file.journal_path.try_exists().map_err(|e| e.to_string())?
+        {
+            if !staged_object_valid(&destination, &file.object, &active)? {
                 return Err(format!("{} changed after publication", file.display_path));
             }
             None
         } else {
-            let destination = paths::join_under(&setup.dest_dir, &file.stored_components)?;
-            // Only the contiguous prefix is trusted, and only as bookkeeping:
-            // publish re-hashes the whole staged object (FileState::rehash),
-            // so a prefix the disk does not actually hold cannot publish.
-            let runs = (file.prefix_bytes > 0).then_some((0, file.prefix_bytes));
-            let native = NativeFile::resume(
-                &file.object,
-                &destination,
-                file.staging_path.clone(),
-                file.journal_path.clone(),
-                file.incarnation,
-                file.profile,
-                runs,
-            )
-            .map_err(|error| format!("{}: {error}", file.display_path))?;
+            if file.staging_path != parent.join(".vot-stage").join(&state.staging_name)
+                || file.journal_path != parent.join(".vot-stage").join(&state.journal_name)
+            {
+                return Err("resume metadata is outside the private receiving namespace".to_owned());
+            }
             kept.push(file.staging_path.clone());
             kept.push(file.journal_path.clone());
             let coverage = ObjectCoverage::from_runs(&file.object, runs)
                 .map_err(|error| format!("{}: {error:?}", file.display_path))?;
-            Some(StagedFile::new(native, destination, coverage, file.profile))
+            let mut staged = if destination.try_exists().map_err(|e| e.to_string())? {
+                let observation = directory
+                    .recover_publication(&file.object, name, &state)
+                    .map_err(|error| format!("recover {}: {error}", file.display_path))?;
+                let location = directory
+                    .destination(name)
+                    .map_err(|error| error.to_string())?;
+                setup.destinations.check_location(&location)?;
+                file.published = true;
+                if !file.receipt {
+                    file.receipt = setup
+                        .signer
+                        .write_sidecar(
+                            &location,
+                            &file.object,
+                            setup.session_id,
+                            observation,
+                            file.profile,
+                        )
+                        .is_ok();
+                }
+                StagedFile {
+                    destinations: Arc::clone(&setup.destinations),
+                    destination: destination.clone(),
+                    staging: file.staging_path.clone(),
+                    journal: file.journal_path.clone(),
+                    incarnation: file.incarnation,
+                    profile: file.profile,
+                    nas_contract: file.nas_contract,
+                    coverage: Mutex::new(coverage),
+                    active: None,
+                    active_directory: None,
+                    reopened: true,
+                    parked_metadata: None,
+                    preserve: true,
+                }
+            } else {
+                let native = directory
+                    .resume(&file.object, name, &state)
+                    .map_err(|error| format!("{}: {error}", file.display_path))?;
+                StagedFile::new(
+                    native,
+                    destination,
+                    coverage,
+                    file.profile,
+                    Arc::clone(&setup.destinations),
+                )
+            };
+            staged.preserve = true;
+            Some(staged)
         };
         files.push(FileState {
             display_path: file.display_path.clone(),
@@ -1146,29 +1306,33 @@ pub fn resume_worker(
             native,
             published: file.published,
             receipt: file.receipt,
-            // A file resumed from a zero prefix receives every byte through
-            // verify_range like a fresh session; only a trusted prefix needs
-            // the rehash.
             first_range_at: None,
             rehash: !file.published && file.prefix_bytes > 0,
         });
     }
     // A prefix that already covers the object publishes now, as begin does
     // for empty objects; the sender only has finish left to call.
-    for (file, record) in files.iter_mut().zip(persisted.files.iter_mut()) {
+    for index in 0..files.len() {
+        let file = &mut files[index];
         let complete = file.native.as_ref().is_some_and(|native| {
             let progress = native.progress();
             progress.covered_bytes == progress.total_bytes
         });
-        if complete {
-            publish_file(&setup, file).map_err(|error| error.message)?;
-            record.published = true;
-            record.receipt = file.receipt;
+        if complete && !file.published {
+            let result = publish_file(setup, file, &active);
+            persisted.files[index].published = file.published;
+            persisted.files[index].receipt = file.receipt;
+            if let Some(staged) = &file.native {
+                persisted.files[index].prefix_bytes = staged.progress().prefix_bytes;
+            }
+            if let Err(error) = result {
+                checkpoint_session(setup, &mut files);
+                return Err(error.message);
+            }
         }
     }
-    let already = persisted_received(persisted);
-    spawn_worker_from(setup, receiver, Phase::Receiving { files }, true, already);
-    Ok((kept, already))
+    checkpoint_session(setup, &mut files);
+    Ok((files, kept))
 }
 
 fn persisted_received(session: &PersistedUploadSession) -> u64 {
@@ -1274,9 +1438,72 @@ fn find_delivered(
     None
 }
 
-fn open_destination(setup: &WorkerSetup, entry: &PackageEntry) -> Result<FileState, SessionError> {
-    let components: Vec<String> = entry.path().map(str::to_owned).collect();
-    open_destination_for(setup, components, entry.object_id())
+fn prepare_files(
+    setup: &WorkerSetup,
+    entries: &[(Vec<String>, ObjectId)],
+    delivered: &HashMap<(&str, &str), Vec<&FileRecord>>,
+    active: impl Fn() -> bool + Sync,
+) -> Result<Vec<FileState>, SessionError> {
+    let prepare = |(components, object): &(Vec<String>, ObjectId)| {
+        if !active() {
+            return Err(SessionError::conflict("receive preparation cancelled"));
+        }
+        if let Some(existing) = find_delivered(setup, delivered, object, &active) {
+            return Ok(FileState {
+                display_path: components.join("/"),
+                stored_components: existing.stored_components,
+                object: object.clone(),
+                native: None,
+                published: true,
+                receipt: existing.receipt,
+                first_range_at: None,
+                rehash: false,
+            });
+        }
+        if !active() {
+            return Err(SessionError::conflict("receive preparation cancelled"));
+        }
+        open_destination_for(setup, components.clone(), object.clone())
+    };
+    if entries.len() < MAX_CHUNK_BATCH * 2 {
+        return entries.iter().map(prepare).collect();
+    }
+    let stopped = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let workers = entries
+            .chunks(entries.len().div_ceil(MAX_CHUNK_BATCH))
+            .map(|chunk| {
+                let prepare = &prepare;
+                let stopped = &stopped;
+                scope.spawn(move || {
+                    let mut files = Vec::with_capacity(chunk.len());
+                    for entry in chunk {
+                        if stopped.load(Ordering::Acquire) {
+                            break;
+                        }
+                        match prepare(entry) {
+                            Ok(file) => files.push(file),
+                            Err(error) => {
+                                stopped.store(true, Ordering::Release);
+                                return Err(error);
+                            }
+                        }
+                    }
+                    Ok(files)
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("receive preparation panicked"))
+            .collect::<Vec<_>>();
+        Ok(results
+            .into_iter()
+            .collect::<Result<Vec<_>, SessionError>>()?
+            .into_iter()
+            .flatten()
+            .collect())
+    })
 }
 
 fn open_destination_for(
@@ -1285,17 +1512,12 @@ fn open_destination_for(
     object: ObjectId,
 ) -> Result<FileState, SessionError> {
     let display_path = components.join("/");
-    let parent = |stored: &[String]| {
-        paths::join_under(&setup.dest_dir, &stored[..stored.len() - 1])
-            .map_err(SessionError::internal)
-    };
-    if components.len() > 1 {
-        let parent = parent(&components)?;
-        fs::create_dir_all(&parent)
-            .map_err(|error| SessionError::internal(format!("create folders: {error}")))?;
-        // Staging lands in this parent; see paths::tighten_dir.
-        paths::tighten_dir(&parent);
-    }
+    let parent = paths::join_under(&setup.dest_dir, &components[..components.len() - 1])
+        .map_err(SessionError::internal)?;
+    let directory = setup
+        .destinations
+        .directory(&parent, true)
+        .map_err(SessionError::internal)?;
     let name = components.last().expect("manifest paths are never empty");
     for attempt in 0..MAX_NAME_ATTEMPTS {
         let mut stored = components.clone();
@@ -1304,10 +1526,12 @@ fn open_destination_for(
         // only for creating intermediate directories.
         let destination =
             paths::join_under(&setup.dest_dir, &stored).map_err(SessionError::internal)?;
-        let profile = paths::commit_profile(&destination).map_err(|error| {
-            SessionError::internal(format!("inspect destination filesystem: {error}"))
-        })?;
-        match NativeFile::create(&object, &destination, profile) {
+        let profile = CommitProfile::Balanced;
+        match directory.create(
+            &object,
+            destination.file_name().expect("non-empty"),
+            profile,
+        ) {
             Ok(native) => {
                 return Ok(FileState {
                     display_path,
@@ -1318,6 +1542,7 @@ fn open_destination_for(
                         destination,
                         ObjectCoverage::new(&object),
                         profile,
+                        Arc::clone(&setup.destinations),
                     )),
                     published: false,
                     receipt: false,
@@ -1457,10 +1682,14 @@ fn accept_batch(
             files
                 .get_mut(item.entry)
                 .ok_or_else(|| SessionError::bad(format!("no entry {}", item.entry)))
-                .and_then(|file| match file.native.as_mut() {
-                    Some(staged) => staged.reopen(),
-                    None if file.published => Ok(()),
-                    None => Err(SessionError::internal("file state lost")),
+                .and_then(|file| {
+                    if file.published {
+                        return Ok(());
+                    }
+                    file.native
+                        .as_mut()
+                        .ok_or_else(|| SessionError::internal("file state lost"))?
+                        .reopen()
                 })
         })
         .collect();
@@ -1490,7 +1719,7 @@ fn accept_batch(
         .map(|(item, core)| {
             let core = core?;
             if core.complete && !files[item.entry].published {
-                publish_file(setup, &mut files[item.entry])?;
+                publish_file(setup, &mut files[item.entry], || true)?;
             }
             Ok(ChunkProgress {
                 accepted: core.accepted,
@@ -1514,228 +1743,104 @@ fn accept_batch(
     outcomes
 }
 
-struct Publication {
-    destination: PathBuf,
-    receipt: Option<PathBuf>,
-}
-
-// ponytail: process-wide lock; shard by destination only if publication
-// throughput measures a need. On the HTTP path the lock covers the rename
-// and receipt write (the push path also holds it across rollback capture);
-// measured 2026-09-01 (concurrent_load upload phase, 16 uploads publishing
-// within the same second) it added nothing visible: p95 completion 580 to
-// 730 ms for 64 MiB, 0 errors.
-static PUBLICATION_NAMESPACE: Mutex<()> = Mutex::new(());
-
-struct PublishedPushFiles {
-    directory: PathBuf,
-    owned: Vec<(PathBuf, PathBuf)>,
-    armed: bool,
-}
-
-impl PublishedPushFiles {
-    fn new(staging: &std::path::Path) -> Result<Self, SessionError> {
-        let directory = staging.join("rollback");
-        fs::create_dir(&directory)
-            .map_err(|error| SessionError::internal(format!("create rollback guards: {error}")))?;
-        paths::tighten_dir(&directory);
-        Ok(Self {
-            directory,
-            owned: Vec::new(),
-            armed: true,
-        })
-    }
-
-    fn capture(&mut self, publication: Publication) -> Result<(), SessionError> {
-        self.capture_path(publication.destination)?;
-        if let Some(path) = publication.receipt {
-            self.capture_path(path)?;
-        }
-        Ok(())
-    }
-
-    fn capture_path(&mut self, destination: PathBuf) -> Result<(), SessionError> {
-        let guard = self.directory.join(self.owned.len().to_string());
-        if let Err(error) = fs::hard_link(&destination, &guard) {
-            // Publication just created this path in a private directory. Hold
-            // its identity before unlinking so even this failure path cannot
-            // remove a replacement.
-            if let Ok(file) = fs::File::open(&destination) {
-                let _ = vot_platform_fs::remove_file_handle(&file, &destination);
-            }
-            return Err(SessionError::internal(format!(
-                "guard published native push file: {error}"
-            )));
-        }
-        self.owned.push((guard, destination));
-        Ok(())
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-        if let Err(error) = fs::remove_dir_all(&self.directory) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %self.directory.display(), %error, "remove native push rollback guards");
-            }
-        }
-    }
-}
-
-impl Drop for PublishedPushFiles {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let _publication_namespace = PUBLICATION_NAMESPACE
-            .lock()
-            .expect("publication namespace poisoned");
-        for (guard, destination) in self.owned.iter().rev() {
-            match fs::File::open(guard)
-                .and_then(|file| vot_platform_fs::remove_file_handle(&file, destination))
-            {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    tracing::error!(path = %destination.display(), %error, "roll back unrecorded native push file");
-                }
-            }
-        }
-        let _ = fs::remove_dir_all(&self.directory);
-    }
-}
-
-fn publish_push_entries(
-    setup: &WorkerSetup,
-    staging: &std::path::Path,
-    entries: &mut [PushEntry],
-    mut keep_running: impl FnMut() -> bool,
-) -> Result<PublishedPushFiles, SessionError> {
-    let mut publications = PublishedPushFiles::new(staging)?;
-    for entry in entries {
-        if !keep_running() {
-            return Err(SessionError::conflict("native push was cancelled"));
-        }
-        let file = entry
-            .file
-            .as_mut()
-            .ok_or_else(|| SessionError::internal("push file state is incomplete"))?;
-        if !file.published {
-            publish_push_entry(setup, file, &mut publications, || {})?;
-        }
-    }
-    Ok(publications)
-}
-
-fn publish_push_entry(
-    setup: &WorkerSetup,
+fn prepare_publication(
     file: &mut FileState,
-    publications: &mut PublishedPushFiles,
-    after_publish: impl FnOnce(),
+    active: impl Fn() -> bool,
 ) -> Result<(), SessionError> {
-    prepare_publication(file)?;
-    let _publication_namespace = PUBLICATION_NAMESPACE
-        .lock()
-        .expect("publication namespace poisoned");
-    let publication = publish_file_locked(setup, file)?;
-    after_publish();
-    publications.capture(publication)
-}
-
-fn prepare_publication(file: &mut FileState) -> Result<(), SessionError> {
     let staged = file
         .native
         .as_mut()
         .ok_or_else(|| SessionError::internal("file state lost"))?;
     staged.reopen()?;
     file.rehash |= staged.reopened;
-    // Outside the publication lock: a multi-GiB rehash must not stall every
-    // other session's publish. Nothing writes this staging meanwhile, since
-    // publish runs on the session's worker after its accepts have joined.
+    // Uncertain recovery verifies the held file after its writes have joined.
     if file.rehash {
-        let staging = file
-            .native
-            .as_ref()
-            .ok_or_else(|| SessionError::internal("file state lost"))?
-            .staging_path()
-            .to_path_buf();
-        staged_object_matches(&staging, &file.object).map_err(|error| {
-            SessionError::bad(format!(
-                "publish {} refused after resume: {error}; retry the upload",
-                file.display_path
-            ))
-        })?;
+        let input = staged
+            .native()?
+            .read_staging()
+            .map_err(|error| SessionError::internal(error.to_string()))?;
+        if !opened_object_valid(input, &file.object, active).map_err(SessionError::internal)? {
+            *staged.coverage.lock().expect("staging coverage poisoned") =
+                ObjectCoverage::new(&file.object);
+            staged.park();
+            staged.reopened = false;
+            file.rehash = false;
+            return Err(SessionError::bad(format!("publish {} refused after resume: staged bytes do not match the announced object; retry the upload", file.display_path)));
+        }
         file.rehash = false;
     }
     Ok(())
 }
 
-fn publish_file(setup: &WorkerSetup, file: &mut FileState) -> Result<Publication, SessionError> {
-    prepare_publication(file)?;
-    let _publication_namespace = PUBLICATION_NAMESPACE
-        .lock()
-        .expect("publication namespace poisoned");
-    publish_file_locked(setup, file)
-}
-
-fn publish_file_locked(
+fn publish_file(
     setup: &WorkerSetup,
     file: &mut FileState,
-) -> Result<Publication, SessionError> {
-    let destination = paths::join_under(&setup.dest_dir, &file.stored_components)
+    active: impl Fn() -> bool,
+) -> Result<(), SessionError> {
+    if !active() {
+        return Err(SessionError::conflict("receive publication cancelled"));
+    }
+    prepare_publication(file, &active)?;
+    if !active() {
+        return Err(SessionError::conflict("receive publication cancelled"));
+    }
+    finish_publication(setup, file)
+}
+
+fn finish_publication(setup: &WorkerSetup, file: &mut FileState) -> Result<(), SessionError> {
+    setup
+        .destinations
+        .check_live()
         .map_err(SessionError::internal)?;
     let native = file
         .native
         .as_mut()
         .ok_or_else(|| SessionError::internal("file state lost"))?;
+    let location = native
+        .directory()?
+        .destination(native.destination.file_name().unwrap_or_default())
+        .map_err(|error| SessionError::internal(error.to_string()))?;
+    setup
+        .destinations
+        .check_location(&location)
+        .map_err(SessionError::conflict)?;
     let active = native
         .active
         .as_mut()
         .ok_or_else(|| SessionError::internal("staging is not open"))?;
-    active.publish().map_err(|error| {
+    active.publish_retaining_journal().map_err(|error| {
         SessionError::conflict(format!(
             "publish {} failed: {error}; the name may have been taken mid-upload, retry the upload",
             file.display_path
         ))
     })?;
+    native.preserve = true;
+    setup
+        .destinations
+        .check_location(&location)
+        .map_err(SessionError::conflict)?;
     // Best effort: the file is delivered and verified either way, and the
     // record notes whether its receipt exists.
-    let receipt = if let Some(observation) = active.publish_observation() {
+    if let Some(observation) = active.publish_observation() {
         match setup.signer.write_sidecar(
-            &destination,
+            &location,
             &file.object,
             setup.session_id,
             observation,
             native.profile,
         ) {
-            Ok(path) => {
+            Ok(_) => {
                 file.receipt = true;
-                Some(path)
             }
             Err(error) => {
                 tracing::warn!(file = %file.display_path, "receipt: {error}");
-                None
             }
         }
-    } else {
-        None
-    };
-    file.published = true;
-    file.native = None;
-    Ok(Publication {
-        destination,
-        receipt,
-    })
-}
-
-/// Hashes a fully covered staging file and checks it is the announced object.
-/// Runs on a re-attached file before publish: the resumed prefix was
-/// bookkeeping, and this is what makes the published bytes verified.
-fn staged_object_matches(path: &std::path::Path, object: &ObjectId) -> Result<(), String> {
-    if staged_object_valid(path, object, || true)? {
-        Ok(())
-    } else {
-        Err("staged bytes do not match the announced object".to_owned())
     }
+    file.published = true;
+    native.preserve = true;
+    native.park();
+    Ok(())
 }
 
 fn staged_object_valid(
@@ -1743,7 +1848,6 @@ fn staged_object_valid(
     object: &ObjectId,
     active: impl Fn() -> bool,
 ) -> Result<bool, String> {
-    let suite = Suite::try_from(object.suite).map_err(|_| "unsupported suite".to_owned())?;
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -1753,9 +1857,18 @@ fn staged_object_valid(
             (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
         );
     }
-    let mut input = options
+    let input = options
         .open(path)
         .map_err(|error| format!("open staging: {error}"))?;
+    opened_object_valid(input, object, active)
+}
+
+fn opened_object_valid(
+    mut input: fs::File,
+    object: &ObjectId,
+    active: impl Fn() -> bool,
+) -> Result<bool, String> {
+    let suite = Suite::try_from(object.suite).map_err(|_| "unsupported suite".to_owned())?;
     let metadata = input
         .metadata()
         .map_err(|error| format!("stat staging: {error}"))?;
@@ -1821,6 +1934,9 @@ fn handle_finish(
     events.push(TransferLog::plain(now_unix(), "finished", Some(replays)));
     let mut report = commit_upload(setup, files, replays, rejected, Some("http"), events)?;
     report.received = received;
+    if checkpoint_session(setup, files) {
+        forget_session(setup);
+    }
     *phase = Phase::Done;
     Ok(report)
 }
@@ -1828,22 +1944,42 @@ fn handle_finish(
 /// A session that ends without finishing still leaves its published files
 /// on disk. Record them as a partial upload so retention, dedupe, and the
 /// operator listing see them; without a record they would be orphans.
+fn preserve_phase(setup: &WorkerSetup, phase: &mut Phase) {
+    if let Phase::Receiving { files } = phase {
+        checkpoint_session(setup, files);
+        for file in files {
+            if let Some(native) = file.native.take() {
+                native.abandon();
+            }
+        }
+    }
+}
+
 fn commit_partial(
     setup: &WorkerSetup,
-    phase: &Phase,
+    phase: &mut Phase,
     replays: u64,
     rejected: u64,
     log: &TransferLog,
-) {
+) -> bool {
     let Phase::Receiving { files } = phase else {
-        return;
+        return true;
     };
+    let unresolved = setup.destinations.check_live().is_err()
+        || files.iter().any(|file| {
+            !file.published
+                && file.native.as_ref().is_some_and(|staged| {
+                    staged.preserve
+                        || staged
+                            .active
+                            .as_ref()
+                            .is_some_and(NativeFile::recovery_required)
+                })
+        });
     let records = file_records(setup, files.iter().filter(|file| file.published));
     if records.is_empty() {
-        return;
+        return !unresolved;
     }
-    let count = records.len();
-    let events = log.snapshot();
     match commit_upload_records(
         setup,
         records,
@@ -1851,14 +1987,12 @@ fn commit_partial(
         rejected,
         Some("http"),
         true,
-        events,
+        log.snapshot(),
     ) {
-        Ok(_) => tracing::info!(
-            target: "audit", event = "upload_partial_recorded", link = %setup.link_id,
-            files = count, "recorded the published files of an unfinished session"
-        ),
+        Ok(_) => !unresolved && checkpoint_session(setup, files),
         Err(error) => {
-            tracing::warn!(link = %setup.link_id, error = %error.message, "partial upload record failed")
+            tracing::warn!(link = %setup.link_id, error = %error.message, "partial upload record failed");
+            false
         }
     }
 }
@@ -1886,21 +2020,29 @@ pub fn commit_persisted_interruption(
         })
         .collect();
     let at = now_unix();
+    let recovery_id = format!("recovery-{}", session.id);
     if !records.is_empty() {
         let upload = UploadRecord {
-            id: crate::auth::random_token(),
+            id: recovery_id,
             started_at: session.started_at,
             completed_at: at,
             replayed_chunks: 0,
             rejected_chunks: 0,
-            transport: Some("http".to_owned()),
+            transport: Some(
+                if session.push_key.is_some() {
+                    "push"
+                } else {
+                    "http"
+                }
+                .to_owned(),
+            ),
             package_root: hex::encode(session.package.root),
             total_bytes: records.iter().map(|record| record.bytes).sum(),
             files: records,
             partial: true,
             log: vec![LogEvent {
                 at,
-                kind: "dropped".to_owned(),
+                kind: "interrupted".to_owned(),
                 path: None,
                 bytes: None,
                 secs: None,
@@ -2023,14 +2165,15 @@ impl From<&vot_cli::ReceiveObject> for PushObjectKey {
 }
 
 struct PushEntry {
-    components: Vec<String>,
-    object: ObjectId,
     file: Option<FileState>,
 }
+
+type PushFiles = Arc<std::sync::RwLock<Vec<(usize, FileState)>>>;
 
 struct PushObject {
     entries: Vec<usize>,
     complete: bool,
+    active: Option<PushFiles>,
 }
 
 #[derive(Default)]
@@ -2053,9 +2196,21 @@ struct PushReceive {
     inner: Mutex<PushReceiveInner>,
     received: AtomicU64,
     last_active: AtomicU64,
+    checkpoint: Mutex<PersistTracker>,
 }
 
 impl PushReceive {
+    fn check_active(&self) -> Result<(), SessionError> {
+        self.mark_active();
+        if self.control.is_cancelled() {
+            return Err(SessionError::conflict("native push was cancelled"));
+        }
+        self.setup
+            .destinations
+            .check_live()
+            .map_err(SessionError::internal)
+    }
+
     fn cli_error(&self, error: SessionError) -> vot_cli::Error {
         self.inner.lock().expect("push receive poisoned").last_error = Some(error.message.clone());
         vot_cli::Error::Io(std::io::Error::other(error.message))
@@ -2092,6 +2247,11 @@ impl PushReceive {
         summary: vot_cli::PackageSummary,
         records: &[vot_cli::EntryRecord],
     ) -> Result<(), SessionError> {
+        let _lease = self
+            .app
+            .sessions
+            .push_lease(&hex::encode(self.setup.session_id));
+        self.check_active()?;
         let validated = validate_push_manifest(&self.setup, summary, records)?;
         let prior_uploads = self
             .setup
@@ -2100,50 +2260,79 @@ impl PushReceive {
             .map_err(|error| SessionError::internal(format!("link read failed: {error}")))?
             .ok_or_else(|| SessionError::conflict("request link no longer exists"))?;
         let delivered = delivered_index(&prior_uploads);
-        fs::create_dir_all(self.staging.join("objects"))
-            .map_err(|error| SessionError::internal(format!("create push staging: {error}")))?;
-        paths::tighten_dir(&self.staging);
-        paths::tighten_dir(&self.staging.join("objects"));
-
+        let mut saved = self
+            .control
+            .resume_key
+            .as_ref()
+            .map(|key| self.setup.store.load_push_session(key))
+            .transpose()
+            .map_err(SessionError::internal)?
+            .flatten();
+        let restored = if let Some(saved) = saved.as_mut().filter(|saved| !saved.files.is_empty()) {
+            if saved.files.len() != validated.len()
+                || saved
+                    .files
+                    .iter()
+                    .zip(&validated)
+                    .any(|(file, (components, object))| {
+                        file.display_path != components.join("/") || file.object != *object
+                    })
+            {
+                return Err(SessionError::conflict(
+                    "push manifest changed since its checkpoint",
+                ));
+            }
+            Some(
+                restore_files(&self.setup, saved, || self.check_active().is_ok())
+                    .map_err(SessionError::internal)?
+                    .0,
+            )
+        } else {
+            None
+        };
+        let files = match restored {
+            Some(files) => files,
+            None => prepare_files(&self.setup, &validated, &delivered, || {
+                self.check_active().is_ok()
+            })?,
+        };
         let mut inner = self.inner.lock().expect("push receive poisoned");
         if inner.manifest_ready {
             return Err(SessionError::conflict("push manifest was already prepared"));
         }
-        for (components, object) in validated {
+        for file in files {
+            self.check_active()?;
             let key = PushObjectKey {
-                suite: object.suite,
-                root: object.root,
-                length: object.length,
+                suite: file.object.suite,
+                root: file.object.root,
+                length: file.object.length,
             };
-            let file = find_delivered(&self.setup, &delivered, &object, || {
-                self.mark_active();
-                !self.control.is_cancelled()
-            })
-            .map(|existing| FileState {
-                display_path: components.join("/"),
-                stored_components: existing.stored_components,
-                object: object.clone(),
-                native: None,
-                published: true,
-                receipt: existing.receipt,
-                first_range_at: None,
-                rehash: false,
-            });
             let index = inner.entries.len();
-            inner.entries.push(PushEntry {
-                components,
-                object,
-                file,
-            });
+            inner.entries.push(PushEntry { file: Some(file) });
             inner
                 .objects
                 .entry(key)
                 .or_insert_with(|| PushObject {
                     entries: Vec::new(),
                     complete: false,
+                    active: None,
                 })
                 .entries
                 .push(index);
+        }
+        let mut record = persisted_session(
+            &self.setup,
+            inner.entries.iter().filter_map(|entry| entry.file.as_ref()),
+        );
+        record.push_key = self.control.resume_key.clone();
+        self.setup
+            .store
+            .insert_upload_session(&record)
+            .map_err(SessionError::internal)?;
+        for entry in &mut inner.entries {
+            if let Some(staged) = entry.file.as_mut().and_then(|file| file.native.as_mut()) {
+                staged.preserve = true;
+            }
         }
         inner.remaining = inner.objects.len();
         inner.manifest_ready = true;
@@ -2159,47 +2348,59 @@ impl PushReceive {
         self: &Arc<Self>,
         object: &vot_cli::ReceiveObject,
     ) -> Result<Option<Box<dyn vot_cli::ReceiveSink>>, SessionError> {
+        let _lease = self
+            .app
+            .sessions
+            .push_lease(&hex::encode(self.setup.session_id));
+        self.check_active()?;
         let key = PushObjectKey::from(object);
-        let all_delivered = {
-            let inner = self.inner.lock().expect("push receive poisoned");
-            let planned = inner
-                .objects
-                .get(&key)
-                .ok_or_else(|| SessionError::bad("push object is absent from the manifest"))?;
-            planned
-                .entries
-                .iter()
-                .all(|index| inner.entries[*index].file.is_some())
-        };
-        if all_delivered {
-            self.finish_object(key, Vec::new())?;
+        let mut inner = self.inner.lock().expect("push receive poisoned");
+        let planned = inner
+            .objects
+            .get(&key)
+            .ok_or_else(|| SessionError::bad("push object is absent from the manifest"))?;
+        if planned.active.is_some() {
+            return Err(SessionError::conflict("push object already has a sink"));
+        }
+        let indices = planned.entries.clone();
+        if indices.iter().all(|index| {
+            inner.entries[*index]
+                .file
+                .as_ref()
+                .is_some_and(|file| file.published)
+        }) {
+            drop(inner);
+            self.finish_object(key)?;
             return Ok(None);
         }
-        let path = self.staging.join("objects").join(hex::encode(key.root));
-        match fs::symlink_metadata(&path) {
-            Ok(_) => {
-                if staged_object_valid(&path, &ObjectId::from(key), || {
-                    self.mark_active();
-                    !self.control.is_cancelled()
-                })
-                .map_err(SessionError::internal)?
+        if indices.len() <= MAX_OPEN_PUSH_ALIASES {
+            for index in &indices {
+                if let Some(staged) = inner.entries[*index]
+                    .file
+                    .as_mut()
+                    .and_then(|file| file.native.as_mut())
                 {
-                    self.complete_object(object)?;
-                    return Ok(None);
+                    staged.reopen()?;
                 }
-                fs::remove_file(&path).map_err(|error| {
-                    SessionError::internal(format!("remove incomplete push object: {error}"))
-                })?;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(SessionError::internal(format!("stat push object: {error}"))),
         }
-        let sink = vot_scheduler::FileSink::create_new(&path, key.length)
-            .map_err(|error| SessionError::internal(format!("create push object: {error}")))?;
+        let files = Arc::new(std::sync::RwLock::new(
+            indices
+                .into_iter()
+                .map(|index| {
+                    let file = inner.entries[index]
+                        .file
+                        .take()
+                        .expect("admitted push file");
+                    (index, file)
+                })
+                .collect(),
+        ));
+        inner.objects.get_mut(&key).unwrap().active = Some(Arc::clone(&files));
         Ok(Some(Box::new(PushFileSink {
-            sink,
-            path,
+            files,
             receive: Arc::clone(self),
+            stopped: AtomicBool::new(false),
         })))
     }
 
@@ -2207,60 +2408,82 @@ impl PushReceive {
         self: &Arc<Self>,
         object: &vot_cli::ReceiveObject,
     ) -> Result<(), SessionError> {
-        let key = PushObjectKey::from(object);
-        let pending = {
-            let inner = self.inner.lock().expect("push receive poisoned");
-            inner
-                .objects
-                .get(&key)
-                .ok_or_else(|| SessionError::bad("push object is absent from the manifest"))?
-                .entries
-                .iter()
-                .filter_map(|index| {
-                    let entry = &inner.entries[*index];
-                    entry
-                        .file
-                        .is_none()
-                        .then(|| (*index, entry.components.clone(), entry.object.clone()))
-                })
-                .collect::<Vec<_>>()
-        };
-        let mut completed = Vec::with_capacity(pending.len());
-        for (index, components, object) in pending {
-            if self.control.is_cancelled() {
-                return Err(SessionError::conflict("native push was cancelled"));
-            }
-            completed.push((
-                index,
-                open_destination_for(&self.setup, components, object)?,
-            ));
-        }
-        let path = self.staging.join("objects").join(hex::encode(key.root));
-        let files = completed
-            .iter_mut()
-            .map(|(_, file)| file)
-            .collect::<Vec<_>>();
-        reprove_staging(&path, &ObjectId::from(key), files, || {
-            self.mark_active();
-            !self.control.is_cancelled()
-        })?;
-        self.finish_object(key, completed)
+        self.finish_object(PushObjectKey::from(object))
     }
 
-    fn finish_object(
-        &self,
-        key: PushObjectKey,
-        completed: Vec<(usize, FileState)>,
-    ) -> Result<(), SessionError> {
-        let (records, mut publications) = {
+    fn checkpoint(&self, inner: &mut PushReceiveInner) -> Result<(), String> {
+        let mut progress = Vec::new();
+        for (index, entry) in inner.entries.iter().enumerate() {
+            if let Some(file) = &entry.file {
+                progress.push(push_progress(index, file));
+            }
+        }
+        for object in inner.objects.values() {
+            if let Some(active) = &object.active {
+                for (index, file) in active.read().expect("push object poisoned").iter() {
+                    progress.push(push_progress(*index, file));
+                }
+            }
+        }
+        self.setup
+            .store
+            .update_upload_file_progress(&hex::encode(self.setup.session_id), progress)?;
+        for entry in &mut inner.entries {
+            if let Some(file) = entry.file.as_mut() {
+                forget_publications(std::slice::from_mut(file));
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_object(&self, key: PushObjectKey) -> Result<(), SessionError> {
+        let _lease = self
+            .app
+            .sessions
+            .push_lease(&hex::encode(self.setup.session_id));
+        self.check_active()?;
+        let active = {
             let mut inner = self.inner.lock().expect("push receive poisoned");
-            for (index, file) in completed {
+            let object = inner
+                .objects
+                .get(&key)
+                .ok_or_else(|| SessionError::bad("push object is absent from the manifest"))?;
+            if object.complete {
+                return Ok(());
+            }
+            if object.active.is_none()
+                && !object.entries.iter().all(|index| {
+                    inner.entries[*index]
+                        .file
+                        .as_ref()
+                        .is_some_and(|file| file.published)
+                })
+            {
+                return Err(SessionError::conflict("push object has no completed sink"));
+            }
+            inner.objects.get_mut(&key).unwrap().active.take()
+        };
+        if let Some(active) = active {
+            let mut files = active.write().expect("push object poisoned");
+            let result = files.iter_mut().try_for_each(|(_, file)| {
+                self.check_active()?;
+                if !file.published {
+                    publish_file(&self.setup, file, || self.check_active().is_ok())?;
+                }
+                Ok(())
+            });
+            let mut inner = self.inner.lock().expect("push receive poisoned");
+            for (index, mut file) in files.drain(..) {
+                if let Some(staged) = file.native.as_mut() {
+                    staged.park();
+                }
                 inner.entries[index].file = Some(file);
             }
-            let planned = inner
-                .objects
-                .get_mut(&key)
-                .ok_or_else(|| SessionError::bad("push object is absent from the manifest"))?;
+            result?;
+        }
+        let records = {
+            let mut inner = self.inner.lock().expect("push receive poisoned");
+            let planned = inner.objects.get_mut(&key).unwrap();
             if planned.complete {
                 return Ok(());
             }
@@ -2269,17 +2492,19 @@ impl PushReceive {
                 .remaining
                 .checked_sub(1)
                 .ok_or_else(|| SessionError::internal("push object count underflow"))?;
+            let due = self
+                .checkpoint
+                .lock()
+                .expect("push checkpoint poisoned")
+                .should_checkpoint(0);
+            if due || inner.remaining == 0 {
+                self.checkpoint(&mut inner)
+                    .map_err(SessionError::internal)?;
+            }
             if inner.remaining != 0 || inner.committing {
                 return Ok(());
             }
             inner.committing = true;
-            if self.control.is_cancelled() {
-                return Err(SessionError::conflict("native push was cancelled"));
-            }
-            let publications =
-                publish_push_entries(&self.setup, &self.staging, &mut inner.entries, || {
-                    !self.control.is_cancelled()
-                })?;
             let files = inner
                 .entries
                 .iter()
@@ -2287,18 +2512,17 @@ impl PushReceive {
                     entry
                         .file
                         .as_ref()
-                        .ok_or_else(|| SessionError::internal("push file state is incomplete"))
+                        .filter(|file| file.published)
+                        .ok_or_else(|| SessionError::internal("push file is not published"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            (file_records_from_refs(&self.setup, &files), publications)
+            file_records_from_refs(&self.setup, &files)
         };
-        if self.control.is_cancelled() {
-            return Err(SessionError::conflict("native push was cancelled"));
-        }
         let report =
             commit_upload_records(&self.setup, records, 0, 0, Some("push"), false, Vec::new())?;
-        publications.disarm();
-        self.inner.lock().expect("push receive poisoned").succeeded = true;
+        let mut inner = self.inner.lock().expect("push receive poisoned");
+        inner.succeeded = true;
+        drop(inner);
         let sid = hex::encode(self.setup.session_id);
         crate::app::upload_completed(
             &self.app,
@@ -2309,6 +2533,17 @@ impl PushReceive {
         );
         Ok(())
     }
+}
+
+fn push_progress(index: usize, file: &FileState) -> (usize, u64, bool, bool) {
+    (
+        index,
+        file.native
+            .as_ref()
+            .map_or(file.object.length, |staged| staged.progress().prefix_bytes),
+        file.published,
+        file.receipt,
+    )
 }
 
 impl Drop for PushReceive {
@@ -2338,19 +2573,59 @@ impl Drop for PushReceive {
                 0,
             );
         }
+        let active = inner
+            .objects
+            .values_mut()
+            .filter_map(|object| object.active.take())
+            .collect::<Vec<_>>();
+        for active in active {
+            for (index, mut file) in active.write().expect("push object poisoned").drain(..) {
+                if let Some(staged) = file.native.as_mut() {
+                    staged.preserve = true;
+                    staged.park();
+                }
+                inner.entries[index].file = Some(file);
+            }
+        }
+        if !succeeded {
+            if let Err(error) = self.checkpoint(&mut inner) {
+                tracing::warn!(%error, "retain native push recovery journals");
+            }
+        }
+        let retain = !succeeded
+            || inner.entries.iter().any(|entry| {
+                entry
+                    .file
+                    .as_ref()
+                    .is_some_and(|file| file.native.is_some())
+            });
         inner.entries.clear();
         drop(inner);
         crate::app::remove_push_ticket(&self.app, &sid);
-        if !succeeded && self.control.park() {
-            let _ = self.app.sessions.mark_active(&sid);
+        if retain {
+            if self.control.park() {
+                let _ = self.app.sessions.mark_active(&sid);
+            } else {
+                self.app.sessions.remove(&sid);
+            }
             return;
         }
         if let Err(error) = self.setup.store.delete_upload_session(&sid) {
             tracing::warn!(%error, "delete completed push session");
         }
-        if let Err(error) = fs::remove_dir_all(&self.staging) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %self.staging.display(), %error, "remove push staging");
+        if let Some(lock) = self
+            .control
+            .directory_lock
+            .lock()
+            .expect("push directory poisoned")
+            .as_ref()
+        {
+            if let Err(error) = self
+                .setup
+                .destinations
+                .clear_push_directory(&self.staging, lock)
+            {
+                tracing::warn!(path = %self.staging.display(), %error, "clear push staging");
             }
         }
         self.app.sessions.remove(&sid);
@@ -2368,66 +2643,219 @@ impl From<PushObjectKey> for ObjectId {
     }
 }
 
+// A single object may appear at thousands of paths in a repeated-frame package.
+const MAX_OPEN_PUSH_ALIASES: usize = 16;
+
 struct PushFileSink {
-    sink: vot_scheduler::FileSink,
-    path: PathBuf,
+    files: PushFiles,
     receive: Arc<PushReceive>,
+    stopped: AtomicBool,
+}
+
+impl PushFileSink {
+    fn check_writable(&self) -> Result<(), SessionError> {
+        self.receive.mark_active();
+        if self.stopped.load(Ordering::Acquire)
+            || self.receive.control.is_cancelled()
+            || self.receive.app.lease_lost.load(Ordering::Acquire)
+        {
+            return Err(SessionError::conflict("native push stopped"));
+        }
+        Ok(())
+    }
+
+    fn place(&self, verified: &vot_sdk::verify::VerifiedSlice<'_>) -> Result<(), SessionError> {
+        fn accept(
+            file: &FileState,
+            verified: &vot_sdk::verify::VerifiedSlice<'_>,
+        ) -> Result<(), SessionError> {
+            if file.published {
+                return Ok(());
+            }
+            let staged = file
+                .native
+                .as_ref()
+                .ok_or_else(|| SessionError::internal("push file state lost"))?;
+            staged
+                .native()?
+                .accept(verified)
+                .map_err(|e| SessionError::internal(e.to_string()))?;
+            staged.record(verified)
+        }
+        let files = self
+            .files
+            .read()
+            .map_err(|_| SessionError::internal("push object poisoned"))?;
+        self.check_writable()?;
+        if files.is_empty() {
+            return Err(SessionError::internal("push object is no longer active"));
+        }
+        if files.len() <= MAX_OPEN_PUSH_ALIASES {
+            return files.iter().try_for_each(|(_, file)| {
+                self.check_writable()?;
+                accept(file, verified)
+            });
+        }
+        drop(files);
+        // ponytail: serialize large alias groups; a bounded clone provider can replace repeated writes.
+        let mut files = self
+            .files
+            .write()
+            .map_err(|_| SessionError::internal("push object poisoned"))?;
+        self.check_writable()?;
+        if files.is_empty() {
+            return Err(SessionError::internal("push object is no longer active"));
+        }
+        for (_, file) in files.iter_mut().filter(|(_, file)| !file.published) {
+            self.check_writable()?;
+            file.native
+                .as_mut()
+                .ok_or_else(|| SessionError::internal("push file state lost"))?
+                .reopen()?;
+            let result = accept(file, verified);
+            file.native.as_mut().unwrap().park();
+            result?;
+        }
+        Ok(())
+    }
 }
 
 impl vot_scheduler::RangeSink for PushFileSink {
-    fn write_at(&self, covered_offset: u64, data: &[u8]) -> Result<(), vot_scheduler::SinkError> {
-        vot_scheduler::RangeSink::write_at(&self.sink, covered_offset, data)?;
+    fn write_at(&self, _: u64, _: &[u8]) -> Result<(), vot_scheduler::SinkError> {
+        Err(vot_scheduler::SinkError)
+    }
+
+    fn write_verified(
+        &self,
+        verified: &vot_scheduler::VerifiedSlice<'_>,
+    ) -> Result<(), vot_scheduler::SinkError> {
+        if self.stopped.load(Ordering::Acquire)
+            || self.receive.control.is_cancelled()
+            || self.receive.app.lease_lost.load(Ordering::Acquire)
+        {
+            return Err(vot_scheduler::SinkError);
+        }
+        let verified = vot_sdk::verify::VerifiedSlice::from(*verified);
+        if self.place(&verified).is_err() {
+            self.stopped.store(true, Ordering::Release);
+            return Err(vot_scheduler::SinkError);
+        }
+        let due = self
+            .receive
+            .checkpoint
+            .lock()
+            .map_err(|_| vot_scheduler::SinkError)?
+            .should_checkpoint(verified.data().len() as u64);
+        if due {
+            let mut inner = self
+                .receive
+                .inner
+                .lock()
+                .map_err(|_| vot_scheduler::SinkError)?;
+            if self.receive.checkpoint(&mut inner).is_err() {
+                self.stopped.store(true, Ordering::Release);
+                return Err(vot_scheduler::SinkError);
+            }
+        }
         self.receive
             .received
-            .fetch_add(data.len() as u64, Ordering::AcqRel);
-        self.receive.app.push_metrics.add_bytes(data.len() as u64);
+            .fetch_add(verified.data().len() as u64, Ordering::AcqRel);
+        self.receive
+            .app
+            .push_metrics
+            .add_bytes(verified.data().len() as u64);
         self.receive.mark_active();
         Ok(())
     }
 }
 
 impl vot_cli::ReceiveSink for PushFileSink {
+    fn resumed_prefix(&self) -> Result<u64, vot_cli::Error> {
+        let files = self
+            .files
+            .read()
+            .map_err(|_| std::io::Error::other("push object poisoned"))?;
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(std::io::Error::other("push sink stopped").into());
+        }
+        files
+            .iter()
+            .map(|(_, file)| push_progress(0, file).1)
+            .min()
+            .ok_or_else(|| std::io::Error::other("push object is no longer active").into())
+    }
+
     fn flush(&self) -> Result<(), vot_cli::Error> {
-        self.sink.file().sync_all().map_err(Into::into)
+        let mut files = self
+            .files
+            .write()
+            .map_err(|_| std::io::Error::other("push object poisoned"))?;
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(std::io::Error::other("push sink stopped").into());
+        }
+        let parked = files.len() > MAX_OPEN_PUSH_ALIASES;
+        let result = files
+            .iter_mut()
+            .filter(|(_, file)| !file.published)
+            .try_for_each(|(_, file)| {
+                self.check_writable()
+                    .map_err(|error| std::io::Error::other(error.message))?;
+                let staged = file
+                    .native
+                    .as_mut()
+                    .ok_or_else(|| std::io::Error::other("push file state lost"))?;
+                staged
+                    .reopen()
+                    .map_err(|e| std::io::Error::other(e.message))?;
+                let result = staged
+                    .native()
+                    .map_err(|e| std::io::Error::other(e.message))?
+                    .read_staging()
+                    .map_err(std::io::Error::other)?
+                    .sync_all();
+                if parked {
+                    staged.park();
+                }
+                result
+            });
+        if result.is_err() {
+            self.stopped.store(true, Ordering::Release);
+        }
+        result.map_err(Into::into)
     }
 
     fn discard_partial(&self) -> Result<(), vot_cli::Error> {
-        match fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        let _files = self
+            .files
+            .write()
+            .map_err(|_| std::io::Error::other("push object poisoned"))?;
+        self.stopped.store(true, Ordering::Release);
+        Ok(())
     }
 }
 
-pub(crate) fn lock_push_directory(directory: &std::path::Path) -> std::io::Result<fs::File> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(
-            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::DIRECTORY).bits() as i32,
-        );
-    }
-    lock_push_handle(options.open(directory)?, directory)
+pub(crate) fn lock_push_directory(
+    directory: &std::path::Path,
+    contract: vot_sdk_file::NasContract,
+) -> std::io::Result<fs::File> {
+    let directory = vot_platform_fs::Directory::open_with_nas(directory, contract)?;
+    let location = directory.entry(std::ffi::OsStr::new("writer.lock"))?;
+    location.require_removal_parent()?;
+    let file = location.open(
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CREATE,
+        rustix::fs::Mode::from_raw_mode(0o600),
+    )?;
+    lock_push_handle(file, &location.path())
 }
 
-fn lock_push_handle(file: fs::File, directory: &std::path::Path) -> std::io::Result<fs::File> {
+fn lock_push_handle(file: fs::File, path: &std::path::Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::MetadataExt as _;
     file.try_lock().map_err(std::io::Error::other)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let held = file.metadata()?;
-        let named = fs::symlink_metadata(directory)?;
-        if !named.is_dir() || held.dev() != named.dev() || held.ino() != named.ino() {
-            return Err(std::io::Error::other(
-                "push directory changed while locking",
-            ));
-        }
+    let held = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    if !named.is_file() || held.dev() != named.dev() || held.ino() != named.ino() {
+        return Err(std::io::Error::other("push lock changed while opening"));
     }
-    #[cfg(not(unix))]
-    let _ = directory;
     Ok(file)
 }
 
@@ -2436,6 +2864,7 @@ fn lock_push_handle(file: fs::File, directory: &std::path::Path) -> std::io::Res
 pub fn push_staging_dir(setup: &WorkerSetup) -> PathBuf {
     setup
         .dest_dir
+        .join(".vot-stage")
         .join(format!(".vot-push-{}", hex::encode(setup.session_id)))
 }
 
@@ -2463,6 +2892,7 @@ pub(crate) fn push_seams(
         inner: Mutex::new(PushReceiveInner::default()),
         received: AtomicU64::new(0),
         last_active: AtomicU64::new(now_unix()),
+        checkpoint: Mutex::new(PersistTracker::new()),
     });
     let handle = PushSeamHandle(Arc::downgrade(&receive));
     (receive_seams(receive), handle)
@@ -2603,17 +3033,20 @@ fn file_records_from_refs(setup: &WorkerSetup, files: &[&FileState]) -> Vec<File
         .collect()
 }
 
+#[cfg(test)]
 enum LocalProofs {
     Blake3(vot_proof_blake3::GroupCvs),
     Sha256(vot_proof_sha256::PieceHashes),
 }
 
+#[cfg(test)]
 struct LocalRangeCover {
     covered_offset: u64,
     covered_length: u64,
     proof: Vec<u8>,
 }
 
+#[cfg(test)]
 impl LocalProofs {
     fn prove(&self, offset: u64, length: u64) -> Result<LocalRangeCover, SessionError> {
         match self {
@@ -2635,6 +3068,7 @@ impl LocalProofs {
     }
 }
 
+#[cfg(test)]
 fn reprove_staging(
     path: &std::path::Path,
     object: &ObjectId,
@@ -3215,7 +3649,7 @@ impl Sessions {
         &self,
         admission: SessionAdmission,
         sender: mpsc::Sender<Cmd>,
-        received_bytes: impl FnOnce() -> Result<u64, String>,
+        received_bytes: impl FnOnce() -> Result<(u64, Vec<crate::store::RetainedReservation>), String>,
     ) -> Result<(), InsertError> {
         let SessionAdmission {
             id,
@@ -3278,16 +3712,31 @@ impl Sessions {
             return Err(InsertError::TenantSessionLimit);
         }
         if let Some(max_total) = max_total_bytes {
-            let received = received.unwrap_or(0);
+            let (received, retained) = received.unwrap_or_default();
+            let resume_key = match &kind {
+                SessionKind::Push(control) => control.resume_key.as_ref(),
+                SessionKind::Http => None,
+            };
+            let resuming = retained.iter().any(|reservation| {
+                resume_key.is_some()
+                    && reservation.push_key.as_ref() == resume_key
+                    && reserved_bytes <= reservation.bytes
+            });
+            let retained_bytes = retained.iter().filter(|reservation| {
+                !inner.map.contains_key(&reservation.id)
+                    && !handles().any(|handle| matches!(&handle.kind, SessionKind::Push(control) if control.resume_key.is_some() && control.resume_key == reservation.push_key))
+            }).fold(0_u64, |total, reservation| total.saturating_add(reservation.bytes));
             let already_reserved = handles()
                 .filter(|handle| handle.tenant == tenant)
                 .fold(0_u64, |total, handle| {
                     total.saturating_add(handle.reserved_bytes)
                 });
-            if reserved_bytes
-                > max_total
-                    .saturating_sub(received)
-                    .saturating_sub(already_reserved)
+            if !resuming
+                && reserved_bytes
+                    > max_total
+                        .saturating_sub(received)
+                        .saturating_sub(already_reserved)
+                        .saturating_sub(retained_bytes)
             {
                 return Err(InsertError::ByteQuota);
             }
@@ -3348,7 +3797,7 @@ impl Sessions {
                 kind: SessionKind::Http,
             },
             sender,
-            || Ok(0),
+            || Ok((0, Vec::new())),
         )
     }
 
@@ -3422,6 +3871,18 @@ impl Sessions {
             .lock()
             .expect("session activity poisoned") = Instant::now();
         true
+    }
+
+    fn push_lease(&self, id: &str) -> Option<SessionLease> {
+        let inner = self.inner.lock().expect("sessions poisoned");
+        let handle = inner.map.get(id)?;
+        if !matches!(&handle.kind, SessionKind::Push(_)) {
+            return None;
+        }
+        handle.activity.in_flight.fetch_add(1, Ordering::AcqRel);
+        Some(SessionLease {
+            activity: Arc::clone(&handle.activity),
+        })
     }
 
     /// Cancels a connected push after releasing the session registry lock.
@@ -3695,44 +4156,90 @@ mod pin_tests {
     fn admission_reserves_bytes_and_session_slots_without_overflow() {
         let sessions = Sessions::new();
         sessions
-            .insert_admitted(admission("s1", 60, 100, 2), dummy_sender(), || Ok(0))
+            .insert_admitted(admission("s1", 60, 100, 2), dummy_sender(), || {
+                Ok((0, Vec::new()))
+            })
             .unwrap();
         let mut full = admission("full", 1, 100, 2);
         full.tenant = "other".to_owned();
         full.max_sessions = 1;
         assert_eq!(
-            sessions.insert_admitted(full, dummy_sender(), || Ok(0)),
+            sessions.insert_admitted(full, dummy_sender(), || Ok((0, Vec::new()))),
             Err(InsertError::Capacity)
         );
         assert_eq!(
-            sessions.insert_admitted(admission("s2", 60, 100, 2), dummy_sender(), || Ok(0),),
+            sessions.insert_admitted(admission("s2", 60, 100, 2), dummy_sender(), || Ok((
+                0,
+                Vec::new()
+            )),),
             Err(InsertError::ByteQuota)
         );
         assert_eq!(
             sessions.insert_admitted(
                 admission("s2", u64::MAX, u64::MAX, 1),
                 dummy_sender(),
-                || Ok(0),
+                || Ok((0, Vec::new())),
             ),
             Err(InsertError::TenantSessionLimit)
         );
         sessions.remove("s1");
         assert_eq!(
-            sessions.insert_admitted(admission("stale", 60, 100, 1), dummy_sender(), || Ok(60),),
+            sessions.insert_admitted(admission("stale", 60, 100, 1), dummy_sender(), || Ok((
+                60,
+                Vec::new()
+            )),),
             Err(InsertError::ByteQuota)
         );
         assert_eq!(
-            sessions.insert_admitted(admission("full", 1, u64::MAX, 1), dummy_sender(), || Ok(
-                u64::MAX
-            ),),
+            sessions.insert_admitted(admission("full", 1, u64::MAX, 1), dummy_sender(), || Ok((
+                u64::MAX,
+                Vec::new()
+            )),),
             Err(InsertError::ByteQuota)
         );
         sessions
             .insert_admitted(
                 admission("s2", u64::MAX, u64::MAX, 1),
                 dummy_sender(),
-                || Ok(0),
+                || Ok((0, Vec::new())),
             )
+            .unwrap();
+    }
+
+    #[test]
+    fn retained_admissions_stay_charged_without_counting_active_sessions_twice() {
+        let usage = || {
+            Ok((
+                0,
+                vec![crate::store::RetainedReservation {
+                    id: "existing".into(),
+                    push_key: Some("checkpoint".into()),
+                    bytes: 60,
+                }],
+            ))
+        };
+        let sessions = Sessions::new();
+        sessions
+            .insert_admitted(admission("existing", 60, 100, 10), dummy_sender(), || {
+                Ok((0, Vec::new()))
+            })
+            .unwrap();
+        sessions
+            .insert_admitted(admission("other", 40, 100, 10), dummy_sender(), usage)
+            .unwrap();
+        sessions.remove("existing");
+        assert_eq!(
+            sessions.insert_admitted(admission("new", 1, 100, 10), dummy_sender(), usage),
+            Err(InsertError::ByteQuota)
+        );
+        let mut resume = admission("resume", 60, 100, 10);
+        resume.kind = SessionKind::Push(PushControl::resumable("checkpoint".into(), None));
+        sessions
+            .insert_admitted(resume, dummy_sender(), usage)
+            .unwrap();
+        sessions.remove("other");
+        sessions
+            .insert_admitted(admission("replacement", 40, 100, 10), dummy_sender(), usage)
             .unwrap();
     }
 
@@ -3745,7 +4252,7 @@ mod pin_tests {
         first.max_sessions = 1;
         first.max_link_sessions = 1;
         sessions
-            .insert_admitted(first, dummy_sender(), || Ok(0))
+            .insert_admitted(first, dummy_sender(), || Ok((0, Vec::new())))
             .unwrap();
         let make_retry = || {
             let mut next = admission("next", 60, 100, 1);
@@ -3755,12 +4262,12 @@ mod pin_tests {
             next
         };
         assert_eq!(
-            sessions.insert_admitted(make_retry(), dummy_sender(), || Ok(41)),
+            sessions.insert_admitted(make_retry(), dummy_sender(), || Ok((41, Vec::new()))),
             Err(InsertError::ByteQuota)
         );
         assert!(sessions.contains_push("first"));
         sessions
-            .insert_admitted(make_retry(), dummy_sender(), || Ok(40))
+            .insert_admitted(make_retry(), dummy_sender(), || Ok((40, Vec::new())))
             .unwrap();
         assert!(!sessions.contains_push("first"));
         assert!(sessions.contains_push("next"));
@@ -3772,7 +4279,7 @@ mod pin_tests {
         foreign.id = "foreign".to_owned();
         foreign.kind = SessionKind::Push(PushControl::resumable("other".to_owned(), None));
         assert_eq!(
-            sessions.insert_admitted(foreign, dummy_sender(), || Ok(0)),
+            sessions.insert_admitted(foreign, dummy_sender(), || Ok((0, Vec::new()))),
             Err(InsertError::Capacity)
         );
     }
@@ -3783,7 +4290,7 @@ mod pin_tests {
         let mut push = admission("push", 0, 100, 1);
         push.kind = SessionKind::Push(PushControl::new());
         sessions
-            .insert_admitted(push, dummy_sender(), || Ok(0))
+            .insert_admitted(push, dummy_sender(), || Ok((0, Vec::new())))
             .unwrap();
 
         assert!(matches!(sessions.touch("push"), Err(TouchError::WrongKind)));
@@ -3803,12 +4310,17 @@ mod pin_tests {
         let mut push = admission("push", 0, 100, 1);
         push.kind = SessionKind::Push(control.clone());
         sessions
-            .insert_admitted(push, dummy_sender(), || Ok(0))
+            .insert_admitted(push, dummy_sender(), || Ok((0, Vec::new())))
             .unwrap();
 
         assert!(sessions.contains_push("push"));
         assert!(control.connect());
         assert!(!control.connect());
+        assert!(sessions.push_lease("missing").is_none());
+        let lease = sessions.push_lease("push").unwrap();
+        sessions.sweep(0);
+        assert!(!control.is_cancelled());
+        drop(lease);
         sessions.sweep(0);
 
         assert!(control.is_cancelled());
@@ -3831,13 +4343,13 @@ mod pin_tests {
         let mut first = admission("push-1", 60, 100, 2);
         first.kind = SessionKind::Push(PushControl::new());
         sessions
-            .insert_admitted(first, dummy_sender(), || Ok(0))
+            .insert_admitted(first, dummy_sender(), || Ok((0, Vec::new())))
             .unwrap();
 
         let mut second = admission("push-2", 50, 100, 2);
         second.kind = SessionKind::Push(PushControl::new());
         assert_eq!(
-            sessions.insert_admitted(second, dummy_sender(), || Ok(0)),
+            sessions.insert_admitted(second, dummy_sender(), || Ok((0, Vec::new()))),
             Err(InsertError::ByteQuota)
         );
 
@@ -3845,7 +4357,7 @@ mod pin_tests {
         let mut admitted = admission("push-2", 50, 100, 2);
         admitted.kind = SessionKind::Push(PushControl::new());
         sessions
-            .insert_admitted(admitted, dummy_sender(), || Ok(0))
+            .insert_admitted(admitted, dummy_sender(), || Ok((0, Vec::new())))
             .unwrap();
     }
 
@@ -3967,11 +4479,21 @@ mod push_tests {
         expected_package: ObjectId,
         app: &crate::app::App,
     ) -> WorkerSetup {
+        use std::os::unix::fs::DirBuilderExt as _;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(directory.join("receive"))
+            .unwrap();
         WorkerSetup {
             store: Arc::clone(&app.store),
             link_id: "link".to_owned(),
             tenant: String::new(),
             dest_dir: directory.join("receive"),
+            destinations: Arc::new(
+                crate::receiving::Destinations::configured(&directory.join("receive"), &app.store)
+                    .unwrap(),
+            ),
             dest_rel: String::new(),
             expected_package,
             max_total_bytes: u64::MAX,
@@ -3982,6 +4504,91 @@ mod push_tests {
             quiet_after_secs: 5,
             ended: mpsc::unbounded_channel().0,
         }
+    }
+
+    #[test]
+    fn preparation_bounds_workers_preserves_order_and_cleans_up_on_failure() {
+        for count in [0, 1, 16, 17, 128] {
+            let directory = tempfile::tempdir().unwrap();
+            let object = object(Suite::Blake3Bao64, b"frame");
+            let setup = setup(directory.path(), object.clone());
+            let mut entries = (0..count)
+                .map(|index| (vec![format!("frame-{index}")], object.clone()))
+                .collect::<Vec<_>>();
+            let workers = Mutex::new(HashSet::new());
+            let files = prepare_files(&setup, &entries, &HashMap::new(), || {
+                workers.lock().unwrap().insert(std::thread::current().id());
+                true
+            })
+            .unwrap();
+            assert_eq!(files.len(), count);
+            for (index, file) in files.iter().enumerate() {
+                assert_eq!(file.stored_components, entries[index].0);
+                assert!(!file.published);
+            }
+            let workers = workers.lock().unwrap().len();
+            assert!(workers <= MAX_CHUNK_BATCH);
+            if count >= MAX_CHUNK_BATCH * 2 {
+                assert!(workers > 1);
+            }
+            drop(files);
+            if count == 0 {
+                continue;
+            }
+            fs::write(setup.dest_dir.join("blocked"), b"unrelated").unwrap();
+            entries[count / 2].0 = vec!["blocked".into(), "frame".into()];
+            assert!(prepare_files(&setup, &entries, &HashMap::new(), || true).is_err());
+            assert_eq!(
+                fs::read(setup.dest_dir.join("blocked")).unwrap(),
+                b"unrelated"
+            );
+            assert_eq!(
+                fs::read_dir(setup.dest_dir.join(".vot-stage"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+            let checks = AtomicU64::new(0);
+            assert!(prepare_files(&setup, &entries, &HashMap::new(), || checks
+                .fetch_add(1, Ordering::Relaxed)
+                < 1)
+            .is_err());
+            assert_eq!(
+                fs::read_dir(setup.dest_dir.join(".vot-stage"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn stopped_storage_preserves_staging_and_refuses_writes_and_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let object = object(Suite::Blake3Bao64, b"data");
+        let setup = setup(directory.path(), object.clone());
+        let mut file = open_destination_for(&setup, vec!["file".into()], object).unwrap();
+        let staged = file.native.as_mut().unwrap();
+        staged.reopen().unwrap();
+        let staging = staged.staging.clone();
+        let journal = staged.journal.clone();
+        setup.destinations.stop();
+        assert!(staged.native().is_err());
+        assert!(staged.reopen().is_err());
+        assert!(staged.directory().is_err());
+        assert!(finish_publication(&setup, &mut file).is_err());
+        let mut phase = Phase::Receiving { files: vec![file] };
+        assert!(!commit_partial(
+            &setup,
+            &mut phase,
+            0,
+            0,
+            &TransferLog::default()
+        ));
+        drop(phase);
+        assert!(staging.is_file());
+        assert!(journal.is_file());
+        assert!(!setup.dest_dir.join("file").exists());
     }
 
     #[test]
@@ -4028,26 +4635,510 @@ mod push_tests {
         }
     }
 
+    #[test]
+    fn ordinary_parking_preserves_verification_but_changed_bytes_require_rehash() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"verified bytes";
+        let object = object(Suite::Blake3Bao64, bytes);
+        let setup = setup(directory.path(), object.clone());
+        let mut file =
+            open_destination_for(&setup, vec!["frame.exr".into()], object.clone()).unwrap();
+        let proof = vot_proof_blake3::prove(bytes, 0, bytes.len() as u64).unwrap();
+        let verified = verify_range(&object, 0, bytes, &proof.proof).unwrap();
+        let staged = file.native.as_mut().unwrap();
+        staged.reopen().unwrap();
+        staged.native().unwrap().accept(&verified).unwrap();
+        staged.record(&verified).unwrap();
+        staged.park();
+        staged.reopen().unwrap();
+        assert!(
+            !staged.reopened,
+            "ordinary parking must not cause another full payload read"
+        );
+        staged.park();
+        fs::write(staged.staging_path(), b"changed bytes").unwrap();
+        assert!(prepare_publication(&mut file, || true).is_err());
+        assert!(!setup.dest_dir.join("frame.exr").exists());
+    }
+
+    #[test]
+    fn cancelled_publication_keeps_verified_staging_before_during_and_after_rehash() {
+        for allowed_checks in [0, 1, 2] {
+            let directory = tempfile::tempdir().unwrap();
+            let bytes = b"verified";
+            let object = object(Suite::Blake3Bao64, bytes);
+            let setup = setup(directory.path(), object.clone());
+            let source = directory.path().join("source");
+            fs::write(&source, bytes).unwrap();
+            let mut file =
+                open_destination_for(&setup, vec!["frame".into()], object.clone()).unwrap();
+            reprove_staging(&source, &object, vec![&mut file], || true).unwrap();
+            file.rehash = true;
+            let checks = std::cell::Cell::new(0);
+            assert!(publish_file(&setup, &mut file, || {
+                let current = checks.get();
+                checks.set(current + 1);
+                current < allowed_checks
+            })
+            .is_err());
+            assert!(!setup.dest_dir.join("frame").exists());
+            assert_eq!(
+                file.native.as_ref().unwrap().progress().prefix_bytes,
+                bytes.len() as u64
+            );
+            publish_file(&setup, &mut file, || true).unwrap();
+            assert_eq!(fs::read(setup.dest_dir.join("frame")).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn publication_journal_remains_until_the_database_checkpoints_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let object = object(Suite::Blake3Bao64, b"");
+        let setup = setup(directory.path(), object.clone());
+        let mut files =
+            vec![open_destination_for(&setup, vec!["empty.exr".into()], object).unwrap()];
+        persist_session(&setup, &files).unwrap();
+        let journal = files[0].native.as_ref().unwrap().journal_path().to_owned();
+        publish_file(&setup, &mut files[0], || true).unwrap();
+        assert!(journal.exists());
+        let connection =
+            rusqlite::Connection::open(directory.path().join("data/votport.db")).unwrap();
+        connection.execute_batch("CREATE TRIGGER fail_checkpoint BEFORE UPDATE ON upload_session_files BEGIN SELECT RAISE(FAIL, 'checkpoint failure'); END;").unwrap();
+        checkpoint_session(&setup, &mut files);
+        assert!(journal.exists());
+        assert!(!setup.store.load_upload_sessions().unwrap()[0].files[0].published);
+        connection
+            .execute_batch("DROP TRIGGER fail_checkpoint;")
+            .unwrap();
+        checkpoint_session(&setup, &mut files);
+        assert!(!journal.exists());
+        assert!(setup.store.load_upload_sessions().unwrap()[0].files[0].published);
+        assert!(setup.dest_dir.join("empty.exr").exists());
+    }
+
+    #[tokio::test]
+    async fn finished_upload_keeps_recovery_when_the_final_checkpoint_fails() {
+        for (fail_checkpoint, fail_cleanup) in [(false, false), (true, false), (false, true)] {
+            use std::os::unix::fs::PermissionsExt as _;
+            let retain = fail_checkpoint || fail_cleanup;
+            let directory = tempfile::tempdir().unwrap();
+            let object = object(Suite::Blake3Bao64, b"");
+            let setup = setup(directory.path(), object.clone());
+            setup
+                .store
+                .insert_link(crate::store::Link {
+                    id: setup.link_id.clone(),
+                    tenant: String::new(),
+                    label: "checkpoint".into(),
+                    dest: String::new(),
+                    password_hash: None,
+                    created_at: 0,
+                    expires_at: None,
+                    max_bytes: None,
+                    active: true,
+                    legal_hold: false,
+                    notify_on_upload: false,
+                    uploads: Vec::new(),
+                    events: Vec::new(),
+                })
+                .unwrap();
+            let mut files =
+                vec![open_destination_for(&setup, vec!["frame".into()], object).unwrap()];
+            persist_session(&setup, &files).unwrap();
+            let journal = files[0].native.as_ref().unwrap().journal_path().to_owned();
+            publish_file(&setup, &mut files[0], || true).unwrap();
+            let connection =
+                rusqlite::Connection::open(directory.path().join("data/votport.db")).unwrap();
+            if fail_checkpoint {
+                connection.execute_batch("CREATE TRIGGER fail_checkpoint BEFORE UPDATE ON upload_session_files BEGIN SELECT RAISE(FAIL, 'checkpoint failure'); END;").unwrap();
+            }
+            let private = setup.dest_dir.join(".vot-stage");
+            if fail_cleanup {
+                fs::set_permissions(&private, fs::Permissions::from_mode(0o770)).unwrap();
+            }
+            let store = Arc::clone(&setup.store);
+            let retry_setup = self::setup(directory.path(), setup.expected_package.clone());
+            let sessions = Sessions::new();
+            let (sender, receiver) = mpsc::channel(1);
+            let sid = hex::encode(setup.session_id);
+            sessions
+                .insert(sid.clone(), setup.link_id.clone(), String::new(), sender)
+                .unwrap();
+            let command = sessions.touch(&sid).unwrap();
+            let (reply, completed) = oneshot::channel();
+            command
+                .sender
+                .send(Cmd::Finish {
+                    reply,
+                    _lease: command.lease,
+                })
+                .await
+                .unwrap();
+            spawn_worker_from(setup, receiver, Phase::Receiving { files }, false, 0);
+            tokio::time::timeout(std::time::Duration::from_secs(5), completed)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(journal.exists(), retain);
+            let mut retained = store.load_upload_sessions().unwrap();
+            assert_eq!(retained.len(), usize::from(retain));
+            if retain {
+                fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+                let mut persisted = retained.remove(0);
+                assert_eq!(persisted.files[0].published, !fail_checkpoint);
+                connection
+                    .execute_batch("DROP TRIGGER IF EXISTS fail_checkpoint;")
+                    .unwrap();
+                let (files, _) = restore_files(&retry_setup, &mut persisted, || true).unwrap();
+                assert!(files[0].published);
+                assert!(!journal.exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_native_teardown_keeps_admission_until_publication_cleanup() {
+        for cleaned in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let application = crate::api::testing::build(directory.path());
+            let object = object(Suite::Blake3Bao64, b"");
+            let setup = setup_with_app(directory.path(), object.clone(), &application);
+            let key = hex::encode([5; 16]);
+            let stage = setup.destinations.push_directory(&key).unwrap();
+            let lock = lock_push_directory(&stage, vot_sdk_file::NasContract::Unqualified).unwrap();
+            let mut file = open_destination_for(&setup, vec!["frame".into()], object).unwrap();
+            let mut record = persisted_session(&setup, std::slice::from_ref(&file));
+            record.push_key = Some(key.clone());
+            setup.store.insert_upload_session(&record).unwrap();
+            let journal = file.native.as_ref().unwrap().journal.clone();
+            publish_file(&setup, &mut file, || true).unwrap();
+            setup
+                .store
+                .update_upload_file_progress(&record.id, [push_progress(0, &file)])
+                .unwrap();
+            if cleaned {
+                assert!(forget_publications(std::slice::from_mut(&mut file)));
+            }
+            let (seams, handle) = push_seams(
+                Arc::clone(&application),
+                setup,
+                PushControl::resumable(key.clone(), Some(lock)),
+                tokio::runtime::Handle::current(),
+            );
+            let receive = handle.0.upgrade().unwrap();
+            {
+                let mut inner = receive.inner.lock().unwrap();
+                inner.entries.push(PushEntry { file: Some(file) });
+                inner.succeeded = true;
+            }
+            drop(receive);
+            drop(seams);
+            assert!(handle.0.upgrade().is_none());
+            assert_eq!(journal.exists(), !cleaned);
+            assert_eq!(
+                application.store.load_push_session(&key).unwrap().is_some(),
+                !cleaned
+            );
+            assert!(directory.path().join("receive/frame").exists());
+        }
+    }
+
+    #[test]
+    fn fully_checkpointed_corruption_persists_the_reset_and_allows_resend() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"verified frame";
+        let object = object(Suite::Blake3Bao64, bytes);
+        let setup = setup(directory.path(), object.clone());
+        let source = directory.path().join("source");
+        fs::write(&source, bytes).unwrap();
+        let mut file = open_destination_for(&setup, vec!["frame".into()], object.clone()).unwrap();
+        reprove_staging(&source, &object, vec![&mut file], || true).unwrap();
+        persist_session(&setup, std::slice::from_ref(&file)).unwrap();
+        let staging = file.native.as_ref().unwrap().staging.clone();
+        file.native.take().unwrap().abandon();
+        fs::write(&staging, b"corrupted data").unwrap();
+        let mut persisted = setup.store.load_upload_sessions().unwrap().remove(0);
+        assert_eq!(persisted.files[0].prefix_bytes, bytes.len() as u64);
+        assert!(restore_files(&setup, &mut persisted, || true).is_err());
+        assert_eq!(persisted.files[0].prefix_bytes, 0);
+        let mut persisted = setup.store.load_upload_sessions().unwrap().remove(0);
+        assert_eq!(persisted.files[0].prefix_bytes, 0);
+        let (mut files, _) = restore_files(&setup, &mut persisted, || true).unwrap();
+        reprove_staging(&source, &object, vec![&mut files[0]], || true).unwrap();
+        publish_file(&setup, &mut files[0], || true).unwrap();
+        assert_eq!(fs::read(setup.dest_dir.join("frame")).unwrap(), bytes);
+    }
+
+    #[test]
+    fn publication_refuses_a_replaced_visible_parent_after_cache_eviction() {
+        let directory = tempfile::tempdir().unwrap();
+        let object = object(Suite::Blake3Bao64, b"");
+        let setup = setup(directory.path(), object.clone());
+        let mut file =
+            open_destination_for(&setup, vec!["project".into(), "frame".into()], object).unwrap();
+        file.native.as_mut().unwrap().reopen().unwrap();
+        for index in 0..16 {
+            setup
+                .destinations
+                .directory(&setup.dest_dir.join(format!("other-{index}")), true)
+                .unwrap();
+        }
+        let selected = setup.dest_dir.join("project");
+        let held = setup.dest_dir.join("held");
+        fs::rename(&selected, &held).unwrap();
+        fs::create_dir(&selected).unwrap();
+        assert!(publish_file(&setup, &mut file, || true).is_err());
+        assert!(!selected.join("frame").exists());
+        assert!(!selected.join("frame.vot-receipt").exists());
+        fs::remove_dir(&selected).unwrap();
+        fs::rename(&held, &selected).unwrap();
+        publish_file(&setup, &mut file, || true).unwrap();
+        assert!(selected.join("frame.vot-receipt").exists());
+    }
+
+    #[test]
+    fn unresolved_partial_upload_keeps_its_admission_and_recovery_history_grows() {
+        let directory = tempfile::tempdir().unwrap();
+        let object = object(Suite::Blake3Bao64, b"");
+        let setup = setup(directory.path(), object.clone());
+        setup
+            .store
+            .insert_link(crate::store::Link {
+                id: setup.link_id.clone(),
+                tenant: String::new(),
+                label: "recovery".into(),
+                dest: String::new(),
+                password_hash: None,
+                created_at: 0,
+                expires_at: None,
+                max_bytes: None,
+                active: true,
+                legal_hold: false,
+                notify_on_upload: false,
+                uploads: Vec::new(),
+                events: Vec::new(),
+            })
+            .unwrap();
+        let mut files = (0..2)
+            .map(|index| {
+                open_destination_for(&setup, vec![format!("frame-{index}")], object.clone())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        persist_session(&setup, &files).unwrap();
+        files[1].native.as_mut().unwrap().preserve = true;
+        let mut phase = Phase::Receiving { files };
+        assert!(!commit_partial(
+            &setup,
+            &mut phase,
+            0,
+            0,
+            &TransferLog::default()
+        ));
+        let Phase::Receiving { files } = &mut phase else {
+            unreachable!()
+        };
+        publish_file(&setup, &mut files[0], || true).unwrap();
+        let journal = files[0].native.as_ref().unwrap().journal_path().to_owned();
+        let connection =
+            rusqlite::Connection::open(directory.path().join("data/votport.db")).unwrap();
+        connection.execute_batch("CREATE TRIGGER fail_checkpoint BEFORE UPDATE ON upload_session_files BEGIN SELECT RAISE(FAIL, 'checkpoint failure'); END;").unwrap();
+        assert!(!commit_partial(
+            &setup,
+            &mut phase,
+            0,
+            0,
+            &TransferLog::default()
+        ));
+        assert!(journal.exists());
+        preserve_phase(&setup, &mut phase);
+        assert!(journal.exists());
+        assert!(!setup.store.load_upload_sessions().unwrap()[0].files[0].published);
+        connection
+            .execute_batch("DROP TRIGGER fail_checkpoint;")
+            .unwrap();
+        let mut persisted = setup.store.load_upload_sessions().unwrap().remove(0);
+        let (files, _) = restore_files(&setup, &mut persisted, || true).unwrap();
+        assert!(files[0].published);
+        assert!(!journal.exists());
+        drop(files);
+        let mut persisted = setup.store.load_upload_sessions().unwrap().remove(0);
+        commit_persisted_interruption(&setup.store, &setup.ended, &persisted, "fixture");
+        setup
+            .store
+            .tombstone_files("", &setup.link_id, |file| file.stored_as == "frame-0")
+            .unwrap();
+        persisted.files[1].published = true;
+        commit_persisted_interruption(&setup.store, &setup.ended, &persisted, "fixture");
+        let uploads = setup.store.uploads_by_id(&setup.link_id).unwrap().unwrap();
+        let recovered = uploads
+            .iter()
+            .find(|upload| upload.id == format!("recovery-{}", persisted.id))
+            .unwrap();
+        assert_eq!(recovered.files.len(), 2);
+        assert!(recovered.files[0].deleted);
+        assert!(!recovered.files[1].deleted);
+    }
+
     #[cfg(unix)]
     #[test]
     fn push_directory_lock_refuses_a_detached_handle_and_symlink() {
         let directory = tempfile::tempdir().unwrap();
         let stage = directory.path().join("stage");
-        fs::create_dir(&stage).unwrap();
-        let stale = fs::File::open(&stage).unwrap();
-        fs::remove_dir(&stage).unwrap();
-        fs::create_dir(&stage).unwrap();
-        assert!(lock_push_handle(stale, &stage).is_err());
-        let held = lock_push_directory(&stage).unwrap();
-        assert!(lock_push_directory(&stage).is_err());
+        use std::os::unix::fs::DirBuilderExt as _;
+        fs::DirBuilder::new().mode(0o700).create(&stage).unwrap();
+        let path = stage.join("writer.lock");
+        let stale = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        assert!(lock_push_handle(stale, &path).is_err());
+        let held = lock_push_directory(&stage, vot_sdk_file::NasContract::Unqualified).unwrap();
+        assert!(lock_push_directory(&stage, vot_sdk_file::NasContract::Unqualified).is_err());
         drop(held);
         let alias = directory.path().join("alias");
         std::os::unix::fs::symlink(&stage, &alias).unwrap();
-        assert!(lock_push_directory(&alias).is_err());
+        assert!(lock_push_directory(&alias, vot_sdk_file::NasContract::Unqualified).is_err());
+    }
+
+    fn write_push(
+        sink: Arc<dyn vot_cli::ReceiveSink>,
+        object: &vot_cli::ReceiveObject,
+        bytes: &[u8],
+    ) {
+        let subject = object.object.try_into().unwrap();
+        let mut verifier = vot_scheduler::ReliableReceiver::new(1 << 20, 1 << 20, 1 << 20).unwrap();
+        verifier.begin_ranges(subject, Box::new(sink)).unwrap();
+        let proof = vot_proof_blake3::prove(bytes, 0, bytes.len() as u64).unwrap();
+        verifier
+            .receive_range(subject, 0, bytes, &proof.proof)
+            .unwrap();
+        verifier.finish_ranges(subject).unwrap();
     }
 
     #[tokio::test]
-    async fn push_retry_rehashes_objects_and_reproves_them_before_publication() {
+    async fn repeated_frames_keep_alias_handles_bounded_and_publish_independent_files() {
+        use std::os::unix::fs::MetadataExt as _;
+        for (count, cancelled) in [
+            (MAX_OPEN_PUSH_ALIASES, false),
+            (MAX_OPEN_PUSH_ALIASES + 1, false),
+            (MAX_OPEN_PUSH_ALIASES + 1, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let application = crate::api::testing::build(directory.path());
+            application
+                .store
+                .insert_link(crate::store::Link {
+                    id: "link".to_owned(),
+                    tenant: String::new(),
+                    label: "retry".to_owned(),
+                    dest: String::new(),
+                    password_hash: None,
+                    created_at: 0,
+                    expires_at: None,
+                    max_bytes: None,
+                    active: true,
+                    legal_hold: false,
+                    notify_on_upload: false,
+                    uploads: Vec::new(),
+                    events: Vec::new(),
+                })
+                .unwrap();
+            let bytes = b"repeated frame";
+            let object = object(Suite::Blake3Bao64, bytes);
+            let package = ObjectId {
+                suite: 1,
+                root: [4; 32],
+                length: object.length * count as u64,
+            };
+            let setup = setup_with_app(directory.path(), package.clone(), &application);
+            let key = hex::encode([3; 16]);
+            setup.destinations.push_directory(&key).unwrap();
+            persist_push(&setup, key.clone()).unwrap();
+            let records: Vec<_> = (0..count)
+                .map(|index| {
+                    record(
+                        vot_manifest::PackagePath::portable([format!("frame-{index:04}.exr")])
+                            .unwrap(),
+                        &object,
+                    )
+                })
+                .collect();
+            let requested = vot_cli::ReceiveObject {
+                object: vot_codec::frames::ObjectId {
+                    suite: object.suite,
+                    root: object.root,
+                    length: object.length,
+                },
+                entries: Vec::new(),
+            };
+            let (seams, handle) = push_seams(
+                application,
+                setup,
+                PushControl::resumable(key, None),
+                tokio::runtime::Handle::current(),
+            );
+            let receive = handle.0.upgrade().unwrap();
+            if cancelled {
+                receive.control.cancel();
+            }
+            let prepared = receive.prepare_manifest(
+                vot_cli::PackageSummary {
+                    root: package.root,
+                    logical_length: package.length,
+                    entries: count as u64,
+                },
+                &records,
+            );
+            if cancelled {
+                assert!(prepared.is_err());
+                assert!(receive.inner.lock().unwrap().entries.is_empty());
+                continue;
+            }
+            prepared.unwrap();
+            assert!(receive.complete_object(&requested).is_err());
+            let sink: Arc<dyn vot_cli::ReceiveSink> =
+                Arc::from(receive.choose_sink(&requested).unwrap().unwrap());
+            let files = receive.inner.lock().unwrap().objects[&PushObjectKey::from(&requested)]
+                .active
+                .as_ref()
+                .unwrap()
+                .clone();
+            assert!(
+                files
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, file)| file.native.as_ref().unwrap().active.is_some())
+                    .count()
+                    <= MAX_OPEN_PUSH_ALIASES
+            );
+            write_push(Arc::clone(&sink), &requested, bytes);
+            sink.flush().unwrap();
+            assert_eq!(sink.resumed_prefix().unwrap(), object.length);
+            let mut identities = std::collections::HashSet::new();
+            for (_, file) in files.write().unwrap().iter_mut() {
+                publish_file(&receive.setup, file, || true).unwrap();
+                let path = receive.setup.dest_dir.join(&file.display_path);
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+                assert!(identities.insert(fs::metadata(&path).unwrap().ino()));
+            }
+            sink.discard_partial().unwrap();
+            assert!(sink.resumed_prefix().is_err());
+            drop(sink);
+            drop(receive);
+            drop(seams);
+        }
+    }
+
+    #[tokio::test]
+    async fn push_retry_preserves_direct_files_and_requires_verified_witnesses() {
         let directory = tempfile::tempdir().unwrap();
         let data = [b"first payload".as_slice(), b"second payload".as_slice()];
         let objects = data.map(|bytes| object(Suite::Blake3Bao64, bytes));
@@ -4079,8 +5170,7 @@ mod push_tests {
             })
             .unwrap();
         let key = hex::encode([3; 16]);
-        let stage = first_setup.dest_dir.join(format!(".vot-push-{key}"));
-        fs::create_dir_all(&stage).unwrap();
+        let stage = first_setup.destinations.push_directory(&key).unwrap();
         let records = objects
             .iter()
             .enumerate()
@@ -4108,8 +5198,10 @@ mod push_tests {
             })
             .collect::<Vec<_>>();
         persist_push(&first_setup, key.clone()).unwrap();
-        let control =
-            PushControl::resumable(key.clone(), Some(lock_push_directory(&stage).unwrap()));
+        let control = PushControl::resumable(
+            key.clone(),
+            Some(lock_push_directory(&stage, vot_sdk_file::NasContract::Unqualified).unwrap()),
+        );
         let (seams, handle) = push_seams(
             application.clone(),
             first_setup,
@@ -4118,23 +5210,26 @@ mod push_tests {
         );
         let receive = handle.0.upgrade().unwrap();
         receive.prepare_manifest(summary, &records).unwrap();
-        let sink = receive.choose_sink(&receive_objects[0]).unwrap().unwrap();
-        sink.write_at(0, data[0]).unwrap();
+        let sink: Arc<dyn vot_cli::ReceiveSink> =
+            Arc::from(receive.choose_sink(&receive_objects[0]).unwrap().unwrap());
+        assert!(sink.write_at(0, data[0]).is_err());
+        write_push(Arc::clone(&sink), &receive_objects[0], data[0]);
         sink.flush().unwrap();
         receive.complete_object(&receive_objects[0]).unwrap();
         drop(sink);
         let sink = receive.choose_sink(&receive_objects[1]).unwrap().unwrap();
-        sink.write_at(0, b"wrong").unwrap();
+        assert!(sink.write_at(0, b"wrong").is_err());
         drop(sink);
         drop(receive);
         drop(seams);
         assert!(handle.0.upgrade().is_none());
-        assert!(stage
-            .join("objects")
-            .join(hex::encode(objects[0].root))
-            .exists());
+        assert!(directory.path().join("receive/file-0").is_file());
+        assert!(!stage.join("objects").exists());
         persist_push(&retry_setup, key.clone()).unwrap();
-        let control = PushControl::resumable(key, Some(lock_push_directory(&stage).unwrap()));
+        let control = PushControl::resumable(
+            key,
+            Some(lock_push_directory(&stage, vot_sdk_file::NasContract::Unqualified).unwrap()),
+        );
         let (seams, handle) = push_seams(
             application.clone(),
             retry_setup,
@@ -4144,14 +5239,20 @@ mod push_tests {
         let receive = handle.0.upgrade().unwrap();
         receive.prepare_manifest(summary, &records).unwrap();
         assert!(receive.choose_sink(&receive_objects[0]).unwrap().is_none());
-        let sink = receive.choose_sink(&receive_objects[1]).unwrap().unwrap();
-        sink.write_at(0, data[1]).unwrap();
+        let sink: Arc<dyn vot_cli::ReceiveSink> =
+            Arc::from(receive.choose_sink(&receive_objects[1]).unwrap().unwrap());
+        write_push(Arc::clone(&sink), &receive_objects[1], data[1]);
         sink.flush().unwrap();
         receive.complete_object(&receive_objects[1]).unwrap();
+        assert!(application.store.load_push_sessions().unwrap()[0]
+            .files
+            .iter()
+            .all(|file| file.published));
         drop(sink);
         drop(receive);
         drop(seams);
-        assert!(!stage.exists());
+        assert!(stage.join("writer.lock").is_file());
+        assert_eq!(fs::read_dir(&stage).unwrap().count(), 1);
         assert!(application.store.load_push_sessions().unwrap().is_empty());
         for (index, bytes) in data.iter().enumerate() {
             assert_eq!(
@@ -4210,12 +5311,22 @@ mod push_tests {
         let setup = setup(directory.path(), object.clone());
         fs::create_dir_all(&setup.dest_dir).unwrap();
         let destination = setup.dest_dir.join("fast");
-        let native = NativeFile::create(&object, &destination, CommitProfile::Fast).unwrap();
+        let native = setup
+            .destinations
+            .directory(&setup.dest_dir, true)
+            .unwrap()
+            .create(
+                &object,
+                destination.file_name().unwrap(),
+                CommitProfile::Fast,
+            )
+            .unwrap();
         let mut staged = StagedFile::new(
             native,
             destination.clone(),
             ObjectCoverage::new(&object),
             CommitProfile::Fast,
+            Arc::clone(&setup.destinations),
         );
         staged.reopen().unwrap();
         staged.park();
@@ -4241,9 +5352,14 @@ mod push_tests {
         let decoded = vot_receipt::decode_authenticated(&bytes).unwrap();
         let verified = vot_receipt::verify_ed25519(&decoded, &signer.verifying_key()).unwrap();
         assert_eq!(verified.receipt().profile, vot_receipt::CommitProfile::Fast);
-        let mut baseline = NativeFile::create(
+        let mut baseline = vot_sdk_file::ReceiveDirectory::open(
+            directory.path(),
+            vot_sdk_file::NasContract::Unqualified,
+        )
+        .unwrap()
+        .create(
             &object,
-            directory.path().join("baseline"),
+            std::ffi::OsStr::new("baseline"),
             CommitProfile::Fast,
         )
         .unwrap();
@@ -4323,7 +5439,7 @@ mod push_tests {
         let Phase::Receiving { files } = &mut phase else {
             unreachable!()
         };
-        let persisted = persisted_session(&setup, files);
+        let persisted = persisted_session(&setup, files.iter());
         assert!(persisted.files[0].published);
         assert_eq!(persisted.files[1].prefix_bytes, 0);
         assert!(!persisted.files[1].staging_path.as_os_str().is_empty());
@@ -4368,7 +5484,7 @@ mod push_tests {
             assert!(staged.active.is_none());
             assert_eq!(staged.progress().prefix_bytes, object.length);
             let path = staged.destination.clone();
-            publish_file(&setup, destination).unwrap();
+            publish_file(&setup, destination, || true).unwrap();
             assert_eq!(fs::read(path).unwrap(), data);
         }
         drop(destinations);
@@ -4531,138 +5647,22 @@ mod push_tests {
     }
 
     #[test]
-    fn unpublished_record_guards_remove_only_held_files() {
+    fn a_published_file_and_journal_survive_an_unrecorded_push_failure() {
         let directory = tempfile::tempdir().unwrap();
-        let staging = directory.path().join("staging");
-        fs::create_dir(&staging).unwrap();
-        let destination = directory.path().join("published");
-        let receipt = directory.path().join("published.vot-receipt");
-        paths::tighten_dir(directory.path());
-        fs::write(&destination, b"data").unwrap();
-        fs::write(&receipt, b"receipt").unwrap();
-
-        let mut guards = PublishedPushFiles::new(&staging).unwrap();
-        guards
-            .capture(Publication {
-                destination: destination.clone(),
-                receipt: Some(receipt.clone()),
-            })
-            .unwrap();
-        drop(guards);
-
-        assert!(!destination.exists());
-        assert!(!receipt.exists());
-    }
-
-    #[test]
-    fn rollback_guard_preserves_a_replacement() {
-        let directory = tempfile::tempdir().unwrap();
-        let staging = directory.path().join("staging");
-        fs::create_dir(&staging).unwrap();
-        paths::tighten_dir(directory.path());
-        let destination = directory.path().join("published");
-        fs::write(&destination, b"ours").unwrap();
-        let mut guards = PublishedPushFiles::new(&staging).unwrap();
-        guards
-            .capture(Publication {
-                destination: destination.clone(),
-                receipt: None,
-            })
-            .unwrap();
-        fs::remove_file(&destination).unwrap();
-        fs::write(&destination, b"replacement").unwrap();
-
-        drop(guards);
-
-        assert_eq!(fs::read(destination).unwrap(), b"replacement");
-    }
-
-    #[test]
-    fn publication_namespace_serializes_capture_and_replacement_rollback() {
-        let directory = tempfile::tempdir().unwrap();
-        let staged = directory.path().join("object");
-        let data = vec![29_u8; 1024];
-        fs::write(&staged, &data).unwrap();
-        let object = object(Suite::Blake3Bao64, &data);
+        let source = directory.path().join("source");
+        let bytes = b"published bytes";
+        fs::write(&source, bytes).unwrap();
+        let object = object(Suite::Blake3Bao64, bytes);
         let setup = setup(directory.path(), object.clone());
-        fs::create_dir_all(&setup.dest_dir).unwrap();
-        paths::tighten_dir(&setup.dest_dir);
         let mut file =
-            open_destination_for(&setup, vec!["published".to_owned()], object.clone()).unwrap();
-        reprove_staging(&staged, &object, vec![&mut file], || true).unwrap();
-        let staging = directory.path().join("staging");
-        fs::create_dir(&staging).unwrap();
-        let mut guards = PublishedPushFiles::new(&staging).unwrap();
-        publish_push_entry(&setup, &mut file, &mut guards, || {
-            assert!(PUBLICATION_NAMESPACE.try_lock().is_err());
-        })
-        .unwrap();
-        let destination = setup.dest_dir.join("published");
-        fs::remove_file(&destination).unwrap();
-        fs::write(&destination, b"replacement").unwrap();
-        drop(guards);
-
-        assert_eq!(fs::read(destination).unwrap(), b"replacement");
-    }
-
-    #[test]
-    fn rollback_guard_creation_failure_removes_the_just_published_file() {
-        let directory = tempfile::tempdir().unwrap();
-        let staging = directory.path().join("staging");
-        fs::create_dir(&staging).unwrap();
-        paths::tighten_dir(directory.path());
-        let destination = directory.path().join("published");
-        fs::write(&destination, b"ours").unwrap();
-        let mut guards = PublishedPushFiles::new(&staging).unwrap();
-        fs::write(guards.directory.join("0"), b"collision").unwrap();
-
-        assert!(guards
-            .capture(Publication {
-                destination: destination.clone(),
-                receipt: None,
-            })
-            .is_err());
-        assert!(!destination.exists());
-    }
-
-    #[test]
-    fn cancellation_between_final_publications_rolls_back_the_first() {
-        let directory = tempfile::tempdir().unwrap();
-        let staged = directory.path().join("object");
-        let data = vec![23_u8; 1024];
-        fs::write(&staged, &data).unwrap();
-        let object = object(Suite::Blake3Bao64, &data);
-        let setup = setup(directory.path(), object.clone());
-        fs::create_dir_all(&setup.dest_dir).unwrap();
-        paths::tighten_dir(&setup.dest_dir);
-        let mut first =
-            open_destination_for(&setup, vec!["first".to_owned()], object.clone()).unwrap();
-        let mut second =
-            open_destination_for(&setup, vec!["second".to_owned()], object.clone()).unwrap();
-        reprove_staging(&staged, &object, vec![&mut first, &mut second], || true).unwrap();
-        let staging = directory.path().join("push-staging");
-        fs::create_dir(&staging).unwrap();
-        let mut entries = [
-            PushEntry {
-                components: vec!["first".to_owned()],
-                object: object.clone(),
-                file: Some(first),
-            },
-            PushEntry {
-                components: vec!["second".to_owned()],
-                object,
-                file: Some(second),
-            },
-        ];
-        let mut checks = 0;
-
-        assert!(publish_push_entries(&setup, &staging, &mut entries, || {
-            checks += 1;
-            checks < 2
-        })
-        .is_err());
-        assert!(!setup.dest_dir.join("first").exists());
-        assert!(!setup.dest_dir.join("second").exists());
+            open_destination_for(&setup, vec!["final".to_owned()], object.clone()).unwrap();
+        reprove_staging(&source, &object, vec![&mut file], || true).unwrap();
+        let journal = file.native.as_ref().unwrap().journal.clone();
+        publish_file(&setup, &mut file, || true).unwrap();
+        assert!(journal.is_file());
+        drop(file);
+        assert_eq!(fs::read(setup.dest_dir.join("final")).unwrap(), bytes);
+        assert!(journal.is_file());
     }
 }
 
@@ -4693,17 +5693,28 @@ mod parallel_accept_tests {
         let data = vec![0x5a_u8; 64 * 1024];
         let object = object(&data);
         let proof = vot_proof_blake3::prove(&data, 0, data.len() as u64).unwrap();
-        let native = NativeFile::create(
-            &object,
-            directory.path().join("obj"),
-            CommitProfile::Balanced,
-        )
-        .unwrap();
+        let destinations = Arc::new(
+            crate::receiving::Destinations::open(
+                directory.path(),
+                vot_sdk_file::NasContract::Unqualified,
+            )
+            .unwrap(),
+        );
+        let native = destinations
+            .directory(directory.path(), true)
+            .unwrap()
+            .create(
+                &object,
+                std::ffi::OsStr::new("obj"),
+                CommitProfile::Balanced,
+            )
+            .unwrap();
         let mut native = StagedFile::new(
             native,
             directory.path().join("obj"),
             ObjectCoverage::new(&object),
             CommitProfile::Balanced,
+            destinations,
         );
         native.reopen().unwrap();
         let files = vec![FileState {

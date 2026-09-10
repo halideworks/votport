@@ -159,6 +159,45 @@ try {
   assert.deepEqual(JSON.parse(await fs.readFile(await (await download).path(), 'utf8')), records);
 
   await page.getByRole('link', { name: 'Storage', exact: true }).click();
+  await page.locator('#receiving-storage').waitFor();
+  await page.click('#receiving-check');
+  await page.getByText('Storage checks passed. Ready to receive.', { exact: true }).waitFor();
+  await layout('receiving-storage');
+  const nas = { path: '/storage/production/receiving', storage: { path: '/storage/production/receiving', filesystem: 'cifs', source: '//studio-nas/production', mount_root: '/', inode: '9007199254740993', service_uid: 1000 }, nas: true, ready: false, qualified: null, error: 'This share requires qualification before receiving.' };
+  let qualification;
+  await page.route('**/api/admin/receiving-storage', async (route) => {
+    if (route.request().method() === 'POST') {
+      qualification = route.request().postDataJSON();
+      await route.fulfill({ json: { ...nas, ready: true, error: null } });
+    } else await route.fulfill({ json: nas });
+  });
+  await page.reload(); await page.locator('#receiving-nas-contract').waitFor();
+  await layout('receiving-nas-qualification');
+  await page.click('#receiving-check');
+  assert.equal(qualification, undefined, 'NAS qualification requires both acknowledgments');
+  await page.check('#receiving-stable'); await page.check('#receiving-private');
+  await page.click('#receiving-check');
+  await page.getByText('Storage checks passed. Ready to receive.', { exact: true }).waitFor();
+  assert.deepEqual(qualification, { storage: nas.storage, enable: true, stable_acknowledgments: true, private_namespace: true });
+  assert.ok(await page.locator('#receiving-nas-contract').isHidden());
+  await layout('receiving-nas-ready');
+  await page.unroute('**/api/admin/receiving-storage');
+  const local = { ...nas, nas: false, storage: { ...nas.storage, filesystem: 'ext4', source: '/dev/fixture' }, error: 'Protect the private control folder before receiving.' };
+  let localChecked = false;
+  await page.route('**/api/admin/receiving-storage', async (route) => {
+    if (route.request().method() === 'POST') {
+      assert.deepEqual(route.request().postDataJSON().storage, local.storage);
+      localChecked = true;
+      await route.fulfill({ json: { ...local, ready: true, error: null } });
+    } else await route.fulfill({ json: local });
+  });
+  await page.reload(); await page.locator('#receiving-storage').waitFor();
+  assert.ok(await page.locator('#receiving-check').isEnabled(), 'Local storage can be checked after permissions are repaired');
+  await page.click('#receiving-check');
+  await page.getByText('Storage checks passed. Ready to receive.', { exact: true }).waitFor();
+  assert.ok(localChecked);
+  await page.unroute('**/api/admin/receiving-storage');
+  await page.reload(); await page.locator('#receiving-storage').waitFor();
   await page.click('#storage-new'); await page.fill('#ws-label', id); await page.fill('#ws-bucket', process.env.S3_TEST_BUCKET || 'fixture-bucket');
   await page.selectOption('#ws-provider', 'custom'); await page.fill('#ws-endpoint', 'http://127.0.0.1:19000');
   await page.fill('#ws-access-key', 'votport-fixture'); await page.fill('#ws-secret-key', 'votport-fixture-secret');
@@ -326,6 +365,7 @@ try {
   assert.equal(await page.getByRole('button', { name: 'Edit project', exact: true }).count(), 0);
   await page.goto(`${base}/storage`); await page.locator('#storage-access').waitFor();
   assert.ok(await page.locator('#storage-new').isHidden());
+  assert.ok(await page.locator('#receiving-storage').isHidden());
   assert.equal(await page.getByRole('button', { name: 'Edit connection', exact: true }).count(), 0);
   assert.deepEqual(errors, []);
   console.log('Responsive admin forms, project creation, lost-response recovery, automatic status refresh, policy invalidation, cumulative event export, private storage credentials and stale connection tests: passed');

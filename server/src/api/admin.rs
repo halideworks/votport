@@ -846,6 +846,9 @@ pub async fn delete_tenant(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_platform_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
+    let destinations = app
+        .receiving_destinations()
+        .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
     let key = admit_tenant_ref(&key)?;
     if !app.sessions.pin_tenant_for_delete(&key) {
         return Err(ApiError::new(
@@ -944,7 +947,16 @@ pub async fn delete_tenant(
         if name == "receive" {
             app.sessions.wait_delete_stall().await;
         }
-        let purge = tokio::fs::remove_dir_all(&path).await;
+        let purge = if name == "receive" {
+            let destinations = Arc::clone(&destinations);
+            let components = paths::tenant_prefix(&key);
+            tokio::task::spawn_blocking(move || destinations.remove_tree(&components))
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))
+                .and_then(|result| result.map_err(std::io::Error::other))
+        } else {
+            tokio::fs::remove_dir_all(&path).await
+        };
         match purge {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && row_deleted => {}
@@ -1822,6 +1834,103 @@ pub async fn get_settings(
     Ok(Json(settings_json(&app)?))
 }
 
+pub async fn get_receiving_storage(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_platform_admin(&app, &headers)?;
+    let app = Arc::clone(&app);
+    tokio::task::spawn_blocking(move || receiving_storage_json(&app).map(Json))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+}
+
+fn receiving_storage_json(app: &App) -> ApiResult<serde_json::Value> {
+    let storage = crate::receiving::storage_identity(&app.config.receive_dir);
+    let active = app.receiving_destinations();
+    let saved =
+        crate::receiving::saved_qualification(&app.store).map_err(super::store_unavailable)?;
+    let nas = storage_is_nas(storage.as_ref().ok());
+    Ok(json!({
+        "path": app.config.receive_dir,
+        "storage": storage.as_ref().ok(),
+        "qualified": saved,
+        "ready": active.is_ok(),
+        "error": storage.err().or_else(|| active.err()),
+        "nas": nas,
+    }))
+}
+
+fn storage_is_nas(storage: Option<&crate::receiving::StorageIdentity>) -> bool {
+    storage.is_some_and(|storage| {
+        matches!(
+            storage.filesystem.as_str(),
+            "cifs" | "smb3" | "nfs" | "nfs4"
+        )
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceivingStorageCheck {
+    storage: crate::receiving::StorageIdentity,
+    #[serde(default)]
+    enable: bool,
+    #[serde(default)]
+    stable_acknowledgments: bool,
+    #[serde(default)]
+    private_namespace: bool,
+}
+
+pub async fn check_receiving_storage(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(request): Json<ReceivingStorageCheck>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_platform_admin(&app, &headers)?;
+    require_admin_write(&headers, &identity)?;
+    tokio::task::spawn_blocking(move || {
+        let conflict = |message| ApiError::new(StatusCode::CONFLICT, message);
+        let mut state = app.receiving.lock().expect("receiving state poisoned");
+        if crate::receiving::storage_identity(&app.config.receive_dir).map_err(ApiError::internal)? != request.storage {
+            return Err(conflict("Storage changed. Refresh this page and review the current mount."));
+        }
+        if let Ok(active) = state.as_ref() {
+            active.destinations.probe().map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+        } else {
+            let nas = storage_is_nas(Some(&request.storage));
+            if nas && (!request.enable || !request.stable_acknowledgments || !request.private_namespace) {
+                return Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY,
+                    "Review the NAS server's stable acknowledgments and private namespace before enabling receiving."));
+            }
+            if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) || app.sessions.total() != 0 {
+                return Err(conflict("Receiving ownership changed or transfers are active. Restart before reconfiguring storage."));
+            }
+            if !nas && crate::receiving::saved_qualification(&app.store).map_err(super::store_unavailable)?.is_some() {
+                return Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "The qualified NAS is missing. Restore its mount before enabling receiving."));
+            }
+            let contract = if nas { vot_sdk_file::NasContract::ServerAcknowledged } else { vot_sdk_file::NasContract::Unqualified };
+            let destinations = crate::receiving::Destinations::open(&app.config.receive_dir, contract)
+                .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+            if destinations.identity().map_err(ApiError::internal)? != request.storage {
+                return Err(conflict("Storage changed while checking it. Refresh and retry."));
+            }
+            let active = crate::receiving::Active::open(destinations, &app.lease_holder)
+                .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+            if nas {
+                let qualification = crate::receiving::Qualification { storage: request.storage, qualified_at: now_unix(), qualified_by: identity.subject.clone() };
+                app.store.put_settings(&identity.subject, &[(crate::receiving::SETTING_KEY.to_owned(), crate::store::SettingWrite::Set(
+                    serde_json::to_string(&qualification).map_err(|e| ApiError::internal(e.to_string()))?
+                ))]).map_err(super::store_unavailable)?;
+            }
+            app.resume_receiving(&active.destinations).map_err(super::store_unavailable)?;
+            *state = Ok(active);
+        }
+        drop(state);
+        receiving_storage_json(&app).map(Json)
+    }).await.map_err(|e| ApiError::internal(e.to_string()))?
+}
+
 #[derive(Deserialize, Default)]
 pub struct NotificationTestQuery {
     channel: Option<String>,
@@ -1913,7 +2022,7 @@ fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
         "public_url": app.config.public_url,
         "data_dir": app.config.data_dir,
         "receive_dir": app.config.receive_dir,
-        "receive_commit_profile": deployment_commit_profile(&app.config.receive_dir),
+        "receive_commit_profile": app.receiving_destinations().ok().map(|_| "balanced"),
         "outbound_dir": app.config.outbound_dir,
         "outbound_filesystem_profile": deployment_commit_profile(&app.config.outbound_dir),
         "web_root": app.config.web_root,
@@ -2871,7 +2980,7 @@ pub async fn delete_link(
     {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
-            "incoming workflows still need these files; finish or cancel them first",
+            "incoming workflows still use these files; wait for their deliveries to be archived before deleting them",
         ));
     }
     if app
@@ -2959,7 +3068,7 @@ pub async fn delete_upload_record(
     {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
-            "incoming workflows still need these files; finish or cancel them first",
+            "incoming workflows still use these files; wait for their deliveries to be archived before deleting them",
         ));
     }
     let link = app
@@ -3020,6 +3129,9 @@ pub async fn delete_received_file(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_operator(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
+    let destinations = app
+        .receiving_destinations()
+        .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
     if app
         .store
         .link(&identity.tenant, &id)
@@ -3045,7 +3157,7 @@ pub async fn delete_received_file(
     {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
-            "incoming workflows still need these files; finish or cancel them first",
+            "incoming workflows still use these files; wait for their deliveries to be archived before deleting them",
         ));
     }
     let link = app
@@ -3065,8 +3177,6 @@ pub async fn delete_received_file(
         .find(|entry| entry.id == upload)
         .and_then(|entry| entry.files.get(index))
         .ok_or_else(ApiError::not_found)?;
-    let path = stored_path(&app, &identity.tenant, &record.stored_as)
-        .ok_or_else(|| ApiError::internal("stored path failed the join guard"))?;
     if app
         .store
         .has_active_outbound_grant(&identity.tenant, &id, &upload, index, now_unix())
@@ -3077,22 +3187,11 @@ pub async fn delete_received_file(
             "active download links must be revoked first",
         ));
     }
-    for target in [path.clone(), {
-        let mut sidecar = path.into_os_string();
-        sidecar.push(".vot-receipt");
-        sidecar.into()
-    }] {
-        match std::fs::remove_file(&target) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(ApiError::internal(format!(
-                    "delete {}: {error}",
-                    target.display()
-                )));
-            }
-        }
-    }
+    let mut components = paths::tenant_prefix(&identity.tenant);
+    components.extend(record.stored_as.split('/').map(str::to_owned));
+    destinations
+        .remove_received(&components)
+        .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
     // Tombstone every record naming this path, not just the one deleted
     // through: the freed name can be reused by different content, and any
     // record still pointing there must never satisfy dedupe again.
@@ -4727,6 +4826,40 @@ mod tenant_offboard_tests {
     }
 
     #[tokio::test]
+    async fn inactive_storage_refuses_tenant_and_file_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(named_tenant("acme"))
+            .unwrap();
+        let tenant_dir = write_dummy(&application.config.receive_dir, "acme");
+        let cookie = login_cookie(app::router(application.clone())).await;
+        *application.receiving.lock().unwrap() = Err("mount unavailable".into());
+        let response = delete_tenant_req(application.clone(), &cookie, "acme").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(tenant_dir.join("x.bin").exists());
+        assert!(application.store.tenant("acme").unwrap().is_some());
+        let headers = HeaderMap::from_iter([
+            (header::COOKIE, cookie.parse().unwrap()),
+            (
+                axum::http::HeaderName::from_static("x-votport"),
+                "1".parse().unwrap(),
+            ),
+        ]);
+        let response = delete_received_file(
+            State(application),
+            Path(("link".into(), "upload".into(), 0)),
+            headers,
+        )
+        .await;
+        assert_eq!(
+            response.unwrap_err().into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
     async fn delete_purges_the_outbound_subtree_without_receive_files() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
@@ -4928,11 +5061,11 @@ mod tenant_offboard_tests {
         let response = delete_tenant_req(application.clone(), &cookie, "ghost").await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(keep.exists());
-        // The instance lease lives at the root and is not tenant content.
+        // The private receiving namespace is not tenant content.
         let mut entries: Vec<_> = std::fs::read_dir(&application.config.receive_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
-            .filter(|name| name != crate::lease::FILE_NAME)
+            .filter(|name| name != ".vot-stage")
             .collect();
         entries.sort();
         assert_eq!(entries, vec![std::ffi::OsString::from("keep.bin")]);
@@ -5856,6 +5989,139 @@ mod settings_api_tests {
     }
 
     #[tokio::test]
+    async fn receiving_storage_checks_require_platform_admin_csrf_and_current_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let url = "/api/admin/receiving-storage";
+        for (tenant, role) in [("", "viewer"), ("", "auditor"), ("team", "admin")] {
+            let (status, _) = send(
+                Arc::clone(&application),
+                Request::get(url)
+                    .header("cookie", cookie_for(&application, tenant, role))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+        let cookie = cookie_for(&application, "", "admin");
+        let (status, view) = send(
+            Arc::clone(&application),
+            Request::get(url)
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(view["ready"], true);
+        assert_eq!(view["nas"], false);
+        let body = json!({"storage": view["storage"]});
+        for (csrf, changed, expected) in [
+            (false, false, StatusCode::FORBIDDEN),
+            (true, true, StatusCode::CONFLICT),
+            (true, false, StatusCode::OK),
+        ] {
+            let mut body = body.clone();
+            if changed {
+                body["storage"]["inode"] = json!("0");
+            }
+            let mut request = Request::post(url)
+                .header("cookie", &cookie)
+                .header("content-type", "application/json");
+            if csrf {
+                request = request.header("x-votport", "1");
+            }
+            let (status, _) = send(
+                Arc::clone(&application),
+                request.body(Body::from(body.to_string())).unwrap(),
+            )
+            .await;
+            assert_eq!(status, expected);
+        }
+        assert!(crate::receiving::saved_qualification(&application.store)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn corrected_local_storage_permissions_can_be_rechecked_in_the_ui() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let config = testing::config(directory.path());
+        std::fs::create_dir(&config.receive_dir).unwrap();
+        std::fs::set_permissions(&config.receive_dir, std::fs::Permissions::from_mode(0o770))
+            .unwrap();
+        let application = app::build(config).unwrap();
+        assert!(application.receiving_destinations().is_err());
+        std::fs::set_permissions(
+            &application.config.receive_dir,
+            std::fs::Permissions::from_mode(0o1770),
+        )
+        .unwrap();
+        let cookie = cookie_for(&application, "", "admin");
+        let storage = crate::receiving::storage_identity(&application.config.receive_dir).unwrap();
+        let (status, view) = send(
+            Arc::clone(&application),
+            Request::post("/api/admin/receiving-storage")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"storage":storage}).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["ready"], true);
+        assert!(crate::receiving::saved_qualification(&application.store)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_qualified_nas_keeps_admin_available_and_refuses_local_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let config = application.config.clone();
+        let qualification = crate::receiving::Qualification {
+            storage: crate::receiving::storage_identity(&config.receive_dir).unwrap(),
+            qualified_at: 1,
+            qualified_by: "fixture".to_owned(),
+        };
+        application
+            .store
+            .put_settings(
+                "fixture",
+                &[(
+                    crate::receiving::SETTING_KEY.to_owned(),
+                    crate::store::SettingWrite::Set(serde_json::to_string(&qualification).unwrap()),
+                )],
+            )
+            .unwrap();
+        app::release_data_lock(&application);
+        drop(application);
+        let application = app::build(config).unwrap();
+        assert!(application.receiving_destinations().is_err());
+        let cookie = cookie_for(&application, "", "admin");
+        let (status, view) = send(
+            Arc::clone(&application),
+            Request::get("/api/admin/receiving-storage")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(view["ready"], false);
+        let (status, _) = send(Arc::clone(&application), Request::post("/api/admin/receiving-storage")
+            .header("cookie", &cookie).header("x-votport", "1").header("content-type", "application/json")
+            .body(Body::from(json!({"storage":view["storage"],"enable":true,"stable_acknowledgments":true,"private_namespace":true}).to_string())).unwrap()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(application.receiving_destinations().is_err());
+        assert!(!crate::lease::path(&application.config.receive_dir).exists());
+    }
+
+    #[tokio::test]
     async fn admin_html_bootstraps_only_the_authenticated_navigation() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
@@ -6170,12 +6436,11 @@ mod settings_api_tests {
             deployment["outbound_dir"],
             directory.path().join("outbound").to_string_lossy().as_ref()
         );
-        for field in ["receive_commit_profile", "outbound_filesystem_profile"] {
-            #[cfg(target_os = "linux")]
-            assert_eq!(deployment[field], "balanced");
-            #[cfg(not(target_os = "linux"))]
-            assert!(deployment[field].is_null());
-        }
+        assert_eq!(deployment["receive_commit_profile"], "balanced");
+        #[cfg(target_os = "linux")]
+        assert_eq!(deployment["outbound_filesystem_profile"], "balanced");
+        #[cfg(not(target_os = "linux"))]
+        assert!(deployment["outbound_filesystem_profile"].is_null());
         assert_eq!(deployment["max_upload_bytes"], 1024 * 1024);
         assert_eq!(deployment["allow_hidden"], false);
         assert_eq!(deployment["session_idle_secs"], 60);
