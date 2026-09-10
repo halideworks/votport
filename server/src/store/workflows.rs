@@ -155,13 +155,49 @@ pub(super) fn check_grant_creation(
             return Err("this directory requires a delivery workflow".into());
         }
     }
+    if grant
+        .files
+        .iter()
+        .any(|file| file.source.starts_with("received:"))
+        && job.is_none_or(|job| job.received.is_none())
+    {
+        return Err("received sources require their owning workflow".into());
+    }
     if let Some(job) = job {
+        let received = job
+            .received
+            .as_ref()
+            .map(|received| {
+                let link = read_link(connection, &job.tenant, &received.link_id)?
+                    .ok_or("incoming link missing")?;
+                let upload = link
+                    .uploads
+                    .into_iter()
+                    .find(|upload| upload.id == received.upload_id)
+                    .filter(|upload| !upload.partial && upload.completed_at != 0)
+                    .ok_or("incoming upload missing")?;
+                Ok::<_, String>(
+                    upload
+                        .files
+                        .into_iter()
+                        .filter(|file| !file.deleted)
+                        .map(|file| (file.path.clone(), file))
+                        .collect::<std::collections::BTreeMap<_, _>>(),
+                )
+            })
+            .transpose()?;
         if job.tenant != grant.tenant
             || job.id != grant.id
             || grant.files.is_empty()
             || grant.files.iter().any(|file| {
                 file.source
-                    != if job.uses_snapshot() {
+                    != if let Some(received) = &received {
+                        received
+                            .get(&file.name)
+                            .filter(|original| original.bytes == file.bytes)
+                            .map(|original| format!("received:{}", original.stored_as))
+                            .unwrap_or_default()
+                    } else if job.uses_snapshot() {
                         format!("workflow:{}/{}", job.id, file.name)
                     } else {
                         format!("{}/{}", job.project.directory, file.name)
@@ -188,7 +224,7 @@ pub(super) fn receive_pending(
     tenant: &str,
     link_id: &str,
 ) -> rusqlite::Result<bool> {
-    connection.prepare_cached("SELECT EXISTS(SELECT 1 FROM delivery_jobs WHERE tenant=?1 AND json_extract(document,'$.received.link_id')=?2 AND json_extract(document,'$.received') IS NOT NULL AND state IN ('queued','preparing','failed','retrying'))")?.query_row(params![tenant,link_id], |row|row.get(0))
+    connection.prepare_cached("SELECT EXISTS(SELECT 1 FROM delivery_jobs WHERE tenant=?1 AND json_extract(document,'$.received.link_id')=?2 AND json_extract(document,'$.received') IS NOT NULL AND state<>'retired')")?.query_row(params![tenant,link_id], |row|row.get(0))
 }
 
 pub(super) fn set_receive_workflow(

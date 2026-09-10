@@ -1,5 +1,11 @@
 # Native push: VOT QUIC receive path
 
+The design record below describes the original native path. Current receiving
+uses the direct sink described in [Direct receiving](direct-receiving.md): verified
+ranges enter the final filesystem once, completed files publish individually,
+and interrupted transfers retain their files and checkpoints. There is no
+intermediate object payload, re-proof pass, or rollback of shared published files.
+
 Status: Native push and its operator surface are implemented, 2026-08-29. VOT ADR-0045 (push, the holder dials)
 landed upstream in PR #391 at `0a129ea8b7ef47578b956f3c70a8274bf623cb79`.
 

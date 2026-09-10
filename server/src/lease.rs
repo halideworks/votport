@@ -1,32 +1,23 @@
-//! Single-writer lease on the receive root.
-//!
-//! The flock on `data/lock` fences two instances over one local or block
-//! data directory. It cannot fence a standby whose `data/` is a replica, and
-//! flock semantics vary on NFS. The one path both instances share in every
-//! supported topology is the receive root, so the lease lives there: a file
-//! created exclusively at boot, renewed by a heartbeat, and taken over only
-//! when its renewal is older than [`STALE_AFTER`]. A holder whose heartbeat
-//! finds another holder's name in the file has been superseded and must
-//! stop, since the other instance is now re-attaching its staging.
-//!
-//! Staleness compares the holder's wall clock at renewal with the reader's;
-//! the margin is far wider than NTP drift between two hosts.
+//! Receive-root ownership held by a kernel file lock in the private namespace.
+//! The permanent lock inode is never renamed or unlinked. Heartbeat timestamps
+//! describe ownership; an expired clock does not authorize a second writer.
 
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::{Read as _, Write as _};
+use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use vot_platform_fs::{Directory, FileLocation};
 
 pub const FILE_NAME: &str = ".votport-lease";
-/// Heartbeat interval.
 pub const RENEW_EVERY: Duration = Duration::from_secs(30);
-/// A lease renewed longer ago than this may be taken over.
-pub const STALE_AFTER: u64 = 90;
+const LOCK_NAME: &str = "writer.lock";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Lease {
-    /// `<host>:<pid>:<random>`; the random part makes two boots on one host
-    /// distinct.
     pub holder: String,
     pub acquired_at: u64,
     pub renewed_at: u64,
@@ -36,14 +27,10 @@ impl Lease {
     pub fn age(&self, now: u64) -> u64 {
         now.saturating_sub(self.renewed_at)
     }
-
-    pub fn stale(&self, now: u64) -> bool {
-        self.age(now) > STALE_AFTER
-    }
 }
 
 pub fn path(receive_dir: &Path) -> PathBuf {
-    receive_dir.join(FILE_NAME)
+    receive_dir.join(".vot-stage").join(FILE_NAME)
 }
 
 pub fn new_holder() -> String {
@@ -55,119 +42,175 @@ pub fn new_holder() -> String {
     )
 }
 
-pub fn read(path: &Path) -> Result<Option<Lease>, String> {
-    match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|error| format!("{} is not a lease file: {error}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("read {}: {error}", path.display())),
+pub struct Guard {
+    root: Directory,
+    directory: Directory,
+    lock: File,
+    lock_location: FileLocation,
+    location: FileLocation,
+    pub record: Lease,
+}
+
+impl Guard {
+    pub fn acquire(root: &Directory, holder: &str, now: u64) -> Result<Self, String> {
+        check_root(root)?;
+        let directory = root
+            .private_child(OsStr::new(".vot-stage"))
+            .map_err(|e| e.to_string())?;
+        let location = directory
+            .entry(OsStr::new(FILE_NAME))
+            .map_err(|e| e.to_string())?;
+        let lock_location = directory
+            .entry(OsStr::new(LOCK_NAME))
+            .map_err(|e| e.to_string())?;
+        let lock = lock_location
+            .open(
+                rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CREATE,
+                rustix::fs::Mode::from_raw_mode(0o600),
+            )
+            .map_err(|e| e.to_string())?;
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+            |e| {
+                format!(
+                    "{FILE_NAME} is held by {}; cannot acquire storage lock: {e}",
+                    read(&location)
+                        .ok()
+                        .flatten()
+                        .map_or_else(|| "another instance".to_owned(), |r| r.holder)
+                )
+            },
+        )?;
+        let record = Lease {
+            holder: holder.to_owned(),
+            acquired_at: now,
+            renewed_at: now,
+        };
+        let guard = Self {
+            root: root.clone(),
+            directory,
+            lock,
+            lock_location,
+            location,
+            record,
+        };
+        guard.check_namespace()?;
+        guard.check_lock()?;
+        write(&guard.location, &guard.record)?;
+        Ok(guard)
+    }
+
+    fn check_namespace(&self) -> Result<(), String> {
+        check_root(&self.root)?;
+        let visible = self
+            .root
+            .open_child(OsStr::new(".vot-stage"))
+            .map_err(|e| e.to_string())?;
+        let visible = visible.file().metadata().map_err(|e| e.to_string())?;
+        let held = self
+            .directory
+            .file()
+            .metadata()
+            .map_err(|e| e.to_string())?;
+        if (visible.dev(), visible.ino()) != (held.dev(), held.ino())
+            || !self
+                .lock_location
+                .same_file(&self.lock)
+                .map_err(|e| e.to_string())?
+        {
+            return Err("receiving storage lock directory changed".to_owned());
+        }
+        Ok(())
+    }
+
+    pub fn renew(&mut self, now: u64) -> Result<(), String> {
+        self.check_namespace()?;
+        self.check_lock()?;
+        if read(&self.location)?.is_none_or(|r| r.holder != self.record.holder) {
+            return Err("receiving storage ownership changed".to_owned());
+        }
+        let mut next = self.record.clone();
+        next.renewed_at = now;
+        write(&self.location, &next)?;
+        self.record = next;
+        Ok(())
+    }
+
+    fn check_lock(&self) -> Result<(), String> {
+        // NFS reports lost locks through I/O on the held handle. Cached reads can succeed.
+        self.lock
+            .write_all_at(&[0], 0)
+            .and_then(|()| self.lock.sync_data())
+            .map_err(|error| format!("receiving storage lock I/O failed: {error}"))
     }
 }
 
-/// Writes the lease through a sibling temporary and a rename, so a reader
-/// never sees a partial file, on NFS included.
-fn write(path: &Path, lease: &Lease) -> Result<(), String> {
-    let temporary = path.with_file_name(format!(
-        "{FILE_NAME}.{}.tmp",
-        &crate::auth::random_token()[..8]
-    ));
-    let bytes = serde_json::to_vec(lease).map_err(|error| error.to_string())?;
+pub(crate) fn check_root(root: &Directory) -> Result<(), String> {
+    if root.nas_contract() == vot_platform_fs::NasContract::Unqualified {
+        let metadata = root.file().metadata().map_err(|e| e.to_string())?;
+        if !protected_root(
+            metadata.uid(),
+            rustix::process::geteuid().as_raw(),
+            metadata.mode(),
+        ) {
+            return Err("The receiving folder must be owned by the Votport service account. Remove group/other write access or set the sticky bit to protect its private control folder.".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn protected_root(owner: u32, service: u32, mode: u32) -> bool {
+    owner == service && (mode & 0o022 == 0 || mode & 0o1000 != 0)
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if let Ok(file) = self.location.open_read() {
+            if read_file(&file).is_ok_and(|r| r.holder == self.record.holder) {
+                let _ = self.location.remove_owned(&file);
+                let _ = self.location.sync_parent();
+            }
+        }
+    }
+}
+
+pub fn read(location: &FileLocation) -> Result<Option<Lease>, String> {
+    match location.open_read() {
+        Ok(file) => read_file(&file).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn read_file(file: &File) -> Result<Lease, String> {
+    let mut bytes = Vec::new();
+    file.take(16_385)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > 16_384 {
+        return Err("lease record is too large".to_owned());
+    }
+    serde_json::from_slice(&bytes).map_err(|e| format!("invalid lease record: {e}"))
+}
+
+fn write(location: &FileLocation, lease: &Lease) -> Result<(), String> {
+    let temporary = location
+        .sibling(OsStr::new(&format!(
+            "lease-{}.tmp",
+            crate::auth::random_token()
+        )))
+        .map_err(|e| e.to_string())?;
+    let mut file = temporary.create().map_err(|e| e.to_string())?;
     let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|error| format!("create {}: {error}", temporary.display()))?;
-        std::io::Write::write_all(&mut file, &bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| format!("write {}: {error}", temporary.display()))?;
-        std::fs::rename(&temporary, path)
-            .map_err(|error| format!("rename {} into place: {error}", temporary.display()))
+        let bytes = serde_json::to_vec(lease).map_err(std::io::Error::other)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        temporary.replace_private(location)?;
+        location.sync_parent()
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+        let _ = temporary.remove_owned(&file);
     }
-    result
-}
-
-/// Takes the lease for `holder`: creates it when absent, takes over a stale
-/// one, refuses a live one with the holder and age in the message.
-pub fn acquire(path: &Path, holder: &str, now: u64) -> Result<Lease, String> {
-    let lease = Lease {
-        holder: holder.to_owned(),
-        acquired_at: now,
-        renewed_at: now,
-    };
-    // Exclusive create is the common path and the only atomic one: two
-    // instances booting together over an absent lease cannot both win.
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(mut file) => {
-            let bytes = serde_json::to_vec(&lease).map_err(|error| error.to_string())?;
-            std::io::Write::write_all(&mut file, &bytes)
-                .and_then(|()| file.sync_all())
-                .map_err(|error| format!("write {}: {error}", path.display()))?;
-            return Ok(lease);
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(format!("create {}: {error}", path.display())),
-    }
-    match read(path)? {
-        Some(current) if !current.stale(now) && current.holder != holder => Err(format!(
-            "{} is held by {} (renewed {} s ago); only one instance may serve a receive root, and a dead holder's lease expires after {STALE_AFTER} s",
-            path.display(),
-            current.holder,
-            current.age(now)
-        )),
-        // Stale, ours from an earlier boot, or removed between the create
-        // and the read: take it.
-        _ => write(path, &lease).map(|()| lease),
-    }
-}
-
-pub enum Renewal {
-    Renewed,
-    /// Another instance took the lease over; this one must stop serving.
-    Lost {
-        holder: String,
-    },
-}
-
-/// Renews the holder's lease; reports a takeover instead of overwriting it.
-pub fn renew(path: &Path, holder: &str, acquired_at: u64, now: u64) -> Result<Renewal, String> {
-    if let Some(current) = read(path)? {
-        if current.holder != holder {
-            return Ok(Renewal::Lost {
-                holder: current.holder,
-            });
-        }
-    }
-    // A missing file means an operator removed it; rewriting keeps the
-    // fence rather than yielding it.
-    write(
-        path,
-        &Lease {
-            holder: holder.to_owned(),
-            acquired_at,
-            renewed_at: now,
-        },
-    )?;
-    Ok(Renewal::Renewed)
-}
-
-/// Drops the lease if this holder still owns it. Production never calls
-/// this: the file is a fence until the process is gone and its staleness
-/// clock has run out. The in-process restart tests need it.
-pub fn release(path: &Path, holder: &str) {
-    if let Ok(Some(current)) = read(path) {
-        if current.holder == holder {
-            let _ = std::fs::remove_file(path);
-        }
-    }
+    result.map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -175,81 +218,112 @@ mod tests {
     use super::*;
 
     #[test]
-    fn acquire_creates_refuses_live_and_takes_over_stale() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = path(directory.path());
-        let first = acquire(&path, "a:1:x", 1_000).unwrap();
-        assert_eq!(read(&path).unwrap().unwrap(), first);
-
-        let error = acquire(&path, "b:2:y", 1_050).unwrap_err();
-        assert!(error.contains("held by a:1:x"), "{error}");
-        assert!(error.contains("renewed 50 s ago"), "{error}");
-        assert_eq!(read(&path).unwrap().unwrap().holder, "a:1:x");
-
-        // The same holder re-acquires its own lease.
-        assert_eq!(acquire(&path, "a:1:x", 1_060).unwrap().holder, "a:1:x");
-
-        // Past STALE_AFTER the standby takes over.
-        let taken = acquire(&path, "b:2:y", 1_060 + STALE_AFTER + 1).unwrap();
-        assert_eq!(taken.holder, "b:2:y");
-        assert_eq!(read(&path).unwrap().unwrap().holder, "b:2:y");
-        // Exactly at the boundary it is still live.
-        assert!(!Lease {
-            holder: String::new(),
-            acquired_at: 0,
-            renewed_at: 100
-        }
-        .stale(100 + STALE_AFTER));
-        assert!(std::fs::read_dir(directory.path())
-            .unwrap()
-            .flatten()
-            .all(|entry| entry.file_name() == FILE_NAME));
+    fn ownership_requires_the_permanent_lock_even_after_a_stale_heartbeat() {
+        let root = tempfile::Builder::new()
+            .permissions({
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::Permissions::from_mode(0o700)
+            })
+            .tempdir()
+            .unwrap();
+        let directory = Directory::open(root.path()).unwrap();
+        let mut first = Guard::acquire(&directory, "first", 1).unwrap();
+        assert_eq!(std::fs::read(first.lock_location.path()).unwrap(), [0]);
+        assert!(Guard::acquire(&directory, "second", u64::MAX).is_err());
+        first.renew(30).unwrap();
+        assert_eq!(read(&first.location).unwrap().unwrap().renewed_at, 30);
+        let lock_identity = first.lock_location.identity().unwrap();
+        let location = first.location.clone();
+        drop(first);
+        assert!(read(&location).unwrap().is_none());
+        let second = Guard::acquire(&directory, "second", 31).unwrap();
+        assert_eq!(second.lock_location.identity().unwrap(), lock_identity);
+        assert_eq!(read(&location).unwrap().unwrap().holder, "second");
     }
 
     #[test]
-    fn renew_updates_the_clock_and_reports_a_takeover() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = path(directory.path());
-        acquire(&path, "a:1:x", 1_000).unwrap();
-        assert!(matches!(
-            renew(&path, "a:1:x", 1_000, 1_030).unwrap(),
-            Renewal::Renewed
-        ));
-        let current = read(&path).unwrap().unwrap();
-        assert_eq!((current.acquired_at, current.renewed_at), (1_000, 1_030));
-
-        acquire(&path, "b:2:y", 1_030 + STALE_AFTER + 1).unwrap();
-        match renew(&path, "a:1:x", 1_000, 2_000).unwrap() {
-            Renewal::Lost { holder } => assert_eq!(holder, "b:2:y"),
-            Renewal::Renewed => panic!("a superseded holder renewed"),
-        }
-        assert_eq!(
-            read(&path).unwrap().unwrap().holder,
-            "b:2:y",
-            "the loser must not overwrite the winner"
-        );
-
-        // A removed file is re-created by the holder, not yielded.
-        std::fs::remove_file(&path).unwrap();
-        assert!(matches!(
-            renew(&path, "b:2:y", 0, 2_100).unwrap(),
-            Renewal::Renewed
-        ));
-        assert_eq!(read(&path).unwrap().unwrap().holder, "b:2:y");
-
-        release(&path, "a:1:x");
-        assert!(path.exists(), "release by a non-holder is a no-op");
-        release(&path, "b:2:y");
-        assert!(!path.exists());
+    fn lock_io_failure_does_not_advance_the_heartbeat() {
+        let root = tempfile::Builder::new()
+            .permissions({
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::Permissions::from_mode(0o700)
+            })
+            .tempdir()
+            .unwrap();
+        let directory = Directory::open(root.path()).unwrap();
+        let mut guard = Guard::acquire(&directory, "first", 1).unwrap();
+        // A read-only handle keeps the inode check valid while forcing the lock write to fail.
+        guard.lock = guard.lock_location.open_read().unwrap();
+        guard.check_namespace().unwrap();
+        assert!(guard.renew(30).unwrap_err().contains("lock I/O failed"));
+        assert_eq!(guard.record.renewed_at, 1);
+        assert_eq!(read(&guard.location).unwrap().unwrap().renewed_at, 1);
     }
 
     #[test]
-    fn a_corrupt_lease_file_is_an_error_not_a_takeover() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = path(directory.path());
-        std::fs::write(&path, b"not json").unwrap();
-        assert!(read(&path).unwrap_err().contains("not a lease file"));
-        assert!(acquire(&path, "a:1:x", 5).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"not json");
+    fn shared_local_roots_need_sticky_protection_and_namespace_replacement_stops_renewal() {
+        use std::os::unix::fs::PermissionsExt as _;
+        for (owner, mode, expected) in [
+            (1, 0o700, true),
+            (1, 0o755, true),
+            (1, 0o770, false),
+            (1, 0o777, false),
+            (1, 0o1770, true),
+            (1, 0o1777, true),
+            (2, 0o1700, false),
+            (2, 0o700, false),
+        ] {
+            assert_eq!(protected_root(owner, 1, mode), expected);
+        }
+        let root = tempfile::Builder::new()
+            .permissions({
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::Permissions::from_mode(0o700)
+            })
+            .tempdir()
+            .unwrap();
+        let directory = Directory::open(root.path()).unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(Guard::acquire(&directory, "first", 1).is_err());
+        assert!(!root.path().join(".vot-stage").exists());
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o1770)).unwrap();
+        let mut first = Guard::acquire(&directory, "first", 1).unwrap();
+        assert!(Guard::acquire(&directory, "second", 2).is_err());
+        std::fs::rename(root.path().join(".vot-stage"), root.path().join("moved")).unwrap();
+        assert!(first.renew(3).is_err());
+        let second = Guard::acquire(&directory, "second", 4).unwrap();
+        assert!(first.renew(5).is_err());
+        drop(first);
+        assert_eq!(read(&second.location).unwrap().unwrap().holder, "second");
+    }
+
+    #[test]
+    fn replaced_control_state_and_symlinks_never_renew_or_escape() {
+        let root = tempfile::Builder::new()
+            .permissions({
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::Permissions::from_mode(0o700)
+            })
+            .tempdir()
+            .unwrap();
+        let directory = Directory::open(root.path()).unwrap();
+        let mut guard = Guard::acquire(&directory, "first", 1).unwrap();
+        write(
+            &guard.location,
+            &Lease {
+                holder: "different".to_owned(),
+                acquired_at: 2,
+                renewed_at: 2,
+            },
+        )
+        .unwrap();
+        assert!(guard.renew(3).is_err());
+        let location = guard.location.clone();
+        drop(guard);
+        assert_eq!(read(&location).unwrap().unwrap().holder, "different");
+        std::fs::remove_file(location.path()).unwrap();
+        std::os::unix::fs::symlink(root.path().join("outside"), location.path()).unwrap();
+        assert!(read(&location).is_err());
+        assert!(!root.path().join("outside").exists());
     }
 }

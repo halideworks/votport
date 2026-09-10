@@ -120,10 +120,10 @@ impl Job {
     }
 
     pub fn uses_snapshot(&self) -> bool {
-        self.received.is_some()
-            || self.project.media.is_some()
-            || self.project.scan_required
-            || self.request.import.is_some()
+        self.received.is_none()
+            && (self.project.media.is_some()
+                || self.project.scan_required
+                || self.request.import.is_some())
     }
 }
 

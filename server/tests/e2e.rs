@@ -69,7 +69,11 @@ async fn start_server_custom(
     max_total_sessions: usize,
 ) -> TestServer {
     let data = tempfile::tempdir().expect("data dir");
-    let received = tempfile::tempdir().expect("receive dir");
+    use std::os::unix::fs::PermissionsExt as _;
+    let received = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .expect("receive dir");
     start_server_in(
         data,
         received,
@@ -2473,14 +2477,14 @@ fn twenty_mib() -> ClientFile {
 }
 
 fn staging_files(root: &std::path::Path) -> Vec<PathBuf> {
-    std::fs::read_dir(root)
+    std::fs::read_dir(root.join(".vot-stage"))
         .unwrap()
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(".vot-"))
+                .is_some_and(|name| name.ends_with(".stage") || name.ends_with(".journal"))
         })
         .collect()
 }
@@ -2643,6 +2647,20 @@ async fn restart_refuses_corrupted_staging() {
         .await
         .unwrap();
     assert_ne!(finish.status(), 200);
+    let (status, body) = begin(&client, &base, &session).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["entries"][0]["covered_bytes"], 0);
+    upload_chunks(&client, &base, &session, 0, file).await;
+    let finish = client
+        .post(format!("{base}/api/session/{session}/finish"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(finish.status(), 200, "{}", finish.text().await.unwrap());
+    assert_eq!(
+        std::fs::read(receive_dir.join("resume.bin")).unwrap(),
+        file.bytes
+    );
 }
 
 /// A two-file session where the first file published before the restart:
@@ -2936,12 +2954,10 @@ async fn refused_resume_records_published_files_as_partial() {
         .set_len(1024)
         .unwrap();
     let server = boot(data, received).await;
-    assert!(server
-        .application
-        .store
-        .load_upload_sessions()
-        .unwrap()
-        .is_empty());
+    let retained = server.application.store.load_upload_sessions().unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].id, session);
+    assert_eq!(std::fs::metadata(&staging).unwrap().len(), 1024);
     assert!(receive_dir.join("first.bin").is_file());
     let uploads = server
         .application
@@ -2953,6 +2969,21 @@ async fn refused_resume_records_published_files_as_partial() {
     assert!(uploads[0].partial);
     assert_eq!(uploads[0].files.len(), 1);
     assert_eq!(uploads[0].files[0].stored_as, "first.bin");
+    assert_eq!(
+        std::fs::read(receive_dir.join("first.bin")).unwrap(),
+        files[0].bytes
+    );
+    let server = server.restart().await;
+    assert_eq!(
+        server
+            .application
+            .store
+            .uploads_by_id(&token)
+            .unwrap()
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 /// Restore drill: a backup taken through the API restores through a restart
@@ -3182,11 +3213,10 @@ async fn standby_pull_stages_the_live_copy_and_a_boot_promotes_it() {
 }
 
 /// A staging file shorter than its checkpointed prefix (power loss before
-/// the data reached disk) is refused at boot: the record and staging go,
-/// the link gets an interrupted event with the bytes that had arrived (so the
-/// failure is counted and notified), and the sender starts a fresh session.
+/// the data reached disk) is refused at boot. Evidence remains, the link gets
+/// an interruption notification, and a fresh session can receive the file.
 #[tokio::test(flavor = "multi_thread")]
-async fn restart_drops_a_truncated_staging_session() {
+async fn restart_preserves_a_truncated_staging_session() {
     let server = start_server().await;
     let client = reqwest::Client::builder()
         .cookie_store(true)
@@ -3218,16 +3248,11 @@ async fn restart_drops_a_truncated_staging_session() {
     let server = boot(data, received).await;
     let base = server.base.clone();
 
-    assert!(server
-        .application
-        .store
-        .load_upload_sessions()
-        .unwrap()
-        .is_empty());
-    assert!(
-        staging_files(&receive_dir).is_empty(),
-        "refused staging is swept"
-    );
+    let retained = server.application.store.load_upload_sessions().unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].id, session);
+    assert_eq!(std::fs::metadata(&staging).unwrap().len(), 1024 * 1024);
+    assert_eq!(staging_files(&receive_dir).len(), 2);
     let link = server
         .application
         .store
@@ -4063,6 +4088,7 @@ async fn native_push_root_mismatch_parks_quota_and_allows_retry() {
         .unwrap();
     let staging = persisted
         .dest_dir
+        .join(".vot-stage")
         .join(format!(".vot-push-{}", persisted.push_key.unwrap()));
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -4073,7 +4099,11 @@ async fn native_push_root_mismatch_parks_quota_and_allows_retry() {
                 .unwrap()
                 .unwrap();
             if link.uploads.is_empty()
-                && std::fs::File::open(&staging).is_ok_and(|file| file.try_lock().is_ok())
+                && std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(staging.join("writer.lock"))
+                    .is_ok_and(|file| file.try_lock().is_ok())
             {
                 break;
             }
@@ -4134,18 +4164,14 @@ async fn native_push_abort_retains_recoverable_objects() {
         .unwrap();
     let staging = persisted
         .dest_dir
+        .join(".vot-stage")
         .join(format!(".vot-push-{}", persisted.push_key.unwrap()));
 
     let abort = async {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let first_complete = std::fs::read_dir(staging.join("objects"))
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                    .find(|entry| entry.metadata().is_ok_and(|meta| meta.len() == 1024 * 1024))
-                    .and_then(|entry| std::fs::read(entry.path()).ok())
-                    .is_some_and(|bytes| bytes.iter().all(|byte| *byte == 83));
+                let first_complete = std::fs::read(server.receive_dir.join("inbox/a-first.bin"))
+                    .is_ok_and(|bytes| bytes == vec![83_u8; 1024 * 1024]);
                 if first_complete {
                     break;
                 }
@@ -4168,7 +4194,12 @@ async fn native_push_abort_retains_recoverable_objects() {
     assert!(pushed.is_err(), "aborted push stops the sender");
 
     tokio::time::timeout(Duration::from_secs(10), async {
-        while !std::fs::File::open(&staging).is_ok_and(|file| file.try_lock().is_ok()) {
+        while !std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(staging.join("writer.lock"))
+            .is_ok_and(|file| file.try_lock().is_ok())
+        {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -4183,7 +4214,10 @@ async fn native_push_abort_retains_recoverable_objects() {
     assert!(link.uploads.is_empty());
     assert_eq!(link.events.last().unwrap().outcome, "cancelled");
     assert!(link.events.last().unwrap().received_bytes > 0);
-    assert!(!server.receive_dir.join("inbox/a-first.bin").exists());
+    assert_eq!(
+        std::fs::read(server.receive_dir.join("inbox/a-first.bin")).unwrap(),
+        vec![83_u8; 1024 * 1024]
+    );
     assert!(!server.receive_dir.join("inbox/z-later.bin").exists());
     assert_eq!(server.application.sessions.total(), 1);
     let retry = preflight_push(&client, &server.base, &token, &holder, summary).await;
@@ -4202,7 +4236,7 @@ async fn native_push_abort_retains_recoverable_objects() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn native_push_store_failure_rolls_back_published_files() {
+async fn native_push_store_failure_preserves_published_files_for_retry() {
     let server = start_push_server().await;
     let client = reqwest::Client::builder()
         .cookie_store(true)
@@ -4237,9 +4271,15 @@ async fn native_push_store_failure_rolls_back_published_files() {
         .unwrap();
     let staging = persisted
         .dest_dir
+        .join(".vot-stage")
         .join(format!(".vot-push-{}", persisted.push_key.unwrap()));
     tokio::time::timeout(Duration::from_secs(10), async {
-        while !std::fs::File::open(&staging).is_ok_and(|file| file.try_lock().is_ok()) {
+        while !std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(staging.join("writer.lock"))
+            .is_ok_and(|file| file.try_lock().is_ok())
+        {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -4253,11 +4293,20 @@ async fn native_push_store_failure_rolls_back_published_files() {
         .unwrap()
         .uploads
         .is_empty());
-    for (path, _) in files {
+    for (path, bytes) in &files {
         let destination = server.receive_dir.join("inbox").join(path);
-        assert!(!destination.exists());
-        assert!(!PathBuf::from(format!("{}.vot-receipt", destination.display())).exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), *bytes);
+        assert!(PathBuf::from(format!("{}.vot-receipt", destination.display())).exists());
     }
+    let identities: Vec<_> = files
+        .iter()
+        .map(|(path, _)| {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(server.receive_dir.join("inbox").join(path))
+                .unwrap()
+                .ino()
+        })
+        .collect();
     assert_eq!(server.application.sessions.total(), 1);
     rusqlite::Connection::open(server._data.path().join("votport.db"))
         .unwrap()
@@ -4268,6 +4317,12 @@ async fn native_push_store_failure_rolls_back_published_files() {
     push_bundle_blocking(&server, &bundle, &capability, &holder_key)
         .await
         .unwrap();
+    for ((path, bytes), inode) in files.iter().zip(identities) {
+        use std::os::unix::fs::MetadataExt as _;
+        let destination = server.receive_dir.join("inbox").join(path);
+        assert_eq!(std::fs::read(&destination).unwrap(), *bytes);
+        assert_eq!(std::fs::metadata(destination).unwrap().ino(), inode);
+    }
     assert_eq!(
         server
             .application
@@ -5894,4 +5949,277 @@ async fn a_library_grant_is_fetched_over_vot_quic_and_counted_once() {
         metrics.contains("votport_serve_deliveries_total 2\n"),
         "the counter moved past two: {metrics}"
     );
+}
+
+/// Runs separately from unit tests against explicitly qualified disposable storage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires VOTPORT_NAS_TEST_MOUNT, VOTPORT_NAS_TEST_SOURCE and NVMe/local TMPDIR"]
+async fn mounted_nas_media_campaign() {
+    use votport_client_core::progress::{Event, Observer};
+    struct Progress {
+        started: std::time::Instant,
+        completed: usize,
+        reported_gib: u64,
+    }
+    impl Observer for Progress {
+        fn event(&mut self, event: Event) {
+            match event {
+                Event::Transport(transport) => println!(
+                    "transport={transport:?} seconds={:.3}",
+                    self.started.elapsed().as_secs_f64()
+                ),
+                Event::SessionCreated { session } => println!(
+                    "session={session} seconds={:.3}",
+                    self.started.elapsed().as_secs_f64()
+                ),
+                Event::EntryComplete { .. } => {
+                    self.completed += 1;
+                    if self.completed.is_multiple_of(10_000) {
+                        println!(
+                            "files={} seconds={:.3}",
+                            self.completed,
+                            self.started.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+                Event::Bytes { moved, .. } if moved >> 30 > self.reported_gib => {
+                    self.reported_gib = moved >> 30;
+                    println!(
+                        "moved={moved} seconds={:.3}",
+                        self.started.elapsed().as_secs_f64()
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    let source = PathBuf::from(
+        std::env::var_os("VOTPORT_NAS_TEST_SOURCE").expect("explicit existing fixture"),
+    );
+    let push = match std::env::var("VOTPORT_NAS_TEST_TRANSPORT").as_deref() {
+        Ok("push") => true,
+        Ok("http") => false,
+        _ => panic!("VOTPORT_NAS_TEST_TRANSPORT must be http or push"),
+    };
+    let server = start_nas_test_server(push).await;
+    let keeper = tokio::spawn(app::lease_keeper(Arc::clone(&server.application)));
+    let lock = server.receive_dir.join(".vot-stage/writer.lock");
+    let try_lock = || {
+        std::process::Command::new("python3")
+            .args(["-c", "import errno,fcntl,sys\nf=open(sys.argv[1], 'r+b')\ntry: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\nexcept OSError as e:\n if e.errno in (errno.EAGAIN, errno.EACCES): sys.exit(3)\n raise"])
+            .arg(&lock)
+            .status()
+            .unwrap()
+            .code()
+    };
+    assert_eq!(
+        try_lock(),
+        Some(3),
+        "a second process must not acquire the NAS writer lock"
+    );
+    println!(
+        "{}",
+        json!({"phase":"start","receive":server.receive_dir,"control":server.application.config.data_dir})
+    );
+    let link = votport::store::Link {
+        id: "campaign".into(),
+        tenant: String::new(),
+        label: "NAS campaign".into(),
+        dest: String::new(),
+        password_hash: None,
+        created_at: votport::store::now_unix(),
+        expires_at: None,
+        max_bytes: None,
+        active: true,
+        legal_hold: false,
+        notify_on_upload: false,
+        uploads: vec![],
+        events: vec![],
+    };
+    server.application.store.insert_link(link).unwrap();
+    let base = server.base.clone();
+    let started = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            assert!(entry.file_type().unwrap().is_file());
+            votport_client_core::collect(&entry.path(), &mut files).unwrap();
+        }
+        let count = files.len();
+        let bytes: u64 = files
+            .iter()
+            .map(|file| std::fs::metadata(&file.source).unwrap().len())
+            .sum();
+        assert!(count > 0);
+        let drop = votport_client_core::Drop {
+            token: "campaign".into(),
+            password: None,
+            files,
+        };
+        let mut progress = Progress {
+            started,
+            completed: 0,
+            reported_gib: 0,
+        };
+        let sent = if push {
+            votport_client_core::send(
+                &base,
+                drop,
+                &votport_client_core::Device::from_signing_key(
+                    ed25519_dalek::SigningKey::from_bytes(&[42; 32]),
+                ),
+                &mut progress,
+            )
+        } else {
+            votport_client_core::send_over_http(&base, drop, &mut progress)
+                .map(votport_client_core::Sent::Http)
+        };
+        (sent, count, bytes)
+    })
+    .await
+    .unwrap();
+    let elapsed = started.elapsed().as_secs_f64();
+    // Keep the isolated fixture artifacts on success and transfer failure for external hashes.
+    let receive_path = server._received.keep();
+    let control_path = server._data.keep();
+    println!(
+        "{}",
+        json!({"receive":receive_path,"control":control_path,"files":result.1,"bytes":result.2,"seconds":elapsed,"transport":if push {"push"} else {"http"},"success":result.0.is_ok()})
+    );
+    let sent = result.0.unwrap();
+    assert_eq!(
+        matches!(sent, votport_client_core::Sent::Push { .. }),
+        push,
+        "transport fallback invalidates the measurement"
+    );
+    let upload = server
+        .application
+        .store
+        .link("", "campaign")
+        .unwrap()
+        .unwrap()
+        .uploads
+        .pop()
+        .expect("published upload");
+    assert_eq!(upload.files.len(), result.1);
+    assert_eq!(upload.total_bytes, result.2);
+    assert!(!upload.partial);
+    assert!(upload
+        .files
+        .iter()
+        .all(|file| file.receipt && !file.deleted));
+    keeper.abort();
+    let _ = keeper.await;
+    assert!(app::renew_lease(
+        &server.application,
+        votport::store::now_unix()
+    ));
+    assert_eq!(
+        try_lock(),
+        Some(3),
+        "NAS ownership must survive the transfer"
+    );
+    app::release_data_lock(&server.application);
+    assert_eq!(
+        try_lock(),
+        Some(0),
+        "released NAS ownership permits another process"
+    );
+}
+
+async fn start_nas_test_server(push: bool) -> TestServer {
+    let mount = PathBuf::from(
+        std::env::var_os("VOTPORT_NAS_TEST_MOUNT").expect("explicit disposable mount"),
+    );
+    let data = tempfile::Builder::new()
+        .prefix("votport-nas-control-")
+        .tempdir()
+        .unwrap();
+    let received = tempfile::Builder::new()
+        .prefix("votport-nas-receive-")
+        .tempdir_in(&mount)
+        .unwrap();
+    let identity = votport::receiving::storage_identity(received.path()).unwrap();
+    assert!(
+        ["nfs", "nfs4", "cifs", "smb3"].contains(&identity.filesystem.as_str()),
+        "campaign requires an actual NAS mount"
+    );
+    {
+        let store = votport::store::Store::open(data.path()).unwrap();
+        let qualified = votport::receiving::Qualification {
+            storage: identity,
+            qualified_at: votport::store::now_unix(),
+            qualified_by: "isolated-fixture".into(),
+        };
+        store
+            .put_settings(
+                "fixture",
+                &[(
+                    votport::receiving::SETTING_KEY.into(),
+                    votport::store::SettingWrite::Set(serde_json::to_string(&qualified).unwrap()),
+                )],
+            )
+            .unwrap();
+    }
+    start_server_in(data, received, 1 << 40, push, 3600, 32).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable NAS and external revocation of this client's file locks"]
+async fn mounted_nas_lock_loss_stops_receiving() {
+    let server = start_nas_test_server(false).await;
+    let destinations = server.application.receiving_destinations().unwrap();
+    println!(
+        "{}",
+        json!({"phase":"lock-ready","receive":server.receive_dir})
+    );
+    let mut lost = false;
+    for _ in 0..120 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if !app::renew_lease(&server.application, votport::store::now_unix()) {
+            lost = true;
+            break;
+        }
+    }
+    assert!(
+        lost,
+        "externally revoke the fixture client's NAS locks within 60 seconds"
+    );
+    assert!(server
+        .application
+        .lease_lost
+        .load(std::sync::atomic::Ordering::Acquire));
+    assert!(destinations.check_live().is_err());
+    assert!(server.application.receiving_destinations().is_err());
+    assert!(!app::renew_lease(
+        &server.application,
+        votport::store::now_unix()
+    ));
+    app::release_data_lock(&server.application);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable NAS and external revocation of this client's file locks"]
+async fn mounted_nas_recovery_lock_loss_stops_receiving() {
+    let server = start_nas_test_server(false).await;
+    let mut state = server.application.receiving.lock().unwrap();
+    let active = state.as_mut().unwrap();
+    let result = active.during_recovery(|destinations| {
+        println!(
+            "{}",
+            json!({"phase":"lock-ready","receive":server.receive_dir})
+        );
+        for _ in 0..120 {
+            if destinations.check_live().is_err() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        panic!("externally revoke the fixture client's NAS locks within 60 seconds");
+    });
+    assert!(result.is_err());
+    assert!(active.destinations.check_live().is_err());
+    drop(state);
+    app::release_data_lock(&server.application);
 }

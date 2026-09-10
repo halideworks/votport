@@ -305,6 +305,7 @@ pub struct PersistedUploadFile {
     pub journal_path: PathBuf,
     pub incarnation: [u8; 16],
     pub profile: vot_sdk_file::CommitProfile,
+    pub nas_contract: vot_sdk_file::NasContract,
     /// Contiguous covered offset from zero; the restart resumes from here.
     pub prefix_bytes: u64,
     pub published: bool,
@@ -318,6 +319,12 @@ pub struct TenantUsage {
     pub tenant: String,
     pub links: u64,
     pub received_bytes: u64,
+}
+
+pub struct RetainedReservation {
+    pub id: String,
+    pub push_key: Option<String>,
+    pub bytes: u64,
 }
 
 impl Tenant {
@@ -466,7 +473,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 30;
+pub(crate) const SCHEMA_VERSION: u64 = 31;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -859,7 +866,11 @@ impl Store {
     /// Moves pre-isolation named-tenant subtrees under the reserved storage
     /// directory. The marker is written last, so a crash between renames can
     /// resume without moving a subtree twice.
-    pub fn migrate_tenant_storage(&self, receive_dir: &Path) -> Result<(), String> {
+    pub fn migrate_tenant_storage(
+        &self,
+        receive_dir: &Path,
+        check_live: impl Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
         const KEY: &str = "tenant_storage_layout";
         const LAYOUT: &str = "reserved-v1";
         let marker = self.with(|connection| {
@@ -963,9 +974,12 @@ impl Store {
             if !source_exists {
                 continue;
             }
+            check_live()?;
             std::fs::create_dir_all(&target_root)
                 .map_err(|error| format!("create {}: {error}", target_root.display()))?;
+            check_live()?;
             crate::paths::tighten_dir(&target_root);
+            check_live()?;
             std::fs::rename(&source, &target).map_err(|error| {
                 format!("move {} to {}: {error}", source.display(), target.display())
             })?;
@@ -975,15 +989,18 @@ impl Store {
         // earlier process.
         #[cfg(unix)]
         {
+            check_live()?;
             if target_root.exists() {
                 std::fs::File::open(&target_root)
                     .and_then(|directory| directory.sync_all())
                     .map_err(|error| format!("sync {}: {error}", target_root.display()))?;
             }
+            check_live()?;
             std::fs::File::open(receive_dir)
                 .and_then(|directory| directory.sync_all())
                 .map_err(|error| format!("sync {}: {error}", receive_dir.display()))?;
         }
+        check_live()?;
         self.with(|connection| {
             connection.execute(
                 "INSERT INTO meta (key, value) VALUES (?1, ?2)",
@@ -1325,6 +1342,14 @@ impl Store {
                 INSERT OR IGNORE INTO receive_workflow_uploads SELECT json_extract(j.document,'$.received.link_id'),json_extract(j.document,'$.received.upload_id') FROM delivery_jobs j JOIN links l ON l.id=json_extract(j.document,'$.received.link_id') AND l.tenant=j.tenant WHERE json_extract(j.document,'$.received') IS NOT NULL;
                 DELETE FROM delivery_policy_cache;")
                 .map_err(|error| format!("schema: {error}"))?;
+        }
+        if stored < 31 {
+            let present: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('upload_session_files') WHERE name='nas_contract')", [], |row| row.get(0))
+                .map_err(|error| format!("schema: {error}"))?;
+            if !present {
+                transaction.execute_batch("ALTER TABLE upload_session_files ADD COLUMN nas_contract TEXT NOT NULL DEFAULT 'unqualified' CHECK (nas_contract IN ('unqualified', 'server_acknowledged'));")
+                    .map_err(|error| format!("schema: {error}"))?;
+            }
         }
         transaction
             .execute(
@@ -1999,7 +2024,7 @@ impl Store {
             && workflows::receive_pending(&transaction, tenant, id).map_err(|e| e.to_string())?
         {
             return Err(
-                "incoming workflows still need this history; finish or cancel them first".into(),
+                "incoming workflows still use this history; wait for their deliveries to be archived before deleting it".into(),
             );
         }
         let Some(mut link) = read_link(&transaction, tenant, id)? else {
@@ -2060,6 +2085,45 @@ impl Store {
             parse_json(&uploads_json, 0).map_err(|error| error.to_string())?;
         let _: Vec<SessionEvent> =
             parse_json(&events_json, 1).map_err(|error| error.to_string())?;
+        if upload.partial && uploads.iter().any(|previous| previous.id == upload.id) {
+            let mut link = read_link(&transaction, tenant, id)?.ok_or("upload link disappeared")?;
+            let previous = link
+                .uploads
+                .iter_mut()
+                .find(|previous| previous.id == upload.id)
+                .ok_or("recovery upload disappeared")?;
+            if !previous.partial || previous.package_root != upload.package_root {
+                return Err("recovery upload identity changed".into());
+            }
+            for file in upload.files {
+                if let Some(existing) = previous
+                    .files
+                    .iter_mut()
+                    .find(|existing| existing.stored_as == file.stored_as)
+                {
+                    if (
+                        existing.bytes,
+                        existing.suite.as_str(),
+                        existing.root.as_str(),
+                    ) != (file.bytes, file.suite.as_str(), file.root.as_str())
+                    {
+                        return Err("recovered file identity changed".into());
+                    }
+                    existing.receipt |= file.receipt;
+                } else {
+                    previous.files.push(file);
+                }
+            }
+            previous.total_bytes = previous
+                .files
+                .iter()
+                .fold(0_u64, |total, file| total.saturating_add(file.bytes));
+            previous.completed_at = upload.completed_at;
+            write_link_row(&transaction, &link).map_err(|e| e.to_string())?;
+            sync_link_files(&transaction, &link).map_err(|e| e.to_string())?;
+            transaction.commit().map_err(|e| e.to_string())?;
+            return Ok(true);
+        }
         let upload_index = i64::try_from(uploads.len()).unwrap_or(i64::MAX);
         drop((uploads, uploads_json, events_json));
         transaction
@@ -2137,7 +2201,7 @@ impl Store {
             .map_err(|error| error.to_string())?;
         if workflows::receive_pending(&transaction, tenant, id).map_err(|e| e.to_string())? {
             return Err(
-                "incoming workflows still need this request; finish or cancel them first".into(),
+                "incoming workflows still use this request; wait for their deliveries to be archived before deleting it".into(),
             );
         }
         transaction
@@ -2435,8 +2499,8 @@ impl Store {
                     "INSERT INTO upload_session_files
                      (session_id, entry, display_path, stored_components, object_suite,
                       object_root, object_length, staging_path, journal_path, incarnation,
-                      prefix_bytes, published, receipt, commit_profile)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                      prefix_bytes, published, receipt, commit_profile, nas_contract)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                     rusqlite::params![
                         session.id,
                         i64::try_from(file.entry).unwrap_or(i64::MAX),
@@ -2455,6 +2519,10 @@ impl Store {
                             vot_sdk_file::CommitProfile::Fast => "fast",
                             vot_sdk_file::CommitProfile::Balanced => "balanced",
                             vot_sdk_file::CommitProfile::Strict => "strict",
+                        },
+                        match file.nas_contract {
+                            vot_sdk_file::NasContract::Unqualified => "unqualified",
+                            vot_sdk_file::NasContract::ServerAcknowledged => "server_acknowledged",
                         },
                     ],
                 )
@@ -2483,7 +2551,7 @@ impl Store {
                 )
                 .map_err(|error| error.to_string())?;
             for (entry, prefix_bytes, published, receipt) in progress {
-                update
+                let updated = update
                     .execute(rusqlite::params![
                         session_id,
                         i64::try_from(entry).unwrap_or(i64::MAX),
@@ -2492,6 +2560,9 @@ impl Store {
                         i64::from(receipt),
                     ])
                     .map_err(|error| error.to_string())?;
+                if updated != 1 {
+                    return Err("upload admission is missing at checkpoint".to_owned());
+                }
             }
         }
         transaction.commit().map_err(|error| error.to_string())
@@ -2499,22 +2570,30 @@ impl Store {
 
     /// Every persisted session with its files, for boot re-attach.
     pub fn load_upload_sessions(&self) -> Result<Vec<PersistedUploadSession>, String> {
-        self.load_sessions(false)
+        self.load_sessions(false, None)
     }
 
     pub fn load_push_sessions(&self) -> Result<Vec<PersistedUploadSession>, String> {
-        self.load_sessions(true)
+        self.load_sessions(true, None)
     }
 
-    fn load_sessions(&self, push_only: bool) -> Result<Vec<PersistedUploadSession>, String> {
+    pub fn load_push_session(&self, key: &str) -> Result<Option<PersistedUploadSession>, String> {
+        Ok(self.load_sessions(true, Some(key))?.into_iter().next())
+    }
+
+    fn load_sessions(
+        &self,
+        push_only: bool,
+        push_key: Option<&str>,
+    ) -> Result<Vec<PersistedUploadSession>, String> {
         self.with(|connection| {
             let mut sessions = Vec::new();
             let mut statement = connection.prepare(
                 "SELECT id, link_id, tenant, dest_dir, dest_rel, package_suite,
                         package_root, package_length, max_total_bytes, started_at, push_key
-                 FROM upload_sessions WHERE NOT ?1 OR push_key IS NOT NULL ORDER BY created_at",
+                 FROM upload_sessions WHERE (NOT ?1 OR push_key IS NOT NULL) AND (?2 IS NULL OR push_key = ?2) ORDER BY created_at",
             )?;
-            let rows = statement.query_map([push_only], |row| {
+            let rows = statement.query_map(rusqlite::params![push_only, push_key], |row| {
                 Ok(PersistedUploadSession {
                     push_key: row.get(10)?,
                     id: row.get(0)?,
@@ -2536,7 +2615,7 @@ impl Store {
             let mut file_statement = connection.prepare(
                 "SELECT entry, display_path, stored_components, object_suite, object_root,
                         object_length, staging_path, journal_path, incarnation,
-                        prefix_bytes, published, receipt, commit_profile
+                        prefix_bytes, published, receipt, commit_profile, nas_contract
                  FROM upload_session_files WHERE session_id = ?1 ORDER BY entry",
             )?;
             for session in &mut sessions {
@@ -2575,6 +2654,17 @@ impl Store {
                                     12,
                                     rusqlite::types::Type::Text,
                                     "invalid commit profile".into(),
+                                ))
+                            }
+                        },
+                        nas_contract: match row.get::<_, String>(13)?.as_str() {
+                            "unqualified" => vot_sdk_file::NasContract::Unqualified,
+                            "server_acknowledged" => vot_sdk_file::NasContract::ServerAcknowledged,
+                            _ => {
+                                return Err(rusqlite::Error::FromSqlConversionFailure(
+                                    13,
+                                    rusqlite::types::Type::Text,
+                                    "invalid NAS contract".into(),
                                 ))
                             }
                         },
@@ -3119,6 +3209,21 @@ impl Store {
         self.tenant_stored(tenant).map(|(_, bytes)| bytes)
     }
 
+    pub fn tenant_admission_usage(
+        &self,
+        tenant: &str,
+    ) -> Result<(u64, Vec<RetainedReservation>), String> {
+        let received = self.tenant_received_bytes(tenant)?;
+        let retained = self.with(|connection| {
+            let mut statement = connection.prepare_cached("SELECT id,push_key,package_length FROM upload_sessions WHERE tenant=?1 AND EXISTS(SELECT 1 FROM upload_session_files WHERE session_id=upload_sessions.id)")?;
+            let rows = statement.query_map([tenant], |row| Ok(RetainedReservation {
+                id: row.get(0)?, push_key: row.get(1)?, bytes: row.get::<_, i64>(2)?.max(0) as u64,
+            }))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        Ok((received, retained))
+    }
+
     /// Link and live-byte totals for every tenant in one grouped query. Both
     /// byte queries take the bare `bytes_lo` beside `MAX(bytes_hi)`: SQLite
     /// returns the other columns from the row that won a lone MAX, so the
@@ -3530,18 +3635,6 @@ impl Store {
         })
     }
 
-    pub fn mark_fetch_delivered(&self, token_id: &str, now: u64) -> Result<(), String> {
-        self.with(|connection| {
-            connection
-                .execute(
-                    "UPDATE outbound_fetch_tickets SET delivered_at = ?2
-                     WHERE token_id = ?1 AND delivered_at IS NULL",
-                    rusqlite::params![token_id, now as i64],
-                )
-                .map(|_| ())
-        })
-    }
-
     /// Drops tickets expired for more than a day; the audit log keeps the
     /// mint and the delivery.
     pub fn prune_fetch_tickets(&self, before: u64) -> Result<usize, String> {
@@ -3831,6 +3924,26 @@ impl Store {
         indexes: &[usize],
         at: u64,
     ) -> Result<OutboundDownloadResult, String> {
+        self.record_download(id, indexes, at, None)
+    }
+
+    pub fn record_fetch_download(
+        &self,
+        id: &str,
+        indexes: &[usize],
+        at: u64,
+        token: &str,
+    ) -> Result<OutboundDownloadResult, String> {
+        self.record_download(id, indexes, at, Some(token))
+    }
+
+    fn record_download(
+        &self,
+        id: &str,
+        indexes: &[usize],
+        at: u64,
+        ticket: Option<&str>,
+    ) -> Result<OutboundDownloadResult, String> {
         let mut connection = self.connection.lock().expect("store poisoned");
         let transaction = connection
             .transaction()
@@ -4037,6 +4150,12 @@ impl Store {
         })();
         match result {
             Ok(result) => {
+                if let Some(ticket) = ticket {
+                    let changed = transaction.execute("UPDATE outbound_fetch_tickets SET delivered_at=COALESCE(delivered_at,?3) WHERE token_id=?1 AND grant_id=?2", rusqlite::params![ticket, id, i64::try_from(at).unwrap_or(i64::MAX)]).map_err(|error| error.to_string())?;
+                    if changed != 1 {
+                        return Err("fetch completion ticket does not match its grant".to_owned());
+                    }
+                }
                 transaction.commit().map_err(|error| error.to_string())?;
                 Ok(result)
             }
@@ -6040,6 +6159,68 @@ mod tests {
     }
 
     #[test]
+    fn fetch_delivery_and_ticket_commit_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut grant = test_outbound_grant("g1", "acme", 0);
+        grant.max_downloads = Some(1);
+        store.insert_outbound_grant(grant).unwrap();
+        store
+            .insert_outbound_grant(test_outbound_grant("g2", "acme", 0))
+            .unwrap();
+        let ticket = FetchTicket {
+            holder: "holder".into(),
+            grant_token_hash: "hash-g1".into(),
+            policy_revision: 0,
+            token_id: "ticket".into(),
+            grant_id: "g1".into(),
+            manifest_root: "00".repeat(32),
+            expires_at: 19,
+            delivered_at: None,
+        };
+        assert!(store.put_fetch_ticket(&ticket, 1).unwrap());
+        let connection = rusqlite::Connection::open(directory.path().join("votport.db")).unwrap();
+        connection.execute_batch("CREATE TRIGGER fail_ticket BEFORE UPDATE OF delivered_at ON outbound_fetch_tickets BEGIN SELECT RAISE(FAIL, 'fixture'); END;").unwrap();
+        assert!(store
+            .record_fetch_download("g1", &[0], 10, "ticket")
+            .is_err());
+        assert_eq!(
+            store.outbound_grant_by_id("g1").unwrap().unwrap().downloads,
+            0
+        );
+        assert_eq!(
+            store.fetch_ticket("ticket").unwrap().unwrap().delivered_at,
+            None
+        );
+        connection
+            .execute_batch("DROP TRIGGER fail_ticket;")
+            .unwrap();
+        for (grant, token) in [("g2", "ticket"), ("g1", "missing")] {
+            assert!(store.record_fetch_download(grant, &[0], 10, token).is_err());
+            assert_eq!(
+                store
+                    .outbound_grant_by_id(grant)
+                    .unwrap()
+                    .unwrap()
+                    .downloads,
+                0
+            );
+        }
+        store
+            .record_fetch_download("g1", &[0], 10, "ticket")
+            .unwrap();
+        assert_eq!(
+            store.outbound_grant_by_id("g1").unwrap().unwrap().downloads,
+            1
+        );
+        assert_eq!(
+            store.fetch_ticket("ticket").unwrap().unwrap().delivered_at,
+            Some(10)
+        );
+        assert!(!store.admit_fetch_ticket(&ticket, 11).unwrap());
+    }
+
+    #[test]
     fn outbound_download_count_and_active_link_query_round_trip() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -6565,6 +6746,54 @@ mod tests {
     }
 
     #[test]
+    fn tenant_storage_migration_stops_before_mutation_and_does_not_mark_completion() {
+        for stop_after in 0..6 {
+            let directory = tempfile::tempdir().unwrap();
+            let receive = directory.path().join("receive");
+            std::fs::create_dir_all(receive.join("acme")).unwrap();
+            std::fs::write(receive.join("acme/frame"), b"media").unwrap();
+            let store = Store::open(&directory.path().join("data")).unwrap();
+            store.insert_tenant(test_tenant("acme")).unwrap();
+            let checks = std::cell::Cell::new(0);
+            assert!(store
+                .migrate_tenant_storage(&receive, || {
+                    let count = checks.get();
+                    checks.set(count + 1);
+                    if count >= stop_after {
+                        Err("ownership lost".into())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err());
+            assert_eq!(checks.get(), stop_after + 1);
+            let marked: bool = store
+                .with(|connection| {
+                    connection.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM meta WHERE key = 'tenant_storage_layout')",
+                        [],
+                        |row| row.get(0),
+                    )
+                })
+                .unwrap();
+            assert!(!marked);
+            if stop_after < 3 {
+                assert!(receive.join("acme/frame").is_file());
+            }
+            store.migrate_tenant_storage(&receive, || Ok(())).unwrap();
+            assert_eq!(
+                std::fs::read(
+                    receive
+                        .join(crate::paths::TENANT_STORAGE_DIR)
+                        .join("acme/frame")
+                )
+                .unwrap(),
+                b"media"
+            );
+        }
+    }
+
+    #[test]
     fn tenant_storage_migration_resumes_and_marks_completion() {
         let directory = tempfile::tempdir().unwrap();
         let data = directory.path().join("data");
@@ -6580,7 +6809,7 @@ mod tests {
         std::fs::create_dir_all(target_root.join("globex")).unwrap();
         std::fs::write(target_root.join("globex/done.pdf"), b"globex").unwrap();
 
-        store.migrate_tenant_storage(&receive).unwrap();
+        store.migrate_tenant_storage(&receive, || Ok(())).unwrap();
         assert!(!receive.join("acme").exists());
         assert_eq!(
             std::fs::read(target_root.join("acme/invoice.pdf")).unwrap(),
@@ -6592,7 +6821,7 @@ mod tests {
         // default tenant and must never be reinterpreted on restart.
         std::fs::create_dir_all(receive.join("acme")).unwrap();
         std::fs::write(receive.join("acme/root.txt"), b"root").unwrap();
-        store.migrate_tenant_storage(&receive).unwrap();
+        store.migrate_tenant_storage(&receive, || Ok(())).unwrap();
         assert!(receive.join("acme/root.txt").exists());
     }
 
@@ -6607,13 +6836,17 @@ mod tests {
         std::fs::create_dir_all(receive.join(crate::paths::TENANT_STORAGE_DIR).join("acme"))
             .unwrap();
 
-        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        let error = store
+            .migrate_tenant_storage(&receive, || Ok(()))
+            .unwrap_err();
         assert!(error.contains("found both"), "{error}");
 
         std::fs::remove_dir_all(receive.join(crate::paths::TENANT_STORAGE_DIR)).unwrap();
         std::fs::remove_dir_all(receive.join("acme")).unwrap();
         std::fs::write(receive.join("acme"), b"default tenant").unwrap();
-        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        let error = store
+            .migrate_tenant_storage(&receive, || Ok(()))
+            .unwrap_err();
         assert!(error.contains("expected a directory"), "{error}");
     }
 
@@ -6650,7 +6883,9 @@ mod tests {
         });
         store.insert_link(link).unwrap();
 
-        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        let error = store
+            .migrate_tenant_storage(&receive, || Ok(()))
+            .unwrap_err();
         assert!(error.contains("cannot determine ownership"), "{error}");
         assert!(receive.join("acme/invoice.pdf").exists());
         assert!(!receive.join(crate::paths::TENANT_STORAGE_DIR).exists());
@@ -6665,7 +6900,9 @@ mod tests {
             })
             .unwrap();
 
-        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        let error = store
+            .migrate_tenant_storage(&receive, || Ok(()))
+            .unwrap_err();
         assert!(error.contains("cannot determine ownership"), "{error}");
         assert!(receive
             .join(crate::paths::TENANT_STORAGE_DIR)
@@ -6685,7 +6922,9 @@ mod tests {
             InsertTenantError::AlreadyExists
         );
 
-        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        let error = store
+            .migrate_tenant_storage(&receive, || Ok(()))
+            .unwrap_err();
         assert!(error.contains("is not portable"), "{error}");
 
         store
@@ -6698,7 +6937,9 @@ mod tests {
             })
             .unwrap();
 
-        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        let error = store
+            .migrate_tenant_storage(&receive, || Ok(()))
+            .unwrap_err();
         assert!(error.contains("is not portable"), "{error}");
     }
 
@@ -6714,19 +6955,25 @@ mod tests {
         link.dest = "S".to_owned();
         store.insert_link(link).unwrap();
 
-        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        let error = store
+            .migrate_tenant_storage(&receive, || Ok(()))
+            .unwrap_err();
         assert!(error.contains("cannot determine ownership"), "{error}");
 
         store
             .update_link("", "dest", |link| link.dest = "ſ".to_owned())
             .unwrap();
-        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        let error = store
+            .migrate_tenant_storage(&receive, || Ok(()))
+            .unwrap_err();
         assert!(error.contains("cannot determine ownership"), "{error}");
 
         store
             .update_link("", "dest", |link| link.dest = "TENANT~1".to_owned())
             .unwrap();
-        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        let error = store
+            .migrate_tenant_storage(&receive, || Ok(()))
+            .unwrap_err();
         assert!(error.contains("cannot determine ownership"), "{error}");
     }
 
@@ -8418,6 +8665,7 @@ mod settings_tests {
                 journal_path: PathBuf::from("/received/link-1/.vot-1-0-2.journal"),
                 incarnation: [3u8; 16],
                 profile: vot_sdk_file::CommitProfile::Balanced,
+                nas_contract: vot_sdk_file::NasContract::Unqualified,
                 prefix_bytes: 0,
                 published: false,
                 receipt: false,
@@ -8430,6 +8678,14 @@ mod settings_tests {
         second.stored_components = vec!["b.bin".to_owned()];
         session.files.push(second);
         store.insert_upload_session(&session).unwrap();
+        let (received, reserved) = store.tenant_admission_usage("").unwrap();
+        assert_eq!(received, 0);
+        assert_eq!(reserved.len(), 1);
+        assert_eq!(
+            (reserved[0].id.as_str(), reserved[0].bytes),
+            (session.id.as_str(), 100)
+        );
+        assert!(store.tenant_admission_usage("other").unwrap().1.is_empty());
         store
             .update_upload_file_progress(
                 &session.id,

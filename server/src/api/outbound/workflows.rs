@@ -465,7 +465,9 @@ async fn prepare(app: &Arc<App>, mut job: Job) -> ApiResult<()> {
     } else {
         None
     };
-    let mut paths = if job.uses_snapshot() {
+    let mut paths = if job.received.is_some() {
+        received_files(app, &job)?.into_keys().collect()
+    } else if job.uses_snapshot() {
         freeze_files(app, &job).await?
     } else {
         let root = library_root(app, &job.tenant);
@@ -483,7 +485,7 @@ async fn prepare(app: &Arc<App>, mut job: Job) -> ApiResult<()> {
         let names: std::collections::BTreeSet<_> = paths
             .iter()
             .map(|path| {
-                if job.uses_snapshot() {
+                if job.received.is_some() || job.uses_snapshot() {
                     path.as_str()
                 } else {
                     path.strip_prefix(&prefix).unwrap_or(path)
@@ -570,6 +572,42 @@ async fn prepare(app: &Arc<App>, mut job: Job) -> ApiResult<()> {
     Ok(())
 }
 
+pub(super) fn received_files(
+    app: &App,
+    job: &Job,
+) -> ApiResult<std::collections::BTreeMap<String, crate::store::FileRecord>> {
+    app.receiving_destinations()
+        .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let received = job.received.as_ref().ok_or_else(ApiError::not_found)?;
+    let upload = app
+        .store
+        .link_upload(&job.tenant, &received.link_id, &received.upload_id)
+        .map_err(crate::api::store_unavailable)?
+        .ok_or_else(ApiError::not_found)?;
+    if upload.partial
+        || upload.completed_at == 0
+        || upload.files.is_empty()
+        || upload.files.len() > MAX_LIBRARY_PROJECT_FILES
+        || upload.files.iter().any(|file| file.deleted)
+    {
+        return Err(conflict(
+            "incoming package is incomplete or unavailable".into(),
+        ));
+    }
+    let count = upload.files.len();
+    let files: std::collections::BTreeMap<_, _> = upload
+        .files
+        .into_iter()
+        .map(|file| (file.path.clone(), file))
+        .collect();
+    if files.len() != count {
+        return Err(conflict(
+            "incoming inventory contains duplicate filenames".into(),
+        ));
+    }
+    Ok(files)
+}
+
 pub(super) fn payload_root(app: &App, tenant: &str, id: &str) -> PathBuf {
     library_root(app, tenant)
         .join(".votport-workflows")
@@ -617,38 +655,8 @@ async fn freeze_files(app: &Arc<App>, job: &Job) -> ApiResult<Vec<String>> {
         if job.request.import.is_some() {
             return Err(conflict("storage import has not completed".into()));
         }
-        let source_root = if job.received.is_some() {
-            app.config.receive_dir.clone()
-        } else {
-            library_root(&app, &job.tenant)
-        };
-        let sources: Vec<(String, PathBuf)> = if let Some(received) = &job.received {
-            let upload = app
-                .store
-                .link_upload(&job.tenant, &received.link_id, &received.upload_id)
-                .map_err(crate::api::store_unavailable)?
-                .ok_or_else(ApiError::not_found)?;
-            if upload.partial
-                || upload.files.is_empty()
-                || upload.files.len() > MAX_LIBRARY_PROJECT_FILES
-            {
-                return Err(conflict(
-                    "incoming package is incomplete or exceeds the workflow file limit".into(),
-                ));
-            }
-            upload
-                .files
-                .into_iter()
-                .map(|file| {
-                    if file.deleted {
-                        return Err(conflict("incoming file was deleted".into()));
-                    }
-                    let path = admin::stored_path(&app, &job.tenant, &file.stored_as)
-                        .ok_or_else(ApiError::not_found)?;
-                    Ok((file.path, path))
-                })
-                .collect::<ApiResult<_>>()?
-        } else {
+        let source_root = library_root(&app, &job.tenant);
+        let sources: Vec<(String, PathBuf)> = {
             let directory = automation_directory(&app, &job.tenant, &job.project.directory)?;
             enumerate_automation_files(&source_root, &directory, MAX_LIBRARY_PROJECT_FILES)?
                 .into_iter()
@@ -749,8 +757,18 @@ async fn check_media(app: &App, job: &Job, names: &[String]) -> ApiResult<()> {
     if job.project.media.is_none() && !job.project.scan_required {
         return Ok(());
     }
+    let received = job
+        .received
+        .as_ref()
+        .map(|_| received_files(app, job))
+        .transpose()?;
     for name in names {
-        let path = payload_path(app, &job.tenant, &job.id, name)?;
+        let path = if let Some(received) = &received {
+            let file = received.get(name).ok_or_else(ApiError::not_found)?;
+            admin::stored_path(app, &job.tenant, &file.stored_as).ok_or_else(ApiError::not_found)?
+        } else {
+            payload_path(app, &job.tenant, &job.id, name)?
+        };
         if let Some(check) = &job.project.media {
             let binary = std::env::var_os("VOTPORT_FFPROBE").unwrap_or_else(|| "ffprobe".into());
             let output = run_check(
@@ -1217,6 +1235,9 @@ async fn retire_snapshot(app: &Arc<App>) -> Result<(), String> {
         return Ok(());
     };
     let _operation = begin_outbound_operation(app, &job.tenant).map_err(|error| error.message)?;
+    if job.received.is_some() {
+        return app.store.complete_snapshot_retirement(&job.id, now_unix());
+    }
     let root = payload_root(app, &job.tenant, &job.id);
     let path = root.parent().ok_or("invalid snapshot path")?.to_owned();
     if !library_components_safe(&library_root(app, &job.tenant), &path) {
@@ -1294,7 +1315,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reception_snapshots_gate_multiple_copies_and_retry_lost_completion() {
+    async fn reception_pins_originals_and_gates_verified_copies_without_snapshots() {
         for release in [
             crate::workflow::Release::AllDestinations,
             crate::workflow::Release::Local,
@@ -1409,11 +1430,32 @@ mod tests {
                 .unwrap();
             prepare(&app, job.clone()).await.unwrap();
             assert_eq!(
-                std::fs::read(payload_root(&app, "", &job.id).join("file.bin")).unwrap(),
+                std::fs::read(app.config.receive_dir.join("file.bin")).unwrap(),
                 bytes
             );
-            assert!(!app.store.receive_workflow_pending("", &link.id).unwrap());
+            assert!(!payload_root(&app, "", &job.id).exists());
+            assert!(app
+                .store
+                .delivery_job(&job.id)
+                .unwrap()
+                .unwrap()
+                .checks
+                .get("snapshot_bytes")
+                .is_none());
+            assert!(app.store.receive_workflow_pending("", &link.id).unwrap());
             std::fs::write(app.config.receive_dir.join("file.bin"), b"changed!").unwrap();
+            let grant = app.store.outbound_grant_by_id(&job.id).unwrap().unwrap();
+            assert_eq!(grant.files[0].source, "received:file.bin");
+            let source = source_info_indexed(&app, &grant, 0).unwrap();
+            assert_eq!(source.path, app.config.receive_dir.join("file.bin"));
+            assert!(write_verified_source(
+                &mut Vec::new(),
+                source,
+                &app.signer.verifying_key(),
+                &mut [0; 64]
+            )
+            .is_err());
+            std::fs::write(app.config.receive_dir.join("file.bin"), bytes).unwrap();
             let exporting = app
                 .store
                 .claim_delivery_job("worker", now_unix())
@@ -1474,6 +1516,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|event| event.kind == "destination_failed" && event.verify()));
+            std::fs::write(app.config.receive_dir.join("file.bin"), b"changed!").unwrap();
             let mut changed = app
                 .store
                 .link_upload("", &link.id, "complete")
@@ -1893,6 +1936,15 @@ mod tests {
                 "cancelled"
             );
             assert!(receiver.store.delivery_release(&received_job.id).is_err());
+            assert!(receiver.store.remove_link("nyc", &token).is_err());
+            let retiring = receiver
+                .store
+                .claim_snapshot_retirement(now_unix() + 8 * 86400)
+                .unwrap()
+                .unwrap();
+            assert_eq!(retiring.id, received_job.id);
+            assert!(!library_root(&receiver, "nyc").exists());
+            retire_snapshot(&receiver).await.unwrap();
             receiver.store.remove_link("nyc", &token).unwrap();
             assert_eq!(
                 receiver.store.remove_tenant("nyc").unwrap(),

@@ -297,6 +297,7 @@ struct PreparedSession {
     link: Link,
     expected: ObjectId,
     dest_dir: std::path::PathBuf,
+    destinations: Arc<crate::receiving::Destinations>,
     cap: u64,
     max_total: Option<u64>,
     max_sessions: Option<u64>,
@@ -405,7 +406,14 @@ async fn prepare_session(
     );
     let dest_dir =
         paths::join_under(&app.config.receive_dir, &dest_components).map_err(ApiError::internal)?;
+    let destinations = app.receiving_destinations().map_err(|error| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("receiving storage is unavailable: {error}"),
+        )
+    })?;
     Ok(PreparedSession {
+        destinations,
         link,
         expected,
         dest_dir,
@@ -446,7 +454,7 @@ async fn register_session(
     let admit_tenant = prepared.link.tenant.clone();
     tokio::task::spawn_blocking(move || {
         admit_app.sessions.insert_admitted(admission, sender, || {
-            admit_app.store.tenant_received_bytes(&admit_tenant)
+            admit_app.store.tenant_admission_usage(&admit_tenant)
         })
     })
     .await
@@ -564,6 +572,7 @@ pub async fn create_session(
         link_id: prepared.link.id.clone(),
         tenant: prepared.link.tenant.clone(),
         dest_dir: prepared.dest_dir.clone(),
+        destinations: Arc::clone(&prepared.destinations),
         dest_rel: prepared.link.dest.clone(),
         expected_package: prepared.expected.clone(),
         max_total_bytes: prepared.cap,
@@ -670,18 +679,44 @@ pub async fn create_push_session(
     hash.update(prepared.expected.length.to_be_bytes());
     hash.update(holder);
     let key = hex::encode(&hash.finalize()[..16]);
-    let directory = prepared.dest_dir.join(format!(".vot-push-{key}"));
-    std::fs::create_dir_all(&directory)
-        .map_err(|error| ApiError::internal(format!("create push directory: {error}")))?;
-    crate::paths::tighten_dir(&directory);
-    let lock = session::lock_push_directory(&directory)
+    let destinations = Arc::new(
+        prepared
+            .destinations
+            .child(
+                &prepared
+                    .dest_dir
+                    .strip_prefix(&app.config.receive_dir)
+                    .map_err(|_| ApiError::internal("destination is outside receiving storage"))?
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(ApiError::internal)?,
+    );
+    let directory = destinations
+        .push_directory(&key)
+        .map_err(ApiError::internal)?;
+    let lock = session::lock_push_directory(&directory, prepared.destinations.contract())
         .map_err(|error| ApiError::new(StatusCode::CONFLICT, error.to_string()))?;
+    let control_directory = destinations
+        .clear_push_directory(&directory, &lock)
+        .map_err(ApiError::internal)?;
+    lock.set_modified(std::time::SystemTime::now())
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    control_directory
+        .private_child(std::ffi::OsStr::new("engine"))
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let engine = control_directory
+        .entry(std::ffi::OsStr::new("engine"))
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .path();
     let control = session::PushControl::resumable(key.clone(), Some(lock));
     let setup = session::WorkerSetup {
         store: Arc::clone(&app.store),
         link_id: prepared.link.id.clone(),
         tenant: prepared.link.tenant.clone(),
         dest_dir: prepared.dest_dir.clone(),
+        destinations,
         dest_rel: prepared.link.dest.clone(),
         expected_package: prepared.expected.clone(),
         max_total_bytes: prepared.cap,
@@ -710,21 +745,6 @@ pub async fn create_push_session(
     if let Err(error) = session::persist_push(&setup, key) {
         control.park();
         return Err(ApiError::internal(format!("persist push session: {error}")));
-    }
-    let engine = directory.join("engine");
-    let prepared_engine = (|| -> std::io::Result<()> {
-        match std::fs::remove_dir_all(&engine) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        std::fs::create_dir(&engine)
-    })();
-    if let Err(error) = prepared_engine {
-        control.park();
-        return Err(ApiError::internal(format!(
-            "prepare push transport: {error}"
-        )));
     }
     let issued = (|| -> ApiResult<(Vec<u8>, [u8; 16], u64)> {
         let now = now_unix();
@@ -1397,11 +1417,11 @@ mod push_preflight_tests {
         let before = application.store.load_push_sessions().unwrap();
         assert_eq!(before.len(), 1);
         let stage = before[0].dest_dir.join(format!(
-            ".vot-push-{}",
+            ".vot-stage/.vot-push-{}",
             before[0].push_key.as_ref().unwrap()
         ));
-        std::fs::create_dir(stage.join("objects")).unwrap();
-        std::fs::write(stage.join("objects/retained"), b"verified bytes").unwrap();
+        let retained = stage.parent().unwrap().join("retained.stage");
+        std::fs::write(&retained, b"verified bytes").unwrap();
         let _ = upload_abort(State(application.clone()), Path(first.clone())).await;
         assert!(application.sessions.contains_push(&first));
         let second = post_push(application.clone(), "retry", request_body(&holder, 7)).await;
@@ -1413,10 +1433,7 @@ mod push_preflight_tests {
         assert_ne!(first, second);
         assert!(!application.sessions.contains_push(&first));
         assert!(application.sessions.contains_push(&second));
-        assert_eq!(
-            std::fs::read(stage.join("objects/retained")).unwrap(),
-            b"verified bytes"
-        );
+        assert_eq!(std::fs::read(&retained).unwrap(), b"verified bytes");
         let after = application.store.load_push_sessions().unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].id, second);

@@ -859,6 +859,26 @@ pub(crate) fn grant_open(grant: &OutboundGrant, now: u64) -> bool {
             .is_some_and(|max| grant.downloads >= max)
 }
 
+fn refuse_closed_fetch(
+    app: &App,
+    token: [u8; 16],
+    peer: std::net::SocketAddr,
+) -> Option<vot_cli::ServeAdmission> {
+    // Completion and its ticket commit together; a late rail is not another refused delivery.
+    if app
+        .store
+        .fetch_ticket(&hex::encode(token))
+        .ok()
+        .flatten()
+        .is_some_and(|ticket| ticket.delivered_at.is_some())
+    {
+        tracing::debug!(target: "audit", event = "serve_straggler", %peer, "late rail on a delivered ticket turned away");
+        None
+    } else {
+        refuse(app, ServeRefusalReason::Closed, peer)
+    }
+}
+
 /// The admission policy the serve listener runs for every session.
 pub(crate) fn admit_fetch(
     app: &Arc<App>,
@@ -907,26 +927,7 @@ pub(crate) fn admit_fetch(
         return refuse(app, ServeRefusalReason::Closed, peer);
     }
     if !grant_open(&grant, presentation.now) {
-        // A rail that dials after the primary's completion closed a capped
-        // grant is this fetch's own straggler, not a refused delivery: the
-        // ticket already records the delivery. Re-read it here, since the
-        // completion marks the ticket just after it records the delivery
-        // and the earlier read may predate both. Turned away quietly so the
-        // closed counter and the audit line keep meaning something.
-        let delivered = app
-            .store
-            .fetch_ticket(&hex::encode(token))
-            .ok()
-            .flatten()
-            .is_some_and(|ticket| ticket.delivered_at.is_some());
-        if delivered {
-            tracing::debug!(
-                target: "audit", event = "serve_straggler", %peer,
-                "late rail on a delivered ticket turned away"
-            );
-            return None;
-        }
-        return refuse(app, ServeRefusalReason::Closed, peer);
+        return refuse_closed_fetch(app, token, peer);
     }
     let Some(server) = serve.registry.server(root) else {
         // Built at mint and warmed off-thread after a restart, so a server
@@ -966,7 +967,7 @@ pub(crate) fn admit_fetch(
         .admit_fetch_ticket(&ticket, presentation.now)
         .unwrap_or(false)
     {
-        return refuse(app, ServeRefusalReason::Closed, peer);
+        return refuse_closed_fetch(app, token, peer);
     }
     tracing::info!(
         target: "audit", event = "serve_admitted", grant_id = %grant.id, %peer,
@@ -1015,14 +1016,7 @@ pub(crate) fn admit_fetch(
             runtime.spawn_blocking(move || {
                 let now = now_unix();
                 let indexes: Vec<usize> = (0..file_count).collect();
-                let recorded = store.record_outbound_download(&grant_id, &indexes, now);
-                // The reservation closes only with a recorded delivery; a
-                // failed record leaves it standing, which errs the safe way.
-                if recorded.is_ok() {
-                    if let Err(error) = store.mark_fetch_delivered(&hex::encode(token), now) {
-                        tracing::warn!(grant_id = %grant_id, %error, "fetch ticket not marked delivered");
-                    }
-                }
+                let recorded = store.record_fetch_download(&grant_id, &indexes, now, &hex::encode(token));
                 tracing::info!(
                     target: "audit", event = "serve_completed", grant_id = %grant_id, %peer,
                     recorded = recorded.is_ok(), "fetch delivered"

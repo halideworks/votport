@@ -232,8 +232,9 @@ Every published file gets a sidecar, `<name>.vot-receipt`: a canonical
 [vot-receipt](https://github.com/halideworks/VOT) CBOR envelope, ed25519-signed
 with a key votport generates in the data directory (`receipt.key`), attesting
 that exactly that object (suite, BLAKE3 root, length) reached **Published**
-assurance under the receive filesystem's commit profile (Balanced locally, Fast on Linux SMB/NFS), with the session, provider
-incarnation, sequence, and UTC timestamp of the observation. The verifying
+assurance under the receive filesystem's commit profile (Balanced on local storage
+and explicitly qualified Linux SMB/NFS), with the session, provider incarnation,
+sequence, and UTC timestamp of the observation. The verifying
 public key is shown on **System** (and returned by `GET /api/admin/links` as
 `receipt_key`); the receipt's embedded key id is the same 32-byte public key.
 Anyone can check a sidecar without an account: open `/verify`, drop the file
@@ -451,13 +452,14 @@ the UDP connection.
 
 Native and browser uploads share link and tenant quotas, upload history,
 receipts, retention, and the admin UI. Browser uploads continue to use HTTP
-through the reverse proxy. Native push stages the complete package first and
-publishes it as one package after verification; an interrupted native push
-does not publish partial files.
+through the reverse proxy. Both paths write verified ranges directly to the
+receiving filesystem and publish each completed file without a payload copy.
+An interrupted transfer retains completed files and recoverable partials. See
+[direct receiving and NAS qualification](docs/direct-receiving.md).
 
 ## Roadmap
 
-VOT is pinned at `ed8a20b7acb2e58d0dd5c794e20dcfaa66be40d0`. This revision adds batched receive checkpoints, streaming completion hooks, a bounded 16-object fetch window, and progress updates shared across QUIC connections. Server, desktop core, and browser WASM use the same revision. Linux CIFS/SMB and NFS receive paths use Fast; Balanced and Strict are incompatible with these filesystems. See [network filesystem requirements and alternatives](docs/deployment.md#network-filesystems).
+VOT is pinned at `a7c90e9bcdddaa3804408d4fc6e6d86469d11852`. Server, desktop core, and browser WASM use the same revision. HTTP and native push receive directly onto the destination filesystem, retain recoverable publication journals, and avoid a final payload copy. Linux SMB3 and NFSv4 require explicit storage qualification before Balanced receiving; Strict NAS receipts are unavailable. Open **Storage > Receiving storage** to check and enable the share. See [direct receiving](docs/direct-receiving.md).
 
 Native push remains disabled unless `VOTPORT_PUSH_BIND` is set. Browser uploads use HTTP through the reverse proxy, with bounded parallel range acceptance and the existing 8 MiB range ceiling.
 

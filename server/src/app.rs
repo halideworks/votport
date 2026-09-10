@@ -134,7 +134,7 @@ pub struct App {
     pub(crate) _data_lock: std::fs::File,
     /// This instance's name in the receive-root lease (crate::lease).
     pub lease_holder: String,
-    pub lease_acquired_at: u64,
+    pub receiving: Mutex<Result<crate::receiving::Active, String>>,
     /// Set when a heartbeat finds another holder in the lease file; the
     /// process is then shutting down and /readyz reports it.
     pub lease_lost: AtomicBool,
@@ -741,61 +741,56 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
                 .to_owned(),
         );
     }
-    // VOT refuses to stage files under a group-writable directory. On hosts
-    // with umask 002 (Ubuntu user groups) every directory votport creates
-    // would be 0775 and every upload would fail, so pin the umask here.
     #[cfg(unix)]
     rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o022));
-    std::fs::create_dir_all(&config.receive_dir)
-        .map_err(|error| format!("create {}: {error}", config.receive_dir.display()))?;
-    crate::paths::tighten_dir(&config.receive_dir);
-    std::fs::create_dir_all(&config.outbound_dir)
-        .map_err(|error| format!("create {}: {error}", config.outbound_dir.display()))?;
-    crate::paths::tighten_dir(&config.outbound_dir);
-    crate::paths::probe_landing_dir(&config.receive_dir, "VOTPORT_RECEIVE_DIR", true)?;
-    crate::paths::probe_landing_dir(&config.outbound_dir, "VOTPORT_OUTBOUND_DIR", false)?;
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
+    #[cfg(target_os = "linux")]
+    if vot_platform_fs::is_smb_or_nfs(
+        &std::fs::File::open(&config.data_dir).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?
+    {
+        return Err(
+            "VOTPORT_DATA_DIR must use local storage; mount the NAS at VOTPORT_RECEIVE_DIR"
+                .to_owned(),
+        );
+    }
     crate::paths::tighten_private_dir(&config.data_dir).map_err(|error| error.to_string())?;
     let data_lock = lock_data_dir(&config.data_dir)?;
-    // The receive root is the one path every topology shares, so the lease
-    // there fences a standby the data directory lock cannot see. Taken after
-    // the lock so two instances over one data directory get the lock's
-    // message, which names the nearer problem.
-    let lease_holder = crate::lease::new_holder();
-    let lease_path = crate::lease::path(&config.receive_dir);
-    let lease = crate::lease::acquire(&lease_path, &lease_holder, now_unix())?;
-    // Everything from here writes under the lease; a failure must give it
-    // back or the next boot spends 90 s blaming a process that is gone.
-    let built = build_under_lease(config, data_lock, lease_holder.clone(), lease);
-    if built.is_err() {
-        crate::lease::release(&lease_path, &lease_holder);
-    }
-    built
-}
-
-fn build_under_lease(
-    config: Config,
-    data_lock: std::fs::File,
-    lease_holder: String,
-    lease: crate::lease::Lease,
-) -> Result<Arc<App>, String> {
     crate::backup::apply_pending_restore(&config.data_dir, crate::store::SCHEMA_VERSION)?;
-    crate::paths::clean_staging(&config.outbound_dir, &HashSet::new());
     let store = Arc::new(Store::open(&config.data_dir)?);
+    // A saved NAS root is never created on a missing mount's local backing directory.
+    if crate::receiving::saved_qualification(&store)?.is_none() {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&config.receive_dir)
+            .map_err(|e| e.to_string())?;
+    }
+    std::fs::create_dir_all(&config.outbound_dir).map_err(|e| e.to_string())?;
+    let lease_holder = crate::lease::new_holder();
+    let mut receiving = match crate::receiving::Destinations::configured(
+        &config.receive_dir,
+        &store,
+    ) {
+        Ok(destinations) => Ok(crate::receiving::Active::open(destinations, &lease_holder)?),
+        Err(error) => {
+            tracing::warn!(%error, "receiving storage needs configuration; admin remains available");
+            Err(error)
+        }
+    };
     clean_outbound_stage(&config.data_dir);
     clean_outbound_proof_stages(&config.data_dir);
     clean_outbound_proofs(&config.data_dir, &store, now_unix());
-    store.migrate_tenant_storage(&config.receive_dir)?;
     let secret = crate::auth::load_secret(&config.data_dir)?;
     let signer = Arc::clone(&store.event_signer);
-    // Upload sessions suspended by the last shutdown re-attach their
-    // staging; every other staging file from a crash or kill has no live
-    // session to sweep it, so remove those once at startup.
     let sessions = Sessions::new();
     let (session_ended, session_ended_rx) = tokio::sync::mpsc::unbounded_channel();
-    let kept = resume_upload_sessions(&config, &store, &signer, &sessions, &session_ended);
-    crate::paths::clean_staging(&config.receive_dir, &kept);
+    if let Ok(active) = &mut receiving {
+        resume_upload_sessions(&config, &store, &signer, &sessions, &session_ended, active)?;
+    }
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .referer(false)
@@ -861,13 +856,38 @@ fn build_under_lease(
         workflow_ready: tokio::sync::Notify::new(),
         _data_lock: data_lock,
         lease_holder,
-        lease_acquired_at: lease.acquired_at,
+        receiving: Mutex::new(receiving),
         lease_lost: AtomicBool::new(false),
         config,
     }))
 }
 
 impl App {
+    pub fn receiving_destinations(&self) -> Result<Arc<crate::receiving::Destinations>, String> {
+        if self.lease_lost.load(Ordering::Relaxed) {
+            return Err("receiving storage ownership was lost".to_owned());
+        }
+        let state = self.receiving.lock().expect("receiving state poisoned");
+        let active = state.as_ref().map_err(Clone::clone)?;
+        active.destinations.check_current()?;
+        Ok(Arc::clone(&active.destinations))
+    }
+
+    pub(crate) fn resume_receiving(
+        &self,
+        active: &mut crate::receiving::Active,
+    ) -> Result<(), String> {
+        resume_upload_sessions(
+            &self.config,
+            &self.store,
+            &self.signer,
+            &self.sessions,
+            &self.session_ended,
+            active,
+        )?;
+        Ok(())
+    }
+
     pub fn request_shutdown(&self) {
         self.shutdown.notify_waiters();
     }
@@ -880,34 +900,54 @@ impl App {
 /// exit, which is the crash path the checkpoint already covers.
 pub async fn suspend_sessions(app: &App) {
     let senders = app.sessions.take_http();
-    let mut replies = Vec::with_capacity(senders.len());
-    for sender in senders {
-        let (reply, done) = tokio::sync::oneshot::channel();
-        if sender.send(session::Cmd::Suspend { reply }).await.is_ok() {
-            replies.push(done);
-        }
-    }
-    let count = replies.len();
+    let count = senders.len();
     if count == 0 {
         return;
     }
-    let all = futures_util::future::join_all(replies);
+    // Pending tasks retain their senders after the deadline; EOF would discard partial uploads.
+    let all = futures_util::future::join_all(senders.into_iter().map(|sender| {
+        tokio::spawn(async move {
+            let (reply, done) = tokio::sync::oneshot::channel();
+            if sender.send(session::Cmd::Suspend { reply }).await.is_ok() {
+                let _ = done.await;
+            }
+        })
+    }));
     match tokio::time::timeout(std::time::Duration::from_secs(30), all).await {
         Ok(_) => tracing::info!(count, "suspended upload sessions for restart"),
         Err(_) => tracing::warn!(count, "suspending upload sessions timed out"),
     }
 }
 
-/// Re-attaches the upload sessions the last shutdown suspended, and returns
-/// the staging paths they own. A session that cannot be re-attached (its
-/// link is gone, its staging is missing or short, its journal moved on) is
-/// dropped: the record goes and its staging falls to the sweep.
+/// Reattaches recorded uploads and preserves unresolved recovery evidence.
 fn resume_upload_sessions(
     config: &Config,
     store: &Arc<Store>,
     signer: &Arc<crate::receipt::ReceiptSigner>,
     sessions: &Sessions,
     ended: &tokio::sync::mpsc::UnboundedSender<session::SessionEnded>,
+    active: &mut crate::receiving::Active,
+) -> Result<HashSet<std::path::PathBuf>, String> {
+    active.during_recovery(|destinations| {
+        store.migrate_tenant_storage(&config.receive_dir, || destinations.check_live())?;
+        Ok(restore_upload_sessions(
+            config,
+            store,
+            signer,
+            sessions,
+            ended,
+            destinations,
+        ))
+    })
+}
+
+fn restore_upload_sessions(
+    config: &Config,
+    store: &Arc<Store>,
+    signer: &Arc<crate::receipt::ReceiptSigner>,
+    sessions: &Sessions,
+    ended: &tokio::sync::mpsc::UnboundedSender<session::SessionEnded>,
+    destinations: &Arc<crate::receiving::Destinations>,
 ) -> HashSet<std::path::PathBuf> {
     let persisted = match store.load_upload_sessions() {
         Ok(persisted) => persisted,
@@ -919,7 +959,15 @@ fn resume_upload_sessions(
     let mut kept = HashSet::new();
     for mut session in persisted {
         let session_tag = session.id.get(..8).unwrap_or(&session.id).to_owned();
-        match resume_upload_session(config, store, signer, sessions, ended, &mut session) {
+        match resume_upload_session(
+            config,
+            store,
+            signer,
+            sessions,
+            ended,
+            destinations,
+            &mut session,
+        ) {
             Ok(paths) => {
                 tracing::info!(
                     target: "audit", event = "upload_session_resumed", link = %session.link_id,
@@ -929,14 +977,11 @@ fn resume_upload_sessions(
                 kept.extend(paths);
             }
             Err(error) => {
-                tracing::warn!(session_tag = %session_tag, %error, "dropped suspended upload session");
-                // Every Err above comes before the worker is spawned
-                // (resume_worker fails before spawn; insert_resumed cannot
-                // fail at boot with unbounded caps and empty pins), so no
-                // worker will write a second partial record for these files.
+                tracing::warn!(session_tag = %session_tag, %error, "suspended upload requires recovery");
                 session::commit_persisted_interruption(store, ended, &session, &error);
-                if let Err(error) = store.delete_upload_session(&session.id) {
-                    tracing::warn!(session_tag = %session_tag, %error, "delete upload session failed");
+                for file in &session.files {
+                    kept.insert(file.staging_path.clone());
+                    kept.insert(file.journal_path.clone());
                 }
             }
         }
@@ -950,6 +995,7 @@ fn resume_upload_session(
     signer: &Arc<crate::receipt::ReceiptSigner>,
     sessions: &Sessions,
     ended: &tokio::sync::mpsc::UnboundedSender<session::SessionEnded>,
+    destinations: &Arc<crate::receiving::Destinations>,
     session: &mut crate::store::PersistedUploadSession,
 ) -> Result<Vec<std::path::PathBuf>, String> {
     let link = store
@@ -967,6 +1013,17 @@ fn resume_upload_session(
         link_id: session.link_id.clone(),
         tenant: session.tenant.clone(),
         dest_dir: session.dest_dir.clone(),
+        destinations: Arc::new(
+            destinations.child(
+                &session
+                    .dest_dir
+                    .strip_prefix(&config.receive_dir)
+                    .map_err(|_| "resume destination is outside receiving storage")?
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+            )?,
+        ),
         dest_rel: session.dest_rel.clone(),
         expected_package: session.package.clone(),
         max_total_bytes: session.max_total_bytes.unwrap_or(u64::MAX),
@@ -983,7 +1040,8 @@ fn resume_upload_session(
         }
         let control = session::PushControl::resumable(key.clone(), None);
         let directory = control.staging_dir(&setup);
-        let lock = session::lock_push_directory(&directory).map_err(|error| error.to_string())?;
+        let lock = session::lock_push_directory(&directory, setup.destinations.contract())
+            .map_err(|error| error.to_string())?;
         let modified = lock
             .metadata()
             .and_then(|metadata| metadata.modified())
@@ -1006,7 +1064,7 @@ fn resume_upload_session(
                     kind: session::SessionKind::Push(control),
                 },
                 sender,
-                || Ok(0),
+                || Ok((0, Vec::new())),
             )
             .map_err(|error| format!("register push session: {error:?}"))?;
         return Ok(vec![directory]);
@@ -1093,37 +1151,26 @@ fn lock_data_dir(data_dir: &std::path::Path) -> Result<std::fs::File, String> {
 pub fn release_data_lock(app: &App) {
     #[cfg(unix)]
     let _ = rustix::fs::flock(&app._data_lock, rustix::fs::FlockOperation::Unlock);
-    crate::lease::release(
-        &crate::lease::path(&app.config.receive_dir),
-        &app.lease_holder,
-    );
+    *app.receiving.lock().expect("receiving state poisoned") =
+        Err("receiving storage released".to_owned());
+    app.lease_lost.store(true, Ordering::Relaxed);
 }
 
-/// One heartbeat: renews the lease, or records the loss when another
-/// instance holds it. Returns whether the lease is still ours; the keeper
-/// turns a loss into a hard stop.
+/// Any failed ownership check stops receiving before another heartbeat can renew.
 pub fn renew_lease(app: &App, now: u64) -> bool {
     if app.lease_lost.load(Ordering::Relaxed) {
         return false;
     }
-    let path = crate::lease::path(&app.config.receive_dir);
-    match crate::lease::renew(&path, &app.lease_holder, app.lease_acquired_at, now) {
-        Ok(crate::lease::Renewal::Renewed) => true,
-        Ok(crate::lease::Renewal::Lost { holder }) => {
-            tracing::error!(
-                target: "audit",
-                event = "lease_lost",
-                %holder,
-                "another instance holds the receive-root lease; stopping so it can serve alone"
-            );
+    let mut state = app.receiving.lock().expect("receiving state poisoned");
+    let Ok(active) = state.as_mut() else {
+        return true;
+    };
+    match active.renew(now) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(%error, "receiving storage ownership check failed");
             app.lease_lost.store(true, Ordering::Relaxed);
             false
-        }
-        Err(error) => {
-            // A renewal that cannot be written leaves the clock running
-            // toward staleness; the next tick retries.
-            tracing::warn!(%error, "lease renewal failed");
-            true
         }
     }
 }
@@ -1425,7 +1472,7 @@ mod outbound_stage_tests {
     }
 
     #[test]
-    fn startup_cleanup_removes_orphaned_outbound_library_stages() {
+    fn startup_preserves_unreconciled_files_on_shared_storage() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
         let stage = app.config.outbound_dir.join(".vot-crash.stage");
@@ -1434,7 +1481,7 @@ mod outbound_stage_tests {
         drop(app);
 
         let _app = crate::api::testing::build(directory.path());
-        assert!(!stage.exists());
+        assert_eq!(std::fs::read(&stage).unwrap(), b"staged");
     }
 }
 
@@ -1594,6 +1641,9 @@ fn admit_push(
     if capability.expiry <= presentation.now {
         return refuse_push(app, PushRefusalReason::Expired, presentation.peer);
     }
+    if app.receiving_destinations().is_err() {
+        return None;
+    }
     let token_id = capability.token_id;
     let (session_id, directory, seams, joined) = {
         let mut tickets = app.push_tickets.lock().expect("push tickets poisoned");
@@ -1624,15 +1674,6 @@ fn admit_push(
                 true,
             )
         } else {
-            let setup = match ticket_setup(ticket) {
-                Ok(setup) => setup,
-                Err(reason) => return refuse_push(app, reason, presentation.peer),
-            };
-            if let Err(error) = std::fs::create_dir_all(&setup.dest_dir) {
-                tracing::error!(path = %setup.dest_dir.display(), %error, "create native push destination");
-                return None;
-            }
-            crate::paths::tighten_dir(&setup.dest_dir);
             if !ticket.control.connect() {
                 return refuse_push(app, PushRefusalReason::Spent, presentation.peer);
             }
@@ -1700,6 +1741,7 @@ fn live_ticket_seams(
     }
 }
 
+#[cfg(test)]
 fn ticket_setup(ticket: &PushTicket) -> Result<&session::WorkerSetup, PushRefusalReason> {
     ticket.setup.as_ref().ok_or(PushRefusalReason::Spent)
 }
@@ -1855,34 +1897,16 @@ fn publish_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> 
 pub(crate) fn check_health(app: &App) -> Result<(), String> {
     app.store
         .health_check()
-        .and_then(|()| health_probe(&app.config.receive_dir, "receive"))
+        .and_then(|()| app.receiving_destinations()?.probe())
         .and_then(|()| health_probe(&app.config.outbound_dir, "outbound"))
 }
 
 fn health_probe(root: &std::path::Path, label: &str) -> Result<(), String> {
-    let path = root.join(format!(
-        ".votport-health-{label}-{}",
-        crate::auth::random_token()
-    ));
-    let mut created = false;
-    let result = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .map_err(|error| format!("create {}: {error}", path.display()))
-        .map(|_| {
-            created = true;
-        });
-    let cleanup = if created {
-        std::fs::remove_file(&path).map_err(|error| format!("remove {}: {error}", path.display()))
-    } else {
-        Ok(())
-    };
-    match (result, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), _) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
+    let metadata = std::fs::symlink_metadata(root).map_err(|e| format!("{label}: {e}"))?;
+    if !metadata.is_dir() {
+        return Err(format!("{label} storage is not a directory"));
     }
+    Ok(())
 }
 
 async fn healthz(State(app): State<Arc<App>>) -> Response {
@@ -1910,7 +1934,9 @@ async fn readyz(State(app): State<Arc<App>>) -> Response {
         _ => (false, false),
     };
     let now = now_unix();
-    let lease = crate::lease::read(&crate::lease::path(&app.config.receive_dir))
+    let lease = app
+        .receiving_destinations()
+        .and_then(|root| root.lease_record())
         .ok()
         .flatten();
     if let Err(error) = healthy {
@@ -1976,6 +2002,53 @@ mod health_tests {
                 .file_name()
                 .to_string_lossy()
                 .starts_with(".votport-health-")));
+    }
+
+    #[tokio::test]
+    async fn suspension_deadline_includes_a_full_worker_queue() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let (reply, _done) = tokio::sync::oneshot::channel();
+        sender.send(session::Cmd::Suspend { reply }).await.unwrap();
+        app.sessions
+            .insert_resumed("blocked".into(), "link".into(), String::new(), 0, sender)
+            .unwrap();
+        let (sender, mut healthy) = tokio::sync::mpsc::channel(1);
+        app.sessions
+            .insert_resumed("healthy".into(), "link".into(), String::new(), 0, sender)
+            .unwrap();
+        let shutdown = tokio::spawn({
+            let app = app.clone();
+            async move { suspend_sessions(&app).await }
+        });
+        let Some(session::Cmd::Suspend { reply }) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), healthy.recv())
+                .await
+                .unwrap()
+        else {
+            panic!("a blocked worker must not prevent another worker suspending");
+        };
+        reply.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(35), shutdown)
+            .await
+            .expect("a full worker queue must not bypass the 30-second shutdown deadline")
+            .unwrap();
+        assert_eq!(receiver.len(), 1);
+        assert!(
+            !receiver.is_closed(),
+            "a timed-out sender must not trigger EOF cleanup of partial files"
+        );
+        assert_eq!(app.sessions.total(), 0);
+        receiver.recv().await.unwrap();
+        let Some(session::Cmd::Suspend { reply }) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+        else {
+            panic!("the pending suspension must still reach a recovered worker");
+        };
+        reply.send(()).unwrap();
     }
 
     #[tokio::test]
@@ -2086,7 +2159,7 @@ mod health_tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["lease"]["lost"], true);
         assert_eq!(json["lease"]["mine"], false);
-        assert_eq!(json["lease"]["holder"], standby.lease_holder);
+        assert!(json["lease"]["holder"].is_null());
         assert!(metrics_text(&first)
             .unwrap()
             .contains("votport_lease_held 0\n"));
@@ -2367,6 +2440,10 @@ pub fn router(app: Arc<App>) -> Router {
             get(api::list_tenants).post(api::create_tenant),
         )
         .route("/api/admin/principals", get(api::list_principals))
+        .route(
+            "/api/admin/receiving-storage",
+            get(api::admin::get_receiving_storage).post(api::admin::check_receiving_storage),
+        )
         .route(
             "/api/admin/settings",
             get(api::get_settings).put(api::put_settings),
@@ -2704,7 +2781,11 @@ mod push_tests {
             })
             .unwrap();
         let key = hex::encode([4; 16]);
-        let stage = app.config.receive_dir.join(format!(".vot-push-{key}"));
+        let stage = app
+            .receiving_destinations()
+            .unwrap()
+            .push_directory(&key)
+            .unwrap();
         std::fs::create_dir_all(stage.join("objects")).unwrap();
         let object_path = stage.join("objects/retained.stage");
         std::fs::write(&object_path, b"staged bytes").unwrap();
@@ -2731,7 +2812,9 @@ mod push_tests {
             &app.signer,
             &app.sessions,
             &app.session_ended,
-        );
+            app.receiving.lock().unwrap().as_mut().unwrap(),
+        )
+        .unwrap();
         assert!(app.sessions.contains_push_key(&key));
         let (sender, _) = tokio::sync::mpsc::channel(1);
         assert_eq!(
@@ -2748,7 +2831,7 @@ mod push_tests {
                     kind: session::SessionKind::Http,
                 },
                 sender,
-                || Ok(0)
+                || Ok((0, Vec::new()))
             ),
             Err(session::InsertError::ByteQuota)
         );
@@ -2756,20 +2839,22 @@ mod push_tests {
         assert_eq!(std::fs::read(&object_path).unwrap(), b"staged bytes");
         sweep_push_staging(&app);
         assert!(object_path.exists());
-        let lock = session::lock_push_directory(&stage).unwrap();
+        let lock =
+            session::lock_push_directory(&stage, vot_sdk_file::NasContract::Unqualified).unwrap();
         app.sessions.sweep(0);
         assert!(!app.sessions.contains_push_key(&key));
         sweep_push_staging(&app);
         assert!(object_path.exists());
         drop(lock);
         sweep_push_staging(&app);
-        assert!(!stage.exists());
+        assert!(stage.join("writer.lock").is_file());
+        assert_eq!(std::fs::read_dir(&stage).unwrap().count(), 1);
         assert!(app.store.load_push_sessions().unwrap().is_empty());
         app.store.insert_upload_session(&persisted).unwrap();
         sweep_push_staging(&app);
         assert!(app.store.load_push_sessions().unwrap().is_empty());
-        std::fs::create_dir(&stage).unwrap();
-        let lock = session::lock_push_directory(&stage).unwrap();
+        let lock =
+            session::lock_push_directory(&stage, vot_sdk_file::NasContract::Unqualified).unwrap();
         lock.set_modified(std::time::SystemTime::UNIX_EPOCH)
             .unwrap();
         drop(lock);
@@ -2779,6 +2864,7 @@ mod push_tests {
             &app.signer,
             &app.sessions,
             &app.session_ended,
+            &app.receiving_destinations().unwrap(),
             &mut persisted
         )
         .is_err());
@@ -2908,6 +2994,15 @@ mod push_tests {
             link_id: "stale-seams".to_owned(),
             tenant: String::new(),
             dest_dir: directory.path().join("destination"),
+            destinations: Arc::new(
+                crate::receiving::Destinations::open(
+                    directory.path(),
+                    vot_sdk_file::NasContract::Unqualified,
+                )
+                .unwrap()
+                .child(&["destination".into()])
+                .unwrap(),
+            ),
             dest_rel: String::new(),
             expected_package: missing_setup.expected_package.clone(),
             max_total_bytes: 1,
@@ -3060,7 +3155,7 @@ mod push_tests {
                     kind: session::SessionKind::Push(live_control.clone()),
                 },
                 sender,
-                || Ok(0),
+                || Ok((0, Vec::new())),
             )
             .unwrap();
         let now = crate::store::now_unix();
@@ -3081,7 +3176,7 @@ mod push_tests {
                     kind: session::SessionKind::Push(expired_control.clone()),
                 },
                 expired_sender,
-                || Ok(0),
+                || Ok((0, Vec::new())),
             )
             .unwrap();
         application.push_tickets.lock().unwrap().extend([
@@ -3168,7 +3263,7 @@ mod push_tests {
                     kind: session::SessionKind::Push(control.clone()),
                 },
                 sender,
-                || Ok(0),
+                || Ok((0, Vec::new())),
             )
             .unwrap();
         application.push_tickets.lock().unwrap().insert(
@@ -3372,7 +3467,9 @@ fn metrics_text(app: &App) -> Result<String, String> {
         "# TYPE votport_draining gauge\nvotport_draining {}\n",
         u8::from(draining)
     );
-    let lease = crate::lease::read(&crate::lease::path(&app.config.receive_dir))
+    let lease = app
+        .receiving_destinations()
+        .and_then(|root| root.lease_record())
         .ok()
         .flatten();
     let _ = write!(
@@ -3726,6 +3823,9 @@ mod request_metrics_tests {
 }
 
 async fn expire_link_uploads(app: &App, candidate: crate::store::Link, cutoff: u64) {
+    if app.receiving_destinations().is_err() {
+        return;
+    }
     if candidate.legal_hold {
         return;
     }
@@ -3799,29 +3899,17 @@ async fn expire_link_uploads(app: &App, candidate: crate::store::Link, cutoff: u
         .collect();
     let mut removed = HashSet::new();
     for stored_as in candidates {
-        // Same shape as admin::stored_path: the tenant prefix is not part of
-        // stored_as, so omitting it here deletes the default tenant's file at
-        // that relative path.
-        let mut components = crate::paths::tenant_prefix(&link.tenant);
-        components.extend(
-            stored_as
-                .split('/')
-                .filter(|part| !part.is_empty())
-                .map(str::to_owned),
-        );
-        let Ok(path) = crate::paths::join_under(&app.config.receive_dir, &components) else {
-            continue;
+        let Ok(destinations) = app.receiving_destinations() else {
+            return;
         };
-        let _ = tokio::fs::remove_file(format!("{}.vot-receipt", path.display())).await;
-        match tokio::fs::remove_file(&path).await {
+        let mut components = crate::paths::tenant_prefix(&link.tenant);
+        components.extend(stored_as.split('/').map(str::to_owned));
+        match destinations.remove_received(&components) {
             Ok(()) => {
                 removed.insert(stored_as.to_owned());
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                removed.insert(stored_as.to_owned());
-            }
             Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "could not delete expired file");
+                tracing::warn!(path = %stored_as, %error, "could not delete expired file");
             }
         }
     }
@@ -3896,6 +3984,9 @@ fn sweep_push_tickets(app: &App) {
 }
 
 fn sweep_push_staging(app: &App) {
+    let Ok(destinations) = app.receiving_destinations() else {
+        return;
+    };
     let sessions = match app.store.load_push_sessions() {
         Ok(sessions) => sessions,
         Err(error) => {
@@ -3907,11 +3998,14 @@ fn sweep_push_staging(app: &App) {
         let Some(key) = &session.push_key else {
             continue;
         };
-        if app.sessions.contains_push_key(key) {
+        if app.sessions.contains_push_key(key) || !session.files.is_empty() {
             continue;
         }
-        let directory = session.dest_dir.join(format!(".vot-push-{key}"));
-        let _lock = match session::lock_push_directory(&directory) {
+        let directory = session
+            .dest_dir
+            .join(".vot-stage")
+            .join(format!(".vot-push-{key}"));
+        let _lock = match session::lock_push_directory(&directory, destinations.contract()) {
             Ok(lock) => lock,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if !app.sessions.contains_push_key(key) {
@@ -3926,11 +4020,15 @@ fn sweep_push_staging(app: &App) {
         if app.sessions.contains_push_key(key) {
             continue;
         }
-        if let Err(error) = std::fs::remove_dir_all(&directory).and_then(|()| {
-            app.store
-                .delete_upload_session(&session.id)
-                .map_err(std::io::Error::other)
-        }) {
+        if let Err(error) = destinations
+            .clear_push_directory(&directory, &_lock)
+            .map_err(std::io::Error::other)
+            .and_then(|_| {
+                app.store
+                    .delete_upload_session(&session.id)
+                    .map_err(std::io::Error::other)
+            })
+        {
             tracing::warn!(%error, "remove expired push staging");
         }
     }
@@ -4177,6 +4275,36 @@ mod retention_tests {
 
         // The candidate came from the first read before an administrator set
         // the hold. The re-read under the lifecycle pin must still preserve it.
+        // An unavailable or replaced receive root must not tombstone live records.
+        let receiving = app
+            .receiving
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .destinations
+            .clone();
+        for missing in [false, true] {
+            let displaced = directory.path().join("displaced");
+            std::fs::rename(&app.config.receive_dir, &displaced).unwrap();
+            if !missing {
+                std::fs::create_dir(&app.config.receive_dir).unwrap();
+                std::fs::write(&expired_path, b"replacement").unwrap();
+            }
+            let candidate = app.store.link("", "expired").unwrap().unwrap();
+            expire_link_uploads(&app, candidate, cutoff).await;
+            assert!(!app.store.link("", "expired").unwrap().unwrap().uploads[0].files[0].deleted);
+            assert_eq!(
+                std::fs::read(displaced.join("expired.txt")).unwrap(),
+                b"expired"
+            );
+            if !missing {
+                assert_eq!(std::fs::read(&expired_path).unwrap(), b"replacement");
+                std::fs::remove_dir_all(&app.config.receive_dir).unwrap();
+            }
+            std::fs::rename(displaced, &app.config.receive_dir).unwrap();
+        }
+        receiving.check_current().unwrap();
         let mut stale_held = held;
         stale_held.legal_hold = false;
         expire_link_uploads(&app, stale_held, cutoff).await;

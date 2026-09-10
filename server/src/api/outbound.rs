@@ -1896,17 +1896,35 @@ async fn create_library_grant(
             format!("paths must contain 1..={max_files} files"),
         ));
     }
-    let root = options
+    let received = options
         .workflow
         .as_ref()
-        .filter(|job| job.uses_snapshot())
-        .map(|job| workflows::payload_root(app, &identity.tenant, &job.id))
-        .unwrap_or_else(|| library_root(app, &identity.tenant));
+        .filter(|job| job.received.is_some())
+        .map(|job| workflows::received_files(app, job))
+        .transpose()?;
+    let root = if received.is_some() {
+        crate::paths::join_under(
+            &app.config.receive_dir,
+            &crate::paths::tenant_prefix(&identity.tenant),
+        )
+        .map_err(ApiError::internal)?
+    } else {
+        options
+            .workflow
+            .as_ref()
+            .filter(|job| job.uses_snapshot())
+            .map(|job| workflows::payload_root(app, &identity.tenant, &job.id))
+            .unwrap_or_else(|| library_root(app, &identity.tenant))
+    };
     let mut selections = Vec::with_capacity(requested.len());
     let mut selected = std::collections::HashSet::with_capacity(requested.len());
     let mut total_bytes = 0u64;
     for name in requested {
-        let path = if let Some(job) = options.workflow.as_ref().filter(|job| job.uses_snapshot()) {
+        let path = if let Some(received) = &received {
+            let file = received.get(name).ok_or_else(ApiError::not_found)?;
+            admin::stored_path(app, &identity.tenant, &file.stored_as)
+                .ok_or_else(ApiError::not_found)?
+        } else if let Some(job) = options.workflow.as_ref().filter(|job| job.uses_snapshot()) {
             workflows::payload_path(app, &identity.tenant, &job.id, name)?
         } else {
             safe_library_path(app, &identity.tenant, name)?
@@ -1961,21 +1979,7 @@ async fn create_library_grant(
     .await
     .into_iter()
     .collect::<ApiResult<Vec<_>>>()?;
-    if let Some(received) = options
-        .workflow
-        .as_ref()
-        .and_then(|job| job.received.as_ref())
-    {
-        let upload = app
-            .store
-            .link_upload(&identity.tenant, &received.link_id, &received.upload_id)
-            .map_err(ApiError::internal)?
-            .ok_or_else(ApiError::not_found)?;
-        let expected: std::collections::BTreeMap<_, _> = upload
-            .files
-            .iter()
-            .map(|file| (file.path.as_str(), file))
-            .collect();
+    if let Some(expected) = &received {
         if expected.len() != hashed.len() {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
@@ -1998,11 +2002,12 @@ async fn create_library_grant(
                             .ok_or_else(ApiError::not_found)?,
                         length: original.bytes,
                     };
-                    let path = root.join(&file.name);
+                    let path = admin::stored_path(app, &identity.tenant, &original.stored_as)
+                        .ok_or_else(ApiError::not_found)?;
                     let proof_root = proof_root.clone();
                     tokio::task::spawn_blocking(move || build_catalog(&proof_root, &path, &object))
                         .await
-                        .map_err(|_| ApiError::internal("verify incoming snapshot failed"))?
+                        .map_err(|_| ApiError::internal("verify incoming file failed"))?
                         .map_err(|_| {
                             ApiError::new(
                                 StatusCode::CONFLICT,
@@ -2048,12 +2053,13 @@ async fn create_library_grant(
                         sequence: 1,
                     },
                     vot_sdk_file::CommitProfile::Fast,
+                    vot_sdk_file::NasContract::Unqualified,
                 )
                 .map_err(ApiError::internal)?;
             let name = options
                 .workflow
                 .as_ref()
-                .filter(|job| !job.uses_snapshot())
+                .filter(|job| job.received.is_none() && !job.uses_snapshot())
                 .and_then(|job| {
                     file.name
                         .strip_prefix(&format!("{}/", job.project.directory))
@@ -2063,12 +2069,22 @@ async fn create_library_grant(
             Ok(OutboundGrantFile {
                 name,
                 receipt_b64: base64::prelude::BASE64_STANDARD.encode(receipt),
-                source: options
-                    .workflow
-                    .as_ref()
-                    .filter(|job| job.uses_snapshot())
-                    .map(|job| format!("workflow:{}/{}", job.id, file.name))
-                    .unwrap_or_else(|| file.source.clone()),
+                source: if let Some(received) = &received {
+                    format!(
+                        "received:{}",
+                        received
+                            .get(&file.name)
+                            .ok_or_else(ApiError::not_found)?
+                            .stored_as
+                    )
+                } else {
+                    options
+                        .workflow
+                        .as_ref()
+                        .filter(|job| job.uses_snapshot())
+                        .map(|job| format!("workflow:{}/{}", job.id, file.name))
+                        .unwrap_or_else(|| file.source.clone())
+                },
                 ..file
             })
         })
@@ -4066,13 +4082,25 @@ pub(crate) fn source_info_indexed_with_file(
     indexed_file: Option<&OutboundGrantFile>,
 ) -> ApiResult<Source> {
     if let Some(file) = indexed_file.or_else(|| grant.files.get(index)) {
-        let path =
-            if let Some(relative) = file.source.strip_prefix(&format!("workflow:{}/", grant.id)) {
+        let (root, path) = if let Some(stored_as) = file.source.strip_prefix("received:") {
+            app.receiving_destinations()
+                .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
+            (
+                app.config.receive_dir.clone(),
+                admin::stored_path(app, &grant.tenant, stored_as)
+                    .ok_or_else(ApiError::not_found)?,
+            )
+        } else {
+            let path = if let Some(relative) =
+                file.source.strip_prefix(&format!("workflow:{}/", grant.id))
+            {
                 workflows::payload_path(app, &grant.tenant, &grant.id, relative)?
             } else {
                 safe_library_path(app, &grant.tenant, &file.source)?
             };
-        if !library_components_safe(&library_root(app, &grant.tenant), &path) {
+            (library_root(app, &grant.tenant), path)
+        };
+        if !library_components_safe(&root, &path) {
             return Err(ApiError::not_found());
         }
         let root: [u8; 32] = hex::decode(&file.root)
@@ -4917,7 +4945,7 @@ mod tests {
         std::fs::write(&source, &bytes).unwrap();
         app.signer
             .write_sidecar(
-                &source,
+                &vot_platform_fs::FileLocation::from_path(&source).unwrap(),
                 &object,
                 [1; 16],
                 PublishObservation {
@@ -5440,6 +5468,7 @@ mod tests {
                     sequence: 1,
                 },
                 vot_sdk_file::CommitProfile::Balanced,
+                vot_sdk_file::NasContract::Unqualified,
             )
             .unwrap();
         let second_receipt = app
@@ -5452,6 +5481,7 @@ mod tests {
                     sequence: 2,
                 },
                 vot_sdk_file::CommitProfile::Balanced,
+                vot_sdk_file::NasContract::Unqualified,
             )
             .unwrap();
 
