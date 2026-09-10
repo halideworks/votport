@@ -30,9 +30,9 @@ public sealed partial class WorkflowsPage : Page
         body.Children.Add(Action("Refresh", () => Refresh()));
         if (PortStore.Shared.SignedIn)
         {
-            body.Children.Add(Action("Project rules, schedules, storage and events", () =>
+            body.Children.Add(Action("Projects, reception routes, storage and events", () =>
             {
-                var address = PortStore.Shared.Port!.Base.TrimEnd('/') + "/deliver#workflows";
+                var address = PortStore.Shared.Port!.Base.TrimEnd('/') + "/workflows";
                 System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(address) { UseShellExecute = true });
                 return Task.CompletedTask;
             }));
@@ -114,10 +114,19 @@ public sealed partial class WorkflowsPage : Page
             var row = new StackPanel { Spacing = 6 };
             row.Children.Add(Text($"{job.Label} · {job.Project} · {job.State.Replace('_', ' ')}"));
             if (job.Manifest is not null) row.Children.Add(Text($"Manifest: {job.Manifest}"));
+            if (job.Received) row.Children.Add(Text("Incoming reception workflow"));
+            foreach (var destination in job.Destinations) row.Children.Add(Text(destination));
+            if (job.Url is not null && job.State != "ready") row.Children.Add(Text("Local download link released; destination copies are pending."));
+            row.Children.Add(Action("Route details and signed evidence", () =>
+            {
+                var address = PortStore.Shared.Port!.Base.TrimEnd('/') + "/workflows#job-" + job.Id;
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(address) { UseShellExecute = true });
+                return Task.CompletedTask;
+            }));
             if (job.Error is not null) row.Children.Add(Text(job.Error));
             if (job.Url is not null) row.Children.Add(Action("Copy download link", () => { Copy(job.Url); return Task.CompletedTask; }));
             if (job.State == "awaiting_approval") row.Children.Add(Action("Approve this manifest", () => Change(job, "approve")));
-            if (job.State == "failed") row.Children.Add(Action("Retry job", () => Change(job, "retry")));
+            if (job.State is "failed" or "retrying") row.Children.Add(Action("Retry job", () => Change(job, "retry")));
             if (job.State is not ("cancelled" or "retired" or "retiring")) row.Children.Add(Action("Cancel job", () => Change(job, "cancel")));
             jobs.Children.Add(row);
         }
@@ -126,7 +135,7 @@ public sealed partial class WorkflowsPage : Page
     {
         if (action != "retry")
         {
-            var dialog = new ContentDialog { XamlRoot = XamlRoot, Title = action == "approve" ? "Approve delivery" : "Cancel delivery", Content = action == "approve" ? $"Release {job.Label} with manifest {job.Manifest}?" : "Stop subsequent downloads for this job?", PrimaryButtonText = action == "approve" ? "Approve" : "Cancel job", CloseButtonText = "Back" };
+            var dialog = new ContentDialog { XamlRoot = XamlRoot, Title = action == "approve" ? "Approve delivery" : "Cancel delivery", Content = action == "approve" ? $"Release {job.Label} with manifest {job.Manifest}?" : "Stop downloads here and request revocation at connected ports? Independent copies remain.", PrimaryButtonText = action == "approve" ? "Approve" : "Cancel job", CloseButtonText = "Back" };
             if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
         }
         await Task.Run(() => VotportClientCoreMethods.ChangeWorkflowJob(job.Id, action, job.Manifest));

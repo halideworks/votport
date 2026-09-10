@@ -18,9 +18,11 @@ use vot_sdk::object::ObjectId;
 use crate::config::Config;
 
 mod evidence;
+mod routes;
 mod webhooks;
 mod workflows;
 pub use evidence::*;
+pub use routes::{InboundRoute, OutboundControl};
 pub use webhooks::*;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -464,7 +466,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 28;
+pub(crate) const SCHEMA_VERSION: u64 = 30;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -1305,6 +1307,25 @@ impl Store {
             transaction.execute_batch("CREATE TABLE IF NOT EXISTS delivery_storage_credentials(id TEXT PRIMARY KEY REFERENCES delivery_storage(id), document TEXT NOT NULL);")
                 .map_err(|error| format!("schema: {error}"))?;
         }
+        if stored < 29 {
+            transaction
+                .execute_batch(routes::SCHEMA)
+                .map_err(|error| format!("schema: {error}"))?;
+            transaction.execute_batch("CREATE TABLE IF NOT EXISTS receive_workflows(link_id TEXT PRIMARY KEY REFERENCES links(id) ON DELETE CASCADE, document TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS delivery_jobs_received ON delivery_jobs(tenant,json_extract(document,'$.received.link_id')) WHERE json_extract(document,'$.received') IS NOT NULL;
+                UPDATE delivery_jobs SET document=json_set(document,'$.checks.legacy_export_checks',json_extract(document,'$.checks')) WHERE json_extract(document,'$.project.export_storage') IS NOT NULL AND json_extract(document,'$.manifest') IS NOT NULL;
+                UPDATE delivery_jobs SET document=json_set(document,'$.checks.destination_revisions',json_object(json_extract(document,'$.project.export_storage'),json_extract(document,'$.checks.export_storage_revision'))) WHERE json_extract(document,'$.project.export_storage') IS NOT NULL;")
+                .map_err(|error| format!("schema: {error}"))?;
+            transaction.execute_batch("UPDATE delivery_projects SET document=json_remove(json_set(document,'$.destinations',json(CASE WHEN json_extract(document,'$.export_storage') IS NULL THEN '[]' ELSE json_array(json_extract(document,'$.export_storage')) END)),'$.export_storage') WHERE json_type(document,'$.export_storage') IS NOT NULL;
+                UPDATE delivery_jobs SET document=json_remove(json_set(document,'$.project.destinations',json(CASE WHEN json_extract(document,'$.project.export_storage') IS NULL THEN '[]' ELSE json_array(json_extract(document,'$.project.export_storage')) END)),'$.project.export_storage') WHERE json_type(document,'$.project.export_storage') IS NOT NULL;")
+                .map_err(|error| format!("schema: {error}"))?;
+        }
+        if stored < 30 {
+            transaction.execute_batch("CREATE TABLE IF NOT EXISTS receive_workflow_uploads(link_id TEXT NOT NULL REFERENCES links(id) ON DELETE CASCADE, upload_id TEXT NOT NULL, PRIMARY KEY(link_id,upload_id));
+                INSERT OR IGNORE INTO receive_workflow_uploads SELECT json_extract(j.document,'$.received.link_id'),json_extract(j.document,'$.received.upload_id') FROM delivery_jobs j JOIN links l ON l.id=json_extract(j.document,'$.received.link_id') AND l.tenant=j.tenant WHERE json_extract(j.document,'$.received') IS NOT NULL;
+                DELETE FROM delivery_policy_cache;")
+                .map_err(|error| format!("schema: {error}"))?;
+        }
         transaction
             .execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
@@ -1904,6 +1925,14 @@ impl Store {
     }
 
     pub fn insert_link(&self, link: Link) -> Result<(), InsertLinkError> {
+        self.insert_link_with_workflow(link, None)
+    }
+
+    pub fn insert_link_with_workflow(
+        &self,
+        link: Link,
+        workflow: Option<&crate::workflow::ReceiveWorkflow>,
+    ) -> Result<(), InsertLinkError> {
         let mut connection = self.connection.lock().expect("store poisoned");
         let transaction = connection
             .transaction()
@@ -1924,6 +1953,10 @@ impl Store {
         }
         insert_link_row(&transaction, &link)
             .map_err(|error| InsertLinkError::Store(error.to_string()))?;
+        if let Some(workflow) = workflow {
+            workflows::set_receive_workflow(&transaction, &link.tenant, &link.id, workflow)
+                .map_err(InsertLinkError::Store)?;
+        }
         transaction
             .commit()
             .map_err(|error| InsertLinkError::Store(error.to_string()))?;
@@ -1962,6 +1995,13 @@ impl Store {
         let transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
+        if sync_uploads
+            && workflows::receive_pending(&transaction, tenant, id).map_err(|e| e.to_string())?
+        {
+            return Err(
+                "incoming workflows still need this history; finish or cancel them first".into(),
+            );
+        }
         let Some(mut link) = read_link(&transaction, tenant, id)? else {
             return Ok(false);
         };
@@ -1979,6 +2019,26 @@ impl Store {
         tenant: &str,
         id: &str,
         upload: UploadRecord,
+    ) -> Result<bool, String> {
+        self.append_upload_inner(tenant, id, upload, None)
+    }
+
+    pub fn append_upload_from_session(
+        &self,
+        tenant: &str,
+        id: &str,
+        upload: UploadRecord,
+        session: &str,
+    ) -> Result<bool, String> {
+        self.append_upload_inner(tenant, id, upload, Some(session))
+    }
+
+    fn append_upload_inner(
+        &self,
+        tenant: &str,
+        id: &str,
+        upload: UploadRecord,
+        session: Option<&str>,
     ) -> Result<bool, String> {
         let upload_json = serde_json::to_string(&upload).map_err(|error| error.to_string())?;
         let mut connection = self.connection.lock().expect("store poisoned");
@@ -2010,8 +2070,19 @@ impl Store {
                 rusqlite::params![tenant, id, upload_json],
             )
             .map_err(|error| error.to_string())?;
+        if let Some(session) = session {
+            routes::complete_route(
+                &transaction,
+                &self.event_signer,
+                tenant,
+                id,
+                session,
+                &upload,
+            )?;
+        }
         insert_upload_files(&transaction, id, tenant, upload_index, &upload)
             .map_err(|error| error.to_string())?;
+        workflows::queue_received(&transaction, &self.event_signer, tenant, id, &upload)?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(true)
     }
@@ -2064,6 +2135,11 @@ impl Store {
         let transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
+        if workflows::receive_pending(&transaction, tenant, id).map_err(|e| e.to_string())? {
+            return Err(
+                "incoming workflows still need this request; finish or cancel them first".into(),
+            );
+        }
         transaction
             .execute(
                 "DELETE FROM files
@@ -2164,6 +2240,10 @@ impl Store {
         let transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
+        let routes_pending: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM outbound_routes r JOIN delivery_jobs j ON j.id=r.job_id WHERE j.tenant=?1 AND r.ack IS NULL)",[key],|row|row.get(0)).map_err(|e|e.to_string())?;
+        if routes_pending {
+            return Ok(TenantRemoval::HasRoutes);
+        }
         let removal = {
             let changed = transaction
                 .execute(
@@ -2190,6 +2270,11 @@ impl Store {
             }
         };
         if matches!(removal, TenantRemoval::Deleted | TenantRemoval::Absent) {
+            transaction.execute("DELETE FROM route_uploads WHERE route_id IN (SELECT id FROM inbound_routes WHERE tenant=?1)",[key]).map_err(|e|e.to_string())?;
+            transaction
+                .execute("DELETE FROM inbound_routes WHERE tenant=?1", [key])
+                .map_err(|e| e.to_string())?;
+            transaction.execute("DELETE FROM outbound_routes WHERE job_id IN (SELECT id FROM delivery_jobs WHERE tenant=?1)",[key]).map_err(|e|e.to_string())?;
             workflows::remove_storage_tenant(&transaction, key)?;
             for table in [
                 "delivery_manifests",
@@ -4829,6 +4914,7 @@ impl Store {
 /// Outcome of [`Store::remove_tenant`].
 #[derive(Debug, PartialEq)]
 pub enum TenantRemoval {
+    HasRoutes,
     Deleted,
     Absent,
     HasLinks,

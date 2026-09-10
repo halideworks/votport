@@ -532,6 +532,7 @@ pub(crate) fn upload_completed(
     report: &FinishReport,
     runtime: &tokio::runtime::Handle,
 ) {
+    app.workflow_ready.notify_one();
     tracing::info!(
         target: "audit", event = "upload_completed", session = %session_id,
         files = report.files.len(), bytes = report.files.iter().map(|file| file.bytes).sum::<u64>(),
@@ -2500,6 +2501,20 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/r/{token}/verify", post(api::verify_link_password))
         .route("/api/r/{token}/push", post(api::create_push_session))
         .route("/api/r/{token}/session", post(api::create_session))
+        .route(
+            "/api/r/{token}/route",
+            post(api::outbound::workflows::routes::receive)
+                .layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route(
+            "/api/route/{id}/revoke",
+            post(api::outbound::workflows::routes::revoke)
+                .layer(DefaultBodyLimit::max(2 * 1024 * 1024)),
+        )
+        .route(
+            "/api/admin/links/{id}/uploads/{upload}/route",
+            get(api::outbound::workflows::routes::evidence),
+        )
         .route("/api/s/{token}", get(api::outbound_metadata))
         .route(
             "/api/s/{token}/evidence-challenge",
@@ -3713,6 +3728,17 @@ mod request_metrics_tests {
 async fn expire_link_uploads(app: &App, candidate: crate::store::Link, cutoff: u64) {
     if candidate.legal_hold {
         return;
+    }
+    match app
+        .store
+        .receive_workflow_pending(&candidate.tenant, &candidate.id)
+    {
+        Ok(false) => {}
+        Ok(true) => return,
+        Err(error) => {
+            tracing::error!(%error, "read incoming workflows; skipping retention");
+            return;
+        }
     }
     let Some(_pin) = app.sessions.try_pin_link(&candidate.id) else {
         return;

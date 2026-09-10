@@ -1,13 +1,13 @@
 /* global URL, Blob, Option, sessionStorage, crypto */
-import { api, button, confirmModal, copyToClipboard, formatWhen, requireSession } from '/assets/admin-common.js';
+import { api, button, confirmModal, copyToClipboard, formatBytes, formatWhen, requireSession, revealHash } from '/assets/admin-common.js';
 
 const $ = (id) => document.getElementById(id);
 const value = (id) => $(id).value.trim();
 const optionalNumber = (id) => value(id) ? Number(value(id)) : null;
 const localTime = (id) => value(id) ? Math.floor(new Date(value(id)).getTime() / 1000) : null;
 const node = (tag, content, className = '') => { const element = document.createElement(tag); element.textContent = content; element.className = className; return element; };
-const stateNames = { queued: 'Scheduled', preparing: 'Preparing files', awaiting_approval: 'Needs approval', exporting: 'Exporting to storage', ready: 'Ready to share', failed: 'Needs attention', cancelled: 'Cancelled', retiring: 'Cleaning up', retired: 'Archived' };
-let projects = [], storage = [], jobs = [], cursor = null, eventCursor = 0, attemptCursor = 0;
+const stateNames = { queued: 'Scheduled', preparing: 'Preparing files', awaiting_approval: 'Needs approval', exporting: 'Delivering copies', retrying: 'Retry scheduled', ready: 'Ready to share', failed: 'Needs attention', cancelled: 'Cancelled', retiring: 'Cleaning up', retired: 'Archived' };
+let projects = [], storage = [], jobs = [], cursor = null, eventCursor = 0, attemptCursor = 0, jobsRevision = 0;
 const eventPage = [];
 let projectRevision = 0, hookRevision = 0, editingProject = null, autoProjectId = true, appendedJobs = false, loadingEvents = false, poll;
 const loaded = new Set();
@@ -69,8 +69,8 @@ async function refreshProjects() {
   const [projectResponse, storageResponse] = await Promise.all([api('/api/workflows/projects'), api('/api/workflows/storage')]);
   projects = projectResponse.projects; storage = storageResponse.storage;
   options($('workflow-project'), projects, 'Choose a project');
-  options($('workflow-import'), storage.filter((item) => item.enabled), 'Project library folder');
-  options($('wp-export'), storage.filter((item) => item.enabled), 'No storage export');
+  options($('workflow-import'), storage.filter((item) => item.enabled && item.kind === 's3'), 'Project library folder');
+
   projectFields(); renderProjects();
 }
 async function newDelivery(id) {
@@ -112,7 +112,8 @@ function renderProjects() {
   for (const project of projects) {
     const card = node('article', '', 'card'); card.append(node('h3', project.label), node('p', project.directory, 'connection-meta'));
     const rules = [project.require_approval ? 'Approval required' : 'No approval step', `${project.recipients.length} enrolled recipients`, `${project.required_metadata.length} required fields`];
-    if (project.export_storage) rules.push(`Export to ${storage.find((item) => item.id === project.export_storage)?.label || project.export_storage}`);
+    if (project.receive) rules.push('Incoming and outgoing files');
+    for (const id of project.destinations) rules.push(`Copy to ${storage.find((item) => item.id === id)?.label || id}`);
     if (project.scan_required) rules.push('Malware scan');
     if (project.sequence) rules.push('Sequence check');
     if (project.media) rules.push('Video checks');
@@ -156,8 +157,18 @@ function editProject(project) {
   for (const key of project?.required_metadata || []) addRow('metadata', { key });
   $('wp-domains').value = (project?.allowed_domains || []).join('\n');
   $('wp-approval').checked = project?.require_approval || false; $('wp-scan').checked = project?.scan_required || false;
-  if (project?.export_storage && ![...$('wp-export').options].some((option) => option.value === project.export_storage)) $('wp-export').add(new Option(`${project.export_storage} (unavailable)`, project.export_storage));
-  $('wp-export').value = project?.export_storage || '';
+  $('wp-release').value = project?.release || 'all_destinations';
+  $('wp-receive').checked = project?.receive || false;
+  $('wp-destinations').replaceChildren();
+  const destinations = new Map(storage.map((item) => [item.id, item]));
+  for (const id of project?.destinations || []) if (!destinations.has(id)) destinations.set(id, { id, label: `${id} (unavailable)`, enabled: false });
+  for (const connection of destinations.values()) {
+    const label = node('label', '', 'check'), input = document.createElement('input');
+    input.type = 'checkbox'; input.value = connection.id; input.checked = project?.destinations?.includes(connection.id) || false;
+    input.disabled = !connection.enabled && !input.checked;
+    label.append(input, document.createTextNode(`${connection.label}${connection.enabled ? '' : ' · disabled'}`)); $('wp-destinations').append(label);
+  }
+  if (!destinations.size) $('wp-destinations').append(node('p', 'Add an S3 bucket, shared folder or Votport connection to send copies automatically.', 'muted'));
   $('wp-sequence-enabled').checked = !!project?.sequence; $('wp-media-enabled').checked = !!project?.media;
   for (const [id, key] of [['sequence-prefix', 'prefix'], ['sequence-suffix', 'suffix'], ['first', 'first'], ['last', 'last'], ['padding', 'padding']]) $(`wp-${id}`).value = project?.sequence?.[key] ?? (key === 'padding' ? 4 : '');
   for (const [id, key] of [['codec', 'video_codec'], ['width', 'width'], ['height', 'height'], ['rate', 'frame_rate']]) $(`wp-${id}`).value = project?.media?.[key] ?? '';
@@ -172,10 +183,16 @@ function checkFields() {
 }
 
 async function refreshJobs(more = false) {
+  const revision = ++jobsRevision;
+  const requested = /^#job-([a-f0-9]{32})$/.exec(window.location.hash)?.[1];
   const page = await api(`/api/workflows/jobs?limit=50&after=${encodeURIComponent(more ? cursor || '' : '')}`);
+  if (!more && requested && !page.jobs.some(({ job }) => job.id === requested)) {
+    page.jobs.unshift(await api(`/api/workflows/jobs/${requested}`));
+  }
+  if (revision !== jobsRevision) return false;
   if (!more) appendedJobs = false;
   else if (page.jobs.length) appendedJobs = true;
-  jobs = more ? jobs.concat(page.jobs) : page.jobs; cursor = page.next; $('workflow-more').hidden = !cursor;
+  jobs = [...new Map((more ? jobs.concat(page.jobs) : page.jobs).map((entry) => [entry.job.id, entry])).values()]; cursor = page.next; $('workflow-more').hidden = !cursor;
   const list = $('workflow-jobs'); list.replaceChildren();
   if (!jobs.length) list.append(empty('Every delivery, in one place', 'Create a delivery to follow preparation, approvals, storage exports, and recipient acceptance.', button('Create delivery', '', () => guard(() => newDelivery()))));
   for (const { job, url } of jobs) {
@@ -184,6 +201,22 @@ async function refreshJobs(more = false) {
     card.append(head, node('p', `${job.project.label} · ${formatWhen(job.created_at)}`, 'connection-meta'));
     if (job.request.not_before) card.append(node('p', `Scheduled ${formatWhen(job.request.not_before)}`, 'muted'));
     if (job.request.deadline) card.append(node('p', `Acceptance due ${formatWhen(job.request.deadline)}`, 'muted'));
+    if (url && job.state !== 'ready') card.append(node('p', 'Local download link is released. Destination copies are still pending.', 'info-banner'));
+    if (job.received) { const source = node('a', 'View incoming request →', 'text-link'); source.href = `/receive?search=${encodeURIComponent(job.received.link_id)}#link-${job.received.link_id}`; card.append(source); }
+    for (const id of job.project.destinations) {
+      const result = job.checks.destinations?.[id], receipt = job.checks.route_receipts?.[id], revoked = job.checks.route_revocations?.[id];
+      const leg = node('div', '', 'destination-status'), name = storage.find((item) => item.id === id)?.label || id;
+      const status = result?.state === 'complete' ? (receipt ? 'Destination signed its receipt' : 'Verified copy complete') : result?.state === 'sending' ? `${formatBytes(result.transferred)} transferred this attempt` : result?.error || 'Pending';
+      leg.append(node('p', `${name}: ${status}`, result?.error ? 'error' : 'connection-meta'));
+      if (revoked || (receipt && ['cancelled', 'retiring', 'retired'].includes(job.state))) {
+        leg.append(node('p', revoked?.state === 'acknowledged' ? 'Revocation acknowledged by the destination port.' : `Revocation awaiting destination acknowledgment.${revoked?.retry_at ? ` Next attempt ${formatWhen(revoked.retry_at)}.` : ''}`, 'field-help'));
+      }
+      if (receipt) leg.append(button('Download custody evidence', 'tiny ghost', () => download(`trade-route-${job.id}-${id}.json`, {
+        format: 'votport-route-evidence-v1', receipt, ancestors: [...(job.checks.source_ancestry || []), ...(job.checks.source_receipt ? [job.checks.source_receipt] : [])], revocation: revoked?.acknowledgement || null,
+      })));
+      card.append(leg);
+    }
+    if (job.state === 'retrying') card.append(node('p', `Next attempt ${formatWhen(job.checks.retry_at)}`, 'muted'));
     if (job.error) card.append(node('p', job.error, 'error'));
     const detail = document.createElement('details'); detail.append(node('summary', 'Package and recipient verification'));
     detail.append(node('p', job.manifest ? `Manifest: ${job.manifest}` : 'The manifest will be available after preparation.', 'mono'));
@@ -210,19 +243,21 @@ async function refreshJobs(more = false) {
         await api(`/api/workflows/jobs/${job.id}`, { method: 'POST', body: JSON.stringify({ action: 'approve', manifest: job.manifest }) }); await refreshJobs();
       }
     })));
-    if (job.state === 'failed') actions.append(button('Retry', 'ghost', () => guard(async () => { await api(`/api/workflows/jobs/${job.id}`, { method: 'POST', body: JSON.stringify({ action: 'retry' }) }); await refreshJobs(); })));
+    if (['failed', 'retrying'].includes(job.state)) actions.append(button('Retry', 'ghost', () => guard(async () => { await api(`/api/workflows/jobs/${job.id}`, { method: 'POST', body: JSON.stringify({ action: 'retry' }) }); await refreshJobs(); })));
     if (!['cancelled', 'retired', 'retiring'].includes(job.state)) actions.append(button('Cancel delivery', 'danger', () => guard(async () => {
-      if (await confirmModal('Cancel delivery', 'Stop subsequent downloads for this delivery? Files already received cannot be recalled.', 'Cancel delivery')) {
+      if (await confirmModal('Cancel delivery', 'Stop downloads here and request revocation at connected ports? Each port will stop route-managed sharing and forwarding. Downloaded files and independent copies remain.', 'Cancel delivery')) {
         await api(`/api/workflows/jobs/${job.id}`, { method: 'POST', body: JSON.stringify({ action: 'cancel' }) }); await refreshJobs();
       }
     })));
     card.append(actions); list.append(card);
   }
+  revealHash({ scroll: false });
   schedulePoll();
+  return true;
 }
 function schedulePoll() {
   clearTimeout(poll);
-  if (!document.hidden && section() === 'jobs' && $('workflow-create').hidden && jobs.some(({ job }) => ['queued', 'preparing', 'exporting'].includes(job.state)) && !appendedJobs) {
+  if (!document.hidden && section() === 'jobs' && $('workflow-create').hidden && jobs.some(({ job }) => (['queued', 'preparing', 'exporting', 'retrying'].includes(job.state) || Object.values(job.checks.route_revocations || {}).some((route) => route.state === 'pending'))) && !appendedJobs) {
     poll = setTimeout(() => { if (!$('workflow-jobs').contains(document.activeElement) && !$('workflow-jobs').querySelector('details[open]')) guard(() => refreshJobs()); else schedulePoll(); }, 10000);
   }
 }
@@ -256,7 +291,7 @@ form('workflow-save-project', async () => {
   const project = { id: value('wp-id'), revision: projectRevision, label: value('wp-label'), directory: value('wp-directory'),
     members: Object.fromEntries(memberRows.map(({ subject, role }) => [subject, role])), recipients: recipientRows.map(({ email, holder }) => ({ email, holder: holder.toLowerCase() })),
     allowed_domains: value('wp-domains').split('\n').map((line) => line.trim().toLowerCase()).filter(Boolean), required_metadata: rows('metadata').map((row) => row.key),
-    require_approval: $('wp-approval').checked, scan_required: $('wp-scan').checked, export_storage: value('wp-export') || null,
+    require_approval: $('wp-approval').checked, scan_required: $('wp-scan').checked, destinations: [...$('wp-destinations').querySelectorAll('input:checked')].map((input) => input.value), receive: $('wp-receive').checked, release: value('wp-release'),
     sequence: $('wp-sequence-enabled').checked ? { prefix: value('wp-sequence-prefix'), suffix: value('wp-sequence-suffix'), first: Number(value('wp-first')), last: optionalNumber('wp-last'), padding: Number(value('wp-padding')) } : null,
     media: $('wp-media-enabled').checked ? media : null };
   if (!(await confirmModal('Save project rules', 'These rules protect the entire folder, including existing links. Existing deliveries need the current policy before further downloads.', 'Save rules'))) return;
@@ -304,12 +339,14 @@ form('workflow-save-webhook', async () => {
 
 function section() { return ['jobs', 'projects', 'webhooks', 'activity'].includes(window.location.hash.slice(1)) ? window.location.hash.slice(1) : 'jobs'; }
 async function showSection() {
+  jobsRevision++;
   const selected = section();
+  const requested = /^#job-([a-f0-9]{32})$/.exec(window.location.hash)?.[1];
   for (const panel of document.querySelectorAll('[data-workflow-panel]')) panel.hidden = panel.dataset.workflowPanel !== selected;
   for (const link of document.querySelectorAll('.page-tabs a')) { if (link.hash === `#${selected}`) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current'); }
   clearTimeout(poll);
-  if (!loaded.has(selected)) {
-    if (selected === 'jobs') await refreshJobs();
+  if (!loaded.has(selected) || (requested && !jobs.some(({ job }) => job.id === requested))) {
+    if (selected === 'jobs' && !await refreshJobs()) return;
     if (selected === 'projects') {
       await refreshProjects();
       if (admin) {
@@ -326,6 +363,7 @@ async function showSection() {
     }
     loaded.add(selected);
   }
+  if (requested) revealHash();
   schedulePoll();
 }
 $('workflow-new').onclick = () => guard(() => newDelivery());

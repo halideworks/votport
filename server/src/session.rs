@@ -908,6 +908,18 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
         )));
     }
 
+    setup
+        .store
+        .check_route_manifest(&hex::encode(setup.session_id), || {
+            route_manifest(entries.iter().map(|entry| {
+                (
+                    entry.path().collect::<Vec<_>>().join("/"),
+                    entry.object_id(),
+                )
+            }))
+        })
+        .map_err(SessionError::bad)?;
+
     // A read failure also means finish cannot record the upload, so refuse
     // before opening destinations rather than leave untracked files.
     let prior_uploads = setup
@@ -923,7 +935,7 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
 
     let mut files = Vec::with_capacity(entries.len());
     for entry in &entries {
-        if let Some(existing) = find_delivered(setup, &delivered, &entry.object_id()) {
+        if let Some(existing) = find_delivered(setup, &delivered, &entry.object_id(), || true) {
             files.push(FileState {
                 display_path: entry.path().collect::<Vec<_>>().join("/"),
                 stored_components: existing.stored_components,
@@ -1100,6 +1112,10 @@ pub fn resume_worker(
     let mut kept = Vec::new();
     for file in &persisted.files {
         let native = if file.published {
+            let destination = paths::join_under(&setup.dest_dir, &file.stored_components)?;
+            if !staged_object_valid(&destination, &file.object, || true)? {
+                return Err(format!("{} changed after publication", file.display_path));
+            }
             None
         } else {
             let destination = paths::join_under(&setup.dest_dir, &file.stored_components)?;
@@ -1217,6 +1233,7 @@ fn find_delivered(
     setup: &WorkerSetup,
     delivered: &HashMap<(&str, &str), Vec<&FileRecord>>,
     object: &ObjectId,
+    active: impl Fn() -> bool,
 ) -> Option<Delivered> {
     let suite = suite_name(object.suite);
     let root = hex::encode(object.root);
@@ -1241,7 +1258,11 @@ fn find_delivered(
             continue;
         };
         match fs::metadata(&path) {
-            Ok(meta) if meta.is_file() && meta.len() == object.length => {
+            Ok(meta)
+                if meta.is_file()
+                    && meta.len() == object.length
+                    && staged_object_valid(&path, object, &active).unwrap_or(false) =>
+            {
                 return Some(Delivered {
                     stored_components: components,
                     receipt: record.receipt,
@@ -1886,7 +1907,9 @@ pub fn commit_persisted_interruption(
                 count: None,
             }],
         };
-        if let Err(error) = store.append_upload(&session.tenant, &session.link_id, upload) {
+        if let Err(error) =
+            store.append_upload_from_session(&session.tenant, &session.link_id, upload, &session.id)
+        {
             tracing::warn!(link = %session.link_id, %error, "partial upload record failed at boot");
         }
     }
@@ -1948,7 +1971,12 @@ fn commit_upload_records(
     let upload_id = upload.id.clone();
     let recorded = setup
         .store
-        .append_upload(&setup.tenant, &setup.link_id, upload)
+        .append_upload_from_session(
+            &setup.tenant,
+            &setup.link_id,
+            upload,
+            &hex::encode(setup.session_id),
+        )
         .map_err(SessionError::internal)?;
     if !recorded {
         return Err(SessionError::conflict("request link no longer exists"));
@@ -2087,7 +2115,11 @@ impl PushReceive {
                 root: object.root,
                 length: object.length,
             };
-            let file = find_delivered(&self.setup, &delivered, &object).map(|existing| FileState {
+            let file = find_delivered(&self.setup, &delivered, &object, || {
+                self.mark_active();
+                !self.control.is_cancelled()
+            })
+            .map(|existing| FileState {
                 display_path: components.join("/"),
                 stored_components: existing.stored_components,
                 object: object.clone(),
@@ -2462,6 +2494,24 @@ fn receive_seams(receive: Arc<PushReceive>) -> vot_cli::ReceiveSeams {
     seams
 }
 
+fn route_manifest(objects: impl Iterator<Item = (String, ObjectId)>) -> String {
+    let files: Vec<_> = objects
+        .map(|(name, object)| {
+            (
+                name,
+                suite_name(object.suite),
+                hex::encode(object.root),
+                object.length,
+            )
+        })
+        .collect();
+    crate::route_protocol::manifest_digest(
+        files.iter().map(|(name, suite, root, bytes)| {
+            (name.as_str(), suite.as_str(), root.as_str(), *bytes)
+        }),
+    )
+}
+
 fn validate_push_manifest(
     setup: &WorkerSetup,
     summary: vot_cli::PackageSummary,
@@ -2525,6 +2575,16 @@ fn validate_push_manifest(
             setup.max_total_bytes
         )));
     }
+    setup
+        .store
+        .check_route_manifest(&hex::encode(setup.session_id), || {
+            route_manifest(
+                validated
+                    .iter()
+                    .map(|(path, object)| (path.join("/"), object.clone())),
+            )
+        })
+        .map_err(SessionError::bad)?;
     Ok(validated)
 }
 
@@ -4098,6 +4158,48 @@ mod push_tests {
                 fs::read(directory.path().join(format!("receive/file-{index}"))).unwrap(),
                 *bytes
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn deduplication_and_published_recovery_reject_changed_bytes() {
+        for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
+            let directory = tempfile::tempdir().unwrap();
+            let expected = object(suite, b"original");
+            let setup = setup(directory.path(), expected.clone());
+            fs::create_dir_all(&setup.dest_dir).unwrap();
+            let path = setup.dest_dir.join("frame.bin");
+            fs::write(&path, b"original").unwrap();
+            let record = FileRecord {
+                path: "frame.bin".into(),
+                stored_as: "frame.bin".into(),
+                bytes: 8,
+                suite: suite_name(expected.suite),
+                root: hex::encode(expected.root),
+                receipt: true,
+                deleted: false,
+            };
+            let delivered =
+                HashMap::from([((record.suite.as_str(), record.root.as_str()), vec![&record])]);
+            assert!(find_delivered(&setup, &delivered, &expected, || true).is_some());
+            assert!(find_delivered(&setup, &delivered, &expected, || false).is_none());
+            fs::write(&path, b"changed!").unwrap();
+            assert!(find_delivered(&setup, &delivered, &expected, || true).is_none());
+            let file = FileState {
+                display_path: record.path.clone(),
+                stored_components: vec![record.path],
+                object: expected,
+                native: None,
+                published: true,
+                receipt: true,
+                first_range_at: None,
+                rehash: false,
+            };
+            let mut persisted = persisted_session(&setup, &[file]);
+            let (_, receiver) = mpsc::channel(1);
+            assert!(resume_worker(setup, receiver, &mut persisted)
+                .unwrap_err()
+                .contains("changed after publication"));
         }
     }
 

@@ -80,6 +80,9 @@ async fn main() {
     tokio::spawn(votport::api::outbound::workflows::event_worker(
         application.clone(),
     ));
+    tokio::spawn(votport::api::outbound::workflows::routes::control_worker(
+        application.clone(),
+    ));
     let router = app::router(application.clone());
     let listener = match tokio::net::TcpListener::bind(bind).await {
         Ok(listener) => listener,

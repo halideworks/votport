@@ -37,21 +37,22 @@
         </form>
       </div>
 
-      <div class="page-heading"><div><p class="eyebrow">Connections</p><h1>Storage</h1><p class="page-lead">Connect S3 storage for incoming files and verified delivery exports.</p></div><button id="storage-new" type="button">Add storage</button></div>
+      <div class="page-heading"><div><p class="eyebrow">Connections</p><h1>Storage</h1><p class="page-lead">Connect S3 buckets, shared folders and other ports for verified delivery copies.</p></div><button id="storage-new" type="button">Add storage</button></div>
       <p id="storage-error" class="error feedback" role="alert" hidden></p><p id="storage-notice" class="feedback" role="status" hidden></p>
       <p id="storage-access" class="info-banner" hidden>Your administrator manages these connections. Available storage can be selected when creating a workflow delivery.</p>
       <div id="storage-list" class="connection-grid"><p class="muted" role="status">Loading storage…</p></div>
       <form id="workflow-save-storage" class="card editor" hidden>
-        <div class="section-heading"><div><h2 id="storage-editor-title" class="section-title">Add storage</h2><p class="muted">Connect a bucket without editing server configuration.</p></div><button id="storage-close" type="button" class="ghost">Cancel</button></div>
+        <div class="section-heading"><div><h2 id="storage-editor-title" class="section-title">Add storage</h2><p class="muted">Choose where verified files should go.</p></div><button id="storage-close" type="button" class="ghost">Cancel</button></div>
         <fieldset><legend>Connection</legend><div class="grid">
-          <label>Connection name<input id="ws-label" required maxlength="200" placeholder="Studio archive" /></label>
+          <label>Connection name<input id="ws-label" required maxlength="200" placeholder="West coast studio" /></label>
+          <label>Destination type<select id="ws-kind"><option value="s3">S3 storage</option><option value="folder">Shared folder</option><option value="votport">Another Votport</option></select></label>
+        </div><label>Connection ID<input id="ws-id" required pattern="[a-z0-9_]+" maxlength="100" /><span class="field-help">Filled from the name. Used by agents and integrations.</span></label></fieldset>
+        <fieldset id="ws-s3-settings"><legend>S3 storage</legend><div class="grid">
           <label>Provider<select id="ws-provider"><option value="aws">Amazon S3</option><option value="custom">S3-compatible service</option></select></label>
           <label>Bucket<input id="ws-bucket" required placeholder="studio-deliveries" /></label>
           <label>Region<input id="ws-region" required value="us-east-1" /></label>
           <label id="ws-endpoint-field">Endpoint<input id="ws-endpoint" type="url" required placeholder="https://s3.us-east-1.amazonaws.com" /></label>
-          <label>Root folder<input id="ws-prefix" maxlength="1024" placeholder="deliveries" /><span class="field-help">Optional. Leave blank to use the bucket root.</span></label>
-        </div><label>Connection ID<input id="ws-id" required pattern="[a-z0-9_]+" maxlength="100" /><span class="field-help">Filled from the name. Used by agents and integrations.</span></label></fieldset>
-        <fieldset><legend>Authentication</legend>
+        </div>
           <label>Credentials<select id="ws-auth"><option value="access_key">Access key</option><option value="server">Use server credentials or IAM role</option><option value="keep" hidden>Keep saved credentials</option></select></label>
           <div id="ws-credential-fields" class="grid">
             <label>Access key ID<input id="ws-access-key" autocomplete="off" spellcheck="false" maxlength="4096" /></label>
@@ -59,17 +60,29 @@
             <label class="span-all">Session token<input id="ws-session-token" type="password" autocomplete="new-password" maxlength="4096" /><span class="field-help">Only for temporary credentials.</span></label>
           </div><p id="ws-auth-note" class="field-help">Credentials are stored privately on the server and are never sent back to the browser.</p>
         </fieldset>
+        <fieldset id="ws-folder-settings" hidden disabled><legend>Shared folder</legend>
+          <label>Folder on the server<input id="ws-directory" required maxlength="4096" placeholder="/mnt/studio-shared" /><span class="field-help">Use a folder or network share already mounted and visible to this Votport server. Enter its full path.</span></label>
+        </fieldset>
+        <fieldset id="ws-votport-settings" hidden disabled><legend>Destination port</legend>
+          <p class="field-help">On the other Votport install, open Receive and create a file request. Choose a project there to apply its reception workflow, then copy the request link.</p>
+          <label>Connection details<select id="ws-port-auth"><option value="replace">Enter receive link and password</option><option value="keep" hidden>Keep saved connection</option></select></label>
+          <div id="ws-port-fields" class="grid">
+            <label>Receive link<input id="ws-port-link" type="password" autocomplete="new-password" required maxlength="4096" placeholder="https://port.example/r/…" /></label>
+            <label>Request password<input id="ws-port-password" type="password" autocomplete="new-password" maxlength="256" /><span class="field-help">Only if the receive request requires one.</span></label>
+          </div><p id="ws-port-note" class="field-help">The receive link and password stay private after saving.</p><p class="field-help">The destination applies its own tenant quota and reception project. Users, permissions and project settings are managed separately at each port.</p>
+        </fieldset>
+        <label id="ws-prefix-field">Folder within the destination<input id="ws-prefix" maxlength="1024" placeholder="client-deliveries" /><span class="field-help">Optional. Leave blank to use the connection root.</span></label>
         <fieldset><legend>Access and delivery</legend>
-          <label>Encryption<select id="ws-encryption"><option value="default">Bucket default</option><option value="kms">AWS KMS managed key</option></select></label>
+          <label id="ws-encryption-field">Encryption<select id="ws-encryption"><option value="default">Bucket default</option><option value="kms">AWS KMS managed key</option></select></label>
           <label id="ws-kms-field" hidden>KMS key ID or ARN<input id="ws-kms" placeholder="arn:aws:kms:…" /><span class="field-help">Applied to exported objects. The credential also needs permission to use this key.</span></label>
           <div class="field-space"><span class="field-label">Tenants allowed to use this connection</span><div id="ws-tenants" class="permission-grid"></div></div>
-          <label class="check"><input id="ws-path" type="checkbox" /> Use path-style bucket addressing</label>
+          <label id="ws-path-field" class="check"><input id="ws-path" type="checkbox" /> Use path-style bucket addressing</label>
           <label class="check"><input id="ws-enabled" type="checkbox" checked /> Connection enabled</label>
-          <p class="field-help">Disabling a connection prevents new imports and exports that depend on it. Existing objects remain in the bucket.</p>
+          <p class="field-help">Disabling a connection prevents new transfers that depend on it. Files already delivered remain at their destination.</p>
         </fieldset>
         <div class="actions"><button type="submit">Save connection</button><button id="storage-test" type="button" class="ghost" disabled>Test saved connection</button><span id="storage-test-result" role="status"></span></div>
       </form>
-      <div class="info-banner"><strong>Use storage in a workflow.</strong> Import from a connection when creating a delivery, or choose it as a project's export destination. <a href="/workflows#projects" class="text-link">Open projects →</a></div>
+      <div class="info-banner"><strong>Use storage in a workflow.</strong> Choose connections for outgoing deliveries and automatic mirroring in a receive project. S3 connections can also import source files. <a href="/workflows#projects" class="text-link">Open projects →</a></div>
       <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
     </div>
 

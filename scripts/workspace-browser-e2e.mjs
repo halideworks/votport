@@ -119,6 +119,33 @@ try {
   await page.locator(`#job-${issued.job.id}`).waitFor();
   await page.locator(`#job-${issued.job.id}`).getByRole('button', { name: 'Copy download link', exact: true }).waitFor({ state: 'hidden' });
   assert.equal(await page.locator(`#job-${issued.job.id}`).getByRole('button', { name: 'Copy download link', exact: true }).count(), 0, 'Changed project rules must remove the cached link');
+  await page.route('**/api/workflows/jobs?*', async (route) => {
+    const response = await route.fetch(), body = await response.json();
+    body.jobs = body.jobs.filter(({ job }) => job.id !== issued.job.id);
+    await route.fulfill({ response, json: body });
+  });
+  await page.goto(`${base}/deliver`);
+  const olderJob = page.waitForResponse((response) => response.url().endsWith(`/api/workflows/jobs/${issued.job.id}`));
+  await page.goto(`${base}/workflows#job-${issued.job.id}`);
+  assert.equal((await olderJob).status(), 200);
+  await page.locator(`#job-${issued.job.id} details[open]`).waitFor();
+  await page.unroute('**/api/workflows/jobs?*');
+  const jobA = 'a'.repeat(32), jobB = 'b'.repeat(32);
+  for (let lookup = 0; lookup < 2; lookup++) {
+    let releaseJob, jobStarted;
+    const heldJob = new Promise((resolve) => releaseJob = resolve), jobPending = new Promise((resolve) => jobStarted = resolve);
+    await page.route(`**/api/workflows/jobs/${jobA}`, async (route) => { jobStarted(); await heldJob; await route.fulfill({ json: { ...issued, job: { ...issued.job, id: jobA } } }); });
+    await page.route(`**/api/workflows/jobs/${jobB}`, (route) => route.fulfill({ json: { ...issued, job: { ...issued.job, id: jobB } } }));
+    await page.evaluate((id) => { window.location.hash = `job-${id}`; }, jobA); await jobPending;
+    await page.evaluate((id) => { window.location.hash = `job-${id}`; }, jobB);
+    await page.locator(`#job-${jobB}`).waitFor();
+    const oldResponse = page.waitForResponse((response) => response.url().endsWith(`/api/workflows/jobs/${jobA}`));
+    releaseJob(); await (await oldResponse).finished();
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    assert.equal(await page.locator(`#job-${jobB}`).count(), 1, 'A delayed previous lookup cannot replace the current job');
+    assert.equal(await page.locator(`#job-${jobA}`).count(), 0);
+    await page.unroute(`**/api/workflows/jobs/${jobA}`); await page.unroute(`**/api/workflows/jobs/${jobB}`);
+  }
 
   let eventPage = 0;
   const records = [1, 2].map((n) => ({ id: n, kind: 'delivery_created', created_at: n, signature: `signature-${n}` }));
@@ -168,15 +195,15 @@ try {
   await page.fill('#ws-label', `${id} renamed`); await saveStorage();
   assert.equal((await api('workflows/storage')).storage.find((item) => item.id === storageId).credential_source, 'saved');
   const project = (await api('workflows/projects')).projects.find((item) => item.id === id);
-  await api('workflows/projects', { ...project, export_storage: storageId }, 'PUT');
+  await api('workflows/projects', { ...project, destinations: [storageId] }, 'PUT');
   const { credential_source, ...disabled } = (await api('workflows/storage')).storage.find((item) => item.id === storageId);
   assert.equal(credential_source, 'saved');
   await api('workflows/storage', { storage: { ...disabled, enabled: false } }, 'PUT');
   await page.goto(`${base}/workflows#projects`);
   await page.locator('#workflow-project-list article').filter({ hasText: id }).getByRole('button', { name: 'Edit project' }).click();
-  assert.equal(await page.inputValue('#wp-export'), storageId, 'Unavailable storage must remain selected in an existing policy');
+  assert.ok(await page.locator(`#wp-destinations input[value="${storageId}"]`).isChecked(), 'Unavailable storage must remain selected in an existing policy');
   await saveProject();
-  assert.equal((await api('workflows/projects')).projects.find((item) => item.id === id).export_storage, storageId);
+  assert.equal((await api('workflows/projects')).projects.find((item) => item.id === id).destinations[0], storageId);
   await page.getByRole('link', { name: 'Automation', exact: true }).click();
   await page.locator('#automation-token-form').waitFor(); await layout('automation');
   for (const name of ['receive', 'audit', 'tenants', 'system']) {
@@ -190,7 +217,105 @@ try {
   await layout('audit-automation-identity');
   await page.unroute('**/api/admin/audit?*');
 
+  await page.goto(`${base}/storage`); await page.click('#storage-new');
+  await page.selectOption('#ws-kind', 'folder'); await page.fill('#ws-label', 'Shared reception');
+  await page.fill('#ws-id', `${storageId}_folder`); await page.fill('#ws-directory', path.join(root, 'shared'));
+  await fs.mkdir(path.join(root, 'shared'), { recursive: true });
+  await layout('shared-folder-editor');
+  let saved = page.waitForResponse((response) => response.url().endsWith('/api/workflows/storage') && response.request().method() === 'PUT');
+  await page.locator('#workflow-save-storage button[type=submit]').click(); assert.equal((await saved).status(), 200);
+  await page.waitForFunction(() => !document.querySelector('#storage-test').disabled);
+  await page.click('#storage-test'); await page.getByText(/The server can read this shared folder/).waitFor();
+  const request = await api('admin/links', { label: 'Peer connection fixture' });
+  await page.click('#storage-new'); await page.selectOption('#ws-kind', 'votport');
+  await page.fill('#ws-label', 'Connected studio'); await page.fill('#ws-id', `${storageId}_peer`);
+  await page.fill('#ws-port-link', request.link.url); await layout('peer-port-editor');
+  saved = page.waitForResponse((response) => response.url().endsWith('/api/workflows/storage') && response.request().method() === 'PUT');
+  await page.locator('#workflow-save-storage button[type=submit]').click(); assert.equal((await saved).status(), 200);
+  await page.waitForFunction(() => document.querySelector('#ws-port-auth').value === 'keep');
+  assert.equal(await page.inputValue('#ws-port-link'), '', 'Saved receive capability stays private');
+  const reception = await api('workflows/projects', { ...project, id: `${storageId}_reception`, directory: `${id}-incoming`, revision: 0, label: `Reception ${id}`, receive: true, release: 'local', destinations: [`${storageId}_folder`], recipients: [], require_approval: false, sequence: null, media: null, scan_required: false }, 'PUT');
+  await page.goto(`${base}/workflows#projects`);
+  await page.locator('#workflow-project-list article').filter({ hasText: `Reception ${id}` }).getByRole('button', { name: 'Edit project' }).click();
+  assert.ok(await page.locator('#wp-receive').isChecked());
+  assert.equal(await page.inputValue('#wp-release'), 'local'); await layout('reception-project-editor');
+  await page.goto(`${base}/receive`); await page.locator('#create-workflow select').selectOption(reception.id);
+  await page.fill('#create-label', `Incoming ${id}`);
+  for (const input of await page.locator('#create-workflow input[data-metadata]').all()) await input.fill('Example studio');
+  await layout('reception-request-editor');
+  await page.locator('#create-form button[type=submit]').click(); await page.locator('#new-link:not([hidden])').waitFor();
+  const requests = await api('admin/links');
+  const incoming = requests.links.find((link) => link.label === `Incoming ${id}`);
+  assert.equal(incoming.workflow.project_id, reception.id);
+  await page.locator(`#link-${incoming.id}`).getByText('Reception workflow', { exact: true }).click();
+  await layout('existing-reception-workflow');
+
+  const status = await api('admin/status'); status.receiving = [];
+  await page.route('**/api/admin/status?*', (route) => route.fulfill({ json: status }));
+  async function pollStatus() {
+    status.sessions_active++;
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await page.waitForFunction((count) => document.querySelector('#stat-active').textContent === String(count), status.sessions_active);
+  }
+  await page.goto(`${base}/receive?search=${incoming.id}#link-${incoming.id}`);
+  const card = page.locator(`#link-${incoming.id}`), editor = card.locator('.reception-workflow');
+  await editor.waitFor(); await page.waitForLoadState('networkidle');
+  await editor.evaluate((node) => { node.open = false; });
+  let releaseList, listStarted, listReads = 0;
+  const heldList = new Promise((resolve) => releaseList = resolve), listPending = new Promise((resolve) => listStarted = resolve);
+  await page.route('**/api/admin/links?*', async (route) => {
+    listReads++; const response = await route.fetch(); listStarted(); await heldList;
+    await route.fulfill({ response });
+  });
+  status.receiving = [{ link_id: incoming.id, received: 1, total: 100, started_at: status.now, transport: 'http' }];
+  await pollStatus();
+  await listPending;
+  await editor.evaluate((node) => { node.open = true; });
+  await editor.locator('input[data-metadata]').fill('Unsaved reception draft');
+  releaseList(); await page.waitForLoadState('networkidle');
+  assert.equal(await editor.locator('input[data-metadata]').inputValue(), 'Unsaved reception draft', 'A response already in flight preserves the draft');
+  await editor.evaluate((node) => { node.open = false; });
+  status.receiving = [];
+  await pollStatus();
+  await page.waitForLoadState('networkidle');
+  assert.equal(listReads, 1, 'A closed dirty editor still prevents poll replacement');
+  let releasePatch, patchStarted;
+  const heldPatch = new Promise((resolve) => releasePatch = resolve), patchPending = new Promise((resolve) => patchStarted = resolve);
+  await page.route(`**/api/admin/links/${incoming.id}`, async (route) => { patchStarted(); await heldPatch; await route.continue(); });
+  await editor.evaluate((node) => { node.open = true; });
+  await editor.getByRole('button', { name: 'Save reception workflow' }).click(); await patchPending;
+  assert.ok(await editor.locator('input[data-metadata]').isDisabled(), 'Inputs cannot create an unsaved revision while PATCH is in flight');
+  await editor.evaluate((node) => { node.open = false; });
+  await pollStatus();
+  assert.equal(listReads, 1, 'A pending save preserves its editor');
+  releasePatch(); await page.waitForFunction(() => document.querySelector('.reception-workflow [role=status]').textContent.startsWith('Saved.'));
+  assert.match(await editor.locator('[role=status]').textContent(), /^Saved\./);
+  await pollStatus();
+  await page.waitForFunction(() => !document.querySelector('.reception-workflow [role=status]').textContent);
+  assert.equal(listReads, 2, 'The deferred refresh runs after editing finishes');
+  await page.unroute('**/api/admin/status?*'); await page.unroute('**/api/admin/links?*'); await page.unroute(`**/api/admin/links/${incoming.id}`);
+
+  await page.goto(`${base}/storage`);
+  let releaseInitial, initialStarted, initialReads = 0;
+  const heldInitial = new Promise((resolve) => releaseInitial = resolve), initialPending = new Promise((resolve) => initialStarted = resolve);
+  await page.route('**/api/workflows/jobs?*', async (route) => {
+    initialReads++; const response = await route.fetch();
+    if (initialReads === 1) { initialStarted(); await heldInitial; }
+    await route.fulfill({ response });
+  });
+  await page.goto(`${base}/workflows`); await initialPending;
+  await page.getByRole('link', { name: 'Projects', exact: true }).click();
+  await page.locator('#workflow-project-list article').first().waitFor();
+  const initialResponse = page.waitForResponse((response) => response.url().includes('/api/workflows/jobs?'));
+  releaseInitial(); await (await initialResponse).finished();
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await page.getByRole('link', { name: 'Deliveries', exact: true }).click();
+  await page.locator('#workflow-jobs article').first().waitFor();
+  assert.equal(initialReads, 2, 'An abandoned initial request must not mark an unrendered panel loaded');
+  await page.unroute('**/api/workflows/jobs?*');
+
   const session = await api('admin/session');
+  await page.goto(`${base}/receive`);
   await page.route(/\/(workflows|storage)$/, async (route) => {
     const response = await route.fetch();
     const body = (await response.text()).replace(/(<script id="admin-session" type="application\/json">)[\s\S]*?(<\/script>)/, (_, start, end) => start + JSON.stringify({ ...session, role: 'operator', tenant: 'named-tenant' }) + end);

@@ -33,8 +33,8 @@ struct WorkflowsView: View {
                 Button("Refresh") { refresh() }.disabled(busy)
                 if let problem { Text(problem).foregroundStyle(Tokens.danger).textSelection(.enabled) }
                 if port.signedIn {
-                    if let base = port.port?.base, let url = URL(string: base + "/deliver#workflows") {
-                        Link("Project rules, schedules, storage and events", destination: url)
+                    if let base = port.port?.base, let url = URL(string: base + "/workflows") {
+                        Link("Projects, reception routes, storage and events", destination: url)
                     }
                     GroupBox("Create a delivery") {
                         VStack(alignment: .leading, spacing: 10) {
@@ -65,11 +65,17 @@ struct WorkflowsView: View {
                             VStack(alignment: .leading, spacing: 8) {
                                 Text("\(job.label) · \(job.project) · \(human(job.state))")
                                 if let manifest = job.manifest { Text("Manifest: \(manifest)").font(Type.monoBody).textSelection(.enabled) }
+                                if job.received { Text("Incoming reception workflow").font(Type.caption) }
+                                ForEach(job.destinations, id: \.self) { Text($0).font(Type.caption) }
+                                if job.url != nil && job.state != "ready" { Text("Local download link released; destination copies are pending.").font(Type.caption) }
+                                if let base = port.port?.base, let url = URL(string: base + "/workflows#job-" + job.id) {
+                                    Link("Route details and signed evidence", destination: url)
+                                }
                                 if let error = job.error { Text(error).foregroundStyle(Tokens.danger) }
                                 HStack {
                                     if let url = job.url { Button("Copy download link") { copy(url) } }
                                     if job.state == "awaiting_approval" { Button("Approve this manifest") { confirmation = Confirmation(id: job.id, action: "approve", manifest: job.manifest) } }
-                                    if job.state == "failed" { Button("Retry job") { change(job.id, "retry", job.manifest) } }
+                                    if ["failed", "retrying"].contains(job.state) { Button("Retry job") { change(job.id, "retry", job.manifest) } }
                                     if !["cancelled", "retired", "retiring"].contains(job.state) { Button("Cancel job") { confirmation = Confirmation(id: job.id, action: "cancel", manifest: job.manifest) } }
                                 }.disabled(busy)
                             }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
@@ -109,7 +115,7 @@ struct WorkflowsView: View {
             }
             Button("Back", role: .cancel) { confirmation = nil }
         } message: { action in
-            Text(action.action == "cancel" ? "Stop subsequent downloads for this job?" : "Confirm you reviewed and \(action.action) manifest \(action.manifest ?? "")?")
+            Text(action.action == "cancel" ? "Stop downloads here and request revocation at connected ports? Downloaded files and independent copies remain." : "Confirm you reviewed and \(action.action) manifest \(action.manifest ?? "")?")
         }
     }
 

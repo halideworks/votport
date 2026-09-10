@@ -120,6 +120,7 @@ pub struct PackageAnnouncement {
 
 #[derive(Deserialize)]
 pub struct CreateSessionRequest {
+    route: Option<String>,
     #[serde(default)]
     password: Option<String>,
     package: PackageAnnouncement,
@@ -159,6 +160,7 @@ pub struct PushPackageAnnouncement {
 
 #[derive(Deserialize)]
 pub struct CreatePushRequest {
+    route: Option<String>,
     #[serde(default)]
     password: Option<String>,
     holder_key: String,
@@ -419,9 +421,15 @@ async fn register_session(
     id: &str,
     sender: mpsc::Sender<Cmd>,
     kind: session::SessionKind,
+    route: Option<&crate::store::InboundRoute>,
 ) -> ApiResult<()> {
     #[cfg(test)]
     app.sessions.wait_session_create_stall().await;
+    let transport = if matches!(kind, session::SessionKind::Http) {
+        "http"
+    } else {
+        "push"
+    };
     let admission = session::SessionAdmission {
         id: id.to_owned(),
         link_id: prepared.link.id.clone(),
@@ -446,6 +454,12 @@ async fn register_session(
     .map_err(|error| session_insert_error(app, &prepared.link.tenant, error))?;
     match app.store.upload_link(&prepared.link.id) {
         Ok(Some(current)) if current.tenant == prepared.link.tenant && current.usable_now() => {
+            if let Some(route) = route {
+                if let Err(error) = app.store.bind_route_session(route, id, transport) {
+                    app.sessions.remove(id);
+                    return Err(ApiError::new(StatusCode::CONFLICT, error));
+                }
+            }
             Ok(())
         }
         Ok(_) => {
@@ -518,6 +532,26 @@ pub async fn create_session(
         || parse_object(&request.package),
     )
     .await?;
+    let route = super::outbound::workflows::routes::admission(
+        &app,
+        request.route.as_deref(),
+        &prepared.link.id,
+    )?;
+    if let Some(existing) = route
+        .as_ref()
+        .and_then(|route| route.session_id.as_ref())
+        .filter(|id| app.sessions.link_id(id).is_some())
+    {
+        if app.sessions.contains_push(existing) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "route has an active native transfer",
+            ));
+        }
+        return Ok(Json(
+            json!({"session":existing,"chunk_bytes":session::CHUNK_BYTES,"resume":true}),
+        ));
+    }
     let announced_bytes = prepared.expected.length;
 
     let session_id = auth::random_token();
@@ -549,6 +583,7 @@ pub async fn create_session(
         &session_id,
         sender,
         session::SessionKind::Http,
+        route.as_ref(),
     )
     .await?;
     session::spawn_worker(setup, receiver);
@@ -593,6 +628,21 @@ pub async fn create_push_session(
         || parse_push_object(&request.package),
     )
     .await?;
+    let route = super::outbound::workflows::routes::admission(
+        &app,
+        request.route.as_deref(),
+        &prepared.link.id,
+    )?;
+    if route
+        .as_ref()
+        .and_then(|route| route.session_id.as_ref())
+        .is_some_and(|id| app.sessions.link_id(id).is_some())
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "route transfer is already active",
+        ));
+    }
     let holder: [u8; 32] = hex::decode(&request.holder_key)
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
@@ -649,6 +699,7 @@ pub async fn create_push_session(
         &session_id,
         sender,
         session::SessionKind::Push(control.clone()),
+        route.as_ref(),
     )
     .await
     {

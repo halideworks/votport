@@ -16,6 +16,7 @@ publish = false
 quiche = { git = "https://github.com/halideworks/quiche.git", rev = "ce7e5b71f3198125ab92a1626390bbe3a2c7faa0" }
 
 [dependencies]
+votport-client-core = { path = "../client/core" }
 vot-sdk = { git = "https://github.com/halideworks/VOT", rev = "ed8a20b7acb2e58d0dd5c794e20dcfaa66be40d0" }
 vot-sdk-file = { git = "https://github.com/halideworks/VOT", rev = "ed8a20b7acb2e58d0dd5c794e20dcfaa66be40d0" }
 vot-receipt = { git = "https://github.com/halideworks/VOT", rev = "ed8a20b7acb2e58d0dd5c794e20dcfaa66be40d0" }
@@ -53,7 +54,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 rusqlite = { version = "0.40.2", features = ["bundled", "functions"] }
 openidconnect = { version = "4.0.1", features = ["reqwest"] }
 rcgen = { version = "0.14.9", default-features = false, features = ["aws_lc_rs", "pem"] }
-object_store = { version = "0.14", default-features = false, features = ["aws"] }
+object_store = { version = "0.14", default-features = false, features = ["aws", "fs"] }
 age = "0.12"
 tar = { version = "0.4", default-features = false }
 x509-parser = "0.18"

@@ -525,6 +525,76 @@ fn ensure_leaves(proof_root: &Path, object: &ObjectId, path: &Path) -> Option<Ve
     Some(leaves)
 }
 
+fn ensure_manifest(
+    app: &App,
+    grant: &OutboundGrant,
+    entries: &[GrantEntry],
+) -> ApiResult<[u8; 32]> {
+    let directory = manifest_directory(app, &grant.id);
+    let recorded = app
+        .store
+        .outbound_grant_manifest_root(&grant.id)
+        .map_err(super::store_unavailable)?
+        .and_then(|hex| hex::decode(hex).ok())
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+    match recorded {
+        Some(root)
+            if directory
+                .join(MANIFEST_DIRECTORY)
+                .join(MANIFEST_SEAL)
+                .is_file() =>
+        {
+            Ok(root)
+        }
+        _ => {
+            let root = write_manifest(&directory, entries)
+                .map_err(|error| ApiError::internal(format!("grant manifest: {error}")))?;
+            app.store
+                .put_outbound_grant_manifest(&grant.id, &hex::encode(root), now_unix())
+                .map_err(super::store_unavailable)?;
+            Ok(root)
+        }
+    }
+}
+
+pub(crate) fn prepare_route_package(
+    app: &App,
+    grant: &OutboundGrant,
+) -> ApiResult<votport_client_core::package::Prepared> {
+    let entries = grant_entries(app, grant)?;
+    let directory = manifest_directory(app, &grant.id);
+    let root = {
+        let _building = BUILDS.lock().expect("manifest builds poisoned");
+        ensure_manifest(app, grant, &entries)?
+    };
+    let proofs = proof_root(app);
+    let mut sources = BTreeMap::new();
+    for entry in &entries {
+        let leaves = ensure_leaves(&proofs, &entry.object, &entry.path);
+        if entry.object.length > PROOF_LEAF_SIZE && leaves.is_none() {
+            return Err(ApiError::internal("prepare route file proofs failed"));
+        }
+        sources.insert(
+            entry.object.root,
+            vot_cli::ServedSource {
+                path: entry.path.clone(),
+                leaves,
+            },
+        );
+    }
+    let logical_length = entries
+        .iter()
+        .try_fold(0u64, |total, entry| total.checked_add(entry.object.length))
+        .ok_or_else(|| ApiError::internal("route package size overflow"))?;
+    let summary = vot_cli::PackageSummary {
+        root,
+        logical_length,
+        entries: entries.len() as u64,
+    };
+    votport_client_core::package::load_prepared(summary, sources, &directory)
+        .map_err(|_| ApiError::internal("read route manifest failed"))
+}
+
 /// The grant's manifest root and its server, building either that is
 /// missing. Runs on the blocking pool: assembling reads every byte of a
 /// file it has no leaves for.
@@ -536,30 +606,7 @@ pub(crate) fn ensure_server(
     let _building = BUILDS.lock().expect("manifest builds poisoned");
     let entries = grant_entries(app, grant)?;
     let directory = manifest_directory(app, &grant.id);
-    let recorded = app
-        .store
-        .outbound_grant_manifest_root(&grant.id)
-        .map_err(super::store_unavailable)?
-        .and_then(|hex| hex::decode(hex).ok())
-        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
-    let root = match recorded {
-        Some(root)
-            if directory
-                .join(MANIFEST_DIRECTORY)
-                .join(MANIFEST_SEAL)
-                .is_file() =>
-        {
-            root
-        }
-        _ => {
-            let root = write_manifest(&directory, &entries)
-                .map_err(|error| ApiError::internal(format!("grant manifest: {error}")))?;
-            app.store
-                .put_outbound_grant_manifest(&grant.id, &hex::encode(root), now_unix())
-                .map_err(super::store_unavailable)?;
-            root
-        }
-    };
+    let root = ensure_manifest(app, grant, &entries)?;
     if let Some(server) = serve.registry.server(root) {
         return Ok((root, server));
     }

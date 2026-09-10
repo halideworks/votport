@@ -40,8 +40,15 @@ pub fn send(
     });
     observer.event(Event::Transport(Transport::Http));
 
-    let result = drive(client, &session, created.chunk_bytes, prepared, observer);
-    if result.is_err() {
+    let result = drive(
+        client,
+        &session,
+        created.chunk_bytes,
+        prepared,
+        observer,
+        created.resume,
+    );
+    if result.is_err() && !client.is_route() {
         // Abort is best effort and safe on any failure path; it lets the
         // server record the session as cancelled rather than idle out.
         client.abort(&session);
@@ -56,16 +63,19 @@ fn drive(
     chunk_bytes: u64,
     prepared: &Prepared,
     observer: &mut dyn Observer,
+    resume: bool,
 ) -> Result<FinishReport> {
-    let expected_pages = client.seal(session, prepared.seal_bytes.clone())?;
-    let mut remaining = expected_pages;
-    for page in &prepared.page_bytes {
-        remaining = client.page(session, page.clone())?;
-    }
-    if remaining != 0 {
-        return Err(Error::Other(format!(
-            "the server still wants {remaining} manifest pages after all were sent"
-        )));
+    if !resume {
+        let expected_pages = client.seal(session, prepared.seal_bytes.clone())?;
+        let mut remaining = expected_pages;
+        for page in &prepared.page_bytes {
+            remaining = client.page(session, page.clone())?;
+        }
+        if remaining != 0 {
+            return Err(Error::Other(format!(
+                "the server still wants {remaining} manifest pages after all were sent"
+            )));
+        }
     }
 
     // Begin can ask for a re-begin after a chunk or at finish; the loop is
