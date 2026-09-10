@@ -232,7 +232,7 @@ jobs:
           e2e_root="$(mktemp -d)"
           data_dir="$e2e_root/data"
           receive_dir="$e2e_root/receive"
-          outbound_dir="$e2e_root/outbound"
+          outbound_dir="$e2e_root/library"
           mkdir -p "$data_dir" "$receive_dir" "$outbound_dir"
           cleanup() {
             status=$?
@@ -273,3 +273,7 @@ jobs:
             ADMIN_PASSWORD="$ADMIN_PASSWORD" \
             RECEIVE_DIR="$receive_dir" \
             npm run browser:e2e
+          BASE_URL=http://127.0.0.1:8080 ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+            WORKFLOW_TEST_ROOT="$e2e_root" node scripts/delivery-browser-e2e.mjs
+          BASE_URL=http://127.0.0.1:8080 ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+            WORKFLOW_TEST_ROOT="$e2e_root" node scripts/workspace-browser-e2e.mjs

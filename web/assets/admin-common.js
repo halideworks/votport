@@ -202,6 +202,9 @@ mountThemeToggle();
 const NAV_ITEMS = [
   ['receive', '/receive', 'Receive'],
   ['deliver', '/deliver', 'Deliver'],
+  ['workflows', '/workflows', 'Workflows'],
+  ['storage', '/storage', 'Storage'],
+  ['automation', '/automation', 'Automation'],
   ['tenants', '/tenants', 'Tenants'],
   ['audit', '/audit', 'Audit'],
   ['system', '/system', 'System'],

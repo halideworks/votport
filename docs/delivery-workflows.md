@@ -2,8 +2,8 @@
 
 Delivery workflows add project policies, durable preparation, recipient evidence,
 and storage integration to the existing verified transfer paths. Open
-**Deliver > Delivery workflows** in the browser or **Workflows** in either
-native app. Agents use the scoped HTTP API, client CLI, or MCP tools described
+**Workflows** in the browser or either native app.
+Agents use the scoped HTTP API, client CLI, or MCP tools described
 in [Agent access](agents.md).
 
 ## What each client can do
@@ -72,7 +72,9 @@ does not prove a person's email address or prevent a modified client from lying.
 
 ## Projects and release policy
 
-Administrators assign a library directory to a project and grant `sender`,
+Open **Workflows > Projects > New project** to create a project. The empty
+project list also offers **Create project**. Administrators assign a library
+directory to a project and grant `sender`,
 `approver`, or `viewer` membership. An automation principal is
 `automation:TOKEN_ID`, using the issued token's ID. Agents also need the matching
 `jobs:read`, `jobs:create`, or `jobs:cancel` permission and a folder scope covering
@@ -141,9 +143,20 @@ Follow returned cursors even when a filtered job/event page is empty.
 
 ## Storage, templates and quarantine
 
-Platform administrators configure S3-compatible endpoints, buckets, regions,
-prefixes, path-style addressing, tenant allowlists, and optional SSE-KMS key IDs.
-Credentials remain on the server. For a storage ID `media`, configure:
+Open **Storage > Add storage** to connect Amazon S3 or an S3-compatible service.
+Platform administrators configure the endpoint, bucket, region, root folder,
+tenant access and optional SSE-KMS key. Enter an access key and secret in the
+form, or select server credentials / IAM role. Saved credentials live in the
+private server database and its backups; list and save responses never return
+them. Editing a connection preserves its keys unless you explicitly replace
+them or switch to server credentials. Keys and settings change atomically under
+the same configuration revision.
+
+**Test saved connection** checks bucket listing without writing objects. Exports
+also need write permission and, when configured, permission to use the KMS key.
+Choose storage as a project's export destination or a new delivery's source.
+
+With server credentials selected, a storage ID `media` can use:
 
 ```sh
 VOTPORT_STORAGE_MEDIA_ACCESS_KEY_ID=...

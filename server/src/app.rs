@@ -2395,6 +2395,9 @@ pub fn router(app: Arc<App>) -> Router {
         // Multi-page admin: static shells; authz is enforced per API call.
         .route("/receive", serve_page(page("receive")))
         .route("/deliver", serve_page(page("deliver")))
+        .route("/workflows", serve_page(page("workflows")))
+        .route("/storage", serve_page(page("storage")))
+        .route("/automation", serve_page(page("automation")))
         .route("/links", serve_page(page("receive")))
         .route("/tenants", serve_page(page("tenants")))
         .route("/audit", serve_page(page("audit")))
@@ -2484,6 +2487,11 @@ pub fn router(app: Arc<App>) -> Router {
             get(api::outbound::workflows::storage::list)
                 .put(api::outbound::workflows::storage::put)
                 .layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/api/workflows/storage/{id}/test",
+            post(api::outbound::workflows::storage::test_connection)
+                .layer(DefaultBodyLimit::max(1024)),
         )
         .route(
             "/api/workflows/webhook",

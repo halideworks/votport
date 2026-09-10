@@ -465,7 +465,7 @@ if (currentDirectory !== PROJECT) {
   throw new Error(`scoped library breadcrumb: ${currentDirectory}`);
 }
 
-await page.getByText("Agent access and automation tokens", { exact: true }).click();
+await page.getByRole("link", { name: "Automation", exact: true }).click();
 await page.fill("#automation-token-label", `browser agent ${run}`);
 await page.fill("#automation-token-directory", PROJECT);
 await page.uncheck('#automation-token-permissions input[value="deliveries:create"]');
@@ -497,7 +497,9 @@ await page.click("#confirm-ok");
 await agentCard.locator(".badge").filter({ hasText: "revoked" }).waitFor();
 const revokedAccess = await page.request.get(`${base}/api/automation/session`, { headers: agentHeaders });
 if (revokedAccess.status() !== 401) throw new Error("revoked agent token still authenticates");
-await page.getByText("Agent access and automation tokens", { exact: true }).click();
+await page.getByRole("link", { name: "Deliver", exact: true }).click();
+await page.getByRole("button", { name: `Open folder ${PROJECT}` }).click();
+await page.waitForFunction(() => document.querySelectorAll("#library-files input[type=checkbox]").length === 12);
 console.log("agent access: selected permissions, MCP config, pagination, and revocation ok");
 
 const projectFiles = await page.$$eval("#library-files .library-file:not(.library-folder) .mono", (els) =>

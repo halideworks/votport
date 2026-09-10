@@ -456,7 +456,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 27;
+pub(crate) const SCHEMA_VERSION: u64 = 28;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -1292,6 +1292,10 @@ impl Store {
                         .map_err(|e| e.to_string())?;
                 }
             }
+        }
+        if stored < 28 {
+            transaction.execute_batch("CREATE TABLE IF NOT EXISTS delivery_storage_credentials(id TEXT PRIMARY KEY REFERENCES delivery_storage(id), document TEXT NOT NULL);")
+                .map_err(|error| format!("schema: {error}"))?;
         }
         transaction
             .execute(

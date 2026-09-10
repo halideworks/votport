@@ -554,7 +554,14 @@ pub async fn admin_session(
     let mut pages = if identity.role == "auditor" {
         vec!["audit"]
     } else {
-        vec!["receive", "deliver", "audit"]
+        vec![
+            "receive",
+            "deliver",
+            "workflows",
+            "storage",
+            "automation",
+            "audit",
+        ]
     };
     if identity.tenant.is_empty() && identity.role == "admin" {
         pages.push("tenants");

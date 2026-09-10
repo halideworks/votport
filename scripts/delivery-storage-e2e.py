@@ -33,7 +33,9 @@ def main():
     parser.add_argument('--root', required=True, type=Path)
     parser.add_argument('--web-root', required=True, type=Path)
     parser.add_argument('--s3', default='http://127.0.0.1:19000')
-    parser.add_argument('--ambient-credentials', action='store_true')
+    credentials = parser.add_mutually_exclusive_group()
+    credentials.add_argument('--ambient-credentials', action='store_true')
+    credentials.add_argument('--saved-credentials', action='store_true')
     args = parser.parse_args()
     args.root.mkdir(parents=True, exist_ok=True)
     access = os.environ['S3_TEST_ACCESS_KEY']
@@ -96,6 +98,9 @@ def main():
         'VOTPORT_WEB_ROOT': str(args.web_root), 'VOTPORT_ADMIN_PASSWORD': 'workflow-fixture-only',
         'VOTPORT_SERVE_BIND': '', 'VOTPORT_PUSH_BIND': '',
         'VOTPORT_STORAGE_FIXTURE_ACCESS_KEY_ID': access, 'VOTPORT_STORAGE_FIXTURE_SECRET_ACCESS_KEY': secret}
+    if args.saved_credentials:
+        env['VOTPORT_STORAGE_FIXTURE_ACCESS_KEY_ID'] = 'wrong-key'
+        env['VOTPORT_STORAGE_FIXTURE_SECRET_ACCESS_KEY'] = 'wrong-secret'
     if args.ambient_credentials:
         del env['VOTPORT_STORAGE_FIXTURE_ACCESS_KEY_ID'], env['VOTPORT_STORAGE_FIXTURE_SECRET_ACCESS_KEY']
         env.update(AWS_ACCESS_KEY_ID=access, AWS_SECRET_ACCESS_KEY=secret,
@@ -133,9 +138,11 @@ def main():
                 assert server.poll() is None, (args.root / 'server.log').read_text()
                 time.sleep(.05)
         api('admin/login', {'password': 'workflow-fixture-only'})
-        config = api('workflows/storage', {'id': 'fixture', 'revision': 0, 'label': 'Fixture',
+        config = api('workflows/storage', {'storage': {'id': 'fixture', 'revision': 0, 'label': 'Fixture',
             'endpoint': f'http://127.0.0.1:{proxy.server_port}', 'bucket': bucket, 'region': 'us-east-1',
-            'prefix': '', 'path_style': True, 'kms_key_id': None, 'tenants': [''], 'enabled': True}, 'PUT')
+            'prefix': '', 'path_style': True, 'kms_key_id': None, 'tenants': [''], 'enabled': True},
+            'credentials': {'mode': 'access_key', 'access_key_id': access, 'secret_access_key': secret} if args.saved_credentials else None}, 'PUT')
+        assert api('workflows/storage/fixture/test', {'revision': config['revision']})['ok']
         api('workflows/projects', {'id': 'storage', 'label': 'Storage checks', 'directory': 'storage',
             'required_metadata': ['client'], 'export_storage': 'fixture'}, 'PUT')
         request = {'operation_id': 's3-import-export', 'project_id': 'storage', 'label': 'S3 delivery',
@@ -176,7 +183,7 @@ def main():
         assert puts[-1].endswith('/complete.json')
         assert config['revision'] == 1
         print(json.dumps({'import_export': 'passed', 'conditional_mutation': 'rejected',
-            'credentials': 'ambient' if args.ambient_credentials else 'configured',
+            'credentials': 'saved' if args.saved_credentials else 'ambient' if args.ambient_credentials else 'configured',
             'completion_failure': 'withheld URL', 'retry': 'same operation and manifest',
             'literal_keys': 'preserved', 'files': len(files), 'bytes': sum(map(len, files.values()))}), flush=True)
     finally:
