@@ -1195,7 +1195,9 @@ pub fn resume_worker(
     receiver: mpsc::Receiver<Cmd>,
     persisted: &mut PersistedUploadSession,
 ) -> Result<(Vec<PathBuf>, u64), String> {
-    let (mut files, kept) = restore_files(&setup, persisted, || true)?;
+    let (mut files, kept) = restore_files(&setup, persisted, || {
+        setup.destinations.check_live().is_ok()
+    })?;
     for file in files.iter_mut().filter(|file| !file.published) {
         if let Some(staged) = file.native.as_mut() {
             staged.preserve = false;
@@ -1250,7 +1252,9 @@ fn restore_files(
                 .map_err(|error| format!("{}: {error:?}", file.display_path))?;
             let mut staged = if destination.try_exists().map_err(|e| e.to_string())? {
                 let observation = directory
-                    .recover_publication(&file.object, name, &state)
+                    .recover_publication(&file.object, name, &state, || {
+                        active() && setup.destinations.check_live().is_ok()
+                    })
                     .map_err(|error| format!("recover {}: {error}", file.display_path))?;
                 let location = directory
                     .destination(name)
@@ -1520,6 +1524,10 @@ fn open_destination_for(
         .map_err(SessionError::internal)?;
     let name = components.last().expect("manifest paths are never empty");
     for attempt in 0..MAX_NAME_ATTEMPTS {
+        setup
+            .destinations
+            .check_live()
+            .map_err(SessionError::internal)?;
         let mut stored = components.clone();
         *stored.last_mut().expect("non-empty") = paths::with_suffix(name, attempt);
         // The full stored path including the file name; `parent` above is
@@ -1627,10 +1635,9 @@ fn accept_range(
         .native
         .as_ref()
         .ok_or_else(|| SessionError::internal("file state lost"))?;
-    let native = staged.native()?;
     let deadline = Instant::now() + RANGE_IN_FLIGHT_BUDGET;
     let acceptance = loop {
-        match native.accept(&verified) {
+        match staged.native()?.accept(&verified) {
             Ok(acceptance) => break acceptance,
             Err(error) if error.kind() == vot_sdk_file::ErrorKind::RangeInFlight => {
                 if Instant::now() >= deadline {
@@ -4791,6 +4798,14 @@ mod push_tests {
                 connection
                     .execute_batch("DROP TRIGGER IF EXISTS fail_checkpoint;")
                     .unwrap();
+                let journal_before = fs::read(&journal).unwrap();
+                let checks = AtomicU64::new(0);
+                assert!(restore_files(&retry_setup, &mut persisted, || {
+                    checks.fetch_add(1, Ordering::Relaxed) < 2
+                })
+                .is_err());
+                assert_eq!(checks.load(Ordering::Relaxed), 3);
+                assert_eq!(fs::read(&journal).unwrap(), journal_before);
                 let (files, _) = restore_files(&retry_setup, &mut persisted, || true).unwrap();
                 assert!(files[0].published);
                 assert!(!journal.exists());

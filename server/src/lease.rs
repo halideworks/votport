@@ -5,7 +5,7 @@
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -94,6 +94,7 @@ impl Guard {
             record,
         };
         guard.check_namespace()?;
+        guard.check_lock()?;
         write(&guard.location, &guard.record)?;
         Ok(guard)
     }
@@ -123,6 +124,7 @@ impl Guard {
 
     pub fn renew(&mut self, now: u64) -> Result<(), String> {
         self.check_namespace()?;
+        self.check_lock()?;
         if read(&self.location)?.is_none_or(|r| r.holder != self.record.holder) {
             return Err("receiving storage ownership changed".to_owned());
         }
@@ -131,6 +133,14 @@ impl Guard {
         write(&self.location, &next)?;
         self.record = next;
         Ok(())
+    }
+
+    fn check_lock(&self) -> Result<(), String> {
+        // NFS reports lost locks through I/O on the held handle. Cached reads can succeed.
+        self.lock
+            .write_all_at(&[0], 0)
+            .and_then(|()| self.lock.sync_data())
+            .map_err(|error| format!("receiving storage lock I/O failed: {error}"))
     }
 }
 
@@ -218,6 +228,7 @@ mod tests {
             .unwrap();
         let directory = Directory::open(root.path()).unwrap();
         let mut first = Guard::acquire(&directory, "first", 1).unwrap();
+        assert_eq!(std::fs::read(first.lock_location.path()).unwrap(), [0]);
         assert!(Guard::acquire(&directory, "second", u64::MAX).is_err());
         first.renew(30).unwrap();
         assert_eq!(read(&first.location).unwrap().unwrap().renewed_at, 30);
@@ -228,6 +239,25 @@ mod tests {
         let second = Guard::acquire(&directory, "second", 31).unwrap();
         assert_eq!(second.lock_location.identity().unwrap(), lock_identity);
         assert_eq!(read(&location).unwrap().unwrap().holder, "second");
+    }
+
+    #[test]
+    fn lock_io_failure_does_not_advance_the_heartbeat() {
+        let root = tempfile::Builder::new()
+            .permissions({
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::Permissions::from_mode(0o700)
+            })
+            .tempdir()
+            .unwrap();
+        let directory = Directory::open(root.path()).unwrap();
+        let mut guard = Guard::acquire(&directory, "first", 1).unwrap();
+        // A read-only handle keeps the inode check valid while forcing the lock write to fail.
+        guard.lock = guard.lock_location.open_read().unwrap();
+        guard.check_namespace().unwrap();
+        assert!(guard.renew(30).unwrap_err().contains("lock I/O failed"));
+        assert_eq!(guard.record.renewed_at, 1);
+        assert_eq!(read(&guard.location).unwrap().unwrap().renewed_at, 1);
     }
 
     #[test]

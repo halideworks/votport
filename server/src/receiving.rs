@@ -69,10 +69,17 @@ fn identity_of(path: &Path, file: &File) -> Result<StorageIdentity, String> {
         if stat.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
             return Err("storage mount identity is unavailable".to_owned());
         }
-        mount_identity(
+        let identity = mount_identity(
             &std::fs::read_to_string("/proc/self/mountinfo").map_err(|e| e.to_string())?,
             stat.stx_mnt_id,
-        )?
+        )?;
+        if matches!(identity.0.as_str(), "nfs" | "nfs4") {
+            validate_nfs_lock_recovery(
+                &std::fs::read_to_string("/sys/module/nfs/parameters/recover_lost_locks")
+                    .map_err(|e| format!("cannot check NFS lock recovery: {e}"))?,
+            )?;
+        }
+        identity
     };
     #[cfg(not(target_os = "linux"))]
     let (filesystem, source, mount_root) = ("local".to_owned(), String::new(), String::new());
@@ -121,6 +128,14 @@ fn validate_locking(filesystem: &str, options: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn validate_nfs_lock_recovery(value: &str) -> Result<(), String> {
+    if !matches!(value.trim(), "N" | "0") {
+        return Err("receiving storage requires nfs.recover_lost_locks disabled".to_owned());
+    }
+    Ok(())
+}
+
 pub struct Active {
     pub destinations: std::sync::Arc<Destinations>,
     pub lease: crate::lease::Guard,
@@ -134,6 +149,43 @@ impl Active {
         Ok(Self {
             destinations: std::sync::Arc::new(destinations),
             lease,
+        })
+    }
+
+    pub fn renew(&mut self, now: u64) -> Result<(), String> {
+        let result = self
+            .destinations
+            .check_current()
+            .and_then(|()| self.lease.renew(now));
+        if result.is_err() {
+            self.destinations.stop();
+        }
+        result
+    }
+
+    pub fn during_recovery<T>(
+        &mut self,
+        recover: impl FnOnce(&std::sync::Arc<Destinations>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.renew(crate::store::now_unix())?;
+        let destinations = std::sync::Arc::clone(&self.destinations);
+        std::thread::scope(|scope| {
+            let (finished, wait) = std::sync::mpsc::channel::<()>();
+            let monitor = scope.spawn(move || {
+                while matches!(
+                    wait.recv_timeout(crate::lease::RENEW_EVERY),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    self.renew(crate::store::now_unix())?;
+                }
+                self.renew(crate::store::now_unix())
+            });
+            let result = recover(&destinations);
+            drop(finished);
+            monitor
+                .join()
+                .expect("recovery ownership monitor panicked")?;
+            result
         })
     }
 }
@@ -512,6 +564,47 @@ impl Destinations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nfs_lock_recovery_must_report_loss_instead_of_reacquiring() {
+        for (value, valid) in [
+            ("N\n", true),
+            ("0", true),
+            ("Y", false),
+            ("1", false),
+            ("", false),
+        ] {
+            assert_eq!(validate_nfs_lock_recovery(value).is_ok(), valid);
+        }
+    }
+
+    #[test]
+    fn recovery_checks_ownership_before_and_after_work() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let destinations = Destinations::open(root.path(), NasContract::Unqualified).unwrap();
+        let mut active = Active::open(destinations, "first").unwrap();
+        assert_eq!(active.during_recovery(|_| Ok(7)).unwrap(), 7);
+        let record = crate::lease::path(root.path());
+        assert!(active
+            .during_recovery(|_| {
+                std::fs::write(
+                    &record,
+                    br#"{"holder":"other","acquired_at":1,"renewed_at":1}"#,
+                )
+                .unwrap();
+                Ok(())
+            })
+            .is_err());
+        assert!(active.destinations.check_live().is_err());
+        assert!(active
+            .during_recovery::<()>(|_| panic!("lost ownership must not run recovery"))
+            .is_err());
+    }
 
     #[test]
     fn storage_identity_preserves_large_inodes_as_decimal_strings() {

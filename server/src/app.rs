@@ -771,7 +771,10 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     }
     std::fs::create_dir_all(&config.outbound_dir).map_err(|e| e.to_string())?;
     let lease_holder = crate::lease::new_holder();
-    let receiving = match crate::receiving::Destinations::configured(&config.receive_dir, &store) {
+    let mut receiving = match crate::receiving::Destinations::configured(
+        &config.receive_dir,
+        &store,
+    ) {
         Ok(destinations) => Ok(crate::receiving::Active::open(destinations, &lease_holder)?),
         Err(error) => {
             tracing::warn!(%error, "receiving storage needs configuration; admin remains available");
@@ -781,22 +784,12 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     clean_outbound_stage(&config.data_dir);
     clean_outbound_proof_stages(&config.data_dir);
     clean_outbound_proofs(&config.data_dir, &store, now_unix());
-    if receiving.is_ok() {
-        store.migrate_tenant_storage(&config.receive_dir)?;
-    }
     let secret = crate::auth::load_secret(&config.data_dir)?;
     let signer = Arc::clone(&store.event_signer);
     let sessions = Sessions::new();
     let (session_ended, session_ended_rx) = tokio::sync::mpsc::unbounded_channel();
-    if let Ok(active) = &receiving {
-        resume_upload_sessions(
-            &config,
-            &store,
-            &signer,
-            &sessions,
-            &session_ended,
-            &active.destinations,
-        );
+    if let Ok(active) = &mut receiving {
+        resume_upload_sessions(&config, &store, &signer, &sessions, &session_ended, active)?;
     }
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -882,18 +875,16 @@ impl App {
 
     pub(crate) fn resume_receiving(
         &self,
-        destinations: &Arc<crate::receiving::Destinations>,
+        active: &mut crate::receiving::Active,
     ) -> Result<(), String> {
-        self.store
-            .migrate_tenant_storage(&self.config.receive_dir)?;
         resume_upload_sessions(
             &self.config,
             &self.store,
             &self.signer,
             &self.sessions,
             &self.session_ended,
-            destinations,
-        );
+            active,
+        )?;
         Ok(())
     }
 
@@ -909,18 +900,19 @@ impl App {
 /// exit, which is the crash path the checkpoint already covers.
 pub async fn suspend_sessions(app: &App) {
     let senders = app.sessions.take_http();
-    let mut replies = Vec::with_capacity(senders.len());
-    for sender in senders {
-        let (reply, done) = tokio::sync::oneshot::channel();
-        if sender.send(session::Cmd::Suspend { reply }).await.is_ok() {
-            replies.push(done);
-        }
-    }
-    let count = replies.len();
+    let count = senders.len();
     if count == 0 {
         return;
     }
-    let all = futures_util::future::join_all(replies);
+    // Pending tasks retain their senders after the deadline; EOF would discard partial uploads.
+    let all = futures_util::future::join_all(senders.into_iter().map(|sender| {
+        tokio::spawn(async move {
+            let (reply, done) = tokio::sync::oneshot::channel();
+            if sender.send(session::Cmd::Suspend { reply }).await.is_ok() {
+                let _ = done.await;
+            }
+        })
+    }));
     match tokio::time::timeout(std::time::Duration::from_secs(30), all).await {
         Ok(_) => tracing::info!(count, "suspended upload sessions for restart"),
         Err(_) => tracing::warn!(count, "suspending upload sessions timed out"),
@@ -929,6 +921,27 @@ pub async fn suspend_sessions(app: &App) {
 
 /// Reattaches recorded uploads and preserves unresolved recovery evidence.
 fn resume_upload_sessions(
+    config: &Config,
+    store: &Arc<Store>,
+    signer: &Arc<crate::receipt::ReceiptSigner>,
+    sessions: &Sessions,
+    ended: &tokio::sync::mpsc::UnboundedSender<session::SessionEnded>,
+    active: &mut crate::receiving::Active,
+) -> Result<HashSet<std::path::PathBuf>, String> {
+    active.during_recovery(|destinations| {
+        store.migrate_tenant_storage(&config.receive_dir, || destinations.check_live())?;
+        Ok(restore_upload_sessions(
+            config,
+            store,
+            signer,
+            sessions,
+            ended,
+            destinations,
+        ))
+    })
+}
+
+fn restore_upload_sessions(
     config: &Config,
     store: &Arc<Store>,
     signer: &Arc<crate::receipt::ReceiptSigner>,
@@ -1152,15 +1165,10 @@ pub fn renew_lease(app: &App, now: u64) -> bool {
     let Ok(active) = state.as_mut() else {
         return true;
     };
-    match active
-        .destinations
-        .check_current()
-        .and_then(|()| active.lease.renew(now))
-    {
+    match active.renew(now) {
         Ok(()) => true,
         Err(error) => {
             tracing::error!(%error, "receiving storage ownership check failed");
-            active.destinations.stop();
             app.lease_lost.store(true, Ordering::Relaxed);
             false
         }
@@ -1997,6 +2005,53 @@ mod health_tests {
     }
 
     #[tokio::test]
+    async fn suspension_deadline_includes_a_full_worker_queue() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let (reply, _done) = tokio::sync::oneshot::channel();
+        sender.send(session::Cmd::Suspend { reply }).await.unwrap();
+        app.sessions
+            .insert_resumed("blocked".into(), "link".into(), String::new(), 0, sender)
+            .unwrap();
+        let (sender, mut healthy) = tokio::sync::mpsc::channel(1);
+        app.sessions
+            .insert_resumed("healthy".into(), "link".into(), String::new(), 0, sender)
+            .unwrap();
+        let shutdown = tokio::spawn({
+            let app = app.clone();
+            async move { suspend_sessions(&app).await }
+        });
+        let Some(session::Cmd::Suspend { reply }) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), healthy.recv())
+                .await
+                .unwrap()
+        else {
+            panic!("a blocked worker must not prevent another worker suspending");
+        };
+        reply.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(35), shutdown)
+            .await
+            .expect("a full worker queue must not bypass the 30-second shutdown deadline")
+            .unwrap();
+        assert_eq!(receiver.len(), 1);
+        assert!(
+            !receiver.is_closed(),
+            "a timed-out sender must not trigger EOF cleanup of partial files"
+        );
+        assert_eq!(app.sessions.total(), 0);
+        receiver.recv().await.unwrap();
+        let Some(session::Cmd::Suspend { reply }) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+        else {
+            panic!("the pending suspension must still reach a recovered worker");
+        };
+        reply.send(()).unwrap();
+    }
+
+    #[tokio::test]
     async fn readyz_follows_draining_and_healthz_does_not() {
         use http_body_util::BodyExt as _;
         let directory = tempfile::tempdir().unwrap();
@@ -2757,8 +2812,9 @@ mod push_tests {
             &app.signer,
             &app.sessions,
             &app.session_ended,
-            &app.receiving_destinations().unwrap(),
-        );
+            app.receiving.lock().unwrap().as_mut().unwrap(),
+        )
+        .unwrap();
         assert!(app.sessions.contains_push_key(&key));
         let (sender, _) = tokio::sync::mpsc::channel(1);
         assert_eq!(

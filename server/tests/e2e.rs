@@ -5993,9 +5993,6 @@ async fn mounted_nas_media_campaign() {
             }
         }
     }
-    let mount = PathBuf::from(
-        std::env::var_os("VOTPORT_NAS_TEST_MOUNT").expect("explicit disposable mount"),
-    );
     let source = PathBuf::from(
         std::env::var_os("VOTPORT_NAS_TEST_SOURCE").expect("explicit existing fixture"),
     );
@@ -6004,37 +6001,8 @@ async fn mounted_nas_media_campaign() {
         Ok("http") => false,
         _ => panic!("VOTPORT_NAS_TEST_TRANSPORT must be http or push"),
     };
-    let data = tempfile::Builder::new()
-        .prefix("votport-nas-control-")
-        .tempdir()
-        .unwrap();
-    let received = tempfile::Builder::new()
-        .prefix("votport-nas-receive-")
-        .tempdir_in(&mount)
-        .unwrap();
-    let identity = votport::receiving::storage_identity(received.path()).unwrap();
-    assert!(
-        ["nfs", "nfs4", "cifs", "smb3"].contains(&identity.filesystem.as_str()),
-        "campaign requires an actual NAS mount"
-    );
-    {
-        let store = votport::store::Store::open(data.path()).unwrap();
-        let qualified = votport::receiving::Qualification {
-            storage: identity,
-            qualified_at: votport::store::now_unix(),
-            qualified_by: "isolated-fixture".into(),
-        };
-        store
-            .put_settings(
-                "fixture",
-                &[(
-                    votport::receiving::SETTING_KEY.into(),
-                    votport::store::SettingWrite::Set(serde_json::to_string(&qualified).unwrap()),
-                )],
-            )
-            .unwrap();
-    }
-    let server = start_server_in(data, received, 1 << 40, push, 3600, 32).await;
+    let server = start_nas_test_server(push).await;
+    let keeper = tokio::spawn(app::lease_keeper(Arc::clone(&server.application)));
     let lock = server.receive_dir.join(".vot-stage/writer.lock");
     let try_lock = || {
         std::process::Command::new("python3")
@@ -6141,10 +6109,117 @@ async fn mounted_nas_media_campaign() {
         .files
         .iter()
         .all(|file| file.receipt && !file.deleted));
+    keeper.abort();
+    let _ = keeper.await;
+    assert!(app::renew_lease(
+        &server.application,
+        votport::store::now_unix()
+    ));
+    assert_eq!(
+        try_lock(),
+        Some(3),
+        "NAS ownership must survive the transfer"
+    );
     app::release_data_lock(&server.application);
     assert_eq!(
         try_lock(),
         Some(0),
         "released NAS ownership permits another process"
     );
+}
+
+async fn start_nas_test_server(push: bool) -> TestServer {
+    let mount = PathBuf::from(
+        std::env::var_os("VOTPORT_NAS_TEST_MOUNT").expect("explicit disposable mount"),
+    );
+    let data = tempfile::Builder::new()
+        .prefix("votport-nas-control-")
+        .tempdir()
+        .unwrap();
+    let received = tempfile::Builder::new()
+        .prefix("votport-nas-receive-")
+        .tempdir_in(&mount)
+        .unwrap();
+    let identity = votport::receiving::storage_identity(received.path()).unwrap();
+    assert!(
+        ["nfs", "nfs4", "cifs", "smb3"].contains(&identity.filesystem.as_str()),
+        "campaign requires an actual NAS mount"
+    );
+    {
+        let store = votport::store::Store::open(data.path()).unwrap();
+        let qualified = votport::receiving::Qualification {
+            storage: identity,
+            qualified_at: votport::store::now_unix(),
+            qualified_by: "isolated-fixture".into(),
+        };
+        store
+            .put_settings(
+                "fixture",
+                &[(
+                    votport::receiving::SETTING_KEY.into(),
+                    votport::store::SettingWrite::Set(serde_json::to_string(&qualified).unwrap()),
+                )],
+            )
+            .unwrap();
+    }
+    start_server_in(data, received, 1 << 40, push, 3600, 32).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable NAS and external revocation of this client's file locks"]
+async fn mounted_nas_lock_loss_stops_receiving() {
+    let server = start_nas_test_server(false).await;
+    let destinations = server.application.receiving_destinations().unwrap();
+    println!(
+        "{}",
+        json!({"phase":"lock-ready","receive":server.receive_dir})
+    );
+    let mut lost = false;
+    for _ in 0..120 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if !app::renew_lease(&server.application, votport::store::now_unix()) {
+            lost = true;
+            break;
+        }
+    }
+    assert!(
+        lost,
+        "externally revoke the fixture client's NAS locks within 60 seconds"
+    );
+    assert!(server
+        .application
+        .lease_lost
+        .load(std::sync::atomic::Ordering::Acquire));
+    assert!(destinations.check_live().is_err());
+    assert!(server.application.receiving_destinations().is_err());
+    assert!(!app::renew_lease(
+        &server.application,
+        votport::store::now_unix()
+    ));
+    app::release_data_lock(&server.application);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable NAS and external revocation of this client's file locks"]
+async fn mounted_nas_recovery_lock_loss_stops_receiving() {
+    let server = start_nas_test_server(false).await;
+    let mut state = server.application.receiving.lock().unwrap();
+    let active = state.as_mut().unwrap();
+    let result = active.during_recovery(|destinations| {
+        println!(
+            "{}",
+            json!({"phase":"lock-ready","receive":server.receive_dir})
+        );
+        for _ in 0..120 {
+            if destinations.check_live().is_err() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        panic!("externally revoke the fixture client's NAS locks within 60 seconds");
+    });
+    assert!(result.is_err());
+    assert!(active.destinations.check_live().is_err());
+    drop(state);
+    app::release_data_lock(&server.application);
 }

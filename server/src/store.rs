@@ -866,7 +866,11 @@ impl Store {
     /// Moves pre-isolation named-tenant subtrees under the reserved storage
     /// directory. The marker is written last, so a crash between renames can
     /// resume without moving a subtree twice.
-    pub fn migrate_tenant_storage(&self, receive_dir: &Path) -> Result<(), String> {
+    pub fn migrate_tenant_storage(
+        &self,
+        receive_dir: &Path,
+        check_live: impl Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
         const KEY: &str = "tenant_storage_layout";
         const LAYOUT: &str = "reserved-v1";
         let marker = self.with(|connection| {
@@ -970,9 +974,12 @@ impl Store {
             if !source_exists {
                 continue;
             }
+            check_live()?;
             std::fs::create_dir_all(&target_root)
                 .map_err(|error| format!("create {}: {error}", target_root.display()))?;
+            check_live()?;
             crate::paths::tighten_dir(&target_root);
+            check_live()?;
             std::fs::rename(&source, &target).map_err(|error| {
                 format!("move {} to {}: {error}", source.display(), target.display())
             })?;
@@ -982,15 +989,18 @@ impl Store {
         // earlier process.
         #[cfg(unix)]
         {
+            check_live()?;
             if target_root.exists() {
                 std::fs::File::open(&target_root)
                     .and_then(|directory| directory.sync_all())
                     .map_err(|error| format!("sync {}: {error}", target_root.display()))?;
             }
+            check_live()?;
             std::fs::File::open(receive_dir)
                 .and_then(|directory| directory.sync_all())
                 .map_err(|error| format!("sync {}: {error}", receive_dir.display()))?;
         }
+        check_live()?;
         self.with(|connection| {
             connection.execute(
                 "INSERT INTO meta (key, value) VALUES (?1, ?2)",
@@ -6736,6 +6746,54 @@ mod tests {
     }
 
     #[test]
+    fn tenant_storage_migration_stops_before_mutation_and_does_not_mark_completion() {
+        for stop_after in 0..6 {
+            let directory = tempfile::tempdir().unwrap();
+            let receive = directory.path().join("receive");
+            std::fs::create_dir_all(receive.join("acme")).unwrap();
+            std::fs::write(receive.join("acme/frame"), b"media").unwrap();
+            let store = Store::open(&directory.path().join("data")).unwrap();
+            store.insert_tenant(test_tenant("acme")).unwrap();
+            let checks = std::cell::Cell::new(0);
+            assert!(store
+                .migrate_tenant_storage(&receive, || {
+                    let count = checks.get();
+                    checks.set(count + 1);
+                    if count >= stop_after {
+                        Err("ownership lost".into())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err());
+            assert_eq!(checks.get(), stop_after + 1);
+            let marked: bool = store
+                .with(|connection| {
+                    connection.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM meta WHERE key = 'tenant_storage_layout')",
+                        [],
+                        |row| row.get(0),
+                    )
+                })
+                .unwrap();
+            assert!(!marked);
+            if stop_after < 3 {
+                assert!(receive.join("acme/frame").is_file());
+            }
+            store.migrate_tenant_storage(&receive, || Ok(())).unwrap();
+            assert_eq!(
+                std::fs::read(
+                    receive
+                        .join(crate::paths::TENANT_STORAGE_DIR)
+                        .join("acme/frame")
+                )
+                .unwrap(),
+                b"media"
+            );
+        }
+    }
+
+    #[test]
     fn tenant_storage_migration_resumes_and_marks_completion() {
         let directory = tempfile::tempdir().unwrap();
         let data = directory.path().join("data");
@@ -6751,7 +6809,7 @@ mod tests {
         std::fs::create_dir_all(target_root.join("globex")).unwrap();
         std::fs::write(target_root.join("globex/done.pdf"), b"globex").unwrap();
 
-        store.migrate_tenant_storage(&receive).unwrap();
+        store.migrate_tenant_storage(&receive, || Ok(())).unwrap();
         assert!(!receive.join("acme").exists());
         assert_eq!(
             std::fs::read(target_root.join("acme/invoice.pdf")).unwrap(),
@@ -6763,7 +6821,7 @@ mod tests {
         // default tenant and must never be reinterpreted on restart.
         std::fs::create_dir_all(receive.join("acme")).unwrap();
         std::fs::write(receive.join("acme/root.txt"), b"root").unwrap();
-        store.migrate_tenant_storage(&receive).unwrap();
+        store.migrate_tenant_storage(&receive, || Ok(())).unwrap();
         assert!(receive.join("acme/root.txt").exists());
     }
 
@@ -6778,13 +6836,17 @@ mod tests {
         std::fs::create_dir_all(receive.join(crate::paths::TENANT_STORAGE_DIR).join("acme"))
             .unwrap();
 
-        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        let error = store
+            .migrate_tenant_storage(&receive, || Ok(()))
+            .unwrap_err();
         assert!(error.contains("found both"), "{error}");
 
         std::fs::remove_dir_all(receive.join(crate::paths::TENANT_STORAGE_DIR)).unwrap();
         std::fs::remove_dir_all(receive.join("acme")).unwrap();
         std::fs::write(receive.join("acme"), b"default tenant").unwrap();
-        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        let error = store
+            .migrate_tenant_storage(&receive, || Ok(()))
+            .unwrap_err();
         assert!(error.contains("expected a directory"), "{error}");
     }
 
@@ -6821,7 +6883,9 @@ mod tests {
         });
         store.insert_link(link).unwrap();
 
-        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        let error = store
+            .migrate_tenant_storage(&receive, || Ok(()))
+            .unwrap_err();
         assert!(error.contains("cannot determine ownership"), "{error}");
         assert!(receive.join("acme/invoice.pdf").exists());
         assert!(!receive.join(crate::paths::TENANT_STORAGE_DIR).exists());
@@ -6836,7 +6900,9 @@ mod tests {
             })
             .unwrap();
 
-        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        let error = store
+            .migrate_tenant_storage(&receive, || Ok(()))
+            .unwrap_err();
         assert!(error.contains("cannot determine ownership"), "{error}");
         assert!(receive
             .join(crate::paths::TENANT_STORAGE_DIR)
@@ -6856,7 +6922,9 @@ mod tests {
             InsertTenantError::AlreadyExists
         );
 
-        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        let error = store
+            .migrate_tenant_storage(&receive, || Ok(()))
+            .unwrap_err();
         assert!(error.contains("is not portable"), "{error}");
 
         store
@@ -6869,7 +6937,9 @@ mod tests {
             })
             .unwrap();
 
-        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        let error = store
+            .migrate_tenant_storage(&receive, || Ok(()))
+            .unwrap_err();
         assert!(error.contains("is not portable"), "{error}");
     }
 
@@ -6885,19 +6955,25 @@ mod tests {
         link.dest = "S".to_owned();
         store.insert_link(link).unwrap();
 
-        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        let error = store
+            .migrate_tenant_storage(&receive, || Ok(()))
+            .unwrap_err();
         assert!(error.contains("cannot determine ownership"), "{error}");
 
         store
             .update_link("", "dest", |link| link.dest = "ſ".to_owned())
             .unwrap();
-        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        let error = store
+            .migrate_tenant_storage(&receive, || Ok(()))
+            .unwrap_err();
         assert!(error.contains("cannot determine ownership"), "{error}");
 
         store
             .update_link("", "dest", |link| link.dest = "TENANT~1".to_owned())
             .unwrap();
-        let error = store.migrate_tenant_storage(&receive).unwrap_err();
+        let error = store
+            .migrate_tenant_storage(&receive, || Ok(()))
+            .unwrap_err();
         assert!(error.contains("cannot determine ownership"), "{error}");
     }
 

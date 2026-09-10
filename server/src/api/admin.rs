@@ -1915,7 +1915,7 @@ pub async fn check_receiving_storage(
             if destinations.identity().map_err(ApiError::internal)? != request.storage {
                 return Err(conflict("Storage changed while checking it. Refresh and retry."));
             }
-            let active = crate::receiving::Active::open(destinations, &app.lease_holder)
+            let mut active = crate::receiving::Active::open(destinations, &app.lease_holder)
                 .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
             if nas {
                 let qualification = crate::receiving::Qualification { storage: request.storage, qualified_at: now_unix(), qualified_by: identity.subject.clone() };
@@ -1923,7 +1923,10 @@ pub async fn check_receiving_storage(
                     serde_json::to_string(&qualification).map_err(|e| ApiError::internal(e.to_string()))?
                 ))]).map_err(super::store_unavailable)?;
             }
-            app.resume_receiving(&active.destinations).map_err(super::store_unavailable)?;
+            if let Err(error) = app.resume_receiving(&mut active) {
+                app.lease_lost.store(true, std::sync::atomic::Ordering::Release);
+                return Err(super::store_unavailable(error));
+            }
             *state = Ok(active);
         }
         drop(state);

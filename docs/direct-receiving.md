@@ -75,6 +75,12 @@ add an unconditional second payload read.
 
 `.vot-stage/writer.lock` is a permanent inode with an exclusive kernel lock.
 Heartbeat JSON is diagnostic and never authorizes takeover based on elapsed time.
+Each renewal writes and synchronizes one byte through the retained lock handle.
+An I/O failure stops receiving; a cached read or inode check cannot detect a lost
+NFS lock. Votport refuses Linux `nfs.recover_lost_locks` when enabled; it must
+report loss instead of silently reacquiring ownership. Do not change this kernel
+setting while receiving. Ownership renewal also runs during startup and
+administrator-triggered recovery.
 Native push control directories also retain their writer-lock inode after
 cleanup; only transfer metadata is removed.
 A local receiving root must be owned by the service account and prevent other
@@ -86,7 +92,9 @@ The NAS must coordinate the lock between clients. Stop or fence the old writer
 before failover and allow the filesystem to recover its locks. Never remove the
 lock file to force another writer in.
 
-Loss of ownership stops receiving writes. Unresolved journals, partial files and
+Detected ownership loss stops new receiving operations. An already-running
+hard-NFS syscall can remain blocked in the kernel; fence the old host before
+another host takes over. Unresolved journals, partial files and
 database records remain for recovery; startup logs the problem and records an
 interrupted transfer event. Published files are retained. The server keeps its
 administration interface available when initial NAS qualification is missing.
@@ -136,9 +144,18 @@ fully written random data. Both generators produce SHA-256 manifests; compare
 every received file independently after the timed transfer. The harness retains
 its paths and reports elapsed time from client collection through publication,
 transport, count, bytes and success. It also checks writer-lock exclusion from a
-second process and reacquisition after release.
+second process before and after transfer, runs the production ownership renewal
+task throughout the transfer, and checks reacquisition after release.
 
 Measure physical allocation on the storage server. CIFS client `st_blocks` can be
 stale across writes and publication. Use inode continuity plus server allocation
 to check that receiving has one payload. Report component measurements separately
 from application transfers and use the same fixture and rig for comparisons.
+
+The ignored `mounted_nas_lock_loss_stops_receiving` and
+`mounted_nas_recovery_lock_loss_stops_receiving` tests require a separate
+storage-administration process to revoke the disposable client's locks after
+`lock-ready` is printed. On an isolated Linux NFS server, write `expire` to the
+matching `/proc/fs/nfsd/clients/<id>/ctl`. Run each test separately and target only
+its fixture client. The tests require ownership loss within 60 seconds, refusal
+of new receiving operations, and no automatic reacquisition.

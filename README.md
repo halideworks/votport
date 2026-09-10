@@ -459,7 +459,7 @@ An interrupted transfer retains completed files and recoverable partials. See
 
 ## Roadmap
 
-VOT is pinned at `5c89030cfd46cb2df4ed058829f0950cfabfb9b6`. Server, desktop core, and browser WASM use the same revision. HTTP and native push receive directly onto the destination filesystem, retain recoverable publication journals, and avoid a final payload copy. Linux SMB3 and NFSv4 require explicit storage qualification before Balanced receiving; Strict NAS receipts are unavailable. Open **Storage > Receiving storage** to check and enable the share. See [direct receiving](docs/direct-receiving.md).
+VOT is pinned at `a7c90e9bcdddaa3804408d4fc6e6d86469d11852`. Server, desktop core, and browser WASM use the same revision. HTTP and native push receive directly onto the destination filesystem, retain recoverable publication journals, and avoid a final payload copy. Linux SMB3 and NFSv4 require explicit storage qualification before Balanced receiving; Strict NAS receipts are unavailable. Open **Storage > Receiving storage** to check and enable the share. See [direct receiving](docs/direct-receiving.md).
 
 Native push remains disabled unless `VOTPORT_PUSH_BIND` is set. Browser uploads use HTTP through the reverse proxy, with bounded parallel range acceptance and the existing 8 MiB range ceiling.
 
