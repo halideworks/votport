@@ -1954,9 +1954,6 @@ details.deployment .settings-status {
  min-width: 0;
  overflow-wrap: anywhere;
 }
-.audit-actor {
- white-space: nowrap;
-}
 .audit-actor:not(:empty)::before {
  content: "by ";
 }

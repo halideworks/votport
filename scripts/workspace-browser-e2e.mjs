@@ -185,6 +185,10 @@ try {
     await page.waitForLoadState('networkidle');
     await layout(name);
   }
+  await page.route('**/api/admin/audit?*', (route) => route.fulfill({ contentType: 'application/x-ndjson', body: JSON.stringify({ at: 1, rowid: 1, event: 'automation_refused', actor: `automation:${'a'.repeat(32)}`, detail: { permission: 'deliveries:create' } }) + '\n' }));
+  await page.goto(`${base}/audit`); await page.locator('.audit-actor').waitFor();
+  await layout('audit-automation-identity');
+  await page.unroute('**/api/admin/audit?*');
 
   const session = await api('admin/session');
   await page.route('**/api/admin/session', (route) => route.fulfill({ json: { ...session, role: 'operator', tenant: 'named-tenant' } }));
