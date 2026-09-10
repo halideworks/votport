@@ -146,7 +146,8 @@ Enable **Use this project for incoming files** in a project, then select it
 under **Receive > After files arrive > Reception project**. Existing requests
 also have a **Reception workflow** editor. The selection applies to subsequent
 completed uploads. Required metadata and recipient selections belong to the
-receiving project. Incomplete uploads remain visible without starting copies.
+receiving project. Incomplete uploads remain visible without starting copies;
+their completed files remain withheld from raw sharing.
 
 A complete upload queues its reception job in the same database transaction.
 The worker snapshots verified files and applies the receiving project's checks,
@@ -360,7 +361,7 @@ did not reproduce. The VM showed substantial timing variation, so these results
 do not establish a universal speedup or a zero-regression guarantee. All payloads
 were independently compared after transfer.
 
-On September 10, 2026, reception routes were compared with `25230c1` on
+On September 10, 2026, reception candidate `01f4eda` was compared with `25230c1` on
 Erebus using isolated NVMe fixtures and release binaries. Three alternating
 runs per revision measured governed delivery preparation through CLI exit,
 and fresh uploads from CLI start through completion. Every received file was
@@ -378,9 +379,9 @@ ordinary-upload comparisons.
 | Upload / 256 MiB / QUIC | 0.816 s | 0.883 s |
 | Upload / 1,000 x 4 KiB / QUIC | 4.634 s | 4.578 s |
 
-The initial native small-file upload included a 37.796 s route-build outlier.
+The initial native small-file upload included a 37.796 s candidate outlier.
 Four additional alternating pairs had medians of 5.666 s before and 3.990 s
-after, with another 14.787 s route-build outlier. These variable samples do not
+after, with another 14.787 s candidate outlier. These variable samples do not
 establish a speed improvement or rule out a latency regression. Reception
 completion adds transactional queue work; copying, checks and network exports
 run in the worker. Peer sends reuse prepared manifests and retained checkpoints.

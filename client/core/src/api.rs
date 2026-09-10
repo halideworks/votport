@@ -1116,42 +1116,13 @@ fn json<T: for<'de> Deserialize<'de>>(
             body,
         });
     }
-    let url = response.url().to_string();
-    let bytes = bounded_body(response, 256 * 1024 * 1024).map_err(|error| {
-        if let Error::Io(error) = error {
-            if error
-                .get_ref()
-                .is_some_and(|source| source.is::<reqwest::Error>())
-            {
-                return Error::Http {
-                    url,
-                    source: *error
-                        .into_inner()
-                        .expect("checked source")
-                        .downcast::<reqwest::Error>()
-                        .expect("checked type"),
-                };
-            }
-            Error::Io(error)
-        } else {
-            error
-        }
-    })?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| Error::Other(format!("invalid {what} response: {error}")))
+    response.json().map_err(|source| Error::Http {
+        url: what.to_owned(),
+        source,
+    })
 }
 
-fn bounded_body(reader: impl std::io::Read, limit: u64) -> Result<Vec<u8>> {
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    reader.take(limit + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limit {
-        return Err(Error::Other("server response exceeds its limit".into()));
-    }
-    Ok(bytes)
-}
-
-fn error_body(response: reqwest::blocking::Response) -> String {
+fn error_body(response: impl std::io::Read) -> String {
     use std::io::Read;
     let mut bytes = Vec::new();
     let _ = response.take(8192).read_to_end(&mut bytes);
@@ -1232,10 +1203,10 @@ mod tests {
     use crate::error::Error;
 
     #[test]
-    fn response_body_limits_accept_the_boundary_and_refuse_excess() {
-        assert_eq!(super::bounded_body(&b"{}"[..], 2).unwrap(), b"{}");
-        assert!(super::bounded_body(&b"{}x"[..], 2).is_err());
-        assert!(super::bounded_body(std::io::empty(), 0).unwrap().is_empty());
+    fn error_bodies_are_bounded_and_decode_invalid_utf8() {
+        assert_eq!(super::error_body(std::io::repeat(b'x')).len(), 8192);
+        assert_eq!(super::error_body(&b"bad\xff"[..]), "bad\u{fffd}");
+        assert!(super::error_body(std::io::empty()).is_empty());
     }
 
     #[test]

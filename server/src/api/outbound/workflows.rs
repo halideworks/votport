@@ -1314,6 +1314,7 @@ mod tests {
             }
             let mut project = crate::workflow::tests::project();
             project.receive = true;
+            project.label = "é".repeat(100);
             project.require_approval = false;
             project.release = release;
             project.destinations = vec!["offline".into(), "online".into()];

@@ -180,7 +180,7 @@ fn received_requires_workflow(
     link: &str,
     upload: &str,
 ) -> Result<bool, String> {
-    connection.prepare_cached("SELECT EXISTS(SELECT 1 FROM delivery_jobs WHERE tenant=?1 AND json_extract(document,'$.received.link_id')=?2 AND json_extract(document,'$.received') IS NOT NULL AND json_extract(document,'$.received.upload_id')=?3)").and_then(|mut statement|statement.query_row(params![tenant,link,upload], |row|row.get(0))).map_err(|e|e.to_string())
+    connection.prepare_cached("SELECT EXISTS(SELECT 1 FROM receive_workflow_uploads r JOIN links l ON l.id=r.link_id WHERE l.tenant=?1 AND r.link_id=?2 AND r.upload_id=?3)").and_then(|mut statement|statement.query_row(params![tenant,link,upload], |row|row.get(0))).map_err(|e|e.to_string())
 }
 
 pub(super) fn receive_pending(
@@ -242,6 +242,16 @@ pub(super) fn queue_received(
     let Some(workflow) = workflow else {
         return Ok(());
     };
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO receive_workflow_uploads(link_id,upload_id) VALUES (?1,?2)",
+            params![link_id, upload.id],
+        )
+        .map_err(|e| e.to_string())?;
+    connection.execute("INSERT OR REPLACE INTO delivery_policy_cache(grant_id,protected) SELECT id,1 FROM outbound_grants WHERE tenant=?1 AND link_id=?2 AND upload_id=?3",params![tenant,link_id,upload.id]).map_err(|e|e.to_string())?;
+    if upload.partial {
+        return Ok(());
+    }
     let project = project_in(connection, tenant, &workflow.project_id)
         .map_err(|e| e.to_string())?
         .ok_or("receive project missing")?;
@@ -251,13 +261,8 @@ pub(super) fn queue_received(
         return Ok(());
     }
     let now = now_unix();
-    let request = workflow.request(
-        &upload.id,
-        &format!("{} · received", project.label)
-            .chars()
-            .take(200)
-            .collect::<String>(),
-    );
+    let label = format!("{} · received", project.label);
+    let request = workflow.request(&upload.id, &label[..label.floor_char_boundary(200)]);
     let mut error = project.validate_job(&request, now).err();
     if !project.receive {
         error = Some("project no longer accepts incoming workflows".into());
@@ -289,7 +294,6 @@ pub(super) fn queue_received(
         }),
     };
     connection.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,document) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",params![job.id,tenant,job.actor,job.request.operation_id,job.project.id,job.state,now as i64,serde_json::to_string(&job).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
-    connection.execute("INSERT OR REPLACE INTO delivery_policy_cache(grant_id,protected) SELECT id,1 FROM outbound_grants WHERE tenant=?1 AND link_id=?2 AND upload_id=?3",params![tenant,link_id,upload.id]).map_err(|e|e.to_string())?;
     evidence::delivery_event(connection,signer,tenant,&job.id,"reception_queued",&serde_json::json!({"project_id":job.project.id,"link_id":link_id,"upload_id":upload.id,"state":job.state,"error":job.error}),now).map_err(|e|e.to_string())
 }
 
@@ -1088,7 +1092,7 @@ pub(super) fn release_in(connection: &Connection, grant_id: &str) -> Result<Opti
     let protected = match cached {
         Some(protected) => protected,
         None => {
-            let protected: bool = connection.prepare_cached("SELECT EXISTS(SELECT 1 FROM outbound_grants g CROSS JOIN delivery_projects p CROSS JOIN outbound_grant_files f WHERE g.id=?1 AND p.tenant=g.tenant AND f.grant_id=g.id AND votport_within(json_extract(p.document,'$.directory'),f.source)) OR EXISTS(SELECT 1 FROM outbound_grants g JOIN delivery_jobs j ON j.tenant=g.tenant AND json_extract(j.document,'$.received.link_id')=g.link_id AND json_extract(j.document,'$.received.upload_id')=g.upload_id WHERE g.id=?1)").and_then(|mut statement| statement.query_row([grant_id], |row| row.get(0))).map_err(|error| error.to_string())?;
+            let protected: bool = connection.prepare_cached("SELECT EXISTS(SELECT 1 FROM outbound_grants g CROSS JOIN delivery_projects p CROSS JOIN outbound_grant_files f WHERE g.id=?1 AND p.tenant=g.tenant AND f.grant_id=g.id AND votport_within(json_extract(p.document,'$.directory'),f.source)) OR EXISTS(SELECT 1 FROM outbound_grants g JOIN receive_workflow_uploads r ON r.link_id=g.link_id AND r.upload_id=g.upload_id JOIN links l ON l.id=r.link_id AND l.tenant=g.tenant WHERE g.id=?1)").and_then(|mut statement| statement.query_row([grant_id], |row| row.get(0))).map_err(|error| error.to_string())?;
             // Project writes invalidate these immutable-file decisions in the same transaction.
             connection.execute("INSERT OR REPLACE INTO delivery_policy_cache(grant_id,protected) SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM outbound_grants WHERE id=?1)",params![grant_id,protected]).map_err(|error| error.to_string())?;
             protected
@@ -1105,6 +1109,88 @@ pub(super) fn release_in(connection: &Connection, grant_id: &str) -> Result<Opti
 mod tests {
     use super::*;
     use crate::workflow::tests::{project, request};
+
+    #[test]
+    fn partial_reception_stays_protected_without_queuing_copies() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut policy = project();
+        policy.receive = true;
+        let policy = store.save_delivery_project("", "admin", policy).unwrap();
+        let workflow = crate::workflow::ReceiveWorkflow {
+            project_id: policy.id,
+            metadata: request().metadata,
+            recipients: vec![],
+        };
+        let link = crate::store::tests::test_link("incoming");
+        store
+            .insert_link_with_workflow(link.clone(), Some(&workflow))
+            .unwrap();
+        let mut upload = UploadRecord {
+            id: "partial".into(),
+            started_at: 1,
+            completed_at: 2,
+            replayed_chunks: 0,
+            rejected_chunks: 0,
+            transport: Some("http".into()),
+            package_root: "package".into(),
+            total_bytes: 1,
+            partial: true,
+            log: vec![],
+            files: vec![FileRecord {
+                path: "file.bin".into(),
+                stored_as: "file.bin".into(),
+                bytes: 1,
+                suite: "blake3".into(),
+                root: "root".into(),
+                receipt: true,
+                deleted: false,
+            }],
+        };
+        let mut raw = crate::store::tests::test_outbound_grant("existing", "", 0);
+        raw.link_id = link.id.clone();
+        raw.upload_id = upload.id.clone();
+        store.insert_outbound_grant(raw.clone()).unwrap();
+        assert!(store.delivery_release(&raw.id).unwrap().is_none());
+        store.append_upload("", &link.id, upload.clone()).unwrap();
+        assert!(store.delivery_jobs("", "", 100).unwrap().is_empty());
+        assert!(!store.receive_workflow_pending("", &link.id).unwrap());
+        assert!(store.delivery_release(&raw.id).is_err());
+        raw.id = "refused".into();
+        raw.token_hash = "refused-token".into();
+        assert!(store
+            .insert_outbound_grant(raw.clone())
+            .unwrap_err()
+            .contains("project delivery link"));
+        let mut disabled = workflow.clone();
+        disabled.project_id.clear();
+        store.set_receive_workflow("", &link.id, &disabled).unwrap();
+        store
+            .with(|connection| connection.execute("DELETE FROM delivery_policy_cache", []))
+            .unwrap();
+        assert!(store.delivery_release("existing").is_err());
+        assert!(store
+            .insert_outbound_grant(raw.clone())
+            .unwrap_err()
+            .contains("project delivery link"));
+        upload.id = "ordinary".into();
+        store.append_upload("", &link.id, upload.clone()).unwrap();
+        raw.id = "ordinary".into();
+        raw.token_hash = "ordinary-token".into();
+        raw.upload_id = upload.id.clone();
+        store.insert_outbound_grant(raw).unwrap();
+        assert!(store.delivery_release("ordinary").unwrap().is_none());
+        store.set_receive_workflow("", &link.id, &workflow).unwrap();
+        upload.partial = false;
+        upload.id = "complete".into();
+        store.append_upload("", &link.id, upload).unwrap();
+        store.with(|connection| connection.execute_batch("DROP TABLE receive_workflow_uploads; UPDATE meta SET value='29' WHERE key='schema_version';")).unwrap();
+        drop(store);
+        let upgraded = Store::open(directory.path()).unwrap();
+        let connection = upgraded.connection.lock().unwrap();
+        assert!(received_requires_workflow(&connection, "", &link.id, "complete").unwrap());
+        assert!(!received_requires_workflow(&connection, "other", &link.id, "complete").unwrap());
+    }
 
     #[test]
     fn upgrade_preserves_only_already_frozen_export_attestations() {

@@ -466,7 +466,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 29;
+pub(crate) const SCHEMA_VERSION: u64 = 30;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -1320,6 +1320,12 @@ impl Store {
                 UPDATE delivery_jobs SET document=json_remove(json_set(document,'$.project.destinations',json(CASE WHEN json_extract(document,'$.project.export_storage') IS NULL THEN '[]' ELSE json_array(json_extract(document,'$.project.export_storage')) END)),'$.project.export_storage') WHERE json_type(document,'$.project.export_storage') IS NOT NULL;")
                 .map_err(|error| format!("schema: {error}"))?;
         }
+        if stored < 30 {
+            transaction.execute_batch("CREATE TABLE IF NOT EXISTS receive_workflow_uploads(link_id TEXT NOT NULL REFERENCES links(id) ON DELETE CASCADE, upload_id TEXT NOT NULL, PRIMARY KEY(link_id,upload_id));
+                INSERT OR IGNORE INTO receive_workflow_uploads SELECT json_extract(j.document,'$.received.link_id'),json_extract(j.document,'$.received.upload_id') FROM delivery_jobs j JOIN links l ON l.id=json_extract(j.document,'$.received.link_id') AND l.tenant=j.tenant WHERE json_extract(j.document,'$.received') IS NOT NULL;
+                DELETE FROM delivery_policy_cache;")
+                .map_err(|error| format!("schema: {error}"))?;
+        }
         transaction
             .execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
@@ -2076,9 +2082,7 @@ impl Store {
         }
         insert_upload_files(&transaction, id, tenant, upload_index, &upload)
             .map_err(|error| error.to_string())?;
-        if !upload.partial {
-            workflows::queue_received(&transaction, &self.event_signer, tenant, id, &upload)?;
-        }
+        workflows::queue_received(&transaction, &self.event_signer, tenant, id, &upload)?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(true)
     }
