@@ -39,6 +39,10 @@ pub struct Config {
     pub admin_token_tag: String,
     /// Webhook URL POSTed a JSON summary when an upload completes.
     pub notify_webhook: Option<String>,
+    pub notify_slack: Option<String>,
+    pub notify_teams: Option<String>,
+    pub notify_google_chat: Option<String>,
+    pub notify_discord: Option<String>,
     /// ntfy topic URL (e.g. "https://ntfy.sh/mytopic") for upload notices.
     pub notify_ntfy: Option<String>,
     /// Bearer token for the ntfy topic, if it needs one.
@@ -547,6 +551,10 @@ pub fn from_env() -> Result<Config, String> {
         admin_password_hash,
         admin_token_tag,
         notify_webhook: optional("VOTPORT_NOTIFY_WEBHOOK_URL"),
+        notify_slack: optional("VOTPORT_NOTIFY_SLACK_URL"),
+        notify_teams: optional("VOTPORT_NOTIFY_TEAMS_URL"),
+        notify_google_chat: optional("VOTPORT_NOTIFY_GOOGLE_CHAT_URL"),
+        notify_discord: optional("VOTPORT_NOTIFY_DISCORD_URL"),
         notify_ntfy: optional("VOTPORT_NOTIFY_NTFY_URL"),
         notify_ntfy_token: optional("VOTPORT_NOTIFY_NTFY_TOKEN"),
         notify_pushover,

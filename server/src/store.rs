@@ -366,6 +366,10 @@ pub enum SettingWrite {
 #[derive(Clone, Debug)]
 pub struct ResolvedSettings {
     pub notify_webhook: Option<String>,
+    pub notify_slack: Option<String>,
+    pub notify_teams: Option<String>,
+    pub notify_google_chat: Option<String>,
+    pub notify_discord: Option<String>,
     pub notify_ntfy: Option<String>,
     pub notify_ntfy_token: Option<String>,
     pub notify_pushover: Option<(String, String)>,
@@ -411,6 +415,10 @@ pub struct ResolvedSmtp {
 pub struct SettingsOverlay {
     pub resolved: ResolvedSettings,
     pub notify_webhook_source: &'static str,
+    pub notify_slack_source: &'static str,
+    pub notify_teams_source: &'static str,
+    pub notify_google_chat_source: &'static str,
+    pub notify_discord_source: &'static str,
     pub notify_ntfy_source: &'static str,
     pub notify_ntfy_token_source: &'static str,
     pub notify_pushover_token_set: bool,
@@ -4865,6 +4873,17 @@ fn schema_version_stored(connection: &Connection) -> Result<u64, String> {
 fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOverlay {
     let (notify_webhook, notify_webhook_source) =
         overlay_text(rows, "notify_webhook", config.notify_webhook.clone());
+    let (notify_slack, notify_slack_source) =
+        overlay_text(rows, "notify_slack", config.notify_slack.clone());
+    let (notify_teams, notify_teams_source) =
+        overlay_text(rows, "notify_teams", config.notify_teams.clone());
+    let (notify_google_chat, notify_google_chat_source) = overlay_text(
+        rows,
+        "notify_google_chat",
+        config.notify_google_chat.clone(),
+    );
+    let (notify_discord, notify_discord_source) =
+        overlay_text(rows, "notify_discord", config.notify_discord.clone());
     let (notify_ntfy, notify_ntfy_source) =
         overlay_text(rows, "notify_ntfy", config.notify_ntfy.clone());
     let (notify_ntfy_token, notify_ntfy_token_source) =
@@ -4947,6 +4966,10 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
     SettingsOverlay {
         resolved: ResolvedSettings {
             notify_webhook,
+            notify_slack,
+            notify_teams,
+            notify_google_chat,
+            notify_discord,
             notify_ntfy,
             notify_ntfy_token,
             notify_pushover,
@@ -4965,6 +4988,10 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
             draining,
         },
         notify_webhook_source,
+        notify_slack_source,
+        notify_teams_source,
+        notify_google_chat_source,
+        notify_discord_source,
         notify_ntfy_source,
         notify_ntfy_token_source,
         notify_pushover_token_set,
@@ -7975,6 +8002,10 @@ mod settings_tests {
             admin_password_hash: "x".to_owned(),
             admin_token_tag: "tag".to_owned(),
             notify_webhook: Some("https://env.example/hook".to_owned()),
+            notify_slack: None,
+            notify_teams: None,
+            notify_google_chat: None,
+            notify_discord: None,
             notify_ntfy: None,
             notify_ntfy_token: Some("env-token".to_owned()),
             notify_pushover: None,

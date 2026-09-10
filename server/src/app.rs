@@ -796,6 +796,8 @@ fn build_under_lease(
     let kept = resume_upload_sessions(&config, &store, &signer, &sessions, &session_ended);
     crate::paths::clean_staging(&config.receive_dir, &kept);
     let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .referer(false)
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|error| format!("http client: {error}"))?;
@@ -2236,24 +2238,71 @@ pub fn router(app: Arc<App>) -> Router {
     const REFERRER_POLICY: &str = "no-referrer";
 
     let serve_page = |path: std::path::PathBuf| {
-        get(move || {
+        let app = Arc::clone(&app);
+        get(move |headers: HeaderMap| {
             let path = path.clone();
+            let app = Arc::clone(&app);
             async move {
                 match tokio::fs::read_to_string(&path).await {
-                    Ok(contents) => (
-                        [
-                            (axum::http::header::CONTENT_SECURITY_POLICY, CSP),
-                            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-                            (axum::http::header::REFERRER_POLICY, REFERRER_POLICY),
-                            // Same policy as /assets: revalidate every visit so
-                            // a redeploy takes effect immediately. Without any
-                            // cache header a browser may replay a stale page,
-                            // error card and all.
-                            (axum::http::header::CACHE_CONTROL, "no-cache"),
-                        ],
-                        Html(contents),
-                    )
-                        .into_response(),
+                    Ok(mut contents) => {
+                        let admin_page = contents.contains("<nav id=\"nav\" class=\"nav\"></nav>");
+                        if admin_page {
+                            if let Some(session) = api::admin::admin_page_session(&app, &headers) {
+                                let mut nav = String::new();
+                                for (page, label) in [
+                                    ("receive", "Receive"),
+                                    ("deliver", "Deliver"),
+                                    ("workflows", "Workflows"),
+                                    ("storage", "Storage"),
+                                    ("automation", "Automation"),
+                                    ("tenants", "Tenants"),
+                                    ("audit", "Audit"),
+                                    ("system", "System"),
+                                ] {
+                                    if session["pages"].as_array().is_some_and(|pages| {
+                                        pages.iter().any(|value| value == page)
+                                    }) {
+                                        let active =
+                                            if path.file_stem().and_then(|name| name.to_str())
+                                                == Some(page)
+                                            {
+                                                " class=\"active\" aria-current=\"page\""
+                                            } else {
+                                                ""
+                                            };
+                                        nav.push_str(&format!(
+                                            "<a href=\"/{page}\"{active}>{label}</a>"
+                                        ));
+                                    }
+                                }
+                                contents = contents.replace(
+                                    "<nav id=\"nav\" class=\"nav\"></nav>",
+                                    &format!("<nav id=\"nav\" class=\"nav\">{nav}</nav>"),
+                                );
+                                let bootstrap = session.to_string().replace('<', "\\u003c");
+                                contents = contents.replace("</head>", &format!("<script id=\"admin-session\" type=\"application/json\">{bootstrap}</script></head>"));
+                            }
+                        }
+                        (
+                            [
+                                (axum::http::header::CONTENT_SECURITY_POLICY, CSP),
+                                (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                                (axum::http::header::REFERRER_POLICY, REFERRER_POLICY),
+                                // Admin pages contain the current identity; shared
+                                // caches must never retain them.
+                                (
+                                    axum::http::header::CACHE_CONTROL,
+                                    if admin_page {
+                                        "private, no-store"
+                                    } else {
+                                        "no-cache"
+                                    },
+                                ),
+                            ],
+                            Html(contents),
+                        )
+                            .into_response()
+                    }
                     Err(_) => (
                         axum::http::StatusCode::NOT_FOUND,
                         "page not found; is VOTPORT_WEB_ROOT set correctly?",

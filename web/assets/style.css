@@ -2154,3 +2154,5 @@ body:has(#nav) .permission-grid { display: grid; grid-template-columns: repeat(2
  body:has(#nav) .nav { flex-basis: 100%; }
  .page-heading > button { width: 100%; }
 }
+
+.link-item > .head + p.muted { margin-top: 0.85rem; }

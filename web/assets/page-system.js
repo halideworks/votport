@@ -117,6 +117,52 @@ function gibValue(bytes) {
   return String(bytes / 1024 ** 3);
 }
 
+const chatForms = [...document.querySelectorAll('[data-chat-channel]')];
+function fillChatSettings(data, forms = chatForms) {
+  for (const form of forms) {
+    const key = `notify_${form.dataset.chatChannel}`, prefix = form.id.replace(/-form$/, '');
+    form.dataset.configured = String(data[`${key}_set`] === true);
+    $(`${prefix}-status`).textContent = data[`${key}_set`] ? 'Connected' : 'Not connected';
+    $(`${prefix}-url`).placeholder = data[`${key}_set`] ? 'Saved URL unchanged' : 'Paste webhook URL';
+    $(`${prefix}-source`).textContent = data[`${key}_set`] ? `Using ${sourceLabel(data[`${key}_source`])} settings. Enter a URL to replace this connection.` : 'No notifications are sent to this service.';
+    form.querySelector('[data-chat-action=disconnect]').hidden = !data[`${key}_set`];
+    form.querySelector('[data-chat-action=reset]').hidden = data[`${key}_source`] !== 'db';
+    syncChatActions(form);
+  }
+}
+function syncChatActions(form) {
+  const draft = form.querySelector('input').value.trim();
+  form.querySelector('[data-chat-action=save]').disabled = !draft;
+  form.querySelector('[data-chat-action=test]').disabled = !!draft || form.dataset.configured !== 'true';
+}
+for (const form of chatForms) {
+  form.inert = true;
+  const input = form.querySelector('input'), key = `notify_${form.dataset.chatChannel}`;
+  input.addEventListener('input', () => { syncChatActions(form); formNote(form, input.value.trim() ? 'Save this URL before sending a test.' : ''); });
+  async function change(value) {
+    if (form.inert) return;
+    form.inert = true; formNote(form, 'Saving…');
+    try {
+      const settings = await putSettings({ [key]: value });
+      input.value = ''; fillChatSettings(settings, [form]);
+      formNote(form, value === null ? 'Using environment settings.' : value ? 'Connection saved. Send a test to check it.' : 'Disconnected.');
+    } catch (error) { formError(form, error); }
+    finally { form.inert = false; syncChatActions(form); }
+  }
+  form.addEventListener('submit', (event) => { event.preventDefault(); if (input.value.trim()) change(input.value.trim()); });
+  form.querySelector('[data-chat-action=disconnect]').onclick = () => change('');
+  form.querySelector('[data-chat-action=reset]').onclick = () => change(null);
+  form.querySelector('[data-chat-action=test]').onclick = async () => {
+    if (form.inert) return;
+    form.inert = true; formNote(form, 'Sending a test…');
+    try {
+      await api(`/api/admin/notifications/test?channel=${form.dataset.chatChannel}`, { method: 'POST' });
+      formNote(form, `Test accepted by ${form.dataset.chatName}. Check the channel for the message.`);
+    } catch (error) { formError(form, error); }
+    finally { form.inert = false; }
+  };
+}
+
 function setNotifyActions(enabled) {
   $('notify-save').disabled = !enabled;
   $('notify-test').disabled = !enabled;
@@ -746,7 +792,10 @@ if (!session.pages.includes('system')) {
   window.location.replace('/receive');
 }
 try {
-  fillSettings(await settingsReady);
+  const settings = await settingsReady;
+  fillSettings(settings);
+  fillChatSettings(settings);
+  for (const form of chatForms) form.inert = false;
   setNotifyActions(true);
   setSmtpActions(true);
 } catch (error) {
