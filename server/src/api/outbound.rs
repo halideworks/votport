@@ -2175,6 +2175,49 @@ async fn create_library_grant(
         .into_response())
 }
 
+fn valid_preparation_length(length: u64, expected: Option<u64>, max: u64) -> bool {
+    max <= vot_sdk::object::MAX_OBJECT_LENGTH
+        && length <= max
+        && expected.is_none_or(|expected| expected == length)
+}
+
+fn prepare_library_file(
+    path: &Path,
+    suite: Suite,
+    expected_length: Option<u64>,
+    max: u64,
+) -> io::Result<vot_sdk::object::InMemoryPreparedObject> {
+    use std::io::Read as _;
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "source");
+    let mut input = std::fs::File::open(path)?;
+    let length = input.metadata()?.len();
+    if !valid_preparation_length(length, expected_length, max) {
+        return Err(invalid());
+    }
+    if length > vot_sdk::object::PROOF_LEAF_SIZE {
+        let leaves =
+            vot_cli::file_proof_leaves(&mut input, suite, length).map_err(|error| match error {
+                vot_cli::Error::Io(error) => error,
+                _ => invalid(),
+            })?;
+        return vot_sdk::object::InMemoryPreparedObject::from_proof_leaves(
+            suite, length, leaves, max,
+        )
+        .map_err(|_| invalid());
+    }
+    let mut builder =
+        InMemoryObjectBuilder::new(suite, Some(length), max).map_err(|_| invalid())?;
+    let mut buffer = vec![0; CHUNK];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        builder.update(&buffer[..count]).map_err(|_| invalid())?;
+    }
+    builder.finish().map_err(|_| invalid())
+}
+
 fn hash_library_file(
     root: &Path,
     name: &str,
@@ -2182,29 +2225,8 @@ fn hash_library_file(
     proof_root: &Path,
     max: u64,
 ) -> io::Result<OutboundGrantFile> {
-    use std::io::Read as _;
-    let mut input = std::fs::File::open(path)?;
-    let mut builder = InMemoryObjectBuilder::new(
-        Suite::try_from(1).map_err(|_| io::Error::other("suite"))?,
-        None,
-        max,
-    )
-    .map_err(|_| io::Error::other("builder"))?;
-    let mut buf = vec![0u8; CHUNK];
-    let mut bytes = 0u64;
-    loop {
-        let count = input.read(&mut buf)?;
-        if count == 0 {
-            break;
-        }
-        bytes = bytes
-            .checked_add(count as u64)
-            .ok_or_else(|| io::Error::other("size"))?;
-        builder
-            .update(&buf[..count])
-            .map_err(|_| io::Error::other("object"))?;
-    }
-    let prepared = builder.finish().map_err(|_| io::Error::other("object"))?;
+    let prepared = prepare_library_file(path, Suite::Blake3Bao64, None, max)?;
+    let bytes = prepared.object_id().length;
     let object = prepared.object_id().clone();
     if bytes >= BATCH_STAGE_BYTES {
         ensure_catalog_from_prepared(proof_root, &prepared)?;
@@ -2353,24 +2375,8 @@ fn ensure_catalog(root: &Path, source: &Path, expected: &ObjectId) -> io::Result
 }
 
 fn build_catalog(root: &Path, source: &Path, expected: &ObjectId) -> io::Result<PathBuf> {
-    use std::io::Read as _;
-    let mut input = std::fs::File::open(source)?;
     let suite = Suite::try_from(expected.suite).map_err(|_| io::Error::other("suite"))?;
-    let mut builder = InMemoryObjectBuilder::new(suite, Some(expected.length), expected.length)
-        .map_err(|_| io::Error::other("builder"))?;
-    let mut buf = vec![0; CHUNK];
-    loop {
-        let count = input.read(&mut buf)?;
-        if count == 0 {
-            break;
-        }
-        builder
-            .update(&buf[..count])
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "source"))?;
-    }
-    let prepared = builder
-        .finish()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "source"))?;
+    let prepared = prepare_library_file(source, suite, Some(expected.length), expected.length)?;
     if prepared.object_id() != expected {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "source"));
     }
@@ -4693,6 +4699,52 @@ mod tests {
         .unwrap();
         builder.update(bytes).unwrap();
         builder.finish().unwrap().object_id().clone()
+    }
+
+    #[test]
+    fn library_preparation_preserves_identity_and_enforces_source_bounds() {
+        let limit = vot_sdk::object::MAX_OBJECT_LENGTH;
+        for (length, expected, max, valid) in [
+            (0, None, 0, true),
+            (1, None, 0, false),
+            (1, None, 1, true),
+            (1, Some(0), 1, false),
+            (1, Some(2), 2, false),
+            (1, Some(1), 1, true),
+            (limit, Some(limit), limit, true),
+            (0, None, limit + 1, false),
+        ] {
+            assert_eq!(valid_preparation_length(length, expected, max), valid);
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.bin");
+        for length in [0, 31, vot_sdk::object::PROOF_LEAF_SIZE as usize + 17] {
+            let bytes = vec![7; length];
+            std::fs::write(&path, &bytes).unwrap();
+            let prepared =
+                prepare_library_file(&path, Suite::Blake3Bao64, None, length as u64).unwrap();
+            assert_eq!(prepared.object_id(), &object_id(&bytes));
+            assert!(prepare_library_file(
+                &path,
+                Suite::Blake3Bao64,
+                None,
+                vot_sdk::object::MAX_OBJECT_LENGTH + 1
+            )
+            .is_err());
+            assert!(prepare_library_file(
+                &path,
+                Suite::Blake3Bao64,
+                Some(length as u64 + 1),
+                length as u64 + 1
+            )
+            .is_err());
+            if length != 0 {
+                assert!(
+                    prepare_library_file(&path, Suite::Blake3Bao64, None, length as u64 - 1)
+                        .is_err()
+                );
+            }
+        }
     }
 
     #[test]

@@ -13,10 +13,10 @@ publish = false
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-vot-cli = { git = "https://github.com/halideworks/VOT", rev = "a7c90e9bcdddaa3804408d4fc6e6d86469d11852", default-features = false, features = ["wire"] }
-vot-object = { git = "https://github.com/halideworks/VOT", rev = "a7c90e9bcdddaa3804408d4fc6e6d86469d11852" }
-vot-manifest = { git = "https://github.com/halideworks/VOT", rev = "a7c90e9bcdddaa3804408d4fc6e6d86469d11852" }
-vot-platform-fs = { git = "https://github.com/halideworks/VOT", rev = "a7c90e9bcdddaa3804408d4fc6e6d86469d11852" }
+vot-cli = { git = "https://github.com/halideworks/VOT", rev = "1010254b553b6e2b5b0a660b08fc6380897d8da5", default-features = false, features = ["wire"] }
+vot-object = { git = "https://github.com/halideworks/VOT", rev = "1010254b553b6e2b5b0a660b08fc6380897d8da5" }
+vot-manifest = { git = "https://github.com/halideworks/VOT", rev = "1010254b553b6e2b5b0a660b08fc6380897d8da5" }
+vot-platform-fs = { git = "https://github.com/halideworks/VOT", rev = "1010254b553b6e2b5b0a660b08fc6380897d8da5" }
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

@@ -108,6 +108,19 @@ still works; storage administrators can manage deletion there. Reception jobs
 release their source-file pins when archived, including tenants that never use
 an outbound library.
 
+## Large-file preparation
+
+Desktop and CLI uploads overlap sequential source reads with up to eight hash
+workers for files of at least 64 MiB. Server preparation of library deliveries
+and missing proof catalogs uses the same pipeline. It reads each source once,
+retains bounded input buffers and proof hashes, and creates no payload copy.
+Small upload entries keep their existing inline preparation path.
+
+This reduces the preparation phase before a transfer starts. Every byte is
+still hashed, and the receiver performs the same verification and publication
+work. Storage read speed remains a limit. See
+[VOT ADR-0055](https://github.com/halideworks/VOT/blob/main/adr/0055-file-preparation-pipeline.md).
+
 ## SMB small-file performance
 
 Use the Linux CIFS `tcpnodelay` mount option when metadata latency affects EXR

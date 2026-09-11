@@ -22,7 +22,7 @@ RUN cargo install cargo-auditable --version 0.7.5 --locked
 
 # Browser-side VOT: hashing, proofs, and package building in WebAssembly.
 ARG VOT_GIT=https://github.com/halideworks/VOT
-ARG VOT_REV=a7c90e9bcdddaa3804408d4fc6e6d86469d11852
+ARG VOT_REV=1010254b553b6e2b5b0a660b08fc6380897d8da5
 RUN git clone --filter=blob:none "$VOT_GIT" /vot \
     && git -C /vot checkout "$VOT_REV"
 RUN cd /vot \
