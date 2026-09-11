@@ -36,7 +36,7 @@ fn a_drop_sends_over_http_and_lands_in_the_receive_directory() {
     std::fs::create_dir(source.path().join("clips")).unwrap();
     std::fs::write(source.path().join("clips").join("a.mov"), &clip).unwrap();
 
-    let files: Vec<(&str, PathBuf, Vec<u8>)> = vec![
+    let mut files: Vec<(&str, PathBuf, Vec<u8>)> = vec![
         ("big.bin", source.path().join("big.bin"), big.clone()),
         ("note.txt", source.path().join("note.txt"), note.clone()),
         ("twin.txt", source.path().join("twin.txt"), note.clone()),
@@ -47,6 +47,15 @@ fn a_drop_sends_over_http_and_lands_in_the_receive_directory() {
             clip.clone(),
         ),
     ];
+    let sequence = (0..16)
+        .map(|index| format!("sequence-{index:02}.exr"))
+        .collect::<Vec<_>>();
+    for (index, name) in sequence.iter().enumerate() {
+        let bytes = vec![index as u8; 1024 + index];
+        let path = source.path().join(name);
+        std::fs::write(&path, &bytes).unwrap();
+        files.push((name.as_str(), path, bytes));
+    }
     let drop = Drop {
         token,
         password: None,

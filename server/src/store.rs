@@ -1424,7 +1424,10 @@ impl Store {
     }
 
     /// Runs `f` with the connection, mapping SQL errors into strings.
-    fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T, String> {
+    pub(crate) fn with<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> Result<T, String> {
         let connection = self.connection.lock().expect("store poisoned");
         f(&connection).map_err(|error| error.to_string())
     }

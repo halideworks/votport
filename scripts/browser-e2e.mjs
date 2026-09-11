@@ -356,6 +356,42 @@ for (const focus of ["cancel", "pick", "external-focus"]) {
 }
 console.log("completion moves hidden focus and preserves external focus: ok");
 
+await page.goto(linkUrl);
+await page.waitForSelector("#uploader:not([hidden])");
+const sequenceFiles = Array.from({ length: 17 }, (_, index) => ({
+  name: `sequence-${String(index).padStart(2, "0")}.bin`,
+  mimeType: "application/octet-stream",
+  buffer: Buffer.alloc(1024 + index, index),
+}));
+let smallActive = 0;
+let smallPeak = 0;
+const observeSmallChunks = async (route) => {
+  smallActive += 1;
+  smallPeak = Math.max(smallPeak, smallActive);
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const response = await route.fetch();
+    await route.fulfill({ response });
+  } finally {
+    smallActive -= 1;
+  }
+};
+await page.route("**/api/session/*/chunk?*", observeSmallChunks);
+await page.setInputFiles("#file-input", sequenceFiles);
+await page.click("#send");
+await page.waitForSelector("#done-card:not([hidden])", { timeout: 30000 });
+await page.unroute("**/api/session/*/chunk?*", observeSmallChunks);
+if (smallPeak <= 1 || smallPeak > 8 || smallActive !== 0) {
+  throw new Error(`small-file upload window: peak=${smallPeak}, active=${smallActive}`);
+}
+for (const file of sequenceFiles) {
+  const received = path.join(receiveDir, dest, file.name);
+  if (!fs.readFileSync(received).equals(file.buffer) || !fs.existsSync(`${received}.vot-receipt`)) {
+    throw new Error(`small-file delivery or receipt mismatch: ${file.name}`);
+  }
+}
+console.log("small files overlap within eight requests and finish with matching bytes and receipts: ok");
+
 // Public receipt check against the same deployment: key GET is public, and
 // the sidecar on disk must verify with a root matching the done-list card.
 const sidecarName = "Résumé Draft.pdf.vot-receipt";

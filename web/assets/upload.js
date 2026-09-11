@@ -3,7 +3,7 @@
 
 import { applyBranding } from '/assets/branding.js';
 import { appendObjectCard, copyToClipboard, formatBytes } from '/assets/object-card.js';
-import { entryFiles } from '/assets/upload-entries.js';
+import { entryFiles, runUploadBatch } from '/assets/upload-entries.js';
 import { segments } from '/assets/hash-plan.js';
 import init, {
   ObjectId,
@@ -940,7 +940,7 @@ async function runUpload() {
         }
 
         rangePostSeen ||= entries.some((entry) => !entry.complete);
-        for (const entry of entries) {
+        const sendEntry = async (entry) => {
           const item = items[entry.index];
           // covered_bytes is the server's contiguous verified prefix, so it is
           // safe to restart from even when chunks landed out of order.
@@ -957,7 +957,7 @@ async function runUpload() {
           if (entry.complete) {
             setMeter(totalBytes ? sent / totalBytes : 1);
             markDelivered(item);
-            continue;
+            return;
           }
           let fileSent = already;
           // A delivered entry released its tree; if a later begin reports it
@@ -987,6 +987,14 @@ async function runUpload() {
           // Every range was verified on arrival and the last one published
           // the file, so it is delivered even if the drop stops here.
           markDelivered(item);
+        };
+        for (let offset = 0; offset < entries.length; offset += UPLOADS_IN_FLIGHT) {
+          const batch = entries.slice(offset, offset + UPLOADS_IN_FLIGHT);
+          if (batch.every((entry) => items[entry.index].file.size <= chunkBytes)) {
+            await runUploadBatch(batch, sendEntry);
+          } else {
+            for (const entry of batch) await sendEntry(entry);
+          }
         }
         let report;
         try {

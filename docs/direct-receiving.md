@@ -129,10 +129,13 @@ Use disposable storage and an explicitly selected local scratch directory. On a
 workstation, put source files, build targets, caches and `TMPDIR` on the test
 volume. Do not use its OS drive. Source and received payload capacity must be on
 separate fixture volumes when checking the single-copy receive requirement.
+Keep at least 25% of each disposable VM's filesystem free after the next
+allocation. Run one large receive at a time, verify its hashes and storage-server
+allocation, then remove that run's output before starting another.
 
 ```sh
 mkdir -p /test/control
-python3 scripts/nas-fixtures.py /test/source-exr --case exr --frames 100000
+python3 scripts/nas-fixtures.py /test/source-exr --case exr --frames 1000
 python3 scripts/nas-fixtures.py /test/source-large --case large --gib 32
 TMPDIR=/test/control cargo +1.97.1 test --release --manifest-path server/Cargo.toml --test e2e --no-run
 VOTPORT_NAS_TEST_MOUNT=/mnt/nfs VOTPORT_NAS_TEST_SOURCE=/test/source-exr VOTPORT_NAS_TEST_TRANSPORT=push TMPDIR=/test/control cargo +1.97.1 test --release --manifest-path server/Cargo.toml --test e2e mounted_nas_media_campaign -- --ignored --nocapture
