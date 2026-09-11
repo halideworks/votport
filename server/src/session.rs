@@ -41,7 +41,7 @@ pub const CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_CHUNK_BODY_BYTES: usize = 9 * 1024 * 1024;
 const MAX_NAME_ATTEMPTS: u32 = 100;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SessionError {
     pub status: u16,
     pub message: String,
@@ -561,6 +561,7 @@ struct FileState {
     native: Option<StagedFile>,
     published: bool,
     receipt: bool,
+    checkpointed: Mutex<Option<(u64, bool, bool)>>,
     /// When this file's first range was accepted, for the publish timing.
     first_range_at: Option<u64>,
     /// Re-attached after a restart: the staged bytes are re-hashed against
@@ -1122,25 +1123,46 @@ fn persisted_session<'a>(
 
 /// Admission metadata must survive before any final filename is published.
 fn persist_session(setup: &WorkerSetup, files: &[FileState]) -> Result<(), SessionError> {
+    let record = persisted_session(setup, files);
     setup
         .store
-        .insert_upload_session(&persisted_session(setup, files))
-        .map_err(|error| SessionError::internal(format!("persist upload admission: {error}")))
+        .insert_upload_session(&record)
+        .map_err(|error| SessionError::internal(format!("persist upload admission: {error}")))?;
+    for (file, saved) in files.iter().zip(&record.files) {
+        *file.checkpointed.lock().expect("checkpoint poisoned") =
+            Some((saved.prefix_bytes, saved.published, saved.receipt));
+    }
+    Ok(())
 }
 
-/// Updates each in-progress file's covered prefix at a checkpoint.
+fn checkpoint_files<'a>(
+    setup: &WorkerSetup,
+    files: impl IntoIterator<Item = (usize, &'a FileState)>,
+) -> Result<(), String> {
+    let progress = files
+        .into_iter()
+        .filter_map(|(index, file)| {
+            let row = file_progress(index, file);
+            (*file.checkpointed.lock().expect("checkpoint poisoned") != Some((row.1, row.2, row.3)))
+                .then_some((row, &file.checkpointed))
+        })
+        .collect::<Vec<_>>();
+    if progress.is_empty() {
+        return Ok(());
+    }
+    setup.store.update_upload_file_progress(
+        &hex::encode(setup.session_id),
+        progress.iter().map(|(row, _)| *row),
+    )?;
+    // Record the committed snapshot, since native writes may have advanced meanwhile.
+    for ((_, prefix, published, receipt), checkpointed) in progress {
+        *checkpointed.lock().expect("checkpoint poisoned") = Some((prefix, published, receipt));
+    }
+    Ok(())
+}
+
 fn checkpoint_session(setup: &WorkerSetup, files: &mut [FileState]) -> bool {
-    let progress = files.iter().enumerate().map(|(entry, file)| {
-        let prefix = file
-            .native
-            .as_ref()
-            .map_or(file.object.length, |native| native.progress().prefix_bytes);
-        (entry, prefix, file.published, file.receipt)
-    });
-    if let Err(error) = setup
-        .store
-        .update_upload_file_progress(&hex::encode(setup.session_id), progress)
-    {
+    if let Err(error) = checkpoint_files(setup, files.iter().enumerate()) {
         tracing::warn!(%error, "checkpoint upload session failed");
         return false;
     }
@@ -1310,6 +1332,7 @@ fn restore_files(
             native,
             published: file.published,
             receipt: file.receipt,
+            checkpointed: Mutex::new(None),
             first_range_at: None,
             rehash: !file.published && file.prefix_bytes > 0,
         });
@@ -1460,6 +1483,7 @@ fn prepare_files(
                 native: None,
                 published: true,
                 receipt: existing.receipt,
+                checkpointed: Mutex::new(None),
                 first_range_at: None,
                 rehash: false,
             });
@@ -1554,6 +1578,7 @@ fn open_destination_for(
                     )),
                     published: false,
                     receipt: false,
+                    checkpointed: Mutex::new(None),
                     first_range_at: None,
                     rehash: false,
                 });
@@ -1683,31 +1708,26 @@ fn accept_batch(
             })
             .collect();
     };
-    let opening: Vec<_> = batch
-        .iter()
-        .map(|item| {
-            files
-                .get_mut(item.entry)
-                .ok_or_else(|| SessionError::bad(format!("no entry {}", item.entry)))
-                .and_then(|file| {
-                    if file.published {
-                        return Ok(());
-                    }
-                    file.native
-                        .as_mut()
-                        .ok_or_else(|| SessionError::internal("file state lost"))?
-                        .reopen()
-                })
-        })
-        .collect();
+    let opening = map_batch_files(files, batch.iter().map(|item| item.entry), |file| {
+        if file.published {
+            return Ok(());
+        }
+        file.native
+            .as_mut()
+            .ok_or_else(|| SessionError::internal("file state lost"))?
+            .reopen()
+    });
     // Verify and accept every range against the shared files. Disjoint
     // ranges of one file, and ranges of different files, all proceed at once.
     let cores: Vec<Result<AcceptCore, SessionError>> = std::thread::scope(|scope| {
         let handles: Vec<_> = batch
             .iter()
-            .zip(opening)
-            .map(|(item, opened)| {
+            .map(|item| {
                 let files = &*files;
+                let opened = opening
+                    .get(&item.entry)
+                    .cloned()
+                    .unwrap_or_else(|| Err(SessionError::bad(format!("no entry {}", item.entry))));
                 scope.spawn(move || {
                     opened?;
                     accept_range(files, item.entry, item.offset, &item.proof, &item.data)
@@ -1719,14 +1739,26 @@ fn accept_batch(
             .map(|handle| handle.join().expect("accept thread panicked"))
             .collect()
     });
-    // Publish each completed file once, in order, with exclusive access.
+    let publication = map_batch_files(
+        files,
+        batch.iter().zip(&cores).filter_map(|(item, core)| {
+            matches!(core, Ok(core) if core.complete).then_some(item.entry)
+        }),
+        |file| {
+            if file.published {
+                Ok(())
+            } else {
+                publish_file(setup, file, || true)
+            }
+        },
+    );
     let outcomes = batch
         .iter()
         .zip(cores)
         .map(|(item, core)| {
             let core = core?;
-            if core.complete && !files[item.entry].published {
-                publish_file(setup, &mut files[item.entry], || true)?;
+            if core.complete {
+                publication[&item.entry].clone()?;
             }
             Ok(ChunkProgress {
                 accepted: core.accepted,
@@ -1748,6 +1780,39 @@ fn accept_batch(
         }
     }
     outcomes
+}
+
+fn map_batch_files<T: Send>(
+    files: &mut [FileState],
+    entries: impl Iterator<Item = usize>,
+    action: impl Fn(&mut FileState) -> T + Sync,
+) -> HashMap<usize, T> {
+    let mut entries = entries
+        .filter(|entry| *entry < files.len())
+        .collect::<Vec<_>>();
+    entries.sort_unstable();
+    entries.dedup();
+    if entries.len() == 1 {
+        let entry = entries[0];
+        return HashMap::from([(entry, action(&mut files[entry]))]);
+    }
+    std::thread::scope(|scope| {
+        let mut remaining = files;
+        let mut offset = 0;
+        let mut workers = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let (_, tail) = remaining.split_at_mut(entry - offset);
+            let (file, tail) = tail.split_first_mut().expect("validated batch entry");
+            remaining = tail;
+            offset = entry + 1;
+            let action = &action;
+            workers.push((entry, scope.spawn(move || action(file))));
+        }
+        workers
+            .into_iter()
+            .map(|(entry, worker)| (entry, worker.join().expect("batch file worker panicked")))
+            .collect()
+    })
 }
 
 fn prepare_publication(
@@ -2336,8 +2401,11 @@ impl PushReceive {
             .store
             .insert_upload_session(&record)
             .map_err(SessionError::internal)?;
-        for entry in &mut inner.entries {
-            if let Some(staged) = entry.file.as_mut().and_then(|file| file.native.as_mut()) {
+        for (entry, saved) in inner.entries.iter_mut().zip(&record.files) {
+            let file = entry.file.as_mut().expect("admitted push file");
+            *file.checkpointed.lock().expect("checkpoint poisoned") =
+                Some((saved.prefix_bytes, saved.published, saved.receipt));
+            if let Some(staged) = file.native.as_mut() {
                 staged.preserve = true;
             }
         }
@@ -2419,22 +2487,27 @@ impl PushReceive {
     }
 
     fn checkpoint(&self, inner: &mut PushReceiveInner) -> Result<(), String> {
-        let mut progress = Vec::new();
-        for (index, entry) in inner.entries.iter().enumerate() {
-            if let Some(file) = &entry.file {
-                progress.push(push_progress(index, file));
-            }
+        {
+            let active = inner
+                .objects
+                .values()
+                .filter_map(|object| object.active.as_ref())
+                .map(|files| files.read().expect("push object poisoned"))
+                .collect::<Vec<_>>();
+            checkpoint_files(
+                &self.setup,
+                inner
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, entry)| entry.file.as_ref().map(|file| (index, file)))
+                    .chain(
+                        active
+                            .iter()
+                            .flat_map(|files| files.iter().map(|(index, file)| (*index, file))),
+                    ),
+            )?;
         }
-        for object in inner.objects.values() {
-            if let Some(active) = &object.active {
-                for (index, file) in active.read().expect("push object poisoned").iter() {
-                    progress.push(push_progress(*index, file));
-                }
-            }
-        }
-        self.setup
-            .store
-            .update_upload_file_progress(&hex::encode(self.setup.session_id), progress)?;
         for entry in &mut inner.entries {
             if let Some(file) = entry.file.as_mut() {
                 forget_publications(std::slice::from_mut(file));
@@ -2542,7 +2615,7 @@ impl PushReceive {
     }
 }
 
-fn push_progress(index: usize, file: &FileState) -> (usize, u64, bool, bool) {
+fn file_progress(index: usize, file: &FileState) -> (usize, u64, bool, bool) {
     (
         index,
         file.native
@@ -2787,7 +2860,7 @@ impl vot_cli::ReceiveSink for PushFileSink {
         }
         files
             .iter()
-            .map(|(_, file)| push_progress(0, file).1)
+            .map(|(_, file)| file_progress(0, file).1)
             .min()
             .ok_or_else(|| std::io::Error::other("push object is no longer active").into())
     }
@@ -4699,6 +4772,296 @@ mod push_tests {
     }
 
     #[test]
+    fn batch_file_operations_select_each_entry_once_and_overlap() {
+        let directory = tempfile::tempdir().unwrap();
+        let object = object(Suite::Blake3Bao64, b"batch");
+        let setup = setup(directory.path(), object.clone());
+        let mut files = (0..4)
+            .map(|entry| {
+                open_destination_for(&setup, vec![entry.to_string()], object.clone()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let arrived = AtomicUsize::new(0);
+        let parent = std::thread::current().id();
+        let results = map_batch_files(&mut files, [3, 0, 3, usize::MAX, 1].into_iter(), |file| {
+            assert_ne!(std::thread::current().id(), parent);
+            arrived.fetch_add(1, Ordering::SeqCst);
+            for _ in 0..1000 {
+                if arrived.load(Ordering::SeqCst) == 3 {
+                    return file.display_path.clone();
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            panic!("independent batch entries did not overlap");
+        });
+        assert_eq!(arrived.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            results,
+            HashMap::from([(0, "0".into()), (1, "1".into()), (3, "3".into())])
+        );
+        let single = map_batch_files(&mut files, [2, 2].into_iter(), |file| {
+            assert_eq!(std::thread::current().id(), parent);
+            file.display_path.clone()
+        });
+        assert_eq!(single, HashMap::from([(2, "2".into())]));
+        assert!(
+            map_batch_files(&mut files, [usize::MAX].into_iter(), |_| panic!(
+                "invalid entry selected"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn batch_publication_keeps_entry_results_and_failed_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = vec![0x73; 65_536];
+        let object = object(Suite::Blake3Bao64, &bytes);
+        let setup = setup(directory.path(), object.clone());
+        let mut phase = Phase::Receiving {
+            files: (0..3)
+                .map(|entry| {
+                    open_destination_for(&setup, vec![format!("file-{entry}")], object.clone())
+                        .unwrap()
+                })
+                .collect(),
+        };
+        let chunk = |entry, valid| {
+            let proof = vot_proof_blake3::prove(&bytes, 0, bytes.len() as u64).unwrap();
+            BatchChunk {
+                entry,
+                offset: proof.covered_offset,
+                proof: proof.proof.into(),
+                data: if valid {
+                    proof.data.into()
+                } else {
+                    vec![0; bytes.len()].into()
+                },
+                reply: oneshot::channel().0,
+                _lease: SessionLease {
+                    activity: Arc::new(SessionActivity {
+                        in_flight: AtomicUsize::new(1),
+                        last_active: Mutex::new(Instant::now()),
+                        received: AtomicU64::new(0),
+                    }),
+                },
+            }
+        };
+        if let Phase::Receiving { files } = &mut phase {
+            files[0].native.as_mut().unwrap().reopen().unwrap();
+        }
+        fs::write(setup.dest_dir.join("file-0"), b"existing destination").unwrap();
+        let result = accept_batch(
+            &setup,
+            &mut phase,
+            &[
+                chunk(2, true),
+                chunk(0, true),
+                chunk(2, true),
+                chunk(usize::MAX, true),
+                chunk(1, false),
+            ],
+        );
+        let duplicates = [result[0].as_ref().unwrap(), result[2].as_ref().unwrap()];
+        assert!(duplicates.iter().all(|result| result.complete));
+        assert_eq!(
+            duplicates.iter().filter(|result| result.accepted).count(),
+            1
+        );
+        assert_eq!(duplicates.iter().filter(|result| result.replay).count(), 1);
+        assert!(
+            result[1].as_ref().unwrap_err().message.contains("publish"),
+            "{:?}",
+            result[1]
+        );
+        assert_eq!(result[3].as_ref().unwrap_err().status, 422);
+        assert_eq!(result[4].as_ref().unwrap_err().status, 422);
+        assert_eq!(
+            fs::read(setup.dest_dir.join("file-0")).unwrap(),
+            b"existing destination"
+        );
+        assert!(!setup.dest_dir.join("file-1").exists());
+        assert_eq!(fs::read(setup.dest_dir.join("file-2")).unwrap(), bytes);
+        let retried = accept_batch(&setup, &mut phase, &[chunk(1, true), chunk(2, true)]);
+        assert!(retried
+            .iter()
+            .all(|result| result.as_ref().is_ok_and(|result| result.complete)));
+        assert!(retried[1].as_ref().unwrap().replay);
+        let Phase::Receiving { files } = phase else {
+            unreachable!()
+        };
+        assert!(!files[0].published);
+        let failed = files[0].native.as_ref().unwrap();
+        assert!(failed.journal.is_file());
+        assert_eq!(fs::read(&failed.staging).unwrap(), bytes);
+        for file in files.into_iter().skip(1) {
+            assert!(file.published && file.receipt);
+            assert_eq!(
+                fs::read(setup.dest_dir.join(&file.display_path)).unwrap(),
+                bytes
+            );
+            assert!(file.native.as_ref().unwrap().active.is_none());
+        }
+    }
+
+    #[test]
+    fn checkpoints_skip_unchanged_rows_and_retry_every_failed_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"checkpoint";
+        let object = object(Suite::Blake3Bao64, bytes);
+        let setup = setup(directory.path(), object.clone());
+        let source = directory.path().join("source");
+        fs::write(&source, bytes).unwrap();
+        let mut files = (0..2)
+            .map(|entry| {
+                open_destination_for(&setup, vec![format!("frame-{entry}")], object.clone())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        persist_session(&setup, &files).unwrap();
+        let connection =
+            rusqlite::Connection::open(directory.path().join("data/votport.db")).unwrap();
+        connection.execute_batch("CREATE TABLE checkpoint_writes(entry INTEGER);
+            CREATE TRIGGER reject_unchanged_checkpoint BEFORE UPDATE ON upload_session_files
+            WHEN NEW.prefix_bytes = OLD.prefix_bytes AND NEW.published = OLD.published AND NEW.receipt = OLD.receipt
+            BEGIN SELECT RAISE(FAIL, 'unchanged checkpoint row'); END;
+            CREATE TRIGGER count_checkpoint AFTER UPDATE ON upload_session_files
+            BEGIN INSERT INTO checkpoint_writes VALUES (NEW.entry); END;").unwrap();
+        let writes = || {
+            connection
+                .query_row("SELECT COUNT(*) FROM checkpoint_writes", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert!(checkpoint_session(&setup, &mut files));
+        assert_eq!(writes(), 0);
+        reprove_staging(&source, &object, vec![&mut files[0]], || true).unwrap();
+        assert!(checkpoint_session(&setup, &mut files));
+        assert_eq!(writes(), 1);
+        assert!(checkpoint_session(&setup, &mut files));
+        assert_eq!(writes(), 1);
+
+        *files[0]
+            .native
+            .as_mut()
+            .unwrap()
+            .coverage
+            .get_mut()
+            .unwrap() = ObjectCoverage::new(&object);
+        assert!(checkpoint_session(&setup, &mut files));
+        assert_eq!(writes(), 2);
+        reprove_staging(&source, &object, files.iter_mut().collect(), || true).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_second_checkpoint BEFORE UPDATE ON upload_session_files
+            WHEN NEW.entry = 1 BEGIN SELECT RAISE(FAIL, 'checkpoint failure'); END;",
+            )
+            .unwrap();
+        assert!(!checkpoint_session(&setup, &mut files));
+        assert_eq!(writes(), 2);
+        assert!(setup.store.load_upload_sessions().unwrap()[0]
+            .files
+            .iter()
+            .all(|file| file.prefix_bytes == 0));
+        connection
+            .execute_batch("DROP TRIGGER fail_second_checkpoint;")
+            .unwrap();
+        assert!(checkpoint_session(&setup, &mut files));
+        assert_eq!(writes(), 4);
+        assert!(setup.store.load_upload_sessions().unwrap()[0]
+            .files
+            .iter()
+            .all(|file| file.prefix_bytes == object.length));
+
+        for (published, receipt) in [(true, false), (true, true), (true, false)] {
+            files[0].published = published;
+            files[0].receipt = receipt;
+            checkpoint_files(&setup, files.iter().enumerate()).unwrap();
+            let saved = &setup.store.load_upload_sessions().unwrap()[0].files[0];
+            assert_eq!((saved.published, saved.receipt), (published, receipt));
+        }
+        assert_eq!(writes(), 7);
+    }
+
+    #[test]
+    fn checkpoint_snapshot_keeps_writes_arriving_during_database_wait() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = vec![0x53; 131_072];
+        let mut builder =
+            InMemoryObjectBuilder::new(Suite::Blake3Bao64, Some(bytes.len() as u64), 131_072)
+                .unwrap();
+        builder.update(&bytes).unwrap();
+        let prepared = builder.finish().unwrap();
+        let setup = setup(directory.path(), prepared.object_id().clone());
+        let mut file =
+            open_destination_for(&setup, vec!["frame".into()], prepared.object_id().clone())
+                .unwrap();
+        persist_session(&setup, std::slice::from_ref(&file)).unwrap();
+        file.native.as_mut().unwrap().reopen().unwrap();
+        let files = [file];
+        let send = |offset| {
+            let proof = prepared.prove(offset, 65_536).unwrap();
+            let offset = offset as usize;
+            accept_range(
+                &files,
+                0,
+                offset as u64,
+                proof.proof(),
+                &bytes[offset..offset + 65_536],
+            )
+            .unwrap();
+        };
+        send(0);
+        let (snapshot, ready) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            setup
+                .store
+                .with(|_| {
+                    scope.spawn(|| {
+                        checkpoint_files(
+                            &setup,
+                            files.iter().enumerate().chain(std::iter::from_fn(|| {
+                                snapshot.send(()).unwrap();
+                                None
+                            })),
+                        )
+                        .unwrap();
+                    });
+                    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+                    send(65_536);
+                    Ok(())
+                })
+                .unwrap();
+        });
+        assert_eq!(
+            setup.store.load_upload_sessions().unwrap()[0].files[0].prefix_bytes,
+            65_536
+        );
+        checkpoint_files(&setup, files.iter().enumerate()).unwrap();
+        assert_eq!(
+            setup.store.load_upload_sessions().unwrap()[0].files[0].prefix_bytes,
+            131_072
+        );
+
+        let (finished, done) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            setup
+                .store
+                .with(|_| {
+                    scope.spawn(|| {
+                        checkpoint_files(&setup, files.iter().enumerate()).unwrap();
+                        finished.send(()).unwrap();
+                    });
+                    done.recv_timeout(Duration::from_secs(5))
+                        .expect("unchanged checkpoint waited for SQLite");
+                    Ok(())
+                })
+                .unwrap();
+        });
+    }
+
+    #[test]
     fn publication_journal_remains_until_the_database_checkpoints_it() {
         let directory = tempfile::tempdir().unwrap();
         let object = object(Suite::Blake3Bao64, b"");
@@ -4831,7 +5194,7 @@ mod push_tests {
             publish_file(&setup, &mut file, || true).unwrap();
             setup
                 .store
-                .update_upload_file_progress(&record.id, [push_progress(0, &file)])
+                .update_upload_file_progress(&record.id, [file_progress(0, &file)])
                 .unwrap();
             if cleaned {
                 assert!(forget_publications(std::slice::from_mut(&mut file)));
@@ -5117,6 +5480,14 @@ mod push_tests {
                 continue;
             }
             prepared.unwrap();
+            receive.setup.store.with(|connection| {
+                connection.execute_batch("CREATE TRIGGER reject_unchanged_checkpoint BEFORE UPDATE ON upload_session_files
+                    WHEN NEW.prefix_bytes = OLD.prefix_bytes AND NEW.published = OLD.published AND NEW.receipt = OLD.receipt
+                    BEGIN SELECT RAISE(FAIL, 'unchanged checkpoint row'); END;")
+            }).unwrap();
+            receive
+                .checkpoint(&mut receive.inner.lock().unwrap())
+                .unwrap();
             assert!(receive.complete_object(&requested).is_err());
             let sink: Arc<dyn vot_cli::ReceiveSink> =
                 Arc::from(receive.choose_sink(&requested).unwrap().unwrap());
@@ -5134,7 +5505,19 @@ mod push_tests {
                     .count()
                     <= MAX_OPEN_PUSH_ALIASES
             );
+            receive
+                .checkpoint(&mut receive.inner.lock().unwrap())
+                .unwrap();
             write_push(Arc::clone(&sink), &requested, bytes);
+            for _ in 0..2 {
+                receive
+                    .checkpoint(&mut receive.inner.lock().unwrap())
+                    .unwrap();
+            }
+            assert!(receive.setup.store.load_push_sessions().unwrap()[0]
+                .files
+                .iter()
+                .all(|file| file.prefix_bytes == object.length));
             sink.flush().unwrap();
             assert_eq!(sink.resumed_prefix().unwrap(), object.length);
             let mut identities = std::collections::HashSet::new();
@@ -5144,6 +5527,13 @@ mod push_tests {
                 assert_eq!(fs::read(&path).unwrap(), bytes);
                 assert!(identities.insert(fs::metadata(&path).unwrap().ino()));
             }
+            receive
+                .checkpoint(&mut receive.inner.lock().unwrap())
+                .unwrap();
+            assert!(receive.setup.store.load_push_sessions().unwrap()[0]
+                .files
+                .iter()
+                .all(|file| file.published && file.receipt));
             sink.discard_partial().unwrap();
             assert!(sink.resumed_prefix().is_err());
             drop(sink);
@@ -5308,6 +5698,7 @@ mod push_tests {
                 native: None,
                 published: true,
                 receipt: true,
+                checkpointed: Mutex::new(None),
                 first_range_at: None,
                 rehash: false,
             };
@@ -5352,6 +5743,7 @@ mod push_tests {
             native: Some(staged),
             published: false,
             receipt: false,
+            checkpointed: Mutex::new(None),
             first_range_at: None,
             rehash: false,
         };
@@ -5425,9 +5817,9 @@ mod push_tests {
             .iter()
             .all(|file| file.native.as_ref().unwrap().active.is_none()));
         let mut phase = Phase::Receiving { files };
-        let send = |phase: &mut Phase, entry, offset| {
+        let chunk = |entry, offset| {
             let proof = vot_proof_blake3::prove(&data, offset, 65_536).unwrap();
-            let batch = [BatchChunk {
+            BatchChunk {
                 entry,
                 offset: proof.covered_offset,
                 proof: proof.proof.into(),
@@ -5440,12 +5832,24 @@ mod push_tests {
                         received: AtomicU64::new(0),
                     }),
                 },
-            }];
-            accept_batch(&setup, phase, &batch).pop().unwrap()
+            }
+        };
+        let send = |phase: &mut Phase, entry, offset| {
+            accept_batch(&setup, phase, &[chunk(entry, offset)])
+                .pop()
+                .unwrap()
         };
         for index in 0..128 {
             let progress = send(&mut phase, index, 131_072).unwrap();
             assert_eq!(progress.covered_bytes, 65_536);
+        }
+        for offset in [0, 65_536] {
+            let batch = (3..3 + MAX_CHUNK_BATCH)
+                .map(|entry| chunk(entry, offset))
+                .collect::<Vec<_>>();
+            for result in accept_batch(&setup, &mut phase, &batch) {
+                assert_eq!(result.unwrap().complete, offset == 65_536);
+            }
         }
         assert_eq!(send(&mut phase, 0, 0).unwrap().covered_bytes, 131_072);
         assert!(send(&mut phase, 0, 131_072).unwrap().replay);
@@ -5739,6 +6143,7 @@ mod parallel_accept_tests {
             native: Some(native),
             published: false,
             receipt: false,
+            checkpointed: Mutex::new(None),
             first_range_at: None,
             rehash: false,
         }];
