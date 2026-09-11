@@ -29,7 +29,7 @@ rand = "0.8"
 thiserror = "2"
 # Pinned to the release uniffi-bindgen-cs (the Windows shell's C# generator)
 # targets; the Swift generator ships inside uniffi itself.
-uniffi = "0.31.0"
+uniffi = "0.32.0"
 tempfile = "3"
 # Free space at a destination before a receive commits; already in the
 # tree through vot-platform-fs.
