@@ -1,3 +1,5 @@
+import { mountHints } from '/assets/hints.js';
+import { mountDrafts, confirmLeave } from '/assets/form-drafts.js';
 // Shared helpers for the multi-page admin. VOTPORT PROPRIETARY LICENSE.
 
 // Copying text with a Copied flash lives with the shared public helpers so
@@ -38,6 +40,8 @@ export async function requireSession() {
   }
   buildNav(session);
   mountSearch(session);
+  mountHints();
+  mountDrafts(session);
   return session;
 }
 
@@ -201,33 +205,40 @@ function mountThemeToggle() {
 mountThemeToggle();
 
 const NAV_ITEMS = [
-  ['receive', '/receive', 'Receive'],
-  ['deliver', '/deliver', 'Deliver'],
-  ['workflows', '/workflows', 'Workflows'],
-  ['storage', '/storage', 'Storage'],
-  ['automation', '/automation', 'Automation'],
-  ['tenants', '/tenants', 'Tenants'],
-  ['audit', '/audit', 'Audit'],
-  ['system', '/system', 'System'],
+  ['receive', '/receive', 'Receive', 'Invite someone to ship files to this port.'],
+  ['deliver', '/deliver', 'Deliver', 'Share files with a private download link.'],
+  ['workflows', '/workflows', 'Workflows', 'Prepare deliveries with reusable checks, approvals and destinations.'],
+  ['trade-routes', '/trade-routes', 'Trade routes', 'Connect ports to move files between your sites and partners.'],
+  ['storage', '/storage', 'Storage', 'Manage receiving storage, S3 buckets and shared folders.'],
+  ['automation', '/automation', 'Automation', 'Connect agents and scripts with limited access.'],
+  ['notifications', '/notifications', 'Notifications', 'Choose notification channels, recipients and shared defaults.'],
+  ['tenants', '/tenants', 'Tenants', 'Manage separate workspaces, each with its own users and files.'],
+  ['audit', '/audit', 'Audit', 'Review who did what on this port.'],
+  ['system', '/system', 'System', 'Manage branding, sign-in, email, backups and port settings.'],
 ];
 
 function buildNav(session) {
   const nav = document.getElementById('nav');
   if (!nav) return;
   nav.replaceChildren();
-  for (const [page, href, label] of NAV_ITEMS) {
+  nav.setAttribute('aria-label', 'Main navigation');
+  const primary = document.createElement('div'); primary.className = 'nav-primary';
+  const more = document.createElement('details'); more.className = 'nav-more';
+  const summary = document.createElement('summary'); summary.textContent = 'Port settings';
+  const panel = document.createElement('div'); panel.className = 'nav-panel';
+  more.append(summary, panel);
+  for (const [page, href, label, hint] of NAV_ITEMS) {
     if (!session.pages.includes(page)) continue;
-    const link = document.createElement('a');
-    link.href = href;
-    link.textContent = label;
-    const active = window.location.pathname === href
-      || (href === '/receive' && window.location.pathname === '/links');
-    if (active) {
-      link.classList.add('active');
-      link.setAttribute('aria-current', 'page');
-    }
-    nav.append(link);
+    const link = document.createElement('a'); link.href = href; link.textContent = label; link.dataset.hint = hint;
+    const active = window.location.pathname === href || (href === '/receive' && window.location.pathname === '/links');
+    if (active) { link.classList.add('active'); link.setAttribute('aria-current', 'page'); }
+    if (['receive', 'deliver', 'workflows', 'trade-routes'].includes(page)) primary.append(link);
+    else { panel.append(link); if (active) summary.classList.add('active'); }
   }
+  nav.append(primary); if (panel.children.length) nav.append(more);
+  document.addEventListener('click', (event) => { if (!more.contains(event.target)) more.open = false; });
+  more.addEventListener('keydown', (event) => { if (event.key === 'Escape') { more.open = false; summary.focus(); } });
+  more.addEventListener('focusout', () => setTimeout(() => { if (!more.contains(document.activeElement)) more.open = false; }, 0));
   // Tenant switcher appears only for multi-tenant principals.
   const switcher = document.getElementById('tenant-switcher');
   if (switcher) {
@@ -243,18 +254,24 @@ function buildNav(session) {
         }),
       );
       switcher.addEventListener('change', async () => {
-        await api('/api/admin/tenant', {
-          method: 'POST',
-          body: JSON.stringify({ tenant: switcher.value }),
-        });
-        window.location.reload();
+        switcher.disabled = true;
+        try {
+          if (await confirmLeave(() => api('/api/admin/tenant', {
+            method: 'POST', body: JSON.stringify({ tenant: switcher.value }),
+          }))) window.location.reload();
+          else switcher.value = session.tenant;
+        } catch (error) { switcher.value = session.tenant; alertModal(error.message); }
+        finally { switcher.disabled = false; }
       });
     }
   }
   const logout = document.getElementById('logout');
   logout?.addEventListener('click', async () => {
-    await api('/api/admin/logout', { method: 'POST' });
-    window.location.replace('/');
+    logout.disabled = true;
+    try {
+      if (await confirmLeave(() => api('/api/admin/logout', { method: 'POST' }))) window.location.replace('/');
+    } catch (error) { alertModal(error.message); }
+    finally { logout.disabled = false; }
   });
 }
 

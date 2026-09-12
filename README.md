@@ -144,16 +144,7 @@ the row so env applies again. Details: [`docs/deployment.md`](docs/deployment.md
 | `VOTPORT_ALLOW_HIDDEN` | off | Set `1` to accept dot-file names from uploaders. |
 | `VOTPORT_SESSION_IDLE_SECS` | `1800` | Idle time before an unfinished upload session is discarded. |
 | `VOTPORT_WEB_ROOT` | `./web` | Static assets directory (`/app/web` in Docker). |
-| `VOTPORT_NOTIFY_SLACK_URL` | — | Slack incoming webhook. Configure and test in System > Notifications. |
-| `VOTPORT_NOTIFY_TEAMS_URL` | — | Microsoft Teams Workflows webhook. |
-| `VOTPORT_NOTIFY_GOOGLE_CHAT_URL` | — | Google Chat space webhook. |
-| `VOTPORT_NOTIFY_DISCORD_URL` | — | Discord channel webhook. |
-| `VOTPORT_NOTIFY_WEBHOOK_URL` | — | POSTed a JSON summary (`event`, `label`, `upload_id`, `total_bytes`, `files`) when an upload completes. |
-| `VOTPORT_NOTIFY_NTFY_URL` | — | Full ntfy topic URL (e.g. `https://ntfy.sh/mytopic`) sent a message per completed upload. |
-| `VOTPORT_NOTIFY_NTFY_TOKEN` | — | Bearer token for the ntfy topic, if it needs one. |
-| `VOTPORT_NOTIFY_PUSHOVER_TOKEN` | — | Pushover application token (set together with the user key). |
-| `VOTPORT_NOTIFY_PUSHOVER_USER` | — | Pushover application token (set together with the user key). |
-| `VOTPORT_NOTIFY_SMTP_HOST` | — | SMTP host. The channel is inert unless host, from, and at least one `to` all resolve. |
+| `VOTPORT_NOTIFY_SMTP_HOST` | — | Shared SMTP relay host. Configure recipients on named email destinations. |
 | `VOTPORT_NOTIFY_SMTP_PORT` | `587` | SMTP port. Port 465 uses implicit TLS. |
 | `VOTPORT_NOTIFY_SMTP_STARTTLS` | on | SMTP STARTTLS. Off only when `0`. Port 465 uses implicit TLS regardless. |
 | `VOTPORT_NOTIFY_SMTP_USERNAME` | — | Optional SMTP AUTH username. |
@@ -164,8 +155,7 @@ the row so env applies again. Details: [`docs/deployment.md`](docs/deployment.md
 | `VOTPORT_STANDBY_INTERVAL_SECS` | `60` | `votport standby` only: seconds between pulls; the RPO. |
 | `VOTPORT_SCIM_REQUIRE_PROVISIONING` | `0` | `1` refuses SSO sign-in for subjects with no principal row. Overridable via `PUT /api/admin/settings`. |
 | `VOTPORT_OIDC_SUBJECT_CLAIM` | `sub` | Id-token claim used as the principal subject: `sub`, `email`, or `preferred_username`. Must match the SCIM `userName` mapping. |
-| `VOTPORT_NOTIFY_SMTP_FROM` | — | SMTP From address (required with host and `to`). |
-| `VOTPORT_NOTIFY_SMTP_TO` | — | Comma-separated SMTP recipients (at least one required with host and from). |
+| `VOTPORT_NOTIFY_SMTP_FROM` | — | SMTP From address (required with the relay host). |
 | `VOTPORT_AUDIT_RETENTION_DAYS` | `400` | Days to keep queryable audit rows; `0` disables pruning. Overridable via `PUT /api/admin/settings`. |
 | `VOTPORT_UPLOAD_RETENTION_DAYS` | off | Days to keep received files and their records; a daily sweep deletes expired content and audits it. `0` (default) keeps everything. Overridable via `PUT /api/admin/settings`. |
 | `VOTPORT_DEFAULT_MAX_TOTAL_BYTES` | unlimited | Fills a new tenant's byte quota when the request omits it, and caps received bytes on the unnamed default tenant. Named tenants keep the quota on their row. |

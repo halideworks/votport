@@ -67,6 +67,7 @@ impl Store {
         if !same {
             return Err("peer identity or route changed; delivery remains held".into());
         }
+        trade::queue_cancelled(&tx, &self.event_signer, destination)?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -96,6 +97,17 @@ impl Store {
         source: &SignedRoute,
         ancestry: &[RouteReceipt],
     ) -> Result<InboundRoute, String> {
+        self.receive_route_authorized(tenant, link_id, source, ancestry, None)
+    }
+
+    pub fn receive_route_authorized(
+        &self,
+        tenant: &str,
+        link_id: &str,
+        source: &SignedRoute,
+        ancestry: &[RouteReceipt],
+        credential: Option<&str>,
+    ) -> Result<InboundRoute, String> {
         if !source.admits(&self.event_signer.public_hex)
             || !crate::route_protocol::verify_ancestry(source, ancestry)
         {
@@ -105,6 +117,14 @@ impl Store {
         let tx = connection.transaction().map_err(|e| e.to_string())?;
         let usable: bool = tx.query_row("SELECT active=1 AND (expires_at IS NULL OR expires_at>?3) FROM links WHERE tenant=?1 AND id=?2",params![tenant,link_id,now_unix() as i64],|row|row.get(0)).optional().map_err(|e|e.to_string())?.ok_or("receive request missing")?;
         let previous = tx.query_row(&format!("SELECT {COLUMNS} FROM inbound_routes WHERE link_id=?1 AND issuer=?2 AND operation_id=?3"),params![link_id,source.document.issuer,source.document.operation_id],row_route).optional().map_err(|e|e.to_string())?;
+        trade::admit(
+            &tx,
+            source,
+            ancestry,
+            link_id,
+            credential,
+            previous.is_some(),
+        )?;
         if let Some(previous) = previous {
             return if &previous.source == source && previous.ancestry == ancestry {
                 Ok(previous)
@@ -121,6 +141,9 @@ impl Store {
         }
         let id = crate::auth::random_token();
         tx.execute("INSERT INTO inbound_routes(id,tenant,link_id,issuer,operation_id,source,created_at,ancestry) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",params![id,tenant,link_id,source.document.issuer,source.document.operation_id,serde_json::to_string(source).map_err(|e|e.to_string())?,now_unix() as i64,serde_json::to_string(ancestry).expect("ancestry serializes")]).map_err(|e|e.to_string())?;
+        if let Some(permission) = &source.document.permission {
+            tx.execute("INSERT INTO trade_delivery_policies(route_id,document) SELECT ?1,json_extract(document,'$.notifications') FROM trade_routes WHERE id=?2",params![id,permission.grant]).map_err(|e|e.to_string())?;
+        }
         evidence::delivery_event(&tx,&self.event_signer,tenant,"","route_admitted",&serde_json::json!({"source":source.document.issuer,"operation_id":source.document.operation_id,"manifest":source.document.manifest}),now_unix()).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(InboundRoute {

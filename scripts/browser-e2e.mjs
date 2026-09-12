@@ -56,6 +56,7 @@ const browser = await browserType.launch({
   env: { ...process.env, LANG: "C.UTF-8", LC_ALL: "C.UTF-8" },
 });
 const page = await browser.newPage();
+page.on("dialog", (dialog) => dialog.accept());
 const errors = [];
 page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
 
@@ -481,8 +482,10 @@ await page.waitForFunction(
 const rootFolder = page.locator(
   `#library-files input[aria-label="Select folder ${PROJECT}"]`,
 );
+await rootFolder.waitFor();
 // Earlier runs leave their own project folders behind; only this run's must be a folder row.
-if (await rootFolder.count() !== 1 || await page.locator("#library-files .library-file:not(.library-folder)").count() !== 0) {
+const rootFiles = await page.locator("#library-files .library-file:not(.library-folder)").allTextContents();
+if (await rootFolder.count() !== 1 || rootFiles.some((row) => outboundFiles.some((file) => row.includes(file.name)))) {
   throw new Error(`scoped library root did not show ${PROJECT} as a folder`);
 }
 await page.getByRole("button", { name: `Open folder ${PROJECT}` }).focus();
@@ -501,6 +504,7 @@ if (currentDirectory !== PROJECT) {
   throw new Error(`scoped library breadcrumb: ${currentDirectory}`);
 }
 
+await page.locator("#nav .nav-more > summary").click();
 await page.getByRole("link", { name: "Automation", exact: true }).click();
 await page.fill("#automation-token-label", `browser agent ${run}`);
 await page.fill("#automation-token-directory", PROJECT);

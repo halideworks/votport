@@ -74,6 +74,7 @@ async fn main() {
     tokio::spawn(app::lease_keeper(application.clone()));
     tokio::spawn(app::upload_ended_notifier(application.clone()));
     tokio::spawn(votport::backup::scheduler(application.clone()));
+    tokio::spawn(votport::api::trade::worker(application.clone()));
     tokio::spawn(votport::api::outbound::workflows::worker(
         application.clone(),
     ));

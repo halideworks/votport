@@ -32,6 +32,10 @@ pub struct MediaCheck {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Project {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub notification_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<crate::store::NotificationPolicy>,
     pub id: String,
     #[serde(default)]
     pub revision: u64,
@@ -70,6 +74,8 @@ pub enum Release {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct JobRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<crate::store::NotificationPolicy>,
     pub operation_id: String,
     pub project_id: String,
     pub label: String,
@@ -137,6 +143,8 @@ pub struct Received {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ReceiveWorkflow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<crate::store::NotificationPolicy>,
     pub project_id: String,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
@@ -147,6 +155,7 @@ pub struct ReceiveWorkflow {
 impl ReceiveWorkflow {
     pub fn request(&self, operation_id: &str, label: &str) -> JobRequest {
         JobRequest {
+            notifications: self.notifications.clone(),
             operation_id: operation_id.into(),
             project_id: self.project_id.clone(),
             label: label.into(),
@@ -187,7 +196,17 @@ pub fn valid_path(value: &str) -> bool {
             .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 impl Project {
+    pub fn same_delivery_policy(&self, other: &Self) -> bool {
+        let mut policy = self.clone();
+        policy.notifications = other.notifications.clone();
+        policy.notification_revision = other.notification_revision;
+        policy == *other
+    }
     pub fn validate(&self) -> Result<(), String> {
         if !valid_id(&self.id)
             || self.label.trim().is_empty()
@@ -375,6 +394,8 @@ pub(crate) mod tests {
 
     pub fn project() -> Project {
         Project {
+            notification_revision: 0,
+            notifications: None,
             id: "project".into(),
             revision: 0,
             label: "Delivery project".into(),
@@ -399,6 +420,7 @@ pub(crate) mod tests {
 
     pub fn request() -> JobRequest {
         JobRequest {
+            notifications: None,
             operation_id: "operation_1".into(),
             project_id: "project".into(),
             label: "Final delivery".into(),

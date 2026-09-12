@@ -1,3 +1,4 @@
+import { markFormSaved } from '/assets/form-drafts.js';
 import { api, button, confirmModal, copyToClipboard, formatWhen, requireSession } from '/assets/admin-common.js';
 const $ = (id) => document.getElementById(id);
 const permissionLabels = {
@@ -97,7 +98,7 @@ $('automation-token-form').addEventListener('submit', async (event) => {
   const expires = Number($('automation-token-expires').value);
   const directory = $('automation-token-directory').value.trim();
   if (!label || label.length > 100) {
-    error.textContent = 'Label must be 1 to 100 characters.';
+    error.textContent = 'Name must be 1 to 100 characters.';
     error.hidden = false;
     return;
   }
@@ -120,7 +121,7 @@ $('automation-token-form').addEventListener('submit', async (event) => {
       body: JSON.stringify({ label, expires_days: expires, directory: directory || null, permissions }),
     });
     if (!response.token) throw new Error('server did not return the automation token');
-    $('automation-token-form').reset();
+    markFormSaved($('automation-token-form')); $('automation-token-form').reset();
     $('automation-token-value').value = response.token;
     $('automation-token-result').hidden = false;
     $('automation-token-copy').onclick = () => copyToClipboard($('automation-token-copy'), response.token);

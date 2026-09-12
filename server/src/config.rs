@@ -37,19 +37,6 @@ pub struct Config {
     /// sessions while a plain restart does not. The argon2 hash above cannot
     /// serve: it is salted fresh each boot.
     pub admin_token_tag: String,
-    /// Webhook URL POSTed a JSON summary when an upload completes.
-    pub notify_webhook: Option<String>,
-    pub notify_slack: Option<String>,
-    pub notify_teams: Option<String>,
-    pub notify_google_chat: Option<String>,
-    pub notify_discord: Option<String>,
-    /// ntfy topic URL (e.g. "https://ntfy.sh/mytopic") for upload notices.
-    pub notify_ntfy: Option<String>,
-    /// Bearer token for the ntfy topic, if it needs one.
-    pub notify_ntfy_token: Option<String>,
-    /// Pushover application token + user key for upload notices.
-    pub notify_pushover: Option<(String, String)>,
-    /// SMTP host for upload-complete mail. Assembled with from/to at resolve.
     pub smtp_host: Option<String>,
     /// SMTP port. Default 587. Port 465 uses implicit TLS.
     pub smtp_port: u16,
@@ -62,8 +49,7 @@ pub struct Config {
     /// Bearer a standby presents to GET /api/replica; None disables it.
     pub replica_token: Option<String>,
     pub smtp_from: Option<String>,
-    /// Comma-separated recipient addresses.
-    pub smtp_to: Option<String>,
+
     /// Public base URL (e.g. "https://drop.example.com"); used to render
     /// links in the admin UI and to decide whether cookies are `Secure`.
     pub public_url: Option<String>,
@@ -466,21 +452,6 @@ pub fn from_env() -> Result<Config, String> {
         Err(_) => 1800,
     };
 
-    let notify_pushover = match (
-        optional("VOTPORT_NOTIFY_PUSHOVER_TOKEN"),
-        optional("VOTPORT_NOTIFY_PUSHOVER_USER"),
-    ) {
-        (Some(token), Some(user)) => Some((token, user)),
-        (None, None) => None,
-        _ => {
-            return Err(
-                "set both VOTPORT_NOTIFY_PUSHOVER_TOKEN and VOTPORT_NOTIFY_PUSHOVER_USER, \
-                 or neither"
-                    .to_owned(),
-            );
-        }
-    };
-
     let smtp_port = match env::var("VOTPORT_NOTIFY_SMTP_PORT") {
         Ok(value) if !value.trim().is_empty() => {
             let parsed: u16 = value
@@ -550,14 +521,7 @@ pub fn from_env() -> Result<Config, String> {
         web_root,
         admin_password_hash,
         admin_token_tag,
-        notify_webhook: optional("VOTPORT_NOTIFY_WEBHOOK_URL"),
-        notify_slack: optional("VOTPORT_NOTIFY_SLACK_URL"),
-        notify_teams: optional("VOTPORT_NOTIFY_TEAMS_URL"),
-        notify_google_chat: optional("VOTPORT_NOTIFY_GOOGLE_CHAT_URL"),
-        notify_discord: optional("VOTPORT_NOTIFY_DISCORD_URL"),
-        notify_ntfy: optional("VOTPORT_NOTIFY_NTFY_URL"),
-        notify_ntfy_token: optional("VOTPORT_NOTIFY_NTFY_TOKEN"),
-        notify_pushover,
+
         smtp_host: optional("VOTPORT_NOTIFY_SMTP_HOST"),
         smtp_port,
         smtp_starttls,
@@ -566,7 +530,7 @@ pub fn from_env() -> Result<Config, String> {
         scim_token: optional("VOTPORT_SCIM_TOKEN"),
         replica_token: optional("VOTPORT_REPLICA_TOKEN"),
         smtp_from: optional("VOTPORT_NOTIFY_SMTP_FROM"),
-        smtp_to: optional("VOTPORT_NOTIFY_SMTP_TO"),
+
         public_url,
         max_upload_bytes,
         workflow_snapshot_bytes,

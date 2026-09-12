@@ -136,6 +136,16 @@ including password gating. Branding covers presentation only: it changes no
 paths, quotas, tokens, or verification behavior, and custom domains remain out
 of scope (see `docs/deployment.md`).
 
+Footer branding accepts a single-line message (160 characters) and one optional
+HTTP(S) link with a label (40 characters) and URL (2048 characters). Both link
+fields must be supplied together. HTML, script URLs, and embedded URL credentials
+are not accepted as markup or executable content. The VOT/VOTPort credit remains.
+The footer appears on the tenant's dashboard and usable recipient pages; the
+default tenant's footer also appears on sign-in and verification pages. Closed
+recipient links do not expose tenant branding. Removing branding clears the
+custom footer; changing a logo preserves it. Older API clients that omit the
+`footer_text`, `footer_link_label`, and `footer_link_url` fields preserve them.
+
 ## Threat-model deltas
 
 | Change | Mitigation |

@@ -47,25 +47,10 @@
     </form>
   </section>
 
-  <details id="delivery-evidence" class="card">
-    <summary>Verify saved files and accept this delivery</summary>
-    <p>Browser download requests do not prove that files were saved. Choose the saved files to verify them, then explicitly accept the exact delivery manifest.</p>
-    <button id="evidence-copy-key" type="button">Copy this browser's device key</button>
-    <p class="muted">For an enrolled-recipient delivery, give this key to the sender. Browser and desktop device keys are separate.</p>
-    <label>Saved files<input id="evidence-files" type="file" multiple /></label>
-    <div class="actions">
-    <button id="evidence-verify" type="button">Verify saved files</button>
-    <button id="evidence-retry" type="button" class="ghost">Retry pending reports</button>
-    <button id="evidence-refresh" type="button" class="ghost">Show verification records</button>
-    <a id="evidence-open-app" href="#" class="button">Open in Votport</a>
-    </div>
-    <p id="evidence-status" role="status"></p>
-    <div id="evidence-records"></div>
-  </details>
-
   <section id="download-content" hidden aria-live="polite">
     <!-- One primary action. The ids stay: the browser e2e drives them. -->
     <div id="separate-download" class="hero-action">
+      <h2><span class="step-number">1</span> Bring your files aboard</h2>
       <button
         type="button"
         id="separate-download-button"
@@ -96,7 +81,7 @@
 
     <div class="card ok" id="manifest">
       <div class="manifest-head">
-        <h2>Manifest</h2>
+        <h2>Files in this delivery</h2>
         <p id="manifest-status" class="muted" aria-live="polite"></p>
       </div>
       <ul id="object" class="files"></ul>
@@ -106,13 +91,29 @@
       </div>
     </div>
 
-    <div class="outbound-actions">
+    <details class="form-advanced"><summary>Delivery receipts and port identity</summary><div class="outbound-actions">
       <a href="/verify">Verify these receipts</a>
       <span class="muted">Receipt issuer <span class="mono" id="receipt-key"></span></span>
-    </div>
+    </div></details>
   </section>
 
-  <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
+  <details id="delivery-evidence" class="card form-advanced">
+    <summary>After downloading: verify files and accept delivery</summary>
+    <p>Verification checks that your saved files match what left the sending port. Acceptance tells the sender you have reviewed this delivery.</p>
+    <h2><span class="step-number">2</span> Verify your saved files <button type="button" class="hint-button" aria-label="Help about file verification" data-hint="Starting a download does not prove the files were saved intact. This check reads the files you select on your device and compares their fingerprints with the signed delivery record. Your files are not uploaded.">?</button></h2>
+    <label>Choose the files you downloaded<input id="evidence-files" type="file" multiple /></label>
+    <button id="evidence-verify" type="button">Verify saved files</button>
+    <p id="evidence-status" role="status"></p>
+    <h2><span class="step-number">3</span> Accept this delivery</h2>
+    <p class="field-help">After verification, review the result and choose Accept verified delivery. You decide whether to accept.</p>
+    <div id="evidence-records" aria-live="polite"><p class="field-help">Verify your saved files to make acceptance available.</p></div>
+    <details class="form-advanced"><summary>Device access and verification records</summary>
+      <p class="field-help">If the sender requires an enrolled device, give them this browser’s device key. The desktop app uses its own key.</p>
+      <div class="actions"><button id="evidence-copy-key" type="button" class="ghost">Copy this browser's device key</button><button id="evidence-retry" type="button" class="ghost">Retry pending reports</button><button id="evidence-refresh" type="button" class="ghost">Show verification records</button><a id="evidence-open-app" href="#" class="button">Open in VOTPort</a></div>
+    </details>
+  </details>
+
+  <p class="sheet-foot"><span class="footer-custom"></span><span>Powered by Verified Object Transport (VOT) · <a href="https://votport.com" target="_blank" rel="noopener noreferrer">VOTPort</a></span></p>
 </div>
 
 <dialog id="separate-download-confirm" class="modal" aria-labelledby="separate-download-confirm-title" aria-describedby="separate-download-confirm-detail">
@@ -126,6 +127,7 @@
   </form>
 </dialog>
 
+<script type="module" src="/assets/hints.js"></script>
 <script type="module" src="/assets/outbound.js"></script>
 </body>
 </html>

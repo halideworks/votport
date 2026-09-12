@@ -183,7 +183,7 @@ application/json`. Unknown share fields and malformed query values are rejected.
 | --- | --- | --- |
 | `GET /api/automation/session` | Any valid token | API version, current scope, permissions, and expiry. |
 | `GET /api/automation/files` | `library:read` | Optional `directory`, `after`, `limit`. Omitted directory selects the token's folder. |
-| `POST /api/automation/share` | `deliveries:create` | `directory`, `expires_days` (1 to 30), optional `operation_id`, `label`, `password`, `max_downloads` (1 to 10,000), `notify_on_download`. |
+| `POST /api/automation/share` | `deliveries:create` | `directory`, `expires_days` (1 to 30), optional `operation_id`, `label`, `password`, `max_downloads` (1 to 10,000), `notifications` (see [notification routing](notifications.md)). |
 | `GET /api/automation/operations/{id}` | `deliveries:create` | Recover a committed creation result. |
 | `GET /api/automation/deliveries` | `deliveries:read` | Optional numeric `after`, `limit`; oldest first. |
 | `GET /api/automation/deliveries/{id}` | `deliveries:read` | Optional `offset`, `limit`; delivery state and file detail. |
@@ -209,3 +209,5 @@ infer recipient-side verification from them. Existing notification webhooks
 remain best-effort notifications. Query persistent delivery state to recover
 after missed notifications. Audit rows attribute creation and revocation to
 `automation:<token-id>` and creation records include the operation ID.
+
+Notification destinations are discoverable through `GET /api/automation/notifications`, `votport agent notifications`, and MCP `list_notification_destinations`. Share and job creation accept the `notifications` policy documented in [Notifications](notifications.md).

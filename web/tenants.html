@@ -16,6 +16,8 @@
     <!-- The whole module graph fetches at once instead of one import level per round trip. -->
     <link rel="modulepreload" href="/assets/page-tenants.js" />
     <link rel="modulepreload" href="/assets/admin-common.js" />
+    <link rel="modulepreload" href="/assets/hints.js" />
+    <link rel="modulepreload" href="/assets/form-drafts.js" />
     <link rel="modulepreload" href="/assets/object-card.js" />
     <link rel="modulepreload" href="/assets/undo.js" />
   </head>
@@ -45,8 +47,8 @@
 
       <h1>Tenant namespaces</h1>
 
-      <form id="tenant-form" class="card">
-        <h2>New tenant</h2>
+      <form data-unsaved id="tenant-form" class="card">
+        <h2>New tenant <button type="button" class="hint-button" aria-label="Help about tenants" data-hint="A tenant is a separate workspace on this port with its own files, users, branding and limits. Create one when teams need separate access.">?</button></h2>
         <div class="grid">
           <label
             >Key
@@ -80,7 +82,7 @@
       <h2>Namespaces</h2>
       <div id="tenants"></div>
 
-      <h2>Principals</h2>
+      <h2>Principals <button type="button" class="hint-button" aria-label="Help about principals" data-hint="A principal is a person or agent identity. Its grants determine which tenant it can access and what it can do there.">?</button></h2>
       <div class="card">
         <p class="muted">
           SSO users who have signed in. Revoke kicks current sessions and refuses
@@ -94,7 +96,7 @@
       </div>
       <div id="principals"></div>
       <button id="principal-load-more" type="button" hidden>Load more</button>
-      <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
+      <p class="sheet-foot"><span class="footer-custom"></span><span>Powered by Verified Object Transport (VOT) · <a href="https://votport.com" target="_blank" rel="noopener noreferrer">VOTPort</a></span></p>
     </div>
 
     <dialog id="confirm" class="modal" aria-labelledby="confirm-title" aria-describedby="confirm-detail">

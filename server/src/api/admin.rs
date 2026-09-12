@@ -26,7 +26,7 @@ const PRINCIPAL_PAGE_MAX: usize = 100;
 /// Signed admin cookie for a test identity; the shared body behind each
 /// test module's `cookie_for`.
 #[cfg(test)]
-fn test_admin_cookie(app: &App, identity: &auth::AdminIdentity) -> String {
+pub(crate) fn test_admin_cookie(app: &App, identity: &auth::AdminIdentity) -> String {
     format!(
         "votport_admin={}; Path=/",
         auth::issue_admin_token(&app.secret, identity, &admin_token_phc(app).unwrap())
@@ -568,8 +568,10 @@ fn admin_session_view(identity: &auth::AdminIdentity) -> serde_json::Value {
             "receive",
             "deliver",
             "workflows",
+            "trade-routes",
             "storage",
             "automation",
+            "notifications",
             "audit",
         ]
     };
@@ -579,6 +581,7 @@ fn admin_session_view(identity: &auth::AdminIdentity) -> serde_json::Value {
     }
     json!({
         "ok": true,
+        "subject": identity.subject,
         "tenant": identity.tenant,
         "grants": identity.grants,
         "role": identity.role,
@@ -1160,6 +1163,9 @@ pub async fn get_branding(
             "name": branding.name,
             "color": branding.color,
             "has_logo": !branding.logo_ext.is_empty(),
+            "footer_text": branding.footer_text,
+            "footer_link_label": branding.footer_link_label,
+            "footer_link_url": branding.footer_link_url,
         }),
         None => json!({ "name": "", "color": "", "has_logo": false }),
     }))
@@ -1170,6 +1176,9 @@ pub struct PutBrandingRequest {
     name: String,
     #[serde(default)]
     color: String,
+    footer_text: Option<String>,
+    footer_link_label: Option<String>,
+    footer_link_url: Option<String>,
 }
 
 /// Sets a tenant's recipient-facing name and accent color. The logo has its
@@ -1184,19 +1193,40 @@ pub async fn put_branding(
     require_admin_write(&headers, &identity)?;
     let tenant = branding_tenant(&app, &key, &identity)?;
     admit_brand_color(&request.color)?;
-    let logo_ext = app
+    let previous = app
         .store
         .branding(&tenant)
         .map_err(super::store_unavailable)?
-        .map(|branding| branding.logo_ext)
         .unwrap_or_default();
-    let branding = crate::store::Branding {
+    let mut branding = crate::store::Branding {
         tenant: tenant.clone(),
         name: request.name.trim().to_owned(),
         color: request.color,
-        logo_ext,
+        footer_text: request
+            .footer_text
+            .unwrap_or(previous.footer_text)
+            .trim()
+            .into(),
+        footer_link_label: request
+            .footer_link_label
+            .unwrap_or(previous.footer_link_label)
+            .trim()
+            .into(),
+        footer_link_url: request
+            .footer_link_url
+            .unwrap_or(previous.footer_link_url)
+            .trim()
+            .into(),
+        logo_ext: previous.logo_ext,
         updated_at: now_unix(),
     };
+    admit_footer(&branding)?;
+    if !branding.footer_link_url.is_empty() {
+        branding.footer_link_url = reqwest::Url::parse(&branding.footer_link_url)
+            .expect("validated footer URL")
+            .to_string();
+        admit_footer(&branding)?;
+    }
     app.store
         .set_branding(&branding)
         .map_err(ApiError::internal)?;
@@ -1209,6 +1239,40 @@ pub async fn put_branding(
         &json!({ "name": branding.name, "color": branding.color }),
     );
     Ok(Json(json!({ "ok": true })))
+}
+
+fn admit_footer(branding: &crate::store::Branding) -> ApiResult<()> {
+    for (value, limit) in [
+        (&branding.footer_text, 160),
+        (&branding.footer_link_label, 40),
+        (&branding.footer_link_url, 2048),
+    ] {
+        if value.chars().count() > limit || value.chars().any(char::is_control) {
+            return Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "Footer text is limited to 160 characters, link labels to 40, and URLs to 2048; use a single line"));
+        }
+    }
+    if branding.footer_link_url.is_empty() != branding.footer_link_label.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Provide both a footer link label and URL, or leave both blank",
+        ));
+    }
+    if !branding.footer_link_url.is_empty()
+        && reqwest::Url::parse(&branding.footer_link_url)
+            .ok()
+            .is_none_or(|url| {
+                !["https", "http"].contains(&url.scheme())
+                    || url.host_str().is_none()
+                    || !url.username().is_empty()
+                    || url.password().is_some()
+            })
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Footer links must use an HTTP or HTTPS address without embedded credentials",
+        ));
+    }
+    Ok(())
 }
 
 /// Removes a tenant's branding row and any stored logo file.
@@ -1338,13 +1402,9 @@ pub async fn put_branding_logo(
         .unwrap_or_default();
     let branding = crate::store::Branding {
         tenant: tenant.clone(),
-        name: previous
-            .as_ref()
-            .map(|b| b.name.clone())
-            .unwrap_or_default(),
-        color: previous.map(|b| b.color).unwrap_or_default(),
         logo_ext: ext.to_owned(),
         updated_at: now_unix(),
+        ..previous.unwrap_or_default()
     };
     app.store
         .set_branding(&branding)
@@ -1796,22 +1856,12 @@ pub async fn restore_backup(
 }
 
 const SETTINGS_KEYS: &[&str] = &[
-    "notify_webhook",
-    "notify_slack",
-    "notify_teams",
-    "notify_google_chat",
-    "notify_discord",
-    "notify_ntfy",
-    "notify_ntfy_token",
-    "notify_pushover_token",
-    "notify_pushover_user",
     "smtp_host",
     "smtp_port",
     "smtp_starttls",
     "smtp_username",
     "smtp_password",
     "smtp_from",
-    "smtp_to",
     "audit_retention_days",
     "upload_retention_days",
     "default_max_total_bytes",
@@ -1934,67 +1984,6 @@ pub async fn check_receiving_storage(
     }).await.map_err(|e| ApiError::internal(e.to_string()))?
 }
 
-#[derive(Deserialize, Default)]
-pub struct NotificationTestQuery {
-    channel: Option<String>,
-}
-
-pub async fn test_notifications(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    axum::extract::Query(query): axum::extract::Query<NotificationTestQuery>,
-) -> ApiResult<Response> {
-    let identity = require_platform_admin(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
-    if query
-        .channel
-        .as_deref()
-        .is_some_and(|channel| !["slack", "teams", "google_chat", "discord"].contains(&channel))
-    {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "unknown notification channel",
-        ));
-    }
-    let report = crate::notify::test_saved(Arc::clone(&app), query.channel.as_deref())
-        .await
-        .map_err(ApiError::internal)?;
-    app.store.audit(
-        &identity.tenant,
-        &identity.subject,
-        "notification_test",
-        "",
-        &json!({ "channel": query.channel, "configured": report.configured, "delivered": report.delivered }),
-    );
-    if report.configured == 0 {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "no notification channels are configured",
-        ));
-    }
-    let status = if report.delivered == report.configured {
-        StatusCode::OK
-    } else {
-        StatusCode::BAD_GATEWAY
-    };
-    let error = (status != StatusCode::OK).then(|| {
-        format!(
-            "Delivered {} of {} configured notification channels",
-            report.delivered, report.configured
-        )
-    });
-    Ok((
-        status,
-        Json(json!({
-            "error": error,
-            "configured": report.configured,
-            "delivered": report.delivered,
-            "failed": report.configured.saturating_sub(report.delivered),
-        })),
-    )
-        .into_response())
-}
-
 fn deployment_commit_profile(root: &std::path::Path) -> Option<&'static str> {
     #[cfg(target_os = "linux")]
     {
@@ -2049,25 +2038,25 @@ fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
         "oidc_configured": oidc.is_some(),
     });
     Ok(json!({
-        "notify_webhook": resolved.notify_webhook,
-        "notify_webhook_source": overlay.notify_webhook_source,
-        "notify_slack_set": resolved.notify_slack.is_some(),
-        "notify_slack_source": overlay.notify_slack_source,
-        "notify_teams_set": resolved.notify_teams.is_some(),
-        "notify_teams_source": overlay.notify_teams_source,
-        "notify_google_chat_set": resolved.notify_google_chat.is_some(),
-        "notify_google_chat_source": overlay.notify_google_chat_source,
-        "notify_discord_set": resolved.notify_discord.is_some(),
-        "notify_discord_source": overlay.notify_discord_source,
-        "notify_ntfy": resolved.notify_ntfy,
-        "notify_ntfy_source": overlay.notify_ntfy_source,
-        "notify_ntfy_token_set": resolved.notify_ntfy_token.is_some(),
-        "notify_ntfy_token_source": overlay.notify_ntfy_token_source,
-        "notify_pushover_set": resolved.notify_pushover.is_some(),
-        "notify_pushover_token_set": overlay.notify_pushover_token_set,
-        "notify_pushover_token_source": overlay.notify_pushover_token_source,
-        "notify_pushover_user_set": overlay.notify_pushover_user_set,
-        "notify_pushover_user_source": overlay.notify_pushover_user_source,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
         "smtp_host": overlay.smtp_host,
         "smtp_host_source": overlay.smtp_host_source,
         "smtp_port": overlay.smtp_port,
@@ -2080,8 +2069,8 @@ fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
         "smtp_password_source": overlay.smtp_password_source,
         "smtp_from": overlay.smtp_from,
         "smtp_from_source": overlay.smtp_from_source,
-        "smtp_to": overlay.smtp_to,
-        "smtp_to_source": overlay.smtp_to_source,
+
+
         "audit_retention_days": resolved.audit_retention_days,
         "audit_retention_days_source": overlay.audit_retention_days_source,
         "upload_retention_days": resolved.upload_retention_days,
@@ -2110,7 +2099,10 @@ fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
     }))
 }
 
-fn write_url(key: &str, value: &serde_json::Value) -> ApiResult<crate::store::SettingWrite> {
+pub(crate) fn write_url(
+    key: &str,
+    value: &serde_json::Value,
+) -> ApiResult<crate::store::SettingWrite> {
     match value {
         serde_json::Value::Null => Ok(crate::store::SettingWrite::Reset),
         serde_json::Value::String(text) if text.is_empty() => {
@@ -2239,16 +2231,10 @@ pub async fn put_settings(
             continue;
         };
         let write = match *key {
-            "notify_webhook" | "notify_ntfy" | "notify_slack" | "notify_teams"
-            | "notify_google_chat" | "notify_discord" => write_url(key, value)?,
-            "notify_ntfy_token"
-            | "notify_pushover_token"
-            | "notify_pushover_user"
-            | "smtp_host"
+            "smtp_host"
             | "smtp_username"
             | "smtp_password"
             | "smtp_from"
-            | "smtp_to"
             | "scim_token"
             | "scim_token_previous"
             | "replica_token" => write_secret(key, value)?,
@@ -2473,7 +2459,8 @@ struct LinkView {
     max_bytes: Option<u64>,
     active: bool,
     legal_hold: bool,
-    notify_on_upload: bool,
+
+    notifications: Option<crate::store::NotificationPolicy>,
     usable: bool,
     uploads: Vec<UploadView>,
     events: Vec<crate::store::SessionEvent>,
@@ -2619,7 +2606,8 @@ fn link_view(
         max_bytes: link.max_bytes,
         active: link.active,
         legal_hold: link.legal_hold,
-        notify_on_upload: link.notify_on_upload,
+
+        notifications: link.notifications.clone(),
         uploads,
         events: link.events,
     })
@@ -2717,7 +2705,7 @@ pub struct CreateLinkRequest {
     #[serde(default)]
     max_bytes: Option<u64>,
     #[serde(default)]
-    notify_on_upload: bool,
+    notifications: Option<crate::store::NotificationPolicy>,
     workflow: Option<crate::workflow::ReceiveWorkflow>,
 }
 
@@ -2794,6 +2782,24 @@ pub async fn create_link(
             ));
         }
     }
+    let notifications = super::notifications::creation_policy(
+        &app,
+        &identity.tenant,
+        request.notifications,
+        &super::notifications::UPLOAD_EVENTS,
+    )?;
+    if let Some(policy) = request
+        .workflow
+        .as_ref()
+        .and_then(|w| w.notifications.as_ref())
+    {
+        super::notifications::validate_policy(
+            &app,
+            &identity.tenant,
+            policy,
+            &super::notifications::WORKFLOW_EVENTS,
+        )?;
+    }
     let link = Link {
         id: auth::random_token(),
         tenant,
@@ -2807,7 +2813,8 @@ pub async fn create_link(
         max_bytes: request.max_bytes,
         active: true,
         legal_hold: false,
-        notify_on_upload: request.notify_on_upload,
+
+        notifications,
         uploads: Vec::new(),
         events: Vec::new(),
     };
@@ -2829,7 +2836,7 @@ pub async fn create_link(
         &identity.subject,
         "link_created",
         &view.id,
-        &serde_json::json!({ "label": view.label, "dest": view.dest, "tenant": identity.tenant, "notify_on_upload": view.notify_on_upload }),
+        &serde_json::json!({ "label": view.label, "dest": view.dest, "tenant": identity.tenant, "notifications": view.notifications }),
     );
     Ok(Json(json!({ "link": view })))
 }
@@ -2841,7 +2848,7 @@ pub struct UpdateLinkRequest {
     #[serde(default)]
     legal_hold: Option<bool>,
     #[serde(default)]
-    notify_on_upload: Option<bool>,
+    notifications: Option<crate::store::NotificationPolicy>,
     workflow: Option<crate::workflow::ReceiveWorkflow>,
 }
 
@@ -2856,7 +2863,7 @@ pub async fn update_link(
     let fields = [
         request.active.is_some(),
         request.legal_hold.is_some(),
-        request.notify_on_upload.is_some(),
+        request.notifications.is_some(),
         request.workflow.is_some(),
     ];
     if fields.iter().filter(|field| **field).count() != 1 {
@@ -2866,6 +2873,14 @@ pub async fn update_link(
         ));
     }
     if let Some(workflow) = request.workflow {
+        if let Some(policy) = &workflow.notifications {
+            super::notifications::validate_policy(
+                &app,
+                &identity.tenant,
+                policy,
+                &super::notifications::WORKFLOW_EVENTS,
+            )?;
+        }
         app.store
             .set_receive_workflow(&identity.tenant, &id, &workflow)
             .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
@@ -2904,26 +2919,31 @@ pub async fn update_link(
         return Ok(Json(json!({ "ok": true })));
     }
 
-    if let Some(notify_on_upload) = request.notify_on_upload {
-        let found = app
+    if let Some(policy) = request.notifications {
+        super::notifications::validate_policy(
+            &app,
+            &identity.tenant,
+            &policy,
+            &super::notifications::UPLOAD_EVENTS,
+        )?;
+        if !app
             .store
             .update_link(&identity.tenant, &id, |link| {
-                link.notify_on_upload = notify_on_upload
+                link.notifications = Some(policy.clone());
             })
-            .map_err(ApiError::internal)?;
-        if !found {
+            .map_err(ApiError::internal)?
+        {
             return Err(ApiError::not_found());
         }
         app.store.audit(
             &identity.tenant,
             &identity.subject,
-            "link_notify_on_upload_changed",
+            "link_notifications_changed",
             &id,
-            &serde_json::json!({ "notify_on_upload": notify_on_upload }),
+            &json!({}),
         );
-        return Ok(Json(json!({ "ok": true })));
+        return Ok(Json(json!({"ok":true})));
     }
-
     let active = request.active.expect("validated above");
     let found = app
         .store
@@ -3543,7 +3563,8 @@ mod handler_tests {
                 max_bytes: None,
                 active: true,
                 legal_hold: true,
-                notify_on_upload: false,
+
+                notifications: None,
                 uploads: Vec::new(),
                 events: Vec::new(),
             })
@@ -3589,7 +3610,8 @@ mod handler_tests {
                     max_bytes: None,
                     active: true,
                     legal_hold: false,
-                    notify_on_upload: false,
+
+                    notifications: None,
                     uploads: Vec::new(),
                     events: Vec::new(),
                 })
@@ -3650,7 +3672,8 @@ mod handler_tests {
                 max_bytes: None,
                 active: true,
                 legal_hold: false,
-                notify_on_upload: false,
+
+                notifications: None,
                 uploads: vec![UploadRecord {
                     partial: false,
                     log: Vec::new(),
@@ -3870,7 +3893,8 @@ mod handler_tests {
                 max_bytes: None,
                 active: true,
                 legal_hold: false,
-                notify_on_upload: false,
+
+                notifications: None,
                 uploads: vec![crate::store::UploadRecord {
                     partial: false,
                     log: Vec::new(),
@@ -4153,7 +4177,8 @@ mod tenant_authz_tests {
                     max_bytes: None,
                     active: true,
                     legal_hold: false,
-                    notify_on_upload: false,
+
+                    notifications: None,
                     uploads: Vec::new(),
                     events: Vec::new(),
                 }
@@ -4401,6 +4426,94 @@ mod branding_tests {
             .await
             .unwrap()
             .status()
+    }
+
+    #[tokio::test]
+    async fn footer_branding_is_bounded_escaped_and_preserved_by_older_clients() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let platform = cookie_for(&application, "", "admin");
+        let valid = json!({"name":"Studio", "footer_text":"<script> & studio", "footer_link_label":"Privacy <policy>", "footer_link_url":"HTTPS://studio.example/privacy#terms"});
+        assert_eq!(
+            put_branding(&application, &platform, "default", &valid.to_string()).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            put_branding(&application, &platform, "default", r#"{"name":"Renamed"}"#).await,
+            StatusCode::OK
+        );
+        let saved = application.store.branding("").unwrap().unwrap();
+        assert_eq!(saved.footer_text, "<script> & studio");
+        assert_eq!(
+            saved.footer_link_url,
+            "https://studio.example/privacy#terms"
+        );
+        let html = crate::api::branding_footer(&saved);
+        assert!(html.contains("&lt;script&gt; &amp; studio"));
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("Privacy &lt;policy&gt;"));
+        assert!(html.contains("noopener noreferrer"));
+        for (field, value) in [
+            ("footer_text", "x".repeat(161)),
+            ("footer_text", "line\nbreak".into()),
+            ("footer_link_label", "x".repeat(41)),
+            ("footer_link_label", "".into()),
+            ("footer_link_url", "javascript:alert(1)".into()),
+            ("footer_link_url", "https://user:secret@example.com".into()),
+            (
+                "footer_link_url",
+                format!("https://example.com/{}", "x".repeat(2048)),
+            ),
+            (
+                "footer_link_url",
+                format!("https://example.com/{}", "é".repeat(400)),
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = json!(value);
+            assert_eq!(
+                put_branding(&application, &platform, "default", &invalid.to_string()).await,
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
+        assert_eq!(
+            put_branding(
+                &application,
+                &cookie_for(&application, "", "viewer"),
+                "default",
+                &valid.to_string()
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        insert_tenant(&application, "studio");
+        assert_eq!(
+            put_branding(
+                &application,
+                &cookie_for(&application, "studio", "admin"),
+                "default",
+                &valid.to_string()
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            put_branding(
+                &application,
+                &platform,
+                "default",
+                r#"{"name":"Studio","footer_text":"","footer_link_label":"","footer_link_url":""}"#
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert!(application
+            .store
+            .branding("")
+            .unwrap()
+            .unwrap()
+            .footer_text
+            .is_empty());
     }
 
     #[tokio::test]
@@ -4729,7 +4842,8 @@ mod tenant_offboard_tests {
             max_bytes: None,
             active: true,
             legal_hold: false,
-            notify_on_upload: false,
+
+            notifications: None,
             uploads: Vec::new(),
             events: Vec::new(),
         }
@@ -5523,14 +5637,7 @@ mod ops_tests {
             web_root: std::path::PathBuf::from("../web"),
             admin_password_hash: crate::auth::hash_password(testing::TEST_PASSWORD).unwrap(),
             admin_token_tag: "tag".to_owned(),
-            notify_webhook: None,
-            notify_slack: None,
-            notify_teams: None,
-            notify_google_chat: None,
-            notify_discord: None,
-            notify_ntfy: None,
-            notify_ntfy_token: None,
-            notify_pushover: None,
+
             smtp_host: None,
             smtp_port: 587,
             smtp_starttls: true,
@@ -5539,7 +5646,7 @@ mod ops_tests {
             scim_token: None,
             replica_token: None,
             smtp_from: None,
-            smtp_to: None,
+
             public_url: None,
             max_upload_bytes: 1024 * 1024,
             workflow_snapshot_bytes: 4 * 1024 * 1024,
@@ -6218,134 +6325,6 @@ mod settings_api_tests {
     }
 
     #[tokio::test]
-    async fn workplace_settings_are_private_validated_and_resettable() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut config = testing::config(directory.path());
-        for url in [
-            &mut config.notify_slack,
-            &mut config.notify_teams,
-            &mut config.notify_google_chat,
-            &mut config.notify_discord,
-        ] {
-            *url = Some("https://env.example/private-hook".to_owned());
-        }
-        let application = app::build(config).unwrap();
-        let cookie = cookie_for(&application, "", "admin");
-        let put = |body: serde_json::Value| {
-            Request::put("/api/admin/settings")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap()
-        };
-        for key in [
-            "notify_slack",
-            "notify_teams",
-            "notify_google_chat",
-            "notify_discord",
-        ] {
-            for bad in [
-                json!("https://"),
-                json!("ftp://host/file"),
-                json!("https://user:password@host/path"),
-                json!("https://host/#secret"),
-                json!("https://host/path\nsecret"),
-                json!(format!("https://host/{}", "x".repeat(8192))),
-                json!(true),
-            ] {
-                assert_eq!(
-                    send(application.clone(), put(json!({key: bad}))).await.0,
-                    StatusCode::UNPROCESSABLE_ENTITY
-                );
-            }
-            for (value, configured, source) in [
-                (
-                    json!("https://saved.example/path?token=private-hook"),
-                    true,
-                    "db",
-                ),
-                (json!(""), false, "db"),
-                (serde_json::Value::Null, true, "env"),
-            ] {
-                let (status, result) = send(application.clone(), put(json!({key: value}))).await;
-                assert_eq!(status, StatusCode::OK);
-                assert_eq!(result[format!("{key}_set")], configured);
-                assert_eq!(result[format!("{key}_source")], source);
-                assert!(result.get(key).is_none());
-                assert!(!result.to_string().contains("private-hook"));
-            }
-        }
-        for (cookie, csrf, expected) in [
-            (String::new(), true, StatusCode::UNAUTHORIZED),
-            (
-                cookie_for(&application, "", "viewer"),
-                true,
-                StatusCode::FORBIDDEN,
-            ),
-            (
-                cookie_for(&application, "named", "admin"),
-                true,
-                StatusCode::FORBIDDEN,
-            ),
-            (cookie.clone(), false, StatusCode::FORBIDDEN),
-        ] {
-            for route in [
-                "/api/admin/settings",
-                "/api/admin/notifications/test?channel=slack",
-            ] {
-                let mut request = if route.ends_with("settings") {
-                    Request::put(route)
-                } else {
-                    Request::post(route)
-                };
-                request = request
-                    .header("cookie", &cookie)
-                    .header("content-type", "application/json");
-                if csrf {
-                    request = request.header("x-votport", "1");
-                }
-                let (status, _) = send(
-                    application.clone(),
-                    request
-                        .body(Body::from(
-                            r#"{"notify_slack":"https://saved.example/private-hook"}"#,
-                        ))
-                        .unwrap(),
-                )
-                .await;
-                assert_eq!(status, expected);
-            }
-        }
-        let (status, _) = send(
-            application.clone(),
-            Request::post("/api/admin/notifications/test?channel=unknown")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(
-            send(application.clone(), put(json!({"notify_slack":""})))
-                .await
-                .0,
-            StatusCode::OK
-        );
-        let (status, _) = send(
-            application,
-            Request::post("/api/admin/notifications/test?channel=slack")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
-    #[tokio::test]
     async fn draining_round_trips_through_the_settings_route() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
@@ -6412,9 +6391,9 @@ mod settings_api_tests {
         assert_eq!(json["audit_retention_days_source"], "env");
         assert_eq!(json["upload_retention_days"], 0);
         assert_eq!(json["upload_retention_days_source"], "env");
-        assert_eq!(json["notify_webhook"], serde_json::Value::Null);
-        assert_eq!(json["notify_webhook_source"], "env");
-        assert_eq!(json["notify_ntfy_token_set"], false);
+        assert_eq!(json["smtp_host"], serde_json::Value::Null);
+        assert_eq!(json["smtp_host_source"], "env");
+        assert_eq!(json["smtp_password_set"], false);
         assert_eq!(json["default_max_total_bytes"], serde_json::Value::Null);
         assert_eq!(json["public_password_login"], true);
         assert_eq!(json["sso_configured"], false);
@@ -6457,17 +6436,6 @@ mod settings_api_tests {
         // password form. Config::admin_token_tag is internal session state,
         // so neither belongs in this API payload.
         for field in [
-            "notify_webhook",
-            "notify_webhook_source",
-            "notify_ntfy",
-            "notify_ntfy_source",
-            "notify_ntfy_token_set",
-            "notify_ntfy_token_source",
-            "notify_pushover_set",
-            "notify_pushover_token_set",
-            "notify_pushover_token_source",
-            "notify_pushover_user_set",
-            "notify_pushover_user_source",
             "smtp_host",
             "smtp_host_source",
             "smtp_port",
@@ -6480,8 +6448,6 @@ mod settings_api_tests {
             "smtp_password_source",
             "smtp_from",
             "smtp_from_source",
-            "smtp_to",
-            "smtp_to_source",
             "audit_retention_days",
             "audit_retention_days_source",
             "upload_retention_days",
@@ -6537,9 +6503,6 @@ mod settings_api_tests {
             "metrics_token",
             "push_private_key",
             "oidc_client_secret",
-            "notify_ntfy_token",
-            "notify_pushover_token",
-            "notify_pushover_user",
             "smtp_password",
         ] {
             assert!(
@@ -6563,7 +6526,7 @@ mod settings_api_tests {
                 .header("x-votport", "1")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"smtp_host":"smtp.example.com","smtp_from":"votport@example.com","smtp_to":"ops@example.com","smtp_password":"s3cret"}"#,
+                    r#"{"smtp_host":"smtp.example.com","smtp_from":"votport@example.com","smtp_password":"s3cret"}"#,
                 ))
                 .unwrap(),
         )
@@ -6589,7 +6552,7 @@ mod settings_api_tests {
                 .header("x-votport", "1")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"audit_retention_days":7,"notify_webhook":"https://db.example/hook"}"#,
+                    r#"{"audit_retention_days":7,"smtp_host":"https://db.example/hook"}"#,
                 ))
                 .unwrap(),
         )
@@ -6597,8 +6560,8 @@ mod settings_api_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["audit_retention_days"], 7);
         assert_eq!(json["audit_retention_days_source"], "db");
-        assert_eq!(json["notify_webhook"], "https://db.example/hook");
-        assert_eq!(json["notify_webhook_source"], "db");
+        assert_eq!(json["smtp_host"], "https://db.example/hook");
+        assert_eq!(json["smtp_host_source"], "db");
         assert_eq!(json["upload_retention_days_source"], "env");
     }
 
@@ -6615,7 +6578,7 @@ mod settings_api_tests {
                 .header("cookie", &cookie)
                 .header("x-votport", "1")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"notify_ntfy_token":"secret-token"}"#))
+                .body(Body::from(r#"{"smtp_password":"secret-token"}"#))
                 .unwrap(),
         )
         .await;
@@ -6633,54 +6596,14 @@ mod settings_api_tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["notify_ntfy_token_set"], true);
-        assert_eq!(json["notify_ntfy_token_source"], "db");
-        assert!(json.get("notify_ntfy_token").is_none());
+        assert_eq!(json["smtp_password_set"], true);
+        assert_eq!(json["smtp_password_source"], "db");
+        assert!(json.get("smtp_password").is_none());
         assert_eq!(json["audit_retention_days"], 10);
     }
 
     #[tokio::test]
-    async fn put_empty_url_disables_env_webhook() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut config = testing::config(directory.path());
-        config.notify_webhook = Some("https://env.example/hook".to_owned());
-        let application = app::build(config).unwrap();
-        let cookie = cookie_for(&application, "", "admin");
-        let (status, json) = send(
-            application.clone(),
-            Request::builder()
-                .method("PUT")
-                .uri("/api/admin/settings")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"notify_webhook":""}"#))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["notify_webhook"], serde_json::Value::Null);
-        assert_eq!(json["notify_webhook_source"], "db");
-
-        let (status, json) = send(
-            application,
-            Request::builder()
-                .method("PUT")
-                .uri("/api/admin/settings")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"notify_webhook":null}"#))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["notify_webhook"], "https://env.example/hook");
-        assert_eq!(json["notify_webhook_source"], "env");
-    }
-
-    #[tokio::test]
-    async fn put_rejects_zero_default_quota_and_non_http_url() {
+    async fn put_rejects_zero_default_quota_and_unknown_settings() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
         let cookie = cookie_for(&application, "", "admin");
@@ -6721,7 +6644,9 @@ mod settings_api_tests {
                 .header("cookie", &cookie)
                 .header("x-votport", "1")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"notify_webhook":"ftp://nope"}"#))
+                .body(Body::from(
+                    r#"{"removed_notification_setting":"ftp://nope"}"#,
+                ))
                 .unwrap(),
         )
         .await;
@@ -6820,7 +6745,8 @@ mod settings_api_tests {
                 max_bytes: None,
                 active: true,
                 legal_hold: false,
-                notify_on_upload: false,
+
+                notifications: None,
                 uploads: Vec::new(),
                 events: Vec::new(),
             })
@@ -6962,7 +6888,8 @@ mod settings_api_tests {
                 max_bytes: None,
                 active: true,
                 legal_hold: false,
-                notify_on_upload: false,
+
+                notifications: None,
                 uploads: Vec::new(),
                 events: Vec::new(),
             })
@@ -7595,7 +7522,6 @@ mod notification_and_limit_tests {
 
     use axum::body::Body;
     use axum::http::Request;
-    use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
 
     use crate::api::testing;
@@ -7712,53 +7638,6 @@ mod notification_and_limit_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn notification_test_requires_a_saved_channel() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        let response = app::router(application.clone())
-            .oneshot(
-                Request::post("/api/admin/notifications/test")
-                    .header("cookie", admin_cookie(&application))
-                    .header("x-votport", "1")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
-    #[tokio::test]
-    async fn notification_test_reports_saved_channel_failures() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut application = testing::build(directory.path());
-        Arc::get_mut(&mut application)
-            .unwrap()
-            .config
-            .notify_webhook = Some("http://127.0.0.1:9/notification-test".to_owned());
-        let response = app::router(application.clone())
-            .oneshot(
-                Request::post("/api/admin/notifications/test")
-                    .header("cookie", admin_cookie(&application))
-                    .header("x-votport", "1")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        let body: serde_json::Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert_eq!(body["configured"], 1);
-        assert_eq!(body["delivered"], 0);
-        assert_eq!(
-            body["error"],
-            "Delivered 0 of 1 configured notification channels"
-        );
     }
 }
 

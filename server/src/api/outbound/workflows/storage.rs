@@ -51,6 +51,9 @@ pub enum Credentials {
         secret_access_key: String,
         session_token: Option<String>,
     },
+    TradeRoute {
+        route_id: String,
+    },
     Votport {
         request_url: String,
         password: Option<String>,
@@ -273,8 +276,13 @@ pub async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<
             .store
             .delivery_storage_has_credentials(&config.id)
             .map_err(crate::api::store_unavailable)?;
+        let paired = app
+            .store
+            .is_trade_route(&config.id)
+            .map_err(crate::api::store_unavailable)?;
         let mut public =
             serde_json::to_value(config).map_err(|e| ApiError::internal(e.to_string()))?;
+        public["trade_route"] = json!(paired);
         public["credential_source"] = json!(if saved { "saved" } else { "server" });
         storage.push(public);
     }
@@ -297,6 +305,14 @@ pub async fn put(
             StatusCode::FORBIDDEN,
             "platform administrator required for storage connections",
         ));
+    }
+    if app
+        .store
+        .is_trade_route(&body.storage.id)
+        .map_err(crate::api::store_unavailable)?
+        || matches!(body.credentials, Some(Credentials::TradeRoute { .. }))
+    {
+        return Err(conflict("Manage paired routes in Trade routes".into()));
     }
     body.storage.validate().map_err(conflict)?;
     let storage = app
@@ -740,6 +756,16 @@ pub(super) async fn export(app: &Arc<App>, job: &Job) -> ApiResult<()> {
             app.store
                 .fail_delivery_destination(&job.id, job.attempts, &config.id, &error.message)
                 .map_err(conflict)?;
+            if job.checks["destinations"][&config.id]["state"] != "failed" {
+                if let (Ok(route), Ok(policy)) = (
+                    app.store.trade_route(&job.tenant, &config.id),
+                    serde_json::from_value(
+                        job.checks["trade_routes"][&config.id]["notifications"].clone(),
+                    ),
+                ) {
+                    crate::notify::trade_event(app, &route, &policy, "route_failed").await;
+                }
+            }
             failures.push(format!("{}: {}", config.label, error.message));
         }
     }

@@ -14,16 +14,17 @@ pub fn run(args: &[String]) -> Result<Value, Value> {
             "--expires-days",
             "--label",
             "--max-downloads",
+            "--notifications",
         ],
         "deliveries" | "jobs" | "events" | "job-evidence" => &["--after", "--limit"],
         "delivery" => &["--offset", "--limit"],
-        "session" | "recover" | "revoke" | "projects" | "job" | "create-job" | "retry-job"
-        | "cancel-job" => &[],
+        "notifications" | "session" | "recover" | "revoke" | "projects" | "job" | "create-job"
+        | "retry-job" | "cancel-job" => &[],
         _ => return Err(invalid("unknown agent command")),
     };
     let (options, positional, _) = super::parse(args, valued).map_err(|e| invalid(&e))?;
     let count = match command.as_str() {
-        "session" | "deliveries" | "projects" | "jobs" | "events" => 0..=0,
+        "notifications" | "session" | "deliveries" | "projects" | "jobs" | "events" => 0..=0,
         "files" => 0..=1,
         _ => 1..=1,
     };
@@ -38,6 +39,7 @@ pub fn run(args: &[String]) -> Result<Value, Value> {
     let client = Automation::from_env().map_err(|e| error_json(&e))?;
     let result = match command.as_str() {
         "session" => client.session(),
+        "notifications" => client.notification_destinations(),
         "projects" => client.projects(),
         "jobs" => client.jobs(
             options.get("--after").map(String::as_str),
@@ -97,6 +99,13 @@ pub fn run(args: &[String]) -> Result<Value, Value> {
             }
             if options.contains_key("--max-downloads") {
                 request["max_downloads"] = json!(number("--max-downloads", 1)?);
+            }
+            if let Some(policy) = options.get("--notifications") {
+                if policy.len() > 65536 {
+                    return Err(invalid("notification policy exceeds 64 KiB"));
+                }
+                request["notifications"] = serde_json::from_str(policy)
+                    .map_err(|_| invalid("--notifications requires a JSON notification policy"))?;
             }
             client.create_delivery(&request)
         }

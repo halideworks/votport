@@ -23,6 +23,61 @@ pub struct RouteDocument {
     pub metadata: BTreeMap<String, String>,
     pub parent_receipt: Option<String>,
     pub visited: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<RoutePermission>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutePermission {
+    pub receiver: String,
+    pub grant: String,
+    pub forwarding: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortMessage {
+    pub issuer: String,
+    pub audience: String,
+    pub purpose: String,
+    pub nonce: String,
+    pub expires_at: u64,
+    pub body: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedPortMessage {
+    pub document: PortMessage,
+    pub signature: String,
+}
+
+impl SignedPortMessage {
+    pub fn sign(mut document: PortMessage, key: &SigningKey) -> Self {
+        document.issuer = hex::encode(key.verifying_key().as_bytes());
+        let signature = hex::encode(
+            key.sign(&message(b"votport-port-message-v1\0", &document))
+                .to_bytes(),
+        );
+        Self {
+            document,
+            signature,
+        }
+    }
+
+    pub fn verify(&self, purpose: &str, audience: &str, now: u64) -> bool {
+        self.document.purpose == purpose
+            && self.document.audience == audience
+            && self.document.expires_at > now
+            && id(&self.document.nonce)
+            && digest(&self.document.issuer)
+            && verify(
+                &self.document.issuer,
+                &self.signature,
+                &message(b"votport-port-message-v1\0", &self.document),
+            )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -149,6 +204,10 @@ impl SignedRoute {
                 .len()
                 == document.visited.len()
             && document.visited.last() == Some(&document.issuer)
+            && document
+                .permission
+                .as_ref()
+                .is_none_or(|permission| digest(&permission.receiver) && id(&permission.grant))
             && verify(
                 &document.issuer,
                 &self.signature,
@@ -160,6 +219,11 @@ impl SignedRoute {
         self.verify()
             && digest(receiver)
             && !self.document.visited.iter().any(|port| port == receiver)
+            && self
+                .document
+                .permission
+                .as_ref()
+                .is_none_or(|permission| permission.receiver == receiver)
     }
 }
 
@@ -169,6 +233,13 @@ pub fn verify_ancestry(source: &SignedRoute, ancestors: &[RouteReceipt]) -> bool
         && source.document.parent_receipt == ancestors.last().map(RouteReceipt::digest)
         && ancestors.iter().enumerate().all(|(index, receipt)| {
             receipt.verify(&source.document.visited[index + 1])
+                && receipt
+                    .document
+                    .source
+                    .document
+                    .permission
+                    .as_ref()
+                    .is_none_or(|permission| permission.forwarding)
                 && receipt.document.source.document.visited == source.document.visited[..index + 1]
                 && receipt.document.source.document.manifest == source.document.manifest
                 && receipt.document.source.document.parent_receipt
@@ -294,6 +365,7 @@ mod tests {
             metadata: BTreeMap::new(),
             parent_receipt: None,
             visited: vec![source_key.clone()],
+            permission: None,
         };
         let source = SignedRoute::sign(document.clone(), &origin);
         assert!(source.admits(&receiver_key));
@@ -311,6 +383,7 @@ mod tests {
                 metadata: BTreeMap::new(),
                 parent_receipt: Some(receipt.digest()),
                 visited: vec![source_key.clone(), receiver_key.clone()],
+                permission: None,
             },
             &receiver,
         );

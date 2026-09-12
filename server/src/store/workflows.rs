@@ -307,6 +307,7 @@ pub(super) fn queue_received(
     if count >= 1000 {
         error = Some("active job limit reached; retry after other jobs finish".into());
     }
+    let checks = trade::snapshot(connection, tenant, &project)?;
     let job = Job {
         id: crate::auth::random_token(),
         tenant: tenant.into(),
@@ -323,7 +324,7 @@ pub(super) fn queue_received(
         created_at: now,
         updated_at: now,
         error,
-        checks: serde_json::json!({}),
+        checks,
         received: Some(crate::workflow::Received {
             link_id: link_id.into(),
             upload_id: upload.id.clone(),
@@ -453,6 +454,21 @@ impl Store {
         }
         let mut connection = self.connection.lock().expect("store poisoned");
         let tx = connection.transaction().map_err(|e| e.to_string())?;
+        let paired: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM trade_routes WHERE id=?1)",
+                [&storage.id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if paired
+            || matches!(
+                credentials,
+                Some(crate::api::outbound::workflows::storage::Credentials::TradeRoute { .. })
+            )
+        {
+            return Err("manage paired connections in Trade routes".into());
+        }
         for tenant in &storage.tenants {
             ensure_tenant(&tx, tenant)?;
         }
@@ -521,7 +537,9 @@ impl Store {
                     )
                     .map_err(|e| e.to_string())?;
                 }
-                Credentials::AccessKey { .. } | Credentials::Votport { .. } => {
+                Credentials::AccessKey { .. }
+                | Credentials::Votport { .. }
+                | Credentials::TradeRoute { .. } => {
                     tx.execute("INSERT INTO delivery_storage_credentials(id,document) VALUES (?1,?2) ON CONFLICT(id) DO UPDATE SET document=excluded.document", params![storage.id, serde_json::to_string(&credentials).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
                 }
             }
@@ -572,6 +590,7 @@ impl Store {
         let mut connection = self.connection.lock().expect("store poisoned");
         let tx = connection.transaction().map_err(|e| e.to_string())?;
         let mut job = export_in(&tx, id, attempt)?;
+        trade::check_destination(&tx, &job, destination)?;
         if !job.project.destinations.iter().any(|id| id == destination) {
             return Err("destination is not part of this job".into());
         }
@@ -645,7 +664,10 @@ impl Store {
         let tx = connection.transaction().map_err(|e| e.to_string())?;
         ensure_tenant(&tx, tenant)?;
         let current = project_in(&tx, tenant, &project.id).map_err(|e| e.to_string())?;
-        if current.as_ref().map_or(0, |p| p.revision) != project.revision {
+        if current.as_ref().map_or(0, |p| p.revision) != project.revision
+            || current.as_ref().map_or(0, |p| p.notification_revision)
+                != project.notification_revision
+        {
             return Err("project changed; reload before saving".into());
         }
         if current
@@ -676,7 +698,18 @@ impl Store {
             return Err("project limit reached".into());
         }
         drop(query);
-        project.revision += 1;
+        let notifications_only = current.as_ref().is_some_and(|p| {
+            p.notifications != project.notifications && p.same_delivery_policy(&project)
+        });
+        if current
+            .as_ref()
+            .is_some_and(|p| p.notifications != project.notifications)
+        {
+            project.notification_revision += 1;
+        }
+        if !notifications_only {
+            project.revision += 1;
+        }
         tx.execute("INSERT INTO delivery_projects(tenant,id,revision,document) VALUES (?1,?2,?3,?4) ON CONFLICT(tenant,id) DO UPDATE SET revision=excluded.revision,document=excluded.document", params![tenant,project.id,project.revision as i64,serde_json::to_string(&project).expect("project serializes")]).map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM delivery_policy_cache WHERE grant_id IN (SELECT id FROM outbound_grants WHERE tenant=?1)",[tenant]).map_err(|error| error.to_string())?;
         evidence::delivery_event(&tx, &self.event_signer, tenant, "", "project_policy_changed", &serde_json::json!({"project_id": project.id, "revision": project.revision, "actor": actor}), now_unix()).map_err(|e| e.to_string())?;
@@ -717,6 +750,7 @@ impl Store {
         if count >= 1000 {
             return Err("active job limit reached".into());
         }
+        let checks = trade::snapshot(&tx, tenant, &project)?;
         let job = Job {
             id: crate::auth::random_token(),
             tenant: tenant.into(),
@@ -733,7 +767,7 @@ impl Store {
             created_at: now,
             updated_at: now,
             error: None,
-            checks: serde_json::json!({}),
+            checks,
             received: None,
         };
         actor_active(&tx, &job)?;
@@ -761,14 +795,37 @@ impl Store {
         tenant: &str,
         after: &str,
         limit: usize,
+        projects: Option<&[String]>,
+        state: &str,
+        search: &str,
     ) -> Result<Vec<Job>, String> {
+        let projects = projects
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| e.to_string())?;
         self.with(|connection| {
             let mut query = connection.prepare(
-                "SELECT document FROM delivery_jobs WHERE tenant=?1 AND id>?2 ORDER BY id LIMIT ?3",
+                "SELECT document FROM delivery_jobs WHERE tenant=?1 AND id>?2
+                 AND (?4 IS NULL OR project_id IN (SELECT value FROM json_each(?4)))
+                 AND (?5='' OR state=?5
+                    OR (?5='attention' AND state IN ('awaiting_approval','failed','retrying'))
+                    OR (?5='active' AND state IN ('queued','preparing','exporting','retrying')))
+                 AND (?6='' OR instr(lower(json_extract(document,'$.request.label')),lower(?6))>0
+                    OR instr(lower(json_extract(document,'$.project.label')),lower(?6))>0
+                    OR instr(lower(id),lower(?6))>0)
+                 ORDER BY id LIMIT ?3",
             )?;
-            let rows = query.query_map(params![tenant, after, limit.min(100) as i64], |row| {
-                decode(row.get(0)?)
-            })?;
+            let rows = query.query_map(
+                params![
+                    tenant,
+                    after,
+                    limit.min(101) as i64,
+                    projects,
+                    state,
+                    search
+                ],
+                |row| decode(row.get(0)?),
+            )?;
             rows.collect()
         })
     }
@@ -1016,6 +1073,7 @@ impl Store {
 }
 
 fn check_job_storage(connection: &Connection, job: &Job) -> Result<(), String> {
+    trade::check_export(connection, job)?;
     let mut connections = job
         .project
         .destinations
@@ -1065,7 +1123,7 @@ fn export_in(connection: &Connection, id: &str, attempt: u64) -> Result<Job, Str
         .ok_or("project missing")?;
     if job.state != "exporting"
         || job.attempts != attempt
-        || job.project != project
+        || !job.project.same_delivery_policy(&project)
         || (project.require_approval && job.approved_by.is_none())
     {
         return Err("export is no longer authorized".into());
@@ -1147,6 +1205,89 @@ mod tests {
     use crate::workflow::tests::{project, request};
 
     #[test]
+    fn unenrolled_route_keeps_the_received_job_recoverable() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let route = crate::store::TradeRoute {
+            id: "pending-route".into(),
+            revision: 1,
+            tenant: String::new(),
+            direction: "outgoing".into(),
+            name: "Partner".into(),
+            peer_name: "Partner".into(),
+            peer_key: "ab".repeat(32),
+            address: "http://localhost".into(),
+            endpoint: "remote-endpoint".into(),
+            endpoint_name: "Masters".into(),
+            category: "external".into(),
+            forwarding: false,
+            metadata_keys: vec![],
+            state: "pending_approval".into(),
+            notifications: Default::default(),
+            last_contact: None,
+            error: None,
+            remote_grant: String::new(),
+            remote_state: "enrolling".into(),
+            cancel_active: false,
+        };
+        let invitation = store.event_signer.port_message(
+            "invitation",
+            "",
+            "nonce".into(),
+            now_unix() + 300,
+            serde_json::json!({}),
+        );
+        store
+            .save_outgoing_trade(&route, &crate::auth::random_token(), &invitation)
+            .unwrap();
+        let mut policy = project();
+        policy.receive = true;
+        policy.destinations = vec![route.id.clone()];
+        let policy = store.save_delivery_project("", "admin", policy).unwrap();
+        let workflow = crate::workflow::ReceiveWorkflow {
+            notifications: None,
+            project_id: policy.id,
+            metadata: request().metadata,
+            recipients: vec![],
+        };
+        let link = crate::store::tests::test_link("incoming");
+        store
+            .insert_link_with_workflow(link.clone(), Some(&workflow))
+            .unwrap();
+        let upload = UploadRecord {
+            id: "complete".into(),
+            started_at: 1,
+            completed_at: 2,
+            replayed_chunks: 0,
+            rejected_chunks: 0,
+            transport: Some("http".into()),
+            package_root: "package".into(),
+            total_bytes: 1,
+            partial: false,
+            log: vec![],
+            files: vec![FileRecord {
+                path: "file.bin".into(),
+                stored_as: "file.bin".into(),
+                bytes: 1,
+                suite: "blake3".into(),
+                root: "root".into(),
+                receipt: true,
+                deleted: false,
+            }],
+        };
+        store.append_upload("", &link.id, upload).unwrap();
+        // The upload is recorded and the job waits with an empty grant that
+        // preparation fills in once enrollment finishes.
+        let jobs = store.delivery_jobs("", "", 100, None, "", "").unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].state, "queued");
+        assert_eq!(
+            jobs[0].checks["trade_routes"][&route.id]["permission"]["grant"],
+            ""
+        );
+    }
+
+    #[test]
     fn partial_reception_stays_protected_without_queuing_copies() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -1154,6 +1295,7 @@ mod tests {
         policy.receive = true;
         let policy = store.save_delivery_project("", "admin", policy).unwrap();
         let workflow = crate::workflow::ReceiveWorkflow {
+            notifications: None,
             project_id: policy.id,
             metadata: request().metadata,
             recipients: vec![],
@@ -1189,7 +1331,10 @@ mod tests {
         store.insert_outbound_grant(raw.clone()).unwrap();
         assert!(store.delivery_release(&raw.id).unwrap().is_none());
         store.append_upload("", &link.id, upload.clone()).unwrap();
-        assert!(store.delivery_jobs("", "", 100).unwrap().is_empty());
+        assert!(store
+            .delivery_jobs("", "", 100, None, "", "")
+            .unwrap()
+            .is_empty());
         assert!(!store.receive_workflow_pending("", &link.id).unwrap());
         assert!(store.delivery_release(&raw.id).is_err());
         raw.id = "refused".into();
@@ -1268,7 +1413,7 @@ mod tests {
             upgraded.delivery_project("", &policy.id).unwrap().unwrap(),
             policy
         );
-        for job in upgraded.delivery_jobs("", "", 100).unwrap() {
+        for job in upgraded.delivery_jobs("", "", 100, None, "", "").unwrap() {
             assert_eq!(job.project, policy);
             if job.manifest.is_some() {
                 assert_eq!(

@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="robots" content="noindex" />
+    <title>VOTPort · Notifications</title>
+    <link rel="icon" type="image/png" href="/assets/favicon.png" />
+    <link rel="stylesheet" href="/assets/style.css" />
+    <link rel="stylesheet" href="/assets/admin-navigation.css" />
+    <link rel="preload" href="/assets/fonts/PlusJakartaSans-300.woff2?v=153fc85b70298bee" as="font" type="font/woff2" crossorigin />
+    <script src="/assets/theme.js"></script>
+    <!-- The whole module graph fetches at once instead of one import level per round trip. -->
+    <link rel="modulepreload" href="/assets/page-notifications.js" />
+    <link rel="modulepreload" href="/assets/admin-common.js" />
+    <link rel="modulepreload" href="/assets/hints.js" />
+    <link rel="modulepreload" href="/assets/form-drafts.js" />
+    <link rel="modulepreload" href="/assets/notifications.js" />
+    <link rel="modulepreload" href="/assets/object-card.js" />
+    <link rel="modulepreload" href="/assets/undo.js" />
+  </head>
+  <body>
+    <div class="sheet">
+      <header class="masthead">
+        <div class="hero-brand">
+          <div class="brand-square"><img src="/assets/pommern_ship_white.png?v=70fc77f19116a72e" alt="" /></div>
+          <span class="wordmark">VOTPort</span>
+          <div class="brand-actions">
+            <button id="theme-toggle" class="link theme-toggle" aria-label="Switch theme"></button>
+            <button id="logout" class="ghost tiny">Sign out</button>
+          </div>
+        </div>
+        <select id="tenant-switcher" aria-label="Tenant" hidden></select>
+      </header>
+      <div class="bar">
+        <nav id="nav" class="nav"></nav>
+        <form id="global-search" class="global-search" role="search" autocomplete="off">
+          <input id="global-search-input" type="search" placeholder="Search requests, downloads, files, audit" aria-label="Search" maxlength="200" />
+          <div id="global-search-results" class="search-results" hidden></div>
+        </form>
+      </div>
+
+      <div class="page-heading"><div><p class="eyebrow">Team updates</p><h1>Notifications</h1><p class="page-lead">Choose who hears about received files, delivery progress, and failures.</p></div><button id="notification-new" type="button">Add destination</button></div>
+      <p id="notification-error" class="error feedback" role="alert" hidden></p>
+      <p id="notification-notice" class="feedback" role="status"></p>
+      <div class="info-banner"><strong>1. Add a destination · 2. Send a test · 3. Choose events</strong><p>Add as many Slack channels, Teams chats or other destinations as you need. Each destination has its own connection and can receive different events.</p></div>
+      <p class="field-help">Destinations belong to the current tenant. Adding one does not subscribe existing transfers. Choose destinations on a request, delivery, or workflow, or include them in tenant defaults.</p>
+      <form data-unsaved id="notification-form" class="card editor" hidden>
+        <div class="section-heading"><h2 id="notification-editor-title">Add destination</h2><button id="notification-cancel" type="button" class="ghost">Cancel</button></div>
+        <div class="grid"><label>Name<input id="nd-label" required maxlength="100" placeholder="Production updates" /></label><label>Service<select id="nd-channel"></select></label></div>
+        <label>Channel, chat or recipients<input id="nd-target" required maxlength="200" placeholder="Production workspace · #incoming" /><span class="field-help">A label to help your team choose. The webhook or recipients determine where messages arrive.</span></label>
+        <p id="nd-guide" class="field-help"></p>
+        <label id="nd-url-field">Webhook or topic URL<input id="nd-url" type="password" autocomplete="new-password" maxlength="8192" spellcheck="false" /><span class="field-help">Use a separate destination for each channel or chat. When editing, leave blank to keep the saved URL.</span></label>
+        <label id="nd-token-field">Application or bearer token<input id="nd-token" type="password" autocomplete="new-password" maxlength="8192" /><span class="field-help">Blank preserves the saved token.</span></label>
+        <label id="nd-clear-token-field" class="check"><input id="nd-clear-token" type="checkbox" /> Remove saved bearer token</label>
+        <label id="nd-user-field">Pushover user or group key<input id="nd-user" type="password" autocomplete="new-password" maxlength="8192" /></label>
+        <label id="nd-recipients-field">Email recipients<textarea id="nd-recipients" rows="3" placeholder="operations@example.com"></textarea><span class="field-help">One address per line, up to 50. Uses the server's SMTP relay.</span></label>
+        <label id="nd-thread-field">Discord thread ID<input id="nd-thread" maxlength="20" inputmode="numeric" pattern="[0-9]*" /><span class="field-help">Optional for text channels. Forum and media channels require a thread.</span></label>
+        <label class="check"><input id="nd-enabled" type="checkbox" checked /> Destination enabled</label>
+        <div class="actions"><button type="submit">Save destination</button></div>
+      </form>
+      <div class="section-heading"><h2>Destinations</h2><button id="notification-refresh" type="button" class="ghost">Refresh</button></div>
+      <div id="notification-destinations" class="connection-grid"></div>
+      <form data-unsaved id="notification-defaults-form" class="card">
+        <div class="section-heading"><h2>Tenant defaults <button type="button" class="hint-button" aria-label="Help about notification defaults" data-hint="Items using tenant defaults follow changes here immediately. Items set to Off or custom destinations keep their own choices.">?</button></h2></div><p class="field-help">These settings apply only where “Use tenant defaults” is selected. Changes affect those subscriptions immediately.</p>
+        <div id="notification-defaults"></div><button id="notification-defaults-save" type="submit">Save defaults</button><p id="notification-defaults-status" class="field-help" role="status"></p>
+      </form>
+      <p class="sheet-foot"><span class="footer-custom"></span><span>Powered by Verified Object Transport (VOT) · <a href="https://votport.com" target="_blank" rel="noopener noreferrer">VOTPort</a></span></p>
+    </div>
+
+    <dialog id="confirm" class="modal" aria-labelledby="confirm-title" aria-describedby="confirm-detail">
+      <form method="dialog">
+        <h2 id="confirm-title">Confirm</h2>
+        <p id="confirm-detail"></p>
+        <div class="modal-actions">
+          <button value="cancel" class="ghost" id="confirm-cancel">Cancel</button>
+          <button value="ok" class="danger" id="confirm-ok">Delete</button>
+        </div>
+      </form>
+    </dialog>
+    <script type="module" src="/assets/admin-common.js"></script>
+    <script type="module" src="/assets/page-notifications.js"></script>
+  </body>
+</html>

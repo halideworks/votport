@@ -1,0 +1,75 @@
+import { openAncestors } from './browser-helpers.mjs';
+import assert from 'node:assert/strict';
+import path from 'node:path';
+import { chromium } from 'playwright';
+
+const base = process.env.BASE_URL, root = process.env.WORKFLOW_TEST_ROOT;
+if (!base || !root || !process.env.ADMIN_PASSWORD) throw new Error('Use an isolated instance with BASE_URL, WORKFLOW_TEST_ROOT and ADMIN_PASSWORD.');
+const browser = await chromium.launch();
+const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, reducedMotion: 'reduce' });
+const page = await context.newPage(), errors = [];
+page.on('dialog', (dialog) => dialog.accept());
+page.on('pageerror', (error) => errors.push(error.message));
+const api = async (route, data, method = data ? 'POST' : 'GET') => {
+  const response = await context.request.fetch(`${base}/api/${route}`, { method, data, headers: { 'X-Votport': '1' } });
+  assert.ok(response.ok(), `${route}: ${response.status()} ${await response.text()}`); return response.json();
+};
+try {
+  await api('admin/login', { password: process.env.ADMIN_PASSWORD });
+  await page.goto(`${base}/system#branding`);
+  await page.fill('#branding-footer-text', 'Studio delivery <help>');
+  await page.fill('#branding-footer-link-label', 'Privacy policy');
+  await page.fill('#branding-footer-link-url', 'https://studio.example/privacy#terms');
+  await page.locator('#branding-form button[type=submit]').click();
+  await page.locator('#branding-note').getByText('Saved.', { exact: true }).waitFor();
+  assert.equal(await page.locator('.footer-custom').innerText(), 'Studio delivery <help> · Privacy policy');
+  assert.equal(await page.locator('.footer-custom help').count(), 0);
+  assert.equal(await page.locator('.sheet-foot').getByRole('link', { name: 'VOTPort', exact: true }).getAttribute('href'), 'https://votport.com');
+  await page.reload();
+  await page.waitForFunction(() => document.querySelector('#branding-footer-text').value === 'Studio delivery <help>');
+  assert.equal(await page.locator('#branding-footer-link-url').inputValue(), 'https://studio.example/privacy#terms');
+  await page.goto(base);
+  assert.ok((await page.locator('.footer-custom').innerText()).includes('Studio delivery <help>'));
+  const created = await api('admin/links', { label: 'Footer recipient fixture', dest: `footer-${Date.now()}`, expires_days: 1, notifications: { mode: 'off' } });
+  await page.goto(created.link.url);
+  await page.locator('.footer-custom').getByRole('link', { name: 'Privacy policy', exact: true }).waitFor();
+  assert.ok((await page.locator('.footer-custom').innerText()).includes('Studio delivery <help>'));
+  await page.goto(`${base}/storage`);
+  await page.click('#storage-new');
+  await openAncestors(page.locator('#ws-id'));
+  await page.getByLabel(/^Local connection ID/).waitFor();
+  assert.equal(await page.locator('#ws-kind option[value=votport]').count(), 0);
+  const hint = page.getByRole('button', { name: 'Help about local connection IDs', exact: true });
+  await hint.hover();
+  await page.locator('.field-hint:popover-open').waitFor();
+  assert.ok((await page.locator('.field-hint:popover-open').innerText()).includes('Scripts and agents'));
+  await page.keyboard.press('Escape');
+  await page.locator('.field-hint:popover-open').waitFor({ state: 'hidden' });
+  await page.mouse.move(0, 0);
+  await hint.focus();
+  assert.equal(await hint.evaluate((element) => element === document.activeElement), true);
+  await page.locator('.field-hint:popover-open').waitFor();
+  await page.keyboard.press('Escape');
+  for (const width of [1440, 390, 320]) {
+    await page.setViewportSize({ width, height: 1000 });
+    await hint.click();
+    await page.locator('.field-hint:popover-open').waitFor();
+    const box = await page.locator('.field-hint:popover-open').boundingBox();
+    assert.ok(box.x >= 0 && box.x + box.width <= width, `Hint overflow at ${width}: ${JSON.stringify(box)}`);
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `Page overflow at ${width}`);
+    if (width !== 320) await page.screenshot({ path: path.join(root, `branding-hints-${width}.png`) });
+    await page.keyboard.press('Escape');
+  }
+  const mobile = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  await mobile.addCookies(await context.cookies()); const touch = await mobile.newPage();
+  await touch.goto(`${base}/system#branding`);
+  await touch.getByRole('button', { name: 'Help about footer branding', exact: true }).tap();
+  await touch.locator('.field-hint:popover-open').waitFor();
+  await touch.locator('#branding-name').tap();
+  await touch.locator('.field-hint:popover-open').waitFor({ state: 'hidden' });
+  await mobile.close();
+  await api('admin/branding/default', { name: '', color: '', footer_text: '', footer_link_label: '', footer_link_url: '' }, 'PUT');
+  await page.goto(base); assert.equal(await page.locator('.footer-custom').innerText(), '');
+  assert.deepEqual(errors, []);
+  console.log('Footer and hint browser checks passed: save/reload, recipient branding, safe text, credits, clear, local connection labels, mouse, keyboard, touch, and responsive layout.');
+} finally { await browser.close(); }

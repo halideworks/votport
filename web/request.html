@@ -63,12 +63,12 @@
       <!-- Desktop only: the app registers the votport: scheme. -->
       <p class="muted" id="open-in-app" hidden><a id="open-in-app-link" class="link-action" href="#">Open in the votport app</a></p>
 
-      <button type="submit" id="send" disabled>Ship</button>
+      <button type="submit" id="send" disabled>Ship files</button>
       <p class="error" id="upload-error" role="alert" hidden></p>
     </form>
 
     <div id="progress-card" class="card" hidden>
-      <h2>Shipping</h2>
+      <h2>Shipping files</h2>
       <p id="phase" role="status">Preparing&hellip;</p>
       <div id="meter" class="meter" role="progressbar" aria-label="Transfer progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="meter-fill"></div></div>
       <p class="muted" id="progress-note"></p>
@@ -78,7 +78,7 @@
     </div>
 
     <div id="done-card" class="card ok" hidden>
-      <h2>Shipped &amp; verified</h2>
+      <h2>Files shipped &amp; verified <button type="button" class="hint-button" aria-label="Help about verified arrival" data-hint="The receiving port checked the uploaded bytes and issued a signed receipt. Any processing or approval workflow runs separately after arrival.">?</button></h2>
       <p id="done-summary"></p>
       <div class="actions done-actions">
         <button type="button" id="copy-proof" class="tiny">Copy proof</button>
@@ -88,7 +88,7 @@
     </div>
   </section>
 
-  <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
+  <p class="sheet-foot"><span class="footer-custom"></span><span>Powered by Verified Object Transport (VOT) · <a href="https://votport.com" target="_blank" rel="noopener noreferrer">VOTPort</a></span></p>
 </div>
 
 <!-- Native <dialog>: focus trap, Esc to dismiss and a backdrop come with it.
@@ -104,6 +104,7 @@
   </form>
 </dialog>
 
+<script type="module" src="/assets/hints.js"></script>
 <script type="module" src="/assets/upload.js"></script>
 </body>
 </html>

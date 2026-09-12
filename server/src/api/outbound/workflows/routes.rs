@@ -7,15 +7,19 @@ pub struct RouteRequest {
     source: SignedRoute,
     password: Option<String>,
     #[serde(default)]
+    credential: Option<String>,
+    #[serde(default)]
     ancestry: Vec<crate::route_protocol::RouteReceipt>,
 }
 
+// The body limits on these two public routes are megabytes; the gates run
+// before the body is read so an unauthorised caller costs nothing to hold.
 pub async fn receive(
     State(app): State<Arc<App>>,
     AxumPath(token): AxumPath<String>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
-    Json(request): Json<RouteRequest>,
+    request: Request,
 ) -> ApiResult<Response> {
     if !headers.contains_key("x-votport") {
         return Err(ApiError::new(
@@ -29,6 +33,9 @@ pub async fn receive(
         .upload_link(&token)
         .map_err(crate::api::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
+    let Json(request) = Json::<RouteRequest>::from_request(request, &app)
+        .await
+        .map_err(|error| ApiError::new(error.status(), error.body_text()))?;
     let ip = crate::api::client_ip(&headers, &peer, &app.config.trusted_proxies);
     crate::api::upload::check_password(
         &app,
@@ -40,7 +47,13 @@ pub async fn receive(
     .await?;
     let route = app
         .store
-        .receive_route(&link.tenant, &link.id, &request.source, &request.ancestry)
+        .receive_route_authorized(
+            &link.tenant,
+            &link.id,
+            &request.source,
+            &request.ancestry,
+            request.credential.as_deref(),
+        )
         .map_err(conflict)?;
     let session = route
         .session_id
@@ -55,6 +68,15 @@ pub(crate) fn admission(
     link_id: &str,
 ) -> ApiResult<Option<crate::store::InboundRoute>> {
     let Some(token) = token else {
+        if app
+            .store
+            .is_trade_endpoint(link_id)
+            .map_err(crate::api::store_unavailable)?
+        {
+            return Err(conflict(
+                "This receiving endpoint requires an enrolled trade route".into(),
+            ));
+        }
         return Ok(None);
     };
     if !valid_token(token) {
@@ -91,12 +113,13 @@ async fn command(
     password: Option<&str>,
     source: &SignedRoute,
     ancestry: &[crate::route_protocol::RouteReceipt],
+    credential: Option<&str>,
 ) -> ApiResult<RemoteRoute> {
     let response = app
         .http
         .post(format!("{origin}/api/r/{token}/route"))
         .header("X-Votport", "1")
-        .json(&json!({"password":password,"source":source,"ancestry":ancestry}))
+        .json(&json!({"password":password,"source":source,"ancestry":ancestry,"credential":credential}))
         .send()
         .await
         .map_err(|_| conflict("could not reach the destination port".into()))?;
@@ -156,10 +179,20 @@ impl votport_client_core::progress::Observer for Progress {
     fn cancelled(&self) -> bool {
         if self.checked.get().elapsed() >= std::time::Duration::from_millis(250) {
             self.checked.set(std::time::Instant::now());
+            let route_cancelled = self.job.checks["trade_routes"]
+                .get(&self.destination)
+                .is_some()
+                && self
+                    .app
+                    .store
+                    .require_trade_destination(&self.job, &self.destination)
+                    .is_err();
             self.cancelled.set(
-                self.app
-                    .lease_lost
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                route_cancelled
+                    || self
+                        .app
+                        .lease_lost
+                        .load(std::sync::atomic::Ordering::Relaxed)
                     || self
                         .app
                         .store
@@ -172,19 +205,55 @@ impl votport_client_core::progress::Observer for Progress {
 }
 
 pub(super) async fn export(app: &Arc<App>, job: &Job, config: &storage::Storage) -> ApiResult<()> {
-    let Some(storage::Credentials::Votport {
-        request_url,
-        password,
-    }) = app
+    let credentials = app
         .store
         .delivery_storage_credentials(&config.id, config.revision)
-        .map_err(conflict)?
-    else {
-        return Err(conflict(
-            "destination receive credentials are missing".into(),
-        ));
+        .map_err(conflict)?;
+    let (origin, token, password, trade) = match credentials {
+        Some(storage::Credentials::Votport {
+            request_url,
+            password,
+        }) => {
+            let (origin, token) = storage::receive_url(&request_url).map_err(conflict)?;
+            (origin, token, password, None)
+        }
+        Some(storage::Credentials::TradeRoute { route_id }) if route_id == config.id => {
+            app.store
+                .require_trade_destination(job, &route_id)
+                .map_err(conflict)?;
+            let route = app
+                .store
+                .trade_route(&job.tenant, &route_id)
+                .map_err(conflict)?;
+            crate::api::trade::refresh_route(app, &route).await?;
+            (
+                route.address.clone(),
+                route.endpoint.clone(),
+                None,
+                Some(route),
+            )
+        }
+        _ => {
+            return Err(conflict(
+                "destination receive credentials are missing".into(),
+            ))
+        }
     };
-    let (origin, token) = storage::receive_url(&request_url).map_err(conflict)?;
+    let credential = trade
+        .as_ref()
+        .map(|route| app.store.trade_credential(&job.tenant, &route.id))
+        .transpose()
+        .map_err(conflict)?;
+    let permission = if trade.is_some() {
+        Some(
+            serde_json::from_value::<crate::route_protocol::RoutePermission>(
+                job.checks["trade_routes"][&config.id]["permission"].clone(),
+            )
+            .map_err(|_| conflict("route permission snapshot missing; submit a new job".into()))?,
+        )
+    } else {
+        None
+    };
     let parent: Option<crate::route_protocol::RouteReceipt> = job
         .checks
         .get("source_receipt")
@@ -212,6 +281,24 @@ pub(super) async fn export(app: &Arc<App>, job: &Job, config: &storage::Storage)
         .map(|receipt| receipt.document.source.document.visited.clone())
         .unwrap_or_default();
     visited.push(app.signer.public_hex.clone());
+    let mut metadata = job.request.metadata.clone();
+    if trade.is_some() {
+        let allowed: Vec<String> =
+            serde_json::from_value(job.checks["trade_routes"][&config.id]["metadata_keys"].clone())
+                .map_err(|_| conflict("metadata policy snapshot missing".into()))?;
+        if ancestry.iter().any(|receipt| {
+            receipt
+                .document
+                .source
+                .document
+                .metadata
+                .keys()
+                .any(|key| !allowed.contains(key))
+        }) {
+            return Err(conflict("custody ancestry contains metadata outside this route's allowlist; forwarding held".into()));
+        }
+        metadata.retain(|key, _| allowed.contains(key));
+    }
     let source = app.signer.sign_route(crate::route_protocol::RouteDocument {
         issuer: app.signer.public_hex.clone(),
         operation_id: job.id.clone(),
@@ -220,9 +307,10 @@ pub(super) async fn export(app: &Arc<App>, job: &Job, config: &storage::Storage)
             .clone()
             .ok_or_else(|| conflict("frozen manifest missing".into()))?,
         label: job.request.label.clone(),
-        metadata: job.request.metadata.clone(),
+        metadata,
         parent_receipt: parent.as_ref().map(|receipt| receipt.digest()),
         visited,
+        permission,
     });
     if !crate::route_protocol::verify_ancestry(&source, &ancestry) {
         return Err(conflict("route exceeds its forwarding limit".into()));
@@ -234,6 +322,7 @@ pub(super) async fn export(app: &Arc<App>, job: &Job, config: &storage::Storage)
         password.as_deref(),
         &source,
         &ancestry,
+        credential.as_deref(),
     )
     .await?;
     if !valid_token(&remote.route)
@@ -254,6 +343,12 @@ pub(super) async fn export(app: &Arc<App>, job: &Job, config: &storage::Storage)
             &source,
         )
         .map_err(conflict)?;
+    if trade
+        .as_ref()
+        .is_some_and(|route| route.peer_key != remote.receipt_key)
+    {
+        return Err(conflict("Port identity mismatch; transfer held".into()));
+    }
     let peer_key = remote.receipt_key.clone();
     if remote.receipt.is_none() {
         let application = Arc::clone(app);
@@ -296,6 +391,7 @@ pub(super) async fn export(app: &Arc<App>, job: &Job, config: &storage::Storage)
             password.as_deref(),
             &source,
             &ancestry,
+            credential.as_deref(),
         )
         .await?;
         if remote.receipt.is_none() {
@@ -328,7 +424,15 @@ pub(super) async fn export(app: &Arc<App>, job: &Job, config: &storage::Storage)
             &config.id,
             &format!("receipt:{}", receipt.digest()),
         )
-        .map_err(conflict)
+        .map_err(conflict)?;
+    if let Some(route) = trade {
+        let policy =
+            serde_json::from_value(job.checks["trade_routes"][&config.id]["notifications"].clone())
+                .map_err(|_| conflict("route notification snapshot missing".into()))?;
+        crate::notify::trade_event(app, &route, &policy, "route_received").await;
+        let _ = crate::api::trade::refresh_route(app, &route).await;
+    }
+    Ok(())
 }
 
 pub async fn revoke(
@@ -336,7 +440,7 @@ pub async fn revoke(
     AxumPath(id): AxumPath<String>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
-    Json(request): Json<crate::route_protocol::RouteRevocation>,
+    request: Request,
 ) -> ApiResult<Response> {
     if !headers.contains_key("x-votport") {
         return Err(ApiError::new(
@@ -348,6 +452,9 @@ pub async fn revoke(
     if !valid_token(&id) {
         return Err(ApiError::not_found());
     }
+    let Json(request) = Json::<crate::route_protocol::RouteRevocation>::from_request(request, &app)
+        .await
+        .map_err(|error| ApiError::new(error.status(), error.body_text()))?;
     let route = app
         .store
         .revoke_inbound_route(&id, &request)

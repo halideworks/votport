@@ -1,3 +1,5 @@
+import { isFormDirty, markFormSaved } from '/assets/form-drafts.js';
+import { notificationEditor, notificationDetails, uploadEvents, workflowEvents } from '/assets/notifications.js';
 // votport receive page: issue transfer requests and manage received files.
 // VOTPORT PROPRIETARY LICENSE.
 
@@ -21,6 +23,15 @@ import {
 } from '/assets/admin-common.js';
 
 const $ = (id) => document.getElementById(id);
+const creatingRoute = new URLSearchParams(window.location.search).get('trade-route') === '1';
+$('trade-return-guide').hidden = !creatingRoute;
+if (creatingRoute) {
+  $('create-password').disabled = true; $('create-password').closest('label').hidden = true;
+  $('create-notification-options').hidden = true;
+  $('create-form').querySelector('button[type="submit"]').textContent = 'Continue to route permissions';
+}
+let createNotifications = notificationEditor({ events: uploadEvents });
+$('create-notifications').append(createNotifications.element);
 
 let receiveProjects = [], receiveAdministrator = false, createWorkflow = null;
 function workflowEditor(current = null) {
@@ -32,10 +43,13 @@ function workflowEditor(current = null) {
   select.value = current?.project_id || ''; label.append(select); element.append(label);
   const help = document.createElement('p'); help.className = 'field-help'; help.textContent = 'Completed uploads run this project’s checks, approvals and destination copies. Incomplete uploads do not start a workflow.';
   const fields = document.createElement('div'); fields.className = 'grid';
+  const notificationHost = document.createElement('div'); let workflowNotifications;
   const manage = document.createElement('a'); manage.href = '/workflows#projects'; manage.className = 'text-link'; manage.textContent = 'Manage reception projects →';
-  element.append(help, fields, manage);
+  element.append(help, fields, notificationHost, manage);
   function render() {
     fields.replaceChildren(); const project = receiveProjects.find((project) => project.id === select.value);
+    notificationHost.replaceChildren(); workflowNotifications = null;
+    if (project) { workflowNotifications = notificationEditor({ policy: current?.project_id === project.id ? current.notifications : null, inherit: project.notifications || null, events: workflowEvents }); notificationHost.append(workflowNotifications.element); }
     for (const key of project?.required_metadata || []) {
       const label = document.createElement('label'), input = document.createElement('input'); label.textContent = key.replace(/[_-]/g, ' ');
       input.dataset.metadata = key; input.required = true; input.maxLength = 4096; input.value = current?.project_id === project.id ? current.metadata[key] || '' : ''; label.append(input); fields.append(label);
@@ -55,7 +69,7 @@ function workflowEditor(current = null) {
     }));
     const recipients = [...fields.querySelectorAll('[data-recipient]:checked')].map((input) => input.dataset.recipient);
     if (project.recipients.length && !recipients.length) throw new Error('Choose at least one enrolled recipient.');
-    return { project_id: select.value, metadata, recipients };
+    return { project_id: select.value, metadata, recipients, notifications: workflowNotifications?.read() || null };
   } };
 }
 
@@ -479,12 +493,12 @@ function renderLink(link) {
     const jobs = document.createElement('a'); jobs.href = '/workflows#jobs'; jobs.className = 'text-link'; jobs.textContent = 'Follow workflow deliveries →'; card.append(route, jobs);
   }
   if (receiveAdministrator) {
-    const details = document.createElement('details'), summary = document.createElement('summary'); summary.textContent = 'Reception workflow'; details.className = 'reception-workflow';
+    const details = document.createElement('details'), summary = document.createElement('summary'); summary.textContent = 'Reception workflow'; details.className = 'reception-workflow'; details.setAttribute('data-unsaved', '');
     const editor = workflowEditor(link.workflow), result = document.createElement('p'); result.setAttribute('role', 'status'); result.className = 'muted';
     editor.element.addEventListener('input', () => { details.dataset.dirty = 'true'; });
     const save = button('Save reception workflow', 'ghost', async () => {
       save.disabled = true;
-      try { const workflow = editor.read(); editor.element.disabled = true; await api(`/api/admin/links/${link.id}`, { method: 'PATCH', body: JSON.stringify({ workflow: workflow || { project_id: '', metadata: {}, recipients: [] } }) }); link.workflow = workflow; delete details.dataset.dirty; result.textContent = 'Saved. This applies to future uploads; existing jobs keep their captured rules.'; }
+      try { const workflow = editor.read(); editor.element.disabled = true; await api(`/api/admin/links/${link.id}`, { method: 'PATCH', body: JSON.stringify({ workflow: workflow || { project_id: '', metadata: {}, recipients: [] } }) }); linksRevision++; link.workflow = workflow; markFormSaved(details); delete details.dataset.dirty; result.textContent = 'Saved. This applies to future uploads; existing jobs keep their captured rules.'; }
       catch (error) { result.textContent = error.message; }
       finally { save.disabled = false; editor.element.disabled = false; }
     });
@@ -497,28 +511,12 @@ function renderLink(link) {
   card.dataset.linkId = link.id;
   card.append(receiving);
   applyReceiving(card, link.receiving || []);
-  const notify = document.createElement('label');
-  notify.className = 'toggle muted';
-  const notifyInput = document.createElement('input');
-  notifyInput.type = 'checkbox';
-  notifyInput.name = 'notify_on_upload';
-  notifyInput.checked = Boolean(link.notify_on_upload);
-  notifyInput.addEventListener('change', async () => {
-    notifyInput.disabled = true;
-    try {
-      await api(`/api/admin/links/${link.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ notify_on_upload: notifyInput.checked }),
-      });
-    } catch (error) {
-      notifyInput.checked = !notifyInput.checked;
-      alertModal(error.message);
-    } finally {
-      notifyInput.disabled = false;
-    }
-  });
-  notify.append(notifyInput, document.createTextNode(' Notify when an upload completes or fails'));
-  card.append(notify);
+  card.append(notificationDetails({ policy: link.notifications, events: uploadEvents, readOnly: !receiveAdministrator,
+    save: async (notifications) => {
+      await api(`/api/admin/links/${link.id}`, { method: 'PATCH', body: JSON.stringify({ notifications }) });
+      linksRevision++; link.notifications = notifications;
+    },
+  }));
   if (link.legal_hold) {
     const holdNote = document.createElement('p');
     holdNote.className = 'muted';
@@ -600,6 +598,8 @@ function renderLink(link) {
         )
           return;
         await api(`/api/admin/links/${link.id}`, { method: 'DELETE' });
+        for (const editor of card.querySelectorAll('[data-unsaved]')) markFormSaved(editor);
+        card.remove();
         await refreshLinks();
         announce('links-action-status', `Request "${link.label}" deleted.`);
       }),
@@ -682,38 +682,35 @@ async function refreshLinks({ append = false, fromPoll = false } = {}) {
 }
 
 function receptionEditing() {
-  return !!$('links').querySelector('.reception-workflow[open], .reception-workflow[data-dirty], .reception-workflow button:disabled');
+  return !!$('links').querySelector('.reception-workflow[open], .reception-workflow[data-dirty], .reception-workflow > button:disabled, .notification-details[open], .notification-details[data-dirty], .notification-details > button:disabled');
 }
 
+let linksRevision = 0;
 async function refreshLinksInner({ append, fromPoll }) {
   if (fromPoll && receptionEditing()) return;
-  if (append) {
-    linksExpanded = true;
-  } else {
-    // A poll-driven refresh keeps the submitted filter; unsubmitted text in
-    // the search box stays where it is.
-    if (!fromPoll) {
-      linksFilter = {
-        search: $('links-query').value.trim(),
-        status: $('links-status').value,
-      };
-    }
-    linksExpanded = false;
-    linksCursor = null;
-  }
+  const revision = ++linksRevision;
+  const filter = append || fromPoll ? linksFilter : { search: $('links-query').value.trim(), status: $('links-status').value };
   const params = new URLSearchParams({ limit: String(LINKS_PAGE_SIZE) });
-  if (linksFilter.search) params.set('search', linksFilter.search);
-  if (linksFilter.status) params.set('status', linksFilter.status);
+  if (filter.search) params.set('search', filter.search);
+  if (filter.status) params.set('status', filter.status);
   if (append && linksCursor) {
     params.set('before_created_at', String(linksCursor.created));
     params.set('before_id', linksCursor.id);
   }
   const response = await api(`/api/admin/links?${params}`);
   await projectsReady;
+  if (revision !== linksRevision) { linksRefreshPending = true; return; }
   if (fromPoll && receptionEditing()) { linksRefreshPending = true; return; }
   const { links, receive_dir } = response;
   $('receive-dir').textContent = `Receive root ${receive_dir}`;
   const container = $('links');
+  const edits = new Map([...container.querySelectorAll('[data-link-id]')].map((card) => [card.dataset.linkId, [...card.querySelectorAll('[data-unsaved]')].filter(isFormDirty)]).filter(([, editors]) => editors.length));
+  if (!append) {
+    const omitted = [...edits].filter(([id]) => !links.some((link) => link.id === id)).flatMap(([, editors]) => editors);
+    if (omitted.length && !window.confirm('Discard unsaved edits on requests outside these results?')) return;
+    for (const editor of omitted) markFormSaved(editor);
+  }
+  linksFilter = filter; linksExpanded = append;
   linksRefreshPending = false;
   if (!append) container.replaceChildren();
   if (!append && !links.length) {
@@ -731,7 +728,9 @@ async function refreshLinksInner({ append, fromPoll }) {
     }
   } else {
     for (const link of links) {
-      container.append(renderLink(link));
+      const card = renderLink(link);
+      for (const editor of edits.get(link.id) || []) card.querySelector(`.${editor.className}`).replaceWith(editor);
+      container.append(card);
     }
   }
   const nextCursor = response.next_cursor;
@@ -758,6 +757,9 @@ async function refreshLinksSafe(options = {}) {
 
 $('create-form').addEventListener('submit', async (event) => {
   event.preventDefault();
+  const submit = event.currentTarget.querySelector('button[type="submit"]');
+  if (submit.disabled) return;
+  submit.disabled = true; $('create-form').inert = true;
   $('create-error').hidden = true;
   const maxGib = parseInt($('create-max').value, 10);
   const expires = parseInt($('create-expires').value, 10);
@@ -767,14 +769,17 @@ $('create-form').addEventListener('submit', async (event) => {
       body: JSON.stringify({
         label: $('create-label').value,
         dest: $('create-dest').value,
-        password: $('create-password').value || null,
+        password: creatingRoute ? null : $('create-password').value || null,
         expires_days: Number.isFinite(expires) ? expires : null,
         max_bytes: Number.isFinite(maxGib) ? maxGib * 1024 ** 3 : null,
-        notify_on_upload: $('create-notify-on-upload').checked,
+        notifications: creatingRoute ? { mode: 'off', rules: [] } : createNotifications.read(),
         workflow: createWorkflow?.read() || null,
       }),
     });
+    markFormSaved($('create-form'));
+    if (creatingRoute) { window.location.assign(`/trade-routes?receive=${encodeURIComponent(link.id)}#receive`); return; }
     $('create-form').reset();
+    createNotifications = notificationEditor({ events: uploadEvents }); $('create-notifications').replaceChildren(createNotifications.element);
     createWorkflow = workflowEditor(); $('create-workflow').replaceChildren(createWorkflow.element);
     $('new-link').hidden = false;
     $('new-link-url').textContent = link.url;
@@ -786,7 +791,7 @@ $('create-form').addEventListener('submit', async (event) => {
   } catch (error) {
     $('create-error').textContent = error.message;
     $('create-error').hidden = false;
-  }
+  } finally { submit.disabled = false; $('create-form').inert = false; }
 });
 
 $('links-filter').addEventListener('submit', (event) => {

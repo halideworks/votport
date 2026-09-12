@@ -9,6 +9,8 @@ const tenants = await readFile(new URL('../web/tenants.html', import.meta.url), 
 const system = await readFile(new URL('../web/system.html', import.meta.url), 'utf8');
 const workflows = await readFile(new URL('../web/workflows.html', import.meta.url), 'utf8');
 const storage = await readFile(new URL('../web/storage.html', import.meta.url), 'utf8');
+const tradeRoutes = await readFile(new URL('../web/trade-routes.html', import.meta.url), 'utf8');
+const notifications = await readFile(new URL('../web/notifications.html', import.meta.url), 'utf8');
 const automation = await readFile(new URL('../web/automation.html', import.meta.url), 'utf8');
 const receiveScript = await readFile(new URL('../web/assets/page-receive.js', import.meta.url), 'utf8');
 const deliverScript = await readFile(new URL('../web/assets/page-deliver.js', import.meta.url), 'utf8');
@@ -22,23 +24,15 @@ const style = await readFile(new URL('../web/assets/style.css', import.meta.url)
 
 test('receive and deliver pages keep transfer concerns separate', () => {
   assert.match(receive, /page-receive\.js/);
-  assert.match(receive, /create-notify-on-upload[^>]+name="notify_on_upload"[^>]+type="checkbox"/);
-  assert.doesNotMatch(receive, /create-notify-on-upload[^>]+checked/);
+  assert.match(receive, /id="create-notifications"/);
   assert.doesNotMatch(receive, /library-input|automation-token-form/);
   assert.match(deliver, /page-deliver\.js/);
-  assert.match(deliver, /deliver-notify-on-download[^>]+name="notify_on_download"[^>]+type="checkbox"/);
-  assert.doesNotMatch(deliver, /deliver-notify-on-download[^>]+checked/);
-  assert.match(receive, /Notify when an upload completes or fails/);
-  assert.match(deliver, /Notify on first download and delivery completion/);
-  assert.doesNotMatch(deliver, /create-notify-on-upload|links-filter/);
-  assert.match(commonScript, /\['receive', '\/receive', 'Receive'\]/);
-  assert.match(commonScript, /\['deliver', '\/deliver', 'Deliver'\]/);
-  assert.match(receiveScript, /notify_on_upload: \$\('create-notify-on-upload'\)\.checked/);
-  assert.match(receiveScript, /method: 'PATCH'[\s\S]+notify_on_upload/);
-  assert.match(receiveScript, /notifyInput\.disabled = true/);
-  assert.match(deliverScript, /notify_on_download: \$\('deliver-notify-on-download'\)\.checked/);
-  assert.match(deliverScript, /method: 'PATCH'[\s\S]+notify_on_download/);
-  assert.match(deliverScript, /notifyInput\.disabled = true/);
+  assert.match(deliver, /id="deliver-notifications"/);
+  assert.match(receiveScript, /notifications: (?:creatingRoute \?[^\n]+: )?createNotifications\.read\(\)/);
+  assert.match(deliverScript, /notifications: (?:creatingRoute \?[^\n]+: )?createNotifications\.read\(\)/);
+  assert.match(receiveScript, /notificationDetails\([\s\S]+events: uploadEvents/);
+  assert.match(deliverScript, /notificationDetails\([\s\S]+events: downloadEvents/);
+  assert.match(receiveScript, /notification-details\[open\]/);
 });
 
 test('issued request status filter uses the shared form control styling', () => {
@@ -222,10 +216,10 @@ test('admin pages preload their module graph and fetch data alongside the sessio
     await walk(entry);
     return [...seen].sort();
   };
-  for (const [name, html] of [['receive', receive], ['deliver', deliver], ['workflows', workflows], ['storage', storage], ['automation', automation], ['tenants', tenants], ['audit', audit], ['system', system]]) {
+  for (const [name, html] of [['receive', receive], ['deliver', deliver], ['workflows', workflows], ['storage', storage], ['automation', automation], ['notifications', notifications], ['trade-routes', tradeRoutes], ['tenants', tenants], ['audit', audit], ['system', system]]) {
     const preloads = [...html.matchAll(/rel="modulepreload" href="\/assets\/([\w-]+\.js)"/g)].map((m) => m[1]).sort();
     assert.deepEqual(preloads, await graph(`page-${name}.js`), `${name} preloads its import graph`);
   }
   assert.match(receiveScript, /Promise\.all\(\[sessionReady, refreshLinksSafe\(\)\]\)/);
-  assert.match(deliverScript, /Promise\.all\(\[requireSession\(\), refreshGrants\(\)/);
+  assert.match(deliverScript, /Promise\.all\(\[sessionReady, refreshGrants\(\)/);
 });

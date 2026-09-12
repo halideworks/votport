@@ -387,8 +387,16 @@ section > h2 {
  text-align: center;
  font-size: 0.69rem;
  letter-spacing: 0.03em;
- user-select: none;
+ overflow-wrap: anywhere;
 }
+.footer-custom:not(:empty) { display: block; margin-bottom: 0.45rem; }
+.sheet-foot a { color: inherit; text-decoration: underline; text-underline-offset: 0.2em; }
+.hint-button { position: relative; display: inline-grid; place-items: center; flex: none; width: 1.75rem; height: 1.75rem; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--muted); font: 500 .75rem/1 "Plus Jakarta Sans", sans-serif; letter-spacing: 0; text-transform: none; vertical-align: middle; box-shadow: none; }
+.hint-button::before { content: ""; position: absolute; width: 1.15rem; height: 1.15rem; border: 1px solid currentColor; border-radius: 50%; opacity: .55; }
+.hint-button:hover:not(:disabled), .hint-button:active:not(:disabled) { color: var(--text); background: var(--panel-hover); transform: none; filter: none; box-shadow: none; }
+.field-heading { display: flex; align-items: center; gap: 0.45rem; margin-bottom: 0.35rem; }
+.field-heading label { margin: 0; }
+.field-hint { position: fixed; inset: auto; margin: 0; padding: .75rem .9rem; width: max-content; max-width: min(22rem, calc(100vw - 24px)); color: var(--text-soft); background: var(--bg); border: 1px solid var(--border); border-radius: .5rem; font: 400 .82rem/1.6 "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif; text-transform: none; letter-spacing: normal; text-align: left; white-space: normal; box-shadow: 0 4px 16px var(--shadow-soft); overflow-wrap: anywhere; }
 
 /* ---- panels ------------------------------------------------------------- */
 
@@ -2037,6 +2045,8 @@ body:has(#nav) .sheet {
  overflow: visible;
 }
 body:has(#nav) .sheet::before { display: none; }
+body:has(#nav) h1 { font-size: clamp(1.7rem, 3vw, 2rem); letter-spacing: -.035em; line-height: 1.25; }
+body:has(#nav) h2 { font-size: 1.05rem; text-transform: none; letter-spacing: -.015em; color: var(--text); }
 body:has(#nav) .card { min-width: 0; padding: clamp(1rem, 2.2vw, 1.75rem); }
 body:has(#nav) label,
 .field-label {
@@ -2156,3 +2166,69 @@ body:has(#nav) .permission-grid { display: grid; grid-template-columns: repeat(2
 }
 
 .link-item > .head + p.muted { margin-top: 0.85rem; }
+
+.notification-editor { min-width: 0; margin-block: 1rem; }
+.notification-editor select { width: 100%; }
+.notification-rules { display: grid; gap: .75rem; margin-block: 1rem; }
+.notification-destination { min-width: 0; margin: 0; }
+.notification-destination legend, .notification-editor .field-help { overflow-wrap: anywhere; }
+.notification-details { margin-block: 1rem; }
+.notification-details > summary { cursor: pointer; }
+
+.feedback:empty { display: none; }
+
+.trade-key { display: block; overflow-wrap: anywhere; word-break: break-word; margin-block: .6rem; }
+.trade-route { min-width: 0; }
+.trade-route details { margin-block: 1rem; }
+#trade-preview { margin-block: 1rem; padding: 1rem; border: 1px solid var(--border); border-radius: .5rem; }
+.trade-port .section-heading { margin-bottom: .75rem; }
+.trade-port h2 { font-size: .9rem; text-transform: none; letter-spacing: 0; }
+.trade-port .trade-key { font-size: .8rem; color: var(--muted); }
+.trade-advanced, #port-details[open] > form { margin-block: 1rem; }
+.trade-advanced > summary, #trade-endpoints-section > summary, #port-details > summary { cursor: pointer; font-size: .85rem; }
+.trade-advanced[open] > summary, #trade-endpoints-section[open] > summary { margin-bottom: 1.25rem; }
+.trade-choices > button { padding: 1.25rem; text-align: left; text-transform: none; letter-spacing: 0; white-space: normal; border-radius: .8rem; }
+.trade-choices strong { display: flex; justify-content: space-between; gap: 1rem; font-size: 1rem; }
+.trade-choices > button > span { display: block; margin-top: .6rem; color: var(--muted); font-size: .8rem; font-weight: 400; line-height: 1.6; }
+.trade-choices > button[aria-expanded="true"] { border-color: var(--progress); background: var(--panel); }
+#trade-setup h3 { font-size: 1rem; }
+#trade-accept-details, #trade-endpoint-details { margin-top: 2rem; }
+.trade-route .info-banner { font-size: .85rem; }
+
+body:has(#nav) .nav { display: flex; align-items: center; flex-wrap: nowrap; gap: 1rem; overflow: visible; margin: 0; padding: 0; border: 0; mask-image: none; -webkit-mask-image: none; }
+.nav-primary { display: flex; align-items: center; gap: 1.25rem; }
+body:has(#nav) .nav-primary a, .nav-more > summary { padding: .65rem 0; border: 0; border-bottom: 1px solid transparent; border-radius: 0; font-size: .8rem; font-weight: 600; }
+body:has(#nav) .nav-primary a.active, .nav-more > summary.active { color: var(--text); border-bottom-color: var(--text-soft); }
+.nav a:hover, .nav-more > summary:hover, .nav-more[open] > summary { color: var(--text); }
+.nav-more { position: relative; margin: 0; flex: none; }
+.nav-more > summary { display: flex; align-items: center; gap: .5rem; width: fit-content; list-style: none; white-space: nowrap; }
+.nav-more > summary::-webkit-details-marker { display: none; }
+.nav-more > summary::after { content: ""; width: .4rem; height: .4rem; border-right: 1px solid currentColor; border-bottom: 1px solid currentColor; transform: translateY(-.1rem) rotate(45deg); }
+.nav-more[open] > summary::after { transform: translateY(.1rem) rotate(225deg); }
+.nav-panel { position: absolute; z-index: 20; top: calc(100% + .4rem); right: 0; display: grid; width: 15rem; max-width: calc(100vw - 3rem); padding: .5rem; background: var(--bg); border: 1px solid var(--border); border-radius: .5rem; box-shadow: 0 8px 24px var(--shadow-soft); }
+body:has(#nav) .nav-panel a { padding: .75rem; border: 0; border-radius: .4rem; }
+.nav-panel a:hover, .nav-panel a.active { background: var(--panel); }
+.nav a:focus-visible, .nav summary:focus-visible { outline: none; color: var(--text); text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: .4rem; }
+.form-advanced { margin: 1.25rem 0; min-width: 0; }
+.form-advanced > summary { cursor: pointer; font-size: .9rem; color: var(--text-soft); }
+.form-advanced[open] > summary { margin-bottom: 1.25rem; }
+.notification-add { display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; }
+.notification-add > select { flex: 1 1 12rem; min-width: 0; }
+.notification-add > button { flex: none; }
+body:has(#nav) .notification-destination { margin-bottom: .5rem; padding: 1rem; border: 1px solid var(--border); border-radius: .65rem; }
+.notification-events > summary { cursor: pointer; color: var(--text-soft); line-height: 1.6; overflow-wrap: anywhere; }
+.notification-events .permission-grid { margin-top: 1rem; }
+.notification-destination > button { margin-top: .75rem; }
+.workflow-filters .grid { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr); }
+.workflow-next { padding: .85rem 1rem; background: var(--panel); border-left: 3px solid var(--progress); line-height: 1.6; }
+@media (pointer: coarse) { .hint-button { min-width: 2.75rem; min-height: 2.75rem; } }
+@media (max-width: 950px) { .bar { flex-wrap: wrap; } .workflow-filters .grid { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 640px) {
+ body:has(#nav) .nav { display: grid; grid-template-columns: minmax(0, 1fr); width: 100%; gap: .5rem; }
+ .nav-primary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .15rem .75rem; }
+ body:has(#nav) .nav-primary a { white-space: normal; min-height: 2.75rem; padding: .7rem .5rem; }
+ .nav-more > summary { min-height: 2.75rem; padding-inline: .5rem; }
+ .nav-panel { position: static; width: auto; max-width: none; margin-top: .4rem; box-shadow: none; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+ body:has(#nav) .nav-panel a { white-space: normal; overflow-wrap: anywhere; }
+ .notification-add > button { width: 100%; }
+}

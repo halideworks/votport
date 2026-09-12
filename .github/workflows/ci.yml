@@ -239,13 +239,15 @@ jobs:
             if [ "$status" -ne 0 ]; then
               docker logs votport-browser-e2e || true
             fi
-            docker rm -f votport-browser-e2e >/dev/null 2>&1 || true
+            docker rm -f votport-browser-e2e votport-browser-peer >/dev/null 2>&1 || true
+            docker network rm votport-browser-trade >/dev/null 2>&1 || true
             rm -rf "$e2e_root"
             exit "$status"
           }
           trap cleanup EXIT
 
-          docker run -d --name votport-browser-e2e \
+          docker network create votport-browser-trade
+          docker run -d --name votport-browser-e2e --network votport-browser-trade \
             --add-host=host.docker.internal:host-gateway \
             -p 127.0.0.1:8080:8080 \
             --user "$(id -u):$(id -g)" \
@@ -280,4 +282,25 @@ jobs:
           BASE_URL=http://127.0.0.1:8080 ADMIN_PASSWORD="$ADMIN_PASSWORD" \
             WORKFLOW_TEST_ROOT="$e2e_root" node scripts/workspace-browser-e2e.mjs
           BASE_URL=http://127.0.0.1:8080 ADMIN_PASSWORD="$ADMIN_PASSWORD" \
-            WORKFLOW_TEST_ROOT="$e2e_root" NOTIFY_TEST_HOST=host.docker.internal NOTIFY_TEST_BIND=0.0.0.0 node scripts/notifications-browser-e2e.mjs
+            WORKFLOW_TEST_ROOT="$e2e_root" node scripts/usability-browser-e2e.mjs
+          BASE_URL=http://127.0.0.1:8080 ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+            WORKFLOW_TEST_ROOT="$e2e_root" NOTIFY_TEST_HOST=host.docker.internal NOTIFY_TEST_BIND=0.0.0.0 node scripts/notification-routing-browser-e2e.mjs
+          BASE_URL=http://127.0.0.1:8080 ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+            WORKFLOW_TEST_ROOT="$e2e_root" node scripts/branding-browser-e2e.mjs
+          mkdir -p "$e2e_root/peer-data" "$e2e_root/peer-receive" "$e2e_root/peer-library"
+          chmod 700 "$e2e_root/peer-receive"
+          docker run -d --name votport-browser-peer --network votport-browser-trade \
+            --add-host=host.docker.internal:host-gateway -p 127.0.0.1:8081:8080 \
+            --user "$(id -u):$(id -g)" -e VOTPORT_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+            -e VOTPORT_PUBLIC_URL=http://127.0.0.1:8081 \
+            -v "$e2e_root/peer-data:/data" -v "$e2e_root/peer-receive:/received" \
+            -v "$e2e_root/peer-library:/outbound" votport:ci
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:8081/healthz >/dev/null; then break; fi
+            if [ "$attempt" -eq 60 ]; then docker logs votport-browser-peer; exit 1; fi
+            sleep 1
+          done
+          BASE_URL=http://127.0.0.1:8080 TRADE_PEER_URL=http://127.0.0.1:8081 \
+            TRADE_PEER_ADDRESS=http://votport-browser-peer:8080 ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+            WORKFLOW_TEST_ROOT="$e2e_root" NOTIFY_TEST_HOST=host.docker.internal NOTIFY_TEST_BIND=0.0.0.0 \
+            node scripts/trade-routes-browser-e2e.mjs

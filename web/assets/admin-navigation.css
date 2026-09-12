@@ -1,6 +1,7 @@
 /* Native transitions keep the existing page visible during navigation. */
 html { background: var(--bg); }
 #nav { min-height: 2rem; }
+.bar:has(> #nav) { position: relative; z-index: 20; }
 @media (prefers-reduced-motion: no-preference) {
  @view-transition { navigation: auto; }
  .masthead { view-transition-name: admin-brand; }

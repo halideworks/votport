@@ -82,6 +82,14 @@ pub async fn put_project(
     let identity = admin::require_operator(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
     let _operation = begin_outbound_operation(&app, &identity.tenant)?;
+    if let Some(policy) = &project.notifications {
+        crate::api::notifications::validate_policy(
+            &app,
+            &identity.tenant,
+            policy,
+            &crate::api::notifications::WORKFLOW_EVENTS,
+        )?;
+    }
     project
         .validate()
         .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
@@ -100,6 +108,24 @@ pub async fn create(
     Json(request): Json<JobRequest>,
 ) -> ApiResult<Response> {
     let actor = actor(&app, &headers, peer, "jobs:create", true)?;
+    if let Some(policy) = &request.notifications {
+        if !app
+            .store
+            .delivery_operation_exists(
+                &actor.identity.tenant,
+                &actor.identity.subject,
+                &request.operation_id,
+            )
+            .map_err(crate::api::store_unavailable)?
+        {
+            crate::api::notifications::validate_policy(
+                &app,
+                &actor.identity.tenant,
+                policy,
+                &crate::api::notifications::WORKFLOW_EVENTS,
+            )?;
+        }
+    }
     let project = app
         .store
         .delivery_project(&actor.identity.tenant, &request.project_id)
@@ -143,7 +169,12 @@ fn public_job(app: &App, headers: &HeaderMap, job: Job) -> serde_json::Value {
             .delivery_token_active(&job.id, &hash_token(&token))
             .unwrap_or(false))
     .then(|| format!("{}/s/{token}", admin::base_url(app, headers)));
-    json!({"job": job, "url": url})
+    let notifications_override = app
+        .store
+        .notification_job_override(&job.tenant, &job.id)
+        .ok()
+        .flatten();
+    json!({"job": job, "url": url, "notifications_override": notifications_override})
 }
 
 #[derive(Default, Deserialize)]
@@ -151,6 +182,9 @@ fn public_job(app: &App, headers: &HeaderMap, job: Job) -> serde_json::Value {
 pub struct Page {
     after: Option<String>,
     limit: Option<usize>,
+    project: Option<String>,
+    state: Option<String>,
+    q: Option<String>,
 }
 
 pub async fn list(
@@ -162,7 +196,30 @@ pub async fn list(
     let actor = actor(&app, &headers, peer, "jobs:read", false)?;
     let limit = page.limit.unwrap_or(50);
     let after = page.after.unwrap_or_default();
-    if !(1..=100).contains(&limit) || after.len() > 100 {
+    let project = page.project.unwrap_or_default();
+    let state = page.state.unwrap_or_default();
+    let search = page.q.unwrap_or_default();
+    if !(1..=100).contains(&limit)
+        || after.len() > 100
+        || project.len() > 100
+        || search.chars().count() > 200
+        || ![
+            "",
+            "attention",
+            "active",
+            "queued",
+            "preparing",
+            "awaiting_approval",
+            "exporting",
+            "retrying",
+            "ready",
+            "failed",
+            "cancelled",
+            "retiring",
+            "retired",
+        ]
+        .contains(&state.as_str())
+    {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid job page",
@@ -172,18 +229,31 @@ pub async fn list(
         .store
         .delivery_projects(&actor.identity.tenant)
         .map_err(crate::api::store_unavailable)?;
-    let jobs = app
+    let projects = projects
+        .iter()
+        .filter(|p| actor.allows(p, "viewer") && (project.is_empty() || p.id == project))
+        .map(|p| p.id.clone())
+        .collect::<Vec<_>>();
+    let mut jobs = app
         .store
-        .delivery_jobs(&actor.identity.tenant, &after, limit)
+        .delivery_jobs(
+            &actor.identity.tenant,
+            &after,
+            limit + 1,
+            Some(&projects),
+            &state,
+            search.trim(),
+        )
         .map_err(crate::api::store_unavailable)?;
-    let next = jobs.last().map(|job| job.id.clone());
+    let more = jobs.len() > limit;
+    jobs.truncate(limit);
+    let next = if more {
+        jobs.last().map(|job| job.id.clone())
+    } else {
+        None
+    };
     let jobs = jobs
         .into_iter()
-        .filter(|job| {
-            projects
-                .iter()
-                .any(|p| p.id == job.project.id && actor.allows(p, "viewer"))
-        })
         .map(|job| public_job(&app, &headers, job))
         .collect::<Vec<_>>();
     Ok((
@@ -454,7 +524,7 @@ async fn prepare(app: &Arc<App>, mut job: Job) -> ApiResult<()> {
             .validate_job(&job.request, job.created_at)
             .map_err(conflict)?;
     }
-    if project != job.project {
+    if !project.same_delivery_policy(&job.project) {
         return Err(conflict("project changed; submit a new job".into()));
     }
     if job.uses_snapshot() {
@@ -531,6 +601,15 @@ async fn prepare(app: &Arc<App>, mut job: Job) -> ApiResult<()> {
         "not_required"
     });
     for id in &job.project.destinations {
+        if job.checks["trade_routes"][id]["permission"]["grant"] == "" {
+            let route = app.store.trade_route(&job.tenant, id).map_err(conflict)?;
+            if route.remote_grant.is_empty() {
+                return Err(conflict(
+                    "route enrollment is incomplete; retry after pairing".into(),
+                ));
+            }
+            job.checks["trade_routes"][id]["permission"]["grant"] = json!(route.remote_grant);
+        }
         job.checks["destination_revisions"][id] =
             json!(storage::authorized_storage(app, &job.tenant, id)?.revision);
     }
@@ -563,7 +642,12 @@ async fn prepare(app: &Arc<App>, mut job: Job) -> ApiResult<()> {
             expires_days: job.request.expires_days,
             password_hash: None,
             max_downloads: None,
-            notify_on_download: false,
+
+            notifications: job
+                .request
+                .notifications
+                .clone()
+                .or_else(|| job.project.notifications.clone()),
             automation: None,
             workflow: Some(job),
         },
@@ -1009,7 +1093,11 @@ pub async fn recipient_verify(
     Ok(([(header::CACHE_CONTROL,"no-store".into()),(header::SET_COOKIE,format!("{cookie}; Path=/api/s/{token}; Max-Age=86400; HttpOnly; SameSite=Strict{secure}"))],Json(json!({"authorized": true}))).into_response())
 }
 
-fn recipient_rate(app: &App, headers: &HeaderMap, peer: &std::net::SocketAddr) -> ApiResult<()> {
+pub(crate) fn recipient_rate(
+    app: &App,
+    headers: &HeaderMap,
+    peer: &std::net::SocketAddr,
+) -> ApiResult<()> {
     let ip = crate::api::client_ip(headers, peer, &app.config.trusted_proxies);
     if app.automation_read_rate.allow(&ip) {
         Ok(())
@@ -1253,6 +1341,56 @@ async fn retire_snapshot(app: &Arc<App>) -> Result<(), String> {
     app.store.complete_snapshot_retirement(&job.id, now_unix())
 }
 
+pub async fn update_notifications(
+    State(app): State<Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(policy): Json<Option<crate::store::NotificationPolicy>>,
+) -> ApiResult<Response> {
+    let actor = actor(&app, &headers, peer, "jobs:create", true)?;
+    let job = app
+        .store
+        .delivery_job(&id)
+        .map_err(crate::api::store_unavailable)?
+        .filter(|job| job.tenant == actor.identity.tenant)
+        .ok_or_else(ApiError::not_found)?;
+    let project = app
+        .store
+        .delivery_project(&job.tenant, &job.project.id)
+        .map_err(crate::api::store_unavailable)?
+        .ok_or_else(ApiError::not_found)?;
+    if !actor.allows(&project, "sender") {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Project sender permission required",
+        ));
+    }
+    if let Some(policy) = &policy {
+        crate::api::notifications::validate_policy(
+            &app,
+            &job.tenant,
+            policy,
+            &crate::api::notifications::WORKFLOW_EVENTS,
+        )?;
+    }
+    if !app
+        .store
+        .set_job_notifications(&job.tenant, &id, policy.as_ref())
+        .map_err(crate::api::store_unavailable)?
+    {
+        return Err(ApiError::not_found());
+    }
+    app.store.audit(
+        &job.tenant,
+        &actor.identity.subject,
+        "job_notifications_changed",
+        &id,
+        &json!({}),
+    );
+    Ok(Json(json!({"ok":true})).into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1315,6 +1453,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn job_filters_apply_visibility_and_search_before_pagination() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let cookie = admin_cookie(&app);
+        let mut expected = Vec::new();
+        for project_id in ["visible", "private"] {
+            let mut project = crate::workflow::tests::project();
+            project.id = project_id.into();
+            project.directory = project_id.into();
+            if project_id == "private" {
+                project.members.clear();
+            }
+            let project = app
+                .store
+                .save_delivery_project("", "local", project)
+                .unwrap();
+            for number in 0..3 {
+                let mut request = crate::workflow::tests::request();
+                request.project_id = project_id.into();
+                request.operation_id = format!("{project_id}-{number}");
+                request.label = format!("Cargo {number}");
+                let job = app
+                    .store
+                    .enqueue_delivery_job("", "sender", 1, None, project.clone(), request)
+                    .unwrap();
+                if project_id == "visible" {
+                    expected.push(job.id);
+                }
+            }
+        }
+        expected.sort();
+        let mut identity = auth::AdminIdentity::local_admin();
+        identity.subject = "observer".into();
+        identity.role = "operator".into();
+        identity.grants[0].role = "operator".into();
+        let viewer = format!(
+            "votport_admin={}",
+            auth::issue_admin_token(&app.secret, &identity, &app.config.admin_token_tag)
+        );
+        let mut after = String::new();
+        for (index, id) in expected.iter().enumerate() {
+            let (status, _, body) = call(
+                &app,
+                Method::GET,
+                &format!("/api/workflows/jobs?limit=1&state=active&q=cArGo&after={after}"),
+                Some(&viewer),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["jobs"].as_array().unwrap().len(), 1);
+            assert_eq!(body["jobs"][0]["job"]["id"], *id);
+            if index == expected.len() - 1 {
+                assert!(body["next"].is_null());
+            } else {
+                after = body["next"].as_str().unwrap().into();
+            }
+        }
+        for filter in [
+            "project=private",
+            "state=attention",
+            "state=failed",
+            "q=does-not-exist",
+            "q=%25",
+        ] {
+            let (status, _, body) = call(
+                &app,
+                Method::GET,
+                &format!("/api/workflows/jobs?{filter}"),
+                Some(&viewer),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(body["jobs"].as_array().unwrap().is_empty());
+            assert!(body["next"].is_null());
+        }
+        let (status, _, body) = call(
+            &app,
+            Method::GET,
+            "/api/workflows/jobs?project=private&q=Cargo%202",
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["jobs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let (status, _, _) = call(
+            &app,
+            Method::GET,
+            "/api/workflows/jobs?state=unknown",
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
     async fn reception_pins_originals_and_gates_verified_copies_without_snapshots() {
         for release in [
             crate::workflow::Release::AllDestinations,
@@ -1344,6 +1589,7 @@ mod tests {
                 .save_delivery_project("", "local", project)
                 .unwrap();
             let workflow = crate::workflow::ReceiveWorkflow {
+                notifications: None,
                 project_id: project.id.clone(),
                 metadata: crate::workflow::tests::request().metadata,
                 recipients: vec![],
@@ -1359,7 +1605,8 @@ mod tests {
                 max_bytes: None,
                 active: true,
                 legal_hold: false,
-                notify_on_upload: false,
+
+                notifications: None,
                 uploads: vec![],
                 events: vec![],
             };
@@ -1401,7 +1648,11 @@ mod tests {
             app.store
                 .append_upload("", &link.id, upload.clone())
                 .unwrap();
-            assert!(app.store.delivery_jobs("", "", 100).unwrap().is_empty());
+            assert!(app
+                .store
+                .delivery_jobs("", "", 100, None, "", "")
+                .unwrap()
+                .is_empty());
             upload.partial = false;
             upload.id = "complete".into();
             app.store.append_upload("", &link.id, upload).unwrap();
@@ -1553,7 +1804,7 @@ mod tests {
             app.store.append_upload("", &link.id, changed).unwrap();
             let refused = app
                 .store
-                .delivery_jobs("", "", 100)
+                .delivery_jobs("", "", 100, None, "", "")
                 .unwrap()
                 .into_iter()
                 .find(|job| job.request.operation_id == "disabled")
@@ -1568,7 +1819,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn peer_routes_transfer_signed_custody_and_acknowledge_revocation() {
-        for push in [false, true] {
+        for (push, paired) in [(false, false), (true, false), (false, true), (true, true)] {
             let directory = tempfile::tempdir().unwrap();
             let source = crate::api::testing::build(&directory.path().join("la"));
             let mut config = crate::api::testing::config(&directory.path().join("nyc"));
@@ -1610,7 +1861,8 @@ mod tests {
                     max_bytes: None,
                     active: true,
                     legal_hold: false,
-                    notify_on_upload: false,
+
+                    notifications: None,
                     uploads: vec![],
                     events: vec![],
                 })
@@ -1621,6 +1873,7 @@ mod tests {
                     "nyc",
                     &token,
                     &crate::workflow::ReceiveWorkflow {
+                        notifications: None,
                         project_id: reception.id.clone(),
                         metadata: crate::workflow::tests::request().metadata,
                         recipients: vec![],
@@ -1639,17 +1892,82 @@ mod tests {
                 .unwrap();
             });
             let config:storage::Storage = serde_json::from_value(json!({"id":"nyc","revision":0,"label":"NYC","kind":"votport","endpoint":origin,"enabled":true,"tenants":[""]})).unwrap();
-            source
-                .store
-                .save_delivery_storage(
-                    "local",
-                    config,
-                    Some(storage::Credentials::Votport {
-                        request_url: format!("{origin}/r/{token}"),
-                        password: None,
-                    }),
-                )
-                .unwrap();
+            if paired {
+                let endpoint = crate::store::TradeEndpoint {
+                    id: token.clone(),
+                    name: "NYC reception".into(),
+                    category: "internal".into(),
+                    forwarding: true,
+                    metadata_keys: crate::workflow::tests::request()
+                        .metadata
+                        .keys()
+                        .cloned()
+                        .collect(),
+                    notifications: crate::store::NotificationPolicy::default(),
+                };
+                receiver
+                    .store
+                    .create_trade_endpoint("nyc", &endpoint)
+                    .unwrap();
+                let (invitation_id, secret) = receiver
+                    .store
+                    .create_trade_invitation(
+                        "nyc",
+                        &token,
+                        &source.signer.public_hex,
+                        now_unix() + 300,
+                    )
+                    .unwrap();
+                let invitation = receiver.signer.port_message(
+                    "invitation",
+                    "",
+                    invitation_id,
+                    now_unix() + 300,
+                    json!({"secret":secret}),
+                );
+                let route = crate::store::TradeRoute {
+                    id: "nyc".into(),
+                    revision: 1,
+                    tenant: "".into(),
+                    direction: "outgoing".into(),
+                    name: "NYC".into(),
+                    peer_name: "NYC".into(),
+                    peer_key: receiver.signer.public_hex.clone(),
+                    address: origin.clone(),
+                    endpoint: token.clone(),
+                    endpoint_name: endpoint.name,
+                    category: "internal".into(),
+                    forwarding: true,
+                    metadata_keys: endpoint.metadata_keys,
+                    state: "pending_approval".into(),
+                    notifications: crate::store::NotificationPolicy::default(),
+                    last_contact: None,
+                    error: None,
+                    remote_grant: String::new(),
+                    remote_state: "enrolling".into(),
+                    cancel_active: false,
+                };
+                source
+                    .store
+                    .save_outgoing_trade(&route, &auth::random_token(), &invitation)
+                    .unwrap();
+                crate::api::trade::enroll_outgoing(&source, &route)
+                    .await
+                    .unwrap();
+                assert_eq!(source.store.trade_route("", "nyc").unwrap().state, "active");
+            } else {
+                source
+                    .store
+                    .save_delivery_storage(
+                        "local",
+                        config,
+                        Some(storage::Credentials::Votport {
+                            request_url: format!("{origin}/r/{token}"),
+                            password: None,
+                        }),
+                    )
+                    .unwrap();
+            }
             let mut project = crate::workflow::tests::project();
             project.require_approval = false;
             project.destinations = vec!["nyc".into()];
@@ -1945,6 +2263,20 @@ mod tests {
             assert_eq!(retiring.id, received_job.id);
             assert!(!library_root(&receiver, "nyc").exists());
             retire_snapshot(&receiver).await.unwrap();
+            for incoming in receiver.store.trade_routes(Some("nyc")).unwrap() {
+                assert!(receiver.store.remove_link("nyc", &token).is_err());
+                receiver
+                    .store
+                    .update_trade_route(
+                        "nyc",
+                        &incoming.id,
+                        incoming.revision,
+                        "revoked",
+                        false,
+                        &incoming.notifications,
+                    )
+                    .unwrap();
+            }
             receiver.store.remove_link("nyc", &token).unwrap();
             assert_eq!(
                 receiver.store.remove_tenant("nyc").unwrap(),
