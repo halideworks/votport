@@ -11,7 +11,6 @@ test('system settings are grouped and deployment values have DOM targets', () =>
   assert.deepEqual(groups, [
     'access-security',
     'storage-transfer',
-    'notifications',
     'email',
     'retention',
     'default-tenant-quotas',

@@ -1,3 +1,5 @@
+import { markFormChanged, markFormSaved } from '/assets/form-drafts.js';
+import { notificationEditor, notificationDetails, downloadEvents } from '/assets/notifications.js';
 if (window.location.hash === '#workflows') window.location.replace('/workflows');
 
 // votport deliver page: build outbound downloads and manage issued links.
@@ -23,6 +25,9 @@ import {
 import { startStatusPoll } from '/assets/status-strip.js';
 
 const $ = (id) => document.getElementById(id);
+const createNotifications = notificationEditor({ events: downloadEvents });
+$('deliver-notifications').append(createNotifications.element);
+let notificationsReadOnly = true;
 
 function grantStatus(grant) {
   if (grant.revoked_at) return 'revoked';
@@ -105,28 +110,12 @@ function renderGrants() {
     }
     meta.textContent = metaParts.join(' · ');
     card.append(meta);
-    const notify = document.createElement('label');
-    notify.className = 'toggle muted';
-    const notifyInput = document.createElement('input');
-    notifyInput.type = 'checkbox';
-    notifyInput.name = 'notify_on_download';
-    notifyInput.checked = Boolean(grant.notify_on_download);
-    notifyInput.addEventListener('change', async () => {
-      notifyInput.disabled = true;
-      try {
-        await api(`/api/admin/outbound-grants/${grant.id}`, {
-          method: 'PATCH',
-          body: JSON.stringify({ notify_on_download: notifyInput.checked }),
-        });
-      } catch (error) {
-        notifyInput.checked = !notifyInput.checked;
-        alertModal(error.message);
-      } finally {
-        notifyInput.disabled = false;
-      }
-    });
-    notify.append(notifyInput, document.createTextNode(' Notify on first download and delivery completion'));
-    card.append(notify);
+    card.append(notificationDetails({ policy: grant.notifications, events: downloadEvents, readOnly: notificationsReadOnly,
+      save: async (notifications) => {
+        await api(`/api/admin/outbound-grants/${grant.id}`, { method: 'PATCH', body: JSON.stringify({ notifications }) });
+        grant.notifications = notifications;
+      },
+    }));
 
     if (grant.files_truncated) {
       const summary = document.createElement('p');
@@ -232,7 +221,7 @@ async function refreshGrants(reset = true) {
     grantRows.push(...(response.grants || []));
     grantTotal = response.total ?? grantRows.length;
     grantHasMore = Boolean(response.has_more);
-    renderGrants();
+    await sessionReady; renderGrants();
   } catch (error) {
     if (reset || !grantRows.length) {
       const message = document.createElement('p');
@@ -678,7 +667,7 @@ function deliverFormValues(selection) {
     expires_days: expires,
     password: $('deliver-password').value || null,
     max_downloads: maxDownloads,
-    notify_on_download: $('deliver-notify-on-download').checked,
+    notifications: createNotifications.read(),
   };
 }
 
@@ -694,7 +683,7 @@ async function submitDeliverGrant(selection, control) {
     error.hidden = false;
     return;
   }
-  deliverGrantBusy = true;
+  deliverGrantBusy = true; $('deliver-form').inert = true;
   const submit = $('deliver-submit');
   submit.disabled = true;
   document.querySelectorAll('[data-library-folder-share]').forEach((button) => {
@@ -707,6 +696,7 @@ async function submitDeliverGrant(selection, control) {
       body: JSON.stringify(request),
     });
     if (!response.url) throw new Error('server did not return a download URL');
+    markFormSaved($('deliver-form'));
     showGrantResult(response.url, response.grant?.has_password);
     $('deliver-password').value = '';
     await refreshGrants();
@@ -714,7 +704,7 @@ async function submitDeliverGrant(selection, control) {
     $('deliver-error').textContent = requestError.message;
     $('deliver-error').hidden = false;
   } finally {
-    deliverGrantBusy = false;
+    deliverGrantBusy = false; $('deliver-form').inert = false;
     submit.disabled = false;
     document.querySelectorAll('[data-library-folder-share]').forEach((button) => {
       button.disabled = false;
@@ -753,5 +743,8 @@ function renderStatus(status) {
 
 // The session check and every list go out together; each is one round trip.
 startStatusPoll({ render: renderStatus, active: (status) => status.outbound.active > 0 });
-await Promise.all([requireSession(), refreshGrants(), refreshLibrary()]);
+const sessionReady = requireSession().then((session) => { notificationsReadOnly = session.role !== 'admin'; });
+await Promise.all([sessionReady, refreshGrants(), refreshLibrary()]);
 await revealGrant();
+
+$('library-files').addEventListener('change', () => markFormChanged($('deliver-form')));

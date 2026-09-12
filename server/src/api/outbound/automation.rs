@@ -211,8 +211,8 @@ pub struct AutomationShareRequest {
     password: Option<String>,
     #[serde(default)]
     max_downloads: Option<u64>,
-    #[serde(default)]
-    notify_on_download: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notifications: Option<crate::store::NotificationPolicy>,
     expires_days: u64,
     #[serde(default)]
     operation_id: Option<String>,
@@ -340,7 +340,12 @@ pub async fn automation_share(
             password_hash: hash_optional_password(request.password.as_deref())?,
             expires_days: request.expires_days,
             max_downloads: request.max_downloads,
-            notify_on_download: request.notify_on_download,
+            notifications: crate::api::notifications::creation_policy(
+                &app,
+                &identity.tenant,
+                request.notifications,
+                &crate::api::notifications::DOWNLOAD_EVENTS,
+            )?,
         },
     )
     .await
@@ -867,5 +872,39 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+}
+
+pub async fn notification_destinations(
+    State(app): State<Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let (token, _) = authenticate(&app, &headers, peer, None)?;
+    if !token
+        .permissions
+        .iter()
+        .any(|p| p == "deliveries:create" || p == "jobs:create")
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Delivery or job creation permission required",
+        ));
+    }
+    crate::api::notifications::catalog(&app, &token.tenant)
+}
+
+#[cfg(test)]
+mod notification_request_tests {
+    use super::*;
+    #[test]
+    fn notification_policy_changes_automation_request_identity() {
+        let original = r#"{"directory":"project","label":null,"password":null,"max_downloads":null,"expires_days":7,"operation_id":"stable"}"#;
+        let request: AutomationShareRequest = serde_json::from_str(original).unwrap();
+        assert_eq!(serde_json::to_string(&request).unwrap(), original);
+        let mut custom = serde_json::from_str::<serde_json::Value>(original).unwrap();
+        custom["notifications"] = json!({"mode":"off","rules":[]});
+        let request: AutomationShareRequest = serde_json::from_value(custom).unwrap();
+        assert_ne!(serde_json::to_string(&request).unwrap(), original);
     }
 }

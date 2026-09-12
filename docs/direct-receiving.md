@@ -175,3 +175,35 @@ storage-administration process to revoke the disposable client's locks after
 matching `/proc/fs/nfsd/clients/<id>/ctl`. Run each test separately and target only
 its fixture client. The tests require ownership loss within 60 seconds, refusal
 of new receiving operations, and no automatic reacquisition.
+
+## Desktop verification, 2026-09-11
+
+The installed macOS and Windows apps uploaded to a qualified Linux NFSv4.2
+mount over both HTTP and QUIC. Each upload contained 104 files totaling
+69,702,607 bytes: 100 valid EXRs, a 64 MiB random file, an empty file, and text
+files with accents, spaces and brackets in their names. All four uploads
+completed without partial records and produced 104 receipt sidecars each.
+Independent SHA-256 checks on the storage server matched every source file.
+Filename comparison accounted for macOS Unicode decomposition.
+
+| Client | HTTP upload | QUIC upload | HTTP download | QUIC download |
+| --- | --- | --- | --- | --- |
+| Installed macOS app | Passed | Passed | Passed | Passed |
+| Installed Windows app | Passed | Passed | Not completed in UI | Not completed in UI |
+| Bundled Windows CLI | Not run | Not run | Passed | Passed |
+
+Every completed download matched all 104 source hashes. Upload records and
+download transport events confirmed the actual routes. An initial Windows
+attempt with UDP blocked fell back to HTTP and also passed all hash checks;
+QUIC was then checked separately after opening the test firewall. Windows
+Receive UI automation was stopped because the workstation was in active use.
+The Windows core suite passed 90 tests with two benchmarks ignored; all nine
+Linux receiving unit tests passed.
+
+The disposable VM ran the deployed server executable, an ext4-backed NFS
+export and its hard-mounted NFS client on the same host over loopback. Desktop
+HTTP traffic used SSH tunnels; QUIC used the VM's UDP listeners. The fixture
+also passed flush, exclusive hard-link publication, inode continuity,
+directory synchronization and second-process lock exclusion probes. This
+checks the real NFS code path, but does not qualify cross-host lock recovery,
+NAS failover or power-loss durability, and is not a throughput benchmark.

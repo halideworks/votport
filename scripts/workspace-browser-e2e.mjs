@@ -1,3 +1,4 @@
+import { openAncestors } from './browser-helpers.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -11,6 +12,7 @@ await fs.writeFile(path.join(root, 'library', id, 'master.txt'), 'UI delivery fi
 const browser = await chromium.launch();
 const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, reducedMotion: 'reduce' });
 const page = await context.newPage(), errors = [];
+page.on('dialog', (dialog) => dialog.accept());
 page.on('pageerror', (error) => errors.push(error.message));
 const api = async (route, data, method = data ? 'POST' : 'GET') => {
   const response = await context.request.fetch(`${base}/api/${route}`, { method, data, headers: { 'X-Votport': '1' } });
@@ -61,14 +63,16 @@ async function saveStorage() {
 try {
   await api('admin/login', { password: process.env.ADMIN_PASSWORD });
   await page.goto(`${base}/deliver`);
-  await page.locator('#nav a[aria-current=page]').waitFor();
+  await page.locator('#nav a[aria-current=page]').waitFor({ state: 'attached' });
   await layout('deliver');
   await page.getByRole('link', { name: 'Workflows', exact: true }).click();
   await page.getByRole('link', { name: 'Projects', exact: true }).click();
   await page.click('#workflow-new-project');
   await page.fill('#wp-label', 'Studio masters');
   assert.equal(await page.inputValue('#wp-id'), 'studio-masters');
+  await openAncestors(page.locator('#wp-id'));
   await page.fill('#wp-id', id); await page.fill('#wp-directory', id);
+  await openAncestors(page.locator('#wp-add-member'));
   await page.click('#wp-add-member');
   await page.locator('#wp-members input').fill('producer@example.com');
   await page.locator('#wp-members select').selectOption('approver');
@@ -99,7 +103,7 @@ try {
   await page.route('**/api/workflows/jobs', (route) => route.fulfill({ status: 403, json: { error: 'Retry denied fixture' } }), { times: 1 });
   await page.locator('#workflow-create button[type=submit]').click();
   await page.getByText('Retry denied fixture', { exact: true }).waitFor();
-  assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem('votport-workflow-draft:')).operation_id), issued.job.request.operation_id);
+  assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem(Object.keys(sessionStorage).find((key) => key.startsWith('votport-workflow-draft:')))).operation_id), issued.job.request.operation_id);
   let jobReads = 0;
   await page.route('**/api/workflows/jobs?*', async (route) => {
     const response = await route.fetch(), body = await response.json(); jobReads++;
@@ -158,6 +162,7 @@ try {
   const download = page.waitForEvent('download'); await page.click('#workflow-events-export');
   assert.deepEqual(JSON.parse(await fs.readFile(await (await download).path(), 'utf8')), records);
 
+  await page.locator('#nav .nav-more > summary').click();
   await page.getByRole('link', { name: 'Storage', exact: true }).click();
   await page.locator('#receiving-storage').waitFor();
   await page.click('#receiving-check');
@@ -235,7 +240,7 @@ try {
   assert.equal((await api('workflows/storage')).storage.find((item) => item.id === storageId).credential_source, 'saved');
   const project = (await api('workflows/projects')).projects.find((item) => item.id === id);
   await api('workflows/projects', { ...project, destinations: [storageId] }, 'PUT');
-  const { credential_source, ...disabled } = (await api('workflows/storage')).storage.find((item) => item.id === storageId);
+  const { credential_source, trade_route, ...disabled } = (await api('workflows/storage')).storage.find((item) => item.id === storageId);
   assert.equal(credential_source, 'saved');
   await api('workflows/storage', { storage: { ...disabled, enabled: false } }, 'PUT');
   await page.goto(`${base}/workflows#projects`);
@@ -243,11 +248,12 @@ try {
   assert.ok(await page.locator(`#wp-destinations input[value="${storageId}"]`).isChecked(), 'Unavailable storage must remain selected in an existing policy');
   await saveProject();
   assert.equal((await api('workflows/projects')).projects.find((item) => item.id === id).destinations[0], storageId);
+  await page.locator('#nav .nav-more > summary').click();
   await page.getByRole('link', { name: 'Automation', exact: true }).click();
   await page.locator('#automation-token-form').waitFor(); await layout('automation');
   for (const name of ['receive', 'audit', 'tenants', 'system']) {
     await page.goto(`${base}/${name}`);
-    await page.locator('#nav a[aria-current=page]').waitFor();
+    await page.locator('#nav a[aria-current=page]').waitFor({ state: 'attached' });
     await page.waitForLoadState('networkidle');
     await layout(name);
   }
@@ -258,7 +264,7 @@ try {
 
   await page.goto(`${base}/storage`); await page.click('#storage-new');
   await page.selectOption('#ws-kind', 'folder'); await page.fill('#ws-label', 'Shared reception');
-  await page.fill('#ws-id', `${storageId}_folder`); await page.fill('#ws-directory', path.join(root, 'shared'));
+  await openAncestors(page.locator('#ws-id')); await page.fill('#ws-id', `${storageId}_folder`); await page.fill('#ws-directory', path.join(root, 'shared'));
   await fs.mkdir(path.join(root, 'shared'), { recursive: true });
   await layout('shared-folder-editor');
   let saved = page.waitForResponse((response) => response.url().endsWith('/api/workflows/storage') && response.request().method() === 'PUT');
@@ -266,13 +272,12 @@ try {
   await page.waitForFunction(() => !document.querySelector('#storage-test').disabled);
   await page.click('#storage-test'); await page.getByText(/The server can read this shared folder/).waitFor();
   const request = await api('admin/links', { label: 'Peer connection fixture' });
-  await page.click('#storage-new'); await page.selectOption('#ws-kind', 'votport');
-  await page.fill('#ws-label', 'Connected studio'); await page.fill('#ws-id', `${storageId}_peer`);
-  await page.fill('#ws-port-link', request.link.url); await layout('peer-port-editor');
-  saved = page.waitForResponse((response) => response.url().endsWith('/api/workflows/storage') && response.request().method() === 'PUT');
-  await page.locator('#workflow-save-storage button[type=submit]').click(); assert.equal((await saved).status(), 200);
-  await page.waitForFunction(() => document.querySelector('#ws-port-auth').value === 'keep');
-  assert.equal(await page.inputValue('#ws-port-link'), '', 'Saved receive capability stays private');
+  await api('workflows/storage', { storage: { ...disabled, id: `${storageId}_peer`, revision: 0, kind: 'votport', label: `Connected studio ${id}`, directory: '', prefix: '', endpoint: base, bucket: '', region: '', enabled: true }, credentials: { mode: 'votport', request_url: request.link.url } }, 'PUT');
+  await page.reload();
+  const peerCard = page.locator('#storage-list article').filter({ has: page.getByRole('heading', { name: `Connected studio ${id}`, exact: true }) });
+  await peerCard.getByRole('button', { name: 'Disable receive-link connection', exact: true }).click(); await page.click('#confirm-ok');
+  await peerCard.getByText('Disabled', { exact: true }).waitFor();
+  assert.equal((await api('workflows/storage')).storage.find((item) => item.id === `${storageId}_peer`).enabled, false);
   const reception = await api('workflows/projects', { ...project, id: `${storageId}_reception`, directory: `${id}-incoming`, revision: 0, label: `Reception ${id}`, receive: true, release: 'local', destinations: [`${storageId}_folder`], recipients: [], require_approval: false, sequence: null, media: null, scan_required: false }, 'PUT');
   await page.goto(`${base}/workflows#projects`);
   await page.locator('#workflow-project-list article').filter({ hasText: `Reception ${id}` }).getByRole('button', { name: 'Edit project' }).click();
@@ -300,6 +305,7 @@ try {
   const card = page.locator(`#link-${incoming.id}`), editor = card.locator('.reception-workflow');
   await editor.waitFor(); await page.waitForLoadState('networkidle');
   await editor.evaluate((node) => { node.open = false; });
+  await card.locator('.notification-details').evaluate((node) => { node.open = false; });
   let releaseList, listStarted, listReads = 0;
   const heldList = new Promise((resolve) => releaseList = resolve), listPending = new Promise((resolve) => listStarted = resolve);
   await page.route('**/api/admin/links?*', async (route) => {
@@ -327,12 +333,29 @@ try {
   await editor.evaluate((node) => { node.open = false; });
   await pollStatus();
   assert.equal(listReads, 1, 'A pending save preserves its editor');
-  releasePatch(); await page.waitForFunction(() => document.querySelector('.reception-workflow [role=status]').textContent.startsWith('Saved.'));
-  assert.match(await editor.locator('[role=status]').textContent(), /^Saved\./);
+  releasePatch(); await page.waitForFunction(() => document.querySelector('.reception-workflow > [role=status]').textContent.startsWith('Saved.'));
+  assert.match(await editor.locator(':scope > [role=status]').textContent(), /^Saved\./);
   await pollStatus();
-  await page.waitForFunction(() => !document.querySelector('.reception-workflow [role=status]').textContent);
+  await page.waitForFunction(() => !document.querySelector('.reception-workflow > [role=status]').textContent);
   assert.equal(listReads, 2, 'The deferred refresh runs after editing finishes');
   await page.unroute('**/api/admin/status?*'); await page.unroute('**/api/admin/links?*'); await page.unroute(`**/api/admin/links/${incoming.id}`);
+  await editor.evaluate((node) => { node.open = true; });
+  await editor.locator('input[data-metadata]').fill('Preserved by manual refresh');
+  await page.click('#links-refresh'); await page.waitForLoadState('networkidle');
+  assert.equal(await editor.locator('input[data-metadata]').inputValue(), 'Preserved by manual refresh');
+  let releaseOld, oldStarted;
+  const heldOld = new Promise((resolve) => releaseOld = resolve), oldPending = new Promise((resolve) => oldStarted = resolve);
+  await page.route('**/api/admin/links?*', async (route) => { const response = await route.fetch(); oldStarted(); await heldOld; await route.fulfill({ response }); }, { times: 1 });
+  await page.click('#links-refresh'); await oldPending;
+  await editor.getByRole('button', { name: 'Save reception workflow' }).click();
+  await page.waitForFunction(() => document.querySelector('.reception-workflow > [role=status]').textContent.startsWith('Saved.'));
+  releaseOld(); await page.waitForLoadState('networkidle');
+  assert.equal(await editor.locator('input[data-metadata]').inputValue(), 'Preserved by manual refresh', 'An older refresh cannot roll back a completed save');
+  await editor.locator('input[data-metadata]').fill('Discard with request');
+  await card.getByRole('button', { name: 'Delete', exact: true }).click();
+  const extraDialogs = []; const onExtra = (dialog) => extraDialogs.push(dialog.message()); page.on('dialog', onExtra);
+  await page.locator('#confirm-ok').click(); await card.waitFor({ state: 'detached' }); await page.waitForLoadState('networkidle');
+  page.off('dialog', onExtra); assert.deepEqual(extraDialogs, [], 'Confirmed deletion removes the request draft without another discard prompt');
 
   await page.goto(`${base}/storage`);
   let releaseInitial, initialStarted, initialReads = 0;

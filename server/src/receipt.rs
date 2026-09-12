@@ -39,6 +39,24 @@ impl ReceiptSigner {
                 .try_into()
                 .map_err(|_| format!("{} is not a 32-byte key seed", path.display()))?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let database = data_dir.join("votport.db");
+                if database.exists() {
+                    let connection = rusqlite::Connection::open_with_flags(
+                        &database,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let paired = connection
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='trade_routes')",
+                            [],
+                            |r| r.get::<_, bool>(0),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    if paired && connection.query_row("SELECT EXISTS(SELECT 1 FROM trade_routes) OR EXISTS(SELECT 1 FROM trade_endpoints)",[],|r|r.get::<_,bool>(0)).map_err(|e|e.to_string())? {
+                        return Err("receipt.key is missing for a paired port; restore its signing key from backup. Replacing its identity requires explicit re-enrollment.".into());
+                    }
+                }
                 let mut seed = [0u8; 32];
                 use rand::RngCore as _;
                 rand::rngs::OsRng.fill_bytes(&mut seed);
@@ -64,6 +82,27 @@ impl ReceiptSigner {
         document: crate::route_protocol::RouteDocument,
     ) -> crate::route_protocol::SignedRoute {
         crate::route_protocol::SignedRoute::sign(document, &self.key)
+    }
+
+    pub(crate) fn port_message(
+        &self,
+        purpose: &str,
+        audience: &str,
+        nonce: String,
+        expires_at: u64,
+        body: serde_json::Value,
+    ) -> crate::route_protocol::SignedPortMessage {
+        crate::route_protocol::SignedPortMessage::sign(
+            crate::route_protocol::PortMessage {
+                issuer: self.public_hex.clone(),
+                audience: audience.into(),
+                purpose: purpose.into(),
+                nonce,
+                expires_at,
+                body,
+            },
+            &self.key,
+        )
     }
 
     pub(crate) fn route_device(&self) -> votport_client_core::Device {

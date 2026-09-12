@@ -245,7 +245,7 @@ CREATE TABLE IF NOT EXISTS principals (
 
 No `REFERENCES` clauses. Do not enable a `foreign_keys` pragma in this stack.
 
-Do not store SMTP/ntfy secrets in `audit_log.detail`. Settings PUTs audit the keys changed (and which were reset), not the values.
+Do not store SMTP or destination secrets in `audit_log.detail`. Settings PUTs audit the keys changed (and which were reset), not the values.
 
 ### 1. DB-backed settings
 
@@ -254,11 +254,7 @@ Do not store SMTP/ntfy secrets in `audit_log.detail`. Settings PUTs audit the ke
 ```rust
 // New type in store.rs (shape, not a freeze of field order).
 pub struct ResolvedSettings {
-    pub notify_webhook: Option<String>,
-    pub notify_ntfy: Option<String>,
-    pub notify_ntfy_token: Option<String>,
-    pub notify_pushover: Option<(String, String)>,
-    pub smtp: Option<ResolvedSmtp>, // always None until the SMTP PR
+    pub smtp: Option<ResolvedSmtp>,
     pub audit_retention_days: u64,
     pub upload_retention_days: u64,
     pub default_max_total_bytes: Option<u64>,
@@ -294,8 +290,7 @@ PUT body is a JSON object of known keys. Unknown keys: `422`. Omitted key: leave
 
 | Keys | JSON type on PUT | `null` | `""` | Other |
 | --- | --- | --- | --- | --- |
-| `notify_webhook`, `notify_ntfy` | string | DELETE row (env) | store empty (disable) | must be `http://` or `https://`; else 422 |
-| `notify_ntfy_token`, `notify_pushover_token`, `notify_pushover_user`, later `smtp_password` | string | DELETE row | store empty (disable) | any non-empty string; not returned on GET |
+| `smtp_password` | string | DELETE row | store empty (disable) | any non-empty string; not returned on GET |
 | `audit_retention_days`, `upload_retention_days` | number (u64, including 0 = off) | DELETE row | 422 | reject negative, float, string |
 | `default_max_total_bytes`, `default_max_links`, `default_max_sessions` | number (u64 **> 0**) | DELETE row (unlimited / env) | 422 | reject `0` (never store `"0"` as a zero-byte cap; matches `create_tenant`'s `filter(|&bytes| bytes > 0)`) |
 | `public_password_login` | bool | DELETE row | 422 | store `"1"` / `"0"` |
@@ -307,13 +302,6 @@ Storage is always TEXT. Numbers as decimal strings. Bools as `"1"` / `"0"`.
 
 ```json
 {
-  "notify_webhook": "https://hooks.example/vot",
-  "notify_webhook_source": "env",
-  "notify_ntfy": null,
-  "notify_ntfy_source": "env",
-  "notify_ntfy_token_set": false,
-  "notify_ntfy_token_source": "env",
-  "notify_pushover_set": false,
   "audit_retention_days": 400,
   "audit_retention_days_source": "env",
   "upload_retention_days": 0,
@@ -332,7 +320,7 @@ Secrets never leave the process: GET returns `*_set: bool` and `*_source`, not t
 
 `*_source` is `"env"` when the row is absent (or invalid-skipped), `"db"` when a row exists, including a stored empty disable.
 
-Audit: `settings_updated` with `actor = identity.subject`, `detail = { "keys": ["notify_webhook"], "reset": ["audit_retention_days"] }`.
+Audit: `settings_updated` with `actor = identity.subject`, `detail = { "keys": ["smtp_host"], "reset": ["audit_retention_days"] }`.
 
 #### Call sites that must switch from `app.config`
 
@@ -374,7 +362,6 @@ Do not add a settings form in the API-only PR. Do not add SMTP fields until the 
 - GET with empty table returns env defaults (`testing::build` has retention 400 / 0) and `*_source: "env"`.
 - PUT then GET shows `source: "db"` and the new values.
 - PUT omitting a secret leaves the previous DB value.
-- PUT `""` on a URL disables it even when env has a value (the test builds `App` with `notify_webhook: Some(...)`).
 - PUT `null` on that key deletes the row; GET follows env again (`source: "env"`).
 - PUT `0` on `default_max_total_bytes` is 422; PUT `0` on `audit_retention_days` is 200 (off).
 - PUT a non-http URL is 422.
@@ -415,7 +402,7 @@ lettre = { version = "0.11", default-features = false, features = ["builder", "s
 
 Do not enable `native-tls`, `sendmail-transport`, or `dkim` (`dkim` would pull `rsa`; `deny.toml` already ignores RUSTSEC-2023-0071 as verify-only). Timeout 15s to match `App.http`.
 
-Env boot defaults (optional): `VOTPORT_NOTIFY_SMTP_HOST`, `VOTPORT_NOTIFY_SMTP_PORT`, `VOTPORT_NOTIFY_SMTP_USERNAME`, `VOTPORT_NOTIFY_SMTP_PASSWORD`, `VOTPORT_NOTIFY_SMTP_FROM`, `VOTPORT_NOTIFY_SMTP_TO`, `VOTPORT_NOTIFY_SMTP_STARTTLS`. Overlay is per-key; assembly uses the same required set as above (host/from/to). A host in DB with from/to still in env is `Some` if all three resolve. Empty `smtp_password` is optional, not a reason to disable the channel.
+Env boot defaults (optional): `VOTPORT_NOTIFY_SMTP_HOST`, `VOTPORT_NOTIFY_SMTP_PORT`, `VOTPORT_NOTIFY_SMTP_USERNAME`, `VOTPORT_NOTIFY_SMTP_PASSWORD`, `VOTPORT_NOTIFY_SMTP_FROM`, `VOTPORT_NOTIFY_SMTP_STARTTLS`. Overlay is per-key; assembly uses the same required set as above (host/from). A host in DB with from still in env is `Some` if both resolve. Empty `smtp_password` is optional, not a reason to disable the channel.
 
 System card fields land in the SMTP PR (the settings form already exists). GET redacts `smtp_password`.
 
@@ -936,8 +923,6 @@ Rollback: revert the PR. Schema v4/v5 tables are additive; a reverted binary tha
 ## Open Questions
 
 1. **Retention of `data/backups/` vs Litestream.** 30 days is already hard-coded in `session_sweeper`. Leave it unless an operator asks for a setting. Not a settings key in this stack (backup files are local disk, not SIEM policy).
-2. **Multiple SMTP recipients** are comma-separated in one `smtp_to` string. A JSON array can wait.
-3. **Per-tenant notification destinations** are not in this stack. One global channel set. A later design if two teams refuse to share a webhook.
 4. **Metrics cardinality** if tenant count grows. Still "counts only". Revisit if someone has hundreds of namespaces.
 5. **Ready TTL** for IdP metadata rotation. Not in this stack; document restart.
 

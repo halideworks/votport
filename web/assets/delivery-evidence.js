@@ -165,14 +165,15 @@ export function initDeliveryEvidence(getMetadata) {
     $('evidence-records').replaceChildren();
     for (const record of records.filter((record) => record.evidence.kind === 'verified')) {
       const accepted = records.find((item) => item.evidence.kind === 'accepted' && item.evidence.authorization.signature === record.evidence.authorization.signature);
-      const row = document.createElement('p');
+      const row = document.createElement('div'); row.className = 'verification-record';
       const manifest = document.createElement('span'); manifest.className = 'mono';
       manifest.textContent = `Manifest ${record.evidence.authorization.challenge.manifest}`;
-      row.append(manifest, document.createTextNode(` · Verified: ${record.status} · Acceptance: ${accepted?.status || 'not accepted'} `));
+      const result = document.createElement('p'); result.textContent = `Files verified on this device. ${record.status === 'recorded' ? 'Verification reported to the sender.' : 'Verification report: ' + record.status + '.'} ${accepted ? (accepted.status === 'recorded' ? 'Delivery accepted and reported to the sender.' : 'Delivery accepted on this device; report: ' + accepted.status + '.') : 'Ready for your acceptance.'}`;
+      const detail = document.createElement('details'), caption = document.createElement('summary'); caption.textContent = 'Signed delivery fingerprint'; detail.append(caption, manifest); row.append(result, detail);
       if (!accepted) {
         const button = document.createElement('button'); button.type = 'button'; button.textContent = 'Accept verified delivery';
         button.onclick = () => run(async () => {
-          if (!window.confirm(`Confirm you reviewed and accept manifest ${record.evidence.authorization.challenge.manifest}?`)) return;
+          if (!window.confirm('Accept this verified delivery? This records your acceptance of the exact files shown here and sends a signed report to the sender.')) return;
           const auth = await verifyAuthorization(record.evidence.authorization, record.evidence.authorization.issuer);
           const acceptance = await statement(auth, 'accepted');
           await show();
@@ -182,6 +183,9 @@ export function initDeliveryEvidence(getMetadata) {
       }
       $('evidence-records').append(row);
     }
+    if (records.some((record) => record.status === 'pending')) status.textContent = 'Signed reports are waiting to reach the sender. Use Retry pending reports if needed.';
+    else if (records.length) status.textContent = records.some((record) => record.status === 'expired') ? 'Some reports expired before reaching the sender. Review the verification records below.' : 'Signed reports recorded by the sending port.';
+    if (!$('evidence-records').children.length) { const empty = document.createElement('p'); empty.className = 'field-help'; empty.textContent = 'No verification record yet. Verify your saved files above to make acceptance available.'; $('evidence-records').append(empty); }
   }
   $('evidence-copy-key').onclick = () => run(async () => {
     const local = await device(); await copyToClipboard($('evidence-copy-key'), local.holder); status.textContent = 'Device public key copied. Give it to the sender for enrollment.';

@@ -559,11 +559,20 @@ pub(crate) fn upload_completed(
             "bytes": report.files.iter().map(|file| file.bytes).sum::<u64>()
         }),
     );
-    if let Some(link) = link.filter(|link| link.notify_on_upload) {
+    {
+        let application = Arc::clone(app);
+        let tenant = completed_tenant.to_owned();
+        let upload = report.upload_id.clone();
+        runtime.spawn(async move {
+            crate::notify::trade_uploaded(&application, &tenant, &upload).await;
+        });
+    }
+    if let Some(link) = link.filter(|link| link.notifications.as_ref().is_some_and(|p| p.enabled()))
+    {
         let app = Arc::clone(app);
         let report = report.clone();
         runtime.spawn(async move {
-            crate::notify::uploaded(app, link.tenant, link.label, report).await;
+            crate::notify::uploaded(app, link.tenant, link.label, report, link.notifications).await;
         });
     }
     let started_at = app
@@ -2320,15 +2329,24 @@ pub fn router(app: Arc<App>) -> Router {
                 match tokio::fs::read_to_string(&path).await {
                     Ok(mut contents) => {
                         let admin_page = contents.contains("<nav id=\"nav\" class=\"nav\"></nav>");
+                        let mut footer_tenant = (!admin_page
+                            && matches!(
+                                path.file_stem().and_then(|name| name.to_str()),
+                                Some("index" | "verify")
+                            ))
+                        .then(String::new);
                         if admin_page {
                             if let Some(session) = api::admin::admin_page_session(&app, &headers) {
+                                footer_tenant = session["tenant"].as_str().map(str::to_owned);
                                 let mut nav = String::new();
                                 for (page, label) in [
                                     ("receive", "Receive"),
                                     ("deliver", "Deliver"),
                                     ("workflows", "Workflows"),
+                                    ("trade-routes", "Trade routes"),
                                     ("storage", "Storage"),
                                     ("automation", "Automation"),
+                                    ("notifications", "Notifications"),
                                     ("tenants", "Tenants"),
                                     ("audit", "Audit"),
                                     ("system", "System"),
@@ -2355,6 +2373,17 @@ pub fn router(app: Arc<App>) -> Router {
                                 );
                                 let bootstrap = session.to_string().replace('<', "\\u003c");
                                 contents = contents.replace("</head>", &format!("<script id=\"admin-session\" type=\"application/json\">{bootstrap}</script></head>"));
+                            }
+                        }
+                        if let Some(tenant) = footer_tenant {
+                            if let Ok(Some(branding)) = app.store.branding(&tenant) {
+                                contents = contents.replace(
+                                    "<span class=\"footer-custom\"></span>",
+                                    &format!(
+                                        "<span class=\"footer-custom\">{}</span>",
+                                        api::branding_footer(&branding)
+                                    ),
+                                );
                             }
                         }
                         (
@@ -2449,10 +2478,6 @@ pub fn router(app: Arc<App>) -> Router {
             get(api::get_settings).put(api::put_settings),
         )
         .route(
-            "/api/admin/notifications/test",
-            post(api::test_notifications),
-        )
-        .route(
             "/api/admin/tenants/{key}",
             axum::routing::patch(api::update_tenant).delete(api::delete_tenant),
         )
@@ -2520,6 +2545,57 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/metrics", axum::routing::get(metrics))
         // Multi-page admin: static shells; authz is enforced per API call.
+        .route(
+            "/api/automation/notifications",
+            get(api::outbound::automation::notification_destinations),
+        )
+        .route(
+            "/api/workflows/jobs/{id}/notifications",
+            axum::routing::patch(api::outbound::workflows::update_notifications),
+        )
+        .route("/trade-routes", serve_page(page("trade-routes")))
+        .route("/api/port", get(api::trade::discover))
+        .route("/api/port/enroll", post(api::trade::enroll))
+        .route("/api/port/status", post(api::trade::status))
+        .route("/api/port/rotate", post(api::trade::rotate_remote))
+        .route(
+            "/api/trade-routes",
+            get(api::trade::list).post(api::trade::accept),
+        )
+        .route(
+            "/api/trade-routes/port",
+            axum::routing::put(api::trade::settings),
+        )
+        .route("/api/trade-routes/endpoints", post(api::trade::endpoint))
+        .route("/api/trade-routes/invitations", post(api::trade::invite))
+        .route("/api/trade-routes/inspect", post(api::trade::inspect))
+        .route(
+            "/api/trade-routes/{id}",
+            axum::routing::put(api::trade::update),
+        )
+        .route("/api/trade-routes/{id}/test", post(api::trade::test))
+        .route("/api/trade-routes/{id}/rotate", post(api::trade::rotate))
+        .route(
+            "/api/trade-routes/{id}/address",
+            axum::routing::put(api::trade::change_address),
+        )
+        .route("/notifications", serve_page(page("notifications")))
+        .route(
+            "/api/notifications",
+            get(api::notifications::list).post(api::notifications::save),
+        )
+        .route(
+            "/api/notifications/defaults",
+            axum::routing::put(api::notifications::defaults),
+        )
+        .route(
+            "/api/notifications/{id}",
+            axum::routing::delete(api::notifications::delete),
+        )
+        .route(
+            "/api/notifications/{id}/test",
+            post(api::notifications::test),
+        )
         .route("/receive", serve_page(page("receive")))
         .route("/deliver", serve_page(page("deliver")))
         .route("/workflows", serve_page(page("workflows")))
@@ -2775,7 +2851,8 @@ mod push_tests {
                 max_bytes: None,
                 active: true,
                 legal_hold: false,
-                notify_on_upload: false,
+
+                notifications: None,
                 uploads: Vec::new(),
                 events: Vec::new(),
             })
@@ -4187,7 +4264,8 @@ mod retention_tests {
             max_bytes: None,
             active: true,
             legal_hold: true,
-            notify_on_upload: false,
+
+            notifications: None,
             uploads: vec![UploadRecord {
                 partial: false,
                 log: Vec::new(),
@@ -4266,7 +4344,8 @@ mod retention_tests {
                 revoked_at: None,
                 downloads: 0,
                 max_downloads: None,
-                notify_on_download: false,
+
+                notifications: None,
                 first_download_at: None,
                 last_download_at: None,
                 files: Vec::new(),

@@ -1,3 +1,4 @@
+import { isFormDirty, markFormChanged, markFormSaved } from '/assets/form-drafts.js';
 // votport tenants page: namespace lifecycle for platform admins.
 // VOTPORT PROPRIETARY LICENSE.
 
@@ -55,7 +56,7 @@ function editTenantForm(tenant) {
   const summary = document.createElement('summary');
   summary.textContent = 'Edit namespace';
   details.append(summary);
-  const form = document.createElement('form');
+  const form = document.createElement('form'); form.setAttribute('data-unsaved', '');
   form.className = 'tenant-edit';
   const fields = [
     ['Label', 'label', tenant.label || '', 'text'],
@@ -91,7 +92,7 @@ function editTenantForm(tenant) {
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     if (!form.reportValidity()) return;
-    save.disabled = true;
+    save.disabled = true; form.inert = true;
     error.hidden = true;
     try {
       const storageBytes = nullableStorageBytes(inputs.max_total_bytes.value);
@@ -105,12 +106,11 @@ function editTenantForm(tenant) {
           max_sessions: nullableNumber(inputs.max_sessions.value),
         }),
       });
-      await refreshTenants();
+      markFormSaved(form); await refreshTenants();
     } catch (requestError) {
       error.textContent = requestError.message;
       error.hidden = false;
-      save.disabled = false;
-    }
+    } finally { save.disabled = false; form.inert = false; }
   });
   const actions = document.createElement('div');
   actions.className = 'actions';
@@ -126,7 +126,7 @@ function brandingForm(tenant) {
   const summary = document.createElement('summary');
   summary.textContent = 'Branding';
   details.append(summary);
-  const form = document.createElement('form');
+  const form = document.createElement('form'); form.setAttribute('data-unsaved', ''); form.inert = true;
   form.className = 'tenant-edit';
   const grid = document.createElement('div');
   grid.className = 'grid';
@@ -165,6 +165,12 @@ function brandingForm(tenant) {
   logoLabel.append(logoInput);
 
   grid.append(nameLabel, colorLabel, logoLabel);
+  const footerFields = {};
+  for (const [key, title, limit, type] of [['footer_text', 'Footer message', 160, 'text'], ['footer_link_label', 'Footer link label', 40, 'text'], ['footer_link_url', 'Footer link URL', 2048, 'url']]) {
+    const label = document.createElement('label'); label.textContent = title;
+    const input = document.createElement('input'); input.type = type; input.maxLength = limit; label.append(input); grid.append(label); footerFields[key] = input;
+  }
+  const footerHelp = document.createElement('p'); footerHelp.className = 'field-help'; footerHelp.textContent = 'Optional short message and one link on this tenant’s dashboard and recipient pages. VOT and VOTPort credits remain visible. Leave blank for the standard footer.'; grid.append(footerHelp);
 
   const save = document.createElement('button');
   save.type = 'submit';
@@ -176,8 +182,10 @@ function brandingForm(tenant) {
 
   const load = async () => {
     const branding = await api(`/api/admin/branding/${key}`);
-    nameInput.value = branding.name || '';
-    accent.set(branding.color || '');
+    if (!isFormDirty(form)) {
+      nameInput.value = branding.name || ''; accent.set(branding.color || '');
+      for (const [key, input] of Object.entries(footerFields)) input.value = branding[key] || '';
+    }
     logoLabel.firstChild.textContent = branding.has_logo
       ? 'Logo (uploaded; choose a file to replace)'
       : 'Logo (PNG, JPEG, or SVG, 512 KiB max)';
@@ -186,12 +194,12 @@ function brandingForm(tenant) {
   details.addEventListener('toggle', () => {
     if (!details.open || loaded) return;
     loaded = true;
-    load().catch((requestError) => alertModal(requestError.message));
+    load().then(() => { form.inert = false; }).catch((requestError) => { loaded = false; alertModal(requestError.message); });
   });
 
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
-    save.disabled = true;
+    save.disabled = true; form.inert = true;
     error.hidden = true;
     try {
       await api(`/api/admin/branding/${key}`, {
@@ -199,14 +207,14 @@ function brandingForm(tenant) {
         body: JSON.stringify({
           name: nameInput.value,
           color: accent.get(),
+          ...Object.fromEntries(Object.entries(footerFields).map(([key, input]) => [key, input.value])),
         }),
       });
+      markFormSaved(form);
     } catch (requestError) {
       error.textContent = requestError.message;
       error.hidden = false;
-    } finally {
-      save.disabled = false;
-    }
+    } finally { save.disabled = false; form.inert = false; }
   });
 
   const actions = document.createElement('div');
@@ -229,7 +237,7 @@ function brandingForm(tenant) {
       await load();
     }),
     button('Reset to default', 'link', () => {
-      accent.set('');
+      accent.set(''); markFormChanged(form);
       colorInput.value = defaultAccent();
     }),
     button('Remove branding', 'danger', async () => {
@@ -241,7 +249,7 @@ function brandingForm(tenant) {
         ))
       )
         return;
-      await api(`/api/admin/branding/${key}`, { method: 'DELETE' });
+      await api(`/api/admin/branding/${key}`, { method: 'DELETE' }); markFormSaved(form);
       form.reset();
       await load();
     }),
@@ -254,7 +262,7 @@ function brandingForm(tenant) {
 
 function renderTenant(tenant, usage) {
   const card = document.createElement('div');
-  card.className = 'card link-item';
+  card.className = 'card link-item'; card.dataset.tenant = tenant.key;
 
   const head = document.createElement('div');
   head.className = 'head';
@@ -392,6 +400,7 @@ async function refreshTenants() {
   ]);
   const usage = new Map((holdings || []).map((item) => [item.tenant, item]));
   const container = $('tenants');
+  const editing = new Map([...container.children].filter((card) => [...card.querySelectorAll('form')].some(isFormDirty)).map((card) => [card.dataset.tenant, card]));
   container.replaceChildren();
   if (!tenants.length) {
     const empty = document.createElement('p');
@@ -400,7 +409,7 @@ async function refreshTenants() {
     container.append(empty);
   } else {
     for (const tenant of tenants) {
-      container.append(renderTenant(tenant, usage.get(tenant.key)));
+      container.append(editing.get(tenant.key) || renderTenant(tenant, usage.get(tenant.key)));
     }
   }
 
@@ -466,6 +475,7 @@ async function refreshPrincipals(reset = false) {
 
 $('tenant-form').addEventListener('submit', async (event) => {
   event.preventDefault();
+  const form = event.currentTarget; if (form.inert) return; form.inert = true;
   $('tenant-error').hidden = true;
   const maxTotal = parseInt($('tenant-max-total').value, 10);
   const maxLinks = parseInt($('tenant-max-links').value, 10);
@@ -482,12 +492,12 @@ $('tenant-form').addEventListener('submit', async (event) => {
         max_sessions: Number.isFinite(maxSessions) ? maxSessions : null,
       }),
     });
-    $('tenant-form').reset();
+    markFormSaved($('tenant-form')); $('tenant-form').reset();
     await refreshTenants();
   } catch (error) {
     $('tenant-error').textContent = error.message;
     $('tenant-error').hidden = false;
-  }
+  } finally { form.inert = false; }
 });
 
 $('principal-search').addEventListener('input', () => {

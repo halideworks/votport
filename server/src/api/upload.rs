@@ -462,6 +462,21 @@ async fn register_session(
     .map_err(|error| session_insert_error(app, &prepared.link.tenant, error))?;
     match app.store.upload_link(&prepared.link.id) {
         Ok(Some(current)) if current.tenant == prepared.link.tenant && current.usable_now() => {
+            if route.is_none() {
+                match app.store.is_trade_endpoint(&prepared.link.id) {
+                    Ok(false) => {}
+                    result => {
+                        app.sessions.remove(id);
+                        return Err(match result {
+                            Err(error) => super::store_unavailable(error),
+                            _ => ApiError::new(
+                                StatusCode::CONFLICT,
+                                "This receiving endpoint requires an enrolled trade route",
+                            ),
+                        });
+                    }
+                }
+            }
             if let Some(route) = route {
                 if let Err(error) = app.store.bind_route_session(route, id, transport) {
                     app.sessions.remove(id);
@@ -1065,7 +1080,8 @@ mod session_rate_tests {
             max_bytes: None,
             active: true,
             legal_hold: false,
-            notify_on_upload: false,
+
+            notifications: None,
             uploads: Vec::new(),
             events: Vec::new(),
         }
@@ -1243,6 +1259,56 @@ mod session_rate_tests {
     }
 
     #[tokio::test]
+    async fn session_creation_rechecks_endpoint_pairing_before_registration() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_link(open_link("pair-race"))
+            .unwrap();
+        let (entered, release) = application.sessions.arm_session_create_stall();
+        let router = app::router(application.clone());
+        let create = tokio::spawn(async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/r/pair-race/session")
+                        .header("content-type", "application/json")
+                        .extension(ConnectInfo(std::net::SocketAddr::from((
+                            [127, 0, 0, 1],
+                            1234,
+                        ))))
+                        .body(Body::from(
+                            r#"{"package":{"suite":"blake3","root":"0000000000000000000000000000000000000000000000000000000000000000","length":1}}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        entered.await.unwrap();
+        application
+            .store
+            .create_trade_endpoint(
+                "",
+                &crate::store::TradeEndpoint {
+                    id: "pair-race".into(),
+                    name: "Paired".into(),
+                    category: "external".into(),
+                    forwarding: false,
+                    metadata_keys: vec![],
+                    notifications: crate::store::NotificationPolicy::default(),
+                },
+            )
+            .unwrap();
+        release.send(()).unwrap();
+
+        assert_eq!(create.await.unwrap().status(), StatusCode::CONFLICT);
+        assert_eq!(application.sessions.total(), 0);
+    }
+
+    #[tokio::test]
     async fn finish_keeps_the_session_registered_through_metadata_reads() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
@@ -1329,7 +1395,8 @@ mod push_preflight_tests {
             max_bytes: None,
             active: true,
             legal_hold: false,
-            notify_on_upload: false,
+
+            notifications: None,
             uploads: Vec::new(),
             events: Vec::new(),
         }

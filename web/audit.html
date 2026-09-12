@@ -16,6 +16,8 @@
     <!-- The whole module graph fetches at once instead of one import level per round trip. -->
     <link rel="modulepreload" href="/assets/page-audit.js" />
     <link rel="modulepreload" href="/assets/admin-common.js" />
+    <link rel="modulepreload" href="/assets/hints.js" />
+    <link rel="modulepreload" href="/assets/form-drafts.js" />
     <link rel="modulepreload" href="/assets/object-card.js" />
     <link rel="modulepreload" href="/assets/undo.js" />
   </head>
@@ -71,7 +73,7 @@
       </div>
       <p id="audit-range" class="mono muted"></p>
       <div id="audit-log" class="mono"></div>
-      <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
+      <p class="sheet-foot"><span class="footer-custom"></span><span>Powered by Verified Object Transport (VOT) · <a href="https://votport.com" target="_blank" rel="noopener noreferrer">VOTPort</a></span></p>
     </div>
 
     <dialog id="confirm" class="modal" aria-labelledby="confirm-title" aria-describedby="confirm-detail">

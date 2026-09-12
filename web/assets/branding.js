@@ -4,6 +4,7 @@
 /// Applies the branding object from link/grant metadata: heading, accent
 /// color, and logo. Absent branding leaves the page exactly as shipped.
 export function applyBranding(branding, logoUrl) {
+  applyFooter(branding);
   if (!branding) return;
   if (branding.name) {
     document.getElementById('title').textContent = branding.name;
@@ -21,6 +22,18 @@ export function applyBranding(branding, logoUrl) {
     logo.alt = '';
     logo.className = 'brand-logo';
     document.querySelector('.masthead').prepend(logo);
+  }
+}
+
+export function applyFooter(branding) {
+  const footer = document.querySelector('.footer-custom');
+  if (!footer) return;
+  footer.replaceChildren();
+  if (branding?.footer_text) footer.append(document.createTextNode(branding.footer_text));
+  if (branding?.footer_link_label && /^https?:\/\//i.test(branding.footer_link_url || '')) {
+    if (footer.childNodes.length) footer.append(document.createTextNode(' · '));
+    const link = document.createElement('a'); link.textContent = branding.footer_link_label;
+    link.href = branding.footer_link_url; link.target = '_blank'; link.rel = 'noopener noreferrer'; footer.append(link);
   }
 }
 

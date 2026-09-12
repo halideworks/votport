@@ -4,12 +4,14 @@
 
 pub mod admin;
 pub mod evidence;
+pub mod notifications;
 pub mod outbound;
 pub mod replica;
 pub mod scim;
 pub mod serve;
 pub mod session_rate;
 pub mod sso;
+pub mod trade;
 pub mod upload;
 pub mod verify;
 
@@ -19,8 +21,8 @@ pub use admin::{
     delete_branding, delete_branding_logo, delete_link, delete_received_file, delete_tenant,
     delete_upload_record, get_backups, get_branding, get_settings, holdings, link_qr, list_links,
     list_principals, list_tenants, put_backups_config, put_branding, put_branding_logo,
-    put_settings, restore_backup, revoke_principal, switch_tenant, test_notifications,
-    unblock_principal, update_link, update_tenant,
+    put_settings, restore_backup, revoke_principal, switch_tenant, unblock_principal, update_link,
+    update_tenant,
 };
 pub use outbound::{
     automation_share, create_automation_token, create_outbound_grant, delete_automation_token,
@@ -267,10 +269,39 @@ pub(crate) fn public_branding(
                 "name": name,
                 "color": row.color,
                 "has_logo": !row.logo_ext.is_empty(),
+                "footer_text": row.footer_text,
+                "footer_link_label": row.footer_link_label,
+                "footer_link_url": row.footer_link_url,
             })))
         }
         None => Ok(label(app)?.map(|name| json!({ "name": name, "color": "", "has_logo": false }))),
     }
+}
+
+pub(crate) fn branding_footer(branding: &crate::store::Branding) -> String {
+    let escape = |value: &str| {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&#39;")
+    };
+    let mut footer = escape(&branding.footer_text);
+    if !branding.footer_link_label.is_empty()
+        && (branding.footer_link_url.starts_with("https://")
+            || branding.footer_link_url.starts_with("http://"))
+    {
+        if !footer.is_empty() {
+            footer.push_str(" · ");
+        }
+        footer.push_str(&format!(
+            "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>",
+            escape(&branding.footer_link_url),
+            escape(&branding.footer_link_label)
+        ));
+    }
+    footer
 }
 
 /// Streams the stored tenant logo with its content type. Callers decide who
@@ -351,14 +382,7 @@ pub(crate) mod testing {
             web_root: std::path::PathBuf::from("../web"),
             admin_password_hash: crate::auth::hash_password(TEST_PASSWORD).unwrap(),
             admin_token_tag: "test-tag".to_owned(),
-            notify_webhook: None,
-            notify_slack: None,
-            notify_teams: None,
-            notify_google_chat: None,
-            notify_discord: None,
-            notify_ntfy: None,
-            notify_ntfy_token: None,
-            notify_pushover: None,
+
             smtp_host: None,
             smtp_port: 587,
             smtp_starttls: true,
@@ -367,7 +391,7 @@ pub(crate) mod testing {
             scim_token: None,
             replica_token: None,
             smtp_from: None,
-            smtp_to: None,
+
             public_url: Some("https://drop.example.com".to_owned()),
             max_upload_bytes: 1024 * 1024,
             workflow_snapshot_bytes: 4 * 1024 * 1024,
@@ -534,7 +558,8 @@ mod handler_tests {
             max_bytes: None,
             active: false,
             legal_hold: false,
-            notify_on_upload: false,
+
+            notifications: None,
             uploads: Vec::new(),
             events: Vec::new(),
         };
@@ -569,7 +594,8 @@ mod handler_tests {
             max_bytes: None,
             active: true,
             legal_hold: false,
-            notify_on_upload: false,
+
+            notifications: None,
             uploads: Vec::new(),
             events: Vec::new(),
         }
@@ -587,6 +613,7 @@ mod handler_tests {
                 color: "#12ab99".to_owned(),
                 logo_ext: "png".to_owned(),
                 updated_at: 0,
+                ..Default::default()
             })
             .unwrap();
         let logo = crate::paths::branding_logo_path(&application.config.data_dir, "", "png");
@@ -671,6 +698,7 @@ mod handler_tests {
                 color: String::new(),
                 logo_ext: "svg".to_owned(),
                 updated_at: 0,
+                ..Default::default()
             })
             .unwrap();
         let logo = crate::paths::branding_logo_path(&application.config.data_dir, "", "svg");

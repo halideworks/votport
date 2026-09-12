@@ -50,6 +50,10 @@ impl Automation {
         Self::new(&base, &token)
     }
 
+    pub fn notification_destinations(&self) -> Result<Value> {
+        self.call(Method::GET, "/notifications", &[], None)
+    }
+
     pub fn session(&self) -> Result<Value> {
         self.call(Method::GET, "/session", &[], None)
     }

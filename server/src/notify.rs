@@ -3,6 +3,10 @@
 //! Best-effort and fire-and-forget: a completed transfer is already recorded
 //! and on disk, so a notification failure is logged and nothing else.
 
+mod routing;
+pub use routing::{destination, test_destination};
+use routing::{send_policy, Route};
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,15 +17,9 @@ use serde_json::json;
 
 use crate::app::App;
 use crate::session::FinishReport;
-use crate::store::{OutboundDownloadResult, OutboundGrant, ResolvedSettings, ResolvedSmtp};
+use crate::store::{OutboundDownloadResult, OutboundGrant, ResolvedSmtp};
 
 const MAX_NOTIFICATION_FILES: usize = 100;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct NotificationReport {
-    pub configured: u32,
-    pub delivered: u32,
-}
 
 /// Product name for notification titles: the tenant's brand name when one is
 /// set, else the tenant label, else "votport".
@@ -43,8 +41,27 @@ fn title_brand(app: &App, tenant: &str) -> String {
         .unwrap_or_else(|| "votport".to_owned())
 }
 
+pub async fn trade_uploaded(app: &App, tenant: &str, upload: &str) {
+    if let Ok(Some(incoming)) = app.store.received_route(tenant, upload) {
+        if let Some(permission) = &incoming.source.document.permission {
+            if let (Ok(route), Ok(Some(policy))) = (
+                app.store.trade_route(tenant, &permission.grant),
+                app.store.trade_delivery_policy(&incoming.id),
+            ) {
+                trade_event(app, &route, &policy, "route_received").await;
+            }
+        }
+    }
+}
+
 /// Sends every configured notification for one completed upload.
-pub async fn uploaded(app: Arc<App>, tenant: String, label: String, report: FinishReport) {
+pub async fn uploaded(
+    app: Arc<App>,
+    tenant: String,
+    label: String,
+    report: FinishReport,
+    notifications: Option<crate::store::NotificationPolicy>,
+) {
     let transfer_id = report.upload_id.clone();
     let total: u64 = report.files.iter().map(|file| file.bytes).sum();
     let count = report.files.len();
@@ -81,6 +98,10 @@ pub async fn uploaded(app: Arc<App>, tenant: String, label: String, report: Fini
     });
     send_all(
         app,
+        Route {
+            tenant: &tenant,
+            policy: notifications.as_ref(),
+        },
         title,
         body,
         payload,
@@ -96,13 +117,18 @@ pub async fn outbound_downloaded(
     grant: OutboundGrant,
     result: OutboundDownloadResult,
 ) {
-    let (event, transition) = if result.completed_delivery {
-        ("outbound_delivery_complete", "delivery complete")
-    } else if result.first_download {
-        ("outbound_download_started", "download started")
-    } else {
-        return;
-    };
+    let transitions = [
+        (
+            result.first_download,
+            "outbound_download_started",
+            "download started",
+        ),
+        (
+            result.completed_delivery,
+            "outbound_delivery_complete",
+            "delivery complete",
+        ),
+    ];
     let transfer_id = grant.id.clone();
     let (file_count, total_bytes, files, files_truncated) = if grant.files.is_empty() {
         (
@@ -130,64 +156,40 @@ pub async fn outbound_downloaded(
         )
     };
     let download_starts = grant.downloads.saturating_add(1);
-    let title = format!(
-        "{}: outbound {transition} for \"{}\"",
-        title_brand(&app, &grant.tenant),
-        grant.label
-    );
-    let body = format!(
-        "{}\n{transition}: {file_count} file(s), {total_bytes} bytes",
-        grant.label
-    );
-    let payload = json!({
-        "event": event,
-        "grant_id": grant.id,
-        "label": grant.label,
-        "download_starts": download_starts,
-        "file_count": file_count,
-        "files_truncated": files_truncated,
-        "total_bytes": total_bytes,
-        "files": files,
-    });
-    send_all(app, title, body, payload, event, Some(&transfer_id)).await;
-}
-
-/// Sends a safe test message using the currently resolved (saved plus
-/// environment) notification settings and reports channel outcomes.
-pub async fn test_saved(
-    app: Arc<App>,
-    channel: Option<&str>,
-) -> Result<NotificationReport, String> {
-    let mut settings = app.store.resolved_settings(&app.config)?;
-    if let Some(channel) = channel {
-        settings.notify_webhook = None;
-        settings.notify_ntfy = None;
-        settings.notify_pushover = None;
-        settings.smtp = None;
-        for (name, url) in [
-            ("slack", &mut settings.notify_slack),
-            ("teams", &mut settings.notify_teams),
-            ("google_chat", &mut settings.notify_google_chat),
-            ("discord", &mut settings.notify_discord),
-        ] {
-            if name != channel {
-                *url = None;
-            }
-        }
+    for (_, event, transition) in transitions.into_iter().filter(|(send, _, _)| *send) {
+        let title = format!(
+            "{}: outbound {transition} for \"{}\"",
+            title_brand(&app, &grant.tenant),
+            grant.label
+        );
+        let body = format!(
+            "{}\n{transition}: {file_count} file(s), {total_bytes} bytes",
+            grant.label
+        );
+        let payload = json!({
+            "event": event,
+            "grant_id": grant.id,
+            "label": grant.label,
+            "download_starts": download_starts,
+            "file_count": file_count,
+            "files_truncated": files_truncated,
+            "total_bytes": total_bytes,
+            "files": files,
+        });
+        send_all(
+            Arc::clone(&app),
+            Route {
+                tenant: &grant.tenant,
+                policy: grant.notifications.as_ref(),
+            },
+            title,
+            body,
+            payload,
+            event,
+            Some(&transfer_id),
+        )
+        .await;
     }
-    Ok(send_resolved(
-        &app,
-        &settings,
-        "votport: notification test".to_owned(),
-        "This is a VOTPort notification test.".to_owned(),
-        json!({
-            "event": "notification_test",
-            "message": "This is a VOTPort notification test."
-        }),
-        "notification_test",
-        None,
-    )
-    .await)
 }
 
 /// Notifies that an upload session ended without publishing: rejected at
@@ -217,6 +219,10 @@ pub async fn upload_ended(app: Arc<App>, ended: crate::session::SessionEnded) {
     });
     send_all(
         app,
+        Route {
+            tenant: &ended.tenant,
+            policy: ended.notifications.as_ref(),
+        },
         title,
         body,
         payload,
@@ -227,6 +233,17 @@ pub async fn upload_ended(app: Arc<App>, ended: crate::session::SessionEnded) {
 }
 
 pub async fn workflow_failed(app: Arc<App>, job: crate::workflow::Job) {
+    let override_policy = match app.store.notification_job_override(&job.tenant, &job.id) {
+        Ok(policy) => policy,
+        Err(_) => {
+            tracing::error!("Cannot read workflow notification settings");
+            return;
+        }
+    };
+    let policy = override_policy
+        .as_ref()
+        .or(job.request.notifications.as_ref())
+        .or(job.project.notifications.as_ref());
     let retrying = job.state == "retrying";
     let title = format!(
         "{}: delivery {} for \"{}\"",
@@ -249,141 +266,37 @@ pub async fn workflow_failed(app: Arc<App>, job: crate::workflow::Job) {
             "The download link remains held."
         }
     );
-    let payload = json!({"event":"workflow_failed", "job_id":job.id, "label":job.request.label, "state":job.state, "error":job.error, "retry_at":job.checks["retry_at"], "released":job.released()});
-    send_all(app, title, body, payload, "workflow_failed", Some(&job.id)).await;
+    let event = if retrying {
+        "workflow_retry_scheduled"
+    } else {
+        "workflow_failed"
+    };
+    let payload = json!({"event":event, "job_id":job.id, "label":job.request.label, "state":job.state, "error":job.error, "retry_at":job.checks["retry_at"], "released":job.released()});
+    send_all(
+        app,
+        Route {
+            tenant: &job.tenant,
+            policy,
+        },
+        title,
+        body,
+        payload,
+        event,
+        Some(&job.id),
+    )
+    .await;
 }
 
 async fn send_all(
     app: Arc<App>,
+    route: Route<'_>,
     title: String,
     body: String,
     payload: serde_json::Value,
     event: &str,
     transfer_id: Option<&str>,
 ) {
-    // Best effort like the rest of this path: a settings read failure logs
-    // and sends nothing, rather than failing a transfer that already landed.
-    let settings = match app.store.resolved_settings(&app.config) {
-        Ok(settings) => settings,
-        Err(error) => {
-            tracing::error!(
-                channel = "settings",
-                event,
-                transfer_id = transfer_id.unwrap_or("none"),
-                outcome = "failed",
-                %error,
-                "settings read failed; skipping notifications"
-            );
-            return;
-        }
-    };
-
-    let _ = send_resolved(&app, &settings, title, body, payload, event, transfer_id).await;
-}
-
-async fn send_resolved(
-    app: &App,
-    settings: &ResolvedSettings,
-    title: String,
-    body: String,
-    payload: serde_json::Value,
-    event: &str,
-    transfer_id: Option<&str>,
-) -> NotificationReport {
-    let mut requests = Vec::new();
-    if let Some(url) = &settings.notify_webhook {
-        requests.push(("webhook", app.http.post(url).json(&payload)));
-    }
-    for (channel, url) in [
-        ("slack", &settings.notify_slack),
-        ("teams", &settings.notify_teams),
-        ("google_chat", &settings.notify_google_chat),
-        ("discord", &settings.notify_discord),
-    ] {
-        if let Some(url) = url {
-            let mut url = url.clone();
-            if channel == "discord" {
-                if let Ok(mut parsed) = reqwest::Url::parse(&url) {
-                    let pairs = parsed
-                        .query_pairs()
-                        .filter(|(key, _)| key != "wait")
-                        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-                        .collect::<Vec<_>>();
-                    parsed
-                        .query_pairs_mut()
-                        .clear()
-                        .extend_pairs(pairs)
-                        .append_pair("wait", "true");
-                    url = parsed.into();
-                }
-            }
-            let request = app
-                .http
-                .post(url)
-                .json(&chat_payload(channel, &title, &body));
-            requests.push((channel, request));
-        }
-    }
-    if let Some(url) = &settings.notify_ntfy {
-        let mut request = app
-            .http
-            .post(url)
-            .header("Title", &title)
-            .body(body.clone());
-        if let Some(token) = &settings.notify_ntfy_token {
-            request = request.bearer_auth(token);
-        }
-        requests.push(("ntfy", request));
-    }
-    if let Some((token, user)) = &settings.notify_pushover {
-        requests.push((
-            "pushover",
-            app.http
-                .post("https://api.pushover.net/1/messages.json")
-                .form(&[
-                    ("token", token.as_str()),
-                    ("user", user.as_str()),
-                    ("title", title.as_str()),
-                    ("message", body.as_str()),
-                ]),
-        ));
-    }
-    let http =
-        futures_util::future::join_all(requests.into_iter().map(|(channel, request)| async move {
-            log_failure(channel, event, transfer_id, request.send().await).await
-        }));
-    let smtp = async {
-        match &settings.smtp {
-            Some(smtp) => Some(log_smtp_failure(
-                event,
-                transfer_id,
-                send_smtp(smtp, &title, &body).await,
-            )),
-            None => None,
-        }
-    };
-    let (http, smtp) = tokio::join!(http, smtp);
-    let report = NotificationReport {
-        configured: http.len() as u32 + u32::from(smtp.is_some()),
-        delivered: http.iter().filter(|delivered| **delivered).count() as u32
-            + u32::from(smtp == Some(true)),
-    };
-    if report.delivered < report.configured {
-        let outcome = if report.delivered == 0 {
-            "failed"
-        } else {
-            "partial"
-        };
-        tracing::warn!(
-            event,
-            transfer_id = transfer_id.unwrap_or("none"),
-            configured = report.configured,
-            delivered = report.delivered,
-            outcome,
-            "notification delivery incomplete"
-        );
-    }
-    report
+    send_policy(&app, route, title, body, payload, event, transfer_id).await;
 }
 
 fn chat_payload(channel: &str, title: &str, body: &str) -> serde_json::Value {
@@ -498,7 +411,12 @@ fn log_smtp_failure<E: std::fmt::Display>(
     }
 }
 
-async fn send_smtp(smtp: &ResolvedSmtp, title: &str, body: &str) -> Result<(), String> {
+async fn send_smtp(
+    smtp: &ResolvedSmtp,
+    recipients: &[String],
+    title: &str,
+    body: &str,
+) -> Result<(), String> {
     let mut builder = Message::builder()
         .from(
             smtp.from
@@ -506,7 +424,7 @@ async fn send_smtp(smtp: &ResolvedSmtp, title: &str, body: &str) -> Result<(), S
                 .map_err(|error| format!("smtp from: {error}"))?,
         )
         .subject(title);
-    for recipient in &smtp.to {
+    for recipient in recipients {
         builder = builder.to(recipient
             .parse()
             .map_err(|error| format!("smtp to: {error}"))?);
@@ -548,23 +466,40 @@ fn tls_params(host: &str) -> Result<TlsParameters, String> {
     TlsParameters::new(host.to_owned()).map_err(|error| error.to_string())
 }
 
+pub async fn trade_event(
+    app: &App,
+    route: &crate::store::TradeRoute,
+    policy: &crate::store::NotificationPolicy,
+    event: &str,
+) {
+    let title = format!(
+        "{}: {}",
+        title_brand(app, &route.tenant),
+        event.replace('_', " ")
+    );
+    let body = format!("{} · {} · {}", route.name, route.peer_name, route.state);
+    send_policy(app, Route {tenant: &route.tenant, policy: Some(policy)}, title, body, json!({"event":event,"route_id":route.id,"name":route.name,"peer":route.peer_key,"state":route.state}), event, None).await;
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use crate::api::testing;
     use crate::app;
     use crate::session::FinishReport;
     use crate::store::{
-        FileRecord, OutboundDownloadResult, OutboundGrant, OutboundGrantFile, SettingWrite,
+        FileRecord, NotificationDestination, NotificationMode, NotificationPolicy,
+        NotificationRule, OutboundDownloadResult, OutboundGrant, OutboundGrantFile,
+        NOTIFICATION_EVENTS,
     };
 
-    fn test_grant(files: Vec<OutboundGrantFile>) -> OutboundGrant {
+    pub(crate) fn test_grant(files: Vec<OutboundGrantFile>) -> OutboundGrant {
         OutboundGrant {
             id: "grant-id".to_owned(),
             token_hash: "token-hash-secret".to_owned(),
             password_hash: Some("password-hash-secret".to_owned()),
-            tenant: "tenant-secret".to_owned(),
+            tenant: String::new(),
             link_id: "link-id".to_owned(),
             upload_id: "upload-id".to_owned(),
             package_root: "package-root-secret".to_owned(),
@@ -579,7 +514,8 @@ mod tests {
             revoked_at: None,
             downloads: 0,
             max_downloads: None,
-            notify_on_download: false,
+
+            notifications: Some(test_policy()),
             first_download_at: None,
             last_download_at: None,
             files,
@@ -598,6 +534,44 @@ mod tests {
             first_download_at: None,
             last_download_at: None,
         }
+    }
+
+    fn test_policy() -> NotificationPolicy {
+        NotificationPolicy {
+            mode: NotificationMode::Default,
+            rules: vec![],
+        }
+    }
+
+    fn test_destination_config(app: &App, channel: &str, url: String) -> NotificationDestination {
+        let mut destination = NotificationDestination {
+            id: crate::auth::random_token(),
+            revision: 0,
+            label: channel.into(),
+            channel: channel.into(),
+            target: "Loopback test".into(),
+            enabled: true,
+            url,
+            token: String::new(),
+            user: String::new(),
+            recipients: if channel == "email" {
+                vec!["ops@example.com".into()]
+            } else {
+                vec![]
+            },
+            thread_id: String::new(),
+        };
+        app.store
+            .save_notification_destination("", &mut destination)
+            .unwrap();
+        let mut defaults = app.store.notification_defaults("").unwrap();
+        defaults.mode = NotificationMode::Custom;
+        defaults.rules.push(NotificationRule {
+            destination_id: destination.id.clone(),
+            events: NOTIFICATION_EVENTS.iter().map(|s| (*s).into()).collect(),
+        });
+        app.store.save_notification_defaults("", &defaults).unwrap();
+        destination
     }
 
     fn webhook_app() -> (
@@ -621,16 +595,7 @@ mod tests {
         });
         let directory = tempfile::tempdir().unwrap();
         let application = app::build(testing::config(directory.path())).unwrap();
-        application
-            .store
-            .put_settings(
-                "local",
-                &[(
-                    "notify_webhook".to_owned(),
-                    SettingWrite::Set(format!("http://{addr}/outbound")),
-                )],
-            )
-            .unwrap();
+        test_destination_config(&application, "webhook", format!("http://{addr}/outbound"));
         (application, directory, rx, thread)
     }
 
@@ -675,6 +640,7 @@ mod tests {
         received_bytes: u64,
     ) -> crate::session::SessionEnded {
         crate::session::SessionEnded {
+            notifications: Some(test_policy()),
             tenant: String::new(),
             link_id: "link-1".to_owned(),
             label: "shoot".to_owned(),
@@ -775,26 +741,37 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
         let channels = ["slack", "teams", "google_chat", "discord"];
-        application
-            .store
-            .put_settings(
-                "local",
-                &channels.map(|channel| {
-                    (
-                        format!("notify_{channel}"),
-                        SettingWrite::Set(format!(
-                            "http://{address}/{channel}{}",
-                            if channel == "discord" {
-                                "?wait=false&thread_id=42"
-                            } else {
-                                ""
-                            }
-                        )),
-                    )
-                }),
+        let destinations = channels.map(|channel| {
+            test_destination_config(
+                &application,
+                channel,
+                format!(
+                    "http://{address}/{channel}{}",
+                    if channel == "discord" {
+                        "?wait=false&thread_id=42"
+                    } else {
+                        ""
+                    }
+                ),
             )
-            .unwrap();
-        let all = tokio::spawn(test_saved(application.clone(), None));
+        });
+        let app = application.clone();
+        let all = tokio::spawn(async move {
+            let policy = test_policy();
+            send_policy(
+                &app,
+                Route {
+                    tenant: "",
+                    policy: Some(&policy),
+                },
+                "notification test".into(),
+                "notification test".into(),
+                json!({"event":"upload_complete"}),
+                "upload_complete",
+                None,
+            )
+            .await;
+        });
         let mut received = Vec::new();
         for _ in channels {
             let (channel, uri, payload) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -810,28 +787,25 @@ mod tests {
         received.sort();
         assert_eq!(received, ["discord", "google_chat", "slack", "teams"]);
         release.add_permits(4);
-        assert_eq!(
-            all.await.unwrap().unwrap(),
-            NotificationReport {
-                configured: 4,
-                delivered: 3
-            }
-        );
-        for channel in channels {
-            let one = tokio::spawn(test_saved(application.clone(), Some(channel)));
+        all.await.unwrap();
+        let outcomes = application.store.notification_outcomes("").unwrap();
+        for destination in &destinations {
+            assert_eq!(
+                outcomes[&destination.id]["delivered"],
+                destination.channel != "teams"
+            );
+        }
+        for destination in destinations {
+            let channel = destination.channel.clone();
+            let app = application.clone();
+            let one = tokio::spawn(async move { test_destination(&app, "", &destination).await });
             let (actual, _, _) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .unwrap()
                 .unwrap();
             assert_eq!(actual, channel);
             release.add_permits(1);
-            assert_eq!(
-                one.await.unwrap().unwrap(),
-                NotificationReport {
-                    configured: 1,
-                    delivered: u32::from(channel != "teams")
-                }
-            );
+            assert_eq!(one.await.unwrap(), channel != "teams");
             assert!(rx.try_recv().is_err());
         }
         server.abort();
@@ -888,24 +862,14 @@ mod tests {
             ("empty", 1),
             ("success", 1),
         ] {
-            application
-                .store
-                .put_settings(
-                    "local",
-                    &[(
-                        "notify_teams".to_owned(),
-                        SettingWrite::Set(format!("http://{address}/{case}?secret=fixture")),
-                    )],
-                )
-                .unwrap();
+            let destination = test_destination_config(
+                &application,
+                "teams",
+                format!("http://{address}/{case}?secret=fixture"),
+            );
             assert_eq!(
-                test_saved(application.clone(), Some("teams"))
-                    .await
-                    .unwrap(),
-                NotificationReport {
-                    configured: 1,
-                    delivered
-                },
+                test_destination(&application, "", &destination).await,
+                delivered == 1,
                 "{case}"
             );
         }
@@ -1000,6 +964,7 @@ mod tests {
                 upload_id: "upload-id".to_owned(),
                 files,
             },
+            Some(test_policy()),
         )
         .await;
         let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1016,9 +981,13 @@ mod tests {
     #[tokio::test]
     async fn saved_notification_test_reports_delivery_without_secrets() {
         let (application, _directory, rx, thread) = webhook_app();
-        let report = test_saved(application, None).await.unwrap();
-        assert_eq!(report.configured, 1);
-        assert_eq!(report.delivered, 1);
+        let destination = application
+            .store
+            .notification_destinations("")
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(test_destination(&application, "", &destination).await);
         let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let payload = request_json(&request);
         assert_eq!(payload["event"], "notification_test");
@@ -1032,85 +1001,10 @@ mod tests {
         let (addr, thread) = http_stub("500 Internal Server Error");
         let directory = tempfile::tempdir().unwrap();
         let application = app::build(testing::config(directory.path())).unwrap();
-        application
-            .store
-            .put_settings(
-                "local",
-                &[(
-                    "notify_webhook".to_owned(),
-                    SettingWrite::Set(format!("http://{addr}/failure")),
-                )],
-            )
-            .unwrap();
-        let settings = application
-            .store
-            .resolved_settings(&application.config)
-            .unwrap();
-        let report = send_resolved(
-            &application,
-            &settings,
-            "title".to_owned(),
-            "body".to_owned(),
-            json!({ "event": "upload_complete" }),
-            "upload_complete",
-            Some("upload-1"),
-        )
-        .await;
-        assert_eq!(
-            report,
-            NotificationReport {
-                configured: 1,
-                delivered: 0
-            }
-        );
+        let destination =
+            test_destination_config(&application, "webhook", format!("http://{addr}/failure"));
+        assert!(!test_destination(&application, "", &destination).await);
         thread.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn partial_channel_delivery_reports_one_failure() {
-        let (webhook_addr, webhook_thread) = http_stub("200 OK");
-        let (ntfy_addr, ntfy_thread) = http_stub("503 Service Unavailable");
-        let directory = tempfile::tempdir().unwrap();
-        let application = app::build(testing::config(directory.path())).unwrap();
-        application
-            .store
-            .put_settings(
-                "local",
-                &[
-                    (
-                        "notify_webhook".to_owned(),
-                        SettingWrite::Set(format!("http://{webhook_addr}/ok")),
-                    ),
-                    (
-                        "notify_ntfy".to_owned(),
-                        SettingWrite::Set(format!("http://{ntfy_addr}/partial")),
-                    ),
-                ],
-            )
-            .unwrap();
-        let settings = application
-            .store
-            .resolved_settings(&application.config)
-            .unwrap();
-        let report = send_resolved(
-            &application,
-            &settings,
-            "title".to_owned(),
-            "body".to_owned(),
-            json!({ "event": "upload_complete" }),
-            "upload_complete",
-            Some("upload-2"),
-        )
-        .await;
-        assert_eq!(
-            report,
-            NotificationReport {
-                configured: 2,
-                delivered: 1
-            }
-        );
-        webhook_thread.join().unwrap();
-        ntfy_thread.join().unwrap();
     }
 
     #[tokio::test]
@@ -1122,7 +1016,7 @@ mod tests {
             application,
             grant,
             OutboundDownloadResult {
-                first_download: true,
+                first_download: false,
                 completed_delivery: true,
             },
         )
@@ -1178,57 +1072,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uploaded_hits_the_db_webhook_not_env() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        listener.set_nonblocking(false).unwrap();
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = vec![0u8; 8192];
-            let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
-            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
-            let _ = std::io::Write::write_all(
-                &mut stream,
-                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            );
-        });
-
-        let directory = tempfile::tempdir().unwrap();
-        let mut config = testing::config(directory.path());
-        config.notify_webhook = Some("http://127.0.0.1:9/env-hook".to_owned());
-        let application = app::build(config).unwrap();
-        application
-            .store
-            .put_settings(
-                "local",
-                &[(
-                    "notify_webhook".to_owned(),
-                    SettingWrite::Set(format!("http://{addr}/db-hook")),
-                )],
-            )
-            .unwrap();
-
-        uploaded(
-            application,
-            String::new(),
-            "label".to_owned(),
-            FinishReport {
-                received: 0,
-                upload_id: "up-1".to_owned(),
-                files: Vec::new(),
-            },
-        )
-        .await;
-
-        let received = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("db webhook was not called");
-        assert!(received.contains("/db-hook"), "{received}");
-        assert!(!received.contains("/env-hook"), "{received}");
-    }
-
-    #[tokio::test]
     async fn uploaded_sends_smtp_to_plaintext_loopback() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1240,8 +1083,8 @@ mod tests {
         config.smtp_port = addr.port();
         config.smtp_starttls = false;
         config.smtp_from = Some("votport@example.com".to_owned());
-        config.smtp_to = Some("ops@example.com".to_owned());
         let application = app::build(config).unwrap();
+        test_destination_config(&application, "email", String::new());
 
         uploaded(
             application,
@@ -1252,6 +1095,7 @@ mod tests {
                 upload_id: "up-smtp".to_owned(),
                 files: Vec::new(),
             },
+            Some(test_policy()),
         )
         .await;
 

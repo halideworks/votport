@@ -131,14 +131,7 @@ async fn start_server_in(
         web_root: PathBuf::from("./web"),
         admin_password_hash: auth::hash_password(ADMIN_PASSWORD).unwrap(),
         admin_token_tag: String::new(),
-        notify_webhook: None,
-        notify_slack: None,
-        notify_teams: None,
-        notify_google_chat: None,
-        notify_discord: None,
-        notify_ntfy: None,
-        notify_ntfy_token: None,
-        notify_pushover: None,
+
         smtp_host: None,
         smtp_port: 587,
         smtp_starttls: true,
@@ -147,7 +140,7 @@ async fn start_server_in(
         scim_token: None,
         replica_token: None,
         smtp_from: None,
-        smtp_to: None,
+
         public_url: None,
         max_upload_bytes,
         workflow_snapshot_bytes: max_upload_bytes.saturating_mul(4),
@@ -3228,7 +3221,12 @@ async fn restart_preserves_a_truncated_staging_session() {
     server
         .application
         .store
-        .update_link("", &token, |link| link.notify_on_upload = true)
+        .update_link("", &token, |link| {
+            link.notifications = Some(votport::store::NotificationPolicy {
+                mode: votport::store::NotificationMode::Default,
+                rules: vec![],
+            })
+        })
         .unwrap();
     let base = server.base.clone();
     assert_eq!(begin(&client, &base, &session).await.0, 200);
@@ -6032,7 +6030,8 @@ async fn mounted_nas_media_campaign() {
         max_bytes: None,
         active: true,
         legal_hold: false,
-        notify_on_upload: false,
+
+        notifications: None,
         uploads: vec![],
         events: vec![],
     };

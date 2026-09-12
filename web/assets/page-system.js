@@ -1,7 +1,9 @@
+import { isFormDirty, markFormChanged, markFormSaved } from '/assets/form-drafts.js';
 // votport system page: credentials, backups, verification key, overlay settings.
 // VOTPORT PROPRIETARY LICENSE.
 
 import { api, colorPair, confirmModal, defaultAccent, formatBytes, formatWhen, requireSession } from '/assets/admin-common.js';
+import { applyFooter } from '/assets/branding.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -117,81 +119,6 @@ function gibValue(bytes) {
   return String(bytes / 1024 ** 3);
 }
 
-const chatForms = [...document.querySelectorAll('[data-chat-channel]')];
-function fillChatSettings(data, forms = chatForms) {
-  for (const form of forms) {
-    const key = `notify_${form.dataset.chatChannel}`, prefix = form.id.replace(/-form$/, '');
-    form.dataset.configured = String(data[`${key}_set`] === true);
-    $(`${prefix}-status`).textContent = data[`${key}_set`] ? 'Connected' : 'Not connected';
-    $(`${prefix}-url`).placeholder = data[`${key}_set`] ? 'Saved URL unchanged' : 'Paste webhook URL';
-    $(`${prefix}-source`).textContent = data[`${key}_set`] ? `Using ${sourceLabel(data[`${key}_source`])} settings. Enter a URL to replace this connection.` : 'No notifications are sent to this service.';
-    form.querySelector('[data-chat-action=disconnect]').hidden = !data[`${key}_set`];
-    form.querySelector('[data-chat-action=reset]').hidden = data[`${key}_source`] !== 'db';
-    syncChatActions(form);
-  }
-}
-function syncChatActions(form) {
-  const draft = form.querySelector('input').value.trim();
-  form.querySelector('[data-chat-action=save]').disabled = !draft;
-  form.querySelector('[data-chat-action=test]').disabled = !!draft || form.dataset.configured !== 'true';
-}
-for (const form of chatForms) {
-  form.inert = true;
-  const input = form.querySelector('input'), key = `notify_${form.dataset.chatChannel}`;
-  input.addEventListener('input', () => { syncChatActions(form); formNote(form, input.value.trim() ? 'Save this URL before sending a test.' : ''); });
-  async function change(value) {
-    if (form.inert) return;
-    form.inert = true; formNote(form, 'Saving…');
-    try {
-      const settings = await putSettings({ [key]: value });
-      input.value = ''; fillChatSettings(settings, [form]);
-      formNote(form, value === null ? 'Using environment settings.' : value ? 'Connection saved. Send a test to check it.' : 'Disconnected.');
-    } catch (error) { formError(form, error); }
-    finally { form.inert = false; syncChatActions(form); }
-  }
-  form.addEventListener('submit', (event) => { event.preventDefault(); if (input.value.trim()) change(input.value.trim()); });
-  form.querySelector('[data-chat-action=disconnect]').onclick = () => change('');
-  form.querySelector('[data-chat-action=reset]').onclick = () => change(null);
-  form.querySelector('[data-chat-action=test]').onclick = async () => {
-    if (form.inert) return;
-    form.inert = true; formNote(form, 'Sending a test…');
-    try {
-      await api(`/api/admin/notifications/test?channel=${form.dataset.chatChannel}`, { method: 'POST' });
-      formNote(form, `Test accepted by ${form.dataset.chatName}. Check the channel for the message.`);
-    } catch (error) { formError(form, error); }
-    finally { form.inert = false; }
-  };
-}
-
-function setNotifyActions(enabled) {
-  $('notify-save').disabled = !enabled;
-  $('notify-test').disabled = !enabled;
-  for (const button of $('notify-form').querySelectorAll('[data-clear]')) {
-    button.disabled = !enabled;
-  }
-}
-
-async function testNotifications() {
-  const button = $('notify-test');
-  const note = $('notify-test-note');
-  const error = $('notify-test-error');
-  button.disabled = true;
-  button.textContent = 'Sending…';
-  note.textContent = 'Testing currently active notification settings…';
-  error.hidden = true;
-  try {
-    const report = await api('/api/admin/notifications/test', { method: 'POST' });
-    note.textContent = `Delivered ${report.delivered} of ${report.configured} configured notification channels.`;
-  } catch (requestError) {
-    note.textContent = 'Currently active notification test failed.';
-    error.textContent = requestError.message;
-    error.hidden = false;
-  } finally {
-    button.disabled = false;
-    button.textContent = 'Test all services';
-  }
-}
-
 function setSmtpActions(enabled) {
   $('smtp-save').disabled = !enabled;
   for (const button of $('smtp-form').querySelectorAll('[data-clear]')) {
@@ -199,19 +126,13 @@ function setSmtpActions(enabled) {
   }
 }
 
-function fillSettings(data) {
+function preserveSettingsEdits(exclude) {
+  const edits = [...document.querySelectorAll('form[data-unsaved] input, form[data-unsaved] select, form[data-unsaved] textarea')].filter((field) => field.type !== 'file' && !exclude?.contains(field) && isFormDirty(field.closest('form'))).map((field) => [field, field.value, field.checked]);
+  return () => { for (const [field, value, checked] of edits) { field.value = value; if (field.type === 'checkbox') field.checked = checked; } };
+}
+function fillSettings(data, exclude = null) {
+  const restore = preserveSettingsEdits(exclude);
   fillDeployment(data);
-  $('notify-webhook').value = data.notify_webhook || '';
-  setSource('notify-webhook-source', data.notify_webhook_source);
-  $('notify-ntfy').value = data.notify_ntfy || '';
-  setSource('notify-ntfy-source', data.notify_ntfy_source);
-  setSecret('notify-ntfy-token', data.notify_ntfy_token_set);
-  setSource('notify-ntfy-token-source', data.notify_ntfy_token_source);
-  setSecret('notify-pushover-token', data.notify_pushover_token_set);
-  setSource('notify-pushover-token-source', data.notify_pushover_token_source);
-  setSecret('notify-pushover-user', data.notify_pushover_user_set);
-  setSource('notify-pushover-user-source', data.notify_pushover_user_source);
-
   $('smtp-host').value = data.smtp_host || '';
   setSource('smtp-host-source', data.smtp_host_source);
   $('smtp-port').value = data.smtp_port;
@@ -224,8 +145,6 @@ function fillSettings(data) {
   setSource('smtp-password-source', data.smtp_password_source);
   $('smtp-from').value = data.smtp_from || '';
   setSource('smtp-from-source', data.smtp_from_source);
-  $('smtp-to').value = data.smtp_to || '';
-  setSource('smtp-to-source', data.smtp_to_source);
 
   $('audit-retention-days').value = data.audit_retention_days;
   setSource('audit-retention-source', data.audit_retention_days_source);
@@ -283,6 +202,7 @@ function fillSettings(data) {
   for (const button of document.querySelectorAll('[data-clear]')) {
     button.hidden = !data[`${button.dataset.clear}_set`];
   }
+  restore();
 }
 
 function syncBackupFields() {
@@ -293,6 +213,7 @@ $('backup-destination').addEventListener('change', syncBackupFields);
 $('backup-encryption-enabled').addEventListener('change', syncBackupFields);
 
 function fillBackups(data) {
+  if (!isFormDirty($('backup-form'))) {
   const config = data.config;
   $('backup-destination').value = config.destination || 'local';
   $('backup-enabled').checked = config.enabled === true;
@@ -310,6 +231,7 @@ function fillBackups(data) {
   $('backup-encryption-enabled').checked = config.encrypt === true;
   setBackupSecret('backup-encryption-passphrase', config.passphrase_configured === true);
   syncBackupFields();
+  }
 
   const status = data.status;
   const statusText = status.running
@@ -394,15 +316,16 @@ async function putSettings(body) {
 async function saveSettings(form, body) {
   formNote(form, '');
   try {
-    fillSettings(await putSettings(body));
+    form.inert = true; const saved = await putSettings(body); markFormSaved(form); fillSettings(saved);
     formNote(form, 'Saved.');
   } catch (error) {
     formError(form, error);
-  }
+  } finally { form.inert = false; }
 }
 
 $('password-form').addEventListener('submit', async (event) => {
   event.preventDefault();
+  const form = event.currentTarget; if (form.inert) return; form.inert = true;
   $('password-error').hidden = true;
   $('password-note').textContent = '';
   try {
@@ -413,36 +336,14 @@ $('password-form').addEventListener('submit', async (event) => {
         new: $('password-new').value,
       }),
     });
-    $('password-form').reset();
+    markFormSaved($('password-form')); $('password-form').reset();
     $('password-note').textContent =
       'Password updated. Every other session was signed out.';
   } catch (error) {
     $('password-error').textContent = error.message;
     $('password-error').hidden = false;
-  }
+  } finally { form.inert = false; }
 });
-
-$('notify-form').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  if ($('notify-save').disabled) return;
-  const body = {
-    notify_webhook: $('notify-webhook').value,
-    notify_ntfy: $('notify-ntfy').value,
-  };
-  // Blank secret inputs mean unchanged, not a wipe.
-  if ($('notify-ntfy-token').value !== '') {
-    body.notify_ntfy_token = $('notify-ntfy-token').value;
-  }
-  if ($('notify-pushover-token').value !== '') {
-    body.notify_pushover_token = $('notify-pushover-token').value;
-  }
-  if ($('notify-pushover-user').value !== '') {
-    body.notify_pushover_user = $('notify-pushover-user').value;
-  }
-  await saveSettings(event.currentTarget, body);
-});
-
-$('notify-test').addEventListener('click', () => testNotifications());
 
 $('smtp-form').addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -452,7 +353,6 @@ $('smtp-form').addEventListener('submit', async (event) => {
     smtp_starttls: $('smtp-starttls').checked,
     smtp_username: $('smtp-username').value,
     smtp_from: $('smtp-from').value,
-    smtp_to: $('smtp-to').value,
   };
   const port = parseInt($('smtp-port').value, 10);
   if (Number.isFinite(port) && port >= 1 && port <= 65535) {
@@ -495,15 +395,18 @@ const accent = colorPair($('branding-color'), $('branding-color-hex'));
 // No accent stored means recipient pages use the stock colour; the picker
 // shows that colour so the reset reads as a return to the default.
 $('branding-color-clear').addEventListener('click', () => {
-  accent.set('');
+  accent.set(''); markFormChanged($('branding-form'));
   $('branding-color').value = defaultAccent();
 });
 
 async function fillBranding() {
   const branding = await api('/api/admin/branding/default');
+  if (isFormDirty($('branding-form'))) { $('branding-logo-remove').disabled = !branding.has_logo; return; }
   $('branding-name').value = branding.name || '';
   accent.set(branding.color || '');
+  for (const field of ['footer-text', 'footer-link-label', 'footer-link-url']) $(`branding-${field}`).value = branding[field.replaceAll('-', '_')] || '';
   $('branding-logo-remove').disabled = !branding.has_logo;
+  applyFooter(branding);
 }
 
 $('branding-form').addEventListener('submit', async (event) => {
@@ -512,17 +415,22 @@ $('branding-form').addEventListener('submit', async (event) => {
   const form = event.currentTarget;
   formNote(form, '');
   try {
+    form.inert = true;
     await api('/api/admin/branding/default', {
       method: 'PUT',
       body: JSON.stringify({
         name: $('branding-name').value,
         color: accent.get(),
+        footer_text: $('branding-footer-text').value,
+        footer_link_label: $('branding-footer-link-label').value,
+        footer_link_url: $('branding-footer-link-url').value,
       }),
     });
+    markFormSaved(form); await fillBranding();
     formNote(form, 'Saved.');
   } catch (error) {
     formError(form, error);
-  }
+  } finally { form.inert = false; }
 });
 
 $('branding-logo-upload').addEventListener('click', async () => {
@@ -572,7 +480,7 @@ $('branding-remove').addEventListener('click', async () => {
   formNote(form, '');
   try {
     await api('/api/admin/branding/default', { method: 'DELETE' });
-    form.reset();
+    markFormSaved(form); form.reset();
     await fillBranding();
     formNote(form, 'Branding removed.');
   } catch (error) {
@@ -650,15 +558,16 @@ $('backup-form').addEventListener('submit', async (event) => {
   }
   formNote(form, '');
   try {
+    form.inert = true;
     await api('/api/admin/backups', {
       method: 'PUT',
       body: JSON.stringify(body),
     });
-    fillBackups(await api('/api/admin/backups'));
+    markFormSaved(form); fillBackups(await api('/api/admin/backups'));
     formNote(form, 'Saved.');
   } catch (error) {
     formError(form, error);
-  }
+  } finally { form.inert = false; }
 });
 
 // The snapshot route takes the CSRF header like every mutating route, so a
@@ -742,13 +651,14 @@ $('backup-restore-snapshot').addEventListener('change', async (event) => {
 for (const button of document.querySelectorAll('[data-reset]')) {
   button.addEventListener('click', async () => {
     const form = button.closest('form');
+    if (form.inert) return; form.inert = true;
     formNote(form, '');
     try {
-      fillSettings(await putSettings({ [button.dataset.reset]: null }));
+      fillSettings(await putSettings({ [button.dataset.reset]: null }), button.closest('.field'));
       formNote(form, 'Using environment.');
     } catch (error) {
       formError(form, error);
-    }
+    } finally { form.inert = false; }
   });
 }
 
@@ -756,13 +666,14 @@ for (const button of document.querySelectorAll('[data-clear]')) {
   button.addEventListener('click', async () => {
     if (button.disabled) return;
     const form = button.closest('form');
+    if (form.inert) return; form.inert = true;
     formNote(form, '');
     try {
-      fillSettings(await putSettings({ [button.dataset.clear]: '' }));
+      fillSettings(await putSettings({ [button.dataset.clear]: '' }), button.closest('.field'));
       formNote(form, 'Cleared.');
     } catch (error) {
       formError(form, error);
-    }
+    } finally { form.inert = false; }
   });
 }
 
@@ -794,21 +705,18 @@ if (!session.pages.includes('system')) {
 try {
   const settings = await settingsReady;
   fillSettings(settings);
-  fillChatSettings(settings);
-  for (const form of chatForms) form.inert = false;
-  setNotifyActions(true);
+  for (const form of document.querySelectorAll('form[data-unsaved]')) if (!['branding-form', 'backup-form'].includes(form.id)) form.inert = false;
   setSmtpActions(true);
 } catch (error) {
-  formError($('notify-form'), error);
   formError($('smtp-form'), error);
 }
 try {
-  await fillBranding();
+  await fillBranding(); $('branding-form').inert = false;
 } catch (error) {
   formError($('branding-form'), error);
 }
 try {
-  fillBackups(await api('/api/admin/backups'));
+  fillBackups(await api('/api/admin/backups')); $('backup-form').inert = false;
   setBackupActions(true);
 } catch (error) {
   setBackupActions(true);

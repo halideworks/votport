@@ -47,7 +47,7 @@ test('recipient page has one primary action with ZIP as a secondary link', () =>
   assert.match(sendPage, /id="bundle-download-button" class="link"[^>]*>Download as ZIP<\/button>/);
   assert.doesNotMatch(sendPage, /<h2>Download all files<\/h2>|<h2>Download as ZIP<\/h2>/);
   // The manifest is the file list; the availability line lives in the masthead.
-  assert.match(sendPage, /<h2>Manifest<\/h2>/);
+  assert.match(sendPage, /<h2>Files in this delivery<\/h2>/);
   assert.doesNotMatch(sendPage, /id="expires"/);
   assert.match(outboundScript, /available until \$\{when\(body\.expires_at\)\}/);
   // A finished save is "landed", never "verified": the browser checks nothing.

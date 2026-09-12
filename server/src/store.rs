@@ -18,7 +18,11 @@ use vot_sdk::object::ObjectId;
 use crate::config::Config;
 
 mod evidence;
+mod notifications;
+pub use notifications::*;
 mod routes;
+mod trade;
+pub use trade::*;
 mod webhooks;
 mod workflows;
 pub use evidence::*;
@@ -147,7 +151,8 @@ pub struct OutboundGrant {
     pub revoked_at: Option<u64>,
     pub downloads: u64,
     pub max_downloads: Option<u64>,
-    pub notify_on_download: bool,
+
+    pub notifications: Option<crate::store::NotificationPolicy>,
     pub first_download_at: Option<u64>,
     pub last_download_at: Option<u64>,
     pub files: Vec<OutboundGrantFile>,
@@ -227,7 +232,7 @@ pub struct Link {
     #[serde(default)]
     pub legal_hold: bool,
     #[serde(default)]
-    pub notify_on_upload: bool,
+    pub notifications: Option<crate::store::NotificationPolicy>,
     #[serde(default)]
     pub uploads: Vec<UploadRecord>,
     #[serde(default)]
@@ -268,7 +273,7 @@ pub struct Tenant {
 }
 
 /// Recipient-facing branding for a tenant ("" is the default tenant).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Branding {
     pub tenant: String,
     pub name: String,
@@ -276,6 +281,9 @@ pub struct Branding {
     pub color: String,
     /// Empty when no logo is stored; else "png", "jpg", or "svg".
     pub logo_ext: String,
+    pub footer_text: String,
+    pub footer_link_label: String,
+    pub footer_link_url: String,
     pub updated_at: u64,
 }
 
@@ -374,15 +382,7 @@ pub enum SettingWrite {
 /// this across requests: a PUT is visible on the next read.
 #[derive(Clone, Debug)]
 pub struct ResolvedSettings {
-    pub notify_webhook: Option<String>,
-    pub notify_slack: Option<String>,
-    pub notify_teams: Option<String>,
-    pub notify_google_chat: Option<String>,
-    pub notify_discord: Option<String>,
-    pub notify_ntfy: Option<String>,
-    pub notify_ntfy_token: Option<String>,
-    pub notify_pushover: Option<(String, String)>,
-    /// Some iff host, from, and at least one `to` all resolve non-empty.
+    /// Configured when the relay host and sender address are present.
     pub smtp: Option<ResolvedSmtp>,
     pub audit_retention_days: u64,
     pub upload_retention_days: u64,
@@ -415,7 +415,6 @@ pub struct ResolvedSmtp {
     pub username: Option<String>,
     pub password: Option<String>,
     pub from: String,
-    pub to: Vec<String>,
 }
 
 /// Resolved settings plus whether each key came from the database or env.
@@ -423,17 +422,7 @@ pub struct ResolvedSmtp {
 #[derive(Clone, Debug)]
 pub struct SettingsOverlay {
     pub resolved: ResolvedSettings,
-    pub notify_webhook_source: &'static str,
-    pub notify_slack_source: &'static str,
-    pub notify_teams_source: &'static str,
-    pub notify_google_chat_source: &'static str,
-    pub notify_discord_source: &'static str,
-    pub notify_ntfy_source: &'static str,
-    pub notify_ntfy_token_source: &'static str,
-    pub notify_pushover_token_set: bool,
-    pub notify_pushover_token_source: &'static str,
-    pub notify_pushover_user_set: bool,
-    pub notify_pushover_user_source: &'static str,
+
     pub smtp_host: Option<String>,
     pub smtp_host_source: &'static str,
     pub smtp_port: u16,
@@ -446,8 +435,7 @@ pub struct SettingsOverlay {
     pub smtp_password_source: &'static str,
     pub smtp_from: Option<String>,
     pub smtp_from_source: &'static str,
-    pub smtp_to: Option<String>,
-    pub smtp_to_source: &'static str,
+
     pub audit_retention_days_source: &'static str,
     pub upload_retention_days_source: &'static str,
     pub default_max_total_bytes_source: &'static str,
@@ -473,7 +461,7 @@ struct LegacyDocument {
     admin_password_hash: Option<String>,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 31;
+pub(crate) const SCHEMA_VERSION: u64 = 35;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -1050,7 +1038,7 @@ impl Store {
                 let mut statement = transaction
                     .prepare(
                         "SELECT id, tenant, label, dest, password_hash, created_at, expires_at,
-                                max_bytes, active, legal_hold, 0 AS notify_on_upload, uploads_json, events_json
+                                max_bytes, active, legal_hold, uploads_json, events_json, NULL AS notifications_json
                          FROM links ORDER BY rowid",
                     )
                     .map_err(|error| error.to_string())?;
@@ -1351,6 +1339,53 @@ impl Store {
                     .map_err(|error| format!("schema: {error}"))?;
             }
         }
+        if stored < 32 {
+            transaction
+                .execute_batch(notifications::SCHEMA)
+                .map_err(|e| e.to_string())?;
+            for table in ["links", "outbound_grants"] {
+                let present: bool = transaction.query_row(&format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name='notifications_json')"), [], |row| row.get(0)).map_err(|e| e.to_string())?;
+                if !present {
+                    transaction
+                        .execute_batch(&format!(
+                            "ALTER TABLE {table} ADD COLUMN notifications_json TEXT;"
+                        ))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        if stored < 33 {
+            for column in ["footer_text", "footer_link_label", "footer_link_url"] {
+                let present: bool = transaction.query_row(&format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('branding') WHERE name='{column}')"), [], |row| row.get(0)).map_err(|e| e.to_string())?;
+                if !present {
+                    transaction
+                        .execute_batch(&format!(
+                            "ALTER TABLE branding ADD COLUMN {column} TEXT NOT NULL DEFAULT '';"
+                        ))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        if stored < 34 {
+            transaction
+                .execute_batch(trade::SCHEMA)
+                .map_err(|e| e.to_string())?;
+        }
+        if stored < 35 {
+            for (table, column) in [
+                ("links", "notify_on_upload"),
+                ("outbound_grants", "notify_on_download"),
+            ] {
+                let present: bool = transaction.query_row(&format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name='{column}')"), [], |row| row.get(0)).map_err(|e| e.to_string())?;
+                if present {
+                    transaction.execute(&format!("UPDATE {table} SET notifications_json='{{\"mode\":\"off\",\"rules\":[]}}' WHERE {column}=0"), []).map_err(|e| e.to_string())?;
+                    transaction
+                        .execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column};"))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            transaction.execute("DELETE FROM settings WHERE key IN ('notify_webhook','notify_slack','notify_teams','notify_google_chat','notify_discord','notify_ntfy','notify_ntfy_token','notify_pushover_token','notify_pushover_user','smtp_to')", []).map_err(|e| e.to_string())?;
+        }
         transaction
             .execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
@@ -1387,7 +1422,7 @@ impl Store {
                     .execute(
                         "INSERT OR IGNORE INTO links (id, tenant, label, dest, password_hash,
                                                       created_at, expires_at, max_bytes, active,
-                                                      legal_hold, notify_on_upload, uploads_json, events_json)
+                                                      legal_hold, uploads_json, events_json, notifications_json)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                         link_params(link),
                     )
@@ -1583,7 +1618,7 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                        active, legal_hold, notify_on_upload, uploads_json, events_json
+                        active, legal_hold, uploads_json, events_json, notifications_json
                  FROM links WHERE tenant = ?1 ORDER BY rowid",
             )?;
             let rows = statement.query_map([tenant], row_to_link)?;
@@ -1821,7 +1856,7 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                        active, legal_hold, notify_on_upload, uploads_json, events_json
+                        active, legal_hold, uploads_json, events_json, notifications_json
                  FROM links
                  WHERE tenant = ?1
                    AND (?2 = '' OR lower(label) LIKE '%' || ?2 || '%' ESCAPE '\\'
@@ -1871,7 +1906,7 @@ impl Store {
             connection
                 .query_row(
                     "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                            active, legal_hold, notify_on_upload, uploads_json, events_json
+                            active, legal_hold, uploads_json, events_json, notifications_json
                      FROM links WHERE tenant = ?1 AND id = ?2",
                     rusqlite::params![tenant, id],
                     row_to_link,
@@ -1888,7 +1923,7 @@ impl Store {
             connection
                 .query_row(
                     "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                            active, legal_hold, notify_on_upload, uploads_json, events_json
+                            active, legal_hold, uploads_json, events_json, notifications_json
                      FROM links WHERE id = ?1",
                     [id],
                     row_to_link,
@@ -1903,8 +1938,8 @@ impl Store {
             connection
                 .prepare_cached(
                     "SELECT id, tenant, label, dest, password_hash, created_at, expires_at,
-                            max_bytes, active, legal_hold, notify_on_upload, '[]' AS uploads_json,
-                            '[]' AS events_json
+                            max_bytes, active, legal_hold, '[]' AS uploads_json,
+                            '[]' AS events_json, notifications_json
                      FROM links WHERE id = ?1",
                 )?
                 .query_row([id], row_to_link)
@@ -2034,6 +2069,18 @@ impl Store {
             return Ok(false);
         };
         mutate(&mut link);
+        if link.password_hash.is_some() {
+            let paired: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM trade_endpoints WHERE id=?1)",
+                    [id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if paired {
+                return Err("paired receiving endpoints use route credentials; manage permissions in Trade routes".into());
+            }
+        }
         write_link_row(&transaction, &link).map_err(|error| error.to_string())?;
         if sync_uploads {
             sync_link_files(&transaction, &link).map_err(|error| error.to_string())?;
@@ -2337,6 +2384,10 @@ impl Store {
             }
         };
         if matches!(removal, TenantRemoval::Deleted | TenantRemoval::Absent) {
+            transaction.execute("DELETE FROM trade_rotations WHERE route_id IN (SELECT id FROM trade_routes WHERE tenant=?1)",[key]).map_err(|e|e.to_string())?;
+            transaction.execute("DELETE FROM trade_delivery_policies WHERE route_id IN (SELECT id FROM inbound_routes WHERE tenant=?1)",[key]).map_err(|e|e.to_string())?;
+            transaction.execute("DELETE FROM delivery_storage_credentials WHERE id IN (SELECT id FROM trade_routes WHERE tenant=?1 AND direction='outgoing')",[key]).map_err(|e|e.to_string())?;
+            transaction.execute("DELETE FROM delivery_storage WHERE id IN (SELECT id FROM trade_routes WHERE tenant=?1 AND direction='outgoing')",[key]).map_err(|e|e.to_string())?;
             transaction.execute("DELETE FROM route_uploads WHERE route_id IN (SELECT id FROM inbound_routes WHERE tenant=?1)",[key]).map_err(|e|e.to_string())?;
             transaction
                 .execute("DELETE FROM inbound_routes WHERE tenant=?1", [key])
@@ -2358,6 +2409,11 @@ impl Store {
                 "delivery_projects",
                 "delivery_webhooks",
                 "delivery_webhook_attempts",
+                "notification_destinations",
+                "notification_defaults",
+                "trade_invitations",
+                "trade_endpoints",
+                "trade_routes",
             ] {
                 transaction
                     .execute(&format!("DELETE FROM {table} WHERE tenant=?1"), [key])
@@ -2411,7 +2467,7 @@ impl Store {
         self.with(|connection| {
             connection
                 .prepare_cached(
-                    "SELECT tenant, name, color, logo_ext, updated_at
+                    "SELECT tenant, name, color, logo_ext, updated_at, footer_text, footer_link_label, footer_link_url
                      FROM branding WHERE tenant = ?1",
                 )?
                 .query_row([tenant], |row| {
@@ -2421,6 +2477,9 @@ impl Store {
                         color: row.get(2)?,
                         logo_ext: row.get(3)?,
                         updated_at: row.get::<_, i64>(4)?.max(0) as u64,
+                        footer_text: row.get(5)?,
+                        footer_link_label: row.get(6)?,
+                        footer_link_url: row.get(7)?,
                     })
                 })
                 .optional()
@@ -2431,11 +2490,13 @@ impl Store {
         self.with(|connection| {
             connection
                 .prepare_cached(
-                    "INSERT INTO branding (tenant, name, color, logo_ext, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
+                    "INSERT INTO branding (tenant, name, color, logo_ext, updated_at, footer_text, footer_link_label, footer_link_url)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                      ON CONFLICT(tenant) DO UPDATE SET
                         name = excluded.name, color = excluded.color,
-                        logo_ext = excluded.logo_ext, updated_at = excluded.updated_at",
+                        logo_ext = excluded.logo_ext, updated_at = excluded.updated_at,
+                        footer_text = excluded.footer_text, footer_link_label = excluded.footer_link_label,
+                        footer_link_url = excluded.footer_link_url",
                 )?
                 .execute(rusqlite::params![
                     branding.tenant,
@@ -2443,6 +2504,9 @@ impl Store {
                     branding.color,
                     branding.logo_ext,
                     i64::try_from(branding.updated_at).unwrap_or(i64::MAX),
+                    branding.footer_text,
+                    branding.footer_link_label,
+                    branding.footer_link_url,
                 ])
                 .map(|_| ())
         })
@@ -3094,7 +3158,7 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                        active, legal_hold, notify_on_upload, uploads_json, events_json
+                        active, legal_hold, uploads_json, events_json, notifications_json
                  FROM links ORDER BY rowid",
             )?;
             let rows = statement.query_map([], row_to_link)?;
@@ -3284,7 +3348,7 @@ impl Store {
 
     pub fn insert_workflow_grant(
         &self,
-        grant: OutboundGrant,
+        mut grant: OutboundGrant,
         operation: Option<&AutomationOperation>,
         job: Option<&crate::workflow::Job>,
     ) -> Result<(), String> {
@@ -3298,6 +3362,12 @@ impl Store {
             .transaction()
             .map_err(|error| error.to_string())?;
         workflows::check_grant_creation(&transaction, &grant, job)?;
+        if let Some(policy) =
+            notifications::notification_job_override_in(&transaction, &grant.tenant, &grant.id)
+                .map_err(|e| e.to_string())?
+        {
+            grant.notifications = Some(policy);
+        }
         if let Some(job) = job {
             workflows::finish_job(
                 &transaction,
@@ -3311,8 +3381,8 @@ impl Store {
                 "INSERT INTO outbound_grants
                  (id, token_hash, password_hash, tenant, link_id, upload_id, package_root, name, suite,
                   root, file_index, bytes_hi, bytes_lo, label, created_at, expires_at, revoked_at,
-                  downloads, max_downloads, notify_on_download, first_download_at, last_download_at,
-                  files_json, file_count)
+                  downloads, max_downloads, first_download_at, last_download_at,
+                  files_json, file_count, notifications_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                 rusqlite::params![
                     &grant_id,
@@ -3336,7 +3406,6 @@ impl Store {
                     grant
                         .max_downloads
                         .map(|count| i64::try_from(count).unwrap_or(i64::MAX)),
-                    grant.notify_on_download,
                     grant
                         .first_download_at
                         .map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
@@ -3345,6 +3414,7 @@ impl Store {
                         .map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
                     files_json,
                     file_count,
+                    serde_json::to_string(&grant.notifications).map_err(|e| e.to_string())?,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -3405,7 +3475,7 @@ impl Store {
             let mut statement = connection.prepare(
                 "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
                         name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
-                        expires_at, revoked_at, downloads, max_downloads, notify_on_download, first_download_at,
+                        expires_at, revoked_at, downloads, max_downloads, notifications_json, first_download_at,
                         last_download_at,
                         files_json
                  FROM outbound_grants WHERE tenant = ?1 ORDER BY created_at, rowid",
@@ -3436,7 +3506,7 @@ impl Store {
                 let mut statement = connection.prepare(
                     "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
                             name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
-                            expires_at, revoked_at, downloads, max_downloads, notify_on_download, first_download_at,
+                            expires_at, revoked_at, downloads, max_downloads, notifications_json, first_download_at,
                             last_download_at,
                             file_count,
                             CASE WHEN file_count <= ?4
@@ -3475,7 +3545,7 @@ impl Store {
                 .prepare_cached(
                     "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
                             name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
-                            expires_at, revoked_at, downloads, max_downloads, notify_on_download, first_download_at,
+                            expires_at, revoked_at, downloads, max_downloads, notifications_json, first_download_at,
                             last_download_at,
                             files_json
                      FROM outbound_grants WHERE token_hash = ?1",
@@ -3532,7 +3602,7 @@ impl Store {
                 .prepare_cached(
                     "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
                             name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
-                            expires_at, revoked_at, downloads, max_downloads, notify_on_download, first_download_at,
+                            expires_at, revoked_at, downloads, max_downloads, notifications_json, first_download_at,
                             last_download_at,
                             files_json
                      FROM outbound_grants WHERE id = ?1",
@@ -3660,7 +3730,7 @@ impl Store {
                 .prepare_cached(
                     "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
                             name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
-                            expires_at, revoked_at, downloads, max_downloads, notify_on_download,
+                            expires_at, revoked_at, downloads, max_downloads, notifications_json,
                             first_download_at, last_download_at, file_count
                      FROM outbound_grants WHERE token_hash = ?1",
                 )?
@@ -3733,7 +3803,7 @@ impl Store {
                 .prepare_cached(
                     "SELECT id, token_hash, password_hash, tenant, link_id, upload_id, package_root,
                             name, suite, root, file_index, bytes_hi, bytes_lo, label, created_at,
-                            expires_at, revoked_at, downloads, max_downloads, notify_on_download,
+                            expires_at, revoked_at, downloads, max_downloads, notifications_json,
                             first_download_at, last_download_at, file_count
                      FROM outbound_grants WHERE token_hash = ?1",
                 )?
@@ -3902,23 +3972,6 @@ impl Store {
             )
         })
         .map(|changed| changed > 0)
-    }
-
-    pub fn set_outbound_notify_on_download(
-        &self,
-        tenant: &str,
-        id: &str,
-        enabled: bool,
-    ) -> Result<bool, String> {
-        self.with(|connection| {
-            connection
-                .execute(
-                    "UPDATE outbound_grants SET notify_on_download = ?3
-                     WHERE tenant = ?1 AND id = ?2",
-                    rusqlite::params![tenant, id, enabled],
-                )
-                .map(|changed| changed > 0)
-        })
     }
 
     pub fn record_outbound_download(
@@ -4327,7 +4380,7 @@ fn escape_like(value: &str) -> String {
 fn insert_link_row(connection: &Connection, link: &Link) -> rusqlite::Result<()> {
     connection.execute(
         "INSERT INTO links (id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                            active, legal_hold, notify_on_upload, uploads_json, events_json)
+                            active, legal_hold, uploads_json, events_json, notifications_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         link_params(link),
     )?;
@@ -4339,7 +4392,7 @@ fn write_link_row(connection: &Connection, link: &Link) -> rusqlite::Result<()> 
     connection.execute(
         "UPDATE links SET label = ?3, dest = ?4, password_hash = ?5, created_at = ?6,
                           expires_at = ?7, max_bytes = ?8, active = ?9,
-                          legal_hold = ?10, notify_on_upload = ?11, uploads_json = ?12, events_json = ?13
+                          legal_hold = ?10, uploads_json = ?11, events_json = ?12, notifications_json = ?13
          WHERE id = ?1 AND tenant = ?2",
         link_params(link),
     )?;
@@ -4503,9 +4556,9 @@ fn link_params(link: &Link) -> [rusqlite::types::Value; 13] {
             .unwrap_or(V::Null),
         V::from(link.active),
         V::from(link.legal_hold),
-        V::from(link.notify_on_upload),
         V::from(uploads),
         V::from(events),
+        V::from(serde_json::to_string(&link.notifications).expect("serializable notifications")),
     ]
 }
 
@@ -4527,7 +4580,12 @@ fn row_to_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<Link> {
             .and_then(|value| u64::try_from(value).ok()),
         active: row.get::<_, i64>("active")? != 0,
         legal_hold: row.get::<_, i64>("legal_hold")? != 0,
-        notify_on_upload: row.get::<_, i64>("notify_on_upload")? != 0,
+
+        notifications: row
+            .get::<_, Option<String>>("notifications_json")?
+            .map(|text| parse_json(&text, 13))
+            .transpose()?
+            .flatten(),
         uploads: parse_json(&uploads_json, 11)?,
         events: parse_json(&events_json, 12)?,
     })
@@ -4576,7 +4634,12 @@ fn map_outbound_grant_base(row: &rusqlite::Row<'_>) -> rusqlite::Result<Outbound
         max_downloads: row
             .get::<_, Option<i64>>("max_downloads")?
             .and_then(|value| u64::try_from(value).ok()),
-        notify_on_download: row.get::<_, i64>("notify_on_download")? != 0,
+
+        notifications: row
+            .get::<_, Option<String>>("notifications_json")?
+            .map(|text| parse_json(&text, 0))
+            .transpose()?
+            .flatten(),
         first_download_at: row
             .get::<_, Option<i64>>("first_download_at")?
             .and_then(|value| u64::try_from(value).ok()),
@@ -4682,7 +4745,7 @@ fn read_link(connection: &Connection, tenant: &str, id: &str) -> Result<Option<L
     connection
         .query_row(
             "SELECT id, tenant, label, dest, password_hash, created_at, expires_at, max_bytes,
-                        active, legal_hold, notify_on_upload, uploads_json, events_json
+                        active, legal_hold, uploads_json, events_json, notifications_json
              FROM links WHERE tenant = ?1 AND id = ?2",
             rusqlite::params![tenant, id],
             row_to_link,
@@ -5079,41 +5142,6 @@ fn schema_version_stored(connection: &Connection) -> Result<u64, String> {
 }
 
 fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOverlay {
-    let (notify_webhook, notify_webhook_source) =
-        overlay_text(rows, "notify_webhook", config.notify_webhook.clone());
-    let (notify_slack, notify_slack_source) =
-        overlay_text(rows, "notify_slack", config.notify_slack.clone());
-    let (notify_teams, notify_teams_source) =
-        overlay_text(rows, "notify_teams", config.notify_teams.clone());
-    let (notify_google_chat, notify_google_chat_source) = overlay_text(
-        rows,
-        "notify_google_chat",
-        config.notify_google_chat.clone(),
-    );
-    let (notify_discord, notify_discord_source) =
-        overlay_text(rows, "notify_discord", config.notify_discord.clone());
-    let (notify_ntfy, notify_ntfy_source) =
-        overlay_text(rows, "notify_ntfy", config.notify_ntfy.clone());
-    let (notify_ntfy_token, notify_ntfy_token_source) =
-        overlay_text(rows, "notify_ntfy_token", config.notify_ntfy_token.clone());
-    let env_pushover_token = config
-        .notify_pushover
-        .as_ref()
-        .map(|(token, _)| token.clone());
-    let env_pushover_user = config
-        .notify_pushover
-        .as_ref()
-        .map(|(_, user)| user.clone());
-    let (pushover_token, notify_pushover_token_source) =
-        overlay_text(rows, "notify_pushover_token", env_pushover_token);
-    let (pushover_user, notify_pushover_user_source) =
-        overlay_text(rows, "notify_pushover_user", env_pushover_user);
-    let notify_pushover_token_set = pushover_token.is_some();
-    let notify_pushover_user_set = pushover_user.is_some();
-    let notify_pushover = match (pushover_token, pushover_user) {
-        (Some(token), Some(user)) => Some((token, user)),
-        _ => None,
-    };
     let (smtp_host, smtp_host_source) = overlay_text(rows, "smtp_host", config.smtp_host.clone());
     let (smtp_port, smtp_port_source) = overlay_port(rows, "smtp_port", config.smtp_port);
     let (smtp_starttls, smtp_starttls_source) =
@@ -5124,7 +5152,6 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
         overlay_text(rows, "smtp_password", config.smtp_password.clone());
     let smtp_password_set = smtp_password.is_some();
     let (smtp_from, smtp_from_source) = overlay_text(rows, "smtp_from", config.smtp_from.clone());
-    let (smtp_to, smtp_to_source) = overlay_text(rows, "smtp_to", config.smtp_to.clone());
     let smtp = assemble_smtp(
         smtp_host.clone(),
         smtp_port,
@@ -5132,7 +5159,6 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
         smtp_username.clone(),
         smtp_password.clone(),
         smtp_from.clone(),
-        smtp_to.clone(),
     );
     let (audit_retention_days, audit_retention_days_source) =
         overlay_u64(rows, "audit_retention_days", config.audit_retention_days);
@@ -5173,14 +5199,6 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
     let (draining, draining_source) = overlay_bool(rows, "draining", false);
     SettingsOverlay {
         resolved: ResolvedSettings {
-            notify_webhook,
-            notify_slack,
-            notify_teams,
-            notify_google_chat,
-            notify_discord,
-            notify_ntfy,
-            notify_ntfy_token,
-            notify_pushover,
             smtp,
             audit_retention_days,
             upload_retention_days,
@@ -5195,17 +5213,7 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
             require_provisioning,
             draining,
         },
-        notify_webhook_source,
-        notify_slack_source,
-        notify_teams_source,
-        notify_google_chat_source,
-        notify_discord_source,
-        notify_ntfy_source,
-        notify_ntfy_token_source,
-        notify_pushover_token_set,
-        notify_pushover_token_source,
-        notify_pushover_user_set,
-        notify_pushover_user_source,
+
         smtp_host,
         smtp_host_source,
         smtp_port,
@@ -5218,8 +5226,7 @@ fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOver
         smtp_password_source,
         smtp_from,
         smtp_from_source,
-        smtp_to,
-        smtp_to_source,
+
         audit_retention_days_source,
         upload_retention_days_source,
         default_max_total_bytes_source,
@@ -5299,14 +5306,6 @@ fn trimmed_option(value: Option<String>) -> Option<String> {
     })
 }
 
-fn smtp_recipients(to: &str) -> Vec<String> {
-    to.split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
 fn assemble_smtp(
     host: Option<String>,
     port: u16,
@@ -5314,14 +5313,9 @@ fn assemble_smtp(
     username: Option<String>,
     password: Option<String>,
     from: Option<String>,
-    to: Option<String>,
 ) -> Option<ResolvedSmtp> {
     let host = trimmed_option(host)?;
     let from = trimmed_option(from)?;
-    let recipients = to
-        .as_deref()
-        .map(smtp_recipients)
-        .filter(|parts| !parts.is_empty())?;
     Some(ResolvedSmtp {
         host,
         port,
@@ -5329,7 +5323,6 @@ fn assemble_smtp(
         username: trimmed_option(username),
         password,
         from,
-        to: recipients,
     })
 }
 
@@ -5415,7 +5408,8 @@ mod tests {
             max_bytes: None,
             active: true,
             legal_hold: false,
-            notify_on_upload: false,
+
+            notifications: None,
             uploads: Vec::new(),
             events: Vec::new(),
         }
@@ -5460,7 +5454,8 @@ mod tests {
             revoked_at: None,
             downloads: 0,
             max_downloads: None,
-            notify_on_download: false,
+
+            notifications: None,
             first_download_at: None,
             last_download_at: None,
             files: Vec::new(),
@@ -8337,15 +8332,8 @@ mod settings_tests {
             web_root: std::path::PathBuf::from("../web"),
             admin_password_hash: "x".to_owned(),
             admin_token_tag: "tag".to_owned(),
-            notify_webhook: Some("https://env.example/hook".to_owned()),
-            notify_slack: None,
-            notify_teams: None,
-            notify_google_chat: None,
-            notify_discord: None,
-            notify_ntfy: None,
-            notify_ntfy_token: Some("env-token".to_owned()),
-            notify_pushover: None,
-            smtp_host: None,
+            smtp_host: Some("https://env.example/hook".to_owned()),
+
             smtp_port: 587,
             smtp_starttls: true,
             smtp_username: None,
@@ -8353,7 +8341,7 @@ mod settings_tests {
             scim_token: None,
             replica_token: None,
             smtp_from: None,
-            smtp_to: None,
+
             public_url: None,
             max_upload_bytes: 1024,
             workflow_snapshot_bytes: 4 * 1024 * 1024,
@@ -8392,17 +8380,13 @@ mod settings_tests {
         let store = Store::open(directory.path()).unwrap();
         let overlay = store.overlay(&test_config()).unwrap();
         assert_eq!(
-            overlay.resolved.notify_webhook.as_deref(),
+            overlay.smtp_host.as_deref(),
             Some("https://env.example/hook")
         );
-        assert_eq!(overlay.notify_webhook_source, "env");
+        assert_eq!(overlay.smtp_host_source, "env");
         assert_eq!(overlay.resolved.audit_retention_days, 400);
         assert_eq!(overlay.audit_retention_days_source, "env");
         assert_eq!(overlay.resolved.upload_retention_days, 0);
-        assert_eq!(
-            overlay.resolved.notify_ntfy_token.as_deref(),
-            Some("env-token")
-        );
         assert!(overlay.resolved.default_max_total_bytes.is_none());
         assert!(overlay.resolved.public_password_login);
     }
@@ -8415,17 +8399,17 @@ mod settings_tests {
             .put_settings(
                 "local",
                 &[(
-                    "notify_webhook".to_owned(),
+                    "smtp_host".to_owned(),
                     SettingWrite::Set("https://db.example/hook".to_owned()),
                 )],
             )
             .unwrap();
         let overlay = store.overlay(&test_config()).unwrap();
         assert_eq!(
-            overlay.resolved.notify_webhook.as_deref(),
+            overlay.smtp_host.as_deref(),
             Some("https://db.example/hook")
         );
-        assert_eq!(overlay.notify_webhook_source, "db");
+        assert_eq!(overlay.smtp_host_source, "db");
         assert_eq!(overlay.resolved.audit_retention_days, 400);
         assert_eq!(overlay.audit_retention_days_source, "env");
     }
@@ -8437,15 +8421,12 @@ mod settings_tests {
         store
             .put_settings(
                 "local",
-                &[(
-                    "notify_webhook".to_owned(),
-                    SettingWrite::Set(String::new()),
-                )],
+                &[("smtp_host".to_owned(), SettingWrite::Set(String::new()))],
             )
             .unwrap();
         let overlay = store.overlay(&test_config()).unwrap();
-        assert_eq!(overlay.resolved.notify_webhook, None);
-        assert_eq!(overlay.notify_webhook_source, "db");
+        assert_eq!(overlay.smtp_host, None);
+        assert_eq!(overlay.smtp_host_source, "db");
     }
 
     #[test]
@@ -8456,24 +8437,21 @@ mod settings_tests {
             .put_settings(
                 "local",
                 &[(
-                    "notify_webhook".to_owned(),
+                    "smtp_host".to_owned(),
                     SettingWrite::Set("https://db.example/hook".to_owned()),
                 )],
             )
             .unwrap();
         store
-            .put_settings(
-                "local",
-                &[("notify_webhook".to_owned(), SettingWrite::Reset)],
-            )
+            .put_settings("local", &[("smtp_host".to_owned(), SettingWrite::Reset)])
             .unwrap();
         let overlay = store.overlay(&test_config()).unwrap();
         assert_eq!(
-            overlay.resolved.notify_webhook.as_deref(),
+            overlay.smtp_host.as_deref(),
             Some("https://env.example/hook")
         );
-        assert_eq!(overlay.notify_webhook_source, "env");
-        assert!(store.setting("notify_webhook").unwrap().is_none());
+        assert_eq!(overlay.smtp_host_source, "env");
+        assert!(store.setting("smtp_host").unwrap().is_none());
     }
 
     #[test]
@@ -8561,6 +8539,7 @@ mod settings_tests {
             color: "#0a84ff".to_owned(),
             logo_ext: String::new(),
             updated_at: 42,
+            ..Default::default()
         };
         store.set_branding(&branding).unwrap();
         let read = store.branding("acme").unwrap().unwrap();
@@ -8613,6 +8592,7 @@ mod settings_tests {
                 color: String::new(),
                 logo_ext: String::new(),
                 updated_at: 0,
+                ..Default::default()
             })
             .unwrap();
         assert!(matches!(
@@ -8769,6 +8749,7 @@ mod settings_tests {
                 color: String::new(),
                 logo_ext: String::new(),
                 updated_at: 1,
+                ..Default::default()
             })
             .unwrap();
         assert_eq!(reopened.branding("acme").unwrap().unwrap().name, "Acme");
@@ -8851,7 +8832,7 @@ mod settings_tests {
                 connection.execute_batch(
                     "DROP TABLE files;
                      DROP TABLE outbound_grants;
-                     ALTER TABLE links DROP COLUMN notify_on_upload;
+
                      UPDATE meta SET value = '6' WHERE key = 'schema_version';",
                 )
             })
@@ -8869,6 +8850,7 @@ mod settings_tests {
         {
             let connection = Connection::open(directory.path().join("votport.db")).unwrap();
             connection.execute_batch(SCHEMA).unwrap();
+            connection.execute_batch(SETTINGS_SCHEMA).unwrap();
             connection
                 .execute_batch(
                     "CREATE TABLE outbound_grants (
@@ -8918,6 +8900,7 @@ mod settings_tests {
         {
             let connection = Connection::open(directory.path().join("votport.db")).unwrap();
             connection.execute_batch(SCHEMA).unwrap();
+            connection.execute_batch(SETTINGS_SCHEMA).unwrap();
             connection
                 .execute_batch(
                     r#"CREATE TABLE outbound_grants (
@@ -8979,8 +8962,8 @@ mod settings_tests {
                      ALTER TABLE outbound_grants DROP COLUMN first_download_at;
                      ALTER TABLE outbound_grants DROP COLUMN last_download_at;
                      ALTER TABLE outbound_grants DROP COLUMN file_count;
-                     ALTER TABLE links DROP COLUMN notify_on_upload;
-                     ALTER TABLE outbound_grants DROP COLUMN notify_on_download;
+
+
                      UPDATE meta SET value = '10' WHERE key = 'schema_version';",
                 )
                 .unwrap();
@@ -9011,8 +8994,8 @@ mod settings_tests {
                     "DROP TABLE automation_tokens;
                      ALTER TABLE outbound_grants DROP COLUMN max_downloads;
                      ALTER TABLE outbound_grants DROP COLUMN file_count;
-                     ALTER TABLE links DROP COLUMN notify_on_upload;
-                     ALTER TABLE outbound_grants DROP COLUMN notify_on_download;
+
+
                      UPDATE meta SET value = '11' WHERE key = 'schema_version';",
                 )
                 .unwrap();
@@ -9051,8 +9034,8 @@ mod settings_tests {
                 .execute_batch(
                     "ALTER TABLE outbound_grants DROP COLUMN max_downloads;
                      ALTER TABLE outbound_grants DROP COLUMN file_count;
-                     ALTER TABLE links DROP COLUMN notify_on_upload;
-                     ALTER TABLE outbound_grants DROP COLUMN notify_on_download;
+
+
                      UPDATE meta SET value = '12' WHERE key = 'schema_version';",
                 )
                 .unwrap();
@@ -9070,20 +9053,6 @@ mod settings_tests {
             )
             .unwrap();
         assert!(default.is_none());
-        for (table, column) in [
-            ("links", "notify_on_upload"),
-            ("outbound_grants", "notify_on_download"),
-        ] {
-            let (default, not_null): (Option<String>, i64) = connection
-                .query_row(
-                    &format!("SELECT dflt_value, \"notnull\" FROM pragma_table_info('{table}') WHERE name = '{column}'"),
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-            assert_eq!(default.as_deref(), Some("0"));
-            assert_eq!(not_null, 1);
-        }
     }
 
     #[test]
@@ -9142,23 +9111,24 @@ mod settings_tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         let mut config = test_config();
+        config.smtp_host = None;
         config.smtp_from = Some("votport@example.com".to_owned());
-        config.smtp_to = Some("ops@example.com".to_owned());
+
         assert!(store.resolved_settings(&config).unwrap().smtp.is_none());
     }
 
     #[test]
-    fn smtp_is_none_when_host_and_from_lack_to() {
+    fn smtp_is_none_without_from() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         let mut config = test_config();
         config.smtp_host = Some("smtp.example.com".to_owned());
-        config.smtp_from = Some("votport@example.com".to_owned());
+        config.smtp_from = None;
         assert!(store.resolved_settings(&config).unwrap().smtp.is_none());
     }
 
     #[test]
-    fn smtp_assembles_when_host_from_and_to_resolve() {
+    fn smtp_assembles_when_host_and_from_resolve() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         store
@@ -9172,15 +9142,15 @@ mod settings_tests {
             .unwrap();
         let mut config = test_config();
         config.smtp_from = Some("votport@example.com".to_owned());
-        config.smtp_to = Some("ops@example.com,  alerts@example.com".to_owned());
+
         let smtp = store
             .resolved_settings(&config)
             .unwrap()
             .smtp
-            .expect("host from DB plus from/to from env");
+            .expect("host from DB plus sender from env");
         assert_eq!(smtp.host, "db.example.com");
         assert_eq!(smtp.from, "votport@example.com");
-        assert_eq!(smtp.to, vec!["ops@example.com", "alerts@example.com"]);
+
         assert_eq!(smtp.port, 587);
         assert!(smtp.starttls);
         assert!(smtp.password.is_none());

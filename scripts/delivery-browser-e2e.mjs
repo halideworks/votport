@@ -1,3 +1,4 @@
+import { openAncestors } from './browser-helpers.mjs';
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright';
 import fs from 'node:fs/promises';
@@ -27,7 +28,7 @@ try {
   await request('admin/login', { password: process.env.ADMIN_PASSWORD });
   await page.goto(`${base}/s/fixture`);
   await page.locator('#delivery-evidence').evaluate((node) => { node.open = true; });
-  await page.locator('#evidence-copy-key').click();
+  await openAncestors(page.locator('#evidence-copy-key')); await page.locator('#evidence-copy-key').click();
   await page.waitForFunction(() => /^[0-9a-f]{64}$/.test(window.copiedText));
   const holder = await page.evaluate(() => window.copiedText);
   assert.match(await page.locator('#evidence-open-app').getAttribute('href'), /^votport:\/\/s\//);
@@ -35,10 +36,10 @@ try {
   await page.waitForURL('**/workflows');
   await page.getByRole('link', { name: 'Projects', exact: true }).click();
   await page.click('#workflow-new-project');
-  await page.fill('#wp-id', project);
+  await openAncestors(page.locator('#wp-id')); await page.fill('#wp-id', project);
   await page.fill('#wp-label', 'Browser delivery');
   await page.fill('#wp-directory', project);
-  await page.click('#wp-add-metadata');
+  await openAncestors(page.locator('#wp-add-metadata')); await page.click('#wp-add-metadata');
   await page.locator('#wp-metadata input').fill('client');
   await page.click('#wp-add-recipient');
   await page.locator('#wp-recipients input[type=email]').fill('recipient@example.com');
@@ -74,7 +75,7 @@ try {
   await page.locator('#delivery-evidence').evaluate((node) => { node.open = true; });
   await page.setInputFiles('#evidence-files', path.join(directory, 'saved.bin'));
   await page.click('#evidence-verify');
-  await page.waitForFunction(() => document.querySelector('#evidence-records').textContent.includes('Verified: recorded'));
+  await page.waitForFunction(() => document.querySelector('#evidence-records').textContent.includes('Verification reported to the sender.'));
   let evidence = await request(`workflows/jobs/${id}/evidence`);
   assert.equal(evidence.evidence.length, 1);
   // An expired acceptance of an older challenge must not hide fresh acceptance.
@@ -89,15 +90,15 @@ try {
   await request(`admin/outbound-grants/${id}`, undefined, 'DELETE');
   await page.reload();
   await page.locator('#delivery-evidence').evaluate((node) => { node.open = true; });
-  await page.click('#evidence-refresh');
+  await openAncestors(page.locator('#evidence-refresh')); await page.click('#evidence-refresh');
   await page.getByRole('button', { name: 'Accept verified delivery', exact: true }).waitFor();
   await page.route('**/api/evidence', (route) => route.fulfill({ status: 503, contentType: 'application/json', body: '{}' }));
   page.once('dialog', (dialog) => dialog.accept());
   await page.getByRole('button', { name: 'Accept verified delivery', exact: true }).click();
-  await page.waitForFunction(() => document.querySelector('#evidence-records').textContent.includes('Acceptance: pending'));
+  await page.waitForFunction(() => document.querySelector('#evidence-records').textContent.includes('report: pending'));
   await page.unroute('**/api/evidence');
-  await page.click('#evidence-retry');
-  await page.waitForFunction(() => document.querySelector('#evidence-records').textContent.includes('Acceptance: recorded'));
+  await openAncestors(page.locator('#evidence-retry')); await page.click('#evidence-retry');
+  await page.waitForFunction(() => document.querySelector('#evidence-records').textContent.includes('Delivery accepted and reported to the sender.'));
   evidence = await request(`workflows/jobs/${id}/evidence`);
   assert.deepEqual(evidence.evidence.map((record) => record.evidence.kind).sort(), ['accepted', 'verified']);
   await page.screenshot({ path: path.join(root, 'recipient-evidence.png'), fullPage: true });

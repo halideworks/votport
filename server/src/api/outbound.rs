@@ -1314,7 +1314,7 @@ pub struct CreateOutboundRequest {
     #[serde(default)]
     max_downloads: Option<u64>,
     #[serde(default)]
-    notify_on_download: bool,
+    notifications: Option<crate::store::NotificationPolicy>,
     #[serde(default = "default_expiry")]
     expires_days: u64,
 }
@@ -1553,6 +1553,12 @@ pub async fn create_outbound_grant(
     let Json(request) = Json::<CreateOutboundRequest>::from_request(request, &app)
         .await
         .map_err(|error| ApiError::new(error.status(), error.body_text()))?;
+    let notifications = super::notifications::creation_policy(
+        &app,
+        &identity.tenant,
+        request.notifications.clone(),
+        &super::notifications::DOWNLOAD_EVENTS,
+    )?;
     if !(1..=30).contains(&request.expires_days) {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1594,7 +1600,8 @@ pub async fn create_outbound_grant(
                 password_hash,
                 expires_days: request.expires_days,
                 max_downloads: request.max_downloads,
-                notify_on_download: request.notify_on_download,
+
+                notifications: notifications.clone(),
             },
         )
         .await;
@@ -1619,7 +1626,8 @@ pub async fn create_outbound_grant(
                 password_hash,
                 expires_days: request.expires_days,
                 max_downloads: request.max_downloads,
-                notify_on_download: request.notify_on_download,
+
+                notifications: notifications.clone(),
             },
         )
         .await;
@@ -1729,7 +1737,8 @@ pub async fn create_outbound_grant(
         created_at,
         expires_at: created_at.saturating_add(request.expires_days * 86_400),
         max_downloads: request.max_downloads,
-        notify_on_download: request.notify_on_download,
+
+        notifications,
         revoked_at: None,
         downloads: 0,
         first_download_at: None,
@@ -1744,7 +1753,7 @@ pub async fn create_outbound_grant(
         &identity.subject,
         "outbound_grant_created",
         &grant.id,
-        &json!({ "link": grant.link_id, "upload": grant.upload_id, "file_index": grant.file_index, "notify_on_download": grant.notify_on_download }),
+        &json!({ "link": grant.link_id, "upload": grant.upload_id, "file_index": grant.file_index }),
     );
     let base = admin::base_url(&app, &headers);
     Ok((
@@ -1878,7 +1887,8 @@ struct GrantOptions {
     password_hash: Option<String>,
     expires_days: u64,
     max_downloads: Option<u64>,
-    notify_on_download: bool,
+
+    notifications: Option<crate::store::NotificationPolicy>,
 }
 
 async fn create_library_grant(
@@ -2132,7 +2142,8 @@ async fn create_library_grant(
         created_at,
         expires_at: created_at.saturating_add(options.expires_days * 86_400),
         max_downloads: options.max_downloads,
-        notify_on_download: options.notify_on_download,
+
+        notifications: options.notifications.clone(),
         revoked_at: None,
         downloads: 0,
         first_download_at: None,
@@ -2165,7 +2176,7 @@ async fn create_library_grant(
         &identity.subject,
         "outbound_grant_created",
         &grant.id,
-        &json!({ "files": grant.files.len(), "notify_on_download": grant.notify_on_download, "operation_id": options.automation.as_ref().map(|(op, _)| &op.operation_id) }),
+        &json!({ "files": grant.files.len(), "operation_id": options.automation.as_ref().map(|(op, _)| &op.operation_id) }),
     );
     let base = admin::base_url(app, headers);
     Ok((
@@ -2415,7 +2426,7 @@ pub struct UpdateOutboundGrantRequest {
     #[serde(default)]
     extend_days: Option<u64>,
     #[serde(default)]
-    notify_on_download: Option<bool>,
+    notifications: Option<crate::store::NotificationPolicy>,
 }
 
 pub async fn update_outbound_grant(
@@ -2430,7 +2441,7 @@ pub async fn update_outbound_grant(
     let fields = [
         request.rotate.is_some(),
         request.extend_days.is_some(),
-        request.notify_on_download.is_some(),
+        request.notifications.is_some(),
     ];
     if fields.iter().filter(|field| **field).count() != 1 || request.rotate == Some(false) {
         return Err(ApiError::new(
@@ -2438,10 +2449,16 @@ pub async fn update_outbound_grant(
             "choose exactly one grant lifecycle or policy action",
         ));
     }
-    if let Some(notify_on_download) = request.notify_on_download {
+    if let Some(policy) = request.notifications {
+        super::notifications::validate_policy(
+            &app,
+            &identity.tenant,
+            &policy,
+            &super::notifications::DOWNLOAD_EVENTS,
+        )?;
         if !app
             .store
-            .set_outbound_notify_on_download(&identity.tenant, &id, notify_on_download)
+            .set_outbound_notifications(&identity.tenant, &id, &policy)
             .map_err(ApiError::internal)?
         {
             return Err(ApiError::not_found());
@@ -2449,11 +2466,11 @@ pub async fn update_outbound_grant(
         app.store.audit(
             &identity.tenant,
             &identity.subject,
-            "outbound_grant_notify_on_download_changed",
+            "outbound_notifications_changed",
             &id,
-            &json!({ "notify_on_download": notify_on_download }),
+            &json!({}),
         );
-        return Ok(Json(json!({ "ok": true })).into_response());
+        return Ok(Json(json!({"ok":true})).into_response());
     }
     if request.rotate == Some(true) {
         let job = app
@@ -3630,7 +3647,7 @@ async fn record_download(
     let store = Arc::clone(&app.store);
     let grant_id = grant.id.clone();
     let token_hash = grant.token_hash.clone();
-    let notify = grant.notify_on_download;
+    let notify = grant.notifications.as_ref().is_some_and(|p| p.enabled());
     let indexes = indexes.to_vec();
     let recorded = tokio::task::spawn_blocking(move || {
         let result = store.record_outbound_download(&grant_id, &indexes, now_unix())?;
@@ -4274,7 +4291,7 @@ fn public_grant_with_file_count(grant: OutboundGrant, file_count: usize) -> serd
             })
             .collect()
     };
-    json!({ "id": grant.id, "tenant": grant.tenant, "link_id": grant.link_id, "upload_id": grant.upload_id, "file_index": grant.file_index, "name": grant.name, "label": grant.label, "has_password": grant.password_hash.is_some(), "created_at": grant.created_at, "expires_at": grant.expires_at, "revoked_at": grant.revoked_at, "max_downloads": grant.max_downloads, "downloads": grant.downloads, "first_download_at": grant.first_download_at, "last_download_at": grant.last_download_at, "notify_on_download": grant.notify_on_download, "file_count": file_count, "files_truncated": files_truncated, "files": files })
+    json!({ "id": grant.id, "tenant": grant.tenant, "link_id": grant.link_id, "upload_id": grant.upload_id, "file_index": grant.file_index, "name": grant.name, "label": grant.label, "has_password": grant.password_hash.is_some(), "created_at": grant.created_at, "expires_at": grant.expires_at, "revoked_at": grant.revoked_at, "max_downloads": grant.max_downloads, "downloads": grant.downloads, "first_download_at": grant.first_download_at, "last_download_at": grant.last_download_at, "notifications":grant.notifications, "file_count": file_count, "files_truncated": files_truncated, "files": files })
 }
 
 fn public_automation_token(token: &AutomationToken) -> serde_json::Value {
@@ -4538,7 +4555,8 @@ mod tests {
             revoked_at: None,
             downloads: 0,
             max_downloads: None,
-            notify_on_download: false,
+
+            notifications: None,
             first_download_at: None,
             last_download_at: None,
             files: Vec::new(),
@@ -4556,6 +4574,7 @@ mod tests {
                 color: "#12ab99".to_owned(),
                 logo_ext: "png".to_owned(),
                 updated_at: 0,
+                ..Default::default()
             })
             .unwrap();
         let logo = crate::paths::branding_logo_path(&app.config.data_dir, "", "png");
@@ -5019,7 +5038,8 @@ mod tests {
                 max_bytes: None,
                 active: true,
                 legal_hold: false,
-                notify_on_upload: false,
+
+                notifications: None,
                 uploads: vec![crate::store::UploadRecord {
                     partial: false,
                     log: Vec::new(),
@@ -5109,7 +5129,8 @@ mod tests {
             revoked_at: None,
             downloads: 0,
             max_downloads: None,
-            notify_on_download: false,
+
+            notifications: None,
             first_download_at: None,
             last_download_at: None,
             files: (0..5_001).map(|_| file(1)).collect(),
@@ -5318,7 +5339,8 @@ mod tests {
                     revoked_at: None,
                     downloads: 0,
                     max_downloads: None,
-                    notify_on_download: false,
+
+                    notifications: None,
                     first_download_at: None,
                     last_download_at: None,
                     files: Vec::new(),
@@ -5389,7 +5411,8 @@ mod tests {
             revoked_at: None,
             downloads: 0,
             max_downloads: Some(1),
-            notify_on_download: false,
+
+            notifications: None,
             first_download_at: None,
             last_download_at: None,
             files: Vec::new(),

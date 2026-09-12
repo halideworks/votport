@@ -175,6 +175,7 @@ pub struct WorkerSetup {
 /// A session that ended without publishing, as handed to the notifier.
 #[derive(Clone, Debug)]
 pub struct SessionEnded {
+    pub notifications: Option<crate::store::NotificationPolicy>,
     pub tenant: String,
     pub link_id: String,
     pub label: String,
@@ -3321,6 +3322,7 @@ fn record_session_event(
     );
     crate::app::TRANSFERS.ended(&event.outcome);
     let mut ended = SessionEnded {
+        notifications: None,
         tenant: tenant.to_owned(),
         link_id: link_id.to_owned(),
         label: String::new(),
@@ -3329,7 +3331,8 @@ fn record_session_event(
     };
     let _ = store.update_link(tenant, link_id, |link| {
         ended.label = link.label.clone();
-        ended.notify = link.notify_on_upload;
+        ended.notify = link.notifications.as_ref().is_some_and(|p| p.enabled());
+        ended.notifications = link.notifications.clone();
         link.events.push(event);
         if link.events.len() > EVENTS_KEPT {
             let excess = link.events.len() - EVENTS_KEPT;
@@ -5108,7 +5111,8 @@ mod push_tests {
                     max_bytes: None,
                     active: true,
                     legal_hold: false,
-                    notify_on_upload: false,
+
+                    notifications: None,
                     uploads: Vec::new(),
                     events: Vec::new(),
                 })
@@ -5294,7 +5298,8 @@ mod push_tests {
                 max_bytes: None,
                 active: true,
                 legal_hold: false,
-                notify_on_upload: false,
+
+                notifications: None,
                 uploads: Vec::new(),
                 events: Vec::new(),
             })
@@ -5423,7 +5428,8 @@ mod push_tests {
                     max_bytes: None,
                     active: true,
                     legal_hold: false,
-                    notify_on_upload: false,
+
+                    notifications: None,
                     uploads: Vec::new(),
                     events: Vec::new(),
                 })
@@ -5569,7 +5575,8 @@ mod push_tests {
                 max_bytes: None,
                 active: true,
                 legal_hold: false,
-                notify_on_upload: false,
+
+                notifications: None,
                 uploads: Vec::new(),
                 events: Vec::new(),
             })

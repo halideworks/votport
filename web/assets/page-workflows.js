@@ -1,3 +1,5 @@
+import { isFormDirty, discardForm, markFormSaved, markFormChanged } from '/assets/form-drafts.js';
+import { notificationEditor, notificationDetails, workflowEvents } from '/assets/notifications.js';
 /* global URL, Blob, Option, sessionStorage, crypto */
 import { api, button, confirmModal, copyToClipboard, formatBytes, formatWhen, requireSession, revealHash } from '/assets/admin-common.js';
 
@@ -7,13 +9,18 @@ const optionalNumber = (id) => value(id) ? Number(value(id)) : null;
 const localTime = (id) => value(id) ? Math.floor(new Date(value(id)).getTime() / 1000) : null;
 const node = (tag, content, className = '') => { const element = document.createElement(tag); element.textContent = content; element.className = className; return element; };
 const stateNames = { queued: 'Scheduled', preparing: 'Preparing files', awaiting_approval: 'Needs approval', exporting: 'Delivering copies', retrying: 'Retry scheduled', ready: 'Ready to share', failed: 'Needs attention', cancelled: 'Cancelled', retiring: 'Cleaning up', retired: 'Archived' };
+let projectNotifications, jobNotifications;
 let projects = [], storage = [], jobs = [], cursor = null, eventCursor = 0, attemptCursor = 0, jobsRevision = 0;
 const eventPage = [];
 let projectRevision = 0, hookRevision = 0, editingProject = null, autoProjectId = true, appendedJobs = false, loadingEvents = false, poll;
 const loaded = new Set();
 const session = await requireSession();
 const admin = session.role === 'admin';
-const draftKey = `votport-workflow-draft:${session.tenant || ''}`;
+const draftKey = `votport-workflow-draft:${JSON.stringify([session.subject, session.tenant])}`;
+const initialFilters = new URLSearchParams(window.location.search);
+let jobsLoading = false, committedFilters = '';
+let jobFilter = { q: initialFilters.get('q') || '', project: initialFilters.get('project') || '', state: initialFilters.get('state') || '' };
+$('workflow-query').value = jobFilter.q; $('workflow-filter-state').value = jobFilter.state;
 
 function notice(message) { $('workflow-notice').textContent = message; $('workflow-notice').hidden = false; }
 async function guard(action) {
@@ -50,8 +57,9 @@ function form(id, action) {
 
 function projectFields() {
   const project = projects.find((item) => item.id === value('workflow-project'));
+  jobNotifications = notificationEditor({ inherit: project?.notifications || null, events: workflowEvents }); $('workflow-notifications').replaceChildren(jobNotifications.element);
   $('workflow-metadata').replaceChildren();
-  $('workflow-recipients').replaceChildren(node('legend', 'Recipients'));
+  $('workflow-recipients').replaceChildren($('workflow-recipients').querySelector('legend'));
   $('workflow-rules').textContent = project
     ? `${project.directory} · ${project.require_approval ? 'Approval required' : 'Released after preparation'}${project.scan_required ? ' · Malware scan' : ''}${project.media ? ' · Video checks' : ''}${project.sequence ? ' · Sequence check' : ''}`
     : 'Choose a project to see its delivery requirements.';
@@ -69,11 +77,13 @@ async function refreshProjects() {
   const [projectResponse, storageResponse] = await Promise.all([api('/api/workflows/projects'), api('/api/workflows/storage')]);
   projects = projectResponse.projects; storage = storageResponse.storage;
   options($('workflow-project'), projects, 'Choose a project');
+  options($('workflow-filter-project'), projects, 'All projects'); $('workflow-filter-project').value = jobFilter.project;
   options($('workflow-import'), storage.filter((item) => item.enabled && item.kind === 's3'), 'Project library folder');
 
-  projectFields(); renderProjects();
+  renderProjects();
 }
 async function newDelivery(id) {
+  if (!discardForm($('workflow-create'))) return;
   if ($('workflow-create').inert) return;
   await refreshProjects();
   if (!projects.length) {
@@ -98,6 +108,7 @@ async function newDelivery(id) {
   }
   projectFields();
   if (saved) {
+    jobNotifications = notificationEditor({ policy: saved.notifications, inherit: projects.find((project) => project.id === saved.project_id)?.notifications || null, events: workflowEvents }); $('workflow-notifications').replaceChildren(jobNotifications.element);
     for (const input of $('workflow-metadata').querySelectorAll('input')) input.value = saved.metadata[input.dataset.key] || '';
     for (const input of $('workflow-recipients').querySelectorAll('input')) input.checked = saved.recipients.includes(input.value);
   }
@@ -139,17 +150,18 @@ function addRow(kind, values = {}) {
     else { input.type = field.type || 'text'; input.maxLength = field.max; if (field.pattern) input.pattern = field.pattern; if (field.list) input.setAttribute('list', field.list); }
     input.value = values[field.key] || (field.options ? field.options[0] : ''); label.append(input); row.append(label);
   }
-  const remove = button('Remove', 'ghost', () => { row.remove(); $(`wp-add-${kind === 'members' ? 'member' : kind === 'recipients' ? 'recipient' : 'metadata'}`).focus(); });
+  const remove = button('Remove', 'ghost', () => { markFormChanged($('workflow-save-project')); row.remove(); $(`wp-add-${kind === 'members' ? 'member' : kind === 'recipients' ? 'recipient' : 'metadata'}`).focus(); });
   remove.setAttribute('aria-label', `Remove ${kind === 'metadata' ? 'required field' : kind === 'members' ? 'team member' : 'recipient'}`);
   row.append(remove); $(`wp-${kind}`).append(row); return row;
 }
 const rows = (kind) => [...$(`wp-${kind}`).children].map((row) => Object.fromEntries([...row.querySelectorAll('input,select')].map((input) => [input.dataset.key, input.value.trim()])));
 function editProject(project) {
-  if (!admin || $('workflow-save-project').inert) return;
+  if (!admin || $('workflow-save-project').inert || !discardForm($('workflow-save-project'))) return;
   editingProject = project || null; projectRevision = project?.revision || 0; autoProjectId = !project;
   $('workflow-save-project').reset(); $('workflow-save-project').hidden = false;
   $('project-editor-title').textContent = project ? `Edit ${project.label}` : 'New project';
   for (const key of ['id', 'label', 'directory']) { $(`wp-${key}`).value = project?.[key] || ''; }
+  projectNotifications = notificationEditor({ policy: project?.notifications, events: workflowEvents }); $('project-notifications').replaceChildren(projectNotifications.element);
   $('wp-id').readOnly = $('wp-directory').readOnly = !!project;
   for (const kind of Object.keys(fields)) $(`wp-${kind}`).replaceChildren();
   for (const [subject, role] of Object.entries(project?.members || {})) addRow('members', { subject, role });
@@ -182,23 +194,43 @@ function checkFields() {
   $('wp-first').required = $('wp-last').required = $('wp-sequence-enabled').checked;
 }
 
-async function refreshJobs(more = false) {
+function editingJob() {
+  return $('workflow-jobs').contains(document.activeElement) || $('workflow-jobs').querySelector('details[open], .notification-details[data-dirty], .notification-details > button:disabled');
+}
+async function refreshJobs(more = false, background = false, discardEdits = false) {
+  const filterKey = JSON.stringify(jobFilter);
+  if (more && (jobsLoading || filterKey !== committedFilters || !cursor)) return false;
+  jobsLoading = true; $('workflow-more').disabled = true; if (discardEdits) $('workflow-jobs').inert = true;
   const revision = ++jobsRevision;
+  try {
   const requested = /^#job-([a-f0-9]{32})$/.exec(window.location.hash)?.[1];
-  const page = await api(`/api/workflows/jobs?limit=50&after=${encodeURIComponent(more ? cursor || '' : '')}`);
+  const params = new URLSearchParams({ ...jobFilter, limit: '50', after: more ? cursor || '' : '' });
+  const page = await api(`/api/workflows/jobs?${params}`);
   if (!more && requested && !page.jobs.some(({ job }) => job.id === requested)) {
     page.jobs.unshift(await api(`/api/workflows/jobs/${requested}`));
   }
   if (revision !== jobsRevision) return false;
+  if (background && editingJob()) { schedulePoll(); return false; }
   if (!more) appendedJobs = false;
   else if (page.jobs.length) appendedJobs = true;
   jobs = [...new Map((more ? jobs.concat(page.jobs) : page.jobs).map((entry) => [entry.job.id, entry])).values()]; cursor = page.next; $('workflow-more').hidden = !cursor;
-  const list = $('workflow-jobs'); list.replaceChildren();
-  if (!jobs.length) list.append(empty('Every delivery, in one place', 'Create a delivery to follow preparation, approvals, storage exports, and recipient acceptance.', button('Create delivery', '', () => guard(() => newDelivery()))));
-  for (const { job, url } of jobs) {
+  committedFilters = filterKey;
+  const list = $('workflow-jobs');
+  if (discardEdits) for (const editor of list.querySelectorAll('[data-unsaved]')) markFormSaved(editor);
+  const editingNotifications = new Map([...list.querySelectorAll('.job-card')].map((card) => [card.id, card.querySelector('.notification-details')]).filter(([, editor]) => isFormDirty(editor)));
+  list.replaceChildren();
+  $('workflow-filter-status').textContent = `${jobs.length}${cursor ? '+' : ''} ${jobs.length === 1 ? 'delivery' : 'deliveries'}${Object.values(jobFilter).some(Boolean) ? ' matching these filters' : ''}`;
+  if (!jobs.length && Object.values(jobFilter).some(Boolean)) list.append(empty('No deliveries match', 'Try another name, project or status.', button('Clear filters', 'ghost', () => clearFilters())));
+  else if (!jobs.length) list.append(empty('Every delivery, in one place', 'Create a delivery to follow preparation, approvals, storage exports, and recipient acceptance.', button('Create delivery', '', () => guard(() => newDelivery()))));
+  for (const entry of jobs) {
+    const { job, url, notifications_override } = entry;
     const card = node('article', '', 'card job-card'); card.id = `job-${job.id}`;
     const head = node('div', '', 'head'); head.append(node('h3', job.request.label), node('span', stateNames[job.state] || job.state, 'badge'));
     card.append(head, node('p', `${job.project.label} · ${formatWhen(job.created_at)}`, 'connection-meta'));
+    const inheritedNotifications = job.request.notifications || job.project.notifications || null;
+    card.append(editingNotifications.get(card.id) || notificationDetails({ policy: notifications_override, inherit: inheritedNotifications, inheritLabel: 'Use original settings', events: workflowEvents, readOnly: !admin && !projects.some((project) => project.id === job.project.id && project.members[session.subject] === 'sender'),
+      save: async (notifications) => { await api(`/api/workflows/jobs/${job.id}/notifications`, { method: 'PATCH', body: JSON.stringify(notifications) }); const current = jobs.find((entry) => entry.job.id === job.id); if (current) current.notifications_override = notifications; },
+    }));
     if (job.request.not_before) card.append(node('p', `Scheduled ${formatWhen(job.request.not_before)}`, 'muted'));
     if (job.request.deadline) card.append(node('p', `Acceptance due ${formatWhen(job.request.deadline)}`, 'muted'));
     if (url && job.state !== 'ready') card.append(node('p', 'Local download link is released. Destination copies are still pending.', 'info-banner'));
@@ -220,6 +252,8 @@ async function refreshJobs(more = false) {
       card.append(leg);
     }
     if (job.state === 'retrying') card.append(node('p', `Next attempt ${formatWhen(job.checks.retry_at)}`, 'muted'));
+    const nextStep = { awaiting_approval: 'Waiting for an authorized approver who did not create this delivery.', failed: 'Delivery stopped. Review the error below, correct the cause, then retry.', retrying: 'Another attempt is scheduled. Review the error below if this keeps happening.', preparing: 'Checking and preparing files before release.', exporting: 'Sending copies to the selected destinations. Each destination reports its progress below.', ready: 'Ready to share. Copy the download link below.' }[job.state];
+    if (nextStep) card.append(node('p', nextStep, 'workflow-next'));
     if (job.error) card.append(node('p', job.error, 'error'));
     const detail = document.createElement('details'); detail.append(node('summary', 'Package and recipient verification'));
     detail.append(node('p', job.manifest ? `Manifest: ${job.manifest}` : 'The manifest will be available after preparation.', 'mono'));
@@ -257,11 +291,13 @@ async function refreshJobs(more = false) {
   revealHash({ scroll: false });
   schedulePoll();
   return true;
+  } catch (error) { if (revision === jobsRevision) $('workflow-filter-status').textContent = 'Could not refresh deliveries. Previous results remain; retry these filters.'; throw error; }
+  finally { if (revision === jobsRevision) { jobsLoading = false; $('workflow-jobs').inert = false; $('workflow-more').disabled = JSON.stringify(jobFilter) !== committedFilters; } }
 }
 function schedulePoll() {
   clearTimeout(poll);
   if (!document.hidden && section() === 'jobs' && $('workflow-create').hidden && jobs.some(({ job }) => (['queued', 'preparing', 'exporting', 'retrying'].includes(job.state) || Object.values(job.checks.route_revocations || {}).some((route) => route.state === 'pending'))) && !appendedJobs) {
-    poll = setTimeout(() => { if (!$('workflow-jobs').contains(document.activeElement) && !$('workflow-jobs').querySelector('details[open]')) guard(() => refreshJobs()); else schedulePoll(); }, 10000);
+    poll = setTimeout(() => { if (!editingJob()) guard(() => refreshJobs(false, true)); else schedulePoll(); }, 10000);
   }
 }
 
@@ -269,7 +305,8 @@ form('workflow-create', async () => {
   const project = projects.find((item) => item.id === value('workflow-project'));
   const recipients = [...$('workflow-recipients').querySelectorAll('input:checked')].map((input) => input.value);
   if (project?.recipients.length && !recipients.length) throw new Error('Choose at least one recipient.');
-  const request = { project_id: value('workflow-project'), label: value('workflow-label'), expires_days: Number(value('workflow-days')),
+  const notifications = jobNotifications.read();
+  const request = { ...(notifications ? { notifications } : {}), project_id: value('workflow-project'), label: value('workflow-label'), expires_days: Number(value('workflow-days')),
     metadata: Object.fromEntries([...$('workflow-metadata').querySelectorAll('input')].map((input) => [input.dataset.key, input.value])), recipients,
     not_before: localTime('workflow-start'), deadline: localTime('workflow-deadline'), import: value('workflow-import') ? { storage_id: value('workflow-import'), prefix: value('workflow-prefix') } : null };
   const saved = JSON.parse(sessionStorage.getItem(draftKey) || 'null'); request.operation_id = saved?.operation_id || crypto.randomUUID();
@@ -283,7 +320,7 @@ form('workflow-create', async () => {
     $('workflow-new-operation').hidden = !sessionStorage.getItem(draftKey); $('workflow-result').textContent = '';
     throw error;
   }
-  sessionStorage.removeItem(draftKey); $('workflow-create').hidden = true; $('workflow-create').reset(); $('workflow-result').textContent = '';
+  markFormSaved($('workflow-create')); sessionStorage.removeItem(draftKey); $('workflow-create').hidden = true; $('workflow-create').reset(); $('workflow-result').textContent = '';
   notice(`“${issued.job.request.label}” was created. Follow its progress below.`); await refreshJobs();
 });
 form('workflow-save-project', async () => {
@@ -291,16 +328,15 @@ form('workflow-save-project', async () => {
   if (new Set(memberRows.map((row) => row.subject)).size !== memberRows.length) throw new Error('Each team member can appear only once.');
   const media = { video_codec: value('wp-codec') || null, width: optionalNumber('wp-width'), height: optionalNumber('wp-height'), frame_rate: value('wp-rate') || null };
   if ($('wp-media-enabled').checked && Object.values(media).every((entry) => entry === null)) throw new Error('Choose at least one video format requirement.');
-  const project = { id: value('wp-id'), revision: projectRevision, label: value('wp-label'), directory: value('wp-directory'),
+  const project = { notifications: projectNotifications.read(), id: value('wp-id'), revision: projectRevision, notification_revision: editingProject?.notification_revision || 0, label: value('wp-label'), directory: value('wp-directory'),
     members: Object.fromEntries(memberRows.map(({ subject, role }) => [subject, role])), recipients: recipientRows.map(({ email, holder }) => ({ email, holder: holder.toLowerCase() })),
     allowed_domains: value('wp-domains').split('\n').map((line) => line.trim().toLowerCase()).filter(Boolean), required_metadata: rows('metadata').map((row) => row.key),
     require_approval: $('wp-approval').checked, scan_required: $('wp-scan').checked, destinations: [...$('wp-destinations').querySelectorAll('input:checked')].map((input) => input.value), receive: $('wp-receive').checked, release: value('wp-release'),
     sequence: $('wp-sequence-enabled').checked ? { prefix: value('wp-sequence-prefix'), suffix: value('wp-sequence-suffix'), first: Number(value('wp-first')), last: optionalNumber('wp-last'), padding: Number(value('wp-padding')) } : null,
     media: $('wp-media-enabled').checked ? media : null };
-  if (!(await confirmModal('Save project rules', 'These rules protect the entire folder, including existing links. Existing deliveries need the current policy before further downloads.', 'Save rules'))) return;
+  if (!(await confirmModal('Save project rules', 'Changes to delivery rules require new deliveries. Notification-only changes apply to future deliveries and keep existing links available.', 'Save rules'))) return;
   const saved = await api('/api/workflows/projects', { method: 'PUT', body: JSON.stringify(project) });
-  $('workflow-save-project').hidden = true; editingProject = null; loaded.delete('jobs');
-  $('workflow-jobs').replaceChildren(node('p', 'Loading deliveries…', 'muted'));
+  markFormSaved($('workflow-save-project')); $('workflow-save-project').hidden = true; editingProject = null; loaded.delete('jobs');
   notice(`Project “${saved.label}” saved.`); await refreshProjects();
 });
 
@@ -336,20 +372,20 @@ async function loadEvents() {
 }
 form('workflow-save-webhook', async () => {
   const result = await api('/api/workflows/webhook', { method: 'PUT', body: JSON.stringify({ url: value('wh-url'), enabled: $('wh-enabled').checked, revision: hookRevision }) });
-  hookRevision = result.webhook.revision; const secret = $('workflow-webhook-secret'); secret.replaceChildren(node('strong', 'Update your receiver with this signing secret'), node('p', result.signing_secret, 'mono'));
+  markFormSaved($('workflow-save-webhook')); hookRevision = result.webhook.revision; const secret = $('workflow-webhook-secret'); secret.replaceChildren(node('strong', 'Update your receiver with this signing secret'), node('p', result.signing_secret, 'mono'));
   secret.append(button('Copy signing secret', 'ghost', (element) => copyToClipboard(element, result.signing_secret))); secret.hidden = false; notice('Webhook saved.'); await loadAttempts();
 });
 
 function section() { return ['jobs', 'projects', 'webhooks', 'activity'].includes(window.location.hash.slice(1)) ? window.location.hash.slice(1) : 'jobs'; }
 async function showSection() {
-  jobsRevision++;
+  jobsRevision++; jobsLoading = false; $('workflow-jobs').inert = false; $('workflow-more').disabled = JSON.stringify(jobFilter) !== committedFilters;
   const selected = section();
   const requested = /^#job-([a-f0-9]{32})$/.exec(window.location.hash)?.[1];
   for (const panel of document.querySelectorAll('[data-workflow-panel]')) panel.hidden = panel.dataset.workflowPanel !== selected;
   for (const link of document.querySelectorAll('.page-tabs a')) { if (link.hash === `#${selected}`) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current'); }
   clearTimeout(poll);
-  if (!loaded.has(selected) || (requested && !jobs.some(({ job }) => job.id === requested))) {
-    if (selected === 'jobs' && !await refreshJobs()) return;
+  if (!loaded.has(selected) || (selected === 'jobs' && JSON.stringify(jobFilter) !== committedFilters) || (requested && !jobs.some(({ job }) => job.id === requested))) {
+    if (selected === 'jobs') { await refreshProjects(); if (!await refreshJobs()) return; }
     if (selected === 'projects') {
       await refreshProjects();
       if (admin) {
@@ -370,8 +406,8 @@ async function showSection() {
   schedulePoll();
 }
 $('workflow-new').onclick = () => guard(() => newDelivery());
-$('workflow-close-create').onclick = () => { $('workflow-create').hidden = true; $('workflow-new').focus(); schedulePoll(); };
-$('workflow-close-project').onclick = () => { $('workflow-save-project').hidden = true; $('workflow-new-project').focus(); };
+$('workflow-close-create').onclick = () => { if (!discardForm($('workflow-create'))) return; $('workflow-create').hidden = true; $('workflow-new').focus(); schedulePoll(); };
+$('workflow-close-project').onclick = () => { if (!discardForm($('workflow-save-project'))) return; $('workflow-save-project').hidden = true; $('workflow-new-project').focus(); };
 $('workflow-new-project').onclick = () => editProject(); $('workflow-new-project').hidden = !admin;
 $('workflow-project').onchange = projectFields;
 $('workflow-import').onchange = () => { $('workflow-prefix-field').hidden = !value('workflow-import'); };
@@ -379,10 +415,23 @@ $('workflow-new-operation').onclick = () => { sessionStorage.removeItem(draftKey
 $('workflow-refresh').onclick = () => guard(() => refreshJobs()); $('workflow-more').onclick = () => guard(() => refreshJobs(true));
 $('wp-label').oninput = () => { if (!editingProject && autoProjectId) $('wp-id').value = value('wp-label').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 100); };
 $('wp-id').oninput = () => { autoProjectId = false; };
-for (const [kind, name] of [['members', 'member'], ['recipients', 'recipient'], ['metadata', 'metadata']]) $(`wp-add-${name}`).onclick = () => addRow(kind).querySelector('input').focus();
+for (const [kind, name] of [['members', 'member'], ['recipients', 'recipient'], ['metadata', 'metadata']]) $(`wp-add-${name}`).onclick = () => { markFormChanged($('workflow-save-project')); addRow(kind).querySelector('input').focus(); };
 $('wp-sequence-enabled').onchange = $('wp-media-enabled').onchange = checkFields;
 $('workflow-save-webhook').hidden = $('workflow-webhook-refresh').hidden = !admin; $('workflow-webhook-access').hidden = admin;
 $('workflow-webhook-refresh').onclick = () => guard(() => loadAttempts()); $('workflow-webhook-more').onclick = () => guard(() => loadAttempts(true));
 $('workflow-events-next').onclick = () => guard(loadEvents); $('workflow-events-export').onclick = () => download(`delivery-events-${eventCursor}.json`, eventPage);
 window.addEventListener('hashchange', () => guard(showSection)); document.addEventListener('visibilitychange', schedulePoll); window.addEventListener('pagehide', () => clearTimeout(poll));
 await guard(showSection);
+
+async function applyFilters() {
+  if ([...$('workflow-jobs').querySelectorAll('[data-unsaved]')].some(isFormDirty) && !window.confirm('Discard unsaved notification edits and change delivery filters?')) return;
+  clearTimeout(poll);
+  jobFilter = { q: value('workflow-query'), project: value('workflow-filter-project'), state: value('workflow-filter-state') };
+  const params = new URLSearchParams(Object.entries(jobFilter).filter(([, value]) => value));
+  window.history.replaceState(null, '', `/workflows${params.size ? `?${params}` : ''}#jobs`);
+  await refreshJobs(false, false, true);
+}
+function clearFilters() { $('workflow-query').value = $('workflow-filter-project').value = $('workflow-filter-state').value = ''; return guard(applyFilters); }
+$('workflow-filters').addEventListener('submit', (event) => { event.preventDefault(); guard(applyFilters); });
+$('workflow-filter-project').onchange = $('workflow-filter-state').onchange = () => guard(applyFilters);
+$('workflow-filter-clear').onclick = clearFilters;

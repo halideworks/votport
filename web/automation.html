@@ -13,6 +13,8 @@
     <!-- The whole module graph fetches at once instead of one import level per round trip. -->
     <link rel="modulepreload" href="/assets/page-automation.js" />
     <link rel="modulepreload" href="/assets/admin-common.js" />
+    <link rel="modulepreload" href="/assets/hints.js" />
+    <link rel="modulepreload" href="/assets/form-drafts.js" />
     <link rel="modulepreload" href="/assets/object-card.js" />
     <link rel="modulepreload" href="/assets/undo.js" />
   </head>
@@ -43,7 +45,7 @@
         <section class="card" aria-labelledby="automation-token-create-title">
           <h2 id="automation-token-create-title">Connect an agent</h2>
           <p class="muted">Choose what this agent may do in this tenant. Delivery access is limited to links created by this token.</p>
-          <form id="automation-token-form">
+          <form data-unsaved id="automation-token-form">
             <div class="grid">
               <label>Agent name
                 <input id="automation-token-label" required maxlength="100" placeholder="Production assistant" />
@@ -56,7 +58,7 @@
               </label>
             </div>
             <fieldset id="automation-token-permissions" class="permission-grid">
-              <legend>What can this agent do?</legend>
+              <legend>What can this agent do? <button type="button" class="hint-button" aria-label="Help about agent permissions" data-hint="Give each agent only the actions it needs. Its token identifies it to this port; changing a token does not change another port’s permissions.">?</button></legend>
               <label class="check"><input type="checkbox" value="library:read" checked /> Browse files in the folder</label>
               <label class="check"><input type="checkbox" value="deliveries:create" checked /> Create delivery links</label>
               <label class="check"><input type="checkbox" value="deliveries:read" checked /> Read delivery activity and receipts</label>
@@ -86,7 +88,7 @@
         <h2 class="section-title">Connected agents</h2>
         <div id="automation-tokens" aria-live="polite"></div>
       </section>
-      <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
+      <p class="sheet-foot"><span class="footer-custom"></span><span>Powered by Verified Object Transport (VOT) · <a href="https://votport.com" target="_blank" rel="noopener noreferrer">VOTPort</a></span></p>
     </div>
 
     <dialog id="confirm" class="modal" aria-labelledby="confirm-title" aria-describedby="confirm-detail">

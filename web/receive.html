@@ -15,6 +15,9 @@
     <link rel="modulepreload" href="/assets/timeline.js" />
     <link rel="modulepreload" href="/assets/status-strip.js" />
     <link rel="modulepreload" href="/assets/admin-common.js" />
+    <link rel="modulepreload" href="/assets/hints.js" />
+    <link rel="modulepreload" href="/assets/form-drafts.js" />
+    <link rel="modulepreload" href="/assets/notifications.js" />
     <link rel="modulepreload" href="/assets/object-card.js" />
     <link rel="modulepreload" href="/assets/undo.js" />
   </head>
@@ -65,43 +68,47 @@
         </div>
       </section>
 
-      <form id="create-form" class="card">
-        <h2>New transfer request</h2>
+      <form data-unsaved data-draft id="create-form" class="card">
+        <div id="trade-return-guide" class="info-banner" hidden><strong>Set up a receiving route · Choose storage and workflow</strong><p>Give this request a name, choose where files go and set any limits or processing steps. We will return you to Trade routes to set permissions and invite the sending port.</p><a class="text-link" href="/trade-routes#receive">Back to route setup</a></div>
+        <h2>New transfer request <button type="button" class="hint-button" aria-label="Help about receive links" data-hint="Create a private link for someone to ship files to this port. They can upload in their browser without an account.">?</button></h2>
         <div class="grid">
-          <label>Reference
-            <input id="create-label" placeholder="Files from Alex" required maxlength="200" />
+          <label>Name
+            <input data-draft-field id="create-label" placeholder="Files from Alex" required maxlength="200" />
           </label>
           <label>Destination folder <span class="muted">optional</span>
-            <input id="create-dest" placeholder="clients/alex" />
-          </label>
-          <label>Access password <span class="muted">optional</span>
-            <input id="create-password" type="text" autocomplete="off" placeholder="none" />
-          </label>
-          <label>Expires after <span class="muted">days, optional</span>
-            <input id="create-expires" type="number" min="1" max="3650" placeholder="never" />
-          </label>
-          <label>Transfer limit <span class="muted">GiB, optional</span>
-            <input id="create-max" type="number" min="1" max="10000" placeholder="server default" />
+            <input data-draft-field id="create-dest" placeholder="clients/alex" />
           </label>
         </div>
+        <details class="form-advanced"><summary>Access and transfer limits <button type="button" class="hint-button" aria-label="Help about receive access and limits" data-hint="The password protects this receive link. Expiry closes it to new uploads. The transfer limit bounds one upload session; server and tenant limits still apply.">?</button></summary><div class="grid">
+          <label>Access password <span class="muted">optional</span>
+            <input id="create-password" type="password" autocomplete="off" placeholder="none" />
+          </label>
+          <label>Expires after <span class="muted">days, optional</span>
+            <input data-draft-field id="create-expires" type="number" min="1" max="3650" placeholder="never" />
+          </label>
+          <label>Transfer limit <span class="muted">GiB, optional</span>
+            <input data-draft-field id="create-max" type="number" min="1" max="10000" placeholder="server default" />
+          </label>
+        </div>
+        </details>
         <div id="create-workflow"></div>
-        <label class="check"><input id="create-notify-on-upload" name="notify_on_upload" type="checkbox" /> Notify when an upload completes or fails</label>
-        <button type="submit">Issue request</button>
+        <details id="create-notification-options" class="form-advanced"><summary>Notifications <button type="button" class="hint-button" aria-label="Help about receive notifications" data-hint="Choose who hears about completed or failed uploads. Tenant defaults follow the current shared settings; custom choices apply only to this request.">?</button></summary><div id="create-notifications"></div></details>
+        <button type="submit">Create receive link</button>
         <p class="error" id="create-error" role="alert" hidden></p>
       </form>
 
       <div id="new-link" class="card ok" hidden>
-        <h2>Request issued</h2>
+        <h2>Receive link ready</h2>
         <p class="mono" id="new-link-url"></p>
         <button id="new-link-copy" type="button">Copy address</button>
         <span id="new-link-note" class="muted"></span>
       </div>
 
-      <h2>Issued requests</h2>
+      <h2>Receive requests</h2>
       <form id="links-filter" class="card">
         <div class="grid">
           <label>Search requests
-            <input id="links-query" type="search" autocomplete="off" placeholder="reference or destination" />
+            <input id="links-query" type="search" autocomplete="off" placeholder="name or destination" />
           </label>
           <label>Status
             <select id="links-status">
@@ -126,7 +133,7 @@
       <button id="outbound-copy" type="button">Copy address</button>
       <p id="outbound-note" class="muted">Shown once. Copy it now; this URL cannot be retrieved later.</p>
     </div>
-      <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
+      <p class="sheet-foot"><span class="footer-custom"></span><span>Powered by Verified Object Transport (VOT) · <a href="https://votport.com" target="_blank" rel="noopener noreferrer">VOTPort</a></span></p>
     </div>
 
     <dialog id="timeline" class="modal timeline" aria-labelledby="timeline-title">

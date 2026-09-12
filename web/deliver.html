@@ -16,6 +16,9 @@
     <link rel="modulepreload" href="/assets/upload-entries.js" />
     <link rel="modulepreload" href="/assets/status-strip.js" />
     <link rel="modulepreload" href="/assets/admin-common.js" />
+    <link rel="modulepreload" href="/assets/hints.js" />
+    <link rel="modulepreload" href="/assets/form-drafts.js" />
+    <link rel="modulepreload" href="/assets/notifications.js" />
     <link rel="modulepreload" href="/assets/object-card.js" />
     <link rel="modulepreload" href="/assets/undo.js" />
   </head>
@@ -95,22 +98,24 @@
       <section class="card delivery-options" aria-labelledby="delivery-options-title">
         <h2 id="delivery-options-title" class="section-title"><span class="step-number">2</span> Set access and share</h2>
         <p class="muted">Only the files you select will be included.</p>
-        <form id="deliver-form">
+        <form data-unsaved data-draft id="deliver-form">
           <div class="grid">
-            <label>Link label
-              <input id="deliver-label" required maxlength="200" placeholder="Project files" />
+            <label>Name
+              <input data-draft-field id="deliver-label" required maxlength="200" placeholder="Project files" />
             </label>
             <label>Expires after <span class="muted">days</span>
-              <input id="deliver-expires" type="number" min="1" max="30" value="7" required />
+              <input data-draft-field id="deliver-expires" type="number" min="1" max="30" value="7" required />
             </label>
+          </div><details class="form-advanced"><summary>Password and download limits <button type="button" class="hint-button" aria-label="Help about download access" data-hint="A password protects the link. A maximum of one download makes it a one-time link. Share the password separately from the link.">?</button></summary><div class="grid">
             <label>Access password <span class="muted">optional</span>
               <input id="deliver-password" type="password" autocomplete="new-password" placeholder="none" />
             </label>
             <label>Max downloads <span class="muted">optional; 1 = one-time</span>
-              <input id="deliver-max-downloads" type="number" min="1" max="10000" placeholder="unlimited" />
+              <input data-draft-field id="deliver-max-downloads" type="number" min="1" max="10000" placeholder="unlimited" />
             </label>
           </div>
-          <label class="check"><input id="deliver-notify-on-download" name="notify_on_download" type="checkbox" /> Notify on first download and delivery completion</label>
+          </details>
+          <details class="form-advanced"><summary>Notifications <button type="button" class="hint-button" aria-label="Help about download notifications" data-hint="First download started means a recipient began fetching files. Delivery completed is a separate event; neither is the recipient’s explicit acceptance.">?</button></summary><div id="deliver-notifications"></div></details>
           <button type="submit" id="deliver-submit">Create download link</button>
           <p id="deliver-error" class="error" role="alert" hidden></p>
         </form>
@@ -118,21 +123,21 @@
 
       </div>
       <div id="outbound-result" class="card ok" hidden aria-live="polite">
-        <h2>Download link issued</h2>
-        <label>One-time address
+        <h2>Download link ready</h2>
+        <label>Private download address
           <input id="outbound-url" class="mono" type="text" readonly aria-describedby="outbound-note" />
         </label>
         <button id="outbound-copy" type="button">Copy address</button>
         <p id="outbound-note" class="muted">Shown once. Copy it now; this URL cannot be retrieved later.</p>
       </div>
 
-      <h2>Issued downloads</h2>
+      <h2>Download links</h2>
       <p id="outbound-grants-count" class="muted" role="status" aria-live="polite">Loading issued downloads…</p>
       <p id="outbound-grants-status" class="muted" role="status"></p>
       <div id="outbound-grants"></div>
       <button id="outbound-grants-load-more" type="button" hidden>Load more</button>
 
-      <p class="sheet-foot">Powered by Verified Object Transport (VOT)</p>
+      <p class="sheet-foot"><span class="footer-custom"></span><span>Powered by Verified Object Transport (VOT) · <a href="https://votport.com" target="_blank" rel="noopener noreferrer">VOTPort</a></span></p>
     </div>
 
     <dialog id="confirm" class="modal" aria-labelledby="confirm-title" aria-describedby="confirm-detail">

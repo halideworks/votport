@@ -986,7 +986,7 @@ pub(crate) fn admit_fetch(
         let grant_id = grant.id.clone();
         let tenant = grant.tenant.clone();
         let token_hash = grant.token_hash.clone();
-        let notify = grant.notify_on_download;
+        let notify = grant.notifications.as_ref().is_some_and(|p| p.enabled());
         let file_count = grant.files.len().max(1);
         Box::new(move |report: vot_cli::ServeReport| {
             // Runs on the session's own thread: bookkeeping only, the store
@@ -1184,7 +1184,8 @@ mod tests {
                 revoked_at: revoked,
                 downloads,
                 max_downloads: max,
-                notify_on_download: false,
+
+                notifications: None,
                 first_download_at: None,
                 last_download_at: None,
                 files: Vec::new(),
