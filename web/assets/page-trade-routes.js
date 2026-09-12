@@ -4,14 +4,16 @@ import { notificationEditor, tradeEvents } from '/assets/notifications.js';
 
 const $ = (id) => document.getElementById(id);
 const session = await requireSession(), admin = session.role === 'admin';
-let catalog, preview = null, previewRevision = 0, setup = null;
+let catalog, preview = null, previewRevision = 0, refreshTicket = 0, setup = null;
 const returnRequest = new URLSearchParams(window.location.search).get('receive');
 function node(tag, text = '', className = '') { const el = document.createElement(tag); el.textContent = text; el.className = className; return el; }
 async function guard(action) { $('trade-error').hidden = true; try { await action(); } catch (error) { $('trade-error').textContent = error.message; $('trade-error').hidden = false; $('trade-error').focus(); } }
 function field(text, input) { input.setAttribute('aria-label', text); const label = node('label', text); label.append(input); return label; }
 function input(type, value = '') { const el = document.createElement('input'); el.type = type; el.value = value; return el; }
 function select(options, current) { const el = document.createElement('select'); for (const [value, label] of options) { const opt = node('option', label); opt.value = value; el.append(opt); } if (current) el.value = current; return el; }
-function resetForm(form) { form.reset(); for (const mode of form.querySelectorAll('.notification-mode')) { mode.value = 'default'; mode.dispatchEvent(new window.Event('change')); } markFormSaved(form); }
+function resetForm(form) { form.reset(); for (const editor of [acceptNotifications, endpointNotifications]) if (form.contains(editor.element)) editor.reset(); markFormSaved(form); }
+// Preserved in-flight editors close over the route they were built from; the row may have moved on since.
+const revisionOf = (route) => (catalog.routes.find((r) => r.id === route.id) || route).revision;
 function link(text, href) { const el = node('a', text); el.href = href; return el; }
 const statusNames = { active: 'Active', pending_approval: 'Pending approval', paused: 'Paused', revoked: 'Revoked', unreachable: 'Unreachable', identity_mismatch: 'Identity mismatch', enrolling: 'Enrollment incomplete' };
 function routeState(route) { return route.direction === 'incoming' || ['paused', 'revoked'].includes(route.state) ? route.state : route.remote_state || route.state; }
@@ -39,7 +41,9 @@ const endpointNotifications = notificationEditor({ events: tradeEvents, policy: 
 $('trade-accept-notifications').append(acceptNotifications.element); $('trade-endpoint-notifications').append(endpointNotifications.element);
 
 async function refresh() {
+  const ticket = ++refreshTicket;
   const [data, requests] = await Promise.all([api('/api/trade-routes'), api('/api/admin/links')]);
+  if (ticket !== refreshTicket) return;
   catalog = data;
   if (!isFormDirty($('port-form'))) { $('port-name').value = catalog.port.name; $('port-address').value = catalog.port.address; }
   $('port-display-name').textContent = catalog.port.name; $('port-display-address').textContent = catalog.port.address; $('port-key').textContent = catalog.port.key;
@@ -90,7 +94,7 @@ async function refresh() {
     if (outgoing) {
       group.append(node('p', outgoing.address, 'trade-key'));
       if (admin) { const edit = node('details'), form = node('form'), address = input('url', outgoing.address); edit.dataset.peer = key; form.setAttribute('data-unsaved', ''); address.required = true; edit.append(node('summary', 'Change peer address')); form.append(field('New port address', address), node('p', 'The new address must prove the same pinned identity. Updates all outgoing routes to this peer in this tenant. Finish active deliveries first.', 'field-help'));
-        const save = node('button', 'Verify and save address'); save.type = 'submit'; form.append(save); form.addEventListener('submit', (event) => { event.preventDefault(); if (form.inert) return; form.inert = true; guard(async () => { await api(`/api/trade-routes/${outgoing.id}/address`, { method: 'PUT', body: JSON.stringify({ address: address.value, revision: outgoing.revision }) }); markFormSaved(form); await refresh(); }).finally(() => { form.inert = false; }); }); edit.append(form); group.append(peerEdits.get(key) || edit); }
+        const save = node('button', 'Verify and save address'); save.type = 'submit'; form.append(save); form.addEventListener('submit', (event) => { event.preventDefault(); if (form.inert) return; form.inert = true; guard(async () => { await api(`/api/trade-routes/${outgoing.id}/address`, { method: 'PUT', body: JSON.stringify({ address: address.value, revision: revisionOf(outgoing) }) }); markFormSaved(form); await refresh(); }).finally(() => { form.inert = false; }); }); edit.append(form); group.append(peerEdits.get(key) || edit); }
     }
     if (!outgoing) group.append(node('p', routes[0].address || 'The sender connects to this port; no inbound address is required on the sender.', 'field-help trade-key'));
     const cards = node('div', '', 'connection-grid');
@@ -168,7 +172,7 @@ function routeCard(route, savedEditor) {
       guard(async () => {
         if (state.value === 'revoked' && !await confirmModal('Revoke this route', 'New deliveries will be denied. Restoring permission requires a new invitation. Previously received files remain on the destination.', 'Revoke route')) return;
         form.inert = true;
-        try { await api(`/api/trade-routes/${route.id}`, { method: 'PUT', body: JSON.stringify({ revision: route.revision, state: state.value, cancel_active: active.value === 'cancel', notifications: policy.read() }) }); markFormSaved(form); $('trade-notice').textContent = 'Route settings saved.'; await refresh(); $(`route-${route.id}`).focus(); } finally { form.inert = false; }
+        try { await api(`/api/trade-routes/${route.id}`, { method: 'PUT', body: JSON.stringify({ revision: revisionOf(route), state: state.value, cancel_active: active.value === 'cancel', notifications: policy.read() }) }); markFormSaved(form); $('trade-notice').textContent = 'Route settings saved.'; await refresh(); $(`route-${route.id}`).focus(); } finally { form.inert = false; }
       });
     }); details.append(form); card.append(savedEditor || details);
     if (route.direction === 'outgoing' && route.remote_grant && route.state !== 'revoked') {

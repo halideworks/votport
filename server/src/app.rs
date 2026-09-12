@@ -598,7 +598,8 @@ pub async fn upload_ended_notifier(app: Arc<App>) {
         return;
     };
     while let Some(ended) = receiver.recv().await {
-        if ended.notify && ended_notifies(&ended.event) {
+        if ended.notifications.as_ref().is_some_and(|p| p.enabled()) && ended_notifies(&ended.event)
+        {
             tokio::spawn(crate::notify::upload_ended(Arc::clone(&app), ended));
         }
     }

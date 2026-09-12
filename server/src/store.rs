@@ -655,10 +655,6 @@ CREATE INDEX IF NOT EXISTS automation_tokens_tenant_created
 const OUTBOUND_GRANTS_LIMIT_SCHEMA: &str =
     "ALTER TABLE outbound_grants ADD COLUMN max_downloads INTEGER;";
 
-const NOTIFICATION_POLICY_SCHEMA: &str =
-    "ALTER TABLE links ADD COLUMN notify_on_upload INTEGER NOT NULL DEFAULT 0;
-     ALTER TABLE outbound_grants ADD COLUMN notify_on_download INTEGER NOT NULL DEFAULT 0;";
-
 const BRANDING_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS branding (
     tenant TEXT PRIMARY KEY,
@@ -1079,11 +1075,6 @@ impl Store {
         if (8..13).contains(&stored) {
             transaction
                 .execute_batch(OUTBOUND_GRANTS_LIMIT_SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if stored < 14 {
-            transaction
-                .execute_batch(NOTIFICATION_POLICY_SCHEMA)
                 .map_err(|error| format!("schema: {error}"))?;
         }
         if (8..15).contains(&stored) {
@@ -2254,6 +2245,22 @@ impl Store {
                 "incoming workflows still use this request; wait for their deliveries to be archived before deleting it".into(),
             );
         }
+        // SQLite foreign keys are off, so the trade tables declared ON DELETE
+        // CASCADE are cleared here; a live peer route blocks the delete.
+        let enrolled: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM trade_routes WHERE tenant=?1 AND endpoint=?2 AND direction='incoming' AND json_extract(document,'$.state')<>'revoked')", [tenant, id], |row| row.get(0)).map_err(|e| e.to_string())?;
+        if enrolled {
+            return Err("trade routes still deliver to this request; revoke them under Trade routes before deleting it".into());
+        }
+        for statement in [
+            "DELETE FROM trade_rotations WHERE route_id IN (SELECT id FROM trade_routes WHERE tenant=?1 AND endpoint=?2)",
+            "DELETE FROM trade_routes WHERE tenant=?1 AND endpoint=?2 AND direction='incoming'",
+            "DELETE FROM trade_invitations WHERE tenant=?1 AND endpoint=?2",
+            "DELETE FROM trade_endpoints WHERE tenant=?1 AND id=?2",
+        ] {
+            transaction
+                .execute(statement, [tenant, id])
+                .map_err(|error| error.to_string())?;
+        }
         transaction
             .execute(
                 "DELETE FROM files
@@ -2393,6 +2400,7 @@ impl Store {
                 .execute("DELETE FROM inbound_routes WHERE tenant=?1", [key])
                 .map_err(|e| e.to_string())?;
             transaction.execute("DELETE FROM outbound_routes WHERE job_id IN (SELECT id FROM delivery_jobs WHERE tenant=?1)",[key]).map_err(|e|e.to_string())?;
+            transaction.execute("DELETE FROM notification_job_overrides WHERE job_id IN (SELECT id FROM delivery_jobs WHERE tenant=?1)",[key]).map_err(|e|e.to_string())?;
             workflows::remove_storage_tenant(&transaction, key)?;
             for table in [
                 "delivery_manifests",

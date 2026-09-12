@@ -1,5 +1,5 @@
 use super::*;
-use crate::route_protocol::{SignedPortMessage, SignedRoute};
+use crate::route_protocol::{RouteReceipt, SignedPortMessage, SignedRoute};
 use rusqlite::params;
 use sha2::{Digest, Sha256};
 
@@ -387,7 +387,25 @@ impl Store {
             ],
         )
         .map_err(|e| e.to_string())?;
+        evidence::delivery_event(
+            &tx,
+            &self.event_signer,
+            &route.tenant,
+            "",
+            "route_accepted",
+            &serde_json::json!({"route":route.id,"peer":route.peer_key,"address":route.address,"endpoint":route.endpoint}),
+            now_unix(),
+        )
+        .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
+    }
+    pub fn prune_trade_invitations(&self) -> Result<usize, String> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM trade_invitations WHERE redeemed IS NULL AND expires_at<=?1",
+                [now_unix() as i64],
+            )
+        })
     }
     pub fn trade_enrollment(
         &self,
@@ -526,6 +544,7 @@ pub fn valid_peer_key(key: &str) -> bool {
 pub(super) fn admit(
     connection: &Connection,
     source: &SignedRoute,
+    ancestry: &[RouteReceipt],
     link_id: &str,
     credential: Option<&str>,
     existing: bool,
@@ -571,6 +590,15 @@ pub(super) fn admit(
             .metadata
             .keys()
             .any(|key| !route.metadata_keys.contains(key))
+        || ancestry.iter().any(|receipt| {
+            receipt
+                .document
+                .source
+                .document
+                .metadata
+                .keys()
+                .any(|key| !route.metadata_keys.contains(key))
+        })
     {
         return Err(
             "route permission, forwarding terms or metadata policy denied admission".into(),
@@ -1150,5 +1178,115 @@ mod tests {
             .err()
             .unwrap()
             .contains("receipt.key is missing"));
+    }
+
+    #[test]
+    fn ancestry_metadata_and_link_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let sender_dir = tempfile::tempdir().unwrap();
+        let sender = crate::receipt::ReceiptSigner::load_or_create(sender_dir.path()).unwrap();
+        let origin_dir = tempfile::tempdir().unwrap();
+        let origin = crate::receipt::ReceiptSigner::load_or_create(origin_dir.path()).unwrap();
+        let endpoint = TradeEndpoint {
+            id: crate::auth::random_token(),
+            name: "Masters".into(),
+            category: "external".into(),
+            forwarding: false,
+            metadata_keys: vec!["episode".into()],
+            notifications: NotificationPolicy::default(),
+        };
+        let link:Link=serde_json::from_value(serde_json::json!({"id":endpoint.id,"label":"Masters","dest":"","tenant":"","created_at":now_unix(),"active":true})).unwrap();
+        store.insert_link(link).unwrap();
+        store.create_trade_endpoint("", &endpoint).unwrap();
+        let (id, secret) = store
+            .create_trade_invitation("", &endpoint.id, "", now_unix() + 300)
+            .unwrap();
+        let credential = crate::auth::random_token();
+        let proof = sender.port_message(
+            "enroll",
+            &store.event_signer.public_hex,
+            id,
+            now_unix() + 300,
+            serde_json::json!({"name":"Sender","secret":secret,"credential":credential}),
+        );
+        let (pending, _) = store.redeem_trade_invitation(&proof).unwrap();
+        let active = store
+            .update_trade_route("", &pending.id, 1, "active", false, &pending.notifications)
+            .unwrap();
+        store
+            .create_trade_invitation("", &endpoint.id, "", now_unix() + 300)
+            .unwrap();
+        store
+            .with(|c| {
+                c.execute(
+                    "UPDATE trade_invitations SET expires_at=1 WHERE redeemed IS NULL",
+                    [],
+                )
+            })
+            .unwrap();
+        assert_eq!(store.prune_trade_invitations().unwrap(), 1);
+        let manifest = "ab".repeat(32);
+        // A forwarded delivery: the origin's metadata rides in the signed
+        // ancestry, not in the forwarding port's own document.
+        let forwarded = |metadata: &[(&str, &str)]| {
+            let upstream = origin.sign_route(RouteDocument {
+                issuer: origin.public_hex.clone(),
+                operation_id: "origin".into(),
+                manifest: manifest.clone(),
+                label: "Origin".into(),
+                metadata: metadata
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                visited: vec![origin.public_hex.clone()],
+                parent_receipt: None,
+                permission: None,
+            });
+            let receipt = sender.route_receipt(upstream, "upload".into(), now_unix());
+            let forward = sender.sign_route(RouteDocument {
+                issuer: sender.public_hex.clone(),
+                operation_id: format!("forward-{}", metadata.len()),
+                manifest: manifest.clone(),
+                label: "Forward".into(),
+                metadata: Default::default(),
+                visited: vec![origin.public_hex.clone(), sender.public_hex.clone()],
+                parent_receipt: Some(receipt.digest()),
+                permission: Some(RoutePermission {
+                    receiver: store.event_signer.public_hex.clone(),
+                    grant: pending.id.clone(),
+                    forwarding: false,
+                }),
+            });
+            (forward, vec![receipt])
+        };
+        let (forward, ancestry) = forwarded(&[("private", "secret")]);
+        assert!(crate::route_protocol::verify_ancestry(&forward, &ancestry));
+        assert!(store
+            .receive_route_authorized("", &endpoint.id, &forward, &ancestry, Some(&credential))
+            .is_err());
+        let (forward, ancestry) = forwarded(&[("episode", "1")]);
+        assert!(store
+            .receive_route_authorized("", &endpoint.id, &forward, &ancestry, Some(&credential))
+            .is_ok());
+
+        assert!(store.remove_link("", &endpoint.id).is_err());
+        store
+            .update_trade_route(
+                "",
+                &active.id,
+                active.revision,
+                "revoked",
+                false,
+                &active.notifications,
+            )
+            .unwrap();
+        assert!(store.remove_link("", &endpoint.id).unwrap());
+        assert!(store.trade_endpoints("").unwrap().is_empty());
+        assert!(store.trade_routes(Some("")).unwrap().is_empty());
+        let invitations: i64 = store
+            .with(|c| c.query_row("SELECT COUNT(*) FROM trade_invitations", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(invitations, 0);
     }
 }

@@ -1205,6 +1205,89 @@ mod tests {
     use crate::workflow::tests::{project, request};
 
     #[test]
+    fn unenrolled_route_keeps_the_received_job_recoverable() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let route = crate::store::TradeRoute {
+            id: "pending-route".into(),
+            revision: 1,
+            tenant: String::new(),
+            direction: "outgoing".into(),
+            name: "Partner".into(),
+            peer_name: "Partner".into(),
+            peer_key: "ab".repeat(32),
+            address: "http://localhost".into(),
+            endpoint: "remote-endpoint".into(),
+            endpoint_name: "Masters".into(),
+            category: "external".into(),
+            forwarding: false,
+            metadata_keys: vec![],
+            state: "pending_approval".into(),
+            notifications: Default::default(),
+            last_contact: None,
+            error: None,
+            remote_grant: String::new(),
+            remote_state: "enrolling".into(),
+            cancel_active: false,
+        };
+        let invitation = store.event_signer.port_message(
+            "invitation",
+            "",
+            "nonce".into(),
+            now_unix() + 300,
+            serde_json::json!({}),
+        );
+        store
+            .save_outgoing_trade(&route, &crate::auth::random_token(), &invitation)
+            .unwrap();
+        let mut policy = project();
+        policy.receive = true;
+        policy.destinations = vec![route.id.clone()];
+        let policy = store.save_delivery_project("", "admin", policy).unwrap();
+        let workflow = crate::workflow::ReceiveWorkflow {
+            notifications: None,
+            project_id: policy.id,
+            metadata: request().metadata,
+            recipients: vec![],
+        };
+        let link = crate::store::tests::test_link("incoming");
+        store
+            .insert_link_with_workflow(link.clone(), Some(&workflow))
+            .unwrap();
+        let upload = UploadRecord {
+            id: "complete".into(),
+            started_at: 1,
+            completed_at: 2,
+            replayed_chunks: 0,
+            rejected_chunks: 0,
+            transport: Some("http".into()),
+            package_root: "package".into(),
+            total_bytes: 1,
+            partial: false,
+            log: vec![],
+            files: vec![FileRecord {
+                path: "file.bin".into(),
+                stored_as: "file.bin".into(),
+                bytes: 1,
+                suite: "blake3".into(),
+                root: "root".into(),
+                receipt: true,
+                deleted: false,
+            }],
+        };
+        store.append_upload("", &link.id, upload).unwrap();
+        // The upload is recorded and the job waits with an empty grant that
+        // preparation fills in once enrollment finishes.
+        let jobs = store.delivery_jobs("", "", 100, None, "", "").unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].state, "queued");
+        assert_eq!(
+            jobs[0].checks["trade_routes"][&route.id]["permission"]["grant"],
+            ""
+        );
+    }
+
+    #[test]
     fn partial_reception_stays_protected_without_queuing_copies() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();

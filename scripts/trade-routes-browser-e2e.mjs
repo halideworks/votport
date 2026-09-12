@@ -118,6 +118,5 @@ try {
   await source(`trade-routes/${route.id}/test`, {}); assert.equal((await source('trade-routes')).routes.find((r) => r.id === route.id).remote_state, 'revoked');
   await until(async () => notices, (v) => v.includes('/receiver') && v.includes('/sender'));
   assert.deepEqual(notices.sort(), ['/receiver', '/sender']);
-  assert.ok(receiverNotice && senderNotice);
   assert.deepEqual(errors, []); console.log('Trade route browser acceptance passed: preview, independent keys, approval, rotation, transfer, metadata filtering, downstream hold, revocation, responsive UI.');
 } finally { await browser.close(); await new Promise((resolve) => sink.close(resolve)); }

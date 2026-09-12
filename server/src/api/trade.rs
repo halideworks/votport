@@ -8,6 +8,20 @@ use std::sync::Arc;
 fn invalid(message: impl Into<String>) -> ApiError {
     ApiError::new(StatusCode::CONFLICT, message)
 }
+fn unprocessable(message: impl Into<String>) -> ApiError {
+    ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message)
+}
+fn unauthorized(message: impl Into<String>) -> ApiError {
+    ApiError::new(StatusCode::UNAUTHORIZED, message)
+}
+/// Notification delivery waits on remote webhooks; a peer's request or an
+/// admin's save must not.
+fn notify_later(app: &Arc<App>, route: &TradeRoute, event: &'static str) {
+    let (app, route) = (Arc::clone(app), route.clone());
+    tokio::spawn(async move {
+        crate::notify::trade_event(&app, &route, &route.notifications, event).await;
+    });
+}
 fn write(app: &App, headers: &HeaderMap) -> ApiResult<crate::auth::AdminIdentity> {
     let identity = admin::require_operator(app, headers)?;
     admin::require_admin_write(headers, &identity)?;
@@ -86,9 +100,9 @@ pub async fn settings(
         || body.name.len() > 200
         || body.name.chars().any(char::is_control)
     {
-        return Err(invalid("enter a port name of at most 200 characters"));
+        return Err(unprocessable("enter a port name of at most 200 characters"));
     }
-    let origin = address(&body.address).map_err(invalid)?;
+    let origin = address(&body.address).map_err(unprocessable)?;
     app.store
         .put_settings(
             &actor.subject,
@@ -177,13 +191,23 @@ pub async fn invite(
         .into_iter()
         .find(|e| e.id == body.endpoint)
         .ok_or_else(ApiError::not_found)?;
-    let expires = now()
-        .checked_add(body.expires_in)
-        .ok_or_else(|| invalid("invalid invitation expiry"))?;
+    if !matches!(body.expires_in, 3600 | 86400 | 604800) {
+        return Err(unprocessable(
+            "choose an invitation expiry of one hour, one day or seven days",
+        ));
+    }
+    let expires = now() + body.expires_in;
     let (id, secret) = app
         .store
         .create_trade_invitation(&actor.tenant, &body.endpoint, &body.expected_key, expires)
         .map_err(invalid)?;
+    app.store.audit(
+        &actor.tenant,
+        &actor.subject,
+        "trade_invitation_created",
+        &body.endpoint,
+        &json!({"invitation":id,"expires_at":expires,"expected_key":body.expected_key}),
+    );
     endpoint.notifications = crate::store::NotificationPolicy::default();
     let invitation=app.signer.port_message("invitation","",id,expires,json!({"address":origin,"name":port["name"],"endpoint":endpoint,"secret":secret,"expected_key":body.expected_key}));
     Ok(private(json!({"invitation":invitation})))
@@ -278,11 +302,20 @@ pub async fn inspect(
         (origin, Some(invite.document.issuer.as_str()))
     } else {
         (
-            address(body.address.as_deref().unwrap_or_default()).map_err(invalid)?,
+            address(body.address.as_deref().unwrap_or_default()).map_err(unprocessable)?,
             None,
         )
     };
-    Ok(private(probe(&app, &origin, key).await?))
+    // The address is admin-chosen and unverified; the reply says whether a
+    // Votport port answered, not how the host failed.
+    let port = probe(&app, &origin, key).await.map_err(|error| {
+        if error.message.contains("identity mismatch") {
+            error
+        } else {
+            invalid("no Votport port answered at that address")
+        }
+    })?;
+    Ok(private(port))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -299,7 +332,7 @@ pub async fn accept(
     let actor = write(&app, &headers)?;
     let (origin, endpoint) = invitation(&body.invitation)?;
     if body.name.trim().is_empty() || body.name.len() > 200 {
-        return Err(invalid("enter a route name"));
+        return Err(unprocessable("enter a route name"));
     }
     super::notifications::validate_policy(&app, &actor.tenant, &body.notifications, &TRADE_EVENTS)?;
     let peer = probe(&app, &origin, Some(&body.invitation.document.issuer)).await?;
@@ -340,6 +373,13 @@ pub async fn accept(
     app.store
         .save_outgoing_trade(&route, &crate::auth::random_token(), &body.invitation)
         .map_err(invalid)?;
+    app.store.audit(
+        &route.tenant,
+        &actor.subject,
+        "trade_route_accepted",
+        &route.id,
+        &json!({"name":route.name,"peer":route.peer_key,"address":route.address,"endpoint":route.endpoint}),
+    );
     let outcome = enroll_outgoing(&app, &route).await;
     if let Err(error) = outcome {
         app.store
@@ -420,14 +460,14 @@ pub async fn enroll(
     let (route, created) = app
         .store
         .redeem_trade_invitation(&request)
-        .map_err(invalid)?;
+        .map_err(unauthorized)?;
     let event = if route.state == "active" {
         "route_approved"
     } else {
         "route_approval_requested"
     };
     if created {
-        crate::notify::trade_event(&app, &route, &route.notifications, event).await;
+        notify_later(&app, &route, event);
     }
     Ok(private(app.signer.port_message(
         "enrolled",
@@ -447,22 +487,37 @@ pub async fn status(
     let route = app
         .store
         .authenticate_trade(&request, "status")
-        .map_err(invalid)?;
-    app.store
-        .trade_contact(&route.tenant, &route.id, "active", None)
-        .map_err(store_unavailable)?;
+        .map_err(unauthorized)?;
     let link = app
         .store
         .upload_link(&route.endpoint)
         .map_err(store_unavailable)?;
-    let state = if link.as_ref().is_none_or(|l| !l.usable_now()) {
+    let state = if route.state == "revoked" || link.as_ref().is_none_or(|l| !l.usable_now()) {
         "revoked"
     } else {
         route.state.as_str()
     };
-    Ok(private(app.signer.port_message("status",&route.peer_key,request.document.nonce,now()+300,json!({"grant":route.id,"state":state,"endpoint":route.endpoint,"deliveries":app.store.trade_deliveries(&route).map_err(store_unavailable)?}))))
+    // A revoked peer learns only that it is revoked: no contact refresh and
+    // no delivery listing.
+    let deliveries = if state == "revoked" {
+        json!([])
+    } else {
+        app.store
+            .trade_contact(&route.tenant, &route.id, "active", None)
+            .map_err(store_unavailable)?;
+        app.store
+            .trade_deliveries(&route)
+            .map_err(store_unavailable)?
+    };
+    Ok(private(app.signer.port_message(
+        "status",
+        &route.peer_key,
+        request.document.nonce,
+        now() + 300,
+        json!({"grant":route.id,"state":state,"endpoint":route.endpoint,"deliveries":deliveries}),
+    )))
 }
-async fn refresh_route_inner(app: &App, route: &TradeRoute) -> ApiResult<()> {
+async fn refresh_route_inner(app: &Arc<App>, route: &TradeRoute) -> ApiResult<()> {
     if route.remote_grant.is_empty() {
         return enroll_outgoing(app, route).await;
     }
@@ -487,17 +542,15 @@ async fn refresh_route_inner(app: &App, route: &TradeRoute) -> ApiResult<()> {
         .record_trade_status(route, &response.document.body["deliveries"])
         .map_err(store_unavailable)?;
     if changed && state == "active" {
-        crate::notify::trade_event(
+        notify_later(
             app,
             route,
-            &route.notifications,
             if route.remote_state == "pending_approval" {
                 "route_approved"
             } else {
                 "route_recovered"
             },
-        )
-        .await;
+        );
     }
     Ok(())
 }
@@ -507,7 +560,10 @@ pub async fn test(
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
     let actor = write(&app, &headers)?;
-    let route = app.store.trade_route(&actor.tenant, &id).map_err(invalid)?;
+    let route = app
+        .store
+        .trade_route(&actor.tenant, &id)
+        .map_err(|_| ApiError::not_found())?;
     if route.direction != "outgoing" {
         return Err(invalid("test connections from the sending port"));
     }
@@ -534,7 +590,10 @@ pub async fn update(
 ) -> ApiResult<Response> {
     let actor = write(&app, &headers)?;
     super::notifications::validate_policy(&app, &actor.tenant, &body.notifications, &TRADE_EVENTS)?;
-    let previous = app.store.trade_route(&actor.tenant, &id).map_err(invalid)?;
+    let previous = app
+        .store
+        .trade_route(&actor.tenant, &id)
+        .map_err(|_| ApiError::not_found())?;
     let route = app
         .store
         .update_trade_route(
@@ -552,7 +611,7 @@ pub async fn update(
         }
     }
     if previous.state == "pending_approval" && route.state == "active" {
-        crate::notify::trade_event(&app, &route, &route.notifications, "route_approved").await;
+        notify_later(&app, &route, "route_approved");
     }
     Ok(private(route))
 }
@@ -566,7 +625,7 @@ pub async fn rotate_remote(
     let route = app
         .store
         .authenticate_trade(&request, "rotate")
-        .map_err(invalid)?;
+        .map_err(unauthorized)?;
     if route.state == "revoked" {
         return Err(invalid("route revoked"));
     }
@@ -591,7 +650,10 @@ pub async fn rotate(
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
     let actor = write(&app, &headers)?;
-    let route = app.store.trade_route(&actor.tenant, &id).map_err(invalid)?;
+    let route = app
+        .store
+        .trade_route(&actor.tenant, &id)
+        .map_err(|_| ApiError::not_found())?;
     if route.direction != "outgoing" || route.remote_grant.is_empty() || route.state == "revoked" {
         return Err(invalid(
             "only an enrolled outgoing route can rotate its credential",
@@ -621,6 +683,13 @@ pub async fn rotate(
     app.store
         .clear_trade_rotation(&id, &next)
         .map_err(store_unavailable)?;
+    app.store.audit(
+        &actor.tenant,
+        &actor.subject,
+        "trade_credential_rotated",
+        &id,
+        &json!({"peer":route.peer_key}),
+    );
     Ok(private(json!({"ok":true})))
 }
 
@@ -637,8 +706,11 @@ pub async fn change_address(
     Json(body): Json<AddressRequest>,
 ) -> ApiResult<Response> {
     let actor = write(&app, &headers)?;
-    let route = app.store.trade_route(&actor.tenant, &id).map_err(invalid)?;
-    let origin = address(&body.address).map_err(invalid)?;
+    let route = app
+        .store
+        .trade_route(&actor.tenant, &id)
+        .map_err(|_| ApiError::not_found())?;
+    let origin = address(&body.address).map_err(unprocessable)?;
     probe(&app, &origin, Some(&route.peer_key)).await?;
     app.store
         .change_trade_address(&actor.tenant, &id, body.revision, &origin)
@@ -648,6 +720,11 @@ pub async fn change_address(
 
 pub async fn worker(app: Arc<App>) {
     use futures_util::{stream, StreamExt};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    // A dead peer costs two 15 s timeouts per probe; back off per route so a
+    // pass stays near a minute and known-dead peers are not hammered.
+    let backoff: std::sync::Mutex<HashMap<String, (u32, Instant)>> = Default::default();
     loop {
         tokio::select! {_=app.shutdown.notified()=>return,_=tokio::time::sleep(std::time::Duration::from_secs(60))=>{}}
         if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) {
@@ -660,25 +737,55 @@ pub async fn worker(app: Arc<App>) {
         {
             continue;
         }
+        if let Err(error) = app.store.prune_trade_invitations() {
+            tracing::warn!(%error, "cannot prune expired trade invitations");
+        }
         match app.store.trade_routes(None) {
             Ok(routes) => {
-                stream::iter(routes.into_iter().filter(|r| {
-                    r.direction == "outgoing" && r.state != "revoked" && !r.remote_grant.is_empty()
-                }))
-                .for_each_concurrent(4, |route| {
-                    let app = Arc::clone(&app);
-                    async move {
-                        let _ = refresh_route(&app, &route).await;
-                    }
-                })
-                .await
+                let now = Instant::now();
+                let due: Vec<TradeRoute> = {
+                    let mut waiting = backoff.lock().expect("backoff poisoned");
+                    waiting.retain(|id, _| routes.iter().any(|r| &r.id == id));
+                    routes
+                        .into_iter()
+                        .filter(|r| {
+                            r.direction == "outgoing"
+                                && r.state != "revoked"
+                                && !r.remote_grant.is_empty()
+                                && waiting.get(&r.id).is_none_or(|(_, next)| *next <= now)
+                        })
+                        .collect()
+                };
+                stream::iter(due)
+                    .for_each_concurrent(4, |route| {
+                        let app = Arc::clone(&app);
+                        let backoff = &backoff;
+                        async move {
+                            let outcome = refresh_route(&app, &route).await;
+                            let mut waiting = backoff.lock().expect("backoff poisoned");
+                            match outcome {
+                                Ok(()) => {
+                                    waiting.remove(&route.id);
+                                }
+                                Err(_) => {
+                                    let failures = waiting.get(&route.id).map_or(1, |(n, _)| n + 1);
+                                    let wait = Duration::from_secs(60 << failures.min(6));
+                                    waiting.insert(
+                                        route.id.clone(),
+                                        (failures, Instant::now() + wait),
+                                    );
+                                }
+                            }
+                        }
+                    })
+                    .await
             }
             Err(error) => tracing::warn!(%error,"cannot monitor trade routes"),
         }
     }
 }
 
-pub async fn refresh_route(app: &App, route: &TradeRoute) -> ApiResult<()> {
+pub async fn refresh_route(app: &Arc<App>, route: &TradeRoute) -> ApiResult<()> {
     let result = refresh_route_inner(app, route).await;
     if let Err(error) = &result {
         let mismatch = error
@@ -695,17 +802,15 @@ pub async fn refresh_route(app: &App, route: &TradeRoute) -> ApiResult<()> {
             .trade_contact(&route.tenant, &route.id, state, Some(&error.message))
             .map_err(store_unavailable)?
         {
-            crate::notify::trade_event(
+            notify_later(
                 app,
                 route,
-                &route.notifications,
                 if mismatch {
                     "route_identity_changed"
                 } else {
                     "route_failed"
                 },
-            )
-            .await;
+            );
         }
     }
     result

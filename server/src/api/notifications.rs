@@ -52,16 +52,25 @@ pub(crate) fn creation_policy(
 
 pub async fn list(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Response> {
     let identity = admin::require_operator(&app, &headers)?;
-    catalog(&app, &identity.tenant)
+    catalog(&app, &identity.tenant, true)
 }
 
-pub(crate) fn catalog(app: &App, tenant: &str) -> ApiResult<Response> {
+/// Automation callers pick destinations by id and label; recipient lists
+/// stay with the administrators who manage them.
+pub(crate) fn catalog(app: &App, tenant: &str, with_recipients: bool) -> ApiResult<Response> {
     let destinations = app
         .store
         .notification_destinations(tenant)
         .map_err(store_unavailable)?
         .iter()
-        .map(NotificationDestination::public)
+        .map(|destination| {
+            let mut view = destination.public();
+            if !with_recipients {
+                view.as_object_mut()
+                    .map(|object| object.remove("recipients"));
+            }
+            view
+        })
         .collect::<Vec<_>>();
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
@@ -244,7 +253,13 @@ pub async fn save(
     }
     app.store
         .save_notification_destination(&identity.tenant, &mut destination)
-        .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
+        .map_err(|error| match error.as_str() {
+            "Connection changed; reload before saving" => {
+                ApiError::new(StatusCode::CONFLICT, error)
+            }
+            "A tenant can have at most 100 notification destinations" => invalid(error),
+            _ => store_unavailable(error),
+        })?;
     app.store.audit(
         &identity.tenant,
         &identity.subject,

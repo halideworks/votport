@@ -12,12 +12,14 @@ pub struct RouteRequest {
     ancestry: Vec<crate::route_protocol::RouteReceipt>,
 }
 
+// The body limits on these two public routes are megabytes; the gates run
+// before the body is read so an unauthorised caller costs nothing to hold.
 pub async fn receive(
     State(app): State<Arc<App>>,
     AxumPath(token): AxumPath<String>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
-    Json(request): Json<RouteRequest>,
+    request: Request,
 ) -> ApiResult<Response> {
     if !headers.contains_key("x-votport") {
         return Err(ApiError::new(
@@ -31,6 +33,9 @@ pub async fn receive(
         .upload_link(&token)
         .map_err(crate::api::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
+    let Json(request) = Json::<RouteRequest>::from_request(request, &app)
+        .await
+        .map_err(|error| ApiError::new(error.status(), error.body_text()))?;
     let ip = crate::api::client_ip(&headers, &peer, &app.config.trusted_proxies);
     crate::api::upload::check_password(
         &app,
@@ -435,7 +440,7 @@ pub async fn revoke(
     AxumPath(id): AxumPath<String>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
-    Json(request): Json<crate::route_protocol::RouteRevocation>,
+    request: Request,
 ) -> ApiResult<Response> {
     if !headers.contains_key("x-votport") {
         return Err(ApiError::new(
@@ -447,6 +452,9 @@ pub async fn revoke(
     if !valid_token(&id) {
         return Err(ApiError::not_found());
     }
+    let Json(request) = Json::<crate::route_protocol::RouteRevocation>::from_request(request, &app)
+        .await
+        .map_err(|error| ApiError::new(error.status(), error.body_text()))?;
     let route = app
         .store
         .revoke_inbound_route(&id, &request)

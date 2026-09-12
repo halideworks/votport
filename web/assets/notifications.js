@@ -81,11 +81,15 @@ export function notificationEditor({ policy = null, events = Object.keys(notific
       status.textContent = chosen.length ? `${chosen.length} ${chosen.length === 1 ? 'destination selected' : 'destinations selected'}. Only checked events will be sent.` : 'Add a destination, then choose when it should hear from this port.';
     } else status.textContent = mode.value === 'off' ? 'Notifications are off for this item.' : '';
   }
+  let loadTicket = 0;
   async function load(refresh = false) {
+    const ticket = ++loadTicket;
     if (refresh && catalog) selected = { mode: mode.value, rules: readRules() };
     element.disabled = true; status.textContent = 'Loading notification destinations…';
     try {
-      catalog = settings || await loadNotificationSettings(refresh);
+      const loaded = settings || await loadNotificationSettings(refresh);
+      if (ticket !== loadTicket) return;
+      catalog = loaded;
       selected ||= policy || (inherit !== undefined ? { mode: 'inherit', rules: [] } : { mode: 'off', rules: [] });
       mode.value = selected.mode;
       const available = new Map(catalog.destinations.map((destination) => [destination.id, destination]));
@@ -102,7 +106,7 @@ export function notificationEditor({ policy = null, events = Object.keys(notific
   mode.addEventListener('change', renderMode);
   rules.addEventListener('change', renderMode);
   const ready = load();
-  return { element, ready, read() {
+  return { element, ready, reset() { mode.value = 'default'; rules.replaceChildren(); if (catalog) { updatePicker(); renderMode(); } }, read() {
     if (!catalog) throw new Error('Notification destinations could not be loaded. Retry before saving.');
     if (mode.value === 'inherit') return null;
     const policy = { mode: mode.value, rules: [] };

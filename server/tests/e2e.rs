@@ -3270,7 +3270,7 @@ async fn restart_preserves_a_truncated_staging_session() {
         .unwrap()
         .try_recv()
         .unwrap();
-    assert!(ended.notify);
+    assert!(ended.notifications.as_ref().is_some_and(|p| p.enabled()));
     assert_eq!(ended.event.outcome, event.outcome);
     assert_eq!(ended.event.received_bytes, event.received_bytes);
     assert_eq!(ended.event.detail, event.detail);

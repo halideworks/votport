@@ -117,7 +117,14 @@ impl Store {
         let tx = connection.transaction().map_err(|e| e.to_string())?;
         let usable: bool = tx.query_row("SELECT active=1 AND (expires_at IS NULL OR expires_at>?3) FROM links WHERE tenant=?1 AND id=?2",params![tenant,link_id,now_unix() as i64],|row|row.get(0)).optional().map_err(|e|e.to_string())?.ok_or("receive request missing")?;
         let previous = tx.query_row(&format!("SELECT {COLUMNS} FROM inbound_routes WHERE link_id=?1 AND issuer=?2 AND operation_id=?3"),params![link_id,source.document.issuer,source.document.operation_id],row_route).optional().map_err(|e|e.to_string())?;
-        trade::admit(&tx, source, link_id, credential, previous.is_some())?;
+        trade::admit(
+            &tx,
+            source,
+            ancestry,
+            link_id,
+            credential,
+            previous.is_some(),
+        )?;
         if let Some(previous) = previous {
             return if &previous.source == source && previous.ancestry == ancestry {
                 Ok(previous)

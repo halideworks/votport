@@ -743,7 +743,7 @@ function renderStatus(status) {
 
 // The session check and every list go out together; each is one round trip.
 startStatusPoll({ render: renderStatus, active: (status) => status.outbound.active > 0 });
-const sessionReady = requireSession().then((session) => { notificationsReadOnly = session.role !== 'admin'; });
+const sessionReady = requireSession().then(async (session) => { notificationsReadOnly = session.role !== 'admin'; await createNotifications.ready; createNotifications.element.disabled = notificationsReadOnly; });
 await Promise.all([sessionReady, refreshGrants(), refreshLibrary()]);
 await revealGrant();
 

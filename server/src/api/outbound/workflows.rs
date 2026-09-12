@@ -2263,6 +2263,20 @@ mod tests {
             assert_eq!(retiring.id, received_job.id);
             assert!(!library_root(&receiver, "nyc").exists());
             retire_snapshot(&receiver).await.unwrap();
+            for incoming in receiver.store.trade_routes(Some("nyc")).unwrap() {
+                assert!(receiver.store.remove_link("nyc", &token).is_err());
+                receiver
+                    .store
+                    .update_trade_route(
+                        "nyc",
+                        &incoming.id,
+                        incoming.revision,
+                        "revoked",
+                        false,
+                        &incoming.notifications,
+                    )
+                    .unwrap();
+            }
             receiver.store.remove_link("nyc", &token).unwrap();
             assert_eq!(
                 receiver.store.remove_tenant("nyc").unwrap(),

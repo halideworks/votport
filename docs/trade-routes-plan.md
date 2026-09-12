@@ -36,11 +36,14 @@ files. A missing signing key on a paired installation stops startup until the ke
 restored or the installation is explicitly re-enrolled.
 
 Outgoing metadata is filtered before transmission. Signed ancestry containing keys
-outside a downstream route's allowlist holds forwarding before any request is sent.
+outside a downstream route's allowlist holds forwarding before any request is sent,
+and the receiver re-checks the ancestry against its endpoint allowlist on admission.
 Forwarding prohibition is signed and checked at every managed hop. Route notification
 policies are captured per delivery; tenant defaults remain dynamic. Connection
 monitoring checks outgoing enrolled routes once per minute, with four requests in
-parallel. Delivery listings show the most recent 50 operations per route.
+parallel; a route that keeps failing is retried with a doubling wait of up to 64
+minutes until it answers again. Delivery listings show the most recent 50 operations
+per route.
 
 The design rationale below describes the implemented boundaries and the optional
 capabilities deliberately left for separate work.
@@ -51,10 +54,10 @@ A Storage connection's **Local connection ID** names that connection on the
 sending installation. It is used by projects and agents. It does not identify or
 locate a remote installation.
 
-To send today, create a request on the destination under Receive, optionally
-attach a reception project, and paste its full receive URL and optional password
-under Storage > Another Votport on the sender. The URL supplies both the server
-address and permission to use that request. The receiving request chooses the
+Older receive-link connections under Storage can no longer be created or
+edited, only disabled. New port-to-port sending goes through Trade routes: the
+receiver converts a receive request into a receiving endpoint and issues an
+invitation, and the sender accepts it. The receiving request chooses the
 tenant, quota, and project; the sender cannot choose those by naming its own
 tenant or project.
 

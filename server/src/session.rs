@@ -179,9 +179,6 @@ pub struct SessionEnded {
     pub tenant: String,
     pub link_id: String,
     pub label: String,
-    /// The link's notify-on-upload switch, read in the same write that
-    /// recorded the event.
-    pub notify: bool,
     pub event: crate::store::SessionEvent,
 }
 
@@ -3326,12 +3323,10 @@ fn record_session_event(
         tenant: tenant.to_owned(),
         link_id: link_id.to_owned(),
         label: String::new(),
-        notify: false,
         event: event.clone(),
     };
     let _ = store.update_link(tenant, link_id, |link| {
         ended.label = link.label.clone();
-        ended.notify = link.notifications.as_ref().is_some_and(|p| p.enabled());
         ended.notifications = link.notifications.clone();
         link.events.push(event);
         if link.events.len() > EVENTS_KEPT {

@@ -891,7 +891,7 @@ pub async fn notification_destinations(
             "Delivery or job creation permission required",
         ));
     }
-    crate::api::notifications::catalog(&app, &token.tenant)
+    crate::api::notifications::catalog(&app, &token.tenant, false)
 }
 
 #[cfg(test)]

@@ -41,11 +41,19 @@ same notification editor:
 
 The supported events are `upload_complete`, `upload_failed`,
 `outbound_download_started`, `outbound_delivery_complete`,
-`workflow_retry_scheduled`, and `workflow_failed`. Receive requests offer the two
-upload events. Delivery links offer the two download events. Workflows offer
-both download events and the retry/failure events. A first download that also
+`workflow_retry_scheduled`, `workflow_failed`, and the six trade route events
+`route_approval_requested`, `route_approved`, `route_identity_changed`,
+`route_failed`, `route_recovered`, and `route_received` (see Trade routes
+below). Receive requests offer the two upload events. Delivery links offer the
+two download events. Workflows offer both download events and the retry/failure
+events. Tenant defaults may subscribe to any event. A first download that also
 completes a delivery emits both subscribed events. An interrupted upload without
 received bytes and a sender cancellation do not send failure notifications.
+
+Upgrading from the earlier environment-configured channels turns notifications
+off on every existing receive request and delivery link and removes the old
+channel settings; configure named destinations and re-enable the policies that
+should keep sending.
 
 There are at most 100 named destinations per tenant and 32 destinations per
 custom subscription. Notification delivery remains best effort, outside transfer
@@ -64,7 +72,8 @@ Read responses use `Cache-Control: no-store`.
 - `POST /api/notifications`: create or update a destination. Supply `label`,
   `channel`, `target`, `enabled`, and service fields `url`, `token`, `user`,
   `recipients`, or `thread_id`. For an update, also supply its `id` and `revision`;
-  stale updates are rejected. `clear_token: true` removes an optional bearer token.
+  stale updates are rejected with 409 and the 100-destination cap with 422.
+  `clear_token: true` removes an optional bearer token.
 - `POST /api/notifications/{id}/test`: test the saved, enabled destination.
   Failures return 502.
 - `DELETE /api/notifications/{id}` with `{"revision": N}`: delete a destination.
@@ -72,7 +81,8 @@ Read responses use `Cache-Control: no-store`.
   another destination.
 - `PUT /api/notifications/defaults`: save an `off` or `custom` notification policy.
 - `GET /api/automation/notifications`: read the catalog with an automation bearer
-  that has `deliveries:create` or `jobs:create` permission.
+  that has `deliveries:create` or `jobs:create` permission. Email recipient
+  lists are omitted from this view.
 
 A notification policy has this shape:
 

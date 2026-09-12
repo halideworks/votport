@@ -96,8 +96,8 @@ pub async fn uploaded(
         "files_truncated": files_truncated,
         "files": files,
     });
-    send_all(
-        app,
+    send_policy(
+        &app,
         Route {
             tenant: &tenant,
             policy: notifications.as_ref(),
@@ -176,8 +176,8 @@ pub async fn outbound_downloaded(
             "total_bytes": total_bytes,
             "files": files,
         });
-        send_all(
-            Arc::clone(&app),
+        send_policy(
+            &app,
             Route {
                 tenant: &grant.tenant,
                 policy: grant.notifications.as_ref(),
@@ -217,8 +217,8 @@ pub async fn upload_ended(app: Arc<App>, ended: crate::session::SessionEnded) {
         "started_at": event.started_at,
         "ended_at": event.at,
     });
-    send_all(
-        app,
+    send_policy(
+        &app,
         Route {
             tenant: &ended.tenant,
             policy: ended.notifications.as_ref(),
@@ -272,8 +272,8 @@ pub async fn workflow_failed(app: Arc<App>, job: crate::workflow::Job) {
         "workflow_failed"
     };
     let payload = json!({"event":event, "job_id":job.id, "label":job.request.label, "state":job.state, "error":job.error, "retry_at":job.checks["retry_at"], "released":job.released()});
-    send_all(
-        app,
+    send_policy(
+        &app,
         Route {
             tenant: &job.tenant,
             policy,
@@ -285,18 +285,6 @@ pub async fn workflow_failed(app: Arc<App>, job: crate::workflow::Job) {
         Some(&job.id),
     )
     .await;
-}
-
-async fn send_all(
-    app: Arc<App>,
-    route: Route<'_>,
-    title: String,
-    body: String,
-    payload: serde_json::Value,
-    event: &str,
-    transfer_id: Option<&str>,
-) {
-    send_policy(&app, route, title, body, payload, event, transfer_id).await;
 }
 
 fn chat_payload(channel: &str, title: &str, body: &str) -> serde_json::Value {
@@ -640,11 +628,10 @@ pub(crate) mod tests {
         received_bytes: u64,
     ) -> crate::session::SessionEnded {
         crate::session::SessionEnded {
-            notifications: Some(test_policy()),
+            notifications: notify.then(test_policy),
             tenant: String::new(),
             link_id: "link-1".to_owned(),
             label: "shoot".to_owned(),
-            notify,
             event: crate::store::SessionEvent {
                 at: 20,
                 started_at: 10,

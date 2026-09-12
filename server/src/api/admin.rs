@@ -581,6 +581,7 @@ fn admin_session_view(identity: &auth::AdminIdentity) -> serde_json::Value {
     }
     json!({
         "ok": true,
+        "subject": identity.subject,
         "tenant": identity.tenant,
         "grants": identity.grants,
         "role": identity.role,
