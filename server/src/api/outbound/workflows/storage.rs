@@ -249,12 +249,18 @@ impl Storage {
     }
 
     fn key(&self, relative: &str) -> ApiResult<ObjectPath> {
-        ObjectPath::parse(if self.prefix.is_empty() {
+        let key = ObjectPath::parse(if self.prefix.is_empty() {
             relative.into()
         } else {
             format!("{}/{relative}", self.prefix)
         })
-        .map_err(|_| conflict("invalid S3 object key".into()))
+        .map_err(|_| conflict("invalid S3 object key".into()))?;
+        if self.kind == StorageKind::S3 && key.as_ref().len() > 1024 {
+            return Err(conflict(
+                "S3 object key exceeds 1024 bytes including the storage prefix".into(),
+            ));
+        }
+        Ok(key)
     }
 }
 
@@ -966,6 +972,60 @@ async fn upload_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn s3_keys_limit_complete_utf8_bytes_for_all_operation_paths() {
+        let mut config: Storage = serde_json::from_value(json!({
+            "id":"destination","revision":0,"label":"Destination","kind":"s3",
+            "endpoint":"https://s3.example.com","bucket":"test","region":"us-east-1",
+            "tenants":[""],"enabled":true
+        }))
+        .unwrap();
+        let delivery = format!("deliveries/{}/{}", "a".repeat(32), "b".repeat(64));
+        for relative in [
+            format!("{delivery}/files/folder/納品.mov"),
+            format!("{delivery}/complete.json"),
+            "incoming/é".into(),
+        ] {
+            config.prefix = "p".repeat(1024 - relative.len() - 1);
+            config.validate().unwrap();
+            let key = config.key(&relative).unwrap();
+            assert_eq!(key.as_ref().len(), 1024);
+
+            config.prefix.push('p');
+            config.validate().unwrap();
+            let error = config.key(&relative).unwrap_err();
+            assert_eq!(error.status, StatusCode::CONFLICT);
+            assert_eq!(
+                error.message,
+                "S3 object key exceeds 1024 bytes including the storage prefix"
+            );
+        }
+
+        config.prefix = "p".repeat(1024);
+        config.validate().unwrap();
+        assert_eq!(config.key("").unwrap().as_ref(), config.prefix);
+        config.prefix.clear();
+        let relative = format!("{}éab", "é/".repeat(340));
+        assert_eq!(relative.len(), 1024);
+        assert!(crate::workflow::valid_path(&relative));
+        assert_eq!(config.key(&relative).unwrap().as_ref(), relative);
+        let oversized = format!("{relative}a");
+        assert_eq!(oversized.chars().count(), 684);
+        assert!(config.key(&oversized).is_err());
+
+        config.kind = StorageKind::Folder;
+        config.directory = std::env::current_dir().unwrap().display().to_string();
+        config.prefix = "folder".into();
+        config.endpoint.clear();
+        config.bucket.clear();
+        config.region.clear();
+        config.validate().unwrap();
+        assert_eq!(
+            config.key(&relative).unwrap().as_ref(),
+            format!("folder/{relative}")
+        );
+    }
 
     #[tokio::test]
     async fn cached_s3_inventory_still_requires_portable_names() {
