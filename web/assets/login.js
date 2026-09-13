@@ -2,6 +2,7 @@
 
 import { api } from '/assets/admin-common.js';
 import { collapseLocalPassword } from '/assets/login-disclosure.js';
+import { ssoErrorMessage } from '/assets/login-errors.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -30,17 +31,12 @@ try {
 }
 
 const ssoError = new URLSearchParams(window.location.search).get('sso_error');
-if (ssoError) {
-  try {
-    const message = new TextDecoder().decode(
-      Uint8Array.from(ssoError.match(/.{2}/g) ?? [], (byte) => parseInt(byte, 16)),
-    );
-    $('login-error').textContent = message;
+if (ssoError !== null) {
+  if (ssoError) {
+    $('login-error').textContent = ssoErrorMessage(ssoError);
     $('login-error').hidden = false;
-    window.history.replaceState({}, '', '/');
-  } catch {
-    /* malformed tag: ignore */
   }
+  window.history.replaceState({}, '', '/');
 }
 
 try {
