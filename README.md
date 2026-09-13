@@ -81,6 +81,7 @@ browser and builds the server. Then add the site to your Caddyfile (see
 
 ```caddy
 drop.example.com {
+ respond /metrics 404
  reverse_proxy 127.0.0.1:8103
 }
 ```

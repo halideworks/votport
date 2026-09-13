@@ -69,10 +69,10 @@ of data:
   three-phase run through a proxy is capped at 20 session creations total:
   keep `SESSIONS` at 10 or below there, or run from inside the network.
   Synthetic addresses appear in link events and the audit log on a real box.
-- **Upload sessions: 8 concurrent per link (`MAX_SESSIONS_PER_LINK`).** The
-  rig seeds one link per eight upload workers and spreads sessions across
-  them, so runs reach the process-wide cap instead of this one. A single
-  real link still refuses its ninth concurrent sender.
+- **`VOTPORT_MAX_LINK_SESSIONS` (default 8).** The rig seeds one link per
+  eight upload workers and spreads sessions across them. With the default
+  setting, a single link refuses its ninth concurrent sender; a lower configured
+  limit also constrains the rig.
 - **`VOTPORT_MAX_TOTAL_SESSIONS` (default 32).** The process-wide session
   cap; this is the knob the rig exists to size. Runs with `SESSIONS` above it
   report the overflow as 429 errors, which is the measurement working.
@@ -111,30 +111,33 @@ the dashboard below tell you what the server thought was happening.
 ## Scraping /metrics into Prometheus
 
 `GET /metrics` is Prometheus text format. Set `VOTPORT_METRICS_TOKEN` on the
-server and give Prometheus the same value as a bearer token:
+server and give Prometheus the same value as a bearer token. Scrape the private
+upstream directly, for example when Prometheus shares votport's container network:
 
 ```yaml
 scrape_configs:
   - job_name: votport
     metrics_path: /metrics
-    scheme: https
+    scheme: http
     authorization:
       type: Bearer
       credentials: <VOTPORT_METRICS_TOKEN value>
     static_configs:
-      - targets: ["drop.example.com:443"]
+      - targets: ["votport:8080"]
 ```
 
-Scrape over an internal interface where you can; the token gates the route
-but the metrics are still counts you may not want on the public path. A 15s
-scrape interval is plenty; the histogram buckets are fixed and cheap.
+The public Caddy examples return 404 for `/metrics`; keep the upstream reachable
+only through trusted internal networking. A 15s scrape interval is plenty;
+the histogram buckets are fixed and cheap.
 
 ## The Grafana dashboard
 
-`ops/grafana-votport.json` covers the whole `/metrics` surface: traffic by
-status class and 5xx ratio, latency percentiles from the request-duration
-histogram, active sessions against the configured cap, native-push activity
-and refusals, per-tenant links and received bytes, and audit health.
+[The Grafana dashboard](../ops/grafana-votport.json) shows drain and storage
+ownership, traffic and latency, upload capacity and outcomes, native push,
+QUIC fetch sessions, reported bytes, completions and refusals, per-tenant usage,
+audit health, and free and total disk space. Lease age is diagnostic; the lease
+status panel reports ownership. QUIC byte counters update at session end, so
+short-window rates can be bursty.
 
 Import it with Dashboards, then Import, then Upload JSON file (or `curl` it
 at `/api/dashboards/import`), and pick the Prometheus datasource when asked.

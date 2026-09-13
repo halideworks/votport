@@ -9,6 +9,8 @@ drop.example.com {
 	# votport itself sends uncompressed responses and relies on the proxy.
 	encode zstd gzip
 
+	# Scrape metrics directly from the private upstream.
+	respond /metrics 404
 	reverse_proxy 127.0.0.1:8103
 
 	# votport uploads travel as chunks of at most ~9 MiB per request, so no

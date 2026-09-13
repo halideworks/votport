@@ -13,14 +13,12 @@
 #
 # The watcher arms only after one successful probe, so a wrong URL cannot
 # fence a healthy instance. A fence that fails (the host is dead) is logged
-# and the promotion proceeds: the receive-root lease is the fence of last
-# resort, and a live process that is in fact alive keeps renewing it, so the
-# promoted instance refuses to boot and this script reports that rather
-# than retries. Run one watcher, and not on the live host.
+# and promotion proceeds, but a holder of the shared receive-root kernel
+# lock prevents the new instance from booting. Heartbeat age cannot release
+# that lock. Run one watcher, and not on the live host.
 #
 # Optional: INTERVAL (seconds between probes, default 10), FAILURES
-# (consecutive misses before acting, default 10, so the trigger clears the
-# lease's 90 s staleness on the first promotion attempt), READY_TIMEOUT
+# (consecutive misses before acting, default 10), READY_TIMEOUT
 # (seconds to wait for the promoted instance, default 300), CMD_TIMEOUT
 # (seconds each supplied command may take, default 120), DRY_RUN=1.
 set -euo pipefail

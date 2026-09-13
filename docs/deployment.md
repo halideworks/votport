@@ -553,12 +553,13 @@ curl -b cookies.txt -X POST -H 'Content-Type: application/json' \
 
 ## Settings
 
-Default-tenant admins edit notification URLs, SMTP, retention days, default
-quotas, and the sign-in disclosure from the System page. Those values
-overlay environment variables via `GET`/`PUT /api/admin/settings`
-(`X-Votport` on PUT). Env remains the boot default; a written key wins;
-`""` disables a URL or token; JSON `null` ("Use environment") deletes the
-row so env applies again. See [`enterprise-ops.md`](enterprise-ops.md).
+Platform admins edit SMTP relay, retention, default quotas and sign-in settings
+on System. These settings overlay environment values through
+`GET`/`PUT /api/admin/settings` (`X-Votport` on PUT). An absent row uses the
+environment; JSON `null` ("Use environment") removes the override. Empty text
+clears optional values. See the [configuration reference](../README.md#configuration).
+Named destinations and recipient lists are managed separately under
+[Notifications](notifications.md).
 
 ## Admin password minimum
 
@@ -646,9 +647,18 @@ Transfers are covered by `votport_upload_sessions_ended_total` with a fixed
 published uploads (1 MiB through 16 GiB, and 1s through 6h), the
 `votport_upload_bytes_in_flight` gauge, and `votport_disk_free_bytes` and
 `votport_disk_total_bytes` per `volume` (`receive`, `outbound`).
+Ownership and admission state use the `votport_draining`, `votport_lease_held`
+and diagnostic `votport_lease_age_seconds` gauges. QUIC delivery exports
+`votport_serve_sessions_active`, `votport_serve_bytes_total`,
+`votport_serve_deliveries_total` and `votport_serve_refused_total{reason}`
+(`rate`, `capability`, `unknown`, `closed`, `busy`). Served bytes update when
+sessions end; completions count successfully recorded fetch acknowledgements.
+[The Grafana dashboard](../ops/grafana-votport.json) includes these series.
 Request metrics never include paths, tenants, addresses,
 methods, or tokens. Set `VOTPORT_METRICS_TOKEN` to require a bearer token, and
-scrape it over an internal interface only.
+scrape the private upstream directly. The public Caddy examples return 404 for
+`/metrics`, including requests with a bearer token. See the
+[Prometheus example](load-testing.md#scraping-metrics-into-prometheus).
 Platform admins can fetch the same per-tenant link and live-byte totals as JSON
 from `GET /api/admin/holdings`.
 
@@ -797,10 +807,13 @@ Layout:
   over once it is up:
 
 ```caddyfile
-reverse_proxy live:8321 standby:8321 {
-	lb_policy first
-	health_uri /healthz
-	health_interval 5s
+drop.example.com {
+	respond /metrics 404
+	reverse_proxy live:8321 standby:8321 {
+		lb_policy first
+		health_uri /healthz
+		health_interval 5s
+	}
 }
 ```
 
@@ -880,8 +893,10 @@ comes from a stopped standby instead, described under
 `GET /healthz` answers 200 when the database and both storage roots answer,
 and is what a proxy health check should poll. `GET /readyz` additionally
 answers 503 while **Drain for restart** is on, with a JSON body
-`{"ready","draining","sessions_active"}`, for failover scripts and
-orchestrators that wait for a drained instance. Do not point a single-upstream
+containing `ready`, `draining`, `sessions_active`, and
+`lease: {holder, mine, age_secs, lost}` for failover scripts and orchestrators.
+`holder` and `age_secs` are null when the lease record is unavailable; its age
+is diagnostic and never authorizes takeover. Do not point a single-upstream
 proxy at `/readyz`: drain keeps downloads and the admin pages up on purpose,
 and a proxy that drops the upstream on 503 would take them down.
 

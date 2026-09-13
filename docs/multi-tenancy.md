@@ -91,7 +91,7 @@ still leave only the tracing event.
   tenant retains the receive root layout. The existing `admit_dest` +
   `join_under` guards apply unchanged below the server-chosen tenant prefix.
 - Quotas per tenant: `max_total_bytes` (sum of live uploads), `max_sessions`
-  (concurrent, enforced next to `MAX_SESSIONS_PER_LINK`), `max_links`. Session
+  (concurrent, alongside `VOTPORT_MAX_LINK_SESSIONS`), `max_links`. Session
   admission atomically combines SQL-accounted live bytes with every in-flight
   session's announced-byte reservation under the same lock that enforces
   tenant, link, and global session caps. Cancellation-safe leases retain those

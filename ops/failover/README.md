@@ -13,9 +13,9 @@ ssh, a local process, or an orchestrator without changes.
 
 Both scripts wait for the promoted instance to report the receive-root
 lease as its own on `/readyz` before repointing the proxy. If the old
-instance is in fact still alive and renewing the lease, the promoted one
+instance still holds the shared receive root's kernel lock, the promoted one
 refuses to boot, the proxy stays on the old live, and the script reports
-that instead of forcing anything: the lease is the fence of last resort. A
+that refusal. Heartbeat age never grants ownership. A
 fence command that fails because the host is dead is logged and the
 promotion proceeds. Every supplied command runs under `CMD_TIMEOUT` so a
 wedged docker daemon cannot stall the failover; `planned.sh` defaults it to
@@ -72,10 +72,10 @@ ops/failover/watch.sh
 
 The watcher arms only after one successful probe, so a wrong URL cannot
 fence a healthy instance. Ten misses at ten seconds (the defaults) is the
-trigger: it clears the lease's 90 s staleness, so after a crash the promoted
-instance boots on the first attempt rather than crash-looping under a
-restart policy until the lease expires, and it also covers a live process
-that is alive but unreachable from the watcher. Run the watcher somewhere
-that is not the live host, and run one watcher only. After a promotion, clear
+trigger. There is no lease expiry: the 30-second heartbeat is diagnostic,
+and promotion requires the filesystem to release the old writer's lock after
+shutdown or fencing. NAS lock recovery can take longer than the probe window.
+Run the watcher somewhere that is not the live host, and run one watcher only.
+After a promotion, clear
 Drain for restart on the new live if it was on, and re-arm the watcher
 against the new pair.
