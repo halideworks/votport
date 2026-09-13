@@ -188,17 +188,23 @@ const openLinks = new Set();
 // Records a pending change, re-renders, and opens the undo window. Undo and
 // commit both drop the record and re-render, so the list always matches
 // either the server or the pending intent, never a detached node.
-async function deferred({ text, mark, unmark, commit }) {
+async function deferred(control, { text, mark, unmark, commit }) {
+  const hadFocus = control === document.activeElement;
+  control.blur();
+  control.disabled = true;
   mark();
   await refreshLinksSafe();
   try {
     await undoable({
       text,
+      focus: hadFocus && document.activeElement === document.body,
+      returnFocus: $('links-action-status'),
       restore: () => { unmark(); refreshLinksSafe(); },
       commit,
     });
   } finally {
     unmark();
+    control.disabled = false;
   }
   await refreshLinksSafe();
 }
@@ -244,7 +250,7 @@ function renderUpload(link, upload) {
   if (!held) {
     head.append(
       // Files on disk stay, so this needs an undo window, not a modal.
-      button('Clear record', 'tiny ghost', () => deferred({
+      button('Clear record', 'tiny ghost', (control) => deferred(control, {
         text: 'Transfer record cleared.',
         mark: () => pendingClears.add(upload.id),
         unmark: () => pendingClears.delete(upload.id),
@@ -545,8 +551,7 @@ function renderLink(link) {
     }),
     button(link.active ? 'Deactivate' : 'Reactivate', 'tiny ghost', (control) => {
       if (pending) return;
-      control.disabled = true;
-      return deferred({
+      return deferred(control, {
         text: link.active ? 'Request deactivated.' : 'Request reactivated.',
         mark: () => pendingLinks.set(link.id, { active: !link.active }),
         unmark: () => pendingLinks.delete(link.id),
@@ -571,8 +576,7 @@ function renderLink(link) {
         return;
       }
       // Releasing lets retention run, so it waits for the undo window.
-      control.disabled = true;
-      await deferred({
+      await deferred(control, {
         text: 'Legal hold released.',
         mark: () => pendingLinks.set(link.id, { legal_hold: false }),
         unmark: () => pendingLinks.delete(link.id),
@@ -599,6 +603,7 @@ function renderLink(link) {
           return;
         await api(`/api/admin/links/${link.id}`, { method: 'DELETE' });
         for (const editor of card.querySelectorAll('[data-unsaved]')) markFormSaved(editor);
+        if (card.contains(document.activeElement)) $('links-action-status').focus({ preventScroll: true });
         card.remove();
         await refreshLinks();
         announce('links-action-status', `Request "${link.label}" deleted.`);
@@ -712,6 +717,7 @@ async function refreshLinksInner({ append, fromPoll }) {
   }
   linksFilter = filter; linksExpanded = append;
   linksRefreshPending = false;
+  const focus = !append && container.contains(document.activeElement) ? document.activeElement : null;
   if (!append) container.replaceChildren();
   if (!append && !links.length) {
     if (linksFilter.search || linksFilter.status) {
@@ -743,6 +749,10 @@ async function refreshLinksInner({ append, fromPoll }) {
   $('links-error').hidden = true;
   // A re-render (the status poll, an action) keeps the deep-linked card open.
   revealHash({ scroll: false });
+  if (focus) {
+    if (!focus.isConnected) announce('links-action-status', 'Receive requests updated.');
+    (focus.isConnected ? focus : $('links-action-status')).focus({ preventScroll: true });
+  }
 }
 
 async function refreshLinksSafe(options = {}) {

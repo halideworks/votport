@@ -44,6 +44,10 @@ let grantLoading = false;
 function renderGrants() {
   const grants = grantRows;
   const container = $('outbound-grants');
+  if (container.contains(document.activeElement)) {
+    announce('outbound-grants-status', 'Issued downloads updated.');
+    $('outbound-grants-status').focus({ preventScroll: true });
+  }
   container.replaceChildren();
   $('outbound-grants-count').textContent = grantTotal
     ? `Showing ${grants.length} of ${grantTotal} issued downloads.`
@@ -227,6 +231,10 @@ async function refreshGrants(reset = true) {
       const message = document.createElement('p');
       message.className = 'muted';
       message.textContent = 'Issued downloads could not be loaded.';
+      if ($('outbound-grants').contains(document.activeElement)) {
+        announce('outbound-grants-status', message.textContent);
+        $('outbound-grants-status').focus({ preventScroll: true });
+      }
       $('outbound-grants').replaceChildren(message);
     } else {
       alertModal(error.message);

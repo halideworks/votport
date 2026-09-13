@@ -329,7 +329,7 @@ export function announce(id, text) {
 }
 
 // Undo toasts: the page changes at once, the server call waits six seconds
-// for an Undo, and a tab closed inside the window commits with keepalive.
+// for an Undo. Interaction pauses the window; pagehide commits with keepalive.
 const undoQueue = createUndoQueue();
 window.addEventListener('pagehide', () => { undoQueue.flush(); });
 
@@ -352,7 +352,7 @@ toastStack();
 /// Shows `text` with an Undo button. `commit` runs when the window closes
 /// (pass fetch options with keepalive so it survives unload); `restore`
 /// runs on Undo. Resolves with whether it committed, once settled.
-export function undoable({ text, commit, restore = () => {} }) {
+export function undoable({ text, commit, restore = () => {}, focus, returnFocus }) {
   const stack = toastStack();
   const toast = document.createElement('div');
   toast.className = 'toast';
@@ -376,6 +376,10 @@ export function undoable({ text, commit, restore = () => {} }) {
       },
       restore,
       onSettled: (committed) => {
+        if (toast.contains(document.activeElement)) {
+          returnFocus.textContent = failure ? 'Action could not be confirmed.' : committed ? text : 'Action undone.';
+          returnFocus.focus({ preventScroll: true });
+        }
         toast.classList.add('leaving');
         setTimeout(() => toast.remove(), 250);
         if (failure) {
@@ -388,6 +392,15 @@ export function undoable({ text, commit, restore = () => {} }) {
       },
     });
     undo.addEventListener('click', () => handle.undo());
+    toast.addEventListener('pointerenter', () => handle.pause());
+    toast.addEventListener('pointerleave', () => {
+      if (!toast.contains(document.activeElement)) handle.resume();
+    });
+    toast.addEventListener('focusin', () => handle.pause());
+    toast.addEventListener('focusout', (event) => {
+      if (!toast.contains(event.relatedTarget) && !toast.matches(':hover')) handle.resume();
+    });
+    if (focus) undo.focus();
   });
 }
 

@@ -11,6 +11,7 @@ function fakeTimers() {
     clearTimer: (id) => timers.delete(id),
     fire: () => { for (const [id, { fn }] of [...timers]) { timers.delete(id); fn(); } },
     get armed() { return timers.size; },
+    get delays() { return [...timers.values()].map(({ ms }) => ms); },
   };
 }
 
@@ -68,4 +69,41 @@ test('a failing commit still reports settled', async () => {
   });
   await assert.rejects(handle.commitNow(), /offline/);
   assert.deepEqual(settled, [true]);
+});
+
+
+test('interaction pauses the window, leaving grants a fresh full window', async () => {
+  const clock = fakeTimers(), calls = [];
+  const queue = createUndoQueue({ ...clock, delayMs: 100 });
+  const handle = queue.add({ commit: () => calls.push('commit'), restore: () => calls.push('restore') });
+  handle.pause(); handle.pause();
+  assert.equal(clock.armed, 0);
+  clock.fire();
+  assert.equal(queue.size, 1);
+  assert.deepEqual(calls, []);
+  handle.resume(); handle.resume();
+  assert.equal(clock.armed, 1);
+  assert.deepEqual(clock.delays, [100]);
+  clock.fire();
+  await new Promise((resolve) => setImmediate(resolve));
+  handle.resume(); await handle.undo(); await queue.flush();
+  assert.equal(clock.armed, 0);
+  assert.deepEqual(calls, ['commit']);
+});
+
+test('Undo and pagehide settle paused entries once, including a pending commit', async () => {
+  const clock = fakeTimers(), calls = [];
+  const queue = createUndoQueue({ ...clock, delayMs: 100 });
+  const first = queue.add({ commit: () => calls.push('first'), restore: () => calls.push('restored') });
+  first.pause(); await first.undo(); first.resume();
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const second = queue.add({ commit: async () => { calls.push('second'); await pending; }, onSettled: () => calls.push('settled') });
+  second.pause();
+  const flushing = queue.flush();
+  await queue.flush(); await second.undo(); second.resume(); clock.fire();
+  assert.deepEqual(calls, ['restored', 'second']);
+  assert.equal(queue.size, 0); assert.equal(clock.armed, 0);
+  release(); await flushing;
+  assert.deepEqual(calls, ['restored', 'second', 'settled']);
 });

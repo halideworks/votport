@@ -373,6 +373,102 @@ try {
   await page.locator(`#link-${incoming.id}`).getByText('Reception workflow', { exact: true }).click();
   await layout('existing-reception-workflow');
 
+  await page.goto(`${base}/receive?search=${incoming.id}#link-${incoming.id}`);
+  const actionCard = page.locator(`#link-${incoming.id}`);
+  await actionCard.getByRole('button', { name: 'Deactivate', exact: true }).focus();
+  await page.keyboard.press('Enter');
+  const undo = page.locator('#toast-stack').getByRole('button', { name: 'Undo', exact: true });
+  await undo.waitFor();
+  assert.ok(await undo.evaluate((node) => node === document.activeElement), 'Keyboard row action must focus its Undo');
+  await undo.hover(); await page.mouse.move(0, 0);
+  await page.waitForTimeout(6200);
+  assert.equal((await api('admin/links')).links.find((link) => link.id === incoming.id).active, true, 'Focused Undo pauses the server commit');
+  await page.keyboard.press('Enter'); await undo.waitFor({ state: 'detached' });
+  assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'Undo returns focus to the request status');
+  await page.route('**/api/admin/links?*', async (route) => {
+    const response = await route.fetch();
+    await actionCard.getByRole('button', { name: 'Copy', exact: true }).focus();
+    await route.fulfill({ response });
+  }, { times: 1 });
+  await actionCard.getByRole('button', { name: 'Deactivate', exact: true }).focus();
+  await page.keyboard.press('Enter'); await undo.waitFor();
+  assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'Undo must not steal the fallback of a newly focused row control');
+  await undo.focus(); await page.keyboard.press('Enter'); await undo.waitFor({ state: 'detached' });
+
+  for (const moveFocus of [false, true]) {
+    await page.route(`**/api/admin/links/${incoming.id}`, async (route) => {
+      await route.fetch();
+      if (moveFocus) await page.locator('#links-query').focus();
+      await route.fulfill({ status: 503, json: { error: 'Lost action response fixture' } });
+    }, { times: 1 });
+    await actionCard.getByRole('button', { name: 'Deactivate', exact: true }).focus();
+    await page.keyboard.press('Enter'); await undo.waitFor();
+    await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
+    await page.getByRole('dialog', { name: 'Something went wrong', exact: true }).waitFor();
+    assert.equal((await api('admin/links')).links.find((link) => link.id === incoming.id).active, false);
+    if (!moveFocus) assert.equal(await page.locator('#links-action-status').textContent(), 'Action could not be confirmed.', 'A lost response must not claim that a committed action was undone');
+    await page.locator('#confirm-cancel').press('Enter');
+    assert.ok(await page.locator(moveFocus ? '#links-query' : '#links-action-status').evaluate((node) => node === document.activeElement), 'Closing the error preserves the current keyboard position');
+    await api(`admin/links/${incoming.id}`, { active: true });
+    await page.reload();
+  }
+  await actionCard.getByRole('button', { name: 'Legal hold', exact: true }).focus();
+  await page.keyboard.press('Enter');
+  await page.getByText('Legal hold set.', { exact: true }).waitFor();
+  assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'Immediate row replacement retains keyboard position');
+  await actionCard.getByRole('button', { name: 'Release hold', exact: true }).focus();
+  await page.keyboard.press('Enter'); await undo.waitFor();
+  assert.ok(await undo.evaluate((node) => node === document.activeElement));
+  await page.goto(`${base}/storage`);
+  await page.waitForFunction(() => document.querySelector('#receiving-storage'));
+  assert.equal((await api('admin/links')).links.find((link) => link.id === incoming.id).legal_hold, false, 'Pagehide commits even while Undo is focused');
+
+  await page.goto(`${base}/receive?search=${incoming.id}#link-${incoming.id}`);
+  await actionCard.waitFor();
+  await page.route('**/api/admin/links?*', async (route) => {
+    const response = await route.fetch();
+    await page.locator('#links-query').focus();
+    await route.fulfill({ response });
+  }, { times: 1 });
+  await actionCard.getByRole('button', { name: 'Deactivate', exact: true }).focus();
+  await page.keyboard.press('Enter'); await undo.waitFor();
+  assert.ok(await page.locator('#links-query').evaluate((node) => node === document.activeElement), 'A delayed refresh must not steal newly moved focus');
+  await undo.hover(); await undo.focus(); await page.locator('#links-query').focus();
+  await page.waitForTimeout(6200);
+  assert.equal((await api('admin/links')).links.find((link) => link.id === incoming.id).active, true, 'Hover also pauses Undo');
+  await page.mouse.move(0, 0);
+  await undo.waitFor({ state: 'detached', timeout: 10000 });
+  assert.equal((await api('admin/links')).links.find((link) => link.id === incoming.id).active, false, 'Leaving Undo resumes its unattended commit');
+  assert.ok(await page.locator('#links-query').evaluate((node) => node === document.activeElement));
+  await api(`admin/links/${incoming.id}`, { active: true });
+
+  const fileRequest = (await api('admin/links', { label: `Files ${id}`, dest: `${id}-focus-files` })).link;
+  await page.goto(fileRequest.url);
+  await page.setInputFiles('#file-input', ['one.txt', 'two.txt'].map((name) => ({ name, mimeType: 'text/plain', buffer: Buffer.from(name) })));
+  await page.click('#send'); await page.locator('#done-card:not([hidden])').waitFor({ timeout: 30000 });
+  await page.goto(`${base}/receive?search=${fileRequest.id}#link-${fileRequest.id}`);
+  const fileCard = page.locator(`#link-${fileRequest.id}`), clearRecord = fileCard.getByRole('button', { name: 'Clear record', exact: true, includeHidden: true });
+  await clearRecord.waitFor({ state: 'attached' }); await openAncestors(clearRecord);
+  await clearRecord.focus(); await page.keyboard.press('Enter'); await undo.waitFor();
+  assert.ok(await undo.evaluate((node) => node === document.activeElement), 'Clearing a transfer record focuses Undo');
+  await page.keyboard.press('Enter'); await undo.waitFor({ state: 'detached' });
+  await clearRecord.waitFor();
+  assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement));
+  await page.route('**/api/admin/links?*', (route) => route.fulfill({ status: 503 }), { times: 2 });
+  await clearRecord.focus(); await page.keyboard.press('Enter'); await undo.waitFor();
+  await page.keyboard.press('Enter'); await undo.waitFor({ state: 'detached' });
+  assert.ok(await clearRecord.isEnabled(), 'Undo re-enables a retained button when list refreshes fail');
+  const deleteFile = fileCard.getByRole('button', { name: 'Delete file', exact: true }).first();
+  await openAncestors(deleteFile); await deleteFile.focus(); await page.keyboard.press('Enter');
+  await page.locator('#confirm-ok').press('Enter');
+  await page.waitForFunction(() => document.querySelector('#links-action-status').textContent.startsWith('Deleted "'));
+  assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'File deletion retains keyboard position');
+  const deleteFiles = fileCard.getByRole('button', { name: 'Delete stored files', exact: true });
+  await openAncestors(deleteFiles); await deleteFiles.focus(); await page.keyboard.press('Enter');
+  await page.locator('#confirm-ok').press('Enter');
+  await page.getByText('Deleted 1 stored file.', { exact: true }).waitFor();
+  assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'Batch file deletion retains keyboard position');
+
   const status = await api('admin/status'); status.receiving = [];
   await page.route('**/api/admin/status?*', (route) => route.fulfill({ json: status }));
   async function pollStatus() {
@@ -398,6 +494,7 @@ try {
   await editor.locator('input[data-metadata]').fill('Unsaved reception draft');
   releaseList(); await page.waitForLoadState('networkidle');
   assert.equal(await editor.locator('input[data-metadata]').inputValue(), 'Unsaved reception draft', 'A response already in flight preserves the draft');
+  assert.ok(await editor.locator('input[data-metadata]').evaluate((node) => node === document.activeElement), 'A retained dirty editor keeps its focused input');
   await editor.evaluate((node) => { node.open = false; });
   status.receiving = [];
   await pollStatus();
@@ -435,6 +532,7 @@ try {
   const extraDialogs = []; const onExtra = (dialog) => extraDialogs.push(dialog.message()); page.on('dialog', onExtra);
   await page.locator('#confirm-ok').click(); await card.waitFor({ state: 'detached' }); await page.waitForLoadState('networkidle');
   page.off('dialog', onExtra); assert.deepEqual(extraDialogs, [], 'Confirmed deletion removes the request draft without another discard prompt');
+  assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'Deleting the request keeps a keyboard focus target');
 
   await page.goto(`${base}/storage`);
   let releaseInitial, initialStarted, initialReads = 0;
