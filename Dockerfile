@@ -27,8 +27,10 @@ RUN git clone --filter=blob:none "$VOT_GIT" /vot \
     && git -C /vot checkout "$VOT_REV"
 RUN cd /vot \
     && cargo build --release -p vot-wasm --target wasm32-unknown-unknown --locked
+COPY scripts/stamp-wasm.sh /stamp-wasm.sh
 RUN wasm-bindgen --target web --no-typescript --out-dir /wasm-vendor \
-    /vot/target/wasm32-unknown-unknown/release/vot_wasm.wasm
+    /vot/target/wasm32-unknown-unknown/release/vot_wasm.wasm \
+    && sh /stamp-wasm.sh /wasm-vendor
 
 # Server.
 COPY LICENSE /src/LICENSE

@@ -13,7 +13,7 @@ $outputProfile = if ($BuildProfile -eq "dev") { "debug" } else { $BuildProfile }
 
 Push-Location $client
 try {
-    cargo build --profile $BuildProfile -p votport-client-core -p votport-client
+    cargo build --locked --profile $BuildProfile -p votport-client-core -p votport-client
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
     uniffi-bindgen-cs --library "$target\$outputProfile\votport_client_core.dll" --out-dir "$target\bindings-cs"
     if ($LASTEXITCODE -ne 0) { throw "uniffi-bindgen-cs failed" }

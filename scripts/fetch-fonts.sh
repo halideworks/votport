@@ -47,9 +47,9 @@ if len(out) == 0:
     raise SystemExit("no latin @font-face blocks found; not writing fonts.css")
 
 open('web/assets/fonts.css', 'w').write(
-    "// Self-hosted Google Fonts (latin subsets), OFL 1.1:\n"
-    "// Libre Caslon Display, Plus Jakarta Sans, JetBrains Mono.\n"
-    "// Regenerate with scripts/fetch-fonts.sh if weights change.\n"
+    "/* Self-hosted Google Fonts (latin subsets), OFL 1.1:\n"
+    " * Libre Caslon Display, Plus Jakarta Sans, JetBrains Mono.\n"
+    " * Regenerate with scripts/fetch-fonts.sh if weights change. */\n"
     + "\n".join(out) + "\n"
 )
 print(f"{len(out)} faces written")
