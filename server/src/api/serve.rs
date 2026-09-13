@@ -550,8 +550,10 @@ fn ensure_manifest(
             Ok(root)
         }
         _ => {
-            let root = write_manifest(&directory, entries)
-                .map_err(|error| ApiError::internal(format!("grant manifest: {error}")))?;
+            let root = write_manifest(&directory, entries).map_err(|error| {
+                tracing::error!(grant_id = %grant.id, %error, "grant manifest preparation failed");
+                ApiError::internal("delivery preparation failed")
+            })?;
             app.store
                 .put_outbound_grant_manifest(&grant.id, &hex::encode(root), now_unix())
                 .map_err(super::store_unavailable)?;
@@ -636,9 +638,8 @@ pub(crate) fn ensure_server(
             for entry in &entries {
                 let _ = std::fs::remove_file(leaf_cache_path(&proofs, &entry.object));
             }
-            return Err(ApiError::internal(format!(
-                "assemble grant server: {error:?}"
-            )));
+            tracing::error!(grant_id = %grant.id, ?error, "grant server assembly failed");
+            return Err(ApiError::internal("delivery preparation failed"));
         }
     };
     serve
@@ -1303,6 +1304,54 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().contains(".stage-"))
             .count();
         assert_eq!(leftovers, 0);
+    }
+
+    #[tokio::test]
+    async fn grant_preparation_errors_keep_internal_details_out_of_responses() {
+        use http_body_util::BodyExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::api::testing::config(directory.path());
+        config.serve_bind = Some("127.0.0.1:0".parse().unwrap());
+        let app = crate::app::build(config).unwrap();
+        std::fs::write(app.config.outbound_dir.join("file.bin"), b"payload").unwrap();
+        let mut grant = crate::store::tests::test_outbound_grant("grant", "", 0);
+        grant.files = vec![crate::store::OutboundGrantFile {
+            source: "file.bin".into(),
+            name: "file.bin".into(),
+            suite: "blake3".into(),
+            root: "00".repeat(32),
+            bytes: 7,
+            receipt_b64: String::new(),
+            downloads: 0,
+            first_download_at: None,
+            last_download_at: None,
+        }];
+        app.store.insert_outbound_grant(grant.clone()).unwrap();
+        let manifest = manifest_directory(&app, &grant.id);
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(&manifest, b"blocks publication").unwrap();
+        for phase in ["manifest", "assembly"] {
+            let result = ensure_server(&app, app.serve.as_ref().unwrap(), &grant);
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("{phase} unexpectedly succeeded"),
+            };
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                payload["error"], "delivery preparation failed",
+                "{phase}: {payload}"
+            );
+            assert_eq!(payload["retryable"], true);
+            assert!(!std::str::from_utf8(&bytes)
+                .unwrap()
+                .contains(directory.path().to_str().unwrap()));
+            if phase == "manifest" {
+                std::fs::remove_file(&manifest).unwrap();
+            }
+        }
     }
 
     #[test]
