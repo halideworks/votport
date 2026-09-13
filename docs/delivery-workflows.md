@@ -170,10 +170,10 @@ Source changes fail verification; no hidden payload snapshot or copy is required
 Failures remain visible and can be retried or cancelled. Raw sharing cannot
 bypass a reception job's release policy.
 
-**Storage > Add storage > Destination type** offers S3, a shared folder, or
-another Votport. A shared folder must already be mounted and visible to the
-server process, including through a container mount when applicable. Votport
-connections save the other port's receive URL and optional password privately.
+**Storage > Add storage > Destination type** offers S3 or a shared folder.
+A shared folder must already be mounted and visible to the server process,
+including through a container mount when applicable. Connect another Votport
+through **Trade routes**, which manages paired port connections separately.
 **Test saved connection** checks access without sending files.
 
 Select up to 16 destinations in **Workflows > Projects > Destinations**.

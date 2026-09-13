@@ -3,8 +3,7 @@
 A small, self-hosted **file transfer portal** built on
 [VOT (Verified Object Transfer)](https://github.com/halideworks/VOT).
 
-You sign in to the admin UI (`/receive`, `/deliver`, `/tenants`, `/audit`,
-`/system`), create
+You sign in to the admin UI, open **Receive**, create
 a unique request link (with an optional password), and send it to someone. They
 open it in a browser, drop files on the page, and the files land, cryptographically
 verified, atomically published, never overwriting anything, in a folder you
@@ -82,7 +81,7 @@ browser and builds the server. Then add the site to your Caddyfile (see
 
 ```caddy
 drop.example.com {
- reverse_proxy 127.0.0.1:8321
+ reverse_proxy 127.0.0.1:8103
 }
 ```
 
@@ -114,10 +113,11 @@ content volumes still need operator-owned file backups.
 ## Configuration
 
 Environment variables are the boot defaults (see `docker-compose.yml`). A
-default-tenant admin can overlay notify channels, retention, and default
-quotas from **System** without SSH (`GET`/`PUT /api/admin/settings`). The same
-page configures automatic local and S3-compatible backups, reports redacted
-status, and stages restores for the service supervisor. Backup archives include
+platform admin can configure the SMTP relay, retention, and default quotas
+from **System** without SSH (`GET`/`PUT /api/admin/settings`). Configure named
+notification destinations and tenant defaults on **Notifications**.
+The System page configures automatic local and S3-compatible backups, reports
+redacted status, and stages restores for the service supervisor. Backup archives include
 the database and VOTPort-managed identity files only; a blank local path uses
 `<data_dir>/backups` (normally `/data/backups`), while a custom path must be a
 writable service-filesystem path mounted by the operator. S3 prefix settings
@@ -131,6 +131,12 @@ the row so env applies again. Details: [`docs/deployment.md`](docs/deployment.md
 Boolean settings accept `1/true/yes/on` and `0/false/no/off`, ignoring case and
 surrounding whitespace. Unset settings use the defaults below; empty or invalid
 boolean values stop startup.
+
+The table covers common settings. See the configuration references for
+[session limits](docs/deployment.md#udp-socket-buffers-quic-push-and-deliver),
+[SSO roles and session lifetime](docs/deployment.md#single-sign-on),
+[JSON logs](docs/deployment.md#logs), and
+[workflow snapshot budgets](docs/delivery-workflows.md#storage-templates-and-quarantine).
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -191,11 +197,11 @@ redirect URI `<public-url>/api/admin/callback`) and the login page gains a
 authorization-code with PKCE; the id token is verified against the provider's
 JWKS, with issuer, audience and nonce checks.
 
-Roles come from the provider's `groups` claim: members of
-`VOTPORT_OIDC_ADMIN_GROUP` sign in as administrators, everyone else as
-viewers with read-only dashboard access. When the group is unset, every
-principal your provider authenticates is an administrator — votport warns
-loudly at startup.
+Roles use provider and SCIM group membership. `VOTPORT_OIDC_ADMIN_GROUP`
+members are administrators; otherwise `VOTPORT_OIDC_AUDITOR_GROUP` members
+get audit-only access, and everyone else is a read-only viewer. Admin
+membership takes precedence. When the admin group is unset, every authenticated
+principal is an administrator and votport warns at startup.
 
 Local password sign-in always remains available as the break-glass path,
 including when SSO is configured. `POST /api/admin/login` is never disabled.
@@ -302,8 +308,13 @@ hashed, verified range by range, independent of every proxy in between.
 5. **Tenants** (platform admin): namespaces, quotas, principals, revoke.
 6. **Audit:** queryable event log and JSONL export.
 7. **System:** password, automatic backup configuration/status/restore,
-   database snapshot download, receipt public key, notify/SMTP, retention,
+   database snapshot download, receipt public key, SMTP relay, retention,
    default quotas.
+
+The navigation also includes **Workflows**, **Trade routes**, **Storage**,
+**Automation**, and **Notifications** for project deliveries, connected ports,
+storage connections, scoped tokens, and notification destinations. Available
+pages depend on the signed-in role; auditors see **Audit** only.
 
 Senders can drop folders as well as files; browser support requires
 WebAssembly SIMD and module workers (Safari 16.4, Chrome 91, Firefox 114 or
@@ -313,21 +324,21 @@ newer).
 
 Agents can browse a scoped library folder, create and recover expiring delivery
 links, inspect object identities and download activity, and revoke their own
-links. Issue a token with explicit permissions from **Deliver** or the desktop
+links. Issue a token with explicit permissions from **Automation** or the desktop
 app's **Settings > Agent access**. The client CLI provides JSON `agent` commands
 and `votport mcp`; desktop builds bundle the CLI and can copy its MCP
 configuration. See [agent setup, API, and retry semantics](docs/agents.md).
 
 ### Automation shares
 
-Create a tenant-scoped automation token on **Deliver**. The raw token is shown
+Create a tenant-scoped automation token on **Automation**. The raw token is shown
 once, so copy it immediately; revoke it and create another if it is lost.
 Use the token to share a server-relative outbound directory from the CLI (up
 to 1,000,000 files per share):
 
 ```sh
 export VOTPORT_URL=https://drop.example.com
-export VOTPORT_AUTOMATION_TOKEN='<token from Deliver>'
+export VOTPORT_AUTOMATION_TOKEN='<token from Automation>'
 # Optional password for the outbound link:
 export VOTPORT_SHARE_PASSWORD='use-a-separate-secret'
 votport share project/render --expires 7d --label "Client delivery" --max-downloads 1

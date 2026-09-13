@@ -486,6 +486,7 @@ failure makes the core attempt `POST /api/session/{sid}/abort` and return the
 error. It does not open an HTTP session for that attempt. HTTP fallback is
 limited to push being disabled or unreachable before preflight; a certificate
 digest mismatch or preflight refusal is an error. The next transfer probes again.
+Desktop Settings has no transport override.
 
 The HTTP fallback is the exact session API `upload.js` speaks and the
 `/api/s/{token}/batch` and per-file routes for receive. It is not a second
@@ -599,35 +600,13 @@ highlight borders anywhere; a selected transfer expands.
 
 ### Repository layout
 
-```
-client/
-  core/            votport-core: the Rust crate, its own workspace like server/
-    Cargo.toml     [workspace] empty, VOT git deps at the server's pin
-    src/
-      api.rs       HTTPS client for the routes above (reqwest, rustls)
-      identity.rs  device key, keychain adapters, link password store
-      package.rs   manifest builder, in-place hashing, in-memory proof leaves
-      transfer.rs  the transfer state machine and observer
-      send.rs      push path and HTTP session path
-      receive.rs   fetch path, HTTP path, publish with receipt
-      probe.rs     the UDP handshake probe
-      journal.rs   SQLite persistence and resume at launch
-      watch.rs     watch folders (notify crate), debounce, one drop per settle
-      verify.rs    receipt verification
-      ffi.rs       the UniFFI surface: commands in, change stream out
-    votport_core.udl
-  cli/             votport: send, receive, verify, watch, status; JSON lines
-  macos/           Xcode project, SwiftUI, the generated Swift package
-  windows/         Visual Studio solution, WinUI 3, C#, the generated bindings
-  design/          tokens.json (generated), app icons, fonts
-```
-
-`client/core` mirrors `server/Cargo.toml`: an empty `[workspace]` so it
-never joins a surrounding workspace, the quiche patch, and the VOT git
-dependencies at the same revision as the server. The repin procedure
-gains one sync point, `client/core/Cargo.toml` and its lock. Cargo target
-directories under `client/` follow the `target-*` naming and go into
-`.dockerignore` with the server's, so an image build never ships them.
+The [client Cargo workspace](../client/Cargo.toml) contains the shared Rust
+[core](../client/core/), the [CLI](../client/cli/), and the
+[UniFFI binding generator](../client/uniffi-bindgen/). It owns the client
+lockfile and quiche patch; the core's VOT dependencies use the server's pin.
+The [macOS](../client/macos/) and [Windows](../client/windows/) directories
+contain the native shells and their build scripts.
+[Design assets](../client/design/) include generated design tokens.
 
 ### The transfer state machine
 
@@ -661,11 +640,10 @@ are coalesced to ten per second before they cross the FFI.
 4. If `push` is true: the probe against the address and digest from
    `GET /api/push-identity`. If it completes, `POST /api/r/{token}/push`
    with the holder key and the package descriptor, then
-   `push_from(assembled server, options)` with rails `min(cores, 4)` and
-   the observer (four, because the push listener admits eight sessions
-   in total and a rail is a session; VOT change 6 lifts this). Only a disabled
-   push listener or an unreachable carrier before preflight selects the HTTP
-   session; failures after preflight end the attempt:
+   `push_from(assembled server, options)` with four rails, reduced to one
+   for macOS loopback, and the observer. Fetch uses the same rail selection.
+   Only a disabled push listener or an unreachable carrier before preflight
+   selects HTTP; failures after preflight end the attempt. The HTTP path is
    `POST /api/r/{token}/session`, seal, pages, begin, chunks with the
    server's `chunk_bytes` and parallel ranges, finish. The HTTP finish
    report and the push's completed cursor both end the transfer; the core
@@ -705,7 +683,7 @@ are coalesced to ten per second before they cross the FFI.
   bounded by the source disk; native on an M-series or a desktop Ryzen
   should read at the disk's rate (2 to 7 GB/s on NVMe, the NAS's rate on
   a NAS). Measure on the Studio and the Windows desktop in C1.
-- Push: four rails in version one (eight after VOT change 6), sixteen
+- Push: four rails, reduced to one for macOS loopback, sixteen
   objects in flight (ADR-0051), FEC automatic,
   the sender's per-byte cost is the read plus AES-GCM. The single-transfer
   ceiling is a per-byte copy cost inside quiche and BLAKE3, the same one
@@ -737,10 +715,10 @@ certificate. Minimum Windows 10 22H2 (the SDK's build floor is 10.0.19041). The 
 generated C# bindings.
 
 CLI (`client/cli`): `votport send <link> <path>...`, `votport receive
-<link> <dest>`, `votport verify <receipt> <file>`, `votport watch <dir>
-<link>`, `votport status`. Every command prints JSON lines on `--json`
-(the change stream verbatim) and a human progress line otherwise. The
-Linux build is the agent's base and the facility's headless watch folder.
+<link> <dest>`, `votport status`, and `votport resume <id>`. `votport help`
+lists the watch, agent, and operator commands. A standalone command to verify
+receipts is unimplemented; use the server's `/verify` page for a file and its
+receipt. The Linux build supports headless sending, receiving, and watch folders.
 
 Operator mode (phase C8, every shell and the CLI): sign in to a votport
 with the admin password (`POST /api/admin/login`, the same session
@@ -822,7 +800,8 @@ one votport repin across the server, the client, and the docs.
    before accept. The cap becomes a per-peer cap plus
    a larger global one that the receiver sets (mirroring item 6 of the
    serve seam in `docs/deliver-over-quic.md`), so a client can use eight
-   rails without starving the next. Until it lands the client uses four.
+   rails without starving the next. The current client uses four rails,
+   reduced to one for macOS loopback.
 
 ## Platform build status
 
