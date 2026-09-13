@@ -196,7 +196,12 @@ async fn pull_replica(
         .await
         .map_err(|error| error.to_string())??
     };
-    crate::backup::write_pending_restore(&config.data_dir, stage_cleanup, manifest.clone())?;
+    crate::backup::write_pending_restore(
+        &config.data_dir,
+        stage_cleanup,
+        manifest.clone(),
+        crate::backup::RestoreMode::Replica,
+    )?;
     Ok(manifest)
 }
 
@@ -470,6 +475,7 @@ mod tests {
             data,
             crate::backup::CleanupPath::directory(data.join(".votport-restore-stage-live")),
             manifest,
+            crate::backup::RestoreMode::Replica,
         )
         .unwrap();
         assert_eq!(sweep_orphans(data).unwrap(), 2);

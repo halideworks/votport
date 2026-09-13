@@ -224,7 +224,7 @@ pub(super) fn receive_pending(
     tenant: &str,
     link_id: &str,
 ) -> rusqlite::Result<bool> {
-    connection.prepare_cached("SELECT EXISTS(SELECT 1 FROM delivery_jobs WHERE tenant=?1 AND json_extract(document,'$.received.link_id')=?2 AND json_extract(document,'$.received') IS NOT NULL AND state<>'retired')")?.query_row(params![tenant,link_id], |row|row.get(0))
+    connection.prepare_cached("SELECT EXISTS(SELECT 1 FROM delivery_jobs WHERE tenant=?1 AND json_extract(document,'$.received.link_id')=?2 AND json_extract(document,'$.received') IS NOT NULL AND state NOT IN ('retired','suspended'))")?.query_row(params![tenant,link_id], |row|row.get(0))
 }
 
 pub(super) fn set_receive_workflow(
@@ -808,7 +808,7 @@ impl Store {
                 "SELECT document FROM delivery_jobs WHERE tenant=?1 AND id>?2
                  AND (?4 IS NULL OR project_id IN (SELECT value FROM json_each(?4)))
                  AND (?5='' OR state=?5
-                    OR (?5='attention' AND state IN ('awaiting_approval','failed','retrying'))
+                    OR (?5='attention' AND state IN ('awaiting_approval','failed','retrying','suspended'))
                     OR (?5='active' AND state IN ('queued','preparing','exporting','retrying')))
                  AND (?6='' OR instr(lower(json_extract(document,'$.request.label')),lower(?6))>0
                     OR instr(lower(json_extract(document,'$.project.label')),lower(?6))>0
@@ -931,6 +931,9 @@ impl Store {
         let project = project_in(&tx, tenant, &job.project.id)
             .map_err(|e| e.to_string())?
             .ok_or("project missing")?;
+        if job.state == "suspended" {
+            return Err("delivery is held after restore; create a new job".into());
+        }
         match action {
             "approve" => {
                 if actor.starts_with("automation:")
@@ -1040,8 +1043,8 @@ impl Store {
             .map_err(|e| e.to_string())?
             .filter(|job| job.tenant == tenant)
             .ok_or("job missing")?;
-        if ["retiring", "retired"].contains(&job.state.as_str()) {
-            return Err("delivery has been retired; create a new job".into());
+        if ["retiring", "retired", "suspended"].contains(&job.state.as_str()) {
+            return Err("delivery is no longer active; create a new job".into());
         }
         if job.token_generation != generation {
             return Err("delivery changed; reload before rotating".into());

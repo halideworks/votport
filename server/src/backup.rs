@@ -138,10 +138,18 @@ struct PendingRestore {
     stage: String,
     version: u32,
     manifest: Manifest,
+    mode: RestoreMode,
     #[serde(default)]
     phase: RestorePhase,
     #[serde(default)]
     rollback: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RestoreMode {
+    Historical,
+    Replica,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -906,18 +914,65 @@ fn validate_database_connection(
     crate::store::validate_schema(connection, schema_version)
 }
 
-fn disable_restored_backups(path: &Path, schema_version: u64) -> Result<(), String> {
-    let connection =
+fn prepare_restored_database(
+    path: &Path,
+    schema_version: u64,
+    mode: RestoreMode,
+) -> Result<(), String> {
+    let mut connection =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
-            .map_err(|e| format!("cannot disable restored backups: {e}"))?;
+            .map_err(|e| format!("cannot prepare restored database: {e}"))?;
     // SQLite must recover a hot rollback journal before validating a resumed restore.
     validate_database_connection(&connection, schema_version)?;
     let _: String = connection
         .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
-        .map_err(|e| format!("cannot disable restored backups: {e}"))?;
-    connection
+        .map_err(|e| format!("cannot prepare restored database: {e}"))?;
+    let transaction = connection.transaction().map_err(|e| e.to_string())?;
+    transaction
         .execute("DELETE FROM settings WHERE key = ?1", [SETTING_KEY])
-        .map_err(|e| format!("cannot disable restored backups: {e}"))?;
+        .map_err(|e| e.to_string())?;
+    if mode == RestoreMode::Historical {
+        let at = now().min(i64::MAX as u64) as i64;
+        for table in ["outbound_grants", "automation_tokens", "inbound_routes"] {
+            transaction
+                .execute(
+                    &format!("UPDATE {table} SET revoked_at=?1 WHERE revoked_at IS NULL"),
+                    [at],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        for (key, value) in [
+            ("scim_token", ""),
+            ("scim_token_previous", ""),
+            ("replica_token", ""),
+            ("upload_retention_days", "0"),
+        ] {
+            transaction.execute(
+                "INSERT INTO settings(key,value,updated_at,updated_by) VALUES (?1,?2,?3,'restore')
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at,updated_by=excluded.updated_by",
+                rusqlite::params![key, value, at],
+            ).map_err(|e| e.to_string())?;
+        }
+        transaction.execute_batch(
+            "UPDATE links SET active=0;
+             DELETE FROM upload_session_files;
+             DELETE FROM upload_sessions;
+             DELETE FROM outbound_fetch_tickets;
+             UPDATE delivery_storage SET document=json_set(document,'$.enabled',json('false'));
+             UPDATE notification_destinations SET document=json_set(document,'$.enabled',json('false'));
+             UPDATE delivery_webhooks SET enabled=0;
+             UPDATE trade_routes SET credential='',enrollment=NULL,
+                 document=json_set(document,'$.state','revoked','$.cancel_active',json('false'),
+                     '$.error','Restored from backup; create a new invitation to reconnect.');
+             DELETE FROM trade_rotations;
+             DELETE FROM trade_invitations;
+             UPDATE delivery_jobs SET state='suspended',owner='',
+                 document=json_set(document,'$.state','suspended',
+                     '$.error','Held after restoring a backup. Create a new job to deliver these files.')
+                 WHERE state<>'suspended';"
+        ).map_err(|e| e.to_string())?;
+    }
+    transaction.commit().map_err(|e| e.to_string())?;
     drop(connection);
     File::open(path)
         .map_err(|e| e.to_string())?
@@ -932,6 +987,7 @@ pub(crate) fn write_pending_restore(
     data_dir: &Path,
     mut extracted: CleanupPath,
     manifest: Manifest,
+    mode: RestoreMode,
 ) -> Result<(), String> {
     let previous = read_pending_restore(data_dir)?;
     if previous
@@ -955,6 +1011,7 @@ pub(crate) fn write_pending_restore(
         stage: stage_name.to_owned(),
         version: VERSION,
         manifest,
+        mode,
         phase: RestorePhase::Prepared,
         rollback: None,
     };
@@ -1083,9 +1140,7 @@ pub fn apply_pending_restore(data_dir: &Path, schema_version: u64) -> Result<(),
         persist_pending_restore(data_dir, &marker)?;
     }
 
-    // Historical backup destinations must never become active with the
-    // deployment's current credentials. An admin explicitly re-enables them.
-    disable_restored_backups(&data_dir.join("votport.db"), schema_version)?;
+    prepare_restored_database(&data_dir.join("votport.db"), schema_version, marker.mode)?;
 
     // Restoring data must invalidate every pre-restore browser session. If a
     // crash occurs after this write, the existing new secret is retained.
@@ -1957,6 +2012,7 @@ mod tests {
             root.path(),
             CleanupPath::directory(stage.clone()),
             manifest.clone(),
+            RestoreMode::Historical,
         )
         .unwrap();
         let original = fs::read(root.path().join(PENDING_FILE)).unwrap();
@@ -1967,6 +2023,7 @@ mod tests {
             root.path(),
             CleanupPath::directory(new.clone()),
             manifest.clone(),
+            RestoreMode::Historical,
         );
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         assert!(failed.is_err(), "test requires an unprivileged user");
@@ -1980,6 +2037,7 @@ mod tests {
             root.path(),
             CleanupPath::directory(new.clone()),
             manifest.clone(),
+            RestoreMode::Historical,
         )
         .unwrap();
         assert_eq!(
@@ -2003,7 +2061,8 @@ mod tests {
             assert!(write_pending_restore(
                 root.path(),
                 CleanupPath::directory(stage.clone()),
-                manifest.clone()
+                manifest.clone(),
+                RestoreMode::Historical,
             )
             .unwrap_err()
             .contains("being applied"));
@@ -2025,8 +2084,13 @@ mod tests {
         fs::create_dir(&stage).unwrap();
         let manifest =
             validate_and_extract(&archive, &stage, crate::store::SCHEMA_VERSION).unwrap();
-        write_pending_restore(root.path(), CleanupPath::directory(stage.clone()), manifest)
-            .unwrap();
+        write_pending_restore(
+            root.path(),
+            CleanupPath::directory(stage.clone()),
+            manifest,
+            RestoreMode::Historical,
+        )
+        .unwrap();
         fs::write(stage.join("receipt.key"), b"tampered").unwrap();
         drop(store);
         assert!(apply_pending_restore(root.path(), crate::store::SCHEMA_VERSION).is_err());
@@ -2118,6 +2182,7 @@ mod tests {
                         stage: ".votport-restore-stage-test".into(),
                         version: VERSION,
                         manifest,
+                        mode: RestoreMode::Historical,
                         phase,
                         rollback: Some(".votport-restore-rollback-test".into()),
                     },
@@ -2192,8 +2257,13 @@ mod tests {
         fs::write(root.path().join("secret"), [9; 32]).unwrap();
         fs::write(root.path().join("votport.db-wal"), b"stale-wal").unwrap();
         fs::write(root.path().join("votport.db-shm"), b"stale-shm").unwrap();
-        write_pending_restore(root.path(), CleanupPath::directory(stage.clone()), manifest)
-            .unwrap();
+        write_pending_restore(
+            root.path(),
+            CleanupPath::directory(stage.clone()),
+            manifest,
+            RestoreMode::Historical,
+        )
+        .unwrap();
         apply_pending_restore(root.path(), crate::store::SCHEMA_VERSION).unwrap();
         let secret = fs::read(root.path().join("secret")).unwrap();
         assert_ne!(secret, [7; 32]);
@@ -2210,6 +2280,265 @@ mod tests {
                 .starts_with(".votport-restore-rollback-")));
         let restored = crate::store::Store::open(root.path()).unwrap();
         assert_eq!(restored.setting(SETTING_KEY).unwrap(), None);
+    }
+
+    #[test]
+    fn historical_restore_suspends_authority_and_preserves_evidence_while_replica_resumes() {
+        use crate::store::tests::{test_link, test_outbound_grant};
+        use crate::workflow::tests::{project, request};
+        use rusqlite::params;
+        for mode in [RestoreMode::Historical, RestoreMode::Replica] {
+            let (root, store) = initialized_root();
+            store.insert_link(test_link("link")).unwrap();
+            let project = store.save_delivery_project("", "admin", project()).unwrap();
+            let mut jobs = Vec::new();
+            for state in [
+                "queued",
+                "preparing",
+                "exporting",
+                "failed",
+                "ready",
+                "retired",
+            ] {
+                let mut request = request();
+                request.operation_id = state.into();
+                let mut job = store
+                    .enqueue_delivery_job("", "sender", 1, None, project.clone(), request)
+                    .unwrap();
+                job.state = state.into();
+                job.checks["snapshot_bytes"] = serde_json::json!(17);
+                job.checks["route_revocations"] =
+                    serde_json::json!({"destination":{"state":"pending"}});
+                let mut grant = test_outbound_grant(&job.id, "", 0);
+                grant.expires_at = now() + 3600;
+                if state == "retired" {
+                    grant.revoked_at = Some(7);
+                }
+                if state == "exporting" {
+                    job.received = Some(crate::workflow::Received {
+                        link_id: "link".into(),
+                        upload_id: "upload".into(),
+                    });
+                }
+                store.insert_outbound_grant(grant).unwrap();
+                let source = store
+                    .event_signer
+                    .sign_route(crate::route_protocol::RouteDocument {
+                        issuer: store.event_signer.public_hex.clone(),
+                        operation_id: job.id.clone(),
+                        manifest: "ab".repeat(32),
+                        label: "delivery".into(),
+                        metadata: Default::default(),
+                        parent_receipt: None,
+                        visited: vec![store.event_signer.public_hex.clone()],
+                        permission: None,
+                    });
+                store.with(|c| {
+                    c.execute("UPDATE delivery_jobs SET state=?2,deadline=1,document=?3 WHERE id=?1", params![job.id, state, serde_json::to_string(&job).unwrap()])?;
+                    c.execute("INSERT INTO outbound_routes(job_id,destination_id,origin,route_id,peer_key,source) VALUES (?1,'destination','http://localhost','route',?2,?3)", params![job.id,store.event_signer.public_hex,serde_json::to_string(&source).unwrap()])?;
+                    Ok(())
+                }).unwrap();
+                jobs.push((job, source));
+            }
+            store.with(|c| c.execute_batch(
+                "INSERT INTO settings(key,value,updated_at) VALUES ('backup_config','{}',1),('scim_token','current',1),('scim_token_previous','previous',1),('replica_token','replica',1),('upload_retention_days','30',1);
+                 INSERT INTO delivery_storage(id,revision,document) VALUES ('destination',1,'{\"enabled\":true}');
+                 INSERT INTO delivery_storage_credentials(id,document) VALUES ('destination','{\"secret\":\"kept\"}');
+                 INSERT INTO notification_destinations(id,tenant,document) VALUES ('notify','','{\"enabled\":true,\"token\":\"kept\"}');
+                 INSERT INTO delivery_webhooks(tenant,url,secret,revision,enabled,cursor) VALUES ('','http://localhost','kept',1,1,0);
+                 INSERT INTO delivery_webhook_attempts(tenant,event_id,revision,status,next_try) VALUES ('',1,1,'pending',0);
+                 INSERT INTO automation_tokens(id,token_hash,tenant,label,created_at,expires_at) VALUES ('agent','agent-token','','agent',1,9223372036854775807);
+                 INSERT INTO trade_routes(id,tenant,direction,peer_key,endpoint,document,credential,enrollment) VALUES ('trade','','incoming','peer','link','{\"state\":\"active\",\"cancel_active\":true}','credential','{}');
+                 INSERT INTO trade_endpoints(id,tenant,document) VALUES ('link','','{}');
+                 INSERT INTO trade_invitations(id,tenant,endpoint,secret_hash,expected_key,expires_at) VALUES ('invitation','','link','secret','peer',9223372036854775807);
+                 INSERT INTO trade_rotations(route_id,credential) VALUES ('trade','next');
+                 INSERT INTO inbound_routes(id,tenant,link_id,issuer,operation_id,source,ancestry,created_at) VALUES ('inbound','','link','peer','operation','{}','[]',1);
+                 INSERT INTO outbound_fetch_tickets(token_id,grant_id,manifest_root,expires_at) VALUES ('ticket','grant','root',9223372036854775807);
+                 INSERT INTO upload_sessions(id,link_id,tenant,dest_dir,dest_rel,package_suite,package_root,package_length,started_at,created_at) VALUES ('session','link','','dir','dir',1,'root',1,1,1);
+                 INSERT INTO upload_session_files(session_id,entry,display_path,stored_components,object_suite,object_root,object_length,staging_path,journal_path,incarnation) VALUES ('session',0,'file','[]',1,'root',1,'stage','journal','incarnation');"
+            )).unwrap();
+            let archive = root.path().join("restore.tar");
+            create_archive(&store, root.path(), &archive, crate::store::SCHEMA_VERSION).unwrap();
+            drop(store);
+            let stage = root.path().join(".votport-restore-stage-policy");
+            fs::create_dir(&stage).unwrap();
+            let manifest =
+                validate_and_extract(&archive, &stage, crate::store::SCHEMA_VERSION).unwrap();
+            write_pending_restore(root.path(), CleanupPath::directory(stage), manifest, mode)
+                .unwrap();
+            assert_eq!(
+                read_pending_restore(root.path()).unwrap().unwrap().mode,
+                mode
+            );
+            let marker_path = root.path().join(PENDING_FILE);
+            let marker = fs::read(&marker_path).unwrap();
+            for value in [None, Some("unknown")] {
+                let mut invalid: serde_json::Value = serde_json::from_slice(&marker).unwrap();
+                if let Some(value) = value {
+                    invalid["mode"] = serde_json::json!(value);
+                } else {
+                    invalid.as_object_mut().unwrap().remove("mode");
+                }
+                fs::write(&marker_path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+                assert!(read_pending_restore(root.path()).is_err());
+            }
+            fs::write(&marker_path, marker).unwrap();
+            apply_pending_restore(root.path(), crate::store::SCHEMA_VERSION).unwrap();
+            prepare_restored_database(
+                &root.path().join("votport.db"),
+                crate::store::SCHEMA_VERSION,
+                mode,
+            )
+            .unwrap();
+            let store = crate::store::Store::open(root.path()).unwrap();
+            let historical = mode == RestoreMode::Historical;
+            assert_eq!(store.link("", "link").unwrap().unwrap().active, !historical);
+            assert!(store.setting(SETTING_KEY).unwrap().is_none());
+            for (key, previous) in [
+                ("scim_token", "current"),
+                ("scim_token_previous", "previous"),
+                ("replica_token", "replica"),
+                ("upload_retention_days", "30"),
+            ] {
+                assert_eq!(
+                    store.setting(key).unwrap().as_deref(),
+                    Some(if historical {
+                        if key == "upload_retention_days" {
+                            "0"
+                        } else {
+                            ""
+                        }
+                    } else {
+                        previous
+                    })
+                );
+            }
+            for (job, source) in &jobs {
+                let restored = store.delivery_job(&job.id).unwrap().unwrap();
+                assert_eq!(
+                    restored.state,
+                    if historical { "suspended" } else { &job.state }
+                );
+                assert_eq!(restored.checks, job.checks);
+                assert_eq!(
+                    store
+                        .outbound_grant_by_id(&job.id)
+                        .unwrap()
+                        .unwrap()
+                        .revoked_at
+                        .is_some(),
+                    historical || job.state == "retired"
+                );
+                if job.state == "retired" {
+                    assert_eq!(
+                        store
+                            .outbound_grant_by_id(&job.id)
+                            .unwrap()
+                            .unwrap()
+                            .revoked_at,
+                        Some(7)
+                    );
+                }
+                let saved: String = store
+                    .with(|c| {
+                        c.query_row(
+                            "SELECT source FROM outbound_routes WHERE job_id=?1",
+                            [&job.id],
+                            |row| row.get(0),
+                        )
+                    })
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<crate::route_protocol::SignedRoute>(&saved).unwrap(),
+                    *source
+                );
+                if historical {
+                    assert!(!restored.released());
+                    for action in ["approve", "retry", "cancel"] {
+                        assert!(store
+                            .change_delivery_job("", &job.id, "sender", true, action, None)
+                            .unwrap_err()
+                            .contains("held after restore"));
+                    }
+                    assert!(store
+                        .rotate_delivery_job_token("", &job.id, 0, "new")
+                        .is_err());
+                    assert!(store
+                        .extend_outbound_grant("", &job.id, 3600, now())
+                        .is_err());
+                }
+            }
+            for query in [
+                "SELECT COUNT(*) FROM upload_sessions", "SELECT COUNT(*) FROM upload_session_files",
+                "SELECT COUNT(*) FROM outbound_fetch_tickets", "SELECT COUNT(*) FROM trade_invitations",
+                "SELECT COUNT(*) FROM trade_rotations", "SELECT COUNT(*) FROM automation_tokens WHERE revoked_at IS NULL",
+                "SELECT COUNT(*) FROM inbound_routes WHERE revoked_at IS NULL",
+                "SELECT COUNT(*) FROM delivery_storage WHERE json_extract(document,'$.enabled')=1",
+                "SELECT COUNT(*) FROM notification_destinations WHERE json_extract(document,'$.enabled')=1",
+                "SELECT COUNT(*) FROM delivery_webhooks WHERE enabled=1",
+                "SELECT COUNT(*) FROM trade_routes WHERE credential='credential' AND enrollment IS NOT NULL AND json_extract(document,'$.state')='active'",
+            ] {
+                let count: i64 = store.with(|c| c.query_row(query, [], |row| row.get(0))).unwrap();
+                assert_eq!(count, i64::from(!historical), "{query}");
+            }
+            assert_eq!(
+                store
+                    .with(|c| c.query_row(
+                        "SELECT document FROM delivery_storage_credentials WHERE id='destination'",
+                        [],
+                        |row| row.get::<_, String>(0)
+                    ))
+                    .unwrap(),
+                "{\"secret\":\"kept\"}"
+            );
+            assert_eq!(
+                store
+                    .with(|c| c.query_row(
+                        "SELECT COUNT(*) FROM delivery_webhook_attempts",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    ))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                store.receive_workflow_pending("", "link").unwrap(),
+                !historical
+            );
+            if historical {
+                assert!(store
+                    .claim_delivery_job("new-owner", now())
+                    .unwrap()
+                    .is_none());
+                assert!(store
+                    .claim_snapshot_retirement(now() + 30 * 86400)
+                    .unwrap()
+                    .is_none());
+                assert!(store.claim_route_revocation(now()).unwrap().is_none());
+                let events = store
+                    .with(|c| {
+                        c.query_row("SELECT COUNT(*) FROM delivery_events", [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                    })
+                    .unwrap();
+                store.escalate_delivery_jobs(now()).unwrap();
+                assert_eq!(
+                    store
+                        .with(|c| c
+                            .query_row("SELECT COUNT(*) FROM delivery_events", [], |row| row
+                                .get::<_, i64>(0)))
+                        .unwrap(),
+                    events
+                );
+                store.queue_delivery_webhooks(now()).unwrap();
+                assert!(store.due_delivery_webhooks(now()).unwrap().is_empty());
+                assert!(store
+                    .authenticate_automation_token("agent-token", now())
+                    .unwrap()
+                    .is_none());
+            }
+        }
     }
 
     #[test]

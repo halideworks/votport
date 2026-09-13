@@ -1742,7 +1742,7 @@ impl Store {
         let transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
-        let routes_pending: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM outbound_routes r JOIN delivery_jobs j ON j.id=r.job_id WHERE j.tenant=?1 AND r.ack IS NULL)",[key],|row|row.get(0)).map_err(|e|e.to_string())?;
+        let routes_pending: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM outbound_routes r JOIN delivery_jobs j ON j.id=r.job_id WHERE j.tenant=?1 AND j.state<>'suspended' AND r.ack IS NULL)",[key],|row|row.get(0)).map_err(|e|e.to_string())?;
         if routes_pending {
             return Ok(TenantRemoval::HasRoutes);
         }
@@ -3313,9 +3313,9 @@ impl Store {
             .transaction()
             .map_err(|error| error.to_string())?;
         let result = (|| {
-            let retired: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM delivery_jobs WHERE id=?1 AND tenant=?2 AND state IN ('retiring','retired'))",rusqlite::params![id,tenant],|row| row.get(0)).map_err(|error| error.to_string())?;
+            let retired: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM delivery_jobs WHERE id=?1 AND tenant=?2 AND state IN ('retiring','retired','suspended'))",rusqlite::params![id,tenant],|row| row.get(0)).map_err(|error| error.to_string())?;
             if retired {
-                return Err("delivery has been retired; create a new job".into());
+                return Err("delivery is no longer active; create a new job".into());
             }
             let existing: Option<i64> = transaction
                 .query_row(
@@ -4816,7 +4816,7 @@ pub fn now_unix() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]

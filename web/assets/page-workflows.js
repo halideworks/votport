@@ -8,7 +8,7 @@ const value = (id) => $(id).value.trim();
 const optionalNumber = (id) => value(id) ? Number(value(id)) : null;
 const localTime = (id) => value(id) ? Math.floor(new Date(value(id)).getTime() / 1000) : null;
 const node = (tag, content, className = '') => { const element = document.createElement(tag); element.textContent = content; element.className = className; return element; };
-const stateNames = { queued: 'Scheduled', preparing: 'Preparing files', awaiting_approval: 'Needs approval', exporting: 'Delivering copies', retrying: 'Retry scheduled', ready: 'Ready to share', failed: 'Needs attention', cancelled: 'Cancelled', retiring: 'Cleaning up', retired: 'Archived' };
+const stateNames = { queued: 'Scheduled', preparing: 'Preparing files', awaiting_approval: 'Needs approval', exporting: 'Delivering copies', retrying: 'Retry scheduled', ready: 'Ready to share', failed: 'Needs attention', cancelled: 'Cancelled', retiring: 'Cleaning up', retired: 'Archived', suspended: 'Held after restore' };
 let projectNotifications, jobNotifications;
 let projects = [], storage = [], jobs = [], cursor = null, eventCursor = 0, attemptCursor = 0, jobsRevision = 0;
 const eventPage = [];
@@ -236,14 +236,14 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
     if (url && job.state !== 'ready') card.append(node('p', 'Local download link is released. Destination copies are still pending.', 'info-banner'));
     if (job.received) {
       const source = node('a', 'View incoming request →', 'text-link'); source.href = `/receive?search=${encodeURIComponent(job.received.link_id)}#link-${job.received.link_id}`; card.append(source);
-      if (job.state !== 'retired') card.append(node('p', 'This delivery uses the original received files. Keep them unchanged until the delivery is archived. Automatic archival occurs seven days after cancellation, failure, or link expiry or revocation.', 'field-help'));
+      if (!['retired', 'suspended'].includes(job.state)) card.append(node('p', 'This delivery uses the original received files. Keep them unchanged until the delivery is archived. Automatic archival occurs seven days after cancellation, failure, or link expiry or revocation.', 'field-help'));
     }
     for (const id of job.project.destinations) {
       const result = job.checks.destinations?.[id], receipt = job.checks.route_receipts?.[id], revoked = job.checks.route_revocations?.[id];
       const leg = node('div', '', 'destination-status'), name = storage.find((item) => item.id === id)?.label || id;
-      const status = result?.state === 'complete' ? (receipt ? 'Destination signed its receipt' : 'Verified copy complete') : result?.state === 'sending' ? `${formatBytes(result.transferred)} transferred this attempt` : result?.error || 'Pending';
+      const status = job.state === 'suspended' ? 'Historical record; no further transfers will run.' : result?.state === 'complete' ? (receipt ? 'Destination signed its receipt' : 'Verified copy complete') : result?.state === 'sending' ? `${formatBytes(result.transferred)} transferred this attempt` : result?.error || 'Pending';
       leg.append(node('p', `${name}: ${status}`, result?.error ? 'error' : 'connection-meta'));
-      if (revoked || (receipt && ['cancelled', 'retiring', 'retired'].includes(job.state))) {
+      if (job.state !== 'suspended' && (revoked || (receipt && ['cancelled', 'retiring', 'retired'].includes(job.state)))) {
         leg.append(node('p', revoked?.state === 'acknowledged' ? 'Revocation acknowledged by the destination port.' : `Revocation awaiting destination acknowledgment.${revoked?.retry_at ? ` Next attempt ${formatWhen(revoked.retry_at)}.` : ''}`, 'field-help'));
       }
       if (receipt) leg.append(button('Download custody evidence', 'tiny ghost', () => download(`trade-route-${job.id}-${id}.json`, {
@@ -281,7 +281,7 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
       }
     })));
     if (['failed', 'retrying'].includes(job.state)) actions.append(button('Retry', 'ghost', () => guard(async () => { await api(`/api/workflows/jobs/${job.id}`, { method: 'POST', body: JSON.stringify({ action: 'retry' }) }); await refreshJobs(); })));
-    if (!['cancelled', 'retired', 'retiring'].includes(job.state)) actions.append(button('Cancel delivery', 'danger', () => guard(async () => {
+    if (!['cancelled', 'retired', 'retiring', 'suspended'].includes(job.state)) actions.append(button('Cancel delivery', 'danger', () => guard(async () => {
       if (await confirmModal('Cancel delivery', 'Stop downloads here and request revocation at connected ports? Each port will stop route-managed sharing and forwarding. Downloaded files and independent copies remain.', 'Cancel delivery')) {
         await api(`/api/workflows/jobs/${job.id}`, { method: 'POST', body: JSON.stringify({ action: 'cancel' }) }); await refreshJobs();
       }
@@ -296,7 +296,7 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
 }
 function schedulePoll() {
   clearTimeout(poll);
-  if (!document.hidden && section() === 'jobs' && $('workflow-create').hidden && jobs.some(({ job }) => (['queued', 'preparing', 'exporting', 'retrying'].includes(job.state) || Object.values(job.checks.route_revocations || {}).some((route) => route.state === 'pending'))) && !appendedJobs) {
+  if (!document.hidden && section() === 'jobs' && $('workflow-create').hidden && jobs.some(({ job }) => job.state !== 'suspended' && (['queued', 'preparing', 'exporting', 'retrying'].includes(job.state) || Object.values(job.checks.route_revocations || {}).some((route) => route.state === 'pending'))) && !appendedJobs) {
     poll = setTimeout(() => { if (!editingJob()) guard(() => refreshJobs(false, true)); else schedulePoll(); }, 10000);
   }
 }

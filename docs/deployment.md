@@ -295,15 +295,25 @@ With the default compose restart policy, the process restart request is
 observed by the supervisor and the service comes back. Without a supervisor,
 the action only stages the restore: stop the container or process, then start
 it manually so boot can apply the pending restore. Never copy a live `-wal`
-over a restored database. The install clears the restored backup destination
-and leaves automatic backups disabled, preventing historical S3 targets from
-receiving data with current credentials. Re-save and re-enable backup settings
-after verifying the deployment.
+over a restored database. Historical restore disables request links, revokes
+download links and automation tokens, and disables SCIM and replica tokens.
+Trade connections require new invitations. Delivery jobs remain visible as
+**Held after restore** and require new submissions; their files and signed
+evidence remain. Pending transfers and route-control messages do not resume.
+
+Automatic backups, received-file retention, storage exports, notifications and
+webhooks stay disabled until an administrator reviews and re-enables them.
+Disabled storage and notification destinations retain their saved credentials.
+Restore still loads the archived users, roles and administrator password;
+review access and reconcile the file volumes before enabling links or retention.
 
 Restore creates a fresh cookie-signing key and signs out existing sessions.
 Plan to sign in again after restart. Archives use format version 2; older
 archives containing a cookie-signing secret are refused. Create a new backup
 after upgrading, and keep older archives private until they can be discarded.
+Finish any pending restore with its existing binary before upgrading. The
+pending marker records whether installation is historical restore or replica
+promotion; markers without that purpose are refused.
 
 For a manual restore, use the System action or place a validated archive in
 the pending restore workflow; do not copy archive members directly over a live
@@ -684,7 +694,10 @@ Layout:
   an initialized, compatible database. A fresh standby must first receive a
   valid replica; an interrupted first pull cannot create an empty live
   instance. Like any restore, promotion rotates the cookie secret, so every admin signs in
-  again; receipt and push identities carry over. Upgrade the standby binary
+  again; receipt and push identities carry over. Replica promotion preserves
+  the snapshot's links, credentials, jobs and resume records. Historical-restore
+  suspension does not apply to promotion. Automatic backups remain disabled
+  until reconfigured. Upgrade the standby binary
   alongside the live one: replica pulls require matching archive formats and database schemas.
   If a promotion boot is interrupted mid-restore, run `votport` normally to
   finish it before returning the directory to standby mode. The RPO is the

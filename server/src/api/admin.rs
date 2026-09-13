@@ -1833,8 +1833,13 @@ pub async fn restore_backup(
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
     .map_err(ApiError::internal)?;
-    crate::backup::write_pending_restore(&app.config.data_dir, stage_cleanup, result.clone())
-        .map_err(ApiError::internal)?;
+    crate::backup::write_pending_restore(
+        &app.config.data_dir,
+        stage_cleanup,
+        result.clone(),
+        crate::backup::RestoreMode::Historical,
+    )
+    .map_err(ApiError::internal)?;
     app.store.audit(
         "",
         &identity.subject,
