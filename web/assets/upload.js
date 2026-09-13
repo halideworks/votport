@@ -47,7 +47,7 @@ let uploading = false;
 let cancelled = false;
 let allowHidden = true; // the server's VOTPORT_ALLOW_HIDDEN, from the link info
 let maxEntries = 20000; // the server's package entry cap, from the link info
-let controller = null; // aborts in-flight requests when the sender cancels
+let controller = null; // aborts in-flight requests on cancellation or refusal
 
 // ------------------------------------------------------------- hash workers
 // Hashing and the merkle trees live in workers so the page stays responsive
@@ -219,6 +219,7 @@ class Cancelled extends Error {
 
 function checkCancelled() {
   if (cancelled) throw new Cancelled();
+  if (controller?.signal.aborted) throw controller.signal.reason;
 }
 
 // Offers the desktop app the same link: `votport://<kind>/<token>?base=<origin>`,
@@ -591,9 +592,8 @@ async function postWithRetry(path, options = {}) {
       resumePhase();
       return body;
     } catch (error) {
-      if (cancelled) throw new Cancelled();
-      // A user cancel is the only thing that aborts in-flight requests, so
-      // an AbortError here is a network-layer pause unless cancel won the race.
+      checkCancelled();
+      // An AbortError outside the shared controller is a network-layer pause.
       const transient = error.transient
         || error.name === 'AbortError'
         || error instanceof TypeError
@@ -604,7 +604,7 @@ async function postWithRetry(path, options = {}) {
   }
 }
 
-// Sleep that wakes early when the sender cancels.
+// Sleep that wakes early on cancellation or a sibling's permanent refusal.
 function sleepCancellable(ms) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -612,10 +612,10 @@ function sleepCancellable(ms) {
       resolve();
     }, ms);
     const poll = setInterval(() => {
-      if (!cancelled) return;
+      if (!cancelled && !controller?.signal.aborted) return;
       clearTimeout(timer);
       clearInterval(poll);
-      reject(new Cancelled());
+      reject(cancelled ? new Cancelled() : controller.signal.reason);
     }, 250);
   });
 }
@@ -747,13 +747,13 @@ async function uploadEntryChunks(sessionId, entryIndex, item, from, onProgress) 
         if (BigInt(start) !== range.offset || BigInt(length) !== range.want) {
           throw new Error('a proof covered an unexpected range; retry the upload');
         }
-        const data = new Uint8Array(await file.slice(start, start + length).arrayBuffer());
-        if (data.length !== length) {
-          throw new Error(`"${item.path}" changed while uploading; pick it again`);
+        const data = await file.slice(start, start + length).arrayBuffer().catch(() => null);
+        if (!data || data.byteLength !== length) {
+          throw Object.assign(new Error(`"${item.path}" changed while uploading; pick it again`), {
+            sourceChanged: true,
+          });
         }
-        const body = new Uint8Array(proof.bytes.length + data.length);
-        body.set(proof.bytes, 0);
-        body.set(data, proof.bytes.length);
+        const body = new window.Blob([proof.bytes, data]);
         const progress = await postWithRetry(
           `/api/session/${sessionId}/chunk?entry=${entryIndex}&offset=${start}`,
           {
@@ -772,6 +772,7 @@ async function uploadEntryChunks(sessionId, entryIndex, item, from, onProgress) 
           throw Object.assign(new Error('server restarted; resuming'), { rebegin: true });
         }
       } catch (error) {
+        if (error.sourceChanged || error.fatal) controller?.abort(error);
         failure ||= error;
       }
     }
@@ -1017,9 +1018,12 @@ async function runUpload() {
         clearResume();
         return;
       } catch (error) {
-        // Only a deliberate cancel throws the session away. A network failure
-        // or dead worker pauses and retries this same session; the partially
-        // written bytes stay on the server until it goes idle.
+        // Another sender's refusal can follow an earlier restart response.
+        if (controller?.signal.aborted) {
+          error = cancelled ? new Cancelled() : controller.signal.reason;
+        }
+        // A network failure or dead worker retries this same session;
+        // partially written bytes stay on the server until it goes idle.
         if (error.cancelled) {
           await abortSession(sessionId);
           throw error;
@@ -1034,7 +1038,7 @@ async function runUpload() {
           }
           continue;
         }
-        if (error.status === 422 || error.status === 409) {
+        if (error.status === 422 || error.status === 409 || error.sourceChanged) {
           // Refused for good: abort so the server records what did publish
           // now (a swept session would only do so after the idle timeout)
           // and the next send dedupes it instead of landing suffixed copies.
@@ -1264,6 +1268,8 @@ $('upload-form').addEventListener('submit', async (event) => {
   try {
     await runUpload();
   } catch (error) {
+    // All range senders have settled; the build check needs a live signal.
+    if (!cancelled && controller?.signal.aborted) controller = new AbortController();
     // Any failure but a deliberate cancel may be a stale tab after a deploy;
     // the reload only happens when the server's build hash actually differs.
     if (!error.cancelled) await reloadIfServerUpdated();
@@ -1274,15 +1280,14 @@ $('upload-form').addEventListener('submit', async (event) => {
       || error.status === 410
       || /unknown or expired session/.test(error.message);
     if (expired) clearResume();
-    // A refusal is not a network story: the server said why, and whether
-    // anything landed decides the advice.
-    const unverified = error.status === 422 || error.status === 409;
+    // Permanent refusals need corrected files, with any deliveries kept.
+    const unverified = error.status === 422 || error.status === 409 || error.sourceChanged;
     const kept = deliveredPaths.size;
     const keptNote = keptPhrase(kept);
     fail(error.cancelled
       ? error.message
       : unverified
-        ? `${error.message}.${keptNote} ${kept ? 'Fix the rest and send them again.' : 'Nothing was delivered; fix the selection and send again.'}`
+        ? `${error.message}.${keptNote} ${kept ? 'Fix the rest and send them again.' : 'Any files already delivered are kept. Fix the selection and send again.'}`
         : expired
           ? `${error.message}.${keptNote} The partial transfer was discarded, reselect the same files to send them again from the start.`
           : `${error.message}.${keptNote} Reselect the same files to resume where this stopped.`);
