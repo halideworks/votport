@@ -84,7 +84,10 @@ impl NotificationPolicy {
                     .len()
                     != rule.events.len()
             {
-                return Err("Choose supported events for each destination".into());
+                return Err(format!(
+                    "Choose distinct supported events for each destination: {}",
+                    events.join(", ")
+                ));
             }
         }
         Ok(())

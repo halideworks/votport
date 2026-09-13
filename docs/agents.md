@@ -211,3 +211,5 @@ after missed notifications. Audit rows attribute creation and revocation to
 `automation:<token-id>` and creation records include the operation ID.
 
 Notification destinations are discoverable through `GET /api/automation/notifications`, `votport agent notifications`, and MCP `list_notification_destinations`. Share and job creation accept the `notifications` policy documented in [Notifications](notifications.md).
+
+The automation catalog's `events` object lists allowed values by MCP tool name: `create_delivery` contains `outbound_download_started` and `outbound_delivery_complete`; `create_job` also contains `workflow_retry_scheduled` and `workflow_failed`. These sets apply to `POST /api/automation/share` and `POST /api/workflows/jobs`, respectively. The administrator catalog's event list includes all tenant-default events; upload and route events cannot be selected for share or job creation. Unsupported events return HTTP 422 with the supported values.

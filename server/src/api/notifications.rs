@@ -77,7 +77,9 @@ pub(crate) fn catalog(app: &App, tenant: &str, with_recipients: bool) -> ApiResu
         Json(json!({"destinations":destinations,
         "defaults":app.store.notification_defaults(tenant).map_err(store_unavailable)?,
         "outcomes":app.store.notification_outcomes(tenant).map_err(store_unavailable)?,
-        "events":NOTIFICATION_EVENTS})),
+        "events":if with_recipients { json!(NOTIFICATION_EVENTS) } else {
+            json!({"create_delivery":DOWNLOAD_EVENTS,"create_job":WORKFLOW_EVENTS})
+        }})),
     )
         .into_response())
 }
@@ -372,6 +374,7 @@ mod tests {
         )
         .await;
         assert!(catalog["destinations"].as_array().unwrap().is_empty());
+        assert_eq!(catalog["events"], json!(NOTIFICATION_EVENTS));
         assert!(
             validate_policy(&app, "b", &policy(id, "upload_complete"), &UPLOAD_EVENTS).is_err()
         );
