@@ -2700,6 +2700,10 @@ pub fn router(app: Arc<App>) -> Router {
                 .layer(DefaultBodyLimit::max(4096)),
         )
         .route(
+            "/api/workflows/jobs/{id}/reprocess",
+            post(api::outbound::workflows::reprocess).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
             "/api/workflows/jobs/{id}/evidence",
             get(api::outbound::workflows::evidence),
         )
