@@ -28,7 +28,7 @@ public static class Protocol
             using var icon = key.CreateSubKey("DefaultIcon");
             icon.SetValue("", Path.Combine(AppContext.BaseDirectory, "Assets", "tray.ico"));
             using var command = key.CreateSubKey(@"shell\open\command");
-            command.SetValue("", $"\"{exe}\" ----ms-protocol:%1");
+            command.SetValue("", Command(exe));
         }
         catch (Exception)
         {
@@ -36,6 +36,8 @@ public static class Protocol
             // app works without it.
         }
     }
+
+    internal static string Command(string executable) => $"\"{executable}\" \"----ms-protocol:%1\"";
 
     private static bool IsPackaged()
     {

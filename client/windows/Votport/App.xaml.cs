@@ -1,6 +1,5 @@
 using Microsoft.UI.Xaml;
 using Microsoft.Windows.AppLifecycle;
-using Windows.ApplicationModel.Activation;
 
 namespace Votport;
 
@@ -30,18 +29,10 @@ public partial class App : Application
             Exit();
             return;
         }
-        main.Activated += (_, e) => Window?.DispatcherQueue.TryEnqueue(() =>
-        {
-            // A link clicked in a browser reaches an app that may be minimized
-            // or behind other windows.
-            Window.Raise();
-            Activate(e);
-        });
+        var dispatcher = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
+        main.Activated += (_, e) => dispatcher.TryEnqueue(() => Activate(e));
 
         Window = new MainWindow();
-        // Started with Windows: stay in the tray until the icon is clicked.
-        if (Environment.GetCommandLineArgs().Contains("--minimized")) Window.AppWindow.Hide();
-        else Window.Activate();
         Protocol.RegisterIfUnpackaged();
         // The Run value names this executable; a moved or updated build
         // rewrites it so the next boot still finds the app.
@@ -50,9 +41,6 @@ public partial class App : Application
         PortStore.Shared.Load();
         TransferStore.Shared.StartWatching();
         if (TransferStore.Shared.Items.Count > 0) Window.Show("transfers");
-        // Launch-time work must not wait for the window: a headless run
-        // (over ssh, into the console session) still has to move bytes.
-        Launch.StartFromArguments(Environment.GetCommandLineArgs());
         Activate(activation);
     }
 
@@ -65,10 +53,15 @@ public partial class App : Application
 
     private static void Activate(AppActivationArguments activation)
     {
-        if (activation.Kind != ExtendedActivationKind.Protocol) return;
-        if (activation.Data is IProtocolActivatedEventArgs protocol)
+        var request = ActivationRequest.Parse(activation.Kind, activation.Data);
+        Window?.ShowActivationError(request.Error);
+        if (request.Minimized) Window?.AppWindow.Hide();
+        else Window?.Raise();
+        if (request.Protocol is Uri uri) Launch.OpenUrl(uri);
+        else if (request.ReceiveLink is string link && request.Destination is string destination)
         {
-            Launch.OpenUrl(protocol.Uri);
+            TransferStore.Shared.Receive(link, null, destination, request.SnapshotPath);
+            Window?.Show("transfers");
         }
     }
 }

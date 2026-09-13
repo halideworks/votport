@@ -102,6 +102,12 @@ public sealed partial class MainWindow : Window
         Activate();
     }
 
+    internal void ShowActivationError(string? message)
+    {
+        ActivationError.Message = message ?? "";
+        ActivationError.IsOpen = message is not null;
+    }
+
     /// Shows a section. Selecting it navigates; when it is already selected
     /// (which fires no change event) this navigates itself, so a prefill
     /// handed in by a votport: link is read by a fresh page either way.

@@ -7,16 +7,12 @@ using Windows.Storage.Streams;
 namespace Votport;
 
 /// `--snapshot <png>` writes the window's own rendering when a transfer
-/// ends, so a headless run (over ssh, into the console session) still
-/// leaves a picture of what the user would see.
+/// started by that CLI activation ends. Other transfers do not inherit it.
 public static class Snapshot
 {
-    public static void WriteIfRequested()
+    public static void WriteIfRequested(string? path)
     {
-        var arguments = Environment.GetCommandLineArgs();
-        var flag = Array.IndexOf(arguments, "--snapshot");
-        if (flag < 0 || arguments.Length <= flag + 1 || App.Window is null) return;
-        var path = arguments[flag + 1];
+        if (path is null || App.Window is null) return;
         // One more layout pass so the final phase is drawn before it is read.
         App.Window.DispatcherQueue.TryEnqueue(async () =>
         {

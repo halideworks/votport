@@ -17,6 +17,7 @@ public sealed class TransferItem : INotifyPropertyChanged
     /// What the user pointed at: the dropped paths or the destination folder.
     public string Subject { get; init; } = "";
     public string Link { get; init; } = "";
+    internal string? SnapshotPath { get; set; }
     public DateTime Started { get; init; } = DateTime.Now;
     private string[] landed = Array.Empty<string>();
 
@@ -173,9 +174,10 @@ public sealed class TransferStore
         });
     }
 
-    public void Receive(string link, string? password, string destination)
+    public void Receive(string link, string? password, string destination, string? snapshotPath = null)
     {
         var item = Start(TransferItem.Kinds.Receive, destination, link);
+        item.SnapshotPath = snapshotPath;
         Run(item, (transfer, listener) =>
         {
             try
@@ -342,7 +344,7 @@ public sealed class TransferStore
         handles.Remove(item.Id);
         ActiveChanged?.Invoke(ActiveCount);
         Notifier.TransferEnded(item);
-        Snapshot.WriteIfRequested();
+        Snapshot.WriteIfRequested(item.SnapshotPath);
     }
 
     /// The core's callback target for one transfer. Called on the core's
@@ -366,21 +368,9 @@ public sealed class TransferStore
     }
 }
 
-/// `Votport --receive <link> <dir>` starts a receive at launch, once per
-/// process; `votport:` links from the web pages prefill a page.
+/// `votport:` links from web pages prefill a page.
 public static class Launch
 {
-    public static bool Done { get; private set; }
-
-    public static void StartFromArguments(string[] arguments)
-    {
-        var flag = Array.IndexOf(arguments, "--receive");
-        if (Done || flag < 0 || arguments.Length <= flag + 2) return;
-        Done = true;
-        TransferStore.Shared.Receive(arguments[flag + 1], null, arguments[flag + 2]);
-        App.Window?.Show("transfers");
-    }
-
     /// A votport: link opened from a web page prefills the page it names.
     public static void OpenUrl(Uri url)
     {
