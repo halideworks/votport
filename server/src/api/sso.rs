@@ -16,7 +16,7 @@ use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use hmac::Mac as _;
-use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreResponseType};
+use openidconnect::core::{self, CoreProviderMetadata, CoreResponseType};
 use openidconnect::reqwest;
 use openidconnect::{
     AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
@@ -30,19 +30,63 @@ use sha2::Digest as _;
 use crate::app::App;
 use crate::auth;
 
+#[derive(Debug, Deserialize, Serialize)]
+struct GroupClaims {
+    #[serde(default)]
+    groups: Vec<String>,
+    #[serde(default)]
+    hasgroups: bool,
+    #[serde(default, rename = "_claim_names")]
+    claim_names: std::collections::HashMap<String, String>,
+}
+
+impl openidconnect::AdditionalClaims for GroupClaims {}
+
+impl GroupClaims {
+    fn direct_groups(&self) -> Result<&[String], &'static str> {
+        if self.hasgroups || self.claim_names.contains_key("groups") {
+            Err("overage or distributed group claims are not supported")
+        } else {
+            Ok(&self.groups)
+        }
+    }
+}
+
+type GroupClient = openidconnect::Client<
+    GroupClaims,
+    core::CoreAuthDisplay,
+    core::CoreGenderClaim,
+    core::CoreJweContentEncryptionAlgorithm,
+    core::CoreJsonWebKey,
+    core::CoreAuthPrompt,
+    openidconnect::StandardErrorResponse<core::CoreErrorResponseType>,
+    openidconnect::StandardTokenResponse<
+        openidconnect::IdTokenFields<
+            GroupClaims,
+            openidconnect::EmptyExtraTokenFields,
+            core::CoreGenderClaim,
+            core::CoreJweContentEncryptionAlgorithm,
+            core::CoreJwsSigningAlgorithm,
+        >,
+        core::CoreTokenType,
+    >,
+    core::CoreTokenIntrospectionResponse,
+    core::CoreRevocableToken,
+    core::CoreRevocationErrorResponse,
+    openidconnect::EndpointSet,
+    openidconnect::EndpointNotSet,
+    openidconnect::EndpointNotSet,
+    openidconnect::EndpointNotSet,
+    openidconnect::EndpointMaybeSet,
+    openidconnect::EndpointMaybeSet,
+>;
+
 /// The discovered provider plus the client bound to our redirect URI.
 /// The generic states come from `from_provider_metadata`: the authorization
 /// endpoint is always set, the rest are MaybeSet because discovery cannot
 /// guarantee them.
 pub struct SsoClient {
-    client: CoreClient<
-        openidconnect::EndpointSet,
-        openidconnect::EndpointNotSet,
-        openidconnect::EndpointNotSet,
-        openidconnect::EndpointNotSet,
-        openidconnect::EndpointMaybeSet,
-        openidconnect::EndpointMaybeSet,
-    >,
+    client: GroupClient,
     /// A no-redirect client owned by this crate's dependency graph; OIDC
     /// endpoints must be contacted directly, never through follower redirects.
     http: reqwest::Client,
@@ -71,7 +115,7 @@ impl SsoClient {
         .await
         .map_err(|error| format!("oidc discovery: {error}"))?;
         let userinfo_url = metadata.userinfo_endpoint().map(|url| url.to_string());
-        let client = CoreClient::from_provider_metadata(
+        let client = GroupClient::from_provider_metadata(
             metadata,
             ClientId::new(client_id.to_owned()),
             Some(ClientSecret::new(client_secret.to_owned())),
@@ -530,7 +574,8 @@ fn sso_error_code(message: &str) -> &'static str {
             "provider_misconfigured"
         }
         "identity could not be verified" => "identity_unverified",
-        "could not verify group membership" => "groups_unverified",
+        "could not verify group membership"
+        | "overage or distributed group claims are not supported" => "groups_unverified",
         "this account is blocked" => "account_blocked",
         "this account is not provisioned" => "not_provisioned",
         _ => "failed",
@@ -702,8 +747,10 @@ pub async fn sso_callback(
         }
     };
 
-    // Groups come from the userinfo endpoint; the id token may not carry them.
-    let mut groups: Vec<String> = Vec::new();
+    let mut groups = match claims.additional_claims().direct_groups() {
+        Ok(groups) => groups.to_vec(),
+        Err(message) => return home(message),
+    };
     if let Some(url) = client.userinfo_url.clone() {
         let token = token_response.access_token().secret();
         // A userinfo failure must not silently downgrade an admin to viewer:
@@ -750,13 +797,20 @@ pub async fn sso_callback(
                 }
             };
         }
-        if let Some(list) = value["groups"].as_array() {
-            groups.extend(
-                list.iter()
-                    .filter_map(|entry| entry.as_str().map(str::to_owned)),
-            );
+        let group_claims: GroupClaims = match serde_json::from_value(value) {
+            Ok(claims) => claims,
+            Err(error) => {
+                tracing::warn!(target: "audit", event = "sso_failed", %error, "userinfo group claims are invalid");
+                return home("could not verify group membership");
+            }
+        };
+        match group_claims.direct_groups() {
+            Ok(memberships) => groups.extend_from_slice(memberships),
+            Err(message) => return home(message),
         }
     }
+    groups.sort_unstable();
+    groups.dedup();
 
     let Some(subject) = subject else {
         tracing::warn!(
@@ -1058,12 +1112,333 @@ mod tests {
             ("no id token in response", "provider_misconfigured"),
             ("identity could not be verified", "identity_unverified"),
             ("could not verify group membership", "groups_unverified"),
+            (
+                "overage or distributed group claims are not supported",
+                "groups_unverified",
+            ),
             ("this account is blocked", "account_blocked"),
             ("this account is not provisioned", "not_provisioned"),
             ("could not complete sign-in", "failed"),
             ("Contact attacker.invalid", "failed"),
         ] {
             assert_eq!(sso_error_code(reason), code, "{reason}");
+        }
+    }
+
+    #[test]
+    fn group_claims_require_complete_string_arrays() {
+        for (value, expected) in [
+            (json!({}), Vec::<String>::new()),
+            (json!({"groups": []}), vec![]),
+            (
+                json!({"groups": ["admin", "tenant"]}),
+                vec!["admin".into(), "tenant".into()],
+            ),
+            (
+                json!({"groups": ["admin"], "hasgroups": false, "_claim_names": {"email": "src1"}}),
+                vec!["admin".into()],
+            ),
+        ] {
+            let claims: GroupClaims = serde_json::from_value(value).unwrap();
+            assert_eq!(claims.direct_groups().unwrap(), expected);
+        }
+        for value in [
+            json!({"groups": null}),
+            json!({"groups": "admin"}),
+            json!({"groups": ["admin", 7]}),
+            json!({"groups": {"admin": true}}),
+            json!({"hasgroups": "true"}),
+            json!({"_claim_names": {"groups": null}}),
+        ] {
+            assert!(
+                serde_json::from_value::<GroupClaims>(value.clone()).is_err(),
+                "{value}"
+            );
+        }
+        for value in [
+            json!({"hasgroups": true}),
+            json!({"_claim_names": {"groups": "src1"}}),
+            json!({"groups": ["admin"], "hasgroups": true}),
+        ] {
+            let claims: GroupClaims = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                claims.direct_groups(),
+                Err("overage or distributed group claims are not supported")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_id_token_groups_reach_roles_only_after_verification() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use base64::Engine as _;
+        use openidconnect::core::{
+            CoreEdDsaPrivateSigningKey, CoreGenderClaim, CoreJweContentEncryptionAlgorithm,
+            CoreJwsSigningAlgorithm,
+        };
+        use openidconnect::{IdToken, IdTokenClaims, PrivateSigningKey as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tower::ServiceExt as _;
+
+        #[derive(Debug, Deserialize, Serialize)]
+        struct TestClaims {
+            #[serde(flatten)]
+            claims: serde_json::Map<String, serde_json::Value>,
+        }
+        impl openidconnect::AdditionalClaims for TestClaims {}
+        type TestToken = IdToken<
+            TestClaims,
+            CoreGenderClaim,
+            CoreJweContentEncryptionAlgorithm,
+            CoreJwsSigningAlgorithm,
+        >;
+
+        let key = CoreEdDsaPrivateSigningKey::from_ed25519_pem(
+            "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEICWeYPLxoZKHZlQ6rkBi11E9JwchynXtljATLqym/XS9\n-----END PRIVATE KEY-----",
+            None,
+        ).unwrap();
+        for (case, expected) in [
+            ("id-token-only", Ok("admin")),
+            ("no-userinfo", Ok("admin")),
+            ("userinfo-only", Ok("auditor")),
+            ("union", Ok("admin")),
+            ("scim-only", Ok("admin")),
+            ("absent", Ok("viewer")),
+            ("token-mixed", Err("unavailable")),
+            ("userinfo-mixed", Err("groups_unverified")),
+            ("token-overage", Err("groups_unverified")),
+            ("token-distributed", Err("groups_unverified")),
+            ("userinfo-overage", Err("groups_unverified")),
+            ("signature", Err("identity_unverified")),
+            ("nonce", Err("identity_unverified")),
+            ("azp", Err("identity_unverified")),
+            ("userinfo-sub", Err("identity_unverified")),
+            ("userinfo-failure", Err("groups_unverified")),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let issuer = format!("http://{}", listener.local_addr().unwrap());
+            let mut metadata = json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "jwks_uri": format!("{issuer}/jwks"),
+                "response_types_supported": ["code"],
+                "subject_types_supported": ["public"],
+                "id_token_signing_alg_values_supported": ["EdDSA"]
+            });
+            if case != "no-userinfo" {
+                metadata["userinfo_endpoint"] = json!(format!("{issuer}/userinfo"));
+            }
+            let mut userinfo = json!({"sub": case});
+            match case {
+                "userinfo-only" => userinfo["groups"] = json!(["auditors", "tenant-admins"]),
+                "union" => {
+                    userinfo["groups"] = json!(["platform-admins", "tenant-admins", "shared"])
+                }
+                "userinfo-mixed" => userinfo["groups"] = json!(["platform-admins", 7]),
+                "userinfo-overage" => userinfo["hasgroups"] = json!(true),
+                "userinfo-sub" => userinfo["sub"] = json!("another-user"),
+                _ => {}
+            }
+            let token = Arc::new(Mutex::new(String::new()));
+            let response_token = Arc::clone(&token);
+            let userinfo_calls = Arc::new(AtomicUsize::new(0));
+            let calls = Arc::clone(&userinfo_calls);
+            let unexpected_calls = Arc::new(AtomicUsize::new(0));
+            let unexpected = Arc::clone(&unexpected_calls);
+            let jwks = json!({"keys": [key.as_verification_key()]});
+            let provider = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+                let response = match uri.path() {
+                    "/.well-known/openid-configuration" => axum::Json(metadata.clone()).into_response(),
+                    "/jwks" => axum::Json(jwks.clone()).into_response(),
+                    "/token" => axum::Json(json!({"access_token": "test-access", "token_type": "Bearer", "id_token": response_token.lock().unwrap().clone()})).into_response(),
+                    "/userinfo" => {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        if case == "userinfo-failure" { StatusCode::SERVICE_UNAVAILABLE.into_response() }
+                        else { axum::Json(userinfo.clone()).into_response() }
+                    }
+                    _ => {
+                        unexpected.fetch_add(1, Ordering::Relaxed);
+                        StatusCode::NOT_FOUND.into_response()
+                    }
+                };
+                async move { response }
+            });
+            let mut tasks = tokio::task::JoinSet::new();
+            tasks.spawn(async move { axum::serve(listener, provider).await.unwrap() });
+            let mut config = crate::api::testing::config(directory.path());
+            config.oidc = Some(crate::config::OidcConfig {
+                issuer: issuer.clone(),
+                client_id: "votport".into(),
+                client_secret: "secret".into(),
+                admin_group: Some("platform-admins".into()),
+                auditor_group: Some("auditors".into()),
+                subject_claim: crate::config::SubjectClaim::Sub,
+            });
+            let app = crate::app::build(config).unwrap();
+            let mut tenant = crate::store::tests::test_tenant("acme");
+            tenant.admin_group = Some("tenant-admins".into());
+            app.store.insert_tenant(tenant).unwrap();
+            if case == "scim-only" {
+                for group in ["platform-admins", "tenant-admins"] {
+                    app.store
+                        .create_scim_group(group, None, &[case.to_owned()])
+                        .unwrap()
+                        .unwrap();
+                }
+            }
+            let router = crate::app::router(Arc::clone(&app));
+            let peer = ConnectInfo("198.51.100.1:1".parse::<std::net::SocketAddr>().unwrap());
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                router.clone().oneshot(
+                    Request::get("/api/admin/sso/start")
+                        .extension(peer)
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::FOUND, "{case}");
+            let cookie = response.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap();
+            let redirect =
+                reqwest::Url::parse(response.headers()[header::LOCATION].to_str().unwrap())
+                    .unwrap();
+            let parameter = |name: &str| {
+                redirect
+                    .query_pairs()
+                    .find(|(key, _)| key == name)
+                    .unwrap()
+                    .1
+                    .into_owned()
+            };
+            let now = crate::store::now_unix();
+            let mut claims = json!({"iss": issuer, "aud": "votport", "sub": case, "iat": now, "exp": now + 300, "nonce": parameter("nonce"), "groups": ["platform-admins", "tenant-admins"]});
+            match case {
+                "userinfo-only" | "scim-only" | "absent" => {
+                    claims.as_object_mut().unwrap().remove("groups");
+                }
+                "union" => claims["groups"] = json!(["auditors", "shared", "shared"]),
+                "token-mixed" => claims["groups"] = json!(["platform-admins", 7]),
+                "token-overage" => {
+                    claims.as_object_mut().unwrap().remove("groups");
+                    claims["hasgroups"] = json!(true);
+                }
+                "token-distributed" => {
+                    claims.as_object_mut().unwrap().remove("groups");
+                    claims["_claim_names"] = json!({"groups": "src1"});
+                    claims["_claim_sources"] =
+                        json!({"src1": {"endpoint": format!("{issuer}/must-not-fetch")}});
+                }
+                "nonce" => claims["nonce"] = json!("another-nonce"),
+                "azp" => claims["azp"] = json!("another-client"),
+                _ => {}
+            }
+            let claims: IdTokenClaims<TestClaims, CoreGenderClaim> =
+                serde_json::from_value(claims).unwrap();
+            let mut signed =
+                TestToken::new(claims, &key, CoreJwsSigningAlgorithm::EdDsa, None, None)
+                    .unwrap()
+                    .to_string();
+            if case == "signature" {
+                let (message, signature) = signed.rsplit_once('.').unwrap();
+                let mut signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(signature)
+                    .unwrap();
+                signature[0] ^= 1;
+                signed = format!(
+                    "{message}.{}",
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature)
+                );
+            }
+            *token.lock().unwrap() = signed;
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                router.oneshot(
+                    Request::get(format!(
+                        "/api/admin/callback?code=test&state={}",
+                        parameter("state")
+                    ))
+                    .extension(peer)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::FOUND, "{case}");
+            match expected {
+                Ok(role) => {
+                    assert_eq!(response.headers()[header::LOCATION], "/", "{case}");
+                    let cookie = response
+                        .headers()
+                        .get_all(header::SET_COOKIE)
+                        .iter()
+                        .find(|value| value.to_str().unwrap().starts_with("votport_admin="))
+                        .unwrap();
+                    let mut headers = HeaderMap::new();
+                    headers.insert(header::COOKIE, cookie.clone());
+                    let identity = super::super::admin::require_admin(&app, &headers).unwrap();
+                    assert_eq!(identity.subject, case);
+                    assert_eq!(identity.role, role, "{case}");
+                    assert_eq!(
+                        identity
+                            .grants
+                            .iter()
+                            .any(|grant| grant.tenant == "acme" && grant.role == "admin"),
+                        case != "absent",
+                        "{case}"
+                    );
+                    let groups = app.store.principal(case).unwrap().unwrap().last_groups;
+                    let unique: std::collections::HashSet<_> =
+                        groups.iter().map(String::as_str).collect();
+                    assert_eq!(groups.len(), unique.len(), "{case}");
+                    if case == "union" {
+                        assert_eq!(
+                            unique,
+                            std::collections::HashSet::from([
+                                "auditors",
+                                "shared",
+                                "platform-admins",
+                                "tenant-admins"
+                            ])
+                        );
+                    }
+                }
+                Err(code) => {
+                    assert_eq!(
+                        response.headers()[header::LOCATION],
+                        format!("/?sso_error={code}"),
+                        "{case}"
+                    );
+                    assert!(app.store.principal(case).unwrap().is_none(), "{case}");
+                    assert!(
+                        response
+                            .headers()
+                            .get_all(header::SET_COOKIE)
+                            .iter()
+                            .all(|value| !value.to_str().unwrap().starts_with("votport_admin=")),
+                        "{case}"
+                    );
+                    if !case.starts_with("userinfo-") {
+                        assert_eq!(userinfo_calls.load(Ordering::Relaxed), 0, "{case}");
+                    }
+                }
+            }
+            assert_eq!(unexpected_calls.load(Ordering::Relaxed), 0, "{case}");
+            tasks.shutdown().await;
         }
     }
 
