@@ -621,7 +621,7 @@ impl Store {
     pub fn trade_deliveries(&self, route: &TradeRoute) -> Result<serde_json::Value, String> {
         self.with(|c| {
             if route.direction=="incoming" {
-                c.prepare("SELECT r.id,r.receipt,r.revoked_at,j.state,json_extract(j.document,'$.checks.released_at') FROM inbound_routes r LEFT JOIN delivery_jobs j ON j.tenant=r.tenant AND json_extract(j.document,'$.received.upload_id')=r.upload_id WHERE json_extract(r.source,'$.document.permission.grant')=?1 ORDER BY r.created_at DESC LIMIT 50")?.query_map([&route.id],|r|{
+                c.prepare("SELECT r.id,r.receipt,r.revoked_at,j.state,json_extract(j.document,'$.checks.released_at') FROM inbound_routes r LEFT JOIN delivery_jobs j ON j.tenant=r.tenant AND json_extract(j.document,'$.received.upload_id')=r.upload_id AND json_extract(j.document,'$.reprocessed_as') IS NULL WHERE json_extract(r.source,'$.document.permission.grant')=?1 ORDER BY r.created_at DESC LIMIT 50")?.query_map([&route.id],|r|{
                     let receipt:Option<String>=r.get(1)?;let state:Option<String>=r.get(3)?;let released:Option<i64>=r.get(4)?;
                     Ok(serde_json::json!({"route":r.get::<_,String>(0)?,"received":receipt.is_some(),"revoked":r.get::<_,Option<i64>>(2)?.is_some(),"workflow":state,"released":state.as_deref()==Some("ready") || (released.is_some() && matches!(state.as_deref(),Some("exporting"|"retrying"|"failed")))}))
                 })?.collect::<rusqlite::Result<Vec<_>>>().map(serde_json::Value::from)

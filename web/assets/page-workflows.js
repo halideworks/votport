@@ -45,6 +45,22 @@ function empty(title, detail, action) {
   if (action) element.append(action);
   return element;
 }
+function canReprocess(job, project) {
+  return Boolean(job.received && job.manifest && !job.reprocessed_as && project?.receive && project.revision !== job.project.revision
+    && ['failed', 'retrying', 'awaiting_approval', 'ready'].includes(job.state));
+}
+function reprocessAction(job, project) {
+  if (!canReprocess(job, project) || (!admin && project.members[session.subject] !== 'sender')) return null;
+  return button('Reprocess with current rules', 'ghost', () => guard(async () => {
+    await refreshProjects();
+    const current = projects.find((item) => item.id === job.project.id);
+    if (!current) throw new Error('Project unavailable. Reload before reprocessing.');
+    if (!await confirmModal('Reprocess with current rules', `Create a new delivery under “${current.label}” revision ${current.revision}, using the saved Receive workflow settings? The old link will stop working and connected ports will be asked to revoke its delivery. Existing copies remain; new checks, approval and exports run again and may create new copies.`, 'Create new delivery')) return;
+    const issued = await api(`/api/workflows/jobs/${job.id}/reprocess`, { method: 'POST', body: JSON.stringify({ manifest: job.manifest, project_revision: current.revision }) });
+    notice('New delivery created from the same received files. The previous delivery retains its evidence.');
+    window.location.hash = `#job-${issued.job.id}`;
+  }));
+}
 function form(id, action) {
   $(id).addEventListener('submit', (event) => {
     event.preventDefault(); const submit = event.submitter;
@@ -237,6 +253,11 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
     if (job.received) {
       const source = node('a', 'View incoming request →', 'text-link'); source.href = `/receive?search=${encodeURIComponent(job.received.link_id)}#link-${job.received.link_id}`; card.append(source);
       if (!['retired', 'suspended'].includes(job.state)) card.append(node('p', 'This delivery uses the original received files. Keep them unchanged until the delivery is archived. Automatic archival occurs seven days after cancellation, failure, or link expiry or revocation.', 'field-help'));
+      const current = projects.find((project) => project.id === job.project.id);
+      if (canReprocess(job, current)) card.append(node('p', 'Project rules changed. This prepared delivery remains held under its recorded rules. Reprocessing requires a new delivery and valid Receive workflow settings.', 'info-banner'));
+      for (const [label, id] of [['Previous delivery', job.reprocessed_from], ['Replacement delivery', job.reprocessed_as]]) {
+        if (id) { const link = node('a', label, 'text-link'); link.href = `/workflows#job-${encodeURIComponent(id)}`; card.append(link); }
+      }
     }
     for (const id of job.project.destinations) {
       const result = job.checks.destinations?.[id], receipt = job.checks.route_receipts?.[id], revoked = job.checks.route_revocations?.[id];
@@ -282,6 +303,8 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
       }
     })));
     if (['failed', 'retrying'].includes(job.state)) actions.append(button('Retry', 'ghost', () => guard(async () => { await api(`/api/workflows/jobs/${job.id}`, { method: 'POST', body: JSON.stringify({ action: 'retry' }) }); await refreshJobs(); })));
+    const reprocess = reprocessAction(job, projects.find((project) => project.id === job.project.id));
+    if (reprocess) actions.append(reprocess);
     if (!['cancelled', 'retired', 'retiring', 'suspended'].includes(job.state)) actions.append(button('Cancel delivery', 'danger', () => guard(async () => {
       if (await confirmModal('Cancel delivery', 'Stop downloads here and request revocation at connected ports? Each port will stop route-managed sharing and forwarding. Downloaded files and independent copies remain.', 'Cancel delivery')) {
         await api(`/api/workflows/jobs/${job.id}`, { method: 'POST', body: JSON.stringify({ action: 'cancel' }) }); await refreshJobs();
@@ -413,7 +436,7 @@ $('workflow-new-project').onclick = () => editProject(); $('workflow-new-project
 $('workflow-project').onchange = projectFields;
 $('workflow-import').onchange = () => { $('workflow-prefix-field').hidden = !value('workflow-import'); };
 $('workflow-new-operation').onclick = () => { sessionStorage.removeItem(draftKey); $('workflow-new-operation').hidden = true; $('workflow-result').textContent = 'Ready to create a new delivery.'; };
-$('workflow-refresh').onclick = () => guard(() => refreshJobs()); $('workflow-more').onclick = () => guard(() => refreshJobs(true));
+$('workflow-refresh').onclick = () => guard(async () => { await refreshProjects(); await refreshJobs(); }); $('workflow-more').onclick = () => guard(() => refreshJobs(true));
 $('wp-label').oninput = () => { if (!editingProject && autoProjectId) $('wp-id').value = value('wp-label').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 100); };
 $('wp-id').oninput = () => { autoProjectId = false; };
 for (const [kind, name] of [['members', 'member'], ['recipients', 'recipient'], ['metadata', 'metadata']]) $(`wp-add-${name}`).onclick = () => { markFormChanged($('workflow-save-project')); addRow(kind).querySelector('input').focus(); };

@@ -2818,7 +2818,7 @@ pub async fn outbound_receipt_indexed(
     require_grant_access(&app, &grant, &headers)?;
     let source = source_info_indexed(&app, &grant, index)?;
     let bytes = source.receipt.ok_or_else(ApiError::not_found)?;
-    let filename = format!("{}.vot-receipt", safe_filename(&source.name));
+    let filename = format!("{}.vot-receipt", source.name);
     let mut response = bytes.into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -2827,11 +2827,9 @@ pub async fn outbound_receipt_indexed(
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response.headers_mut().insert(
-        header::CONTENT_DISPOSITION,
-        HeaderValue::try_from(format!("attachment; filename=\"{filename}\""))
-            .map_err(|_| ApiError::internal("receipt filename invalid"))?,
-    );
+    response
+        .headers_mut()
+        .insert(header::CONTENT_DISPOSITION, attachment_filename(&filename)?);
     Ok(response)
 }
 
@@ -3275,9 +3273,8 @@ async fn outbound_file_inner(
         }
         require_grant_access(&app, &grant, &headers)?;
         let length = range.map_or(source.object.length, |(start, end)| end - start + 1);
-        let filename = safe_filename(&source.name);
         let mut response = Body::from_stream(stream).into_response();
-        add_file_headers(&mut response, &source, filename, length, range)?;
+        add_file_headers(&mut response, &source, length, range)?;
         if range.is_some() {
             *response.status_mut() = StatusCode::PARTIAL_CONTENT;
         }
@@ -3305,20 +3302,13 @@ async fn outbound_file_head_inner(
     }
     let source = source_info_indexed_with_file(&app, &grant, index, file.as_ref())?;
     let mut response = Body::empty().into_response();
-    add_file_headers(
-        &mut response,
-        &source,
-        safe_filename(&source.name),
-        source.object.length,
-        None,
-    )?;
+    add_file_headers(&mut response, &source, source.object.length, None)?;
     Ok(response)
 }
 
 fn add_file_headers(
     response: &mut Response,
     source: &Source,
-    filename: String,
     length: u64,
     range: Option<(u64, u64)>,
 ) -> ApiResult<()> {
@@ -3347,11 +3337,9 @@ fn add_file_headers(
                 .map_err(|_| ApiError::internal("download range invalid"))?,
         );
     }
-    let disposition = format!("attachment; filename=\"{filename}\"");
     response.headers_mut().insert(
         header::CONTENT_DISPOSITION,
-        HeaderValue::try_from(disposition)
-            .map_err(|_| ApiError::internal("download filename invalid"))?,
+        attachment_filename(&source.name)?,
     );
     Ok(())
 }
@@ -4191,9 +4179,15 @@ fn hash_token(token: &str) -> String {
 fn valid_token(token: &str) -> bool {
     token.len() == 32 && token.as_bytes().iter().all(u8::is_ascii_hexdigit)
 }
-fn safe_filename(name: &str) -> String {
-    let name = name.rsplit('/').next().unwrap_or(name);
-    let mut value: String = name
+fn attachment_filename(name: &str) -> ApiResult<HeaderValue> {
+    use std::fmt::Write as _;
+
+    let name = name
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !matches!(*name, "" | "." | ".."))
+        .unwrap_or("download.bin");
+    let fallback: String = name
         .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ' ') {
@@ -4203,10 +4197,15 @@ fn safe_filename(name: &str) -> String {
             }
         })
         .collect();
-    if value.is_empty() || value == "." || value == ".." {
-        value = "download.bin".to_owned();
+    let mut value = format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''");
+    for byte in name.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'~') {
+            value.push(char::from(byte));
+        } else {
+            write!(value, "%{byte:02X}").expect("writing to a string cannot fail");
+        }
     }
-    value.chars().take(180).collect()
+    HeaderValue::try_from(value).map_err(|_| ApiError::internal("download filename invalid"))
 }
 fn public_grant(grant: OutboundGrant) -> serde_json::Value {
     let file_count = if grant.files.is_empty() {
@@ -5416,7 +5415,31 @@ mod tests {
 
     #[test]
     fn filenames_are_single_safe_components() {
-        assert_eq!(safe_filename("../a/b?.txt"), "b_.txt");
+        for (name, fallback, encoded) in [
+            ("../a/b?.txt", "b_.txt", "b%3F.txt"),
+            ("a\\file.txt", "file.txt", "file.txt"),
+            ("a-z_1~. txt", "a-z_1_. txt", "a-z_1~.%20txt"),
+            ("x\";\r\n*.txt", "x_____.txt", "x%22%3B%0D%0A%2A.txt"),
+            ("100% prêt.txt", "100_ pr_t.txt", "100%25%20pr%C3%AAt.txt"),
+            ("", "download.bin", "download.bin"),
+            (".", "download.bin", "download.bin"),
+            ("..", "download.bin", "download.bin"),
+        ] {
+            assert_eq!(
+                attachment_filename(name).unwrap(),
+                format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
+            );
+        }
+        let name = format!("{}.mov.vot-receipt", "a".repeat(239));
+        let header = attachment_filename(&name).unwrap();
+        assert!(header
+            .to_str()
+            .unwrap()
+            .starts_with(&format!("attachment; filename=\"{name}\";")));
+        assert!(header
+            .to_str()
+            .unwrap()
+            .ends_with(&format!("filename*=UTF-8''{name}")));
     }
     #[test]
     fn bundle_paths_are_relative_and_normalized() {
@@ -5693,6 +5716,58 @@ mod tests {
                 .unwrap();
         assert!(ActiveDownload::claim(Arc::clone(&app), "grant:0").is_err());
         drop((first, leased));
+    }
+
+    #[tokio::test]
+    async fn download_headers_preserve_unicode_file_and_receipt_names() {
+        let (_directory, app, cookie, _) = fixture().await;
+        app.store
+            .update_link_uploads("", "link", |link| {
+                link.uploads[0].files[0].path = "folder/納品 café.mov".into();
+            })
+            .unwrap();
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = body(response).await;
+        let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
+        for (path, extension) in [
+            ("file", ""),
+            ("files/0", ""),
+            ("receipt", ".vot-receipt"),
+            ("receipts/0", ".vot-receipt"),
+        ] {
+            for method in [axum::http::Method::GET, axum::http::Method::HEAD] {
+                let response = crate::app::router(app.clone())
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(format!("/api/s/{token}/{path}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                assert_eq!(
+                    response.headers()[header::CONTENT_DISPOSITION],
+                    format!("attachment; filename=\"__ caf_.mov{extension}\"; filename*=UTF-8''%E7%B4%8D%E5%93%81%20caf%C3%A9.mov{extension}"),
+                    "{path}"
+                );
+                response.into_body().collect().await.unwrap();
+            }
+        }
     }
 
     #[tokio::test]

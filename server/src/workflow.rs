@@ -116,6 +116,10 @@ pub struct Job {
     pub checks: serde_json::Value,
     #[serde(default)]
     pub received: Option<Received>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reprocessed_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reprocessed_as: Option<String>,
 }
 
 impl Job {

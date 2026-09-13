@@ -481,13 +481,21 @@ const receiptShare = await page.request.post(`${base}/api/admin/outbound-grants`
 if (!receiptShare.ok()) throw new Error(`received-file share: ${receiptShare.status()} ${await receiptShare.text()}`);
 await page.goto((await receiptShare.json()).url);
 await page.getByRole("button", { name: "Download file: Résumé Draft.pdf", exact: true }).waitFor();
+const [fileDownload] = await collectDownloads(
+  () => page.getByRole("button", { name: "Download file: Résumé Draft.pdf", exact: true }).click(), 1,
+);
+if (fileDownload.suggestedFilename() !== "Résumé Draft.pdf" ||
+    fs.readFileSync(await fileDownload.path(), "utf8") !== "unicode names travel\n") {
+  throw new Error("individual download changed the Unicode filename or file bytes");
+}
 const [receiptDownload] = await collectDownloads(
   () => page.getByRole("button", { name: "Download receipt: Résumé Draft.pdf", exact: true }).click(), 1,
 );
-if (!fs.readFileSync(await receiptDownload.path()).equals(fs.readFileSync(path.join(receiveDir, dest, sidecarName)))) {
-  throw new Error("receipt button returned different evidence");
+if (receiptDownload.suggestedFilename() !== sidecarName ||
+    !fs.readFileSync(await receiptDownload.path()).equals(fs.readFileSync(path.join(receiveDir, dest, sidecarName)))) {
+  throw new Error("receipt download changed the Unicode filename or evidence");
 }
-console.log("received-file and receipt buttons expose filename-specific names: ok");
+console.log("received-file and receipt buttons preserve Unicode filenames and bytes: ok");
 
 // The /verify page itself: slot UI, sidecar-only, full match, mismatch.
 const stored = path.join(receiveDir, dest);

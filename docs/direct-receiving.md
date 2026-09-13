@@ -115,6 +115,19 @@ project without creating another job or upload. A detached or reassigned request
 or a project that no longer accepts incoming files, remains refused. Prepared
 deliveries keep their recorded policy and delivery progress.
 
+For a prepared reception blocked by changed project rules, a human project sender
+or administrator can choose **Reprocess with current rules** on Workflows. Save
+any required metadata or recipient changes on the original Receive request first;
+it must still select the same project. Reprocessing creates a new delivery from
+the same verified files, reruns checks and approval, and may export new copies.
+It cancels the old delivery and requests revocation at connected ports. Existing
+copies and signed evidence remain; the two deliveries link to each other.
+Repeated submission of the same reprocess action returns the same replacement.
+Revoked incoming custody, missing or deleted upload records, and jobs held after
+a restore or already archived cannot be reprocessed. Missing or changed source
+bytes fail the replacement's verification. The original upload remains protected
+from raw sharing.
+
 File deletion verifies the stored content and any signed receipt before committing
 its tombstone, then removes the verified file handles. Changed or unverified files
 are retained. Retention verifies again after its batch tombstone commit to bound

@@ -108,18 +108,30 @@ pub(super) fn finish_job(
     evidence::delivery_event(connection, signer, &grant.tenant, &grant.id, &format!("delivery_{}", current.state), &serde_json::json!({"manifest": manifest, "project_id": project.id, "policy_revision": project.revision}), current.updated_at).map_err(|e| e.to_string())
 }
 
+fn principal_active(
+    connection: &Connection,
+    actor: &str,
+    credential_version: u64,
+) -> rusqlite::Result<bool> {
+    connection.query_row("SELECT COALESCE((SELECT blocked=0 AND credential_version=?2 FROM principals WHERE subject=?1), ?2=1)", params![actor,credential_version as i64], |row| row.get(0))
+}
+
 fn actor_active(connection: &Connection, job: &Job) -> Result<(), String> {
-    if job.received.is_some() {
-        return if job.project.receive {
-            Ok(())
-        } else {
-            Err("project no longer accepts incoming workflows".into())
-        };
+    if let Some(received) = &job.received {
+        if !job.project.receive {
+            return Err("project no longer accepts incoming workflows".into());
+        }
+        if job.actor == format!("reception:{}", received.link_id)
+            && job.credential_version == 0
+            && job.automation_token_id.is_none()
+        {
+            return Ok(());
+        }
     }
     let active: bool = if let Some(token_id) = &job.automation_token_id {
         connection.query_row("SELECT EXISTS(SELECT 1 FROM automation_tokens WHERE id=?1 AND tenant=?2 AND revoked_at IS NULL AND expires_at>?3 AND EXISTS(SELECT 1 FROM json_each(permissions) WHERE value='jobs:create') AND (directory IS NULL OR directory=?4 OR substr(?4,1,length(directory)+1)=directory||'/'))", params![token_id,job.tenant,now_unix() as i64,job.project.directory], |row| row.get(0))
     } else {
-        connection.query_row("SELECT COALESCE((SELECT blocked=0 AND credential_version=?2 FROM principals WHERE subject=?1), ?2=1)", params![job.actor,job.credential_version as i64], |row| row.get(0))
+        principal_active(connection, &job.actor, job.credential_version)
     }.map_err(|e| e.to_string())?;
     if active {
         Ok(())
@@ -133,7 +145,7 @@ pub(super) fn check_grant_creation(
     grant: &OutboundGrant,
     job: Option<&Job>,
 ) -> Result<(), String> {
-    super::routes::require_shareable(connection, grant)?;
+    super::routes::require_shareable(connection, &grant.upload_id)?;
     if !grant.link_id.is_empty()
         && received_requires_workflow(connection, &grant.tenant, &grant.link_id, &grant.upload_id)?
     {
@@ -332,6 +344,8 @@ pub(super) fn queue_received(
             link_id: link_id.into(),
             upload_id: upload.id.clone(),
         }),
+        reprocessed_from: None,
+        reprocessed_as: None,
     };
     connection.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,document) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",params![job.id,tenant,job.actor,job.request.operation_id,job.project.id,job.state,now as i64,serde_json::to_string(&job).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
     evidence::delivery_event(connection,signer,tenant,&job.id,"reception_queued",&serde_json::json!({"project_id":job.project.id,"link_id":link_id,"upload_id":upload.id,"state":job.state,"error":job.error}),now).map_err(|e|e.to_string())
@@ -780,6 +794,8 @@ impl Store {
             error: None,
             checks,
             received: None,
+            reprocessed_from: None,
+            reprocessed_as: None,
         };
         actor_active(&tx, &job)?;
         tx.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,deadline,document) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![job.id,tenant,actor,job.request.operation_id,job.project.id,job.state,job.request.not_before.unwrap_or(now) as i64,job.request.deadline.map(|t| t as i64),serde_json::to_string(&job).expect("job serializes")]).map_err(|e| e.to_string())?;
@@ -922,6 +938,143 @@ impl Store {
         )
         .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn reprocess_received_job(
+        &self,
+        identity: &crate::auth::AdminIdentity,
+        id: &str,
+        manifest: &str,
+        project_revision: u64,
+    ) -> Result<Job, String> {
+        if !matches!(identity.role.as_str(), "admin" | "viewer")
+            || identity.subject.starts_with("automation:")
+        {
+            return Err("reprocessing requires a human project sender".into());
+        }
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+        if !principal_active(&tx, &identity.subject, identity.credential_version)
+            .map_err(|e| e.to_string())?
+        {
+            return Err("submitting identity is no longer authorized".into());
+        }
+        let mut original = job_in(&tx, id)
+            .map_err(|e| e.to_string())?
+            .filter(|job| job.tenant == identity.tenant)
+            .ok_or("job missing")?;
+        let received = original
+            .received
+            .clone()
+            .ok_or("only incoming deliveries can be reprocessed")?;
+        let project = project_in(&tx, &identity.tenant, &original.project.id)
+            .map_err(|e| e.to_string())?
+            .ok_or("project missing")?;
+        if !project.allows(&identity.subject, "sender", identity.role == "admin") {
+            return Err("project sender permission required".into());
+        }
+        if original.manifest.as_deref() != Some(manifest) || manifest.is_empty() {
+            return Err("delivery manifest changed; reload before reprocessing".into());
+        }
+        if let Some(id) = &original.reprocessed_as {
+            return job_in(&tx, id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "replacement delivery missing".into());
+        }
+        if !["failed", "retrying", "awaiting_approval", "ready"].contains(&original.state.as_str())
+        {
+            return Err("only an inactive prepared delivery can be reprocessed".into());
+        }
+        if project.revision != project_revision || project.revision == original.project.revision {
+            return Err("project policy changed; reload before reprocessing".into());
+        }
+        let workflow = receive_workflow_in(&tx, &identity.tenant, &received.link_id)
+            .map_err(|e| e.to_string())?
+            .filter(|workflow| workflow.project_id == project.id)
+            .ok_or("the receive request must still select this project")?;
+        if !received_requires_workflow(
+            &tx,
+            &identity.tenant,
+            &received.link_id,
+            &received.upload_id,
+        )? {
+            return Err("incoming workflow ownership is missing".into());
+        }
+        let upload = read_link(&tx, &identity.tenant, &received.link_id)?
+            .ok_or("incoming link missing")?
+            .uploads
+            .into_iter()
+            .find(|upload| upload.id == received.upload_id)
+            .filter(|upload| {
+                !upload.partial
+                    && upload.completed_at != 0
+                    && !upload.files.is_empty()
+                    && upload.files.iter().all(|file| !file.deleted)
+            })
+            .ok_or("incoming package is incomplete or unavailable")?;
+        if crate::route_protocol::manifest_digest(upload.files.iter().map(|file| {
+            (
+                file.path.as_str(),
+                file.suite.as_str(),
+                file.root.as_str(),
+                file.bytes,
+            )
+        })) != manifest
+        {
+            return Err("incoming inventory no longer matches the prepared delivery".into());
+        }
+        super::routes::require_shareable(&tx, &received.upload_id)?;
+        let now = now_unix();
+        let request = workflow.request(
+            &format!("reprocess_{}", original.id),
+            &original.request.label,
+        );
+        project.validate_job(&request, now)?;
+        let replacement = Job {
+            id: crate::auth::random_token(),
+            tenant: identity.tenant.clone(),
+            token_generation: 0,
+            actor: identity.subject.clone(),
+            credential_version: identity.credential_version,
+            automation_token_id: None,
+            request,
+            checks: trade::snapshot(&tx, &identity.tenant, &project)?,
+            project,
+            state: "queued".into(),
+            manifest: None,
+            approved_by: None,
+            attempts: 0,
+            created_at: now,
+            updated_at: now,
+            error: None,
+            received: Some(received),
+            reprocessed_from: Some(original.id.clone()),
+            reprocessed_as: None,
+        };
+        actor_active(&tx, &replacement)?;
+        check_job_source(&tx, &replacement)?;
+        original.state = "cancelled".into();
+        original.updated_at = now;
+        original.reprocessed_as = Some(replacement.id.clone());
+        save_job(&tx, &original).map_err(|e| e.to_string())?;
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM delivery_jobs WHERE tenant=?1 AND state IN ('queued','preparing','awaiting_approval','exporting','retrying')",[&identity.tenant],|row| row.get(0)).map_err(|e| e.to_string())?;
+        if count >= 1000 {
+            return Err("active job limit reached".into());
+        }
+        let revoked = tx.execute("UPDATE outbound_grants SET revoked_at=COALESCE(revoked_at,?2) WHERE id=?1 AND tenant=?3",params![original.id,now as i64,identity.tenant]).map_err(|e| e.to_string())?;
+        if revoked != 1 {
+            return Err("prepared delivery link is missing".into());
+        }
+        tx.execute(
+            "UPDATE delivery_jobs SET owner='' WHERE id=?1",
+            [&original.id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,document) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",params![replacement.id,replacement.tenant,replacement.actor,replacement.request.operation_id,replacement.project.id,replacement.state,now as i64,serde_json::to_string(&replacement).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
+        evidence::delivery_event(&tx,&self.event_signer,&identity.tenant,&original.id,"delivery_reprocessed",&serde_json::json!({"actor":identity.subject,"manifest":manifest,"project_id":replacement.project.id,"original_revision":original.project.revision,"revision":replacement.project.revision,"replacement_id":replacement.id}),now).map_err(|e| e.to_string())?;
+        evidence::delivery_event(&tx,&self.event_signer,&identity.tenant,&replacement.id,"reception_queued",&serde_json::json!({"actor":identity.subject,"project_id":replacement.project.id,"reprocessed_from":original.id,"received":replacement.received}),now).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(replacement)
     }
 
     pub fn change_delivery_job(
@@ -1536,6 +1689,561 @@ mod tests {
         let connection = reopened.connection.lock().unwrap();
         assert!(received_requires_workflow(&connection, "", &link.id, "complete").unwrap());
         assert!(!received_requires_workflow(&connection, "other", &link.id, "complete").unwrap());
+    }
+
+    fn prepared_reception(store: &Store) -> (Job, crate::workflow::ReceiveWorkflow) {
+        let mut project = project();
+        project.receive = true;
+        project.require_approval = false;
+        let project = store.save_delivery_project("", "local", project).unwrap();
+        let workflow = crate::workflow::ReceiveWorkflow {
+            notifications: None,
+            project_id: project.id.clone(),
+            metadata: request().metadata,
+            recipients: vec![],
+        };
+        let mut link = crate::store::tests::test_link("incoming");
+        link.active = false;
+        link.expires_at = Some(1);
+        store
+            .insert_link_with_workflow(link, Some(&workflow))
+            .unwrap();
+        store
+            .append_upload(
+                "",
+                "incoming",
+                UploadRecord {
+                    id: "received".into(),
+                    started_at: 1,
+                    completed_at: 2,
+                    replayed_chunks: 0,
+                    rejected_chunks: 0,
+                    transport: Some("http".into()),
+                    package_root: "package".into(),
+                    total_bytes: 1,
+                    partial: false,
+                    log: vec![],
+                    files: vec![FileRecord {
+                        path: "file.bin".into(),
+                        stored_as: "file.bin".into(),
+                        bytes: 1,
+                        suite: "blake3".into(),
+                        root: "abc".into(),
+                        receipt: true,
+                        deleted: false,
+                    }],
+                },
+            )
+            .unwrap();
+        let job = store
+            .claim_delivery_job("worker", now_unix())
+            .unwrap()
+            .unwrap();
+        let mut grant = grant(&job);
+        grant.link_id.clear();
+        grant.upload_id.clear();
+        grant.files[0].source = "received:file.bin".into();
+        store
+            .insert_workflow_grant(grant, None, Some(&job))
+            .unwrap();
+        (store.delivery_job(&job.id).unwrap().unwrap(), workflow)
+    }
+
+    #[test]
+    fn reprocess_validates_current_policy_identity_and_inactive_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let (original, mut workflow) = prepared_reception(&store);
+        let identity = crate::auth::AdminIdentity::local_admin();
+        let manifest = original.manifest.as_deref().unwrap();
+        assert!(store
+            .reprocess_received_job(&identity, &original.id, manifest, original.project.revision)
+            .is_err());
+        let mut project = original.project.clone();
+        project.required_metadata.push("take".into());
+        project.recipients.push(crate::workflow::Recipient {
+            email: "editor@example.com".into(),
+            holder: store.event_signer.public_hex.clone(),
+        });
+        let project = store.save_delivery_project("", "local", project).unwrap();
+        let attempt = |identity: &crate::auth::AdminIdentity| {
+            store.reprocess_received_job(identity, &original.id, manifest, project.revision)
+        };
+        assert!(attempt(&identity).unwrap_err().contains("metadata"));
+        workflow.metadata.insert("take".into(), "02".into());
+        workflow
+            .recipients
+            .push(store.event_signer.public_hex.clone());
+        workflow.notifications = Some(NotificationPolicy {
+            mode: NotificationMode::Default,
+            rules: vec![],
+        });
+        store
+            .set_receive_workflow("", "incoming", &workflow)
+            .unwrap();
+        for (subject, role, tenant, credential_version) in [
+            ("observer", "viewer", "", 1),
+            ("approver", "viewer", "", 1),
+            ("local", "auditor", "", 1),
+            ("automation:token", "admin", "", 1),
+            ("local", "admin", "other", 1),
+            ("sender", "viewer", "", 2),
+        ] {
+            let mut denied = identity.clone();
+            denied.subject = subject.into();
+            denied.role = role.into();
+            denied.tenant = tenant.into();
+            denied.credential_version = credential_version;
+            assert!(attempt(&denied).is_err(), "{subject}/{role}/{tenant}");
+        }
+        assert!(store
+            .reprocess_received_job(&identity, &original.id, "changed", project.revision)
+            .is_err());
+        assert!(store
+            .reprocess_received_job(&identity, &original.id, manifest, project.revision + 1)
+            .is_err());
+        for state in [
+            "queued",
+            "preparing",
+            "exporting",
+            "cancelled",
+            "retiring",
+            "retired",
+            "suspended",
+        ] {
+            let mut busy = original.clone();
+            busy.state = state.into();
+            store.with(|c| save_job(c, &busy)).unwrap();
+            assert!(attempt(&identity).is_err(), "{state}");
+            assert_eq!(
+                serde_json::to_value(store.delivery_job(&original.id).unwrap().unwrap()).unwrap(),
+                serde_json::to_value(&busy).unwrap()
+            );
+        }
+        store.with(|c| save_job(c, &original)).unwrap();
+        let mut detached = workflow.clone();
+        detached.project_id.clear();
+        store
+            .set_receive_workflow("", "incoming", &detached)
+            .unwrap();
+        assert!(attempt(&identity)
+            .unwrap_err()
+            .contains("must still select"));
+        let mut other = project.clone();
+        other.id = "other".into();
+        other.directory = "other".into();
+        other.revision = 0;
+        store.save_delivery_project("", "local", other).unwrap();
+        detached.project_id = "other".into();
+        store
+            .set_receive_workflow("", "incoming", &detached)
+            .unwrap();
+        assert!(attempt(&identity)
+            .unwrap_err()
+            .contains("must still select"));
+        store
+            .set_receive_workflow("", "incoming", &workflow)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(store.delivery_job(&original.id).unwrap().unwrap()).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+        let replacement = attempt(&identity).unwrap();
+        assert_eq!(replacement.request.metadata, workflow.metadata);
+        assert_eq!(replacement.request.recipients, workflow.recipients);
+        assert_eq!(replacement.request.notifications, workflow.notifications);
+        assert!(received_requires_workflow(
+            &store.connection.lock().unwrap(),
+            "",
+            "incoming",
+            "received"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn reprocess_replay_survives_successor_retry_and_fences_old_workers() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let (original, _) = prepared_reception(&store);
+        let mut project = original.project.clone();
+        project.label.push_str(" changed");
+        let project = store.save_delivery_project("", "local", project).unwrap();
+        let mut identity = crate::auth::AdminIdentity::local_admin();
+        identity.subject = "sender".into();
+        identity.role = "viewer".into();
+        let (replacement, repeated) = std::thread::scope(|threads| {
+            let reprocess = || {
+                store
+                    .reprocess_received_job(
+                        &identity,
+                        &original.id,
+                        original.manifest.as_deref().unwrap(),
+                        project.revision,
+                    )
+                    .unwrap()
+            };
+            let first = threads.spawn(reprocess);
+            let second = threads.spawn(reprocess);
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_eq!(replacement.id, repeated.id);
+        assert_eq!(
+            replacement.reprocessed_from.as_deref(),
+            Some(original.id.as_str())
+        );
+        assert_eq!(
+            store
+                .delivery_job(&original.id)
+                .unwrap()
+                .unwrap()
+                .reprocessed_as
+                .as_deref(),
+            Some(replacement.id.as_str())
+        );
+        let upload = store
+            .link_upload("", "incoming", "received")
+            .unwrap()
+            .unwrap();
+        store.append_upload("", "incoming", upload).unwrap();
+        assert_eq!(
+            store
+                .delivery_jobs("", "", 100, None, "", "")
+                .unwrap()
+                .len(),
+            2
+        );
+        store
+            .fail_delivery_job(&original.id, original.attempts, "late failure")
+            .unwrap();
+        assert!(store
+            .complete_delivery_export(&original.id, original.attempts, "old", "late")
+            .is_err());
+        let mut stale = original.clone();
+        stale.state = "preparing".into();
+        assert!(store
+            .insert_workflow_grant(grant(&stale), None, Some(&stale))
+            .is_err());
+        assert_eq!(
+            store.delivery_job(&original.id).unwrap().unwrap().state,
+            "cancelled"
+        );
+        let running = store
+            .claim_delivery_job("worker", now_unix())
+            .unwrap()
+            .unwrap();
+        store
+            .fail_delivery_job(&running.id, running.attempts, "failed before manifest")
+            .unwrap();
+        let mut later = project.clone();
+        later.label.push_str(" again");
+        let later = store.save_delivery_project("", "local", later).unwrap();
+        store
+            .change_delivery_job("", &replacement.id, "sender", false, "retry", None)
+            .unwrap();
+        let recovered = store
+            .reprocess_received_job(
+                &identity,
+                &original.id,
+                original.manifest.as_deref().unwrap(),
+                project.revision,
+            )
+            .unwrap();
+        assert_eq!(recovered.id, replacement.id);
+        assert_eq!(recovered.project.revision, later.revision);
+        store.provision_principal("sender", None).unwrap();
+        store.revoke_principal("sender").unwrap();
+        assert!(actor_active(&store.connection.lock().unwrap(), &recovered).is_err());
+        let blocked = store
+            .claim_delivery_job("worker", now_unix())
+            .unwrap()
+            .unwrap();
+        let mut blocked_grant = grant(&blocked);
+        blocked_grant.link_id.clear();
+        blocked_grant.upload_id.clear();
+        blocked_grant.files[0].source = "received:file.bin".into();
+        assert!(store
+            .insert_workflow_grant(blocked_grant, None, Some(&blocked))
+            .unwrap_err()
+            .contains("identity"));
+        assert!(store
+            .outbound_grant_by_id(&replacement.id)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .reprocess_received_job(
+                &identity,
+                &original.id,
+                original.manifest.as_deref().unwrap(),
+                project.revision
+            )
+            .is_err());
+        assert!(actor_active(&store.connection.lock().unwrap(), &original).is_ok());
+        let mut forged = original.clone();
+        forged.actor = "reception:another-link".into();
+        assert!(actor_active(&store.connection.lock().unwrap(), &forged).is_err());
+    }
+
+    #[test]
+    fn reprocess_source_and_capacity_refusals_leave_old_delivery_intact() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let (original, _) = prepared_reception(&store);
+        let mut project = original.project.clone();
+        project.label.push_str(" changed");
+        let project = store.save_delivery_project("", "local", project).unwrap();
+        let identity = crate::auth::AdminIdentity::local_admin();
+        let mut disabled = project.clone();
+        disabled.receive = false;
+        let disabled = store.save_delivery_project("", "local", disabled).unwrap();
+        assert!(store
+            .reprocess_received_job(
+                &identity,
+                &original.id,
+                original.manifest.as_deref().unwrap(),
+                disabled.revision
+            )
+            .unwrap_err()
+            .contains("no longer accepts"));
+        let mut enabled = disabled;
+        enabled.receive = true;
+        let project = store.save_delivery_project("", "local", enabled).unwrap();
+        let attempt = || {
+            store.reprocess_received_job(
+                &identity,
+                &original.id,
+                original.manifest.as_deref().unwrap(),
+                project.revision,
+            )
+        };
+        store.with(|c| c.execute_batch("INSERT INTO inbound_routes(id,tenant,link_id,issuer,operation_id,source,ancestry,upload_id,revoked_at,created_at) VALUES ('route','','incoming','issuer','operation','{}','[]','received',1,1); INSERT INTO route_uploads(route_id,upload_id,partial) VALUES ('route','received',0)")).unwrap();
+        assert!(attempt().unwrap_err().contains("revoked"));
+        store
+            .with(|c| {
+                c.execute_batch(
+                    "UPDATE inbound_routes SET revoked_at=NULL; UPDATE route_uploads SET partial=1",
+                )
+            })
+            .unwrap();
+        assert!(attempt().unwrap_err().contains("incomplete"));
+        store
+            .with(|c| c.execute_batch("DELETE FROM route_uploads; DELETE FROM inbound_routes"))
+            .unwrap();
+        let uploaded = store
+            .link_upload("", "incoming", "received")
+            .unwrap()
+            .unwrap();
+        for change in ["partial", "deleted", "content", "name", "empty"] {
+            let mut changed = uploaded.clone();
+            match change {
+                "partial" => changed.partial = true,
+                "deleted" => changed.files[0].deleted = true,
+                "content" => changed.files[0].root = "different".into(),
+                "name" => changed.files[0].path = "different.bin".into(),
+                _ => changed.files.clear(),
+            }
+            store
+                .with(|c| {
+                    c.execute(
+                        "UPDATE links SET uploads_json=?1 WHERE id='incoming'",
+                        [serde_json::to_string(&vec![changed]).unwrap()],
+                    )
+                })
+                .unwrap();
+            assert!(attempt().is_err(), "{change}");
+        }
+        store
+            .with(|c| {
+                c.execute(
+                    "UPDATE links SET uploads_json=?1 WHERE id='incoming'",
+                    [serde_json::to_string(&vec![uploaded]).unwrap()],
+                )
+            })
+            .unwrap();
+        store.with(|c| c.execute("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1000) INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,document) SELECT 'busy_'||i,'','sender','busy_'||i,'project','queued',0,'{}' FROM n",[])).unwrap();
+        assert!(attempt().unwrap_err().contains("active job limit"));
+        assert_eq!(
+            serde_json::to_value(store.delivery_job(&original.id).unwrap().unwrap()).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+        assert!(store
+            .outbound_grant_by_id(&original.id)
+            .unwrap()
+            .unwrap()
+            .revoked_at
+            .is_none());
+        store
+            .with(|c| c.execute("DELETE FROM delivery_jobs WHERE id='busy_1000'", []))
+            .unwrap();
+        let mut pending = original.clone();
+        pending.state = "awaiting_approval".into();
+        store.with(|c| save_job(c, &pending)).unwrap();
+        assert!(attempt().is_ok());
+    }
+
+    #[test]
+    fn reprocess_retains_completed_peer_evidence_and_reports_the_current_successor() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_directory = tempfile::tempdir().unwrap();
+        let peer_directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let signer =
+            crate::receipt::ReceiptSigner::load_or_create(source_directory.path()).unwrap();
+        let peer = crate::receipt::ReceiptSigner::load_or_create(peer_directory.path()).unwrap();
+        let (original, _) = prepared_reception(&store);
+        let route = crate::store::TradeRoute {
+            id: "incoming-route".into(),
+            revision: 1,
+            tenant: String::new(),
+            direction: "incoming".into(),
+            name: "Source".into(),
+            peer_name: "Source".into(),
+            peer_key: signer.public_hex.clone(),
+            address: "http://localhost".into(),
+            endpoint: "incoming".into(),
+            endpoint_name: "Incoming".into(),
+            category: "internal".into(),
+            forwarding: true,
+            metadata_keys: vec![],
+            state: "active".into(),
+            notifications: Default::default(),
+            last_contact: None,
+            error: None,
+            remote_grant: String::new(),
+            remote_state: "active".into(),
+            cancel_active: false,
+        };
+        let source = signer.sign_route(crate::route_protocol::RouteDocument {
+            issuer: signer.public_hex.clone(),
+            operation_id: "incoming-operation".into(),
+            manifest: original.manifest.clone().unwrap(),
+            label: "Received".into(),
+            metadata: Default::default(),
+            parent_receipt: None,
+            visited: vec![signer.public_hex.clone()],
+            permission: Some(crate::route_protocol::RoutePermission {
+                receiver: store.event_signer.public_hex.clone(),
+                grant: route.id.clone(),
+                forwarding: true,
+            }),
+        });
+        let receipt = store
+            .event_signer
+            .route_receipt(source.clone(), "received".into(), 2);
+        store.with(|c| {
+            c.execute("INSERT INTO inbound_routes(id,tenant,link_id,issuer,operation_id,source,ancestry,upload_id,receipt,created_at) VALUES ('inbound','','incoming',?1,'incoming-operation',?2,'[]','received',?3,1)",params![signer.public_hex,serde_json::to_string(&source).unwrap(),serde_json::to_string(&receipt).unwrap()])?;
+            c.execute("INSERT INTO route_uploads(route_id,upload_id,partial) VALUES ('inbound','received',0)",[])
+        }).unwrap();
+        let config = store.save_delivery_storage("local", serde_json::from_value(serde_json::json!({"id":"downstream","revision":0,"label":"Peer","kind":"votport","endpoint":"http://localhost","tenants":[""],"enabled":true})).unwrap(),Some(crate::api::outbound::workflows::storage::Credentials::Votport { request_url: format!("http://localhost/r/{}", "ab".repeat(16)), password: None })).unwrap();
+        let mut project = original.project.clone();
+        project.destinations = vec![config.id.clone()];
+        let project = store.save_delivery_project("", "local", project).unwrap();
+        let identity = crate::auth::AdminIdentity::local_admin();
+        let first = store
+            .reprocess_received_job(
+                &identity,
+                &original.id,
+                original.manifest.as_deref().unwrap(),
+                project.revision,
+            )
+            .unwrap();
+        let mut preparing = store
+            .claim_delivery_job("worker", now_unix())
+            .unwrap()
+            .unwrap();
+        preparing.checks["destination_revisions"] =
+            serde_json::json!({"downstream":config.revision});
+        let mut first_grant = grant(&preparing);
+        first_grant.link_id.clear();
+        first_grant.upload_id.clear();
+        first_grant.files[0].source = "received:file.bin".into();
+        store
+            .insert_workflow_grant(first_grant, None, Some(&preparing))
+            .unwrap();
+        let exporting = store
+            .claim_delivery_job("worker", now_unix())
+            .unwrap()
+            .unwrap();
+        let outgoing = store
+            .event_signer
+            .sign_route(crate::route_protocol::RouteDocument {
+                issuer: store.event_signer.public_hex.clone(),
+                operation_id: first.id.clone(),
+                manifest: original.manifest.clone().unwrap(),
+                label: "Forwarded".into(),
+                metadata: Default::default(),
+                parent_receipt: Some(receipt.digest()),
+                visited: vec![
+                    signer.public_hex.clone(),
+                    store.event_signer.public_hex.clone(),
+                ],
+                permission: None,
+            });
+        let completed = peer.route_receipt(outgoing.clone(), "remote-upload".into(), 3);
+        store
+            .bind_outbound_route(
+                &exporting,
+                "downstream",
+                "http://localhost",
+                "remote-route",
+                &peer.public_hex,
+                &outgoing,
+            )
+            .unwrap();
+        store
+            .record_route_receipt(&exporting, "downstream", &completed)
+            .unwrap();
+        store
+            .complete_delivery_export(
+                &first.id,
+                exporting.attempts,
+                "downstream",
+                "receipt:complete",
+            )
+            .unwrap();
+        assert_eq!(
+            store.trade_deliveries(&route).unwrap()[0]["workflow"],
+            "ready"
+        );
+        let retained = store.delivery_job(&first.id).unwrap().unwrap();
+        let mut current = project;
+        current.destinations.clear();
+        let current = store.save_delivery_project("", "local", current).unwrap();
+        let next = store
+            .reprocess_received_job(
+                &identity,
+                &first.id,
+                retained.manifest.as_deref().unwrap(),
+                current.revision,
+            )
+            .unwrap();
+        let status = store.trade_deliveries(&route).unwrap();
+        assert_eq!(status.as_array().unwrap().len(), 1);
+        assert_eq!(status[0]["workflow"], "queued");
+        assert_eq!(status[0]["released"], false);
+        assert_eq!(
+            store.delivery_job(&first.id).unwrap().unwrap().checks,
+            retained.checks
+        );
+        let control = store.claim_route_revocation(now_unix()).unwrap().unwrap();
+        assert_eq!(control.job_id, first.id);
+        assert_eq!(control.request.document.source, outgoing);
+        assert!(control.request.verify());
+        let revoke = signer.revoke_route(source, store.event_signer.public_hex.clone(), "inbound");
+        store.revoke_inbound_route("inbound", &revoke).unwrap();
+        assert_eq!(
+            store.delivery_job(&next.id).unwrap().unwrap().state,
+            "cancelled"
+        );
+        assert!(store
+            .reprocess_received_job(
+                &identity,
+                &next.id,
+                retained.manifest.as_deref().unwrap(),
+                current.revision
+            )
+            .is_err());
+        assert!(store.receive_workflow_pending("", "incoming").unwrap());
     }
 
     fn grant(job: &Job) -> OutboundGrant {

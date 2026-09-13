@@ -380,11 +380,8 @@ pub(super) fn complete_route(
     .map_err(|e| e.to_string())
 }
 
-pub(super) fn require_shareable(
-    connection: &Connection,
-    grant: &OutboundGrant,
-) -> Result<(), String> {
-    let blocked:bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM route_uploads u JOIN inbound_routes r ON r.id=u.route_id WHERE u.upload_id=?1 AND (u.partial=1 OR r.revoked_at IS NOT NULL))",[&grant.upload_id],|row|row.get(0)).map_err(|e|e.to_string())?;
+pub(super) fn require_shareable(connection: &Connection, upload_id: &str) -> Result<(), String> {
+    let blocked:bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM route_uploads u JOIN inbound_routes r ON r.id=u.route_id WHERE u.upload_id=?1 AND (u.partial=1 OR r.revoked_at IS NOT NULL))",[upload_id],|row|row.get(0)).map_err(|e|e.to_string())?;
     if blocked {
         Err("incoming route is incomplete or revoked".into())
     } else {

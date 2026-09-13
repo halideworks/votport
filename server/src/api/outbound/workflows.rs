@@ -347,6 +347,71 @@ pub async fn evidence(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Reprocess {
+    manifest: String,
+    project_revision: u64,
+}
+
+pub async fn reprocess(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<Reprocess>,
+) -> ApiResult<Response> {
+    if headers.contains_key(header::AUTHORIZATION) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "reprocessing requires a human project sender",
+        ));
+    }
+    let actor = admin::require_operator(&app, &headers)?;
+    if !headers.contains_key("x-votport") {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "missing X-Votport header",
+        ));
+    }
+    let original = app
+        .store
+        .delivery_job(&id)
+        .map_err(crate::api::store_unavailable)?
+        .filter(|job| job.tenant == actor.identity.tenant)
+        .ok_or_else(ApiError::not_found)?;
+    let project = app
+        .store
+        .delivery_project(&original.tenant, &original.project.id)
+        .map_err(crate::api::store_unavailable)?
+        .ok_or_else(ApiError::not_found)?;
+    if !project.allows(
+        &actor.identity.subject,
+        "sender",
+        actor.identity.role == "admin",
+    ) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "project sender permission required",
+        ));
+    }
+    let job = app
+        .store
+        .reprocess_received_job(
+            &actor.identity,
+            &id,
+            &request.manifest,
+            request.project_revision,
+        )
+        .map_err(conflict)?;
+    app.workflow_ready.notify_one();
+    Ok((
+        StatusCode::ACCEPTED,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(public_job(&app, &headers, job)),
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Action {
     action: String,
     manifest: Option<String>,
@@ -1569,6 +1634,11 @@ mod tests {
     async fn reception_pins_originals_and_gates_verified_copies_without_snapshots() {
         for (release, suite, failure) in [
             (
+                crate::workflow::Release::Local,
+                Suite::Blake3Bao64,
+                "reprocess",
+            ),
+            (
                 crate::workflow::Release::AllDestinations,
                 Suite::Blake3Bao64,
                 "lost_ack",
@@ -1914,6 +1984,200 @@ mod tests {
                 std::fs::read(completion.parent().unwrap().join("files/file.bin")).unwrap(),
                 bytes
             );
+            if failure == "reprocess" {
+                let connection =
+                    rusqlite::Connection::open(app.config.data_dir.join("votport.db")).unwrap();
+                connection.execute("UPDATE delivery_jobs SET document=json_remove(document,'$.checks.destinations.online') WHERE id=?1",[&job.id]).unwrap();
+                let original = app.store.delivery_job(&job.id).unwrap().unwrap();
+                let mut current = edited.clone();
+                current.require_approval = true;
+                current.required_metadata.push("revision_note".into());
+                let current = app
+                    .store
+                    .save_delivery_project("", "local", current)
+                    .unwrap();
+                assert!(app.store.delivery_release(&job.id).is_err());
+                assert!(app
+                    .store
+                    .change_delivery_job("", &job.id, "local", true, "retry", None)
+                    .is_err());
+                corrected
+                    .metadata
+                    .insert("revision_note".into(), "New rules".into());
+                app.store
+                    .set_receive_workflow("", &link.id, &corrected)
+                    .unwrap();
+                let action =
+                    json!({"manifest":original.manifest,"project_revision":current.revision});
+                let endpoint = format!("/api/workflows/jobs/{}/reprocess", job.id);
+                assert_eq!(
+                    call(&app, Method::POST, &endpoint, None, Some(action.clone()))
+                        .await
+                        .0,
+                    StatusCode::UNAUTHORIZED
+                );
+                let mut observer = auth::AdminIdentity::local_admin();
+                observer.subject = "observer".into();
+                observer.role = "viewer".into();
+                observer.grants[0].role = "viewer".into();
+                let observer_cookie = format!(
+                    "votport_admin={}",
+                    auth::issue_admin_token(&app.secret, &observer, &app.config.admin_token_tag)
+                );
+                assert_eq!(
+                    call(
+                        &app,
+                        Method::POST,
+                        &endpoint,
+                        Some(&observer_cookie),
+                        Some(action.clone())
+                    )
+                    .await
+                    .0,
+                    StatusCode::FORBIDDEN
+                );
+                for automation in [false, true] {
+                    let mut request = Request::builder()
+                        .method(Method::POST)
+                        .uri(&endpoint)
+                        .header(header::COOKIE, &cookie)
+                        .header(header::CONTENT_TYPE, "application/json");
+                    if automation {
+                        request = request
+                            .header(header::AUTHORIZATION, "Bearer token")
+                            .header("X-Votport", "1");
+                    }
+                    let response = crate::app::router(Arc::clone(&app))
+                        .oneshot(request.body(Body::from(action.to_string())).unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                }
+                let (status, _, response) = call(
+                    &app,
+                    Method::POST,
+                    &endpoint,
+                    Some(&cookie),
+                    Some(action.clone()),
+                )
+                .await;
+                assert_eq!(
+                    status,
+                    StatusCode::ACCEPTED,
+                    "prepared reception must support a new delivery under current rules: {}",
+                    String::from_utf8_lossy(&response)
+                );
+                let replacement: Job = serde_json::from_value(
+                    serde_json::from_slice::<serde_json::Value>(&response).unwrap()["job"].clone(),
+                )
+                .unwrap();
+                assert_ne!(replacement.id, original.id);
+                assert_eq!(replacement.received, original.received);
+                assert_eq!(replacement.project, current);
+                assert_eq!(replacement.actor, "local");
+                assert_eq!(replacement.request.metadata, corrected.metadata);
+                assert!(replacement.manifest.is_none());
+                assert!(replacement.approved_by.is_none());
+                assert!(replacement.checks.get("destinations").is_none());
+                let (status, _, response) =
+                    call(&app, Method::POST, &endpoint, Some(&cookie), Some(action)).await;
+                assert_eq!(status, StatusCode::ACCEPTED);
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&response).unwrap()["job"]["id"],
+                    replacement.id
+                );
+                assert_eq!(
+                    app.store
+                        .delivery_jobs("", "", 100, None, "", "")
+                        .unwrap()
+                        .len(),
+                    2
+                );
+                let retained = app.store.delivery_job(&original.id).unwrap().unwrap();
+                assert_eq!(retained.state, "cancelled");
+                assert_eq!(retained.project, original.project);
+                assert_eq!(retained.manifest, original.manifest);
+                assert_eq!(retained.checks, original.checks);
+                let old_token = app.signer.delivery_token(&format!("{}:0", original.id));
+                assert_ne!(
+                    call(
+                        &app,
+                        Method::GET,
+                        &format!("/api/s/{old_token}"),
+                        None,
+                        None
+                    )
+                    .await
+                    .0,
+                    StatusCode::OK
+                );
+                assert!(app
+                    .store
+                    .outbound_grant_by_id(&original.id)
+                    .unwrap()
+                    .unwrap()
+                    .revoked_at
+                    .is_some());
+                assert!(app
+                    .store
+                    .complete_delivery_export(&original.id, exporting.attempts, "offline", "late")
+                    .is_err());
+                app.store
+                    .fail_delivery_job(&original.id, exporting.attempts, "late failure")
+                    .unwrap();
+                assert_eq!(
+                    app.store.delivery_job(&original.id).unwrap().unwrap().state,
+                    "cancelled"
+                );
+                let preparing = app
+                    .store
+                    .claim_delivery_job("worker", now_unix())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(preparing.id, replacement.id);
+                prepare(&app, preparing).await.unwrap();
+                let pending = app.store.delivery_job(&replacement.id).unwrap().unwrap();
+                assert_eq!(pending.state, "awaiting_approval");
+                assert_eq!(pending.manifest, original.manifest);
+                assert!(app
+                    .store
+                    .change_delivery_job(
+                        "",
+                        &pending.id,
+                        "local",
+                        true,
+                        "approve",
+                        pending.manifest.as_deref()
+                    )
+                    .is_err());
+                app.store
+                    .change_delivery_job(
+                        "",
+                        &pending.id,
+                        "approver",
+                        false,
+                        "approve",
+                        pending.manifest.as_deref(),
+                    )
+                    .unwrap();
+                std::fs::create_dir(directory.path().join("offline")).unwrap();
+                let exporting = app
+                    .store
+                    .claim_delivery_job("worker", now_unix())
+                    .unwrap()
+                    .unwrap();
+                prepare(&app, exporting).await.unwrap();
+                let ready = app.store.delivery_job(&replacement.id).unwrap().unwrap();
+                assert_eq!(ready.state, "ready");
+                assert_ne!(ready.checks["destinations"]["online"]["location"], key);
+                assert_eq!(std::fs::read(&completion).unwrap(), signed);
+                assert_eq!(
+                    std::fs::read(app.config.receive_dir.join("file.bin")).unwrap(),
+                    bytes
+                );
+                assert!(!payload_root(&app, "", &replacement.id).exists());
+                continue;
+            }
             if unavailable {
                 assert!(error.message.contains("offline"));
                 assert!(app
