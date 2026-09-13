@@ -7,9 +7,11 @@ mod routing;
 pub use routing::{destination, test_destination};
 use routing::{send_policy, Route};
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
+use lettre::message::SinglePart;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
@@ -287,16 +289,25 @@ pub async fn workflow_failed(app: Arc<App>, job: crate::workflow::Job) {
     .await;
 }
 
-fn chat_payload(channel: &str, title: &str, body: &str) -> serde_json::Value {
-    fn clipped(text: &str, limit: usize) -> String {
-        if text.len() <= limit {
-            text.to_owned()
-        } else {
-            format!("{}…", &text[..text.floor_char_boundary(limit - 3)])
-        }
+fn clipped_bytes(text: &str, limit: usize) -> Cow<'_, str> {
+    if text.len() <= limit {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(format!("{}…", &text[..text.floor_char_boundary(limit - 3)]))
     }
-    let title = clipped(title, 150);
-    let body = clipped(body, 1500);
+}
+
+fn clipped_chars(text: &str, limit: usize) -> Cow<'_, str> {
+    let mut chars = text.char_indices();
+    match chars.nth(limit - 1) {
+        Some((last, _)) if chars.next().is_some() => Cow::Owned(format!("{}…", &text[..last])),
+        _ => Cow::Borrowed(text),
+    }
+}
+
+fn chat_payload(channel: &str, title: &str, body: &str) -> serde_json::Value {
+    let title = clipped_bytes(title, 150);
+    let body = clipped_bytes(body, 1500);
     let text = format!("{title}\n{body}");
     match channel {
         "slack" => json!({
@@ -411,14 +422,17 @@ async fn send_smtp(
                 .parse()
                 .map_err(|error| format!("smtp from: {error}"))?,
         )
-        .subject(title);
+        .subject(clipped_chars(title, 250).into_owned());
     for recipient in recipients {
         builder = builder.to(recipient
             .parse()
             .map_err(|error| format!("smtp to: {error}"))?);
     }
+    // Application summary bound before MIME encoding, not an SMTP size limit.
     let message = builder
-        .body(body.to_owned())
+        .singlepart(SinglePart::plain(
+            clipped_bytes(body, 64 * 1024).into_owned(),
+        ))
         .map_err(|error| format!("smtp message: {error}"))?;
 
     let tls = smtp_tls(smtp)?;
@@ -643,6 +657,98 @@ pub(crate) mod tests {
                 rejected_chunks: 0,
             },
         }
+    }
+
+    #[test]
+    fn summary_limits_keep_complete_unicode_at_boundaries() {
+        for text in ["", "abc", "界🎬é"] {
+            assert_eq!(clipped_bytes(text, text.len().max(3)), text);
+            assert_eq!(clipped_chars(text, text.chars().count().max(1)), text);
+        }
+        assert_eq!(clipped_bytes("界🎬é", 8), "界…");
+        assert_eq!(clipped_bytes("界🎬é", 3), "…");
+        assert_eq!(clipped_chars("界🎬é", 2), "界…");
+        assert_eq!(clipped_chars("界🎬é", 1), "…");
+    }
+
+    #[tokio::test]
+    async fn uploaded_ntfy_and_test_share_safe_bounded_requests() {
+        use axum::{
+            http::{HeaderMap, StatusCode, Uri},
+            routing::post,
+            Router,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let messages = Arc::new(std::sync::Mutex::new(Vec::<(Uri, HeaderMap, String)>::new()));
+        let received = messages.clone();
+        let routes = Router::new().route(
+            "/topic",
+            post(move |uri: Uri, headers: HeaderMap, body: String| {
+                received.lock().unwrap().push((uri, headers, body));
+                async { (StatusCode::OK, [("connection", "close")]) }
+            }),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let destination =
+            test_destination_config(&application, "ntfy", format!("http://{address}/topic"));
+        let files = (0..100)
+            .map(|index| FileRecord {
+                path: format!("{}-{index}.mov", "撮影🎬".repeat(8)),
+                stored_as: format!("{}-{index}.mov", "撮影🎬".repeat(8)),
+                bytes: 1,
+                suite: "blake3".into(),
+                root: "fixture".into(),
+                receipt: false,
+                deleted: false,
+            })
+            .collect();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let (served, tested) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                async {
+                    axum::serve(listener, routes)
+                        .with_graceful_shutdown(async {
+                            let _ = stopped.await;
+                        })
+                        .await
+                },
+                async {
+                    uploaded(
+                        application.clone(),
+                        String::new(),
+                        "Müller\n撮影".into(),
+                        FinishReport {
+                            received: 0,
+                            upload_id: "up-ntfy".into(),
+                            files,
+                        },
+                        Some(test_policy()),
+                    )
+                    .await;
+                    let tested = test_destination(&application, "", &destination).await;
+                    let _ = stop.send(());
+                    tested
+                }
+            )
+        })
+        .await
+        .unwrap();
+        served.unwrap();
+        assert!(tested);
+        let messages = messages.lock().unwrap();
+        assert_eq!(messages.len(), 2);
+        let (uri, headers, body) = &messages[0];
+        assert!(!headers.contains_key("title"));
+        let url = reqwest::Url::parse(&format!("http://localhost{uri}")).unwrap();
+        assert!(url
+            .query_pairs()
+            .any(|(key, value)| key == "title" && value.contains("Müller\n撮影")));
+        assert!(body.starts_with("ID: up-ntfy\n100 file(s), 100 bytes\n"));
+        assert!(body.len() <= 4096 && body.ends_with('…'));
+        assert!(body.contains("撮影🎬"));
+        assert_eq!(messages[1].2, "This is a VOTPort notification test.");
     }
 
     #[test]
@@ -1080,7 +1186,17 @@ pub(crate) mod tests {
             FinishReport {
                 received: 0,
                 upload_id: "up-smtp".to_owned(),
-                files: Vec::new(),
+                files: (0..100)
+                    .map(|index| FileRecord {
+                        path: format!("{}Müller_撮影-{index}.mov", "撮影/".repeat(200)),
+                        stored_as: format!("{}Müller_撮影-{index}.mov", "撮影/".repeat(200)),
+                        bytes: 1,
+                        suite: "blake3".into(),
+                        root: "fixture".into(),
+                        receipt: false,
+                        deleted: false,
+                    })
+                    .collect(),
             },
             Some(test_policy()),
         )
@@ -1097,6 +1213,31 @@ pub(crate) mod tests {
         );
         assert!(transcript.contains("votport@example.com"), "{transcript}");
         assert!(transcript.contains("smtp-label"), "{transcript}");
+        assert!(transcript.contains("MIME-Version: 1.0"), "{transcript}");
+        assert!(
+            transcript.contains("Content-Type: text/plain; charset=utf-8"),
+            "{transcript}"
+        );
+        let data = transcript
+            .split_once("DATA\r\n")
+            .unwrap()
+            .1
+            .split_once("\r\n.\r\n")
+            .unwrap()
+            .0;
+        let (headers, encoded) = data.split_once("\r\n\r\n").unwrap();
+        assert!(
+            headers.contains("Content-Transfer-Encoding: base64"),
+            "{headers}"
+        );
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded.lines().collect::<String>())
+            .unwrap();
+        let text = String::from_utf8(decoded).unwrap().replace("\r\n", "\n");
+        assert!(text.starts_with("ID: up-smtp\n100 file(s), 100 bytes\n"));
+        assert!(text.contains("Müller_撮影-0.mov"));
+        assert!(text.len() <= 64 * 1024 && text.ends_with('…'));
     }
 
     #[test]

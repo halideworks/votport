@@ -19,7 +19,7 @@ pub(super) async fn send_policy(
     app: &App,
     route: Route<'_>,
     title: String,
-    body: String,
+    mut body: String,
     payload: serde_json::Value,
     event: &str,
     transfer_id: Option<&str>,
@@ -58,6 +58,9 @@ pub(super) async fn send_policy(
             return;
         }
     };
+    if let Some(id) = transfer_id {
+        body.insert_str(0, &format!("ID: {id}\n"));
+    }
     stream::iter(destinations.iter())
         .for_each_concurrent(8, |destination| async {
             let delivered = send_destination(
@@ -102,27 +105,55 @@ async fn send_destination(
             send_smtp(&smtp, &destination.recipients, title, body).await,
         );
     }
+    let Some(request) = destination_request(&app.http, destination, title, body, payload) else {
+        return false;
+    };
+    log_failure(
+        &destination.channel,
+        event,
+        transfer_id,
+        request.send().await,
+    )
+    .await
+}
+
+fn destination_request(
+    client: &reqwest::Client,
+    destination: &NotificationDestination,
+    title: &str,
+    body: &str,
+    payload: &serde_json::Value,
+) -> Option<reqwest::RequestBuilder> {
     let request = match destination.channel.as_str() {
-        "webhook" => app.http.post(&destination.url).json(payload),
-        "ntfy" => app
-            .http
-            .post(&destination.url)
-            .header("Title", title)
-            .body(body.to_owned()),
-        "pushover" => app
-            .http
+        "webhook" => client.post(&destination.url).json(payload),
+        "ntfy" => {
+            let mut url = reqwest::Url::parse(&destination.url).ok()?;
+            let pairs = url
+                .query_pairs()
+                .filter(|(key, _)| !matches!(key.as_ref(), "title" | "t" | "x-title"))
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect::<Vec<_>>();
+            url.query_pairs_mut()
+                .clear()
+                .extend_pairs(pairs)
+                .append_pair("title", &clipped_bytes(title, 1024));
+            client
+                .post(url)
+                .body(clipped_bytes(body, 4096).into_owned())
+        }
+        "pushover" => client
             .post("https://api.pushover.net/1/messages.json")
             .form(&[
-                ("token", destination.token.as_str()),
-                ("user", destination.user.as_str()),
-                ("title", title),
-                ("message", body),
+                ("token", Cow::Borrowed(destination.token.as_str())),
+                ("user", Cow::Borrowed(destination.user.as_str())),
+                ("title", clipped_chars(title, 250)),
+                ("message", clipped_chars(body, 1024)),
             ]),
         "slack" | "teams" | "google_chat" | "discord" => {
             let mut url = destination.url.clone();
             if destination.channel == "discord" {
                 let Ok(mut parsed) = reqwest::Url::parse(&url) else {
-                    return false;
+                    return None;
                 };
                 let pairs = parsed
                     .query_pairs()
@@ -143,11 +174,11 @@ async fn send_destination(
                 }
                 url = parsed.into();
             }
-            app.http
+            client
                 .post(url)
                 .json(&chat_payload(&destination.channel, title, body))
         }
-        _ => return false,
+        _ => return None,
     };
     let request = if ["webhook", "ntfy"].contains(&destination.channel.as_str())
         && !destination.token.is_empty()
@@ -156,13 +187,7 @@ async fn send_destination(
     } else {
         request
     };
-    log_failure(
-        &destination.channel,
-        event,
-        transfer_id,
-        request.send().await,
-    )
-    .await
+    Some(request)
 }
 
 pub async fn test_destination(
@@ -192,6 +217,113 @@ mod tests {
     use crate::api::testing;
     use crate::store::{NotificationRule, SettingWrite};
     use axum::{extract::Path, routing::post, Json, Router};
+
+    fn push_destination(channel: &str) -> NotificationDestination {
+        NotificationDestination {
+            id: "fixture".into(),
+            revision: 0,
+            label: "fixture".into(),
+            channel: channel.into(),
+            target: "fixture".into(),
+            enabled: true,
+            url: "http://127.0.0.1/topic?priority=high&title=old&t=old&x-title=old".into(),
+            token: "fixture-token".into(),
+            user: "fixture-user".into(),
+            recipients: vec![],
+            thread_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn provider_payload_ntfy_bounds_utf8_bytes() {
+        let client = reqwest::Client::new();
+        let destination = push_destination("ntfy");
+        let title = "界".repeat(342);
+        let body = "🎬".repeat(1025);
+        let request = destination_request(&client, &destination, &title, &body, &json!({}))
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(request.body().unwrap().as_bytes().unwrap().len() <= 4096);
+        let titles = request
+            .url()
+            .query_pairs()
+            .filter(|(k, _)| k == "title")
+            .collect::<Vec<_>>();
+        assert_eq!(titles.len(), 1);
+        assert!(titles[0].1.len() <= 1024);
+        assert_eq!(request.headers()["authorization"], "Bearer fixture-token");
+        let title = format!("{}a", "界".repeat(341));
+        let body = "🎬".repeat(1024);
+        let request = destination_request(&client, &destination, &title, &body, &json!({}))
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(request.body().unwrap().as_bytes().unwrap(), body.as_bytes());
+        assert!(request
+            .url()
+            .query_pairs()
+            .any(|(key, value)| key == "title" && value == title));
+    }
+
+    #[test]
+    fn provider_payload_pushover_bounds_characters() {
+        let client = reqwest::Client::new();
+        let destination = push_destination("pushover");
+        let title = "界".repeat(251);
+        let body = "🎬".repeat(1025);
+        let request = destination_request(&client, &destination, &title, &body, &json!({}))
+            .unwrap()
+            .build()
+            .unwrap();
+        let form = reqwest::Url::parse(&format!(
+            "http://localhost/?{}",
+            std::str::from_utf8(request.body().unwrap().as_bytes().unwrap()).unwrap()
+        ))
+        .unwrap();
+        let values = form
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert!(values["title"].chars().count() <= 250);
+        assert!(values["message"].chars().count() <= 1024);
+        assert_eq!(values["token"], "fixture-token");
+        assert_eq!(values["user"], "fixture-user");
+        let title = "🎬".repeat(250);
+        let body = "🎬".repeat(1024);
+        let request = destination_request(&client, &destination, &title, &body, &json!({}))
+            .unwrap()
+            .build()
+            .unwrap();
+        let form = reqwest::Url::parse(&format!(
+            "http://localhost/?{}",
+            std::str::from_utf8(request.body().unwrap().as_bytes().unwrap()).unwrap()
+        ))
+        .unwrap();
+        let values = form
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(values["title"], title);
+        assert_eq!(values["message"], body);
+    }
+
+    #[test]
+    fn provider_payload_ntfy_encodes_title_controls() {
+        let client = reqwest::Client::new();
+        let destination = push_destination("ntfy");
+        let title = "Müller\n撮影🎬";
+        let request = destination_request(&client, &destination, title, "body", &json!({}))
+            .unwrap()
+            .build()
+            .unwrap();
+        let params = request
+            .url()
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(params["title"], title);
+        assert_eq!(params["priority"], "high");
+        assert!(!params.contains_key("t") && !params.contains_key("x-title"));
+        assert!(!request.headers().contains_key("title"));
+    }
 
     #[tokio::test]
     async fn selected_destinations_receive_only_their_events_and_defaults_do_not_broadcast() {
