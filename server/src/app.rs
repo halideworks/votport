@@ -747,12 +747,7 @@ async fn discover_sso(
 }
 
 pub fn build(config: Config) -> Result<Arc<App>, String> {
-    if config.push_bind.is_some() && config.session_idle_secs == 0 {
-        return Err(
-            "VOTPORT_SESSION_IDLE_SECS must be greater than zero when native push is enabled"
-                .to_owned(),
-        );
-    }
+    config.validate()?;
     #[cfg(unix)]
     rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o022));
     std::fs::create_dir_all(&config.data_dir)
@@ -3036,15 +3031,40 @@ mod push_tests {
     }
 
     #[test]
-    fn native_push_requires_a_nonzero_session_lifetime() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut config = push_config(directory.path());
-        config.session_idle_secs = 0;
-
-        assert_eq!(
-            build(config).err().unwrap(),
-            "VOTPORT_SESSION_IDLE_SECS must be greater than zero when native push is enabled"
-        );
+    fn startup_validation_precedes_filesystem_changes() {
+        for invalid in ["idle", "url", "hash"] {
+            for push in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut config = push_config(directory.path());
+                if !push {
+                    config.push_bind = None;
+                }
+                let expected = match invalid {
+                    "idle" => {
+                        config.session_idle_secs = 0;
+                        "VOTPORT_SESSION_IDLE_SECS"
+                    }
+                    "url" => {
+                        config.public_url = Some("https://drop.example.com/base".into());
+                        "VOTPORT_PUBLIC_URL"
+                    }
+                    "hash" => {
+                        config.admin_password_hash = "invalid".into();
+                        "VOTPORT_ADMIN_PASSWORD_HASH"
+                    }
+                    _ => unreachable!(),
+                };
+                let data = config.data_dir.clone();
+                assert!(build(config)
+                    .err()
+                    .expect("invalid configuration was admitted")
+                    .contains(expected));
+                assert!(
+                    !data.exists(),
+                    "{invalid}, push={push}: startup created files"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4373,9 +4393,8 @@ mod retention_tests {
         use std::time::{Duration, SystemTime};
 
         let directory = tempfile::tempdir().unwrap();
-        let mut config = crate::api::testing::config(directory.path());
-        config.session_idle_secs = 0;
-        let app = build(config).unwrap();
+        let mut app = build(crate::api::testing::config(directory.path())).unwrap();
+        Arc::get_mut(&mut app).unwrap().config.session_idle_secs = 0;
         let backups = crate::backup::ensure_backups_dir(&app.config.data_dir).unwrap();
         let snapshot = backups.join("votport-1-deadbeef.db");
         let add_expired = || {

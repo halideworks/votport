@@ -141,8 +141,8 @@ The table covers common settings. See the configuration references for
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `VOTPORT_ADMIN_PASSWORD` | — | Admin password (hashed with argon2id at startup). Required unless the hash is set. At least 12 characters; a shorter one refuses to start, because this is the credential that still works when the identity provider does not. |
-| `VOTPORT_ADMIN_PASSWORD_HASH` | — | Argon2 PHC string; takes precedence over the plain password. |
-| `VOTPORT_PUBLIC_URL` | — | Public https URL; used for generated links and to mark cookies `Secure`. |
+| `VOTPORT_ADMIN_PASSWORD_HASH` | — | Complete supported Argon2 PHC string; malformed hashes stop startup. Takes precedence over the plain password. |
+| `VOTPORT_PUBLIC_URL` | — | Public https origin with no path prefix; used for generated links and to mark cookies `Secure`. |
 | `VOTPORT_BIND` | `0.0.0.0:8080` | Listen address inside the container. |
 | `VOTPORT_PUSH_BIND` | off | UDP address for native VOT pushes. Setting it enables the listener; leave unset to keep native push disabled. |
 | `VOTPORT_PUSH_ADVERTISE` | derived | `host:port` that native senders dial. Defaults to the host in `VOTPORT_PUBLIC_URL` and the push bind port. Set it when the public UDP address differs. |
@@ -154,7 +154,7 @@ The table covers common settings. See the configuration references for
 | `VOTPORT_OUTBOUND_DIR` | `/outbound` | Root folder for server-rendered projects and files uploaded by admins for outbound links. Nested project subdirectories are allowed. |
 | `VOTPORT_MAX_UPLOAD_BYTES` | 50 GiB | Hard cap per upload session (per-link caps can be lower). Accepts plain bytes or a `K/KiB/KB`, `M/MiB/MB`, `G/GiB/GB`, `T/TiB/TB` suffix, e.g. `500G`. |
 | `VOTPORT_ALLOW_HIDDEN` | off | Set `1` to accept dot-file names from uploaders. |
-| `VOTPORT_SESSION_IDLE_SECS` | `1800` | Idle time before an unfinished upload session is discarded. |
+| `VOTPORT_SESSION_IDLE_SECS` | `1800` | Positive idle time in seconds before an unfinished upload session is discarded; zero stops startup. |
 | `VOTPORT_WEB_ROOT` | `./web` | Static assets directory (`/app/web` in Docker). |
 | `VOTPORT_NOTIFY_SMTP_HOST` | — | Shared SMTP relay host. Configure recipients on named email destinations. |
 | `VOTPORT_NOTIFY_SMTP_PORT` | `587` | SMTP port. Port 465 uses implicit TLS. |

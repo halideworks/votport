@@ -50,7 +50,7 @@ pub struct Config {
     pub replica_token: Option<String>,
     pub smtp_from: Option<String>,
 
-    /// Public base URL (e.g. "https://drop.example.com"); used to render
+    /// Public origin (e.g. "https://drop.example.com"); used to render
     /// links in the admin UI and to decide whether cookies are `Secure`.
     pub public_url: Option<String>,
     /// Hard cap on the total bytes of a single upload session.
@@ -95,6 +95,18 @@ pub struct Config {
     pub trusted_proxies: Vec<IpCidr>,
     /// OIDC single sign-on for the admin dashboard. None when unset.
     pub oidc: Option<OidcConfig>,
+}
+
+impl Config {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if let Some(url) = self.public_url.as_deref() {
+            validate_public_url(url)?;
+        }
+        if self.session_idle_secs == 0 {
+            return Err("VOTPORT_SESSION_IDLE_SECS must be greater than zero".to_owned());
+        }
+        validate_admin_password_hash(&self.admin_password_hash)
+    }
 }
 
 /// Identity-provider settings for admin SSO (docs/multi-tenancy.md phase 3).
@@ -290,10 +302,6 @@ pub fn from_env() -> Result<Config, String> {
         .ok()
         .map(|url| url.trim_end_matches('/').to_owned())
         .filter(|url| !url.is_empty());
-    if let Some(url) = public_url.as_deref() {
-        validate_public_url(url)?;
-    }
-
     let push_bind = optional("VOTPORT_PUSH_BIND")
         .map(|value| {
             value
@@ -501,7 +509,7 @@ pub fn from_env() -> Result<Config, String> {
         }
     };
 
-    Ok(Config {
+    let config = Config {
         bind,
         push_bind,
         push_certificate,
@@ -543,7 +551,31 @@ pub fn from_env() -> Result<Config, String> {
         sso_session_secs,
         trusted_proxies,
         oidc,
-    })
+    };
+    config.validate()?;
+    Ok(config)
+}
+
+fn validate_admin_password_hash(phc: &str) -> Result<(), String> {
+    use argon2::{password_hash::PasswordHash, Algorithm, Params, Version};
+
+    let invalid =
+        || "VOTPORT_ADMIN_PASSWORD_HASH must be a complete supported Argon2 PHC string".to_owned();
+    let hash = PasswordHash::new(phc).map_err(|_| invalid())?;
+    Algorithm::try_from(hash.algorithm).map_err(|_| invalid())?;
+    if let Some(version) = hash.version {
+        Version::try_from(version).map_err(|_| invalid())?;
+    }
+    Params::try_from(&hash).map_err(|_| invalid())?;
+    if hash.hash.is_none() {
+        return Err(invalid());
+    }
+    let salt = hash.salt.ok_or_else(invalid)?;
+    let mut decoded = [0u8; 64];
+    if salt.decode_b64(&mut decoded).map_err(|_| invalid())?.len() < argon2::MIN_SALT_LEN {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 fn validate_public_url(url: &str) -> Result<(), String> {
@@ -557,6 +589,9 @@ fn validate_public_url(url: &str) -> Result<(), String> {
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return Err("VOTPORT_PUBLIC_URL must not contain a query or fragment".to_owned());
+    }
+    if parsed.path() != "/" {
+        return Err("VOTPORT_PUBLIC_URL must be an origin without a path prefix".to_owned());
     }
     let host = parsed
         .host_str()
@@ -759,7 +794,7 @@ mod public_url_tests {
     fn public_url_requires_https_except_loopback_http() {
         for valid in [
             "https://drop.example.com",
-            "https://drop.example.com/base",
+            "https://drop.example.com/",
             "http://localhost:8080",
             "http://127.0.0.1:8080",
             "http://[::1]:8080",
@@ -767,6 +802,9 @@ mod public_url_tests {
             assert!(validate_public_url(valid).is_ok(), "{valid} was refused");
         }
         for invalid in [
+            "https://drop.example.com/base",
+            "https://drop.example.com/base/",
+            "https://drop.example.com/%2fbase",
             "http://drop.example.com",
             "ftp://drop.example.com",
             "https://user:pass@drop.example.com",
@@ -896,6 +934,159 @@ mod cidr_tests {
 mod tests {
     use super::*;
 
+    fn test_password_hash(algorithm: argon2::Algorithm, version: argon2::Version) -> String {
+        use argon2::password_hash::{PasswordHasher as _, SaltString};
+        argon2::Argon2::new(
+            algorithm,
+            version,
+            argon2::Params::new(8, 1, 1, Some(16)).unwrap(),
+        )
+        .hash_password(b"short", &SaltString::encode_b64(b"test salt").unwrap())
+        .unwrap()
+        .to_string()
+    }
+
+    #[test]
+    fn startup_environment_refuses_unusable_urls_lifetimes_and_hashes() {
+        if let Ok(expected) = env::var("VOTPORT_TEST_CONFIG_CASE") {
+            match from_env() {
+                Ok(config) => {
+                    assert_eq!(expected, "valid", "{expected} was accepted");
+                    assert!(crate::auth::verify_password(
+                        "short",
+                        &config.admin_password_hash
+                    ));
+                    assert!(config.session_idle_secs > 0);
+                }
+                Err(error) => assert!(expected != "valid" && error.contains(&expected), "{error}"),
+            }
+            return;
+        }
+        let hash = test_password_hash(argon2::Algorithm::Argon2id, argon2::Version::V0x13);
+        let mut cases = vec![
+            (
+                "VOTPORT_PUBLIC_URL",
+                "https://drop.example.com/base".to_owned(),
+                false,
+            ),
+            (
+                "VOTPORT_PUBLIC_URL",
+                "https://drop.example.com/base/".to_owned(),
+                false,
+            ),
+            (
+                "VOTPORT_PUBLIC_URL",
+                "https://drop.example.com/".to_owned(),
+                true,
+            ),
+            (
+                "VOTPORT_PUBLIC_URL",
+                "http://127.0.0.1:8080".to_owned(),
+                true,
+            ),
+            ("VOTPORT_SESSION_IDLE_SECS", "0".to_owned(), false),
+            ("VOTPORT_SESSION_IDLE_SECS", "1".to_owned(), true),
+            (
+                "VOTPORT_ADMIN_PASSWORD_HASH",
+                "not-a-password-hash".to_owned(),
+                false,
+            ),
+            ("VOTPORT_ADMIN_PASSWORD_HASH", "$argon2id".to_owned(), false),
+            (
+                "VOTPORT_ADMIN_PASSWORD_HASH",
+                hash.rsplit_once('$').unwrap().0.to_owned(),
+                false,
+            ),
+            (
+                "VOTPORT_ADMIN_PASSWORD_HASH",
+                hash.replace("argon2id", "scrypt"),
+                false,
+            ),
+            (
+                "VOTPORT_ADMIN_PASSWORD_HASH",
+                hash.replace("v=19", "v=99"),
+                false,
+            ),
+            (
+                "VOTPORT_ADMIN_PASSWORD_HASH",
+                hash.replace("$v=19", ""),
+                true,
+            ),
+            (
+                "VOTPORT_ADMIN_PASSWORD_HASH",
+                hash.replace("m=8", "m=7"),
+                false,
+            ),
+            (
+                "VOTPORT_ADMIN_PASSWORD_HASH",
+                hash.replace("t=1", "t=0"),
+                false,
+            ),
+            (
+                "VOTPORT_ADMIN_PASSWORD_HASH",
+                hash.replace("p=1", "p=0"),
+                false,
+            ),
+            ("VOTPORT_ADMIN_PASSWORD_HASH", format!("  {hash}\n"), true),
+        ];
+        for salt in ["c2FsdA", "abcdefghi"] {
+            let mut parts: Vec<_> = hash.split('$').collect();
+            parts[4] = salt;
+            cases.push(("VOTPORT_ADMIN_PASSWORD_HASH", parts.join("$"), false));
+        }
+        for algorithm in [
+            argon2::Algorithm::Argon2d,
+            argon2::Algorithm::Argon2i,
+            argon2::Algorithm::Argon2id,
+        ] {
+            for version in [argon2::Version::V0x10, argon2::Version::V0x13] {
+                cases.push((
+                    "VOTPORT_ADMIN_PASSWORD_HASH",
+                    test_password_hash(algorithm, version),
+                    true,
+                ));
+            }
+        }
+        let mut failures = Vec::new();
+        for (key, value, valid) in cases {
+            for push in [false, true] {
+                let mut command = std::process::Command::new(env::current_exe().unwrap());
+                command.args([
+                    "--exact",
+                    "config::tests::startup_environment_refuses_unusable_urls_lifetimes_and_hashes",
+                    "--nocapture",
+                ]);
+                for (key, _) in
+                    env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("VOTPORT_"))
+                {
+                    command.env_remove(key);
+                }
+                command
+                    .env(
+                        "VOTPORT_TEST_CONFIG_CASE",
+                        if valid { "valid" } else { key },
+                    )
+                    .env("VOTPORT_ADMIN_PASSWORD_HASH", &hash)
+                    .env("VOTPORT_ADMIN_PASSWORD", "correct-horse-battery")
+                    .env(key, &value);
+                if push {
+                    command
+                        .env("VOTPORT_PUSH_BIND", "127.0.0.1:8322")
+                        .env("VOTPORT_PUSH_ADVERTISE", "localhost:8322");
+                }
+                let output = command.output().unwrap();
+                if !output.status.success() {
+                    failures.push(format!(
+                        "{key}, push={push}: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     #[test]
     fn boolean_environment_settings_are_explicit() {
         const KEYS: [&str; 4] = [
@@ -928,6 +1119,7 @@ mod tests {
             }
             return;
         }
+        let hash = test_password_hash(argon2::Algorithm::Argon2id, argon2::Version::V0x13);
         let child = |expected: &str| {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command.args([
@@ -942,7 +1134,7 @@ mod tests {
             }
             command
                 .env("VOTPORT_TEST_BOOLEAN_CASE", expected)
-                .env("VOTPORT_ADMIN_PASSWORD_HASH", "test-config-only");
+                .env("VOTPORT_ADMIN_PASSWORD_HASH", &hash);
             command
         };
         let check = |mut command: std::process::Command| {
