@@ -149,7 +149,7 @@ function hashFile(file) {
   });
 }
 
-export function initDeliveryEvidence(getMetadata) {
+export function initDeliveryEvidence(getMetadata, savedNames) {
   const $ = (id) => document.getElementById(id);
   const token = window.location.pathname.split('/').filter(Boolean).pop();
   const status = $('evidence-status');
@@ -203,7 +203,8 @@ export function initDeliveryEvidence(getMetadata) {
     if (!metadata?.grant_id) throw new Error('Load the delivery before verifying files.');
     const auth = await verifyAuthorization(metadata.evidence_authorization, metadata.receipt_key);
     if (auth.challenge.grant_id !== metadata.grant_id || auth.challenge.manifest !== await manifestDigest(metadata.files)) throw new Error('The delivery manifest does not match its authorization.');
-    const names = dedupeFilenames(metadata.files.map((file) => file.name));
+    const names = dedupeFilenames(metadata.files.map((file) => file.name))
+      .map((name, index) => savedNames.get(index) ?? name);
     const selectedByName = new Map();
     for (const file of selected) { if (selectedByName.has(file.name)) throw new Error('Choose files with distinct saved filenames.'); selectedByName.set(file.name, file); }
     for (const [index, expected] of metadata.files.entries()) {

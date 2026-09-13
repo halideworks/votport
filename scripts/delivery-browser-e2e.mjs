@@ -11,12 +11,14 @@ const project = `browser-${Date.now()}`;
 const directory = path.join(root, 'library', project);
 await fs.mkdir(directory, { recursive: true });
 await fs.writeFile(path.join(directory, 'saved.bin'), 'Recipient verification fixture.\n');
+await fs.writeFile(path.join(directory, 'saved (2).bin'), 'Second verification fixture.\n');
 const browser = await chromium.launch();
 const context = await browser.newContext();
 const page = await context.newPage();
 const errors = [];
 page.on('pageerror', (error) => errors.push(error.message));
 await page.addInitScript(() => {
+  window.showDirectoryPicker = () => window.savedDirectory;
   Object.defineProperty(navigator, 'clipboard', { value: { writeText: async (text) => { window.copiedText = text; } } });
 });
 const request = async (route, data, method = data ? 'POST' : 'GET') => {
@@ -73,9 +75,49 @@ try {
   await page.screenshot({ path: path.join(root, 'workflow-admin.png'), fullPage: true });
   await page.goto(ready.url);
   await page.locator('#delivery-evidence').evaluate((node) => { node.open = true; });
-  await page.setInputFiles('#evidence-files', path.join(directory, 'saved.bin'));
+  await page.waitForSelector('#download-content:not([hidden])');
+  await page.evaluate(async () => {
+    window.savedDirectory = await navigator.storage.getDirectory();
+    const file = await window.savedDirectory.getFileHandle('saved.bin', { create: true });
+    const writable = await file.createWritable();
+    await writable.write('Keep this existing file.');
+    await writable.close();
+  });
+  await page.getByRole('button', { name: 'Download all files', exact: true }).click();
+  await page.waitForFunction(() => document.getElementById('separate-download-status').textContent === 'Downloaded 2 files.', null, { timeout: 10000 });
+  await page.evaluate(async () => {
+    const existing = await window.savedDirectory.getFileHandle('saved.bin');
+    if (await (await existing.getFile()).text() !== 'Keep this existing file.') throw new Error('existing file was overwritten');
+    const selected = new DataTransfer();
+    for await (const [name, handle] of window.savedDirectory.entries()) {
+      if (name !== 'saved.bin') selected.items.add(await handle.getFile());
+    }
+    document.getElementById('evidence-files').files = selected.files;
+  });
+  const refreshed = page.waitForResponse((response) => response.url().includes('/api/s/') && response.url().includes('offset=0'));
+  await page.evaluate(() => {
+    document.getElementById('download-password').value = 'unused';
+    document.getElementById('download-password-form').requestSubmit();
+  });
+  await refreshed;
+  await page.waitForFunction(() => !document.getElementById('download-password-submit').disabled, null, { timeout: 10000 });
+  await page.evaluate(async () => {
+    const input = document.getElementById('evidence-files');
+    window.savedSelection = input.files;
+    const altered = new DataTransfer();
+    const bytes = new Uint8Array(await input.files[0].arrayBuffer());
+    bytes[0] ^= 1;
+    altered.items.add(new File([bytes], input.files[0].name));
+    for (const file of [...input.files].slice(1)) altered.items.add(file);
+    input.files = altered.files;
+  });
   await page.click('#evidence-verify');
-  await page.waitForFunction(() => document.querySelector('#evidence-records').textContent.includes('Verification reported to the sender.'));
+  await page.waitForFunction(() => document.getElementById('evidence-status').textContent.startsWith('Verification failed:'), null, { timeout: 10000 });
+  assert.equal((await request(`workflows/jobs/${id}/evidence`)).evidence.length, 0);
+  await page.evaluate(() => { document.getElementById('evidence-files').files = window.savedSelection; });
+  await page.click('#evidence-verify');
+  await page.waitForFunction(() => document.querySelector('#evidence-records').textContent.includes('Verification reported to the sender.') || document.querySelector('#evidence-status').textContent.startsWith('Missing or wrong-sized file:'), null, { timeout: 10000 });
+  assert.match(await page.locator('#evidence-records').textContent(), /Verification reported to the sender\./, await page.locator('#evidence-status').textContent());
   let evidence = await request(`workflows/jobs/${id}/evidence`);
   assert.equal(evidence.evidence.length, 1);
   // An expired acceptance of an older challenge must not hide fresh acceptance.

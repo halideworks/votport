@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
+import { runInNewContext } from 'node:vm';
 import {
   appendMetadataPage,
   batchDownloadEligible,
@@ -20,6 +21,17 @@ import {
 
 const outboundScript = await readFile(new URL('../web/assets/outbound.js', import.meta.url), 'utf8');
 const sendPage = await readFile(new URL('../web/send.html', import.meta.url), 'utf8');
+const downloadHelpers = await import('../web/assets/outbound-download.js');
+
+function individualSave(directory, file, name) {
+  const save = runInNewContext(`${outboundScript.slice(outboundScript.indexOf('async function saveFile('), outboundScript.indexOf('async function triggerSeparateDownloads('))}\nsaveFile`, {
+    streamToWritable,
+    createDownloadFile: downloadHelpers.createDownloadFile,
+    fetch: async () => new Response(file.content),
+    reauthorizeDownload: async () => false,
+  });
+  return save(directory, file, name);
+}
 
 test('VOTPort imposes no anchor fallback file-count cap; Chromium batches permission after 10', () => {
   assert.doesNotMatch(outboundScript, /MAX_ANCHOR_DOWNLOADS|anchorDownloadsAllowed/);
@@ -234,14 +246,20 @@ function responseInChunks(chunks, status = 200, contentType = 'application/vnd.v
   };
 }
 
-function fakeDirectory({ failWrite = false } = {}) {
-  const files = new Map();
+function fakeDirectory({ failWrite = false, initialFiles = [], directories = [] } = {}) {
+  const files = new Map(initialFiles);
   const aborted = [];
   return {
     files,
     aborted,
-    async getFileHandle(name) {
+    async getFileHandle(name, { create = false } = {}) {
+      if (directories.includes(name)) throw new DOMException('entry is a directory', 'TypeMismatchError');
+      if (!files.has(name)) {
+        if (!create) throw new DOMException('entry missing', 'NotFoundError');
+        files.set(name, '');
+      }
       return {
+        name,
         async createWritable() {
           const chunks = [];
           return {
@@ -258,6 +276,71 @@ function fakeDirectory({ failWrite = false } = {}) {
   };
 }
 
+test('batch saves preserve existing files and directories with numbered names', async () => {
+  const directory = fakeDirectory({ initialFiles: [['chart.txt', 'keep'], ['chart.txt.vot-receipt', 'proof']], directories: ['chart (2).txt'] });
+  await saveBatchFiles(responseInChunks([new TextEncoder().encode('newreceipt')]), directory,
+    [{ bytes: 3 }, { bytes: 7 }, { bytes: 0 }], ['chart.txt', 'chart.txt.vot-receipt', 'empty']);
+  assert.deepEqual([...directory.files], [
+    ['chart.txt', 'keep'], ['chart.txt.vot-receipt', 'proof'],
+    ['chart (3).txt', 'new'], ['chart.txt (2).vot-receipt', 'receipt'], ['empty', ''],
+  ]);
+});
+
+test('parallel individual saves and interrupted batch fallback retain earlier files', async () => {
+  const directory = fakeDirectory({ initialFiles: [['chart.txt', 'keep']] });
+  await Promise.all([
+    individualSave(directory, { content: 'one', bytes: 3 }, 'chart.txt'),
+    individualSave(directory, { content: 'two', bytes: 3 }, 'chart (2).txt'),
+  ]);
+  assert.equal(directory.files.get('chart.txt'), 'keep');
+  assert.deepEqual([...directory.files.values()].sort(), ['keep', 'one', 'two']);
+  let completed = 0;
+  await assert.rejects(saveBatchFiles(responseInChunks([new TextEncoder().encode('firstcut')]), directory,
+    [{ bytes: 5 }, { bytes: 9 }], ['first', 'second'], (count) => { completed = count; }), /truncated/);
+  assert.equal(completed, 1);
+  await individualSave(directory, { content: 'remaining', bytes: 9 }, 'second');
+  assert.equal(directory.files.get('first'), 'first');
+  assert.equal(directory.files.get('second'), '');
+  assert.equal(directory.files.get('second (2)'), 'remaining');
+});
+
+test('name allocation propagates permission, cancellation and invalid-name failures without poisoning the queue', async () => {
+  for (const name of ['NotAllowedError', 'AbortError', 'TypeError', 'QuotaExceededError']) {
+    const failure = new DOMException('Cannot use this filename', name);
+    let probes = 0;
+    await assert.rejects(downloadHelpers.createDownloadFile({
+      async getFileHandle() { probes += 1; throw failure; },
+    }, 'chart.txt'), (error) => error === failure);
+    assert.equal(probes, 1);
+    const directory = fakeDirectory();
+    await downloadHelpers.createDownloadFile(directory, 'chart.txt');
+    assert.deepEqual([...directory.files], [['chart.txt', '']]);
+  }
+});
+
+test('name allocation bounds collisions and handles a directory appearing during creation', async () => {
+  let probes = 0;
+  await assert.rejects(downloadHelpers.createDownloadFile({
+    async getFileHandle(_name, options) {
+      assert.equal(options, undefined);
+      probes += 1;
+      if (probes > 1000) throw new Error('fixture observed excess name probes');
+      return {};
+    },
+  }, 'chart.txt'), /after 1,000 attempts/);
+  assert.equal(probes, 1000);
+  const directory = fakeDirectory();
+  const getFileHandle = directory.getFileHandle;
+  directory.getFileHandle = async (name, options) => {
+    if (name === 'chart.txt') {
+      throw new DOMException('directory appeared', options?.create ? 'TypeMismatchError' : 'NotFoundError');
+    }
+    return getFileHandle(name, options);
+  };
+  await downloadHelpers.createDownloadFile(directory, 'chart.txt');
+  assert.deepEqual([...directory.files], [['chart (2).txt', '']]);
+});
+
 function join(...parts) {
   const output = new Uint8Array(parts.reduce((size, part) => size + part.length, 0));
   let offset = 0;
@@ -273,9 +356,9 @@ test('streams concatenated batch payloads by trusted metadata lengths', async ()
   ]);
   const progress = [];
   await saveBatchFiles(response, directory, [{ bytes: 5 }, { bytes: 6 }], ['first.bin', 'second.bin'],
-    (completed, total) => progress.push([completed, total]));
+    (completed, total, name) => progress.push([completed, total, name]));
   assert.deepEqual([...directory.files], [['first.bin', 'first'], ['second.bin', 'second']]);
-  assert.deepEqual(progress, [[1, 2], [2, 2]]);
+  assert.deepEqual(progress, [[1, 2, 'first.bin'], [2, 2, 'second.bin']]);
 });
 
 test('rejects truncation and trailing bytes without direct fallback', async () => {

@@ -54,6 +54,14 @@ all expected files before offering explicit acceptance. Browser and native
 keys are separate. Clearing browser site data removes that browser's key and
 local evidence history.
 
+Folder downloads try up to 1,000 names, adding numbered suffixes to keep existing
+files and directories. Successful save names remain associated with the delivery
+for verification while that page stays open, including after password verification
+refreshes its metadata. After reloading the page, or when the browser renames a
+normal download, verification still expects the original download names. Browsers
+cannot reserve names exclusively against other tabs or applications writing to
+the same folder during a save.
+
 Native first-use key creation is coordinated across processes. A damaged or
 unreadable existing key is reported instead of silently replacing the enrolled
 identity; restore that key from backup to retain its enrollment and acceptance

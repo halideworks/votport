@@ -7,6 +7,7 @@ import {
   appendMetadataPage,
   batchDownloadEligible,
   BatchDownloadUnsupportedError,
+  createDownloadFile,
   dedupeFilenames,
   FILE_RENDER_BATCH_SIZE,
   metadataMoreAvailable,
@@ -35,6 +36,7 @@ const rows = new Map();
 // Saved file indexes, counted whether or not their row is rendered yet
 // (rows past the first page appear only after Show more).
 const saved = new Set();
+const savedNames = new Map();
 
 function manifestStatus() {
   $('manifest-status').textContent = saved.size
@@ -51,7 +53,8 @@ function landedBadge(row) {
   row.querySelector('.status').after(badge);
 }
 
-function markSaved(index) {
+function markSaved(index, name) {
+  savedNames.set(index, name);
   if (saved.has(index)) return;
   saved.add(index);
   manifestStatus();
@@ -89,11 +92,12 @@ function showPasswordGate() {
   $('download-password').focus();
 }
 
-function downloadButton(text, url, classes) {
+function downloadButton(text, url, classes, name) {
   const button = document.createElement('button');
   button.type = 'button';
   button.className = classes;
   button.textContent = text;
+  button.setAttribute('aria-label', `${text}: ${name}`);
   button.addEventListener('click', () => { window.location.assign(url); });
   return button;
 }
@@ -102,9 +106,9 @@ function renderNextFileBatch() {
   const batch = nextFileBatch(metadataFiles, renderedFileCount);
   for (const [offset, file] of batch.entries()) {
     const extras = [
-      downloadButton('Download file', file.download_url, 'tiny'),
+      downloadButton('Download file', file.download_url, 'tiny', file.name),
     ];
-    if (file.receipt_url) extras.push(downloadButton('Download receipt', file.receipt_url, 'tiny ghost'));
+    if (file.receipt_url) extras.push(downloadButton('Download receipt', file.receipt_url, 'tiny ghost', file.name));
     const row = appendObjectCard(
       $('object'),
       { name: file.name, suite: file.suite, root: file.root },
@@ -167,13 +171,14 @@ function reauthorizeDownload() {
 }
 
 async function saveFile(directory, file, name) {
-  const handle = await directory.getFileHandle(name, { create: true });
+  const handle = await createDownloadFile(directory, name);
   const writable = await handle.createWritable();
   try {
     await streamToWritable((...args) => fetch(...args), writable, file, {
       onAuthLost: reauthorizeDownload,
     });
     await writable.close();
+    return handle.name;
   } catch (error) {
     await writable.abort().catch(() => {});
     throw error;
@@ -347,9 +352,9 @@ async function downloadSeparately() {
         }
         if (response.status === 404) throw new Error('The verified batch is no longer available.');
         if (!response.ok) throw new Error(`server returned ${response.status}`);
-        await saveBatchFiles(response, directory, files, names, (completed, total) => {
+        await saveBatchFiles(response, directory, files, names, (completed, total, name) => {
           batchSaved = completed;
-          markSaved(completed - 1);
+          markSaved(completed - 1, name);
           status.textContent = `Saving files: ${completed} of ${total}`;
         });
         status.textContent = `Downloaded ${files.length} files.`;
@@ -370,8 +375,8 @@ async function downloadSeparately() {
       remainingFiles,
       async (file, index) => {
         try {
-          await saveFile(directory, file, remainingNames[index]);
-          markSaved(batchSaved + index);
+          const name = await saveFile(directory, file, remainingNames[index]);
+          markSaved(batchSaved + index, name);
         } catch (error) {
           failures.push(`${remainingNames[index]}: ${error.message}`);
         }
@@ -572,4 +577,4 @@ $('download-password-form').addEventListener('submit', async (event) => {
 
 loadMetadata();
 
-initDeliveryEvidence(async () => ({ ...evidenceMetadata, files: metadataHasMore ? await loadRemainingMetadata() : metadataFiles }));
+initDeliveryEvidence(async () => ({ ...evidenceMetadata, files: metadataHasMore ? await loadRemainingMetadata() : metadataFiles }), savedNames);

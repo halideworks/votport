@@ -44,6 +44,8 @@ ZIP or stream the files separately in bulk; signed receipts remain optional
 individual downloads. Optional link passwords gate metadata, files, receipts,
 and the ZIP.
 
+Folder downloads keep existing files and directories by using numbered names.
+
 ## Why VOT instead of a plain upload form?
 
 * **End-to-end integrity.** The browser computes each file's VOT object

@@ -5,6 +5,36 @@ export const BATCH_DOWNLOAD_THRESHOLD = 100;
 export const BATCH_LARGE_FILE_BYTES = 1024 ** 3;
 export class BatchDownloadUnsupportedError extends Error {}
 
+let allocatingFile = Promise.resolve();
+
+export function createDownloadFile(directory, name) {
+  // ponytail: serialize this page's claims; File System Access cannot create exclusively.
+  // Other tabs and applications can still race the native probe and creation.
+  const allocation = allocatingFile.then(async () => {
+    const original = sanitizeFilename(name);
+    const extensionIndex = original.lastIndexOf('.');
+    const stem = extensionIndex > 0 ? original.slice(0, extensionIndex) : original;
+    const extension = extensionIndex > 0 ? original.slice(extensionIndex) : '';
+    for (let attempt = 1; attempt <= 1000; attempt += 1) {
+      const candidate = attempt === 1 ? original : `${stem} (${attempt})${extension}`;
+      try {
+        await directory.getFileHandle(candidate);
+      } catch (error) {
+        if (error.name === 'TypeMismatchError') continue;
+        if (error.name !== 'NotFoundError') throw error;
+        try {
+          return await directory.getFileHandle(candidate, { create: true });
+        } catch (error) {
+          if (error.name !== 'TypeMismatchError') throw error;
+        }
+      }
+    }
+    throw new Error(`No available filename for "${original}" after 1,000 attempts. Choose another folder.`);
+  });
+  allocatingFile = allocation.catch(() => {});
+  return allocation;
+}
+
 export function batchDownloadEligible(files) {
   return files.length >= BATCH_DOWNLOAD_THRESHOLD ||
     (files.length > 1 && files.some((file) => file.bytes >= BATCH_LARGE_FILE_BYTES));
@@ -33,7 +63,7 @@ export async function saveBatchFiles(response, directory, files, names, onComple
   try {
     for (let index = 0; index < files.length; index += 1) {
       const expected = sizes[index];
-      const handle = await directory.getFileHandle(names[index], { create: true });
+      const handle = await createDownloadFile(directory, names[index]);
       const writable = await handle.createWritable();
       let remaining = expected;
       try {
@@ -50,7 +80,7 @@ export async function saveBatchFiles(response, directory, files, names, onComple
         await writable.abort().catch(() => {});
         throw error;
       }
-      onComplete?.(index + 1, files.length);
+      onComplete?.(index + 1, files.length, handle.name);
     }
     if (await nextBytes()) throw new Error('batch response has trailing bytes');
   } catch (error) {
