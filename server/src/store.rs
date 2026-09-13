@@ -748,6 +748,7 @@ pub struct Store {
     connection: Mutex<Connection>,
     pub(crate) event_signer: std::sync::Arc<crate::receipt::ReceiptSigner>,
     path: PathBuf,
+    settings_generation: std::sync::atomic::AtomicU64,
 }
 
 impl Store {
@@ -854,6 +855,7 @@ impl Store {
                 data_dir,
             )?),
             path: path.clone(),
+            settings_generation: std::sync::atomic::AtomicU64::new(0),
         };
         Ok(store)
     }
@@ -2697,12 +2699,23 @@ impl Store {
             }
         }
         transaction.commit().map_err(|error| error.to_string())?;
+        self.settings_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
     pub fn delete_setting(&self, key: &str) -> Result<(), String> {
-        self.with(|connection| connection.execute("DELETE FROM settings WHERE key = ?1", [key]))
-            .map(|_| ())
+        self.with(|connection| {
+            connection.execute("DELETE FROM settings WHERE key = ?1", [key])?;
+            self.settings_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn settings_generation(&self) -> u64 {
+        self.settings_generation
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn overlay(&self, config: &Config) -> Result<SettingsOverlay, String> {
