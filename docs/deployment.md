@@ -195,12 +195,21 @@ container user; blank uses `<data_dir>/backups` (normally `/data/backups`). A
 custom path must already exist with no symlink or group/other-writable ancestor.
 A dedicated host directory must be mounted at that container path. S3 uploads
 use the configured bucket and prefix. The UI reports credential and passphrase
-configured flags, never their values.
+configured flags, never their values. A pending restore or an unreadable restore
+marker pauses scheduled backups. The System page shows the current reason
+without replacing the last backup result. The scheduler checks again each
+minute and resumes when the blocker clears; applying a restore still requires
+a restart.
 
 Pruning is owned by VOTPort for snapshots it created under the configured
 local path and for generated `votport-backup-v2-*` objects under the configured
-S3 prefix. It does not delete unrelated local files or bucket objects. Keep an
-external recovery copy of the encryption passphrase. An
+S3 prefix. It does not delete unrelated local files or bucket objects. S3
+inventory and retention listings allow five minutes and 100,000 returned
+objects, including unrelated objects under that prefix. Use a dedicated backup
+prefix. A failed or oversized listing deletes no remote snapshots. If other
+maintenance repeatedly blocks the scheduler for a configured backup interval,
+it logs a warning, at most once per interval, while continuing to wait.
+Keep an external recovery copy of the encryption passphrase. An
 encrypted archive is unrecoverable without it, and storing that passphrase in
 the same deployment backup defeats recovery isolation.
 

@@ -234,15 +234,17 @@ function fillBackups(data) {
   }
 
   const status = data.status;
-  const statusText = status.running
-    ? 'Backup running…'
-    : status.last_error
-      ? `Last run failed: ${status.last_error}`
-      : status.last_success_at
-        ? `Last successful run ${formatWhen(status.last_success_at)}`
-        : status.last_attempt_at
-          ? `Last attempt ${formatWhen(status.last_attempt_at)}`
-          : 'No backup has run yet.';
+  const statusText = data.paused_reason
+    ? `Backups paused: ${data.paused_reason}`
+    : status.running
+      ? 'Backup running…'
+      : status.last_error
+        ? `Last run failed: ${status.last_error}`
+        : status.last_success_at
+          ? `Last successful run ${formatWhen(status.last_success_at)}`
+          : status.last_attempt_at
+            ? `Last attempt ${formatWhen(status.last_attempt_at)}`
+            : 'No backup has run yet.';
   $('backup-status').textContent = statusText;
   $('backup-status-error').hidden = !status.last_error;
   if (status.last_error) $('backup-status-error').textContent = status.last_error;

@@ -30,6 +30,8 @@ const MAX_MANIFEST: u64 = 64 * 1024;
 const MAX_MARKER: u64 = MAX_MANIFEST + 16 * 1024;
 const MAX_IDENTITY: u64 = 16 * 1024 * 1024;
 const PART_SIZE: usize = 5 * 1024 * 1024;
+const MAX_S3_LIST_ENTRIES: usize = 100_000;
+const S3_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const ARCHIVE_FILES: [&str; 5] = [
     "votport.db",
     "receipt.key",
@@ -1404,14 +1406,9 @@ pub async fn inventory_s3(
     config: &BackupConfig,
     secrets: &BackupSecrets,
 ) -> Result<Vec<InventoryItem>, String> {
-    use futures_util::StreamExt;
     let store = s3_store(config, secrets)?;
-    let root = s3_root(config);
-    let list_prefix = (!root.is_empty()).then(|| ObjectPath::from(root));
-    let mut stream = store.list(list_prefix.as_ref());
     let mut result = Vec::new();
-    while let Some(item) = stream.next().await {
-        let item = item.map_err(|_| "S3 snapshot inventory unavailable".to_owned())?;
+    for item in list_s3_backups(&*store, config, MAX_S3_LIST_ENTRIES, S3_LIST_TIMEOUT).await? {
         let Some(id) = owned_s3_id(config, &item.location) else {
             continue;
         };
@@ -1426,6 +1423,35 @@ pub async fn inventory_s3(
     Ok(result)
 }
 
+async fn list_s3_backups(
+    store: &dyn ObjectStore,
+    config: &BackupConfig,
+    max_entries: usize,
+    timeout: std::time::Duration,
+) -> Result<Vec<object_store::ObjectMeta>, String> {
+    use futures_util::StreamExt;
+    tokio::time::timeout(timeout, async {
+        let root = s3_root(config);
+        let list_prefix = (!root.is_empty()).then(|| ObjectPath::from(root));
+        let mut stream = store.list(list_prefix.as_ref());
+        let mut files = Vec::new();
+        let mut seen = 0;
+        while let Some(item) = stream.next().await {
+            let item = item.map_err(|_| "S3 backup listing failed".to_owned())?;
+            if seen == max_entries {
+                return Err(format!("S3 backup listing exceeds {max_entries} objects; use a dedicated backup prefix"));
+            }
+            seen += 1;
+            if owned_s3_id(config, &item.location).is_some() {
+                files.push(item);
+            }
+        }
+        Ok(files)
+    })
+    .await
+    .map_err(|_| "S3 backup listing timed out".to_owned())?
+}
+
 pub async fn prune_s3(
     config: &BackupConfig,
     secrets: &BackupSecrets,
@@ -1434,7 +1460,16 @@ pub async fn prune_s3(
     protected_id: Option<&str>,
 ) -> Result<(), String> {
     let store = s3_store(config, secrets)?;
-    prune_s3_store(store, config, retention_days, retention_count, protected_id).await
+    prune_s3_store(
+        store,
+        config,
+        retention_days,
+        retention_count,
+        protected_id,
+        MAX_S3_LIST_ENTRIES,
+        S3_LIST_TIMEOUT,
+    )
+    .await
 }
 
 async fn prune_s3_store(
@@ -1443,18 +1478,10 @@ async fn prune_s3_store(
     retention_days: u64,
     retention_count: u64,
     protected_id: Option<&str>,
+    max_entries: usize,
+    timeout: std::time::Duration,
 ) -> Result<(), String> {
-    use futures_util::StreamExt;
-    let root = s3_root(config);
-    let list_prefix = (!root.is_empty()).then(|| ObjectPath::from(root));
-    let mut stream = store.list(list_prefix.as_ref());
-    let mut files = Vec::new();
-    while let Some(item) = stream.next().await {
-        let item = item.map_err(|_| "S3 pruning failed".to_owned())?;
-        if owned_s3_id(config, &item.location).is_some() {
-            files.push(item);
-        }
-    }
+    let mut files = list_s3_backups(&*store, config, max_entries, timeout).await?;
     files.sort_by(|left, right| {
         let left_id = owned_s3_id(config, &left.location).unwrap_or_default();
         let right_id = owned_s3_id(config, &right.location).unwrap_or_default();
@@ -1664,16 +1691,56 @@ fn scheduler_due(config: &BackupConfig, status: &BackupStatus, timestamp: u64) -
     true
 }
 
+fn backup_lock_warning_due(
+    busy_since: &mut Option<std::time::Instant>,
+    config: &BackupConfig,
+    timestamp: std::time::Instant,
+) -> bool {
+    if !config.enabled {
+        *busy_since = None;
+        return false;
+    }
+    let since = busy_since.get_or_insert(timestamp);
+    if timestamp.duration_since(*since) < std::time::Duration::from_secs(config.interval_secs) {
+        return false;
+    }
+    *since = timestamp;
+    true
+}
+
 pub async fn scheduler(app: Arc<crate::app::App>) {
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+    scheduler_with_interval(app, std::time::Duration::from_secs(60)).await;
+}
+
+async fn scheduler_with_interval(app: Arc<crate::app::App>, interval: std::time::Duration) {
+    let mut busy_since = None;
+    let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;
         let Ok(_guard) = app.backup_lock.try_lock() else {
+            match app
+                .store
+                .setting(SETTING_KEY)
+                .map_err(|error| error.to_string())
+                .and_then(|setting| parse_config(setting, &app.config.data_dir))
+            {
+                Ok(config) => {
+                    if backup_lock_warning_due(&mut busy_since, &config, std::time::Instant::now())
+                    {
+                        tracing::warn!(
+                            interval_secs = config.interval_secs,
+                            "backup scheduler repeatedly deferred because maintenance lock is busy"
+                        );
+                    }
+                }
+                Err(error) => tracing::error!("backup scheduler config while waiting: {error}"),
+            }
             continue;
         };
+        busy_since = None;
         if let Err(error) = ensure_no_pending_restore(&app.config.data_dir) {
-            tracing::info!("backup scheduler stopped: {error}");
-            return;
+            tracing::error!("backup scheduler paused: {error}");
+            continue;
         }
         let setting = match app.store.setting(SETTING_KEY) {
             Ok(setting) => setting,
@@ -2613,6 +2680,123 @@ mod tests {
         assert!(!root.path().join(other).exists());
     }
 
+    #[test]
+    fn backup_lock_warnings_start_at_the_interval_and_reset() {
+        use std::time::{Duration, Instant};
+        let mut config = BackupConfig {
+            enabled: true,
+            interval_secs: 300,
+            ..BackupConfig::default()
+        };
+        let start = Instant::now();
+        let mut busy_since = None;
+        for (offset, expected) in [
+            (0, false),
+            (299, false),
+            (300, true),
+            (301, false),
+            (599, false),
+            (600, true),
+        ] {
+            assert_eq!(
+                backup_lock_warning_due(
+                    &mut busy_since,
+                    &config,
+                    start + Duration::from_secs(offset)
+                ),
+                expected
+            );
+        }
+        config.enabled = false;
+        assert!(!backup_lock_warning_due(
+            &mut busy_since,
+            &config,
+            start + Duration::from_secs(900)
+        ));
+        assert_eq!(busy_since, None);
+        config.enabled = true;
+        assert!(!backup_lock_warning_due(
+            &mut busy_since,
+            &config,
+            start + Duration::from_secs(1200)
+        ));
+        assert_eq!(busy_since, Some(start + Duration::from_secs(1200)));
+        assert!(backup_lock_warning_due(
+            &mut busy_since,
+            &config,
+            start + Duration::from_secs(1500)
+        ));
+    }
+
+    #[tokio::test]
+    async fn s3_listing_limits_preserve_all_remote_objects() {
+        use object_store::throttle::{ThrottleConfig, ThrottledStore};
+        use std::time::Duration;
+        let store = Arc::new(ThrottledStore::new(
+            object_store::memory::InMemory::new(),
+            ThrottleConfig::default(),
+        ));
+        let config = BackupConfig {
+            s3_prefix: Some("backups".into()),
+            ..BackupConfig::default()
+        };
+        let keys = [
+            "votport-backup-v2-1-a.tar",
+            "votport-backup-v2-2-b.tar",
+            "unrelated",
+        ]
+        .map(|id| s3_path(&config, id));
+        for key in &keys {
+            store.put(key, "file".into()).await.unwrap();
+        }
+        for (limit, delay, message) in [(2, 0, "exceeds"), (3, 50, "timed out")] {
+            store.config_mut(|c| c.wait_list_per_entry = Duration::from_millis(delay));
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                prune_s3_store(
+                    store.clone(),
+                    &config,
+                    0,
+                    1,
+                    None,
+                    limit,
+                    Duration::from_millis(90),
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(result.unwrap_err().contains(message));
+            for key in &keys {
+                assert!(store.head(key).await.is_ok(), "{key}");
+            }
+        }
+        store.config_mut(|c| c.wait_list_per_entry = Duration::ZERO);
+        let files = list_s3_backups(&*store, &config, 3, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files
+            .iter()
+            .all(|file| owned_s3_id(&config, &file.location).is_some()));
+        prune_s3_store(
+            store.clone(),
+            &config,
+            0,
+            1,
+            None,
+            3,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(store.head(&keys[2]).await.is_ok());
+        assert_eq!(
+            usize::from(store.head(&keys[0]).await.is_ok())
+                + usize::from(store.head(&keys[1]).await.is_ok()),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn protected_s3_backup_survives_same_second_retention() {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
@@ -2643,9 +2827,17 @@ mod tests {
                 break;
             }
         }
-        prune_s3_store(Arc::clone(&store), &config, 0, 1, Some(protected))
-            .await
-            .unwrap();
+        prune_s3_store(
+            Arc::clone(&store),
+            &config,
+            0,
+            1,
+            Some(protected),
+            MAX_S3_LIST_ENTRIES,
+            S3_LIST_TIMEOUT,
+        )
+        .await
+        .unwrap();
         assert!(store.head(&protected_path).await.is_ok());
         assert!(store.head(&other_path).await.is_err());
     }
@@ -2756,6 +2948,74 @@ mod tests {
         }
         stop.send(()).unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduler_pauses_without_changing_history_and_resumes_after_restore_clears() {
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(root.path());
+        let config = BackupConfig {
+            enabled: true,
+            ..BackupConfig::default()
+        };
+        app.store
+            .put_settings(
+                "test",
+                &[(
+                    SETTING_KEY.into(),
+                    crate::store::SettingWrite::Set(serde_json::to_string(&config).unwrap()),
+                )],
+            )
+            .unwrap();
+        write_status(
+            &app.config.data_dir,
+            BackupStatus {
+                last_attempt_at: Some(1),
+                last_success_at: Some(1),
+                last_error: Some("previous attempt failed".into()),
+                ..BackupStatus::default()
+            },
+        )
+        .unwrap();
+        let status_path = app.config.data_dir.join(STATUS_FILE);
+        let history = fs::read(&status_path).unwrap();
+        let archive_root = ensure_backups_dir(&app.config.data_dir).unwrap();
+        let pending = app.config.data_dir.join(PENDING_FILE);
+        fs::write(&pending, b"pending").unwrap();
+        let mut worker = Box::pin(scheduler_with_interval(
+            Arc::clone(&app),
+            Duration::from_millis(20),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), &mut worker)
+                .await
+                .is_err(),
+            "pending restore must pause the scheduler, not terminate it"
+        );
+        assert_eq!(fs::read(&status_path).unwrap(), history);
+        assert!(local_files(&archive_root).unwrap().is_empty());
+
+        fs::remove_file(pending).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = &mut worker => panic!("scheduler terminated after the restore cleared"),
+                _ = async {
+                    loop {
+                        let status = read_status(&app.config.data_dir).unwrap();
+                        if status.last_success_at.is_some_and(|at| at > 1) {
+                            assert!(status.last_error.is_none());
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } => {}
+            }
+        })
+        .await
+        .expect("same scheduler must resume and complete a backup");
+        assert_eq!(local_files(&archive_root).unwrap().len(), 1);
     }
 
     #[test]
