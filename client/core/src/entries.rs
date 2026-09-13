@@ -86,6 +86,9 @@ fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String> {
                 .to_owned(),
         );
     }
+    if crate::protocol_paths::is_receipt_name(component) {
+        return Err("name is reserved for signed receipts".into());
+    }
     if !allow_hidden && component.starts_with('.') {
         return Err("hidden file names are not accepted here".to_owned());
     }
@@ -174,6 +177,22 @@ mod tests {
                 "separator, control character, or DOS alias",
             ),
             (".secret", false, "hidden file names are not accepted"),
+            (
+                "report.pdf.vot-receipt",
+                false,
+                "reserved for signed receipts",
+            ),
+            (
+                "report.VOT-RECEIPT/child",
+                false,
+                "reserved for signed receipts",
+            ),
+            (
+                "report.vot-receI\u{307}pt",
+                false,
+                "reserved for signed receipts",
+            ),
+            (".vot-receipt", true, "reserved for signed receipts"),
             (".VOT-anything.LEASE", true, "reserved for votport staging"),
             (".vot-tenants.stage", true, "reserved for tenant storage"),
             (

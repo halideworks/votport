@@ -50,6 +50,12 @@ Native push carries verified ranges directly into the same receiver. Reception
 workflows keep and verify the original received files instead of taking another
 payload snapshot.
 
+File and folder components ending in `.vot-receipt` are reserved for signed
+receipts, including portable case and Unicode aliases. Uploads, receive
+destinations and shared payload names reject them before new transfer work.
+Generated receipt downloads and verification remain available; existing damaged
+payload/receipt pairs require separate recovery.
+
 HTTP and native uploads reserve final filenames together when their manifests
 are admitted. Reservations include unfinished sessions retained across restart
 and overlapping link destinations within a tenant. Conflicting filenames get a

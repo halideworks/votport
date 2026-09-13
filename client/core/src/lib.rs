@@ -20,6 +20,8 @@ pub mod journal;
 pub mod package;
 pub mod port;
 pub mod progress;
+#[path = "../../../protocol/paths.rs"]
+mod protocol_paths;
 pub mod receive;
 #[path = "../../../protocol/routes.rs"]
 pub mod route_protocol;

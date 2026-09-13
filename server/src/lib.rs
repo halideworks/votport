@@ -15,6 +15,8 @@ pub mod delivery_protocol;
 pub mod lease;
 pub mod notify;
 pub mod paths;
+#[path = "../../protocol/paths.rs"]
+mod protocol_paths;
 pub mod receipt;
 pub mod receiving;
 #[path = "../../protocol/routes.rs"]

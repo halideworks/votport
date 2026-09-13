@@ -165,6 +165,18 @@ await page.route("**/api/r/*", previewInfoRoute);
 await page.goto(linkUrl);
 await page.waitForSelector("#uploader:not([hidden])", { timeout: 15000 });
 
+for (const name of ["report.pdf.vot-receipt", "report.VOT-RECEIPT", "report.vot-receI\u0307pt", ".vot-receipt"]) {
+  await page.setInputFiles("#file-input", { name, mimeType: "application/octet-stream", buffer: Buffer.from("x") });
+  const error = page.locator("#upload-error");
+  if (!(await error.isVisible()) || !(await error.textContent()).includes("reserved for signed receipts")) {
+    throw new Error(`receipt filename was not refused: ${name}`);
+  }
+  if (await page.locator("#file-list > li").count() !== 0 || !(await page.locator("#send").isDisabled())) {
+    throw new Error("a refused receipt filename changed the selection");
+  }
+}
+console.log("Receipt filenames are refused before browser selection: ok");
+
 const previewFiles = Array.from({ length: 100_000 }, (_, index) => ({
   name: `preview-${String(index).padStart(6, "0")}.exr`,
   mimeType: "application/octet-stream",
