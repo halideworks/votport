@@ -262,6 +262,85 @@ try {
   await layout('audit-automation-identity');
   await page.unroute('**/api/admin/audit?*');
 
+  const auditRows = Array.from({ length: 1501 }, (_, index) => ({ rowid: index + 1, at: 100 + Math.floor(index / 400), tenant: '', actor: 'fixture', event: `event_${index + 1}`, subject: `row ${index + 1}`, detail: { sequence: index + 1 } }));
+  const auditRequests = [];
+  let failAudit = false, holdAudit = null;
+  await page.route('**/api/admin/audit?*', async (route) => {
+    const query = new URL(route.request().url()).searchParams;
+    assert.equal(query.get('limit'), '250');
+    auditRequests.push(query.toString());
+    if (holdAudit) { holdAudit.started(); await holdAudit.wait; holdAudit = null; }
+    if (failAudit) { failAudit = false; return route.fulfill({ status: 503, body: 'Audit fixture failure' }); }
+    let rows = auditRows.filter((row) => (!query.get('event') || row.event === query.get('event')) && (!query.get('q') || row.subject.includes(query.get('q'))));
+    if (query.has('before_rowid')) rows = rows.filter((row) => row.rowid < Number(query.get('before_rowid'))).reverse();
+    else rows = rows.filter((row) => row.at > Number(query.get('since')) || (row.at === Number(query.get('since')) && row.rowid > Number(query.get('after_rowid'))));
+    await route.fulfill({ contentType: 'application/x-ndjson', body: rows.slice(0, 250).map((row) => JSON.stringify(row)).join('\n') });
+  });
+  async function auditAction(action) {
+    const response = page.waitForResponse((response) => response.url().includes('/api/admin/audit?'));
+    await action(); await (await response).finished();
+    await page.waitForFunction(() => !document.querySelector('#load-more').disabled);
+  }
+  async function moreAudit() { await page.locator('#load-more').focus(); await page.keyboard.press('Enter'); }
+  for (const order of ['newest', 'oldest']) {
+    await auditAction(() => order === 'newest' ? page.goto(`${base}/audit`) : page.selectOption('#audit-order', order));
+    const ordered = order === 'newest' ? [...auditRows].reverse() : auditRows;
+    let retainedDetail;
+    for (let number = 1; number <= 7; number++) {
+      if (number > 1) {
+        if (number === 5 && order === 'newest') {
+          let started, release;
+          const pending = new Promise((resolve) => { started = resolve; });
+          holdAudit = { started, wait: new Promise((resolve) => { release = resolve; }) };
+          await auditAction(async () => {
+            await moreAudit(); await pending;
+            await page.locator('.audit-row summary').first().focus(); release();
+          });
+          assert.equal(await page.evaluate(() => document.activeElement.id), 'audit-range', 'Evicting the focused row moves focus to the range');
+        } else {
+          await auditAction(moreAudit);
+          assert.equal(await page.evaluate(() => document.activeElement.id), number === 7 ? 'audit-range' : 'load-more', 'Keyboard pagination retains useful focus');
+        }
+      }
+      const end = Math.min(number * 250, ordered.length), expected = ordered.slice(Math.max(0, end - 1000), end);
+      assert.equal(await page.locator('.audit-row').count(), expected.length, 'The Audit page retains at most 1,000 rows');
+      assert.deepEqual(await page.locator('.audit-subject').allTextContents(), expected.map((row) => row.subject));
+      assert.equal(await page.locator('#audit-event-options option').count(), expected.length, 'Event suggestions follow the retained window');
+      assert.equal(await page.locator('#audit-range').textContent(), `Showing rows ${end - expected.length + 1} to ${end}.`);
+      if (number === 3) {
+        retainedDetail = await page.locator('.audit-row details').nth(500).elementHandle();
+        await retainedDetail.evaluate((node) => { node.open = true; });
+      }
+      if (number === 6) assert.ok(await retainedDetail.evaluate((node) => node.isConnected && node.open), 'Retained rows keep their open details');
+    }
+    assert.ok(await page.locator('#load-more').isHidden());
+  }
+  await page.fill('#audit-query', 'row 900'); await page.fill('#audit-event', 'event_900');
+  await auditAction(() => page.locator('#audit-filters button[type=submit]').click());
+  assert.deepEqual(await page.locator('.audit-subject').allTextContents(), ['row 900']);
+  const auditExport = new URL(await page.locator('#export').getAttribute('href'), base);
+  assert.equal(auditExport.searchParams.get('q'), 'row 900'); assert.equal(auditExport.searchParams.get('event'), 'event_900');
+  assert.equal(auditExport.searchParams.get('limit'), '10000');
+  await page.fill('#audit-query', 'missing');
+  await auditAction(() => page.locator('#audit-filters button[type=submit]').click());
+  assert.equal(await page.locator('.audit-row').count(), 0); assert.equal(await page.locator('#audit-event-options option').count(), 0);
+  assert.ok(await page.getByText('No audit rows yet.', { exact: true }).isVisible());
+  await auditAction(() => page.click('#audit-clear'));
+  assert.equal(await page.locator('.audit-subject').first().textContent(), 'row 1');
+  assert.equal(await page.locator('.audit-row').count(), 250);
+  failAudit = true; await auditAction(moreAudit);
+  const failedAuditQuery = auditRequests.at(-1);
+  assert.equal(await page.locator('.audit-row').count(), 250);
+  assert.match(await page.locator('#audit-range').textContent(), /503/);
+  await auditAction(moreAudit);
+  assert.equal(auditRequests.at(-1), failedAuditQuery, 'A failed continuation must retry the same cursor');
+  assert.equal(await page.locator('.audit-row').count(), 500);
+  await auditAction(() => page.click('#refresh'));
+  assert.equal(await page.locator('.audit-row').count(), 250);
+  assert.equal(await page.locator('.audit-subject').first().textContent(), 'row 1');
+  assert.equal(await page.locator('#audit-range').getAttribute('role'), 'status');
+  await page.unroute('**/api/admin/audit?*');
+
   await page.goto(`${base}/storage`); await page.click('#storage-new');
   await page.selectOption('#ws-kind', 'folder'); await page.fill('#ws-label', 'Shared reception');
   await openAncestors(page.locator('#ws-id')); await page.fill('#ws-id', `${storageId}_folder`); await page.fill('#ws-directory', path.join(root, 'shared'));

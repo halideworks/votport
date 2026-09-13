@@ -71,7 +71,8 @@
         <button id="load-more" class="ghost" hidden>Load more</button>
         <a id="export" class="ghost" href="/api/admin/audit?limit=10000">Export JSONL</a>
       </div>
-      <p id="audit-range" class="mono muted"></p>
+      <p class="field-help">Load more keeps up to 1,000 rows on this page. Refresh starts again with the selected filters and order.</p>
+      <p id="audit-range" class="mono muted" role="status" tabindex="-1"></p>
       <div id="audit-log" class="mono"></div>
       <p class="sheet-foot"><span class="footer-custom"></span><span>Powered by Verified Object Transport (VOT) · <a href="https://votport.com" target="_blank" rel="noopener noreferrer">VOTPort</a></span></p>
     </div>
