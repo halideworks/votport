@@ -1,14 +1,25 @@
-# Sender identity: the drop is an object, not a file that arrived
+# Sender identity: historical object-card and verification design
 
 | Field | Value |
 | --- | --- |
-| Status | Ready to implement (design review: 0 open issues) |
+| Status | Historical design; object cards and public verification shipped |
 | Date | 2026-08-22 |
 | Head | `87c9f7b` Document the shipped admin, settings overlay, and 8 MiB ceiling (#36) |
 | Continues | `docs/enterprise-ops.md` (phases 6+ shipped). This is a new product slice, not an ops follow-on. |
 | Audience | Senior engineers who already know the votport tree |
 
-Canonical copy. Implement from the PR Plan at the bottom. Merge PR 1 then PR 2, and PR 1 then PR 3.
+The August 2026 proposal below preserves its original file names, constants and
+resume examples. It is not a current implementation checklist. Current sender
+code is in [upload.js](../web/assets/upload.js); the operator listing is
+[Receive](../web/receive.html) and [page-receive.js](../web/assets/page-receive.js).
+Both use [object-card.js](../web/assets/object-card.js).
+
+System and the public [verification page](../web/verify.html) load the key from
+`GET /api/receipt-key`. Browser resume uses `saveResume` in `upload.js`, with
+`session`, `files`, `size`, `root` and `chunk`; `root` identifies the package.
+See [Receipts](../README.md#receipts) for current use. The old `/links`,
+`page-links.js`, `admin.js`, `LOOKAHEAD` and single-file resume references below
+belong to the design baseline.
 
 ## Overview
 
@@ -18,7 +29,7 @@ This slice makes object identity the result of a drop, on three surfaces that sh
 
 ## Background & Motivation
 
-### Current state (verified in code)
+### Original implementation baseline
 
 Object identity is already on every completed upload. `server/src/store.rs` `FileRecord` persists:
 

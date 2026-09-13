@@ -69,10 +69,10 @@ of data:
   three-phase run through a proxy is capped at 20 session creations total:
   keep `SESSIONS` at 10 or below there, or run from inside the network.
   Synthetic addresses appear in link events and the audit log on a real box.
-- **Upload sessions: 8 concurrent per link (`MAX_SESSIONS_PER_LINK`).** The
-  rig seeds one link per eight upload workers and spreads sessions across
-  them, so runs reach the process-wide cap instead of this one. A single
-  real link still refuses its ninth concurrent sender.
+- **`VOTPORT_MAX_LINK_SESSIONS` (default 8).** The rig seeds one link per
+  eight upload workers and spreads sessions across them. With the default
+  setting, a single link refuses its ninth concurrent sender; a lower configured
+  limit also constrains the rig.
 - **`VOTPORT_MAX_TOTAL_SESSIONS` (default 32).** The process-wide session
   cap; this is the knob the rig exists to size. Runs with `SESSIONS` above it
   report the overflow as 429 errors, which is the measurement working.

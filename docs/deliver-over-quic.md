@@ -254,9 +254,10 @@ not per range, so it costs nothing on the data path.
 
 ### Failure webhook and audit
 
-`serve_admitted` and `serve_completed` audit rows and tracing events, and
-`serve_refused{reason}` as a tracing event only (a refusal is unauthenticated
-and attacker-controllable, as with push), mirroring the push vocabulary. A
+`serve_admitted` and `serve_completed` produce audit rows and tracing events.
+Refusals emit a `serve_refused` tracing event and increment
+`votport_serve_refused_total{reason}` with the fixed reasons `rate`, `capability`,
+`unknown`, `closed` and `busy`; they do not create audit rows. A
 completed QUIC delivery sends the same `outbound_download_started` and
 `outbound_delivery_complete` notifications the HTTP path sends.
 
@@ -343,8 +344,9 @@ own. If a later version gives it one, it goes in `backup::MANAGED_FILES`.
 
 ### Automation token scopes
 
-Automation tokens gain a `scopes` column (schema 21, default `share` for
-existing rows). Scopes: `share` (today's `POST /api/automation/share`),
+This unimplemented agent proposal has no assigned schema version. Current
+[automation tokens](agents.md) use a `permissions` field, not the proposed
+`scopes` column. The proposed scopes are `share` (`POST /api/automation/share`),
 `replicate` (feed, ack, and agent fetch of the tenant's uploads), and
 `fetch` (mint a fetch capability for a named grant, for scripted client
 pulls). The create endpoint takes a scope list; the admin page shows it; a

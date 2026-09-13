@@ -49,7 +49,7 @@ votport evidence accept VERIFICATION_ID
 
 The browser stores a nonextractable device key and queued evidence in IndexedDB.
 Ordinary download clicks do not prove saved bytes. After downloading, choose the
-saved files in **Verify saved files and accept this delivery**. Votport hashes
+saved files under **After downloading: verify files and accept delivery**. Votport hashes
 all expected files before offering explicit acceptance. Browser and native
 keys are separate. Clearing browser site data removes that browser's key and
 local evidence history.
@@ -206,7 +206,7 @@ its frozen manifest. NYC verifies the arriving files and records its own signed
 custody receipt in the upload completion transaction. Forwarding from NYC
 includes the parent receipt's digest and its complete signed ancestry. Receivers
 verify the chain and reject loops; a route allows at most eight sending ports.
-**Workflows > Jobs > Download custody evidence** exports the peer receipt,
+**Workflows > Deliveries > Download custody evidence** exports the peer receipt,
 ancestors and any revocation acknowledgment. **Receive > Trade route > evidence**
 exports evidence retained by the receiving port. File publication receipts
 continue to identify their actual storage commit profile; custody signatures do

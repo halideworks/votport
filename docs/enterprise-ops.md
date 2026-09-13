@@ -1,4 +1,4 @@
-# votport enterprise operations (phases 6+)
+# Enterprise operations: historical phases 6+ design
 
 | Field | Value |
 | --- | --- |
@@ -8,12 +8,18 @@
 | Continues | `docs/multi-tenancy.md` (phases 1-5 plus multi-page admin #28) |
 | Audience | Senior engineers who already know the votport tree |
 
-The body below preserves the design and pre-implementation baseline that
-shipped. Later hardening added per-link legal hold in schema v6, the schema-v7
-exact-byte files projection, atomic announced-byte/session reservations, and
-reserved tenant storage. See [`multi-tenancy.md`](multi-tenancy.md) for current
-behavior. The remaining follow-on is scoped automation tokens. VOT is pinned at
-`1010254b`. See the README roadmap for what that pin does and does not change.
+This is the August 2026 design record, with later implementation notes. Its
+proposed settings, page lists, schema changes and recovery recipes are historical.
+Use the [deployment guide](deployment.md) for current operations and the
+[configuration reference](../README.md#configuration) for environment settings.
+
+Current [Notifications](notifications.md) uses named tenant destinations; SMTP
+relay configuration stays on System and requires a host and sender address, with
+recipients on each email destination. [Tenant storage](multi-tenancy.md#what-a-tenant-is)
+uses the reserved `.vot-tenants.stage` subtree, and the Tenants page loads
+principals in pages. [Backups](deployment.md#backups) and
+[standby replication](deployment.md#high-availability-active-passive) are shipped;
+the Litestream proposal below is not the only recovery option.
 
 ## Overview
 
@@ -23,7 +29,7 @@ This design adds the smallest version that closes that loop. One instance sits b
 
 ## Background & Motivation
 
-### Current state
+### Original implementation baseline
 
 | Piece | Where it lives |
 | --- | --- |

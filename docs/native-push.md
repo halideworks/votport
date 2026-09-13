@@ -102,12 +102,10 @@ admission decision, one commit path, and one `UploadRecord` shape.
    key, and the package root and length. votport admits the session there,
    mints the capability, and returns it with the UDP address and the
    certificate digest. The QUIC connection carries only VOT frames.
-3. **One session table.** The push session is a row in `Sessions` with the
-   same reserved bytes and delete pins. `SessionHandle` gains a `kind`
-   field that `insert_admitted` (`session.rs:1061-1070`) sets from a new
-   `SessionAdmission` field; `remove` and tenant delete pins work
-   unchanged; `sweep` and abort call the cancellation handle for a push
-   session instead of dropping or sending on the `Cmd` channel.
+3. **One session table.** `Sessions::insert_admitted` copies
+   `SessionAdmission::kind` into `SessionHandle`. HTTP and native push share
+   byte reservations and delete pins. `SessionKind::Push` carries the
+   `PushControl` used for cancellation and resume.
 4. **Receive directly, then publish each completed object.**
    `PushFileSink::write_verified` passes the engine's verification witness to
    `NativeFile::accept`. Each file uses private staging on its destination
@@ -211,47 +209,39 @@ check; the received manifest is checked later against `MAX_ENTRIES`.
   small limiter keyed by
   validated peer address, not `app.session_rate`: that table is the
   per-sender upload quota for HTTP, capped at 4096 buckets with eviction
-  (`server/src/api/session_rate.rs:16,40-58`), and feeding it unvalidated
-  UDP sources would let an off-path spoofer evict browser senders' buckets.
+  (`SessionRate` in `server/src/api/session_rate.rs`), and feeding it
+  unvalidated UDP sources would let an off-path spoofer evict browser buckets.
   The capability check is the first application frame after `AUTH_CONTEXT`,
-  so a flood is bounded by retry cost, the limiter, and the `MAX_SESSIONS`
-  table, not by disk.
-- Push sessions count against `MAX_SESSIONS` and `MAX_SESSIONS_PER_LINK`
-  from preflight, so a sender that preflights and never dials holds a slot
-  until the idle sweep, the same as a browser that creates a session and
-  closes the tab. `last_active` is written only by `touch` and the lease
-  drop (`session.rs:1126`, `:821`), which a push session never calls, and
-  `sweep` evicts on `last_active` alone when `in_flight` is zero
-  (`session.rs:1158-1174`). The sink votport hands the engine wraps
-  `FileSink` and stamps `last_active` through `Sessions::mark_active(sid)`
-  from `write_at`, throttled to once a second, so a single large object
-  keeps refreshing it and only a stalled transfer is swept.
+  so a flood is bounded by retry cost, the limiter, and the shared session
+  cap, not by disk.
+- Push sessions count against `VOTPORT_MAX_TOTAL_SESSIONS` and
+  `VOTPORT_MAX_LINK_SESSIONS` from preflight. A sender that never dials holds
+  a slot until idle cleanup. `PushReceive::mark_active` refreshes session
+  activity at most once per second during writes. `Sessions::sweep` keeps
+  commands with in-flight leases registered and cancels an idle connected
+  push; its reservation remains until the receive seams exit.
 
 ### 4. Push worker
 
-`SessionHandle` (`session.rs:795`) gains a `kind` field, `Http` or
-`Push { cancel }`; `Phase` is the HTTP worker's private state and a push
-session has none. The engine drives the session and calls votport through
-the seams:
+`SessionHandle::kind` distinguishes HTTP from native push. `Phase` is the
+HTTP worker's state; `PushReceive` owns the native receive state. The engine
+calls votport through the receive seams:
 
-1. There is no per-session worker thread driving the engine; the engine
-   drives the session and calls votport through the seams. votport's
-   per-session state (`files`, the dedupe index, the staging root
-   `<dest_dir>/.vot-push-<sid>/`) lives in the `ReceiveSeams` closures,
-   `tighten_dir` applied to every directory they create (umask 022 is
-   already pinned in `app::build`).
-2. The manifest hook runs the entry validation `handle_page` and
-   `handle_begin` run today, before any range is requested: entry count
-   against `MAX_ENTRIES` (`session.rs:327`), packed entries refused,
-   `paths::admit_component` per path component (`session.rs:371`), and the
-   dedupe index over prior uploads. A refusal ends the session with
-   `ADMISSION_DENIED` and no byte transferred, matching the HTTP path.
+1. `PushControl::staging_dir` places resumable transfer metadata under
+   `<dest_dir>/.vot-stage/.vot-push-<resume-key>/`. The resume key survives a
+   fresh session ID and capability; the session ID is used only for a control
+   without a resume key. Each `NativeFile` keeps its payload in private staging
+   on the destination filesystem.
+2. `validate_push_manifest` checks the admitted package, `MAX_ENTRIES`, direct
+   storage and text paths, using `paths::admit_component` for every component.
+   `PushReceive::prepare_manifest` then restores a matching checkpoint or
+   prepares destination files using the prior-upload dedupe index. A refused
+   manifest does not request payload ranges.
 3. The sink factory answers per object: an entry the dedupe index already
    has with its stored file intact returns the skip decision, so the engine
    issues no `RANGE_REQUEST` for that object; this is the `find_delivered`
-   outcome of the browser path (`session.rs:469-507`) at the same point in
-   the flow. Otherwise it returns a `PushFileSink` backed by the destination
-   files' private staging.
+   outcome shared with the browser's `prepare_files` path. Otherwise it returns
+   a `PushFileSink` backed by the destination files' private staging.
    `HAVE` is not involved: it carries verified 64 KiB group coverage within
    one object (`spec/object.md` section 10), not a package-level skip, and
    has no implementation outside the codec.
@@ -269,21 +259,12 @@ the seams:
    releases it. If startup cannot resume the persisted session, it can record
    files already checkpointed as published in a partial upload; publication
    that never reached a checkpoint may remain absent from upload history.
-7. Abort and the `Cmd` routes. Nothing consumes a push session's `Cmd`
-   channel, and `dispatch` awaits a oneshot with no timeout
-   (`upload.rs:415-434`), so every HTTP session route (`seal`, `page`,
-   `begin`, `chunk`, `finish`, `abort`) would hang on a push session id.
-   The guard goes in `Sessions::touch` (`session.rs:1121`), the one place
-   all six routes obtain a `SessionCommand`. `touch` returns
-   `Option<SessionCommand>` and `dispatch` maps `None` to 404
-   (`upload.rs:421-423`), so it becomes `Result<SessionCommand,
-   TouchError>` with `NotFound` and `WrongKind`, and `dispatch` maps
-   `WrongKind` to 409. `upload_abort` handles a push session before
-   `dispatch`: `Sessions::cancel_push(sid)` clones the cancellation handle
-   out of `SessionHandle::kind` and triggers it. The engine sends `GOAWAY`,
-   the fetch loop returns, and step 6 runs. `Sessions::sweep` does the same
-   on idle eviction, since dropping the `mpsc::Sender` does not interrupt
-   the engine.
+7. `Sessions::touch` refuses native push with `TouchError::WrongKind`, which
+   HTTP `dispatch` maps to 409; unknown or expired sessions return 404.
+   `upload_abort` handles native tickets before dispatch, using
+   `Sessions::abort_push` for a connected receiver. Idle cleanup also signals
+   cancellation through `PushControl`; dropping an HTTP command sender alone
+   would not interrupt the VOT engine.
 
 ### 5. Engine dependency
 
@@ -365,9 +346,8 @@ parser, a signature scheme, and a spec section.
 
 The engine could write final files in place. That bypasses `NativeFile`'s
 same-directory staging and journal, `publish_observation`, and the
-receipt's incarnation and sequence. The extra copy from `.vot-push-<sid>/`
-to the destination is a rename on the same filesystem; the design keeps
-the commit contract instead of the copy.
+receipt's incarnation and sequence. `NativeFile` publishes from its private
+staging on the destination filesystem; the native path keeps that commit contract.
 
 ### 5. Terminate QUIC in Caddy
 
@@ -387,7 +367,7 @@ want one public port, and changes nothing in votport.
   crosses the QUIC connection.
 - The QUIC listener accepts any handshake; authorization is the first
   application frame. Handshake cost per validated address is the exposure,
-  bounded by stateless retry, the push limiter, and `MAX_SESSIONS` for
+  bounded by stateless retry, the push limiter, and the shared session cap for
   anything that gets as far as a session row.
 - The issuer key never leaves `data_dir`. The certificate digest is public
   by design.
@@ -417,7 +397,9 @@ want one public port, and changes nothing in votport.
 
 ## Rollout Plan
 
-1. Keep `VOTPORT_PUSH_BIND` unset unless native push is needed.
+1. Keep `VOTPORT_PUSH_BIND` unset unless native push is needed. Set
+   `VOTPORT_SESSION_IDLE_SECS` to a positive number of seconds (default 1800);
+   startup rejects zero for both HTTP uploads and native push.
 2. When enabling it, choose a reachable UDP port, set a numeric
    `VOTPORT_PUSH_ADVERTISE` for the b14 CLI, map the UDP port, open the
    firewall, and verify `/api/push-identity`.
@@ -439,9 +421,9 @@ want one public port, and changes nothing in votport.
 |---|---|---|
 | High | BoringSSL build in the image and CI adds minutes and a toolchain | Build once per lock change; the docker job already runs vot-wasm from source. Measure the first CI run and record it. |
 | High | A second commit path drifts from the first | There is no second path: publication is `NativeFile` plus `write_sidecar` for both. Test asserts `FileRecord` equality between an HTTP and a push upload of the same package. |
-| Medium | UDP port exposed to unauthenticated handshakes | Stateless retry before any state, a separate limiter on validated addresses, capability before any session row, `MAX_SESSIONS` ceiling. |
+| Medium | UDP port exposed to unauthenticated handshakes | Stateless retry before any state, a separate limiter on validated addresses, capability before any session row, shared session cap. |
 | Medium | Self-signed certificate digest changes on data loss | Digest is published and pinned per transfer at preflight, so a rotation invalidates only sessions started before it. |
-| Low | `.vot-push-*` staging orphaned by a crash | `clean_staging` at boot sweeps the prefix. |
+| Low | `.vot-push-*` staging orphaned by a crash | Startup restores resumable sessions and preserves unresolved checkpoints. Idle cleanup clears inactive controls with no file checkpoints under a verified directory lock, retaining the lock inode. |
 
 ## References
 
