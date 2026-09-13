@@ -39,6 +39,11 @@ pub fn random_token() -> String {
     hex::encode(bytes)
 }
 
+pub(crate) fn hash_token(token: &str) -> String {
+    use sha2::Digest as _;
+    hex::encode(Sha256::digest(token.as_bytes()))
+}
+
 /// Loads or creates the 32-byte cookie-signing secret in the data directory.
 pub fn load_secret(data_dir: &std::path::Path) -> Result<[u8; 32], String> {
     let path = data_dir.join("secret");

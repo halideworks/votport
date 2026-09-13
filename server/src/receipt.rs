@@ -70,13 +70,6 @@ impl ReceiptSigner {
         Ok(Self { key, public_hex })
     }
 
-    pub(crate) fn delivery_token(&self, id: &str) -> String {
-        use ed25519_dalek::Signer;
-        use sha2::{Digest, Sha256};
-        let message = format!("votport-job-token-v1\0{id}");
-        hex::encode(Sha256::digest(self.key.sign(message.as_bytes()).to_bytes()))[..32].into()
-    }
-
     pub(crate) fn sign_route(
         &self,
         document: crate::route_protocol::RouteDocument,

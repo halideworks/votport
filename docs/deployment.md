@@ -528,6 +528,13 @@ completion from published file flags or discard unresolved session rows. Older
 archives require a matching binary; take fresh backups after the transition
 and upgrade replicas together.
 
+Schema 38 additionally stores an independent random bearer for each workflow job.
+An offline conversion must replace existing workflow bearers and their matching
+grant hashes together; distribute the replacement links to recipients. Do not
+derive these values from `receipt.key` or retain the old deterministic links.
+Use a matching binary for older archives, take fresh backups after conversion,
+and upgrade replicas together.
+
 The local platform password is break-glass for every namespace; named
 tenants have no separate password.
 

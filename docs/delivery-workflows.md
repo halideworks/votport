@@ -111,6 +111,12 @@ issuance and session admission, enforce release and recipient policy. Rotating a
 share invalidates its previous token and QUIC tickets. Already-admitted streams
 may finish; previously delivered bytes cannot be recalled.
 
+Workflow links use independent random bearers retained privately in the database,
+separate from the receipt-signing key. Rotation replaces the stored bearer and
+grant hash together. A backup can reproduce the links current at its snapshot,
+but cannot derive later rotations. Replica promotion preserves current links,
+while historical restore suspends their jobs and revokes grants.
+
 ## Durable preparation, schedules and deadlines
 
 Create a job with a stable `operation_id`. Repeating the same request under the

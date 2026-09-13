@@ -33,6 +33,7 @@ use super::{ApiError, ApiResult};
 use crate::api::admin;
 use crate::app::App;
 use crate::auth;
+use crate::auth::hash_token;
 use crate::session::{OutboundOperation, OwnedOutboundOperation};
 use crate::store::{
     now_unix, AutomationToken, OutboundDownloadResult, OutboundGrant, OutboundGrantFile,
@@ -2084,15 +2085,17 @@ async fn create_library_grant(
         .collect::<ApiResult<Vec<_>>>()?;
     let first = files.first().cloned().ok_or_else(ApiError::not_found)?;
     let created_at = now_unix();
-    let token = options
-        .workflow
-        .as_ref()
-        .map(|job| {
-            app.signer
-                .delivery_token(&format!("{}:{}", job.id, job.token_generation))
-        })
-        .or_else(|| options.automation.as_ref().map(|(_, token)| token.clone()))
-        .unwrap_or_else(auth::random_token);
+    let token = if let Some(job) = &options.workflow {
+        app.store
+            .delivery_job_token(&job.tenant, &job.id)
+            .map_err(super::store_unavailable)?
+    } else {
+        options
+            .automation
+            .as_ref()
+            .map(|(_, token)| token.clone())
+            .unwrap_or_else(auth::random_token)
+    };
     let label = options
         .label
         .unwrap_or_else(|| first.name.clone())
@@ -2461,20 +2464,10 @@ pub async fn update_outbound_grant(
             .delivery_job(&id)
             .map_err(super::store_unavailable)?
             .filter(|job| job.tenant == identity.tenant);
-        let token = job
-            .as_ref()
-            .map(|job| {
-                app.signer
-                    .delivery_token(&format!("{}:{}", job.id, job.token_generation + 1))
-            })
-            .unwrap_or_else(auth::random_token);
+        let token = auth::random_token();
         let changed = if let Some(job) = job {
-            app.store.rotate_delivery_job_token(
-                &identity.tenant,
-                &id,
-                job.token_generation,
-                &hash_token(&token),
-            )
+            app.store
+                .rotate_delivery_job_token(&identity.tenant, &id, job.token_generation, &token)
         } else {
             app.store
                 .rotate_outbound_grant_token(&identity.tenant, &id, &hash_token(&token))
@@ -4172,9 +4165,6 @@ fn receipt_path(path: &Path) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(".vot-receipt");
     value.into()
-}
-fn hash_token(token: &str) -> String {
-    hex::encode(Sha256::digest(token.as_bytes()))
 }
 fn valid_token(token: &str) -> bool {
     token.len() == 32 && token.as_bytes().iter().all(u8::is_ascii_hexdigit)

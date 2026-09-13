@@ -163,16 +163,19 @@ pub async fn create(
 }
 
 fn public_job(app: &App, headers: &HeaderMap, job: Job) -> serde_json::Value {
-    let token = app
-        .signer
-        .delivery_token(&format!("{}:{}", job.id, job.token_generation));
-    let url = (job.released()
-        && app.store.delivery_release(&job.id).is_ok()
-        && app
-            .store
-            .delivery_token_active(&job.id, &hash_token(&token))
-            .unwrap_or(false))
-    .then(|| format!("{}/s/{token}", admin::base_url(app, headers)));
+    let url = if job.released() && app.store.delivery_release(&job.id).is_ok() {
+        app.store
+            .delivery_job_token(&job.tenant, &job.id)
+            .ok()
+            .filter(|token| {
+                app.store
+                    .delivery_token_active(&job.id, &hash_token(token))
+                    .unwrap_or(false)
+            })
+            .map(|token| format!("{}/s/{token}", admin::base_url(app, headers)))
+    } else {
+        None
+    };
     let notifications_override = app
         .store
         .notification_job_override(&job.tenant, &job.id)
@@ -2099,7 +2102,10 @@ mod tests {
                 assert_eq!(retained.project, original.project);
                 assert_eq!(retained.manifest, original.manifest);
                 assert_eq!(retained.checks, original.checks);
-                let old_token = app.signer.delivery_token(&format!("{}:0", original.id));
+                let old_token = app
+                    .store
+                    .delivery_job_token(&original.tenant, &original.id)
+                    .unwrap();
                 assert_ne!(
                     call(
                         &app,
@@ -3381,7 +3387,7 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 prepare(&app, running).await.unwrap();
-                let token = app.signer.delivery_token(&format!("{}:0", job.id));
+                let token = app.store.delivery_job_token(&job.tenant, &job.id).unwrap();
                 let path = format!("/api/s/{token}");
                 let grant = app.store.outbound_grant_by_id(&job.id).unwrap().unwrap();
                 let manifest = app.store.delivery_manifest(&job.id).unwrap();
@@ -3561,6 +3567,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workflow_bearers_are_independent_of_the_receipt_key() {
+        use ed25519_dalek::Signer as _;
+        use sha2::{Digest as _, Sha256};
+
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        std::fs::create_dir_all(app.config.outbound_dir.join("project")).unwrap();
+        std::fs::write(
+            app.config.outbound_dir.join("project/file.bin"),
+            b"original",
+        )
+        .unwrap();
+        let mut project = crate::workflow::tests::project();
+        project.require_approval = false;
+        let project = app
+            .store
+            .save_delivery_project("", "local", project)
+            .unwrap();
+        let job = app
+            .store
+            .enqueue_delivery_job(
+                "",
+                "sender",
+                1,
+                None,
+                project,
+                crate::workflow::tests::request(),
+            )
+            .unwrap();
+        let running = app
+            .store
+            .claim_delivery_job("boot", now_unix())
+            .unwrap()
+            .unwrap();
+        prepare(&app, running).await.unwrap();
+        let seed: [u8; 32] = std::fs::read(app.config.data_dir.join("receipt.key"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let compromised = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let cookie = admin_cookie(&app);
+        let mut previous = None;
+        for generation in 0..=1 {
+            let response = call(
+                &app,
+                Method::GET,
+                &format!("/api/workflows/jobs/{}", job.id),
+                Some(&cookie),
+                None,
+            )
+            .await;
+            assert_eq!(response.0, StatusCode::OK);
+            let public: serde_json::Value = serde_json::from_slice(&response.2).unwrap();
+            let token = public["url"].as_str().unwrap().rsplit('/').next().unwrap();
+            let message = format!("votport-job-token-v1\0{}:{generation}", job.id);
+            let derived = hex::encode(Sha256::digest(
+                compromised.sign(message.as_bytes()).to_bytes(),
+            ))[..32]
+                .to_owned();
+            assert_eq!(
+                call(
+                    &app,
+                    Method::GET,
+                    &format!("/api/s/{derived}/file"),
+                    None,
+                    None
+                )
+                .await
+                .0,
+                StatusCode::NOT_FOUND,
+                "the receipt key must not reproduce a workflow bearer"
+            );
+            assert_ne!(token, derived);
+            let downloaded = call(
+                &app,
+                Method::GET,
+                &format!("/api/s/{token}/file"),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(downloaded.0, StatusCode::OK);
+            assert_eq!(downloaded.2, b"original");
+            assert!(!public["job"].to_string().contains(token));
+            assert!(
+                !serde_json::to_string(&app.store.delivery_events("", 0, 100).unwrap())
+                    .unwrap()
+                    .contains(token)
+            );
+            if let Some(previous) = previous {
+                assert_ne!(token, previous);
+                assert_eq!(
+                    call(
+                        &app,
+                        Method::GET,
+                        &format!("/api/s/{previous}/file"),
+                        None,
+                        None
+                    )
+                    .await
+                    .0,
+                    StatusCode::NOT_FOUND
+                );
+            }
+            previous = Some(token.to_owned());
+            if generation == 0 {
+                let rotated = call(
+                    &app,
+                    Method::PATCH,
+                    &format!("/api/admin/outbound-grants/{}", job.id),
+                    Some(&cookie),
+                    Some(json!({"rotate":true})),
+                )
+                .await;
+                assert_eq!(rotated.0, StatusCode::OK);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn workflow_reuses_library_bytes_and_enforces_recipient_approval_and_evidence() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
@@ -3593,7 +3719,7 @@ mod tests {
             .unwrap()
             .unwrap();
         prepare(&app, running).await.unwrap();
-        let token = app.signer.delivery_token(&format!("{}:0", job.id));
+        let token = app.store.delivery_job_token(&job.tenant, &job.id).unwrap();
         let path = format!("/api/s/{token}");
         for suffix in [
             "",
