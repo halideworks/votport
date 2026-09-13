@@ -132,7 +132,7 @@ impl Store {
         endpoint.validate()?;
         let mut c = self.connection.lock().expect("store poisoned");
         let tx = c.transaction().map_err(|e| e.to_string())?;
-        let eligible: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM links WHERE id=?1 AND tenant=?2 AND password_hash IS NULL AND active=1 AND json_array_length(uploads_json)=0) AND NOT EXISTS(SELECT 1 FROM inbound_routes WHERE link_id=?1)", params![endpoint.id, tenant], |r|r.get(0)).map_err(|e|e.to_string())?;
+        let eligible: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM links WHERE id=?1 AND tenant=?2 AND password_hash IS NULL AND active=1 AND NOT EXISTS(SELECT 1 FROM link_uploads WHERE link_id=links.id)) AND NOT EXISTS(SELECT 1 FROM inbound_routes WHERE link_id=?1)", params![endpoint.id, tenant], |r|r.get(0)).map_err(|e|e.to_string())?;
         if !eligible {
             return Err(
                 "choose a new, active receive request without a password or previous uploads"

@@ -3011,7 +3011,7 @@ pub async fn update_link(
     if let Some(legal_hold) = request.legal_hold {
         if app
             .store
-            .link(&identity.tenant, &id)
+            .link_metadata(&identity.tenant, &id)
             .map_err(ApiError::internal)?
             .is_none()
         {
@@ -3087,7 +3087,7 @@ pub async fn delete_link(
     require_admin_write(&headers, &identity)?;
     if app
         .store
-        .link(&identity.tenant, &id)
+        .link_metadata(&identity.tenant, &id)
         .map_err(super::store_unavailable)?
         .is_none()
     {
@@ -3099,7 +3099,7 @@ pub async fn delete_link(
         .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "link delete already in progress"))?;
     let link = app
         .store
-        .link(&identity.tenant, &id)
+        .link_metadata(&identity.tenant, &id)
         .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
     if link.legal_hold {
@@ -3158,7 +3158,7 @@ pub async fn link_qr(
     let identity = require_operator(&app, &headers)?;
     let link = app
         .store
-        .link(&identity.tenant, &id)
+        .link_metadata(&identity.tenant, &id)
         .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
     let url = format!("{}/r/{}", base_url(&app, &headers), link.id);
@@ -3183,7 +3183,7 @@ pub async fn delete_upload_record(
     require_admin_write(&headers, &identity)?;
     if app
         .store
-        .link(&identity.tenant, &id)
+        .link_metadata(&identity.tenant, &id)
         .map_err(super::store_unavailable)?
         .is_none()
     {
@@ -3211,7 +3211,7 @@ pub async fn delete_upload_record(
     }
     let link = app
         .store
-        .link(&identity.tenant, &id)
+        .link_metadata(&identity.tenant, &id)
         .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
     if link.legal_hold {
@@ -3220,10 +3220,10 @@ pub async fn delete_upload_record(
             "received records cannot be deleted while the link is on legal hold",
         ));
     }
-    let record = link
-        .uploads
-        .iter()
-        .find(|entry| entry.id == upload)
+    let record = app
+        .store
+        .link_upload(&identity.tenant, &id, &upload)
+        .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
     for index in 0..record.files.len() {
         if app
@@ -3239,9 +3239,7 @@ pub async fn delete_upload_record(
     }
     let found = app
         .store
-        .update_link_uploads(&identity.tenant, &id, |link| {
-            link.uploads.retain(|entry| entry.id != upload)
-        })
+        .remove_upload(&identity.tenant, &id, &upload)
         .map_err(ApiError::internal)?;
     if !found {
         return Err(ApiError::not_found());
@@ -3286,7 +3284,7 @@ fn delete_received_file_sync(
         .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
     if app
         .store
-        .link(&identity.tenant, id)
+        .link_metadata(&identity.tenant, id)
         .map_err(super::store_unavailable)?
         .is_none()
     {
@@ -3314,7 +3312,7 @@ fn delete_received_file_sync(
     }
     let link = app
         .store
-        .link(&identity.tenant, id)
+        .link_metadata(&identity.tenant, id)
         .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
     if link.legal_hold {
@@ -3323,12 +3321,12 @@ fn delete_received_file_sync(
             "received files cannot be deleted while the link is on legal hold",
         ));
     }
-    let record = link
-        .uploads
-        .iter()
-        .find(|entry| entry.id == upload)
-        .and_then(|entry| entry.files.get(index))
+    let selected = app
+        .store
+        .link_upload(&identity.tenant, id, upload)
+        .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
+    let record = selected.files.get(index).ok_or_else(ApiError::not_found)?;
     if record.deleted {
         return Ok(Json(json!({ "ok": true })));
     }
@@ -3337,10 +3335,12 @@ fn delete_received_file_sync(
         .active_outbound_file_keys(&identity.tenant, id, now_unix())
         .map_err(ApiError::internal)?;
     for (upload_id, file_index) in active {
-        let protected = link
-            .uploads
-            .iter()
-            .find(|upload| upload.id == upload_id)
+        let protected_upload = app
+            .store
+            .link_upload(&identity.tenant, id, &upload_id)
+            .map_err(super::store_unavailable)?;
+        let protected = protected_upload
+            .as_ref()
             .and_then(|upload| upload.files.get(file_index));
         if protected.is_none_or(|file| file.stored_as == record.stored_as) {
             return Err(ApiError::new(
@@ -3356,9 +3356,11 @@ fn delete_received_file_sync(
         .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
     if !app
         .store
-        .tombstone_files(&identity.tenant, id, |file| {
-            file.stored_as == record.stored_as
-        })
+        .tombstone_files(
+            &identity.tenant,
+            id,
+            &std::collections::HashSet::from([record.stored_as.as_str()]),
+        )
         .map_err(ApiError::internal)?
     {
         return Err(ApiError::new(

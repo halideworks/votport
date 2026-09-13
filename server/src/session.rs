@@ -6206,10 +6206,17 @@ mod push_tests {
             let final_path = setup.dest_dir.join("frame");
             if final_state != "original" {
                 app.store
-                    .update_link_uploads("", &setup.link_id, |link| {
-                        link.uploads.clear();
-                        link.active = false;
-                    })
+                    .remove_upload(
+                        "",
+                        &setup.link_id,
+                        &app.store.load_upload_sessions().unwrap()[0]
+                            .committed_upload_id
+                            .clone()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                app.store
+                    .update_link("", &setup.link_id, |link| link.active = false)
                     .unwrap();
                 match final_state {
                     "missing" => fs::remove_file(&final_path).unwrap(),
@@ -6365,10 +6372,11 @@ mod push_tests {
         );
         setup
             .store
-            .update_link_uploads("", "link", |link| {
-                link.uploads.clear();
-                link.active = false;
-            })
+            .remove_upload("", "link", &report.upload_id)
+            .unwrap();
+        setup
+            .store
+            .update_link("", "link", |link| link.active = false)
             .unwrap();
         for partial in [false, true] {
             assert_eq!(
@@ -6741,7 +6749,7 @@ mod push_tests {
         commit_persisted_interruption(&setup.store, &setup.ended, &persisted, "fixture");
         setup
             .store
-            .tombstone_files("", &setup.link_id, |file| file.stored_as == "frame-0")
+            .tombstone_files("", &setup.link_id, &HashSet::from(["frame-0"]))
             .unwrap();
         persisted.files[1].published = true;
         commit_persisted_interruption(&setup.store, &setup.ended, &persisted, "fixture");

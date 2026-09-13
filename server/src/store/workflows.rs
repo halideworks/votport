@@ -181,14 +181,15 @@ pub(super) fn check_grant_creation(
             .received
             .as_ref()
             .map(|received| {
-                let link = read_link(connection, &job.tenant, &received.link_id)?
-                    .ok_or("incoming link missing")?;
-                let upload = link
-                    .uploads
-                    .into_iter()
-                    .find(|upload| upload.id == received.upload_id)
-                    .filter(|upload| !upload.partial && upload.completed_at != 0)
-                    .ok_or("incoming upload missing")?;
+                let upload = read_upload(
+                    connection,
+                    &job.tenant,
+                    &received.link_id,
+                    &received.upload_id,
+                )
+                .map_err(|e| e.to_string())?
+                .filter(|upload| !upload.partial && upload.completed_at != 0)
+                .ok_or("incoming upload missing")?;
                 Ok::<_, String>(
                     upload
                         .files
@@ -1000,18 +1001,20 @@ impl Store {
         )? {
             return Err("incoming workflow ownership is missing".into());
         }
-        let upload = read_link(&tx, &identity.tenant, &received.link_id)?
-            .ok_or("incoming link missing")?
-            .uploads
-            .into_iter()
-            .find(|upload| upload.id == received.upload_id)
-            .filter(|upload| {
-                !upload.partial
-                    && upload.completed_at != 0
-                    && !upload.files.is_empty()
-                    && upload.files.iter().all(|file| !file.deleted)
-            })
-            .ok_or("incoming package is incomplete or unavailable")?;
+        let upload = read_upload(
+            &tx,
+            &identity.tenant,
+            &received.link_id,
+            &received.upload_id,
+        )
+        .map_err(|e| e.to_string())?
+        .filter(|upload| {
+            !upload.partial
+                && upload.completed_at != 0
+                && !upload.files.is_empty()
+                && upload.files.iter().all(|file| !file.deleted)
+        })
+        .ok_or("incoming package is incomplete or unavailable")?;
         if crate::route_protocol::manifest_digest(upload.files.iter().map(|file| {
             (
                 file.path.as_str(),
@@ -2081,8 +2084,8 @@ mod tests {
             store
                 .with(|c| {
                     c.execute(
-                        "UPDATE links SET uploads_json=?1 WHERE id='incoming'",
-                        [serde_json::to_string(&vec![changed]).unwrap()],
+                        "UPDATE link_uploads SET document=?1 WHERE link_id='incoming' AND upload_id='received'",
+                        [serde_json::to_string(&changed).unwrap()],
                     )
                 })
                 .unwrap();
@@ -2091,8 +2094,8 @@ mod tests {
         store
             .with(|c| {
                 c.execute(
-                    "UPDATE links SET uploads_json=?1 WHERE id='incoming'",
-                    [serde_json::to_string(&vec![uploaded]).unwrap()],
+                    "UPDATE link_uploads SET document=?1 WHERE link_id='incoming' AND upload_id='received'",
+                    [serde_json::to_string(&uploaded).unwrap()],
                 )
             })
             .unwrap();
