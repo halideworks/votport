@@ -1998,7 +1998,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
-        let rows = application.store.audit_export("", 0, 0, 100).unwrap();
+        let rows = application.store.audit_export(None, 0, 0, 100).unwrap();
         let events: Vec<_> = rows
             .iter()
             .filter(|row| row.subject == "audited")
@@ -2288,7 +2288,7 @@ mod tests {
 
         let events: Vec<_> = application
             .store
-            .audit_export("", 0, 0, 100)
+            .audit_export(None, 0, 0, 100)
             .unwrap()
             .into_iter()
             .filter(|row| row.event.starts_with("scim_group_"))

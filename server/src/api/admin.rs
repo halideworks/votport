@@ -47,11 +47,15 @@ fn admin_token_phc(app: &App) -> ApiResult<String> {
 
 /// Returns the authenticated principal, or unauthorized.
 pub(crate) fn require_admin(app: &App, headers: &HeaderMap) -> ApiResult<auth::AdminIdentity> {
+    require_admin_session(app, headers).map(|(identity, _)| identity)
+}
+
+fn require_admin_session(app: &App, headers: &HeaderMap) -> ApiResult<(auth::AdminIdentity, u64)> {
     let token = headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
         .and_then(|cookies| auth::cookie_value(cookies, ADMIN_COOKIE));
-    let mut identity = auth::verify_admin_token(
+    let (mut identity, expires) = auth::verify_admin_token(
         &app.secret,
         &admin_token_phc(app)?,
         token.unwrap_or_default(),
@@ -75,7 +79,7 @@ pub(crate) fn require_admin(app: &App, headers: &HeaderMap) -> ApiResult<auth::A
             identity.role = "admin".to_owned();
         }
     }
-    Ok(identity)
+    Ok((identity, expires))
 }
 
 /// Read routes for operators: admins and viewers pass, auditors do not.
@@ -131,6 +135,10 @@ pub(crate) fn require_admin_write(
     if identity.role != "admin" {
         return Err(ApiError::new(StatusCode::FORBIDDEN, "read-only session"));
     }
+    require_csrf_header(headers)
+}
+
+fn require_csrf_header(headers: &HeaderMap) -> ApiResult<()> {
     if !headers.contains_key("x-votport") {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -154,8 +162,13 @@ fn admin_hash(app: &App) -> ApiResult<String> {
 /// Builds the signed admin session cookie value for `identity`. The local
 /// break-glass subject keeps the fixed 7-day lifetime; SSO identities use
 /// the adjustable one (VOTPORT_SSO_SESSION_SECS, overridable live from the
-/// System page) so IdP-side offboarding latency is a policy knob.
-pub(crate) fn issue_admin_cookie(app: &App, identity: &auth::AdminIdentity) -> ApiResult<String> {
+/// System page) so IdP-side offboarding latency is a policy knob. Switching
+/// supplies the authenticated expiry to prevent extending that deadline.
+pub(crate) fn issue_admin_cookie(
+    app: &App,
+    identity: &auth::AdminIdentity,
+    expires_at: Option<u64>,
+) -> ApiResult<String> {
     let ttl = if identity.subject == "local" {
         7 * 24 * 3600
     } else {
@@ -165,8 +178,11 @@ pub(crate) fn issue_admin_cookie(app: &App, identity: &auth::AdminIdentity) -> A
             .resolved
             .sso_session_secs
     };
+    let now = now_unix();
+    let expires = expires_at.unwrap_or(u64::MAX).min(now.saturating_add(ttl));
+    let ttl = expires.saturating_sub(now);
     let token =
-        auth::issue_admin_token_with_ttl(&app.secret, identity, &admin_token_phc(app)?, ttl);
+        auth::issue_admin_token_until(&app.secret, identity, &admin_token_phc(app)?, expires);
     Ok(format!(
         "{ADMIN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl}{}",
         cookie_attributes(app)
@@ -236,7 +252,7 @@ pub async fn admin_login(
     tracing::info!(target: "audit", event = "admin_login", %ip, "admin signed in");
     app.store
         .audit("", "", "admin_login", &ip, &serde_json::json!({}));
-    let cookie = issue_admin_cookie(&app, &auth::AdminIdentity::local_admin())?;
+    let cookie = issue_admin_cookie(&app, &auth::AdminIdentity::local_admin(), None)?;
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
 
@@ -244,12 +260,7 @@ pub async fn admin_logout(State(app): State<Arc<App>>, headers: HeaderMap) -> Ap
     // A cross-site form POST can force a logout (denial of convenience, not
     // of security); the CSRF header closes even that.
     let _identity = require_admin(&app, &headers)?;
-    if !headers.contains_key("x-votport") {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "missing X-Votport header",
-        ));
-    }
+    require_csrf_header(&headers)?;
     let cookie = format!(
         "{ADMIN_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}",
         cookie_attributes(&app)
@@ -257,8 +268,16 @@ pub async fn admin_logout(State(app): State<Arc<App>>, headers: HeaderMap) -> Ap
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
 
-/// Streams audit rows as JSONL. The legacy `since`/`after_rowid` mode is
-/// oldest-first; `before_rowid` opts into recent-first pagination.
+fn audit_tenant(identity: &auth::AdminIdentity) -> Option<&str> {
+    if identity.tenant.is_empty() && matches!(identity.role.as_str(), "admin" | "auditor") {
+        None
+    } else {
+        Some(&identity.tenant)
+    }
+}
+
+/// Returns a bounded JSONL page. `since`/`after_rowid` is oldest-first;
+/// `before_rowid` opts into recent-first pagination.
 pub async fn admin_audit_export(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -271,9 +290,6 @@ pub async fn admin_audit_export(
             "before_rowid cannot be combined with since or after_rowid",
         ));
     }
-    // Named-tenant principals see only their namespace's rows; the default
-    // tenant (platform admin) sees everything.
-    let tenant_filter = identity.tenant.clone();
     let limit = query.limit.unwrap_or(1000).min(10_000);
     let event = validate_audit_filter(query.event, "event")?;
     let search = validate_audit_filter(query.q, "q")?;
@@ -282,15 +298,16 @@ pub async fn admin_audit_export(
     let before_rowid = query.before_rowid;
     let store = Arc::clone(&app.store);
     let rows = tokio::task::spawn_blocking(move || {
+        let tenant_filter = audit_tenant(&identity);
         let filters = AuditFilters {
             event: event.as_deref(),
             query: search.as_deref(),
         };
         if let Some(before_rowid) = before_rowid {
-            store.audit_recent_filtered(&tenant_filter, before_rowid, limit, filters)
+            store.audit_recent_filtered(tenant_filter, before_rowid, limit, filters)
         } else {
             store.audit_export_filtered(
-                &tenant_filter,
+                tenant_filter,
                 since.unwrap_or(0),
                 after_rowid.unwrap_or(0),
                 limit,
@@ -515,12 +532,10 @@ pub async fn admin_search(
         .store
         .search(&identity.tenant, phrase, 5)
         .map_err(super::store_unavailable)?;
-    // The audit trail follows the Audit page's rule: a named tenant sees its
-    // own rows, the default tenant sees everything.
     let audit = app
         .store
         .audit_recent_filtered(
-            &identity.tenant,
+            audit_tenant(&identity),
             0,
             5,
             AuditFilters {
@@ -2320,8 +2335,8 @@ pub async fn switch_tenant(
     headers: HeaderMap,
     Json(request): Json<SwitchTenantRequest>,
 ) -> ApiResult<Response> {
-    let identity = require_admin(&app, &headers)?;
-    require_admin_write(&headers, &identity)?;
+    let (identity, expires) = require_admin_session(&app, &headers)?;
+    require_csrf_header(&headers)?;
     let Some(grant) = identity
         .grants
         .iter()
@@ -2351,7 +2366,7 @@ pub async fn switch_tenant(
         &switched.tenant,
         &json!({ "from": identity.tenant }),
     );
-    let cookie = issue_admin_cookie(&app, &switched)?;
+    let cookie = issue_admin_cookie(&app, &switched, Some(expires))?;
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
 
@@ -2445,7 +2460,7 @@ pub async fn admin_change_password(
         "",
         &serde_json::json!({}),
     );
-    let cookie = issue_admin_cookie(&app, &auth::AdminIdentity::local_admin())?;
+    let cookie = issue_admin_cookie(&app, &auth::AdminIdentity::local_admin(), None)?;
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response())
 }
 
@@ -4050,6 +4065,84 @@ mod tenant_authz_tests {
         super::test_admin_cookie(app, &identity)
     }
 
+    #[tokio::test]
+    async fn audit_scope_requires_platform_authority_in_both_cursors_and_search() {
+        use http_body_util::BodyExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        for tenant in ["", "acme", "other"] {
+            application.store.audit(
+                tenant,
+                "actor",
+                "scope_test",
+                &format!("needle-{tenant}"),
+                &json!({}),
+            );
+        }
+        for (tenant, role, all) in [
+            ("", "viewer", false),
+            ("", "admin", true),
+            ("", "auditor", true),
+            ("acme", "viewer", false),
+            ("acme", "admin", false),
+            ("acme", "auditor", false),
+        ] {
+            let cookie = cookie_for(&application, tenant, role);
+            for uri in [
+                "/api/admin/audit?q=needle",
+                "/api/admin/audit?before_rowid=0&q=needle",
+                "/api/admin/search?q=needle",
+            ] {
+                let response = app::router(application.clone())
+                    .oneshot(
+                        Request::get(uri)
+                            .header("cookie", &cookie)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                if role == "auditor" && uri.contains("/search") {
+                    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                    continue;
+                }
+                assert_eq!(response.status(), StatusCode::OK, "{tenant}/{role} {uri}");
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let subjects: Vec<String> = if uri.contains("/search") {
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["audit"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|row| row["subject"].as_str().unwrap().to_owned())
+                        .collect()
+                } else {
+                    std::str::from_utf8(&bytes)
+                        .unwrap()
+                        .lines()
+                        .map(|line| {
+                            serde_json::from_str::<serde_json::Value>(line).unwrap()["subject"]
+                                .as_str()
+                                .unwrap()
+                                .to_owned()
+                        })
+                        .collect()
+                };
+                let mut expected: Vec<_> = if all {
+                    ["", "acme", "other"].to_vec()
+                } else {
+                    vec![tenant]
+                }
+                .into_iter()
+                .map(|tenant| format!("needle-{tenant}"))
+                .collect();
+                let mut subjects = subjects;
+                subjects.sort();
+                expected.sort();
+                assert_eq!(subjects, expected, "{tenant}/{role} {uri}");
+            }
+        }
+    }
+
     /// A new handler that calls bare `require_admin` silently reopens the
     /// audit-only surface; the allow-list below is every function that may
     /// serve an auditor. Extend it deliberately or use `require_operator`.
@@ -4108,8 +4201,9 @@ mod tenant_authz_tests {
                     current_fn = rest.split(['(', '<']).next().unwrap_or_default().to_owned();
                 }
                 // Split so this test's own source cannot match the needle.
-                let needle = ["require_admin", "("].concat();
-                let bare = line.contains(&needle)
+                let bare = ["require_admin", "require_admin_session"]
+                    .iter()
+                    .any(|name| line.contains(&format!("{name}(")))
                     && !line.contains("fn require_admin")
                     && !line.contains("require_admin_write");
                 if bare && current_fn != "require_admin" {
@@ -4336,7 +4430,7 @@ mod tenant_authz_tests {
         );
         assert!(application
             .store
-            .audit_export("acme", 0, 0, 100)
+            .audit_export(Some("acme"), 0, 0, 100)
             .unwrap()
             .iter()
             .any(|row| row.event == "link_legal_hold_changed"));
@@ -4973,7 +5067,7 @@ mod tenant_offboard_tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!tenant_dir.exists());
 
-        let rows = application.store.audit_export("", 0, 0, 100).unwrap();
+        let rows = application.store.audit_export(None, 0, 0, 100).unwrap();
         let deleted = rows
             .iter()
             .find(|row| row.event == "tenant_deleted")
@@ -5041,7 +5135,7 @@ mod tenant_offboard_tests {
             .join("acme")
             .exists());
         assert!(default_file.exists());
-        let rows = application.store.audit_export("", 0, 0, 100).unwrap();
+        let rows = application.store.audit_export(None, 0, 0, 100).unwrap();
         let deleted = rows
             .iter()
             .find(|row| row.event == "tenant_deleted")
@@ -5261,7 +5355,7 @@ mod tenant_offboard_tests {
         let response = delete_tenant_req(application.clone(), &cookie, "acme").await;
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!tenant_dir.exists());
-        let rows = application.store.audit_export("", 0, 0, 100).unwrap();
+        let rows = application.store.audit_export(None, 0, 0, 100).unwrap();
         let deleted = rows
             .iter()
             .find(|row| row.event == "tenant_deleted")
@@ -6095,7 +6189,7 @@ mod settings_api_tests {
             credential_version: 1,
         };
         // Env default: 7 days for both SSO and break-glass.
-        let cookie = issue_admin_cookie(&application, &sso).unwrap();
+        let cookie = issue_admin_cookie(&application, &sso, None).unwrap();
         assert!(cookie.contains("Max-Age=604800"), "{cookie}");
         application
             .store
@@ -6107,10 +6201,24 @@ mod settings_api_tests {
                 )],
             )
             .unwrap();
-        let cookie = issue_admin_cookie(&application, &sso).unwrap();
+        let cookie = issue_admin_cookie(&application, &sso, None).unwrap();
         assert!(cookie.contains("Max-Age=3600"), "{cookie}");
+        let later = now_unix() + 86_400;
+        let capped = issue_admin_cookie(&application, &sso, Some(later)).unwrap();
+        assert!(capped.contains("Max-Age=3600"), "{capped}");
+        let (_, expires) = auth::verify_admin_token(
+            &application.secret,
+            &admin_token_phc(&application).unwrap(),
+            auth::cookie_value(&capped, ADMIN_COOKIE).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            expires < later,
+            "the current policy can shorten the original expiry"
+        );
         // Break-glass keeps its fixed lifetime regardless of the setting.
-        let local = issue_admin_cookie(&application, &auth::AdminIdentity::local_admin()).unwrap();
+        let local =
+            issue_admin_cookie(&application, &auth::AdminIdentity::local_admin(), None).unwrap();
         assert!(local.contains("Max-Age=604800"), "{local}");
     }
 
@@ -7238,27 +7346,69 @@ mod principals_api_tests {
             .store
             .unblock_principal("user@example.com")
             .unwrap();
-        let mut identity = sso_identity("user@example.com", 2);
-        identity.grants.push(TenantGrant {
-            tenant: "acme".to_owned(),
-            role: "admin".to_owned(),
-        });
-        let cookie = cookie_for(&application, identity);
-        let (status, _, set_cookie) = send(
-            application,
-            Request::builder()
-                .method("POST")
-                .uri("/api/admin/tenant")
-                .header("cookie", &cookie)
-                .header("x-votport", "1")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"tenant":"acme"}"#))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let set_cookie = set_cookie.expect("switch reissues a cookie");
-        assert_eq!(payload_cv(&set_cookie), 2);
+        for role in ["viewer", "admin", "auditor"] {
+            for target_role in ["admin", "viewer"] {
+                let mut identity = sso_identity("user@example.com", 2);
+                identity.role = role.into();
+                identity.grants[0].role = role.into();
+                identity.grants.push(TenantGrant {
+                    tenant: "acme".to_owned(),
+                    role: target_role.to_owned(),
+                });
+                let cookie = format!(
+                    "votport_admin={}",
+                    auth::issue_admin_token_with_ttl(
+                        &application.secret,
+                        &identity,
+                        &admin_token_phc(&application).unwrap(),
+                        60,
+                    )
+                );
+                let expires = cookie_token(&cookie).split('.').next().unwrap();
+                for (csrf, target, expected) in [
+                    (true, "acme", StatusCode::OK),
+                    (false, "acme", StatusCode::FORBIDDEN),
+                    (true, "other", StatusCode::FORBIDDEN),
+                ] {
+                    let mut request = Request::post("/api/admin/tenant")
+                        .header("cookie", &cookie)
+                        .header("content-type", "application/json");
+                    if csrf {
+                        request = request.header("x-votport", "1");
+                    }
+                    let (status, _, set_cookie) = send(
+                        application.clone(),
+                        request
+                            .body(Body::from(json!({"tenant": target}).to_string()))
+                            .unwrap(),
+                    )
+                    .await;
+                    assert_eq!(
+                        status, expected,
+                        "{role} to {target}/{target_role}, csrf={csrf}"
+                    );
+                    if expected == StatusCode::OK {
+                        let set_cookie = set_cookie.expect("switch reissues a cookie");
+                        assert_eq!(payload_cv(&set_cookie), 2);
+                        assert_eq!(
+                            cookie_token(&set_cookie).split('.').next().unwrap(),
+                            expires
+                        );
+                        let (switched, switched_expires) = auth::verify_admin_token(
+                            &application.secret,
+                            &admin_token_phc(&application).unwrap(),
+                            cookie_token(&set_cookie),
+                        )
+                        .unwrap();
+                        assert_eq!(switched_expires.to_string(), expires);
+                        assert_eq!(switched.tenant, target);
+                        assert_eq!(switched.role, target_role);
+                    } else {
+                        assert!(set_cookie.is_none());
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

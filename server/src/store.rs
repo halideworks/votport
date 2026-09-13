@@ -4369,11 +4369,11 @@ impl Store {
     }
 
     /// Audit rows strictly after the (at, rowid) cursor, oldest first,
-    /// capped. When `tenant` is non-empty only that namespace's rows are
-    /// returned; the empty string sees everything (platform admin).
+    /// capped. `Some(tenant)` matches that exact namespace, including the
+    /// default tenant. `None` explicitly selects all tenants.
     pub fn audit_export(
         &self,
-        tenant: &str,
+        tenant: Option<&str>,
         since: u64,
         after_rowid: u64,
         limit: u64,
@@ -4383,7 +4383,7 @@ impl Store {
 
     pub fn audit_export_filtered(
         &self,
-        tenant: &str,
+        tenant: Option<&str>,
         since: u64,
         after_rowid: u64,
         limit: u64,
@@ -4396,7 +4396,7 @@ impl Store {
 
     pub fn audit_recent(
         &self,
-        tenant: &str,
+        tenant: Option<&str>,
         before_rowid: u64,
         limit: u64,
     ) -> Result<Vec<AuditRow>, String> {
@@ -4405,7 +4405,7 @@ impl Store {
 
     pub fn audit_recent_filtered(
         &self,
-        tenant: &str,
+        tenant: Option<&str>,
         before_rowid: u64,
         limit: u64,
         filters: AuditFilters<'_>,
@@ -4414,7 +4414,7 @@ impl Store {
             let mut statement = connection.prepare_cached(
                 "SELECT rowid, at, tenant, actor, event, subject, detail
                  FROM audit_log
-                 WHERE (?1 = '' OR tenant = ?1)
+                 WHERE (?1 IS NULL OR tenant = ?1)
                    AND (?2 = '' OR event = ?2)
                    AND (?3 = '' OR instr(lower(CASE WHEN tenant = '' THEN 'default' ELSE tenant END), lower(?3)) > 0
                         OR instr(lower(actor), lower(?3)) > 0
@@ -4439,7 +4439,7 @@ impl Store {
 
     fn audit_export_query(
         connection: &Connection,
-        tenant: &str,
+        tenant: Option<&str>,
         since: u64,
         after_rowid: u64,
         limit: u64,
@@ -4457,7 +4457,7 @@ impl Store {
                     OR instr(lower(actor), lower(?4)) > 0
                     OR instr(lower(event), lower(?4)) > 0
                     OR instr(lower(subject), lower(?4)) > 0)
-               AND (?5 = '' OR tenant = ?5)
+               AND (?5 IS NULL OR tenant = ?5)
              ORDER BY at, rowid LIMIT ?6",
         )?;
         let rows = statement.query_map(
@@ -6209,29 +6209,29 @@ pub(crate) mod tests {
         );
         store.audit("", "", "admin_login", "10.0.0.1", &serde_json::json!({}));
 
-        let rows = store.audit_export("", 0, 0, 100).unwrap();
+        let rows = store.audit_export(None, 0, 0, 100).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].event, "link_created");
         assert_eq!(rows[0].tenant, "");
         assert_eq!(rows[0].detail["label"], "x");
         // `since` is strictly greater-than (rows share second granularity).
         let after_all = store
-            .audit_export("", rows.last().unwrap().at + 1, 0, 100)
+            .audit_export(None, rows.last().unwrap().at + 1, 0, 100)
             .unwrap();
         assert!(after_all.is_empty());
-        assert_eq!(store.audit_export("", 0, 0, 1).unwrap().len(), 1);
+        assert_eq!(store.audit_export(None, 0, 0, 1).unwrap().len(), 1);
 
         // Pruning removes only rows strictly older than the cutoff.
         let now = now_unix();
         let pruned = store.audit_prune(now + 1).unwrap();
         assert_eq!(pruned, 2);
-        assert!(store.audit_export("", 0, 0, 100).unwrap().is_empty());
+        assert!(store.audit_export(None, 0, 0, 100).unwrap().is_empty());
 
         store.audit("", "", "test", "corrupt", &serde_json::json!({}));
         store
             .with(|connection| connection.execute("UPDATE audit_log SET detail = 'broken'", []))
             .unwrap();
-        assert!(store.audit_export("", 0, 0, 100).is_err());
+        assert!(store.audit_export(None, 0, 0, 100).is_err());
     }
 }
 
@@ -6895,11 +6895,11 @@ mod phase4_review_tests {
         }
         // Page size 2: the third row shares the second with the first two
         // and must still be reachable through the rowid cursor.
-        let page_one = store.audit_export("", 0, 0, 2).unwrap();
+        let page_one = store.audit_export(None, 0, 0, 2).unwrap();
         assert_eq!(page_one.len(), 2);
         let last = page_one.last().unwrap();
         let page_two = store
-            .audit_export("", last.at, last.rowid as u64, 2)
+            .audit_export(None, last.at, last.rowid as u64, 2)
             .unwrap();
         assert_eq!(page_two.len(), 1);
         assert_eq!(page_two[0].subject, "row-2");
@@ -6911,9 +6911,13 @@ mod phase4_review_tests {
         let store = Store::open(directory.path()).unwrap();
         store.audit("acme", "", "link_created", "l-1", &serde_json::json!({}));
         store.audit("", "", "admin_login", "ip", &serde_json::json!({}));
-        let scoped = store.audit_export("acme", 0, 0, 100).unwrap();
+        let scoped = store.audit_export(Some("acme"), 0, 0, 100).unwrap();
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].tenant, "acme");
+        let default = store.audit_export(Some(""), 0, 0, 100).unwrap();
+        assert_eq!(default.len(), 1);
+        assert_eq!(default[0].tenant, "");
+        assert_eq!(store.audit_export(None, 0, 0, 100).unwrap().len(), 2);
     }
 
     #[test]
@@ -7122,11 +7126,11 @@ mod phase4_review_tests {
         store.audit("acme", "", "second", "b", &serde_json::json!({}));
         store.audit("other", "", "foreign", "c", &serde_json::json!({}));
 
-        let page = store.audit_recent("acme", 0, 1).unwrap();
+        let page = store.audit_recent(Some("acme"), 0, 1).unwrap();
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].event, "second");
         let older = store
-            .audit_recent("acme", page[0].rowid as u64, 10)
+            .audit_recent(Some("acme"), page[0].rowid as u64, 10)
             .unwrap();
         assert_eq!(older.len(), 1);
         assert_eq!(older[0].event, "first");
@@ -7164,14 +7168,14 @@ mod phase4_review_tests {
             query: Some("ALICE"),
         };
         let recent = store
-            .audit_recent_filtered("acme", 0, 100, filters)
+            .audit_recent_filtered(Some("acme"), 0, 100, filters)
             .unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].subject, "request-1");
 
         let detail_only = store
             .audit_recent_filtered(
-                "acme",
+                Some("acme"),
                 0,
                 100,
                 AuditFilters {
@@ -7184,7 +7188,7 @@ mod phase4_review_tests {
 
         let display_tenant = store
             .audit_recent_filtered(
-                "",
+                None,
                 0,
                 100,
                 AuditFilters {
@@ -7197,7 +7201,7 @@ mod phase4_review_tests {
         assert_eq!(display_tenant[0].event, "default_event");
 
         let legacy = store
-            .audit_export_filtered("acme", 0, 0, 100, filters)
+            .audit_export_filtered(Some("acme"), 0, 0, 100, filters)
             .unwrap();
         assert_eq!(legacy.len(), 1);
         assert_eq!(legacy[0].subject, "request-1");
@@ -7214,10 +7218,12 @@ mod phase4_review_tests {
             event: Some("match"),
             query: None,
         };
-        let first = store.audit_recent_filtered("acme", 0, 2, filters).unwrap();
+        let first = store
+            .audit_recent_filtered(Some("acme"), 0, 2, filters)
+            .unwrap();
         assert_eq!(first.len(), 2);
         let second = store
-            .audit_recent_filtered("acme", first[1].rowid as u64, 2, filters)
+            .audit_recent_filtered(Some("acme"), first[1].rowid as u64, 2, filters)
             .unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].subject, "first");

@@ -79,11 +79,13 @@ still leave only the tracing event.
 
 ## Phase 4: Tenant scoping and quotas
 
-- Every `Link` gains `tenant`. Named-tenant link and audit reads use the tenant
-  from the authenticated context; authorized platform administration,
-  retention, and metrics may span tenants explicitly. Public link metadata uses
-  the unguessable link id as a capability, while any configured link password
-  gates authorization and session creation.
+- Every `Link` gains `tenant`. Link and audit reads use the authenticated
+  tenant context, including viewers in the default tenant. Only admins and
+  auditors in the default tenant can read all tenants' audit rows; switching
+  to a named tenant scopes those reads to that tenant. Authorized platform
+  administration, retention, and metrics may span tenants explicitly. Public
+  link metadata uses the unguessable link id as a capability, while any configured
+  link password gates authorization and session creation.
 - Path layout: named tenants publish under the reserved
   `<receive_dir>/.vot-tenants.stage/<tenant>/<dest>/...` subtree; the default
   tenant retains the receive root layout. The existing `admit_dest` +
@@ -94,8 +96,11 @@ still leave only the tracing event.
   session's announced-byte reservation under the same lock that enforces
   tenant, link, and global session caps. Cancellation-safe leases retain those
   reservations until queued worker commands actually finish.
-- Admin UI: tenant switcher for admins with multiple tenant roles; otherwise the
-  UI is unchanged. Senders see nothing new.
+- Admin UI: the tenant switcher follows the session's grants. A viewer or
+  auditor may switch into a tenant where they have a grant; the destination
+  grant determines their role there. Switching requires the same CSRF header
+  as other session mutations and preserves the original session expiration.
+  A shorter current session policy can shorten it further. Senders see nothing new.
 
 ## Phase 5: Operations polish
 
