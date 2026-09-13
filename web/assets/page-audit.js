@@ -5,6 +5,7 @@ import { formatWhen, requireSession } from '/assets/admin-common.js';
 
 const $ = (id) => document.getElementById(id);
 const PAGE_SIZE = 250;
+const MAX_RENDERED_ROWS = 1000;
 const INITIAL_CURSOR = '18446744073709551615';
 let beforeRowid = INITIAL_CURSOR;
 // Oldest first walks forward with the server's (at, rowid) keyset cursor:
@@ -34,11 +35,10 @@ function updateExport() {
   $('export').href = `/api/admin/audit?${query}`;
 }
 
-function addEvents(rows) {
+function updateEvents() {
   const events = new Set(
-    [...$('audit-event-options').options].map((option) => option.value),
+    [...$('audit-log').querySelectorAll('.audit-event')].map((event) => event.textContent),
   );
-  for (const row of rows) events.add(row.event);
   $('audit-event-options').replaceChildren(
     ...[...events].sort().map((event) => {
       const option = document.createElement('option');
@@ -89,9 +89,15 @@ function renderRow(row) {
   return line;
 }
 
+function rangeText() {
+  const retained = $('audit-log').childElementCount;
+  return retained ? `Showing rows ${loadedRows - retained + 1} to ${loadedRows}.` : '0 rows loaded';
+}
+
 async function load(reset = false) {
   if (loading) return;
   loading = true;
+  const restoreMoreFocus = document.activeElement === $('load-more');
   for (const control of $('audit-filters').elements) control.disabled = true;
   $('refresh').disabled = true;
   $('load-more').disabled = true;
@@ -101,6 +107,7 @@ async function load(reset = false) {
     sinceAt = '0';
     afterRowid = '0';
     loadedRows = 0;
+    if ($('audit-log').contains(document.activeElement)) $('audit-range').focus();
     $('audit-log').replaceChildren();
     $('audit-event-options').replaceChildren();
   }
@@ -125,8 +132,13 @@ async function load(reset = false) {
       .map((line) => JSON.parse(line));
     const container = $('audit-log');
     if (!rows.length && loadedRows === 0) container.textContent = 'No audit rows yet.';
-    addEvents(rows);
-    for (const row of rows) container.append(renderRow(row));
+    const focusedRow = container.contains(document.activeElement) ? document.activeElement : null;
+    for (const row of rows) {
+      if (container.childElementCount === MAX_RENDERED_ROWS) container.firstElementChild.remove();
+      container.append(renderRow(row));
+    }
+    updateEvents();
+    if (focusedRow && !focusedRow.isConnected) $('audit-range').focus();
     loadedRows += rows.length;
     if (rows.length) {
       const last = rows[rows.length - 1];
@@ -137,19 +149,22 @@ async function load(reset = false) {
         beforeRowid = String(last.rowid);
       }
     }
-    $('audit-range').textContent = `${loadedRows} rows loaded`;
+    $('audit-range').textContent = rangeText();
     $('load-more').hidden = rows.length < PAGE_SIZE;
   } finally {
     loading = false;
     for (const control of $('audit-filters').elements) control.disabled = false;
     $('refresh').disabled = false;
     $('load-more').disabled = false;
+    if (restoreMoreFocus && document.activeElement === document.body) {
+      ($('load-more').hidden ? $('audit-range') : $('load-more')).focus();
+    }
   }
 }
 
 function showLoadError(error) {
   if (loadedRows > 0) {
-    $('audit-range').textContent = `${loadedRows} rows loaded · ${error.message}`;
+    $('audit-range').textContent = `${rangeText()} · ${error.message}`;
   } else {
     $('audit-log').textContent = error.message;
   }

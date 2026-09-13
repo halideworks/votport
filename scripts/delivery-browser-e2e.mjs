@@ -161,6 +161,30 @@ try {
   assert.deepEqual(evidence.evidence.map((record) => record.evidence.kind).sort(), ['accepted', 'verified']);
   await page.screenshot({ path: path.join(root, 'recipient-evidence.png'), fullPage: true });
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), 'Evidence must wrap within the viewport');
+  const grantDirectory = `${project}-keyboard`;
+  await fs.mkdir(path.join(root, 'library', grantDirectory));
+  await fs.writeFile(path.join(root, 'library', grantDirectory, 'sample.txt'), 'Keyboard fixture.');
+  await request('admin/outbound-grants', { directory: grantDirectory, label: 'Keyboard grant' });
+  await page.goto(`${base}/deliver`);
+  const grantCard = page.locator('#outbound-grants .card').filter({ has: page.getByRole('heading', { name: 'Keyboard grant', exact: true }) });
+  await grantCard.waitFor();
+  await page.route('**/api/admin/outbound-grants?*', async (route) => {
+    const response = await route.fetch();
+    await page.locator('#global-search-input').focus();
+    await route.fulfill({ response });
+  }, { times: 1 });
+  await grantCard.getByRole('button', { name: 'Extend 7 days', exact: true }).focus();
+  await page.keyboard.press('Enter'); await page.locator('#confirm-ok').press('Enter');
+  await page.waitForFunction(() => document.querySelector('#outbound-grants-status').textContent.startsWith('Download extended until'));
+  assert.ok(await page.locator('#global-search-input').evaluate((node) => node === document.activeElement), 'A delayed grant refresh preserves newly moved focus');
+  for (const [action, message] of [['New address', 'Download address rotated.'], ['Extend 7 days', 'Download extended until'], ['Revoke', 'Download revoked.']]) {
+    if (action === 'Revoke') await page.route('**/api/admin/outbound-grants?*', (route) => route.fulfill({ status: 503 }), { times: 1 });
+    await grantCard.getByRole('button', { name: action, exact: true }).focus();
+    await page.keyboard.press('Enter'); await page.locator('#confirm-ok').press('Enter');
+    await page.waitForFunction((text) => document.querySelector('#outbound-grants-status').textContent.startsWith(text), message);
+    assert.ok(await page.locator('#outbound-grants-status').evaluate((node) => node === document.activeElement), `${action} retains keyboard position`);
+  }
+  await page.getByText('Issued downloads could not be loaded.', { exact: true }).waitFor();
   assert.deepEqual(errors, []);
   console.log('Project UI, recipient-key admission, copy/open actions, saved-file verification, revoked-link recovery and queued acceptance: passed');
 } finally {

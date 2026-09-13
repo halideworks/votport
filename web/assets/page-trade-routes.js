@@ -89,7 +89,7 @@ async function refresh() {
   $('trade-connection-count').textContent = pending ? `${pending} incoming ${pending === 1 ? 'route needs' : 'routes need'} approval` : `${peers.size} connected ${peers.size === 1 ? 'port' : 'ports'}`;
   for (const [key, routes] of peers) {
     const group = node('section', '', 'card'); group.append(node('h3', routes[0].peer_name));
-    const identity = node('details', '', 'trade-advanced'); identity.open = routes.some((r) => r.direction === 'incoming' && r.state === 'pending_approval'); identity.append(node('summary', 'Verify port identity'), node('code', key, 'trade-key'), button('Copy peer fingerprint', 'ghost tiny', (element) => copyToClipboard(key, element))); group.append(identity);
+    const identity = node('details', '', 'trade-advanced'); identity.open = routes.some((r) => r.direction === 'incoming' && r.state === 'pending_approval'); identity.append(node('summary', 'Verify port identity'), node('code', key, 'trade-key'), button('Copy peer fingerprint', 'ghost tiny', (element) => copyToClipboard(element, key))); group.append(identity);
     const outgoing = routes.find((r) => r.direction === 'outgoing');
     if (outgoing) {
       group.append(node('p', outgoing.address, 'trade-key'));
@@ -123,7 +123,7 @@ function routeCard(route, savedEditor) {
   if (next[current]) card.append(node('p', next[current], 'info-banner'));
   if (route.direction === 'outgoing') {
     if (current === 'active') card.append(link('Choose this route in a workflow →', '/workflows#projects'));
-    const local = node('details', '', 'trade-advanced'); local.append(node('summary', 'Local connection ID for scripts and agents'), node('p', 'This ID selects the saved route on this port. It is not the other port’s address. In the UI, choose the route by name.', 'field-help'), node('code', route.id, 'trade-key'), button('Copy local connection ID', 'ghost tiny', (element) => copyToClipboard(route.id, element))); card.append(local);
+    const local = node('details', '', 'trade-advanced'); local.append(node('summary', 'Local connection ID for scripts and agents'), node('p', 'This ID selects the saved route on this port. It is not the other port’s address. In the UI, choose the route by name.', 'field-help'), node('code', route.id, 'trade-key'), button('Copy local connection ID', 'ghost tiny', (element) => copyToClipboard(element, route.id))); card.append(local);
   }
   card.append(node('p', route.last_contact ? `Last contact ${formatWhen(route.last_contact)}` : 'No successful contact yet.', 'field-help'));
   if (route.error) card.append(node('p', route.error, 'error'));
@@ -189,9 +189,9 @@ $('port-form').addEventListener('submit', (event) => { event.preventDefault(); c
 $('trade-start-send').onclick = () => showSetup('send'); $('trade-start-receive').onclick = () => showSetup('receive');
 for (const close of document.querySelectorAll('[data-close-setup]')) close.onclick = () => { const previous = setup; showSetup(null); $(`trade-start-${previous}`).focus(); };
 $('trade-request').onchange = requestSelected;
-$('port-copy-key').onclick = (event) => copyToClipboard(catalog.port.key, event.currentTarget);
-$('port-copy-address').onclick = (event) => copyToClipboard(catalog.port.address, event.currentTarget);
-$('trade-copy-invitation').onclick = (event) => copyToClipboard($('trade-issued-invitation').value, event.currentTarget);
+$('port-copy-key').onclick = (event) => copyToClipboard(event.currentTarget, catalog.port.key);
+$('port-copy-address').onclick = (event) => copyToClipboard(event.currentTarget, catalog.port.address);
+$('trade-copy-invitation').onclick = (event) => copyToClipboard(event.currentTarget, $('trade-issued-invitation').value);
 $('trade-dismiss-invitation').onclick = () => { $('trade-issued-invitation').value = ''; $('trade-invitation-result').hidden = true; $('trade-start-receive').focus(); };
 $('trade-refresh').onclick = () => guard(refresh);
 $('trade-category').onchange = () => { $('trade-forwarding').checked = $('trade-category').value === 'internal'; };

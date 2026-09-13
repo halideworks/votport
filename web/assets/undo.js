@@ -34,6 +34,10 @@ export function createUndoQueue({
     return {
       undo: () => settle(false),
       commitNow: () => settle(true),
+      pause: () => { clearTimer(entry.timer); entry.timer = null; },
+      resume: () => {
+        if (!entry.done && entry.timer === null) entry.timer = setTimer(() => { settle(true); }, delayMs);
+      },
     };
   }
 

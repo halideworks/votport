@@ -262,6 +262,85 @@ try {
   await layout('audit-automation-identity');
   await page.unroute('**/api/admin/audit?*');
 
+  const auditRows = Array.from({ length: 1501 }, (_, index) => ({ rowid: index + 1, at: 100 + Math.floor(index / 400), tenant: '', actor: 'fixture', event: `event_${index + 1}`, subject: `row ${index + 1}`, detail: { sequence: index + 1 } }));
+  const auditRequests = [];
+  let failAudit = false, holdAudit = null;
+  await page.route('**/api/admin/audit?*', async (route) => {
+    const query = new URL(route.request().url()).searchParams;
+    assert.equal(query.get('limit'), '250');
+    auditRequests.push(query.toString());
+    if (holdAudit) { holdAudit.started(); await holdAudit.wait; holdAudit = null; }
+    if (failAudit) { failAudit = false; return route.fulfill({ status: 503, body: 'Audit fixture failure' }); }
+    let rows = auditRows.filter((row) => (!query.get('event') || row.event === query.get('event')) && (!query.get('q') || row.subject.includes(query.get('q'))));
+    if (query.has('before_rowid')) rows = rows.filter((row) => row.rowid < Number(query.get('before_rowid'))).reverse();
+    else rows = rows.filter((row) => row.at > Number(query.get('since')) || (row.at === Number(query.get('since')) && row.rowid > Number(query.get('after_rowid'))));
+    await route.fulfill({ contentType: 'application/x-ndjson', body: rows.slice(0, 250).map((row) => JSON.stringify(row)).join('\n') });
+  });
+  async function auditAction(action) {
+    const response = page.waitForResponse((response) => response.url().includes('/api/admin/audit?'));
+    await action(); await (await response).finished();
+    await page.waitForFunction(() => !document.querySelector('#load-more').disabled);
+  }
+  async function moreAudit() { await page.locator('#load-more').focus(); await page.keyboard.press('Enter'); }
+  for (const order of ['newest', 'oldest']) {
+    await auditAction(() => order === 'newest' ? page.goto(`${base}/audit`) : page.selectOption('#audit-order', order));
+    const ordered = order === 'newest' ? [...auditRows].reverse() : auditRows;
+    let retainedDetail;
+    for (let number = 1; number <= 7; number++) {
+      if (number > 1) {
+        if (number === 5 && order === 'newest') {
+          let started, release;
+          const pending = new Promise((resolve) => { started = resolve; });
+          holdAudit = { started, wait: new Promise((resolve) => { release = resolve; }) };
+          await auditAction(async () => {
+            await moreAudit(); await pending;
+            await page.locator('.audit-row summary').first().focus(); release();
+          });
+          assert.equal(await page.evaluate(() => document.activeElement.id), 'audit-range', 'Evicting the focused row moves focus to the range');
+        } else {
+          await auditAction(moreAudit);
+          assert.equal(await page.evaluate(() => document.activeElement.id), number === 7 ? 'audit-range' : 'load-more', 'Keyboard pagination retains useful focus');
+        }
+      }
+      const end = Math.min(number * 250, ordered.length), expected = ordered.slice(Math.max(0, end - 1000), end);
+      assert.equal(await page.locator('.audit-row').count(), expected.length, 'The Audit page retains at most 1,000 rows');
+      assert.deepEqual(await page.locator('.audit-subject').allTextContents(), expected.map((row) => row.subject));
+      assert.equal(await page.locator('#audit-event-options option').count(), expected.length, 'Event suggestions follow the retained window');
+      assert.equal(await page.locator('#audit-range').textContent(), `Showing rows ${end - expected.length + 1} to ${end}.`);
+      if (number === 3) {
+        retainedDetail = await page.locator('.audit-row details').nth(500).elementHandle();
+        await retainedDetail.evaluate((node) => { node.open = true; });
+      }
+      if (number === 6) assert.ok(await retainedDetail.evaluate((node) => node.isConnected && node.open), 'Retained rows keep their open details');
+    }
+    assert.ok(await page.locator('#load-more').isHidden());
+  }
+  await page.fill('#audit-query', 'row 900'); await page.fill('#audit-event', 'event_900');
+  await auditAction(() => page.locator('#audit-filters button[type=submit]').click());
+  assert.deepEqual(await page.locator('.audit-subject').allTextContents(), ['row 900']);
+  const auditExport = new URL(await page.locator('#export').getAttribute('href'), base);
+  assert.equal(auditExport.searchParams.get('q'), 'row 900'); assert.equal(auditExport.searchParams.get('event'), 'event_900');
+  assert.equal(auditExport.searchParams.get('limit'), '10000');
+  await page.fill('#audit-query', 'missing');
+  await auditAction(() => page.locator('#audit-filters button[type=submit]').click());
+  assert.equal(await page.locator('.audit-row').count(), 0); assert.equal(await page.locator('#audit-event-options option').count(), 0);
+  assert.ok(await page.getByText('No audit rows yet.', { exact: true }).isVisible());
+  await auditAction(() => page.click('#audit-clear'));
+  assert.equal(await page.locator('.audit-subject').first().textContent(), 'row 1');
+  assert.equal(await page.locator('.audit-row').count(), 250);
+  failAudit = true; await auditAction(moreAudit);
+  const failedAuditQuery = auditRequests.at(-1);
+  assert.equal(await page.locator('.audit-row').count(), 250);
+  assert.match(await page.locator('#audit-range').textContent(), /503/);
+  await auditAction(moreAudit);
+  assert.equal(auditRequests.at(-1), failedAuditQuery, 'A failed continuation must retry the same cursor');
+  assert.equal(await page.locator('.audit-row').count(), 500);
+  await auditAction(() => page.click('#refresh'));
+  assert.equal(await page.locator('.audit-row').count(), 250);
+  assert.equal(await page.locator('.audit-subject').first().textContent(), 'row 1');
+  assert.equal(await page.locator('#audit-range').getAttribute('role'), 'status');
+  await page.unroute('**/api/admin/audit?*');
+
   await page.goto(`${base}/storage`); await page.click('#storage-new');
   await page.selectOption('#ws-kind', 'folder'); await page.fill('#ws-label', 'Shared reception');
   await openAncestors(page.locator('#ws-id')); await page.fill('#ws-id', `${storageId}_folder`); await page.fill('#ws-directory', path.join(root, 'shared'));
@@ -294,6 +373,102 @@ try {
   await page.locator(`#link-${incoming.id}`).getByText('Reception workflow', { exact: true }).click();
   await layout('existing-reception-workflow');
 
+  await page.goto(`${base}/receive?search=${incoming.id}#link-${incoming.id}`);
+  const actionCard = page.locator(`#link-${incoming.id}`);
+  await actionCard.getByRole('button', { name: 'Deactivate', exact: true }).focus();
+  await page.keyboard.press('Enter');
+  const undo = page.locator('#toast-stack').getByRole('button', { name: 'Undo', exact: true });
+  await undo.waitFor();
+  assert.ok(await undo.evaluate((node) => node === document.activeElement), 'Keyboard row action must focus its Undo');
+  await undo.hover(); await page.mouse.move(0, 0);
+  await page.waitForTimeout(6200);
+  assert.equal((await api('admin/links')).links.find((link) => link.id === incoming.id).active, true, 'Focused Undo pauses the server commit');
+  await page.keyboard.press('Enter'); await undo.waitFor({ state: 'detached' });
+  assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'Undo returns focus to the request status');
+  await page.route('**/api/admin/links?*', async (route) => {
+    const response = await route.fetch();
+    await actionCard.getByRole('button', { name: 'Copy', exact: true }).focus();
+    await route.fulfill({ response });
+  }, { times: 1 });
+  await actionCard.getByRole('button', { name: 'Deactivate', exact: true }).focus();
+  await page.keyboard.press('Enter'); await undo.waitFor();
+  assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'Undo must not steal the fallback of a newly focused row control');
+  await undo.focus(); await page.keyboard.press('Enter'); await undo.waitFor({ state: 'detached' });
+
+  for (const moveFocus of [false, true]) {
+    await page.route(`**/api/admin/links/${incoming.id}`, async (route) => {
+      await route.fetch();
+      if (moveFocus) await page.locator('#links-query').focus();
+      await route.fulfill({ status: 503, json: { error: 'Lost action response fixture' } });
+    }, { times: 1 });
+    await actionCard.getByRole('button', { name: 'Deactivate', exact: true }).focus();
+    await page.keyboard.press('Enter'); await undo.waitFor();
+    await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
+    await page.getByRole('dialog', { name: 'Something went wrong', exact: true }).waitFor();
+    assert.equal((await api('admin/links')).links.find((link) => link.id === incoming.id).active, false);
+    if (!moveFocus) assert.equal(await page.locator('#links-action-status').textContent(), 'Action could not be confirmed.', 'A lost response must not claim that a committed action was undone');
+    await page.locator('#confirm-cancel').press('Enter');
+    assert.ok(await page.locator(moveFocus ? '#links-query' : '#links-action-status').evaluate((node) => node === document.activeElement), 'Closing the error preserves the current keyboard position');
+    await api(`admin/links/${incoming.id}`, { active: true });
+    await page.reload();
+  }
+  await actionCard.getByRole('button', { name: 'Legal hold', exact: true }).focus();
+  await page.keyboard.press('Enter');
+  await page.getByText('Legal hold set.', { exact: true }).waitFor();
+  assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'Immediate row replacement retains keyboard position');
+  await actionCard.getByRole('button', { name: 'Release hold', exact: true }).focus();
+  await page.keyboard.press('Enter'); await undo.waitFor();
+  assert.ok(await undo.evaluate((node) => node === document.activeElement));
+  await page.goto(`${base}/storage`);
+  await page.waitForFunction(() => document.querySelector('#receiving-storage'));
+  assert.equal((await api('admin/links')).links.find((link) => link.id === incoming.id).legal_hold, false, 'Pagehide commits even while Undo is focused');
+
+  await page.goto(`${base}/receive?search=${incoming.id}#link-${incoming.id}`);
+  await actionCard.waitFor();
+  await page.route('**/api/admin/links?*', async (route) => {
+    const response = await route.fetch();
+    await page.locator('#links-query').focus();
+    await route.fulfill({ response });
+  }, { times: 1 });
+  await actionCard.getByRole('button', { name: 'Deactivate', exact: true }).focus();
+  await page.keyboard.press('Enter'); await undo.waitFor();
+  assert.ok(await page.locator('#links-query').evaluate((node) => node === document.activeElement), 'A delayed refresh must not steal newly moved focus');
+  await undo.hover(); await undo.focus(); await page.locator('#links-query').focus();
+  await page.waitForTimeout(6200);
+  assert.equal((await api('admin/links')).links.find((link) => link.id === incoming.id).active, true, 'Hover also pauses Undo');
+  await page.mouse.move(0, 0);
+  await undo.waitFor({ state: 'detached', timeout: 10000 });
+  assert.equal((await api('admin/links')).links.find((link) => link.id === incoming.id).active, false, 'Leaving Undo resumes its unattended commit');
+  assert.ok(await page.locator('#links-query').evaluate((node) => node === document.activeElement));
+  await api(`admin/links/${incoming.id}`, { active: true });
+
+  const fileRequest = (await api('admin/links', { label: `Files ${id}`, dest: `${id}-focus-files` })).link;
+  await page.goto(fileRequest.url);
+  await page.setInputFiles('#file-input', ['one.txt', 'two.txt'].map((name) => ({ name, mimeType: 'text/plain', buffer: Buffer.from(name) })));
+  await page.click('#send'); await page.locator('#done-card:not([hidden])').waitFor({ timeout: 30000 });
+  await page.goto(`${base}/receive?search=${fileRequest.id}#link-${fileRequest.id}`);
+  const fileCard = page.locator(`#link-${fileRequest.id}`), clearRecord = fileCard.getByRole('button', { name: 'Clear record', exact: true, includeHidden: true });
+  await clearRecord.waitFor({ state: 'attached' }); await openAncestors(clearRecord);
+  await clearRecord.focus(); await page.keyboard.press('Enter'); await undo.waitFor();
+  assert.ok(await undo.evaluate((node) => node === document.activeElement), 'Clearing a transfer record focuses Undo');
+  await page.keyboard.press('Enter'); await undo.waitFor({ state: 'detached' });
+  await clearRecord.waitFor();
+  assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement));
+  await page.route('**/api/admin/links?*', (route) => route.fulfill({ status: 503 }), { times: 2 });
+  await clearRecord.focus(); await page.keyboard.press('Enter'); await undo.waitFor();
+  await page.keyboard.press('Enter'); await undo.waitFor({ state: 'detached' });
+  assert.ok(await clearRecord.isEnabled(), 'Undo re-enables a retained button when list refreshes fail');
+  const deleteFile = fileCard.getByRole('button', { name: 'Delete file', exact: true }).first();
+  await openAncestors(deleteFile); await deleteFile.focus(); await page.keyboard.press('Enter');
+  await page.locator('#confirm-ok').press('Enter');
+  await page.waitForFunction(() => document.querySelector('#links-action-status').textContent.startsWith('Deleted "'));
+  assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'File deletion retains keyboard position');
+  const deleteFiles = fileCard.getByRole('button', { name: 'Delete stored files', exact: true });
+  await openAncestors(deleteFiles); await deleteFiles.focus(); await page.keyboard.press('Enter');
+  await page.locator('#confirm-ok').press('Enter');
+  await page.getByText('Deleted 1 stored file.', { exact: true }).waitFor();
+  assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'Batch file deletion retains keyboard position');
+
   const status = await api('admin/status'); status.receiving = [];
   await page.route('**/api/admin/status?*', (route) => route.fulfill({ json: status }));
   async function pollStatus() {
@@ -319,6 +494,7 @@ try {
   await editor.locator('input[data-metadata]').fill('Unsaved reception draft');
   releaseList(); await page.waitForLoadState('networkidle');
   assert.equal(await editor.locator('input[data-metadata]').inputValue(), 'Unsaved reception draft', 'A response already in flight preserves the draft');
+  assert.ok(await editor.locator('input[data-metadata]').evaluate((node) => node === document.activeElement), 'A retained dirty editor keeps its focused input');
   await editor.evaluate((node) => { node.open = false; });
   status.receiving = [];
   await pollStatus();
@@ -356,6 +532,7 @@ try {
   const extraDialogs = []; const onExtra = (dialog) => extraDialogs.push(dialog.message()); page.on('dialog', onExtra);
   await page.locator('#confirm-ok').click(); await card.waitFor({ state: 'detached' }); await page.waitForLoadState('networkidle');
   page.off('dialog', onExtra); assert.deepEqual(extraDialogs, [], 'Confirmed deletion removes the request draft without another discard prompt');
+  assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'Deleting the request keeps a keyboard focus target');
 
   await page.goto(`${base}/storage`);
   let releaseInitial, initialStarted, initialReads = 0;

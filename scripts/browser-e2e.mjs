@@ -270,7 +270,9 @@ await Promise.all([
   page.waitForResponse((response) => response.url().endsWith("/session") && response.status() === 503),
   page.keyboard.press("Enter"),
 ]);
-await page.focus("#cancel");
+if (await page.evaluate(() => document.activeElement.id) !== "cancel") {
+  throw new Error("keyboard upload did not focus Cancel transfer");
+}
 await page.keyboard.press("Enter");
 await page.getByRole("dialog", { name: "Cancel transfer", exact: true }).waitFor();
 await page.keyboard.press("Tab");
@@ -284,7 +286,9 @@ await Promise.all([
   page.waitForResponse((response) => response.url().endsWith("/session") && response.status() === 503),
   page.keyboard.press("Enter"),
 ]);
-await page.focus("#cancel");
+if (await page.evaluate(() => document.activeElement.id) !== "cancel") {
+  throw new Error("keyboard upload did not focus Cancel transfer");
+}
 await page.keyboard.press("Enter");
 await page.keyboard.press("Escape");
 await page.waitForFunction(() =>
@@ -341,10 +345,11 @@ await page.click("#send");
 await page.waitForSelector("#done-card:not([hidden])", { timeout: 120000 });
 await page.waitForFunction(() =>
   !document.getElementById("confirm-cancel").open
-  && document.activeElement === document.getElementById("copy-proof"),
+  && document.activeElement === document.getElementById("copy-proof")
+  && document.getElementById("upload-status").textContent === "2 files shipped and verified.",
 );
 await page.unroute("**/api/r/*/session");
-console.log("completion dismisses cancellation and focuses proof: ok");
+console.log("completion announces both files, dismisses cancellation and focuses proof: ok");
 console.log(
   "uploaded:",
   (await page.textContent("#done-list")).trim().replace(/\s+/g, " "),
@@ -382,14 +387,14 @@ if (browserEngine === "chromium") {
   }
 }
 
-for (const focus of ["cancel", "pick", "external-focus"]) {
+for (const focus of ["send", "cancel", "pick", "external-focus"]) {
   await page.goto(linkUrl);
   await page.waitForSelector("#uploader:not([hidden])");
   await page.setInputFiles("#file-input", {
     name: `${focus}.txt`, mimeType: "text/plain", buffer: Buffer.from("focus check\n"),
   });
   await page.route("**/api/r/*/session", async (route) => {
-    await page.evaluate((id) => {
+    if (focus !== "send") await page.evaluate((id) => {
       if (id === "external-focus") {
         const button = document.createElement("button");
         button.id = id;
@@ -400,8 +405,14 @@ for (const focus of ["cancel", "pick", "external-focus"]) {
     }, focus);
     await route.continue();
   });
-  await page.click("#send");
+  await page.focus("#send");
+  await page.keyboard.press("Enter");
   await page.waitForSelector("#done-card:not([hidden])", { timeout: 30000 });
+  const announcement = page.locator("#upload-status");
+  if (await announcement.getAttribute("role") !== "status"
+    || await announcement.textContent() !== "1 file shipped and verified.") {
+    throw new Error("completion status was not announced");
+  }
   const expected = focus === "external-focus" ? focus : "copy-proof";
   if (await page.evaluate(() => document.activeElement.id) !== expected) {
     throw new Error(`completion did not preserve focus from ${focus}`);
