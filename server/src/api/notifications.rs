@@ -289,8 +289,16 @@ pub async fn test(
     if !destination.enabled {
         return Err(invalid("Enable this destination before testing"));
     }
-    let delivered = crate::notify::test_destination(&app, &identity.tenant, &destination).await;
-    Ok((if delivered { StatusCode::OK } else { StatusCode::BAD_GATEWAY },Json(json!({"delivered":delivered,"error":if delivered { None } else { Some("The destination did not accept the test. Check its connection settings and try again.") }}))).into_response())
+    let result = crate::notify::test_destination(&app, &identity.tenant, &destination).await;
+    Ok((
+        if result.is_ok() {
+            StatusCode::OK
+        } else {
+            StatusCode::BAD_GATEWAY
+        },
+        Json(json!({"delivered":result.is_ok(),"error":result.err()})),
+    )
+        .into_response())
 }
 
 #[cfg(test)]
@@ -346,6 +354,132 @@ mod tests {
             json!({"mode":"custom","rules":[{"destination_id":id,"events":[event]}]}),
         )
         .unwrap()
+    }
+
+    async fn smtp_test_response(steps: &[(&str, &str)], starttls: bool) -> serde_json::Value {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = testing::config(directory.path());
+        config.smtp_host = Some("127.0.0.1".into());
+        config.smtp_port = address.port();
+        config.smtp_starttls = starttls;
+        config.smtp_username = Some("smtp-user-secret".into());
+        config.smtp_password = Some("smtp-password-secret".into());
+        config.smtp_from = Some("sender-secret@example.test".into());
+        let app = crate::app::build(config).unwrap();
+        app.store.insert_tenant(tenant("studio")).unwrap();
+        let saved = body(
+            save(
+                State(app.clone()),
+                headers(&app, "studio", "admin"),
+                Json(json!({
+                    "label":"Email", "channel":"email", "target":"Ops", "enabled":true,
+                    "recipients":["recipient-secret@example.test"]
+                })),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        let id = saved["id"].as_str().unwrap();
+        let (response, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                test(
+                    State(app.clone()),
+                    Path(id.into()),
+                    headers(&app, "studio", "admin")
+                ),
+                async {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut socket = tokio::io::BufReader::new(socket);
+                    for (command, reply) in steps {
+                        if !command.is_empty() {
+                            let mut line = String::new();
+                            socket.read_line(&mut line).await.unwrap();
+                            assert!(line.starts_with(command), "expected {command}");
+                        }
+                        socket.get_mut().write_all(reply.as_bytes()).await.unwrap();
+                    }
+                }
+            )
+        })
+        .await
+        .expect("SMTP Test fixture timed out");
+        let response = response.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let response = body(response).await;
+        assert_eq!(response["delivered"], false);
+        assert_eq!(
+            app.store.notification_outcomes("studio").unwrap()[id]["delivered"],
+            false
+        );
+        assert!(app
+            .store
+            .notification_outcomes("")
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .is_empty());
+        let text = response.to_string();
+        for secret in [
+            "127.0.0.1",
+            "relay-secret",
+            "smtp-user-secret",
+            "smtp-password-secret",
+            "sender-secret",
+            "recipient-secret",
+        ] {
+            assert!(!text.contains(secret), "response exposed {secret}");
+        }
+        response
+    }
+
+    #[tokio::test]
+    async fn smtp_test_reports_refusal_without_relay_details() {
+        let response = smtp_test_response(
+            &[
+                ("", "220 relay-secret ready\r\n"),
+                ("EHLO", "250-relay-secret\r\n250 AUTH PLAIN\r\n"),
+                (
+                    "AUTH",
+                    "535 relay-secret rejected smtp-user-secret smtp-password-secret\r\n",
+                ),
+            ],
+            false,
+        )
+        .await;
+        assert_eq!(response["error"], "SMTP relay rejected the request. Check the recipients and ask the platform administrator to check relay policy and credentials.");
+    }
+
+    #[tokio::test]
+    async fn smtp_test_reports_incompatible_settings_without_relay_details() {
+        let response = smtp_test_response(
+            &[
+                ("", "220 relay-secret ready\r\n"),
+                ("EHLO", "250 relay-secret\r\n"),
+            ],
+            true,
+        )
+        .await;
+        assert_eq!(response["error"], "SMTP settings are incompatible with the relay. Ask the platform administrator to check TLS and authentication settings.");
+    }
+
+    #[tokio::test]
+    async fn smtp_test_distinguishes_transient_invalid_and_tls_responses() {
+        for (steps, starttls, expected) in [
+            (vec![("", "421 relay-secret temporarily unavailable\r\n")], false,
+             "SMTP relay temporarily refused the request. Try again later."),
+            (vec![("", "malformed relay-secret response\r\n")], false,
+             "SMTP relay returned an invalid response. Ask the platform administrator to check relay configuration."),
+            (vec![("", "220 relay-secret ready\r\n"),
+                  ("EHLO", "250-relay-secret\r\n250 STARTTLS\r\n"),
+                  ("STARTTLS", "220 begin TLS\r\n")], true,
+             "SMTP connection failed. Ask the platform administrator to check the host, port and TLS settings."),
+        ] {
+            assert_eq!(smtp_test_response(&steps, starttls).await["error"], expected);
+        }
     }
 
     #[tokio::test]
