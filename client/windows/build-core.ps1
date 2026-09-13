@@ -2,23 +2,26 @@
 # UniFFI C# bindings, copied into the project. Run from anywhere; needs
 # cargo 1.97, cmake and nasm (BoringSSL), libclang, and uniffi-bindgen-cs
 # (cargo install uniffi-bindgen-cs --git https://github.com/NordSecurity/uniffi-bindgen-cs --tag v0.11.0+v0.31.0).
+param([ValidateSet("dev", "release")][string]$BuildProfile = "release")
+
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $client = Resolve-Path "$here\.."
 $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "$client\target" }
 $project = "$here\Votport"
+$outputProfile = if ($BuildProfile -eq "dev") { "debug" } else { $BuildProfile }
 
 Push-Location $client
 try {
-    cargo build --release -p votport-client-core -p votport-client
+    cargo build --profile $BuildProfile -p votport-client-core -p votport-client
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
-    uniffi-bindgen-cs --library "$target\release\votport_client_core.dll" --out-dir "$target\bindings-cs"
+    uniffi-bindgen-cs --library "$target\$outputProfile\votport_client_core.dll" --out-dir "$target\bindings-cs"
     if ($LASTEXITCODE -ne 0) { throw "uniffi-bindgen-cs failed" }
 } finally {
     Pop-Location
 }
 New-Item -ItemType Directory -Force "$project\Generated" | Out-Null
 Copy-Item "$target\bindings-cs\votport_client_core.cs" "$project\Generated\"
-Copy-Item "$target\release\votport_client_core.dll" "$project\Generated\"
-Copy-Item "$target\release\votport.exe" "$project\Generated\votport-cli.exe"
+Copy-Item "$target\$outputProfile\votport_client_core.dll" "$project\Generated\"
+Copy-Item "$target\$outputProfile\votport.exe" "$project\Generated\votport-cli.exe"
 Write-Host "core ready in $project\Generated"

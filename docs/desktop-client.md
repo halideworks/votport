@@ -105,6 +105,15 @@ as interrupted cards with Resume (and a password field when the entry
 needs one), offer Retry on a failed card the core kept, and forget an
 entry on Remove; the CLI gains `votport status` and `votport resume`.
 
+Windows handles each normal CLI activation, including launches redirected to
+an already running app. Quoted destination paths use Windows argument parsing.
+CLI destinations and snapshot paths must be absolute, including UNC paths;
+relative paths show an error instead of resolving in another process's directory.
+Protocol links prefill their page and cannot supply CLI receive, snapshot or
+minimized options. `--snapshot <png>` belongs to the `--receive` in that launch;
+other transfers do not inherit it. The Windows CI job runs headless activation
+checks and builds both unpackaged and MSIX shells.
+
 Each HTTP send allows 100 server-requested restarts after its initial attempt.
 Chunk and finish restarts share that budget, even when chunks are accepted.
 Exhaustion returns an error through the existing retry flow; cancellation stops

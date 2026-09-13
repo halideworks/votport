@@ -55,7 +55,15 @@
         <NavigationViewItem Content="Workflows" Tag="workflows" Icon="Accept" />
         <NavigationViewItem Content="Settings" Tag="settings" Icon="Setting" />
       </NavigationView.MenuItems>
-      <Frame x:Name="Pages" Padding="20,20,0,20" />
+      <Grid>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto" />
+          <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <InfoBar x:Name="ActivationError" Title="Receive not started" Severity="Error" IsOpen="False"
+            IsClosable="True" Margin="20,0,20,0" />
+        <Frame x:Name="Pages" Grid.Row="1" Padding="20,20,0,20" />
+      </Grid>
     </NavigationView>
   </Grid>
 </Window>
