@@ -916,6 +916,12 @@ and is what a proxy health check should poll. `GET /readyz` additionally
 answers 503 while **Drain for restart** is on, with a JSON body
 containing `ready`, `draining`, `sessions_active`, and
 `lease: {holder, mine, age_secs, lost}` for failover scripts and orchestrators.
+The two endpoints share a storage probe cached for up to five seconds. Only
+one probe runs at a time; a missing or stale result reports unavailable after
+at most a one-second wait. Concurrent requests without a fresh result return
+503 immediately. Draining changes and detected ownership loss take
+effect without waiting for that cache to expire. If a probe remains blocked
+at shutdown, storage ownership is retained until process exit.
 `holder` and `age_secs` are null when the lease record is unavailable; its age
 is diagnostic and never authorizes takeover. Do not point a single-upstream
 proxy at `/readyz`: drain keeps downloads and the admin pages up on purpose,

@@ -140,6 +140,7 @@ pub struct App {
     /// Set when a heartbeat finds another holder in the lease file; the
     /// process is then shutting down and /readyz reports it.
     pub lease_lost: AtomicBool,
+    health: HealthCache,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -866,6 +867,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         lease_holder,
         receiving: Mutex::new(receiving),
         lease_lost: AtomicBool::new(false),
+        health: HealthCache::default(),
         config,
     }))
 }
@@ -1162,8 +1164,15 @@ pub(crate) fn lock_data_dir(data_dir: &std::path::Path) -> Result<std::fs::File,
 /// it as the last step of a clean shutdown, right before the process exits,
 /// so a standby (or the same host's next container) starts without waiting
 /// for the lease to go stale; the restart e2e tests, which boot a second
-/// App in the same process, call it too. Nothing may write after it.
+/// App in the same process, call it too. A running health probe retains both
+/// fences until process exit. Otherwise nothing may write after release.
 pub fn release_data_lock(app: &App) {
+    if !app.health.stop() {
+        tracing::warn!(
+            "health probe still running; retaining storage ownership until process exit"
+        );
+        return;
+    }
     #[cfg(unix)]
     let _ = rustix::fs::flock(&app._data_lock, rustix::fs::FlockOperation::Unlock);
     *app.receiving.lock().expect("receiving state poisoned") =
@@ -1907,8 +1916,123 @@ fn publish_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> 
     }
 }
 
-/// The store and both storage roots answer; what /healthz and the admin
-/// status strip report.
+const HEALTH_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+const HEALTH_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[derive(Default)]
+struct HealthCache {
+    state: Mutex<HealthState>,
+    stopped: AtomicBool,
+    #[cfg(test)]
+    probes: AtomicU64,
+}
+
+#[derive(Default)]
+struct HealthState {
+    snapshot: Option<HealthSnapshot>,
+    running: bool,
+}
+
+#[derive(Clone)]
+struct HealthSnapshot {
+    started: std::time::Instant,
+    generation: u64,
+    healthy: bool,
+    draining: Option<bool>,
+    lease: Option<crate::lease::Lease>,
+}
+
+impl HealthSnapshot {
+    fn fresh(&self, generation: u64) -> bool {
+        self.generation == generation && self.started.elapsed() < HEALTH_TTL
+    }
+}
+
+impl HealthCache {
+    fn stop(&self) -> bool {
+        self.stopped.store(true, Ordering::Release);
+        self.state.try_lock().is_ok_and(|state| !state.running)
+    }
+}
+
+async fn health_snapshot(app: &Arc<App>) -> Option<HealthSnapshot> {
+    if app.lease_lost.load(Ordering::Relaxed) {
+        return None;
+    }
+    let completed = {
+        let mut state = app.health.state.try_lock().ok()?;
+        if app.health.stopped.load(Ordering::Acquire) {
+            return None;
+        }
+        let generation = app.store.settings_generation();
+        if let Some(snapshot) = state.snapshot.as_ref().filter(|s| s.fresh(generation)) {
+            return Some(snapshot.clone());
+        }
+        if state.running {
+            return None;
+        }
+        state.running = true;
+        let started = std::time::Instant::now();
+        let app = app.clone();
+        let (done, completed) = tokio::sync::oneshot::channel();
+        // The completion task owns the claim even if its requesting client leaves.
+        tokio::spawn(async move {
+            let worker = app.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                worker.health.probes.fetch_add(1, Ordering::Relaxed);
+                let health = check_health(&worker);
+                if let Err(error) = &health {
+                    tracing::error!(%error, "health check failed");
+                }
+                let draining = worker
+                    .store
+                    .resolved_settings(&worker.config)
+                    .map(|settings| settings.draining)
+                    .map_err(|error| tracing::error!(%error, "readiness settings check failed"))
+                    .ok();
+                let lease = worker
+                    .receiving_destinations()
+                    .and_then(|root| root.lease_record())
+                    .ok()
+                    .flatten();
+                (health.is_ok(), draining, lease)
+            })
+            .await;
+            let (healthy, draining, lease) = result.unwrap_or_else(|error| {
+                tracing::error!(%error, "health probe failed");
+                (false, None, None)
+            });
+            let mut state = app.health.state.lock().expect("health state poisoned");
+            state.snapshot = Some(HealthSnapshot {
+                started,
+                generation,
+                healthy,
+                draining,
+                lease,
+            });
+            state.running = false;
+            drop(state);
+            let _ = done.send(());
+        });
+        completed
+    };
+    tokio::time::timeout(HEALTH_WAIT, completed)
+        .await
+        .ok()?
+        .ok()?;
+    let state = app.health.state.try_lock().ok()?;
+    if app.health.stopped.load(Ordering::Acquire) {
+        return None;
+    }
+    state
+        .snapshot
+        .as_ref()
+        .filter(|s| s.fresh(app.store.settings_generation()))
+        .cloned()
+}
+
+/// Blocking checks for the shared health and readiness snapshot.
 pub(crate) fn check_health(app: &App) -> Result<(), String> {
     app.store
         .health_check()
@@ -1925,11 +2049,15 @@ fn health_probe(root: &std::path::Path, label: &str) -> Result<(), String> {
 }
 
 async fn healthz(State(app): State<Arc<App>>) -> Response {
-    if let Err(error) = check_health(&app) {
-        tracing::error!(%error, "health check failed");
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    if health_snapshot(&app)
+        .await
+        .is_some_and(|snapshot| snapshot.healthy)
+        && !app.lease_lost.load(Ordering::Relaxed)
+    {
+        StatusCode::OK.into_response()
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
     }
-    StatusCode::OK.into_response()
 }
 
 /// Readiness for failover scripts and orchestrators: 503 while unhealthy or
@@ -1938,25 +2066,20 @@ async fn healthz(State(app): State<Arc<App>>) -> Response {
 /// up on purpose (docs/deployment.md, Scaling and availability). The body
 /// carries the active upload count so a failover script can wait for zero.
 async fn readyz(State(app): State<Arc<App>>) -> Response {
-    let healthy = check_health(&app);
-    let draining = app
-        .store
-        .resolved_settings(&app.config)
-        .map(|settings| settings.draining);
+    let snapshot = health_snapshot(&app).await;
     let lease_lost = app.lease_lost.load(Ordering::Relaxed);
-    let (ready, draining) = match (&healthy, draining) {
-        (Ok(()), Ok(draining)) => (!draining && !lease_lost, draining),
+    let (ready, draining) = match snapshot.as_ref() {
+        Some(HealthSnapshot {
+            healthy: true,
+            draining: Some(draining),
+            ..
+        }) => (!draining && !lease_lost, *draining),
         _ => (false, false),
     };
     let now = now_unix();
-    let lease = app
-        .receiving_destinations()
-        .and_then(|root| root.lease_record())
-        .ok()
-        .flatten();
-    if let Err(error) = healthy {
-        tracing::error!(%error, "readiness check failed");
-    }
+    let lease = snapshot
+        .and_then(|snapshot| snapshot.lease)
+        .filter(|_| !lease_lost);
     let status = if ready {
         StatusCode::OK
     } else {
@@ -1985,6 +2108,439 @@ mod health_tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt as _;
+
+    async fn wait_health_idle(app: &App) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while app.health.state.lock().unwrap().running {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    struct PausedHealth {
+        release: std::sync::mpsc::Sender<()>,
+        holder: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl PausedHealth {
+        fn new(app: &Arc<App>, receiving: bool) -> Self {
+            let app = app.clone();
+            let (entered, waiting) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let pause = || {
+                    entered.send(()).unwrap();
+                    let _ = released.recv_timeout(std::time::Duration::from_secs(8));
+                };
+                if receiving {
+                    let _state = app.receiving.lock().unwrap();
+                    pause();
+                } else {
+                    app.store
+                        .with(|_| {
+                            pause();
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+            });
+            waiting
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            Self {
+                release,
+                holder: Some(holder),
+            }
+        }
+    }
+
+    impl Drop for PausedHealth {
+        fn drop(&mut self) {
+            let _ = self.release.send(());
+            self.holder.take().unwrap().join().unwrap();
+        }
+    }
+
+    async fn blocked_health_request(path: &str) {
+        use std::time::{Duration, Instant};
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let store = app.store.clone();
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            store
+                .with(|_| {
+                    entered.send(()).unwrap();
+                    let _ = released.recv_timeout(Duration::from_secs(3));
+                    Ok(())
+                })
+                .unwrap();
+        });
+        waiting.recv_timeout(Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+        let (response, timer_elapsed) = tokio::join!(
+            router(app.clone()).oneshot(Request::get(path).body(Body::empty()).unwrap()),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                started.elapsed()
+            },
+        );
+        let elapsed = started.elapsed();
+        let _ = release.send(());
+        holder.join().unwrap();
+        wait_health_idle(&app).await;
+        assert!(
+            timer_elapsed < Duration::from_millis(500),
+            "{path} blocked the async timer for {timer_elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "{path} waited {elapsed:?}"
+        );
+        assert_eq!(response.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn health_routes_do_not_block_healthz_on_sqlite() {
+        blocked_health_request("/healthz").await;
+    }
+
+    #[tokio::test]
+    async fn health_routes_do_not_block_readyz_on_sqlite() {
+        blocked_health_request("/readyz").await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_health_requests_leave_only_one_blocking_probe() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let pause = PausedHealth::new(&app, false);
+        let request = tokio::spawn(
+            router(app.clone()).oneshot(Request::get("/healthz").body(Body::empty()).unwrap()),
+        );
+        tokio::time::timeout(HEALTH_WAIT, async {
+            while app.health.probes.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(HEALTH_WAIT + std::time::Duration::from_millis(50)).await;
+        let mut statuses = Vec::new();
+        let started = std::time::Instant::now();
+        for index in 0..20 {
+            let path = if index % 2 == 0 {
+                "/healthz"
+            } else {
+                "/readyz"
+            };
+            statuses.push(
+                router(app.clone())
+                    .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+            );
+        }
+        let elapsed = started.elapsed();
+        let probes = app.health.probes.load(Ordering::Relaxed);
+        drop(pause);
+        wait_health_idle(&app).await;
+        assert!(statuses
+            .iter()
+            .all(|status| *status == StatusCode::SERVICE_UNAVAILABLE));
+        assert!(elapsed < HEALTH_WAIT, "busy requests waited {elapsed:?}");
+        assert_eq!(probes, 1);
+        assert!(
+            app.health
+                .state
+                .lock()
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .healthy
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_health_cache_expires_and_never_refreshes_an_over_age_probe() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        assert!(health_snapshot(&app).await.unwrap().healthy);
+        let response = router(app.clone())
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(app.health.probes.load(Ordering::Relaxed), 1);
+        app.health
+            .state
+            .lock()
+            .unwrap()
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .started -= HEALTH_TTL;
+        let pause = PausedHealth::new(&app, false);
+        let started = std::time::Instant::now();
+        assert!(health_snapshot(&app).await.is_none());
+        assert!(health_snapshot(&app).await.is_none());
+        assert_eq!(app.health.probes.load(Ordering::Relaxed), 2);
+        tokio::time::sleep(
+            HEALTH_TTL.saturating_sub(started.elapsed()) + std::time::Duration::from_millis(50),
+        )
+        .await;
+        drop(pause);
+        wait_health_idle(&app).await;
+        assert!(!app
+            .health
+            .state
+            .lock()
+            .unwrap()
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .fresh(app.store.settings_generation()));
+        assert!(health_snapshot(&app).await.unwrap().healthy);
+        assert_eq!(app.health.probes.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn failed_health_probes_are_cached_and_panics_are_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        std::fs::remove_dir(&app.config.outbound_dir).unwrap();
+        assert!(!health_snapshot(&app).await.unwrap().healthy);
+        assert!(!health_snapshot(&app).await.unwrap().healthy);
+        assert_eq!(app.health.probes.load(Ordering::Relaxed), 1);
+        std::fs::create_dir(&app.config.outbound_dir).unwrap();
+        app.health
+            .state
+            .lock()
+            .unwrap()
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .started -= HEALTH_TTL;
+        let store = app.store.clone();
+        assert!(std::thread::spawn(move || {
+            let _ = store.with::<()>(|_| panic!("fixture store poison"));
+        })
+        .join()
+        .is_err());
+        assert!(!health_snapshot(&app).await.unwrap().healthy);
+        assert!(!health_snapshot(&app).await.unwrap().healthy);
+        assert_eq!(app.health.probes.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_retains_both_fences_until_a_health_probe_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let pause = PausedHealth::new(&app, true);
+        assert!(health_snapshot(&app).await.is_none());
+        let started = std::time::Instant::now();
+        release_data_lock(&app);
+        let elapsed = started.elapsed();
+        let data_refused = build(app.config.clone()).is_err();
+        let mut standby = app.config.clone();
+        standby.data_dir = directory.path().join("standby");
+        let receive_refused = build(standby.clone()).is_err();
+        let frozen = health_snapshot(&app).await.is_none();
+        drop(pause);
+        wait_health_idle(&app).await;
+        assert!(
+            elapsed < HEALTH_WAIT,
+            "release waited on a running probe: {elapsed:?}"
+        );
+        assert!(
+            data_refused && receive_refused,
+            "both fences must remain held"
+        );
+        assert!(frozen);
+        assert_eq!(app.health.probes.load(Ordering::Relaxed), 1);
+        assert!(health_snapshot(&app).await.is_none());
+        release_data_lock(&app);
+        let standby = build(standby).unwrap();
+        release_data_lock(&standby);
+    }
+
+    #[test]
+    fn an_outstanding_health_probe_does_not_delay_process_exit() {
+        const ROOT: &str = "VOTPORT_TEST_HEALTH_PROBE_EXIT";
+        if let Some(root) = std::env::var_os(ROOT) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let app = crate::api::testing::build(std::path::Path::new(&root));
+                let _pause = PausedHealth::new(&app, true);
+                assert!(health_snapshot(&app).await.is_none());
+                release_data_lock(&app);
+                assert!(app.health.state.lock().unwrap().running);
+                std::process::exit(0);
+            });
+            unreachable!();
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let log = std::fs::File::create(directory.path().join("child.log")).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "app::health_tests::an_outstanding_health_probe_does_not_delay_process_exit",
+                "--nocapture",
+            ])
+            .env(ROOT, directory.path())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let outcome = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(
+            outcome.is_some_and(|status| status.success()),
+            "probe shutdown failed: {}",
+            std::fs::read_to_string(directory.path().join("child.log")).unwrap()
+        );
+        let app = crate::api::testing::build(directory.path());
+        release_data_lock(&app);
+    }
+
+    #[tokio::test]
+    async fn health_settings_generation_tracks_successful_writes_and_resets() {
+        use crate::store::SettingWrite;
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        assert_eq!(health_snapshot(&app).await.unwrap().draining, Some(false));
+        app.store
+            .put_settings(
+                "fixture",
+                &[("draining".into(), SettingWrite::Set("1".into()))],
+            )
+            .unwrap();
+        assert_eq!(health_snapshot(&app).await.unwrap().draining, Some(true));
+        let generation = app.store.settings_generation();
+        let probes = app.health.probes.load(Ordering::Relaxed);
+        app.store.with(|c| c.execute_batch(
+            "CREATE TRIGGER refuse_settings BEFORE INSERT ON settings BEGIN SELECT RAISE(FAIL,'fixture refusal'); END;
+             CREATE TRIGGER refuse_reset BEFORE DELETE ON settings BEGIN SELECT RAISE(FAIL,'fixture refusal'); END;"
+        )).unwrap();
+        assert!(app
+            .store
+            .put_settings(
+                "fixture",
+                &[("draining".into(), SettingWrite::Set("0".into()))]
+            )
+            .is_err());
+        assert!(app.store.delete_setting("draining").is_err());
+        assert_eq!(app.store.settings_generation(), generation);
+        assert_eq!(health_snapshot(&app).await.unwrap().draining, Some(true));
+        assert_eq!(app.health.probes.load(Ordering::Relaxed), probes);
+        app.store
+            .with(|c| c.execute_batch("DROP TRIGGER refuse_settings; DROP TRIGGER refuse_reset;"))
+            .unwrap();
+        app.store.delete_setting("draining").unwrap();
+        assert_eq!(health_snapshot(&app).await.unwrap().draining, Some(false));
+        app.store
+            .put_settings(
+                "fixture",
+                &[("draining".into(), SettingWrite::Set("1".into()))],
+            )
+            .unwrap();
+        assert_eq!(health_snapshot(&app).await.unwrap().draining, Some(true));
+        app.store
+            .put_settings("fixture", &[("draining".into(), SettingWrite::Reset)])
+            .unwrap();
+        assert_eq!(health_snapshot(&app).await.unwrap().draining, Some(false));
+        assert_eq!(app.health.probes.load(Ordering::Relaxed), probes + 3);
+    }
+
+    #[tokio::test]
+    async fn settings_changed_during_a_probe_invalidate_its_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let pause = PausedHealth::new(&app, true);
+        assert!(health_snapshot(&app).await.is_none());
+        app.store
+            .put_settings(
+                "fixture",
+                &[(
+                    "draining".into(),
+                    crate::store::SettingWrite::Set("1".into()),
+                )],
+            )
+            .unwrap();
+        drop(pause);
+        wait_health_idle(&app).await;
+        assert!(!app
+            .health
+            .state
+            .lock()
+            .unwrap()
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .fresh(app.store.settings_generation()));
+        assert_eq!(health_snapshot(&app).await.unwrap().draining, Some(true));
+        assert_eq!(app.health.probes.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn cached_readiness_keeps_live_sessions_and_lease_loss() {
+        use http_body_util::BodyExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        assert!(health_snapshot(&app).await.unwrap().healthy);
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        app.sessions
+            .insert_resumed("live".into(), "link".into(), String::new(), 0, sender)
+            .unwrap();
+        let response = router(app.clone())
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["sessions_active"], 1);
+        app.sessions.remove("live");
+        app.lease_lost.store(true, Ordering::Relaxed);
+        let response = router(app.clone())
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["sessions_active"], 0);
+        assert_eq!(json["lease"]["lost"], true);
+        assert_eq!(json["lease"]["mine"], false);
+        assert!(json["lease"]["holder"].is_null());
+        assert!(json["lease"]["age_secs"].is_null());
+        let response = router(app.clone())
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(app.health.probes.load(Ordering::Relaxed), 1);
+    }
 
     #[tokio::test]
     async fn healthz_is_public_and_probes_database_and_directories() {
