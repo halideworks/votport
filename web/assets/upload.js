@@ -434,6 +434,10 @@ function addNamed(pairs) {
         return;
       }
     }
+    if (utf8.encode(components.at(-1) ?? '').length > 243) {
+      fail(`"${path}": filename exceeds 243 UTF-8 bytes; shorten it to leave room for its signed receipt`);
+      return;
+    }
     const joined = components.join('/');
     // One package holds the whole drop, so two names that fold to the same
     // key would be refused at the manifest; catch it before hashing.

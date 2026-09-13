@@ -137,6 +137,12 @@ pub fn admit(relative: &str, source: PathBuf, allow_hidden: bool) -> Result<Entr
             reason,
         })?;
     }
+    crate::protocol_paths::check_payload_name_length(components.last().unwrap()).map_err(
+        |reason| Rejected {
+            path: relative.to_owned(),
+            reason,
+        },
+    )?;
     // vot-manifest's portable profile is the other authority: forbidden
     // characters, trailing dot or space, NFKC directory references, and
     // Windows device names. Building the path applies all of them.
@@ -156,6 +162,18 @@ mod tests {
 
     fn source() -> PathBuf {
         PathBuf::from("/dev/null")
+    }
+
+    #[test]
+    fn payload_names_leave_receipt_space_without_shortening_parents() {
+        let parent = "p".repeat(255);
+        for name in ["a".repeat(243), "ア".repeat(81)] {
+            admit(&format!("{parent}/{name}"), source(), false).unwrap();
+        }
+        for name in ["a".repeat(244), format!("{}a", "ア".repeat(81))] {
+            let error = admit(&format!("{parent}/{name}"), source(), false).unwrap_err();
+            assert!(error.reason.contains("243 UTF-8 bytes; shorten"));
+        }
     }
 
     #[test]

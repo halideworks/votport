@@ -426,6 +426,9 @@ pub(crate) fn admit_portable_paths<'a>(
     use unicode_normalization::UnicodeNormalization as _;
     let mut keyed = Vec::new();
     for name in names {
+        crate::protocol_paths::check_payload_name_length(
+            name.rsplit('/').next().unwrap_or_default(),
+        )?;
         if name.split('/').any(is_receipt_name) {
             return Err(format!(
                 "filename {name:?} is reserved for signed receipts; rename it before sharing"
@@ -751,6 +754,20 @@ mod tests {
         assert!(admit_dest("a/../b").is_err());
         assert!(admit_dest(".hidden").is_err());
         assert!(admit_dest("a//b").is_err());
+    }
+
+    #[test]
+    fn portable_payload_names_leave_space_for_receipts() {
+        let parent = "p".repeat(255);
+        assert!(admit_component(&parent, false).is_ok());
+        for name in ["a".repeat(243), "ア".repeat(81)] {
+            admit_portable_paths([format!("{parent}/{name}").as_str()]).unwrap();
+        }
+        for name in ["a".repeat(244), format!("{}a", "ア".repeat(81))] {
+            assert!(admit_portable_paths([format!("{parent}/{name}").as_str()])
+                .unwrap_err()
+                .contains("243 UTF-8 bytes; shorten"));
+        }
     }
 
     #[test]

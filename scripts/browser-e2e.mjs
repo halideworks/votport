@@ -177,6 +177,24 @@ for (const name of ["report.pdf.vot-receipt", "report.VOT-RECEIPT", "report.vot-
 }
 console.log("Receipt filenames are refused before browser selection: ok");
 
+for (const name of ["a".repeat(244), "ア".repeat(81) + "a"]) {
+  await page.setInputFiles("#file-input", { name, mimeType: "application/octet-stream", buffer: Buffer.from("x") });
+  const error = page.locator("#upload-error");
+  if (!(await error.isVisible()) || !(await error.textContent()).includes("243 UTF-8 bytes; shorten")) {
+    throw new Error(`oversized payload filename was not refused: ${name}`);
+  }
+  if (await page.locator("#file-list > li").count() !== 0 || !(await page.locator("#send").isDisabled())) {
+    throw new Error("an oversized filename changed the selection");
+  }
+}
+for (const name of ["a".repeat(243), "ア".repeat(81)]) {
+  await page.setInputFiles("#file-input", { name, mimeType: "application/octet-stream", buffer: Buffer.from("x") });
+  if (await page.locator("#upload-error").isVisible() || await page.locator("#file-list > li").count() !== 1 || await page.locator("#send").isDisabled()) {
+    throw new Error(`243-byte payload filename was not admitted: ${name}`);
+  }
+  await page.click("#clear-files");
+}
+
 const previewFiles = Array.from({ length: 100_000 }, (_, index) => ({
   name: `preview-${String(index).padStart(6, "0")}.exr`,
   mimeType: "application/octet-stream",
