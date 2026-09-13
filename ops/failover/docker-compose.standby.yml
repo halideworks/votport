@@ -38,9 +38,14 @@ services:
     user: "1000:1000"
     ports:
       - "10.0.0.6:8103:8080"
+    # Copy every application environment setting from the primary, including
+    # custom listeners, authentication and limits. See README.md.
     environment:
       VOTPORT_ADMIN_PASSWORD: "${VOTPORT_ADMIN_PASSWORD:?set VOTPORT_ADMIN_PASSWORD in .env}"
-      VOTPORT_PUBLIC_URL: "https://drop.example.com"
+      VOTPORT_PUBLIC_URL: "${VOTPORT_PUBLIC_URL:?copy the primary public URL into .env}"
+      VOTPORT_MAX_UPLOAD_BYTES: "${VOTPORT_MAX_UPLOAD_BYTES:?copy the primary upload byte limit into .env}"
+      VOTPORT_ALLOW_HIDDEN: "${VOTPORT_ALLOW_HIDDEN:?copy the primary hidden-file policy into .env}"
+      VOTPORT_SESSION_IDLE_SECS: "${VOTPORT_SESSION_IDLE_SECS:?copy the primary resume window into .env}"
       # Kept on the live profile so a future standby can pull from this host.
       VOTPORT_REPLICA_TOKEN: "${VOTPORT_REPLICA_TOKEN:?set VOTPORT_REPLICA_TOKEN in .env}"
     volumes:

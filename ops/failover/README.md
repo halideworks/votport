@@ -34,6 +34,39 @@ Run `scripts/restart-e2e.mjs` in both modes before relying on either script;
 it exercises the same sequence against the real binary. `DRY_RUN=1` on
 either script prints every step and changes nothing (no sign-in, no drain).
 
+## Matching the primary
+
+The promoted `live` profile must use the primary's complete application
+environment. Replicas copy database settings, not environment variables.
+Copy any additional primary settings into the example's `votport.environment`
+block, including authentication, retention, quotas, session limits and native
+listeners. Keep mounted container paths the same; adapt host addresses and
+mount sources to the standby host.
+
+The example requires an explicit public URL, upload limit, hidden-file policy
+and resume window in `.env`, alongside the admin password and replica token.
+Docker Compose validates these even when starting only the `standby` profile,
+so configure the promoted service before relying on replica pulls. For the
+repository's primary example, the transfer settings are:
+
+```dotenv
+VOTPORT_MAX_UPLOAD_BYTES=536870912000
+VOTPORT_ALLOW_HIDDEN=1
+VOTPORT_SESSION_IDLE_SECS=172800
+```
+
+These are 500 GiB and 48 hours. Use the actual primary values if customized;
+the server defaults are 50 GiB, hidden files disabled and 30 minutes. These
+three settings have no database override. Set `VOTPORT_PUBLIC_URL` to the
+same public origin as the primary. Validate the example from the repository
+root on the standby before promotion:
+
+```sh
+docker compose --env-file .env -f ops/failover/docker-compose.standby.yml --profile live config --quiet
+```
+
+A missing required value must be corrected first.
+
 ## Planned failover
 
 ```sh

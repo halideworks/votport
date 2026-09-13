@@ -742,14 +742,27 @@ what they generate, and `npm test` fails if a stamp goes stale.
 
 ## High availability (active-passive)
 
-One live instance, one stopped standby, the same three volumes. votport keeps
-no state outside `data/`, `/received`, and `/outbound`, so a standby host that
-mounts the same three paths and starts the same image is the live instance.
+One live instance, one stopped standby, the same three volumes and application
+environment. Mounting `data/`, `/received`, and `/outbound` at the same paths
+and starting the same image preserves stored state, but does not copy the
+primary's environment settings. Match those before promotion.
 It sees the same links, tenants, settings, cookie secret, receipt key, and
 push certificate (all under `data/`), and it re-attaches the uploads the
 previous instance suspended: staging and journal files sit in a private
 `.vot-stage` child of their destination directory under `/received`, and the
 resume record in SQLite names them by path, not by host.
+
+In both topologies, copy the primary's complete application environment into
+the promoted service. In particular, `VOTPORT_MAX_UPLOAD_BYTES`,
+`VOTPORT_ALLOW_HIDDEN`, and `VOTPORT_SESSION_IDLE_SECS` have no database
+override. A smaller cap or resume window can reject an unfinished transfer;
+changing the hidden-file policy can prevent its staged files from reopening.
+Keep the public URL, authentication, retention, quotas, workflow capacity,
+session limits and enabled transports consistent too. Host bind addresses,
+advertised endpoints and mount sources may differ, but must preserve client
+reachability and the same container paths. Saved System settings override
+only the settings described in [Settings](#settings); they do not replace
+the deployment environment. See the [standby configuration example](../ops/failover/README.md#matching-the-primary).
 
 Layout:
 
