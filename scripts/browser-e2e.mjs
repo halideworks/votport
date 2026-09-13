@@ -457,6 +457,224 @@ for (const file of sequenceFiles) {
 }
 console.log("small files overlap within eight requests and finish with matching bytes and receipts: ok");
 
+for (const mode of browserEngine === "chromium" ? ["unreadable", "short", "short-busy"] : ["short", "short-busy"]) {
+  const keptName = `source-${mode}-a-kept.txt`;
+  const changedName = `source-${mode}-z-changed.bin`;
+  const keptPath = path.join(dir, keptName);
+  const changedPath = path.join(dir, changedName);
+  const keptBytes = `verified before ${mode} source failure\n`;
+  fs.writeFileSync(keptPath, keptBytes);
+  fs.writeFileSync(changedPath, Buffer.alloc(9 * 1024 * 1024, 0x37));
+  await page.goto(linkUrl);
+  await page.waitForSelector("#uploader:not([hidden])");
+  let changed = false;
+  let aborts = 0;
+  let busy = 0;
+  let buildChecks = 0;
+  const observeBuildCheck = (request) => {
+    if (new URL(request.url()).pathname === `/api/r/${linkToken}`) buildChecks += 1;
+  };
+  page.on("request", observeBuildCheck);
+  const changeSource = async (route) => {
+    if (mode === "short-busy" && new URL(route.request().url()).searchParams.get("entry") === "1") {
+      busy += 1;
+      await route.fulfill({ status: 503, body: "busy" });
+      await page.waitForFunction(() => document.getElementById("phase").textContent === "Paused");
+      await page.waitForFunction(() => typeof window.releaseShortRead === "function");
+      await page.evaluate(() => window.releaseShortRead());
+      return;
+    }
+    const response = await route.fetch();
+    if (!changed) {
+      if (new URL(route.request().url()).searchParams.get("entry") !== "0" || response.status() !== 200
+        || fs.readFileSync(path.join(receiveDir, dest, keptName), "utf8") !== keptBytes) {
+        throw new Error("source mutation did not follow the first verified file");
+      }
+      if (mode === "unreadable") {
+        const fd = fs.openSync(changedPath, "r+");
+        try { fs.writeSync(fd, Buffer.from([0x99]), 0, 1, 0); } finally { fs.closeSync(fd); }
+        const later = new Date(Date.now() + 2000);
+        fs.utimesSync(changedPath, later, later);
+      } else {
+        await page.evaluate((hold) => {
+          const read = Blob.prototype.arrayBuffer;
+          Blob.prototype.arrayBuffer = function () {
+            if (hold && this.size === 1024 * 1024) {
+              return new Promise((resolve) => { window.releaseShortRead = () => resolve(new ArrayBuffer(1)); });
+            }
+            return !hold && this.size > 1024 ? Promise.resolve(new ArrayBuffer(1)) : read.call(this);
+          };
+        }, mode === "short-busy");
+      }
+      changed = true;
+    }
+    await route.fulfill({ response });
+  };
+  const observeAbort = async (route) => { aborts += 1; await route.continue(); };
+  await page.route("**/api/session/*/chunk?*", changeSource);
+  await page.route("**/api/session/*/abort", observeAbort);
+  await page.setInputFiles("#file-input", [keptPath, changedPath]);
+  await page.click("#send");
+  await page.waitForSelector("#upload-error:not([hidden])", { timeout: 10000 });
+  const message = await page.textContent("#upload-error");
+  if (!changed || aborts !== 1 || buildChecks === 0 || (mode === "short-busy" && busy === 0)
+    || message !== `"${changedName}" changed while uploading; pick it again. The one already delivered is kept. Fix the rest and send them again.`
+    || await page.locator("#resume-note").isVisible()
+    || await page.evaluate((key) => localStorage.getItem(key), `votport-resume-${linkToken}`) !== null
+    || fs.readFileSync(path.join(receiveDir, dest, keptName), "utf8") !== keptBytes
+    || !fs.existsSync(path.join(receiveDir, dest, `${keptName}.vot-receipt`))
+    || fs.existsSync(path.join(receiveDir, dest, changedName))) {
+    throw new Error(`source ${mode} did not abort with verified files preserved: ${message}`);
+  }
+  await page.unroute("**/api/session/*/chunk?*", changeSource);
+  await page.unroute("**/api/session/*/abort", observeAbort);
+  page.off("request", observeBuildCheck);
+}
+console.log("failed and short source reads discard resume state and preserve verified files: ok");
+
+for (const mode of ["retry", "cancel"]) {
+  const name = `snapshot-${mode}.bin`;
+  const sourcePath = path.join(dir, name);
+  const original = Buffer.alloc(1024 * 1024, mode === "retry" ? 0x51 : 0x52);
+  fs.writeFileSync(sourcePath, original);
+  await page.goto(linkUrl);
+  await page.waitForSelector("#uploader:not([hidden])");
+  let attempts = 0;
+  const busyOnce = async (route) => {
+    attempts += 1;
+    if (attempts === 1 || mode === "cancel") {
+      fs.writeFileSync(sourcePath, Buffer.alloc(original.length, 0x99));
+      await route.fulfill({ status: 503, body: "busy" });
+    } else {
+      await route.continue();
+    }
+  };
+  await page.route("**/api/session/*/chunk?*", busyOnce);
+  await page.setInputFiles("#file-input", sourcePath);
+  await page.click("#send");
+  if (mode === "retry") {
+    await page.waitForSelector("#done-card:not([hidden])", { timeout: 30000 });
+    if (attempts !== 2 || !fs.readFileSync(path.join(receiveDir, dest, name)).equals(original)
+      || !fs.existsSync(path.join(receiveDir, dest, `${name}.vot-receipt`))) {
+      throw new Error("retry did not reuse the verified source snapshot");
+    }
+  } else {
+    await page.waitForFunction(() => document.getElementById("phase").textContent === "Paused");
+    await page.click("#cancel");
+    await page.locator('#confirm-cancel button[value="cancel"]').click();
+    await page.waitForFunction(() => !document.getElementById("upload-error").hidden
+      && document.getElementById("upload-error").textContent === "Transfer cancelled.");
+    if (fs.existsSync(path.join(receiveDir, dest, name)) || await page.locator("#resume-note").isVisible()
+      || await page.evaluate((key) => localStorage.getItem(key), `votport-resume-${linkToken}`) !== null) {
+      throw new Error("cancelled snapshot retry left a delivery or resume record");
+    }
+  }
+  await page.unroute("**/api/session/*/chunk?*", busyOnce);
+}
+console.log("retries preserve the original source snapshot and remain cancellable: ok");
+
+for (const status of [409, 422]) {
+  await page.goto(linkUrl);
+  await page.waitForSelector("#uploader:not([hidden])");
+  let busy = 0;
+  let releaseRefusal;
+  const busyStarted = new Promise((resolve) => { releaseRefusal = resolve; });
+  const refuseWithBusySibling = async (route) => {
+    if (new URL(route.request().url()).searchParams.get("entry") === "0") {
+      await busyStarted;
+      await route.fulfill({ status, contentType: "application/json", body: JSON.stringify({ error: "range refused" }) });
+    } else {
+      busy += 1;
+      await route.fulfill({ status: 503, body: "busy" });
+      await page.waitForFunction(() => document.getElementById("phase").textContent === "Paused");
+      releaseRefusal();
+    }
+  };
+  await page.route("**/api/session/*/chunk?*", refuseWithBusySibling);
+  await page.setInputFiles("#file-input", ["a", "b"].map((name) => ({
+    name: `refused-${status}-${name}.bin`, mimeType: "application/octet-stream", buffer: Buffer.from(`${status}-${name}`),
+  })));
+  await page.click("#send");
+  await page.waitForSelector("#upload-error:not([hidden])", { timeout: 10000 });
+  if (!busy || await page.textContent("#upload-error") !== "range refused. Any files already delivered are kept. Fix the selection and send again."
+    || await page.locator("#resume-note").isVisible()
+    || await page.evaluate((key) => localStorage.getItem(key), `votport-resume-${linkToken}`) !== null) {
+    throw new Error(`${status} refusal did not stop the busy sibling`);
+  }
+  await page.unroute("**/api/session/*/chunk?*", refuseWithBusySibling);
+}
+console.log("permanent range refusals stop retries across parallel files: ok");
+
+await page.goto(linkUrl);
+await page.waitForSelector("#uploader:not([hidden])");
+let rebeginAborts = 0;
+const rebeginThenRefuse = async (route) => {
+  if (new URL(route.request().url()).searchParams.get("entry") === "0") {
+    const response = await route.fetch();
+    const body = await response.json();
+    await route.fulfill({ response, json: { ...body, rebegin: true } });
+  } else {
+    await page.waitForFunction(() => document.getElementById("meter").getAttribute("aria-valuenow") === "50");
+    await route.fulfill({ status: 422, contentType: "application/json", body: JSON.stringify({ error: "range refused after restart" }) });
+  }
+};
+const observeRebeginAbort = async (route) => { rebeginAborts += 1; await route.continue(); };
+await page.route("**/api/session/*/chunk?*", rebeginThenRefuse);
+await page.route("**/api/session/*/abort", observeRebeginAbort);
+await page.setInputFiles("#file-input", ["a", "b"].map((name) => ({
+  name: `rebegin-${name}.bin`, mimeType: "application/octet-stream", buffer: Buffer.from(`rebegin-${name}`),
+})));
+await page.click("#send");
+await page.waitForSelector("#upload-error:not([hidden])", { timeout: 10000 });
+if (rebeginAborts !== 1 || !(await page.textContent("#upload-error")).startsWith("range refused after restart.")
+  || await page.locator("#resume-note").isVisible()
+  || await page.evaluate((key) => localStorage.getItem(key), `votport-resume-${linkToken}`) !== null
+  || fs.readFileSync(path.join(receiveDir, dest, "rebegin-a.bin"), "utf8") !== "rebegin-a"
+  || !fs.existsSync(path.join(receiveDir, dest, "rebegin-a.bin.vot-receipt"))) {
+  throw new Error(`earlier rebegin hid the terminal refusal: aborts=${rebeginAborts}`);
+}
+await page.unroute("**/api/session/*/chunk?*", rebeginThenRefuse);
+await page.unroute("**/api/session/*/abort", observeRebeginAbort);
+console.log("terminal refusal takes precedence over an earlier rebegin and preserves published bytes: ok");
+
+await page.goto(linkUrl);
+await page.waitForSelector("#uploader:not([hidden])");
+let releaseHeldReply;
+let published;
+const heldReply = new Promise((resolve) => { releaseHeldReply = resolve; });
+const publication = new Promise((resolve) => { published = resolve; });
+const holdPublishedReply = async (route) => {
+  if (new URL(route.request().url()).searchParams.get("entry") === "0") {
+    const response = await route.fetch();
+    if (response.status() !== 200) throw new Error("held reply did not follow publication");
+    published();
+    await heldReply;
+  } else {
+    await publication;
+    await route.fulfill({ status: 422, contentType: "application/json", body: JSON.stringify({ error: "range refused with a held reply" }) });
+  }
+};
+await page.route("**/api/session/*/chunk?*", holdPublishedReply);
+try {
+  await page.setInputFiles("#file-input", ["a", "b"].map((name) => ({
+    name: `held-${name}.bin`, mimeType: "application/octet-stream", buffer: Buffer.from(`held-${name}`),
+  })));
+  await page.click("#send");
+  await page.waitForSelector("#upload-error:not([hidden])", { timeout: 10000 });
+  const message = await page.textContent("#upload-error");
+  const kept = fs.readFileSync(path.join(receiveDir, dest, "held-a.bin"), "utf8") === "held-a"
+    && fs.existsSync(path.join(receiveDir, dest, "held-a.bin.vot-receipt"));
+  if (!kept || message !== "range refused with a held reply. Any files already delivered are kept. Fix the selection and send again."
+    || await page.locator("#resume-note").isVisible()
+    || await page.evaluate((key) => localStorage.getItem(key), `votport-resume-${linkToken}`) !== null) {
+    throw new Error(`held publication feedback was wrong: kept=${kept}, message=${message}`);
+  }
+} finally {
+  releaseHeldReply();
+  await page.unroute("**/api/session/*/chunk?*", holdPublishedReply);
+}
+console.log("a lost success reply does not claim that no file was delivered: ok");
+
 // Public receipt check against the same deployment: key GET is public, and
 // the sidecar on disk must verify with a root matching the done-list card.
 const sidecarName = "Résumé Draft.pdf.vot-receipt";
