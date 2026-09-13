@@ -234,6 +234,9 @@ pub(crate) struct GrantEntry {
 /// The grant's files in package order, resolved the way a download resolves
 /// them.
 pub(crate) fn grant_entries(app: &App, grant: &OutboundGrant) -> ApiResult<Vec<GrantEntry>> {
+    grant
+        .validate_names()
+        .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     let count = grant.files.len().max(1);
     let mut entries = Vec::with_capacity(count);
     for index in 0..count {

@@ -158,6 +158,16 @@ pub struct OutboundGrant {
     pub files: Vec<OutboundGrantFile>,
 }
 
+impl OutboundGrant {
+    pub(crate) fn validate_names(&self) -> Result<(), String> {
+        if self.files.is_empty() {
+            crate::paths::admit_portable_paths([self.name.as_str()])
+        } else {
+            crate::paths::admit_portable_paths(self.files.iter().map(|file| file.name.as_str()))
+        }
+    }
+}
+
 pub struct OutboundGrantFilesPage {
     pub grant: OutboundGrant,
     pub file_count: usize,
@@ -2745,6 +2755,7 @@ impl Store {
         operation: Option<&AutomationOperation>,
         job: Option<&crate::workflow::Job>,
     ) -> Result<(), String> {
+        grant.validate_names()?;
         let delivery_digest = evidence::grant_digest(&grant);
         let (bytes_hi, bytes_lo) = split_bytes(grant.bytes);
         let files_json = serde_json::to_string(&grant.files).unwrap_or_else(|_| "[]".to_owned());
@@ -4916,6 +4927,42 @@ pub(crate) mod tests {
             last_download_at: None,
             files: Vec::new(),
         }
+    }
+
+    #[test]
+    fn grant_insertion_refuses_ambiguous_and_nonportable_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut grant = test_outbound_grant("ambiguous", "", 0);
+        for name in ["XML:EDL/file.mov", "CON.txt", "clip.mov."] {
+            grant.name = name.into();
+            assert!(store
+                .insert_outbound_grant(grant.clone())
+                .unwrap_err()
+                .contains("not portable"));
+        }
+        grant.files = ["Café.mov", "Cafe\u{301}.mov"]
+            .into_iter()
+            .map(|name| OutboundGrantFile {
+                source: name.into(),
+                name: name.into(),
+                suite: "blake3".into(),
+                root: "00".repeat(32),
+                bytes: 1,
+                receipt_b64: String::new(),
+                downloads: 0,
+                first_download_at: None,
+                last_download_at: None,
+            })
+            .collect();
+        assert!(store
+            .insert_outbound_grant(grant.clone())
+            .unwrap_err()
+            .contains("collide"));
+        assert!(store.outbound_grants("").unwrap().is_empty());
+        grant.files[1].name = "second.mov".into();
+        store.insert_outbound_grant(grant.clone()).unwrap();
+        assert_eq!(store.outbound_grants("").unwrap(), vec![grant]);
     }
 
     #[test]

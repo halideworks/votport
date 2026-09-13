@@ -219,20 +219,24 @@ export function sanitizeFilename(name) {
   return value;
 }
 
+function filenameKey(name) {
+  return name.normalize('NFC').toLowerCase().normalize('NFC');
+}
+
 export function dedupeFilenames(names) {
   const used = new Set();
   const nextSuffix = new Map();
   return names.map((name) => {
     const original = sanitizeFilename(name);
-    const key = original.toLowerCase();
+    const key = filenameKey(original);
     const extensionIndex = original.lastIndexOf('.');
     const stem = extensionIndex > 0 ? original.slice(0, extensionIndex) : original;
     const extension = extensionIndex > 0 ? original.slice(extensionIndex) : '';
     let candidate = original;
     let suffix = nextSuffix.get(key) || 2;
-    while (used.has(candidate.toLowerCase())) candidate = `${stem} (${suffix++})${extension}`;
+    while (used.has(filenameKey(candidate))) candidate = `${stem} (${suffix++})${extension}`;
     nextSuffix.set(key, suffix);
-    used.add(candidate.toLowerCase());
+    used.add(filenameKey(candidate));
     return candidate;
   });
 }

@@ -4998,6 +4998,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "unicase",
  "unicode-normalization",
  "vot-capability",
  "vot-cli",

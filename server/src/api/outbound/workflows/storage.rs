@@ -600,19 +600,13 @@ pub(super) async fn import(app: &Arc<App>, job: &Job) -> ApiResult<Option<u64>> 
         sync_directory(parent)?;
         inventory.objects
     };
-    if parent.join("inventory.json").is_file() {
-        return Ok(Some(config.revision));
-    }
     if objects.is_empty() || objects.len() > MAX_LIBRARY_PROJECT_FILES {
         return Err(conflict("invalid S3 inventory".into()));
     }
-    let mut portable_names = std::collections::HashSet::new();
-    for object in &objects {
-        if !portable_names.insert(bundle_collision_key(&object.name)) {
-            return Err(conflict(
-                "S3 filenames collide on recipient filesystems".into(),
-            ));
-        }
+    crate::paths::admit_portable_paths(objects.iter().map(|object| object.name.as_str()))
+        .map_err(conflict)?;
+    if parent.join("inventory.json").is_file() {
+        return Ok(Some(config.revision));
     }
     let reserved = objects
         .iter()
@@ -781,15 +775,16 @@ pub(super) async fn export(app: &Arc<App>, job: &Job) -> ApiResult<()> {
 }
 
 async fn export_destination(app: &Arc<App>, job: &Job, config: &Storage) -> ApiResult<()> {
-    if config.kind == StorageKind::Votport {
-        return super::routes::export(app, job, config).await;
-    }
-    let store = config.connect(&app.store).map_err(conflict)?;
     let grant = app
         .store
         .outbound_grant_by_id(&job.id)
         .map_err(crate::api::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
+    grant.validate_names().map_err(conflict)?;
+    if config.kind == StorageKind::Votport {
+        return super::routes::export(app, job, config).await;
+    }
+    let store = config.connect(&app.store).map_err(conflict)?;
     let manifest = job
         .manifest
         .as_deref()
@@ -966,4 +961,153 @@ async fn upload_file(
         let _ = upload.abort().await;
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cached_s3_inventory_still_requires_portable_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let config: Storage = serde_json::from_value(json!({
+            "id":"source","revision":0,"label":"Source","kind":"s3",
+            "endpoint":"http://127.0.0.1:1","bucket":"test","region":"us-east-1",
+            "path_style":true,"tenants":[""],"enabled":true
+        }))
+        .unwrap();
+        let config = app
+            .store
+            .save_delivery_storage(
+                "local",
+                config,
+                Some(Credentials::AccessKey {
+                    access_key_id: "test-access".into(),
+                    secret_access_key: "test-secret".into(),
+                    session_token: None,
+                }),
+            )
+            .unwrap();
+        let mut request = crate::workflow::tests::request();
+        request.import = Some(crate::workflow::Import {
+            storage_id: config.id.clone(),
+            prefix: "source".into(),
+        });
+        let job: Job = serde_json::from_value(json!({
+            "id":"cached","tenant":"","token_generation":0,"actor":"local","credential_version":0,
+            "request":request,"project":crate::workflow::tests::project(),
+            "state":"preparing","attempts":1,"created_at":1,"updated_at":1,"checks":{}
+        }))
+        .unwrap();
+        let root = payload_root(&app, "", &job.id);
+        let parent = root.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        std::fs::write(parent.join("inventory.json"), b"[]").unwrap();
+        let mut inventory = SourceInventory {
+            storage_id: config.id.clone(),
+            revision: config.revision,
+            objects: ["Café.mov", "Cafe\u{301}.mov"]
+                .into_iter()
+                .map(|name| SourceObject {
+                    name: name.into(),
+                    key: format!("source/{name}"),
+                    size: 1,
+                    etag: Some("test".into()),
+                    version: None,
+                })
+                .collect(),
+        };
+        for cached in [true, false] {
+            if !cached {
+                std::fs::remove_file(parent.join("inventory.json")).unwrap();
+            }
+            std::fs::write(
+                parent.join("source-inventory.json"),
+                serde_json::to_vec(&inventory).unwrap(),
+            )
+            .unwrap();
+            let error = tokio::time::timeout(std::time::Duration::from_secs(5), import(&app, &job))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.status, StatusCode::CONFLICT);
+            assert!(error.message.contains("collide"), "{}", error.message);
+            assert!(!root.exists());
+        }
+        inventory.objects[1].name = "second.mov".into();
+        std::fs::write(
+            parent.join("source-inventory.json"),
+            serde_json::to_vec(&inventory).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(parent.join("inventory.json"), b"[]").unwrap();
+        assert_eq!(import(&app, &job).await.unwrap(), Some(config.revision));
+    }
+
+    #[tokio::test]
+    async fn existing_ambiguous_grants_are_refused_before_destination_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let mut grant = crate::store::tests::test_outbound_grant("existing", "", 0);
+        grant.files = ["Café.mov", "second.mov"]
+            .into_iter()
+            .map(|name| crate::store::OutboundGrantFile {
+                source: name.into(),
+                name: name.into(),
+                suite: "blake3".into(),
+                root: "00".repeat(32),
+                bytes: 1,
+                receipt_b64: String::new(),
+                downloads: 0,
+                first_download_at: None,
+                last_download_at: None,
+            })
+            .collect();
+        {
+            let store = crate::store::Store::open(&data).unwrap();
+            store.insert_outbound_grant(grant.clone()).unwrap();
+        }
+        // The closed scratch database represents a grant admitted before portable-name checks.
+        {
+            grant.files[1].name = "Cafe\u{301}.mov".into();
+            let db = rusqlite::Connection::open(data.join("votport.db")).unwrap();
+            db.execute(
+                "UPDATE outbound_grants SET files_json = ?1 WHERE id = ?2",
+                rusqlite::params![serde_json::to_string(&grant.files).unwrap(), grant.id],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE outbound_grant_files SET name = ?1 WHERE grant_id = ?2 AND file_index = 1",
+                rusqlite::params![grant.files[1].name, grant.id],
+            )
+            .unwrap();
+        }
+        let app = crate::api::testing::build(directory.path());
+        let job: Job = serde_json::from_value(json!({
+            "id":grant.id,"tenant":"","token_generation":0,"actor":"local","credential_version":0,
+            "request":crate::workflow::tests::request(),"project":crate::workflow::tests::project(),
+            "state":"exporting","manifest":"frozen","attempts":1,"created_at":1,"updated_at":1,"checks":{}
+        })).unwrap();
+        for kind in ["folder", "s3", "votport"] {
+            let config: Storage = serde_json::from_value(json!({
+                "id":"destination","revision":1,"label":"Destination","kind":kind,
+                "directory":directory.path().join("destination"),"tenants":[""],"enabled":true
+            }))
+            .unwrap();
+            let error = export_destination(&app, &job, &config).await.unwrap_err();
+            assert_eq!(error.status, StatusCode::CONFLICT);
+            assert!(
+                error.message.contains("collide"),
+                "{kind}: {}",
+                error.message
+            );
+            assert!(!directory.path().join("destination").exists());
+        }
+        let error = crate::api::serve::grant_entries(&app, &grant)
+            .err()
+            .unwrap();
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error.message.contains("collide"));
+    }
 }

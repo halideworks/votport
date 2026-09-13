@@ -176,6 +176,12 @@ The release choice is explicit:
 - **After local checks and approval** releases the local link and copies in the
   background. A failed destination does not retract that local release.
 
+Delivery filenames must be portable to recipient filesystems. Grant creation,
+S3 imports, ZIP downloads and storage exports reject reserved names and paths
+that collide after Unicode normalization and case folding, including file and
+folder conflicts. Rename the conflicting files and submit the delivery again.
+Original filename bytes and VOT package roots are preserved for accepted files.
+
 Two destination legs can run concurrently. After preparation and approval, an
 unavailable destination records its own failure while other authorized destinations
 continue. Completed copies remain recorded if their connection is later changed

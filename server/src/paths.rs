@@ -412,6 +412,34 @@ pub fn join_under(base: &Path, components: &[String]) -> Result<PathBuf, String>
     Ok(path)
 }
 
+/// Rejects names that cannot remain distinct on portable recipient filesystems.
+pub(crate) fn admit_portable_paths<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    use unicode_normalization::UnicodeNormalization as _;
+    let mut keyed = Vec::new();
+    for name in names {
+        let invalid = || format!("filename {name:?} is not portable; rename it before sharing");
+        let path = vot_manifest::PackagePath::portable(name.split('/')).map_err(|_| invalid())?;
+        let key = vot_manifest::canonical_path_key(&path, vot_manifest::PathProfile::Portable)
+            .map_err(|_| invalid())?;
+        let key = String::from_utf8(key).map_err(|_| invalid())?;
+        // Preserve VOT's Turkish-I rule and NUL separators while strengthening Unicode folding.
+        let folded: String = unicase::UniCase::new(key).to_folded_case().nfc().collect();
+        keyed.push((folded.into_bytes(), name));
+    }
+    keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    for pair in keyed.windows(2) {
+        if pair[0].0 == pair[1].0 || vot_manifest::is_path_prefix(&pair[0].0, &pair[1].0) {
+            return Err(format!(
+                "filenames {:?} and {:?} collide on recipient filesystems; rename one before sharing",
+                pair[0].1, pair[1].1
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Produces `name`, `name-1`, `name-2`, ... keeping the extension.
 pub fn with_suffix(name: &str, attempt: u32) -> String {
     if attempt == 0 {
@@ -476,6 +504,54 @@ pub(crate) fn walk(dir: &Path, visit: &mut impl FnMut(&Path, &str, bool) -> bool
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn portable_names_reject_aliases_and_file_directory_prefixes() {
+        for names in [
+            vec!["Café.mov", "Cafe\u{301}.mov"],
+            vec!["ΣΊΣΥΦΟΣ.mov", "σίσυφος.mov"],
+            vec!["ſtraße.mov", "strasse.mov"],
+            vec!["Straße.mov", "STRAẞE.mov"],
+            vec!["I.mov", "ı.mov"],
+            vec!["İ.mov", "i.mov"],
+            vec!["folder/Café", "folder/Cafe\u{301}/clip"],
+            vec!["foo", "foo-bar", "FOO/child"],
+            vec!["foo", "foo.bar", "foo/child"],
+            vec!["duplicate", "duplicate"],
+        ] {
+            for order in [names.clone(), names.into_iter().rev().collect()] {
+                assert!(
+                    super::admit_portable_paths(order.iter().copied())
+                        .unwrap_err()
+                        .contains("collide"),
+                    "{order:?}"
+                );
+            }
+        }
+        for name in [
+            "",
+            "/a",
+            "a//b",
+            "a/../b",
+            "a\\b",
+            "XML:EDL/a",
+            "NUL.txt",
+            "a.",
+            "a ",
+        ] {
+            assert!(super::admit_portable_paths([name])
+                .unwrap_err()
+                .contains("not portable"));
+        }
+        for names in [
+            vec!["Café.mov", "Cafe.mov"],
+            vec!["a/Café.mov", "b/Cafe\u{301}.mov"],
+            vec!["foo", "foobar/child"],
+            vec!["foo/one", "foo/two"],
+        ] {
+            super::admit_portable_paths(names).unwrap();
+        }
+    }
+
     #[test]
     fn landing_probe_accepts_a_tight_directory_and_leaves_nothing_behind() {
         let directory = tempfile::tempdir().unwrap();
