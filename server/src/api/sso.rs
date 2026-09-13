@@ -12,7 +12,7 @@
 
 use std::fmt::Write as _;
 
-use axum::extract::{Query, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use hmac::Mac as _;
@@ -479,10 +479,28 @@ async fn start_flow(
         .into_response())
 }
 
+fn sso_rate(app: &App, headers: &HeaderMap, peer: &std::net::SocketAddr) -> super::ApiResult<()> {
+    let ip = super::client_ip(headers, peer, &app.config.trusted_proxies);
+    if app.sso_rate.allow(&super::throttle_key(&ip)) {
+        Ok(())
+    } else {
+        Err(super::ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many SSO sign-in requests; wait ten minutes, then start sign-in again",
+        )
+        .with_retry_after(600))
+    }
+}
+
 pub async fn sso_start(
     State(app): State<std::sync::Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
     Query(params): Query<StartParams>,
 ) -> Response {
+    if let Err(error) = sso_rate(&app, &headers, &peer) {
+        return error.into_response();
+    }
     let desktop = match params.desktop() {
         Ok(desktop) => desktop,
         Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
@@ -521,12 +539,16 @@ fn sso_error_code(message: &str) -> &'static str {
 
 /// Finishes the flow: validates state, exchanges the code with the PKCE
 /// verifier, maps groups to a role, issues the admin cookie, and returns to
-/// the dashboard. Any failure redirects home with ?sso_error=...
+/// the dashboard. Admitted failures redirect home with ?sso_error=...
 pub async fn sso_callback(
     State(app): State<std::sync::Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Query(params): Query<CallbackParams>,
 ) -> Response {
+    if let Err(error) = sso_rate(&app, &headers, &peer) {
+        return error.into_response();
+    }
     let app_for_home = std::sync::Arc::clone(&app);
     let home = move |message: &str| {
         if !message.is_empty() {
@@ -1046,6 +1068,245 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sso_routes_share_a_budget_before_provider_calls_and_audit() {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::Request;
+        use http_body_util::BodyExt as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tower::ServiceExt as _;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let metadata = json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "jwks_uri": format!("{issuer}/jwks"),
+            "response_types_supported": ["code"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["RS256"]
+        });
+        let provider = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            seen.fetch_add(1, Ordering::Relaxed);
+            let metadata = metadata.clone();
+            async move {
+                match uri.path() {
+                    "/.well-known/openid-configuration" => axum::Json(metadata).into_response(),
+                    "/jwks" => axum::Json(json!({"keys": []})).into_response(),
+                    "/token" => (
+                        StatusCode::BAD_REQUEST,
+                        axum::Json(json!({"error": "invalid_grant"})),
+                    )
+                        .into_response(),
+                    _ => panic!("unexpected provider request: {uri}"),
+                }
+            }
+        });
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move { axum::serve(listener, provider).await.unwrap() });
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::api::testing::config(directory.path());
+        config.oidc = Some(crate::config::OidcConfig {
+            issuer,
+            client_id: "votport".into(),
+            client_secret: "secret".into(),
+            admin_group: None,
+            auditor_group: None,
+            subject_claim: crate::config::SubjectClaim::Sub,
+        });
+        let app = crate::app::build(config).unwrap();
+        let router = crate::app::router(Arc::clone(&app));
+        let peer: std::net::SocketAddr = "198.51.100.1:1234".parse().unwrap();
+        let mut callback = String::new();
+        let mut cookie = String::new();
+        for flow in 0..100 {
+            let start = if flow % 2 == 0 {
+                "/api/admin/sso/start".to_owned()
+            } else {
+                format!(
+                    "/api/admin/sso/start?desktop_challenge={}&desktop_state={}",
+                    "ab".repeat(32),
+                    "cd".repeat(16)
+                )
+            };
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                router.clone().oneshot(
+                    Request::get(start)
+                        .extension(ConnectInfo(peer))
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::FOUND, "start {flow}");
+            cookie = response.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap()
+                .to_owned();
+            let redirect =
+                reqwest::Url::parse(response.headers()[header::LOCATION].to_str().unwrap())
+                    .unwrap();
+            let state = redirect
+                .query_pairs()
+                .find(|(name, _)| name == "state")
+                .unwrap()
+                .1;
+            callback = format!("/api/admin/callback?code=junk&state={state}");
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                router.clone().oneshot(
+                    Request::get(&callback)
+                        .extension(ConnectInfo(peer))
+                        .header(header::COOKIE, &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::FOUND, "callback {flow}");
+            assert_eq!(
+                response.headers()[header::LOCATION],
+                "/?sso_error=unavailable"
+            );
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 102);
+        assert_eq!(app.store.audit_recent(None, 0, 1000).unwrap().len(), 100);
+        for path in [
+            &callback,
+            "/api/admin/sso/start",
+            "/api/admin/callback?error=refused",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::get(path)
+                        .extension(ConnectInfo(peer))
+                        .header(header::COOKIE, &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{path}");
+            assert_eq!(response.headers()[header::RETRY_AFTER], "600");
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 102);
+        assert_eq!(app.store.audit_recent(None, 0, 1000).unwrap().len(), 100);
+        let response = router
+            .oneshot(
+                Request::post("/api/admin/login")
+                    .extension(ConnectInfo(peer))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-votport", "1")
+                    .body(Body::from(
+                        json!({"password": crate::api::testing::TEST_PASSWORD}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["ok"]
+                .as_bool()
+                .unwrap()
+        );
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sso_budget_uses_trusted_client_addresses_before_discovery() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::api::testing::config(directory.path());
+        config.trusted_proxies = vec![crate::config::IpCidr::parse("10.0.0.1/32").unwrap()];
+        config.oidc = Some(crate::config::OidcConfig {
+            issuer: "invalid issuer".into(),
+            client_id: "votport".into(),
+            client_secret: "secret".into(),
+            admin_group: None,
+            auditor_group: None,
+            subject_claim: crate::config::SubjectClaim::Sub,
+        });
+        let mut app = crate::app::build(config).unwrap();
+        std::sync::Arc::get_mut(&mut app).unwrap().sso_rate =
+            super::super::session_rate::SessionRate::with_limit(2);
+        let router = crate::app::router(std::sync::Arc::clone(&app));
+        for (peer, forwarded, denied) in [
+            ("198.51.100.1:1", "203.0.113.1", false),
+            ("198.51.100.1:2", "203.0.113.2", false),
+            ("198.51.100.1:3", "203.0.113.3", true),
+            ("198.51.100.2:1", "203.0.113.3", false),
+            ("10.0.0.2:1", "203.0.113.1", false),
+            ("10.0.0.2:2", "203.0.113.2", false),
+            ("10.0.0.2:3", "203.0.113.3", true),
+            ("10.0.0.1:1", "192.0.2.1, 203.0.113.1", false),
+            ("10.0.0.1:2", "192.0.2.2, 203.0.113.1", false),
+            ("10.0.0.1:3", "192.0.2.3, 203.0.113.1", true),
+            ("10.0.0.1:4", "192.0.2.3, 203.0.113.2", false),
+            ("[2001:db8:1::1]:1", "", false),
+            ("[2001:db8:1::2]:2", "", false),
+            ("[2001:db8:1::3]:3", "", true),
+            ("[2001:db8:2::1]:1", "", false),
+        ] {
+            let path = if denied {
+                "/api/admin/sso/start"
+            } else {
+                "/api/admin/callback"
+            };
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::get(path)
+                        .extension(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()))
+                        .header("x-forwarded-for", forwarded)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if denied {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    StatusCode::FOUND
+                },
+                "{peer}, {forwarded}"
+            );
+        }
+        let attempted = std::sync::atomic::AtomicBool::new(false);
+        let _ = app
+            .sso_client
+            .get_or_discover_with(|| async {
+                attempted.store(true, std::sync::atomic::Ordering::Relaxed);
+                Err("test discovery".into())
+            })
+            .await;
+        assert!(
+            attempted.load(std::sync::atomic::Ordering::Relaxed),
+            "a refused start must leave discovery unattempted, outside its failure cooldown"
+        );
+        assert_eq!(app.store.audit_recent(None, 0, 1000).unwrap().len(), 11);
+    }
+
+    #[tokio::test]
     async fn callback_failure_redirects_with_a_code_and_clears_state() {
         use axum::body::Body;
         use axum::http::Request;
@@ -1071,6 +1332,9 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::get(format!("/api/admin/callback{query}"))
+                        .extension(ConnectInfo(
+                            "198.51.100.1:1234".parse::<std::net::SocketAddr>().unwrap(),
+                        ))
                         .header(header::COOKIE, cookie)
                         .body(Body::empty())
                         .unwrap(),

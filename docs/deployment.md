@@ -389,6 +389,12 @@ disclosure when SSO is configured; the form stays in the page. Without SSO
 the form stays expanded even if `VOTPORT_PUBLIC_PASSWORD_LOGIN=0`. An
 unreachable IdP may mute the SSO button, never the password form.
 
+SSO start and callback requests share a limit of 200 per ten minutes for each
+client address (IPv6 addresses share a /64 bucket). A normal sign-in uses two
+requests. Excess requests return HTTP 429 with `Retry-After: 600` before provider
+calls or failure audit writes. This budget is separate from local password
+sign-in and uses the same `VOTPORT_TRUSTED_PROXIES` rules.
+
 The macOS and Windows apps use the same provider configuration. In Settings,
 enter the port address and choose **Sign in with SSO**. Finish sign-in in the
 default browser and allow it to open Votport. The app receives a one-use code
@@ -607,6 +613,10 @@ Recheck after recreating the network. Naming an address the proxy does not
 connect from collapses every client into one bucket, so confirm afterwards
 that failed sign-ins from two different clients still log two different `ip`
 values.
+
+Public port discovery (`GET /api/port`) shares the recipient authentication
+budget of 6,000 requests per ten minutes for each client address. Exhaustion
+returns HTTP 429 with `Retry-After: 600` before settings reads or signing.
 
 ## Metrics
 

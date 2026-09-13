@@ -65,8 +65,11 @@ pub struct DiscoveryQuery {
 }
 pub async fn discover(
     State(app): State<Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
     Query(query): Query<DiscoveryQuery>,
 ) -> ApiResult<Response> {
+    super::outbound::workflows::recipient_rate(&app, &headers, &peer)?;
     if !crate::workflow::valid_id(&query.challenge) {
         return Err(invalid("invalid discovery challenge"));
     }
@@ -814,4 +817,120 @@ pub async fn refresh_route(app: &Arc<App>, route: &TradeRoute) -> ApiResult<()> 
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn discovery_limits_requests_before_identity_reads_and_signing() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::api::testing::config(directory.path());
+        config.trusted_proxies = vec![crate::config::IpCidr::parse("10.0.0.1/32").unwrap()];
+        let mut app = crate::app::build(config).unwrap();
+        Arc::get_mut(&mut app).unwrap().automation_read_rate =
+            super::super::session_rate::SessionRate::with_limit(2);
+        let router = crate::app::router(Arc::clone(&app));
+        for (peer, forwarded, denied) in [
+            ("198.51.100.1:1", "203.0.113.1", false),
+            ("198.51.100.1:2", "203.0.113.2", false),
+            ("198.51.100.1:3", "203.0.113.3", true),
+            ("198.51.100.2:1", "203.0.113.3", false),
+            ("10.0.0.1:1", "192.0.2.1, 203.0.113.1", false),
+            ("10.0.0.1:2", "192.0.2.2, 203.0.113.1", false),
+            ("10.0.0.1:3", "192.0.2.3, 203.0.113.1", true),
+            ("10.0.0.1:4", "192.0.2.3, 203.0.113.2", false),
+        ] {
+            let challenge = crate::auth::random_token();
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::get(format!("/api/port?challenge={challenge}"))
+                        .extension(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()))
+                        .header("x-forwarded-for", forwarded)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if denied {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    StatusCode::OK
+                },
+                "{peer}, {forwarded}"
+            );
+            if denied {
+                assert_eq!(response.headers()[header::RETRY_AFTER], "600");
+            } else {
+                assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let message: SignedPortMessage = serde_json::from_slice(&bytes).unwrap();
+                assert!(message.verify("discovery", "", now()));
+                assert_eq!(message.document.issuer, app.signer.public_hex);
+                assert_eq!(message.document.nonce, challenge);
+            }
+        }
+        let peer = ConnectInfo("198.51.100.1:1".parse::<std::net::SocketAddr>().unwrap());
+        let request = app.signer.port_message(
+            "status",
+            "",
+            crate::auth::random_token(),
+            now() + 300,
+            json!({}),
+        );
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/port/status")
+                    .extension(peer)
+                    .header("x-votport", "1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/api/admin/callback")
+                    .extension(peer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+        app.store
+            .with(|connection| connection.execute_batch("DROP TABLE settings"))
+            .unwrap();
+        for (peer, status) in [
+            ("198.51.100.1:1", StatusCode::TOO_MANY_REQUESTS),
+            ("198.51.100.3:1", StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::get(format!(
+                        "/api/port?challenge={}",
+                        crate::auth::random_token()
+                    ))
+                    .extension(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()))
+                    .body(Body::empty())
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+        }
+    }
 }

@@ -108,6 +108,8 @@ pub struct App {
     /// OIDC configuration when SSO is enabled; the client discovers lazily.
     pub sso_config: Option<crate::config::OidcConfig>,
     pub sso_client: SsoSlot,
+    /// Shared SSO start/callback budget, independent of local password sign-in.
+    pub sso_rate: crate::api::session_rate::SessionRate,
     pub desktop_sign_ins: crate::api::sso::DesktopSignIns,
     pub push: Option<PushState>,
     /// The VOT serve listener for Deliver over QUIC, when bound.
@@ -852,6 +854,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         http,
         sso_config: config.oidc.clone(),
         sso_client: SsoSlot::new(),
+        sso_rate: crate::api::session_rate::SessionRate::with_limit(200),
         desktop_sign_ins: crate::api::sso::DesktopSignIns::default(),
         push,
         serve,
