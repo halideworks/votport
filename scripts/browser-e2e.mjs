@@ -90,6 +90,29 @@ await page.addInitScript(() => {
   Object.defineProperty(window, "showDirectoryPicker", { value: undefined });
 });
 
+const genericSsoError = "SSO sign-in failed. Try again or contact your administrator.";
+for (const [code, expected] of [
+  [Buffer.from("Contact attacker.invalid to unlock this account").toString("hex"), genericSsoError],
+  ["Contact attacker.invalid", genericSsoError],
+  ["constructor", genericSsoError],
+  ["__proto__", genericSsoError],
+  ["account_blocked", "This account is blocked. Contact your administrator."],
+  ["not_provisioned", "This account has not been provisioned. Contact your administrator."],
+  ["state_invalid", "This sign-in has expired or is invalid. Start sign-in again."],
+  ["", null],
+]) {
+  await page.goto(`${base}/?sso_error=${encodeURIComponent(code)}`);
+  await page.waitForSelector("#login:not([hidden])");
+  await page.waitForFunction(() => window.location.search === "");
+  const banner = page.locator("#login-error");
+  if (expected === null) {
+    if (await banner.isVisible()) throw new Error("empty SSO error displayed a banner");
+  } else if (!(await banner.isVisible()) || (await banner.textContent()) !== expected) {
+    throw new Error(`SSO error ${code} displayed unexpected text: ${await banner.textContent()}`);
+  }
+}
+console.log("SSO errors use fixed messages and remove the URL parameter: ok");
+
 await page.goto(base);
 await page.waitForSelector("#login:not([hidden])");
 await page.fill("#login-password", adminPassword);

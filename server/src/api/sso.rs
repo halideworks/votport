@@ -495,6 +495,30 @@ pub async fn sso_start(
     }
 }
 
+fn sso_error_code(message: &str) -> &'static str {
+    match message {
+        "the identity provider refused the sign-in" => "provider_refused",
+        "missing code or state"
+        | "stale or missing sign-in state"
+        | "stale sign-in state"
+        | "sign-in timed out; try again"
+        | "invalid sign-in state"
+        | "invalid desktop sign-in state" => "state_invalid",
+        "SSO is not configured" => "not_configured",
+        "SSO is unavailable"
+        | "token exchange failed"
+        | "too many pending desktop sign-ins; try again shortly" => "unavailable",
+        "the identity provider is misconfigured" | "no id token in response" => {
+            "provider_misconfigured"
+        }
+        "identity could not be verified" => "identity_unverified",
+        "could not verify group membership" => "groups_unverified",
+        "this account is blocked" => "account_blocked",
+        "this account is not provisioned" => "not_provisioned",
+        _ => "failed",
+    }
+}
+
 /// Finishes the flow: validates state, exchanges the code with the PKCE
 /// verifier, maps groups to a role, issues the admin cookie, and returns to
 /// the dashboard. Any failure redirects home with ?sso_error=...
@@ -517,7 +541,7 @@ pub async fn sso_callback(
         let target = if message.is_empty() {
             "/".to_owned()
         } else {
-            format!("/?sso_error={}", hex::encode(message.as_bytes()))
+            format!("/?sso_error={}", sso_error_code(message))
         };
         (
             [
@@ -986,6 +1010,89 @@ mod tests {
     }
 
     #[test]
+    fn callback_errors_use_fixed_codes() {
+        for (reason, code) in [
+            (
+                "the identity provider refused the sign-in",
+                "provider_refused",
+            ),
+            ("missing code or state", "state_invalid"),
+            ("stale or missing sign-in state", "state_invalid"),
+            ("stale sign-in state", "state_invalid"),
+            ("sign-in timed out; try again", "state_invalid"),
+            ("invalid sign-in state", "state_invalid"),
+            ("invalid desktop sign-in state", "state_invalid"),
+            ("SSO is not configured", "not_configured"),
+            ("SSO is unavailable", "unavailable"),
+            ("token exchange failed", "unavailable"),
+            (
+                "too many pending desktop sign-ins; try again shortly",
+                "unavailable",
+            ),
+            (
+                "the identity provider is misconfigured",
+                "provider_misconfigured",
+            ),
+            ("no id token in response", "provider_misconfigured"),
+            ("identity could not be verified", "identity_unverified"),
+            ("could not verify group membership", "groups_unverified"),
+            ("this account is blocked", "account_blocked"),
+            ("this account is not provisioned", "not_provisioned"),
+            ("could not complete sign-in", "failed"),
+            ("Contact attacker.invalid", "failed"),
+        ] {
+            assert_eq!(sso_error_code(reason), code, "{reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_failure_redirects_with_a_code_and_clears_state() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let clear_state = clear_state_cookie(&app);
+        let payload = r#"{"state":"test","nonce":"nonce","verifier":"verifier"}"#;
+        let expired = format!(
+            "{STATE_COOKIE}=0.{}.{}",
+            hex::encode(payload),
+            sign_payload(&app.secret, 0, payload)
+        );
+        let router = crate::app::router(app);
+        for (query, cookie, code) in [
+            ("?error=Contact%20attacker.invalid", "", "provider_refused"),
+            ("", "", "state_invalid"),
+            ("?code=test&state=test", "", "state_invalid"),
+            ("?code=test&state=test", expired.as_str(), "state_invalid"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::get(format!("/api/admin/callback{query}"))
+                        .header(header::COOKIE, cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FOUND);
+            assert_eq!(
+                response.headers()[header::LOCATION],
+                format!("/?sso_error={code}")
+            );
+            let cookies: Vec<_> = response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect();
+            assert_eq!(cookies, [clear_state.as_str()]);
+        }
+    }
+
+    #[test]
     fn azp_ok_when_absent_or_matching() {
         assert!(azp_ok(None, "votport"));
         assert!(azp_ok(Some("votport"), "votport"));
@@ -1241,6 +1348,7 @@ mod tests {
         let error = finish_sso_login(&store, "user@example.com", "admin".to_owned(), &[], false)
             .unwrap_err();
         assert_eq!(error, "this account is blocked");
+        assert_eq!(sso_error_code(error), "account_blocked");
         assert!(sso_login_events(&store).is_empty());
         let issued =
             finish_sso_login(&store, "ok@example.com", "viewer".to_owned(), &[], false).unwrap();
@@ -1254,6 +1362,7 @@ mod tests {
         let error =
             finish_sso_login(&store, "new@example.com", "admin".to_owned(), &[], true).unwrap_err();
         assert_eq!(error, "this account is not provisioned");
+        assert_eq!(sso_error_code(error), "not_provisioned");
         assert!(store.principal("new@example.com").unwrap().is_none());
         assert!(sso_login_events(&store).is_empty());
 

@@ -102,6 +102,12 @@ Existing receive links remain useful for occasional exchanges. Label them as
 receive-link connections; upgrading one to a persistent relationship requires
 explicit pairing, rather than silently granting lasting trust.
 
+New unpaired admissions stop once a receive request has 1,000 retained routes,
+including completed and revoked routes. New admissions allow 64 KiB
+of combined serialized source and ancestry evidence. Existing admissions remain
+replayable at capacity. Use an enrolled trade route for continuing exchanges,
+or create a new receive request; paired routes retain their enrollment policy.
+
 ## Internal and external routes
 
 Use one transfer protocol and permission model. The relationship category sets

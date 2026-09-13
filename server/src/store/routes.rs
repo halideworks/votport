@@ -39,6 +39,8 @@ fn row_route(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboundRoute> {
 
 const COLUMNS: &str =
     "id,tenant,link_id,source,session_id,transport,upload_id,receipt,revoked_at,ancestry";
+const MAX_UNPAIRED_ROUTE_BYTES: usize = 64 * 1024;
+const MAX_UNPAIRED_ROUTES: i64 = 1000;
 
 impl Store {
     pub fn route_progress(
@@ -113,6 +115,8 @@ impl Store {
         {
             return Err("invalid route evidence, forwarding loop or hop limit".into());
         }
+        let source_json = serde_json::to_string(source).map_err(|e| e.to_string())?;
+        let ancestry_json = serde_json::to_string(ancestry).map_err(|e| e.to_string())?;
         let mut connection = self.connection.lock().expect("store poisoned");
         let tx = connection.transaction().map_err(|e| e.to_string())?;
         let usable: bool = tx.query_row("SELECT active=1 AND (expires_at IS NULL OR expires_at>?3) FROM links WHERE tenant=?1 AND id=?2",params![tenant,link_id,now_unix() as i64],|row|row.get(0)).optional().map_err(|e|e.to_string())?.ok_or("receive request missing")?;
@@ -135,12 +139,30 @@ impl Store {
         if !usable {
             return Err("request is no longer accepting routes".into());
         }
+        if source.document.permission.is_none() {
+            if source_json.len().saturating_add(ancestry_json.len()) > MAX_UNPAIRED_ROUTE_BYTES {
+                return Err(
+                    "receive request route evidence exceeds 64 KiB; use an enrolled trade route"
+                        .into(),
+                );
+            }
+            let retained: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM inbound_routes WHERE tenant=?1 AND link_id=?2",
+                    params![tenant, link_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if retained >= MAX_UNPAIRED_ROUTES {
+                return Err("receive request route limit reached; use an enrolled trade route or a new receive request".into());
+            }
+        }
         let pending:i64 = tx.query_row("SELECT COUNT(*) FROM inbound_routes r JOIN links l ON l.id=r.link_id WHERE r.tenant=?1 AND r.receipt IS NULL AND r.revoked_at IS NULL AND l.active=1 AND (l.expires_at IS NULL OR l.expires_at>?2)",params![tenant,now_unix() as i64],|row|row.get(0)).map_err(|e|e.to_string())?;
         if pending >= 1000 {
             return Err("incoming route limit reached".into());
         }
         let id = crate::auth::random_token();
-        tx.execute("INSERT INTO inbound_routes(id,tenant,link_id,issuer,operation_id,source,created_at,ancestry) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",params![id,tenant,link_id,source.document.issuer,source.document.operation_id,serde_json::to_string(source).map_err(|e|e.to_string())?,now_unix() as i64,serde_json::to_string(ancestry).expect("ancestry serializes")]).map_err(|e|e.to_string())?;
+        tx.execute("INSERT INTO inbound_routes(id,tenant,link_id,issuer,operation_id,source,created_at,ancestry) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",params![id,tenant,link_id,source.document.issuer,source.document.operation_id,source_json,now_unix() as i64,ancestry_json]).map_err(|e|e.to_string())?;
         if let Some(permission) = &source.document.permission {
             tx.execute("INSERT INTO trade_delivery_policies(route_id,document) SELECT ?1,json_extract(document,'$.notifications') FROM trade_routes WHERE id=?2",params![id,permission.grant]).map_err(|e|e.to_string())?;
         }
@@ -476,6 +498,162 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpaired_route_limit_counts_retained_rows_and_preserves_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let signer =
+            crate::receipt::ReceiptSigner::load_or_create(source_directory.path()).unwrap();
+        let link = super::super::tests::test_link("incoming");
+        store.insert_link(link.clone()).unwrap();
+        let source = signer.sign_route(crate::route_protocol::RouteDocument {
+            issuer: signer.public_hex.clone(),
+            operation_id: "first".into(),
+            manifest: "ab".repeat(32),
+            label: "delivery".into(),
+            metadata: Default::default(),
+            parent_receipt: None,
+            visited: vec![signer.public_hex.clone()],
+            permission: None,
+        });
+        let route = store.receive_route("", &link.id, &source, &[]).unwrap();
+        let revocation = signer.revoke_route(
+            source.clone(),
+            store.event_signer.public_hex.clone(),
+            &route.id,
+        );
+        store.revoke_inbound_route(&route.id, &revocation).unwrap();
+        let receipt = store
+            .event_signer
+            .route_receipt(source.clone(), "retained".into(), 1);
+        // Seed retained rows without repeating 998 cryptographic admissions.
+        store.with(|c| c.execute(
+            "WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<998)
+             INSERT INTO inbound_routes(id,tenant,link_id,issuer,operation_id,source,ancestry,receipt,revoked_at,created_at)
+             SELECT 'retained-'||n,'',?1,'previous-peer','retained-'||n,?2,'[]',CASE WHEN n%2=0 THEN ?3 END,CASE WHEN n%2=1 THEN 1 END,1 FROM numbers",
+            params![link.id, serde_json::to_string(&source).unwrap(), serde_json::to_string(&receipt).unwrap()]
+        )).unwrap();
+        let last_source = signer.sign_route(crate::route_protocol::RouteDocument {
+            operation_id: "last".into(),
+            ..source.document.clone()
+        });
+        let last = store
+            .receive_route("", &link.id, &last_source, &[])
+            .unwrap();
+        let revoke_last =
+            signer.revoke_route(last_source, store.event_signer.public_hex.clone(), &last.id);
+        store.revoke_inbound_route(&last.id, &revoke_last).unwrap();
+        drop(store);
+        let store = Store::open(directory.path()).unwrap();
+        let replay = store.receive_route("", &link.id, &source, &[]).unwrap();
+        assert_eq!(replay.id, route.id);
+        assert!(replay.revoked_at.is_some());
+        let events = store.delivery_events("", 0, 100).unwrap();
+        let next = signer.sign_route(crate::route_protocol::RouteDocument {
+            operation_id: "next".into(),
+            ..source.document
+        });
+        assert_eq!(
+            store.receive_route("", &link.id, &next, &[]).unwrap_err(),
+            "receive request route limit reached; use an enrolled trade route or a new receive request"
+        );
+        assert_eq!(
+            serde_json::to_value(store.delivery_events("", 0, 100).unwrap()).unwrap(),
+            serde_json::to_value(events).unwrap()
+        );
+        let retained: i64 = store
+            .with(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM inbound_routes WHERE tenant='' AND link_id=?1",
+                    [&link.id],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(retained, 1000);
+        let other = super::super::tests::test_link("other");
+        store.insert_link(other.clone()).unwrap();
+        assert!(store.receive_route("", &other.id, &next, &[]).is_ok());
+    }
+
+    #[test]
+    fn unpaired_route_size_includes_escaped_ancestry() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_directory = tempfile::tempdir().unwrap();
+        let relay_directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let signer =
+            crate::receipt::ReceiptSigner::load_or_create(source_directory.path()).unwrap();
+        let relay = crate::receipt::ReceiptSigner::load_or_create(relay_directory.path()).unwrap();
+        let link = super::super::tests::test_link("incoming");
+        store.insert_link(link.clone()).unwrap();
+        let source = signer.sign_route(crate::route_protocol::RouteDocument {
+            issuer: signer.public_hex.clone(),
+            operation_id: "first".into(),
+            manifest: "ab".repeat(32),
+            label: "delivery".into(),
+            metadata: [
+                ("first".into(), "\0".repeat(4096)),
+                ("second".into(), "\0".repeat(4096)),
+            ]
+            .into(),
+            parent_receipt: None,
+            visited: vec![signer.public_hex.clone()],
+            permission: None,
+        });
+        let receipt = relay.route_receipt(source.clone(), "upload".into(), 1);
+        let forwarded = relay.sign_route(crate::route_protocol::RouteDocument {
+            operation_id: "forwarded".into(),
+            parent_receipt: Some(receipt.digest()),
+            visited: vec![signer.public_hex.clone(), relay.public_hex.clone()],
+            ..source.document.clone()
+        });
+        let ancestry = [receipt];
+        assert!(forwarded.admits(&store.event_signer.public_hex));
+        assert!(crate::route_protocol::verify_ancestry(
+            &forwarded, &ancestry
+        ));
+        let source_bytes = serde_json::to_string(&forwarded).unwrap().len();
+        let ancestry_bytes = serde_json::to_string(&ancestry).unwrap().len();
+        assert!(source_bytes < 65536 && ancestry_bytes < 65536);
+        assert!(source_bytes + ancestry_bytes > 65536);
+        assert_eq!(
+            store
+                .receive_route("", &link.id, &forwarded, &ancestry)
+                .unwrap_err(),
+            "receive request route evidence exceeds 64 KiB; use an enrolled trade route"
+        );
+        assert!(store.delivery_events("", 0, 100).unwrap().is_empty());
+        assert!(store.receive_route("", &link.id, &source, &[]).is_ok());
+        for size in [65536, 65537] {
+            let mut document = source.document.clone();
+            document.operation_id = format!("bytes-{size}");
+            document.metadata = (0..16)
+                .map(|n| (format!("pad{n:02}"), "a".repeat(4096)))
+                .collect();
+            let oversized = signer.sign_route(document.clone());
+            let excess = serde_json::to_string(&oversized).unwrap().len() + 2 - size;
+            document
+                .metadata
+                .get_mut("pad15")
+                .unwrap()
+                .truncate(4096 - excess);
+            let bounded = signer.sign_route(document);
+            assert!(bounded.admits(&store.event_signer.public_hex));
+            assert_eq!(serde_json::to_string(&bounded).unwrap().len() + 2, size);
+            let result = store.receive_route("", &link.id, &bounded, &[]);
+            if size == 65536 {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    "receive request route evidence exceeds 64 KiB; use an enrolled trade route"
+                );
+            }
+        }
+    }
 
     #[test]
     fn inbound_revocation_preserves_retirement_and_restore_holds() {
