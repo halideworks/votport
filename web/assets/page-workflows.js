@@ -443,7 +443,7 @@ for (const [kind, name] of [['members', 'member'], ['recipients', 'recipient'], 
 $('wp-sequence-enabled').onchange = $('wp-media-enabled').onchange = checkFields;
 $('workflow-save-webhook').hidden = $('workflow-webhook-refresh').hidden = !admin; $('workflow-webhook-access').hidden = admin;
 $('workflow-webhook-refresh').onclick = () => guard(() => loadAttempts()); $('workflow-webhook-more').onclick = () => guard(() => loadAttempts(true));
-$('workflow-events-next').onclick = () => guard(loadEvents); $('workflow-events-export').onclick = () => download(`delivery-events-${eventCursor}.json`, eventPage);
+$('workflow-events-next').onclick = () => guard(loadEvents); $('workflow-events-export').onclick = () => download(`delivery-activity-${eventCursor}.json`, { complete_chain: false, events: eventPage });
 window.addEventListener('hashchange', () => guard(showSection)); document.addEventListener('visibilitychange', schedulePoll); window.addEventListener('pagehide', () => clearTimeout(poll));
 await guard(showSection);
 

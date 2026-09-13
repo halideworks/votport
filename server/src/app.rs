@@ -2712,6 +2712,10 @@ pub fn router(app: Arc<App>) -> Router {
             get(api::outbound::workflows::events),
         )
         .route(
+            "/api/workflows/events/export",
+            get(api::outbound::workflows::export_events),
+        )
+        .route(
             "/api/workflows/storage",
             get(api::outbound::workflows::storage::list)
                 .put(api::outbound::workflows::storage::put)
