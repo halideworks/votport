@@ -680,7 +680,8 @@ pub async fn get_user(
 }
 
 /// PUT replaces the whole resource. userName is immutable here (it is the
-/// identity the sign-in path keys on), so only `active` can change.
+/// identity the sign-in path keys on). Only an explicit `active` changes
+/// whether the principal can sign in.
 pub async fn replace_user(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -694,12 +695,9 @@ pub async fn replace_user(
     if admit_subject(body.get("userName"))? != id {
         return Err(ScimError::mutability("userName cannot change"));
     }
-    let active = body
-        .get("active")
-        .map(parse_active)
-        .transpose()?
-        .unwrap_or(true);
-    set_active(&app, &id, active, &ip)?;
+    if let Some(active) = body.get("active") {
+        set_active(&app, &id, parse_active(active)?, &ip)?;
+    }
     Ok(scim_json(StatusCode::OK, resource(&app, &load(&app, &id)?)))
 }
 
@@ -1604,6 +1602,46 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(!application.store.principal_allows("gone@example.com", 1));
+        let revoked_version = application
+            .store
+            .principal("gone@example.com")
+            .unwrap()
+            .unwrap()
+            .credential_version;
+        let (status, json) = scim(
+            &application,
+            "PUT",
+            "/scim/v2/Users/gone@example.com",
+            Some(r#"{"userName":"gone@example.com"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["active"], false,
+            "omitting active must preserve revocation"
+        );
+        let row = application
+            .store
+            .principal("gone@example.com")
+            .unwrap()
+            .unwrap();
+        assert!(row.blocked);
+        assert_eq!(row.credential_version, revoked_version);
+        let (status, json) = scim(
+            &application,
+            "PUT",
+            "/scim/v2/Users/gone@example.com",
+            Some(r#"{"userName":"gone@example.com","active":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["active"], true);
+        assert!(application
+            .store
+            .principal_allows("gone@example.com", revoked_version));
+        assert!(!application
+            .store
+            .principal_allows("gone@example.com", revoked_version - 1));
     }
 
     #[tokio::test]
