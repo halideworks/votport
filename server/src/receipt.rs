@@ -188,8 +188,54 @@ impl ReceiptSigner {
         name.push(".vot-receipt");
         let sidecar = destination.sibling(&name).map_err(|e| e.to_string())?;
         write_sidecar_file(&sidecar, &bytes, |file, bytes| file.write_all(bytes))
+            .or_else(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    self.reuse_sidecar(&sidecar, &bytes)
+                } else {
+                    Err(error)
+                }
+            })
             .map_err(|error| format!("write or publish {}: {error}", sidecar.path().display()))?;
         Ok(sidecar.path())
+    }
+
+    fn reuse_sidecar(
+        &self,
+        sidecar: &vot_platform_fs::FileLocation,
+        expected: &[u8],
+    ) -> std::io::Result<()> {
+        use std::io::Read as _;
+        const MAX_BYTES: u64 = 64 * 1024;
+        let invalid = || std::io::Error::other("existing receipt does not match this publication");
+        let mut file = sidecar.open_read()?;
+        let mut bytes = Vec::new();
+        (&mut file).take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err(invalid());
+        }
+        let decoded = vot_receipt::decode_authenticated(&bytes).map_err(|_| invalid())?;
+        let verified =
+            vot_receipt::verify_ed25519(&decoded, &self.verifying_key()).map_err(|_| invalid())?;
+        let mut expected = vot_receipt::decode_authenticated(expected).map_err(|_| invalid())?;
+        let receipt = verified.receipt();
+        if decoded.key_id != expected.key_id || receipt.sequence < expected.receipt.sequence {
+            return Err(invalid());
+        }
+        // Journal replay omits failure/recovery transitions counted by the original observation.
+        expected.receipt.sequence = receipt.sequence;
+        expected
+            .receipt
+            .observed_at
+            .clone_from(&receipt.observed_at);
+        if receipt != &expected.receipt {
+            return Err(invalid());
+        }
+        file.sync_all()?;
+        sidecar.sync_parent()?;
+        if !sidecar.same_file(&file)? {
+            return Err(invalid());
+        }
+        Ok(())
     }
 
     /// Encodes a signed receipt for a newly prepared object.
@@ -544,6 +590,121 @@ mod tests {
                 let name = name.to_string_lossy();
                 name.starts_with(".vot-") && name.ends_with(".stage")
             }));
+    }
+
+    #[test]
+    fn receipt_reuse_requires_the_same_signed_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let signer = ReceiptSigner::load_or_create(directory.path()).unwrap();
+        let destination =
+            vot_platform_fs::FileLocation::from_path(&directory.path().join("frame")).unwrap();
+        let sidecar = destination
+            .sibling(std::ffi::OsStr::new("frame.vot-receipt"))
+            .unwrap();
+        let object = ObjectId {
+            suite: 1,
+            root: [9; 32],
+            length: 5,
+        };
+        let observation = PublishObservation {
+            incarnation: [3; 16],
+            sequence: 7,
+        };
+        let profile = vot_sdk_file::CommitProfile::Balanced;
+        let bytes = signer
+            .encode(
+                &object,
+                [2; 16],
+                observation,
+                profile,
+                vot_sdk_file::NasContract::Unqualified,
+            )
+            .unwrap();
+        let mut original = vot_receipt::decode_authenticated(&bytes).unwrap().receipt;
+        original.observed_at = "2000-01-01T00:00:00Z".into();
+        let encode = |receipt, key: &SigningKey, key_id: &[u8]| {
+            encode_authenticated(&sign_ed25519(receipt, key_id, key).unwrap()).unwrap()
+        };
+        let key_id = signer.verifying_key().to_bytes();
+        type Change = fn(&mut Receipt);
+        let changes: &[(&str, Change)] = &[
+            ("kind", |r| r.subject_kind = SubjectKind::Package),
+            ("suite", |r| r.suite_id = 2),
+            ("digest", |r| r.subject_digest[0] ^= 1),
+            ("length", |r| r.subject_length += 1),
+            ("assurance", |r| r.assurance = AssuranceLevel::Durable),
+            ("profile", |r| r.profile = CommitProfile::Fast),
+            ("predecessor", |r| {
+                r.actual_predecessor = AssuranceLevel::TransitVerified
+            }),
+            ("provider", |r| r.provider = 5),
+            ("version", |r| r.provider_version[0] += 1),
+            ("session", |r| r.session_id[0] ^= 1),
+            ("incarnation", |r| r.incarnation_id[0] ^= 1),
+            ("sequence", |r| r.sequence -= 1),
+            ("clock", |r| r.clock_source = 0),
+            ("flags", |r| r.flags = 1),
+            ("previous", |r| r.previous = Some([4; 32])),
+        ];
+        let mut cases = vec![("same", encode(original.clone(), &signer.key, &key_id), true)];
+        let mut retried = original.clone();
+        retried.sequence += 2;
+        cases.push((
+            "replayed sequence",
+            encode(retried, &signer.key, &key_id),
+            true,
+        ));
+        for (name, change) in changes {
+            let mut changed = original.clone();
+            change(&mut changed);
+            cases.push((name, encode(changed, &signer.key, &key_id), false));
+        }
+        let other = SigningKey::from_bytes(&[8; 32]);
+        cases.push((
+            "other signer",
+            encode(original.clone(), &other, &key_id),
+            false,
+        ));
+        cases.push((
+            "other key label",
+            encode(original.clone(), &signer.key, &[8; 32]),
+            false,
+        ));
+        let mut invalid = vot_receipt::decode_authenticated(&bytes).unwrap();
+        invalid.authentication[0] ^= 1;
+        cases.push((
+            "invalid signature",
+            encode_authenticated(&invalid).unwrap(),
+            false,
+        ));
+        cases.push(("malformed", b"existing evidence".to_vec(), false));
+        cases.push(("oversized", vec![0; 64 * 1024 + 1], false));
+        for (name, bytes, accepted) in cases {
+            std::fs::write(sidecar.path(), &bytes).unwrap();
+            let identity = sidecar.identity().unwrap();
+            let result = signer.write_sidecar(&destination, &object, [2; 16], observation, profile);
+            assert_eq!(result.is_ok(), accepted, "{name}: {result:?}");
+            assert_eq!(std::fs::read(sidecar.path()).unwrap(), bytes, "{name}");
+            assert_eq!(sidecar.identity().unwrap(), identity, "{name}");
+            assert_eq!(
+                std::fs::read_dir(directory.path().join(".vot-stage"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+        let target = directory.path().join("retained-evidence");
+        let bytes = encode(original, &signer.key, &key_id);
+        std::fs::write(&target, &bytes).unwrap();
+        std::fs::remove_file(sidecar.path()).unwrap();
+        std::os::unix::fs::symlink(&target, sidecar.path()).unwrap();
+        assert!(signer
+            .write_sidecar(&destination, &object, [2; 16], observation, profile)
+            .is_err());
+        assert!(std::fs::symlink_metadata(sidecar.path())
+            .unwrap()
+            .is_symlink());
+        assert_eq!(std::fs::read(target).unwrap(), bytes);
     }
 
     #[test]

@@ -5914,6 +5914,31 @@ mod push_tests {
     }
 
     #[test]
+    fn publication_recovery_recognizes_its_existing_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"frame";
+        let object = object(Suite::Blake3Bao64, bytes);
+        let setup = setup(directory.path(), object.clone());
+        let source = directory.path().join("source");
+        fs::write(&source, bytes).unwrap();
+        let mut file = open_destination_for(&setup, vec!["frame".into()], object).unwrap();
+        reprove_staging(&source, &file.object.clone(), vec![&mut file], || true).unwrap();
+        persist_session(&setup, std::slice::from_ref(&file)).unwrap();
+        publish_file(&setup, &mut file, || true).unwrap();
+        assert!(file.published && file.receipt);
+        let sidecar = setup.dest_dir.join("frame.vot-receipt");
+        let evidence = fs::read(&sidecar).unwrap();
+        file.native.take().unwrap().abandon();
+        let mut saved = setup.store.load_upload_sessions().unwrap().remove(0);
+        assert!(!saved.files[0].published && !saved.files[0].receipt);
+        let (files, _) = restore_files(&setup, &mut saved, || true).unwrap();
+        assert!(files[0].published && files[0].receipt);
+        assert_eq!(fs::read(&sidecar).unwrap(), evidence);
+        assert_eq!(fs::read(setup.dest_dir.join("frame")).unwrap(), bytes);
+        assert!(setup.store.load_upload_sessions().unwrap()[0].files[0].receipt);
+    }
+
+    #[test]
     fn publication_journal_remains_until_the_database_checkpoints_it() {
         let directory = tempfile::tempdir().unwrap();
         let object = object(Suite::Blake3Bao64, b"");
