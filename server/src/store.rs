@@ -756,6 +756,8 @@ impl Store {
             .try_exists()
             .map_err(|e| e.to_string())?;
         let path = data_dir.join("votport.db");
+        // Closing another descriptor for a live SQLite file releases its POSIX locks.
+        // Tighten permissions before opening; new journals inherit the database mode.
         match crate::paths::tighten_private_file(&path)? {
             true => {}
             false if promotion => {
@@ -841,9 +843,6 @@ impl Store {
             )?),
             path: path.clone(),
         };
-        crate::paths::tighten_private_file(&path)?;
-        crate::paths::tighten_private_file(&wal)?;
-        crate::paths::tighten_private_file(&shm)?;
         Ok(store)
     }
 
@@ -4945,6 +4944,91 @@ pub(crate) mod tests {
             .with(|connection| connection.execute_batch("DROP TABLE principals"))
             .unwrap();
         assert!(!store.principal_allows("user@example.com", 1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_sqlite_readers_preserve_open_database_locks() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        const CHILD_DATABASE: &str = "VOTPORT_TEST_EXTERNAL_DATABASE";
+        const CHILD_BACKUP: &str = "VOTPORT_TEST_EXTERNAL_BACKUP";
+        if let Some(path) = std::env::var_os(CHILD_DATABASE) {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let retained = matches!(
+                rustix::fs::fcntl_lock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive,),
+                Err(rustix::io::Errno::AGAIN | rustix::io::Errno::ACCESS)
+            );
+            drop(file);
+            println!("database lock retained={retained}");
+            let connection = Connection::open(&path).unwrap();
+            let count: i64 = connection
+                .query_row("SELECT count(*) FROM links", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 1);
+            if let Some(destination) = std::env::var_os(CHILD_BACKUP) {
+                connection
+                    .execute("VACUUM INTO ?1", [destination.to_str().unwrap()])
+                    .unwrap();
+            }
+            return;
+        }
+
+        for (reopen, backup) in [(false, false), (false, true), (true, false), (true, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            store.insert_link(test_link("before-reader")).unwrap();
+            let store = if reopen {
+                drop(store);
+                Store::open(directory.path()).unwrap()
+            } else {
+                store
+            };
+            let files = ["votport.db", "votport.db-wal", "votport.db-shm"]
+                .map(|name| directory.path().join(name));
+            let identities = files.each_ref().map(|path| {
+                let metadata = std::fs::metadata(path).unwrap();
+                assert_eq!(metadata.mode() & 0o777, 0o600);
+                (metadata.dev(), metadata.ino())
+            });
+            let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "store::tests::external_sqlite_readers_preserve_open_database_locks",
+                    "--nocapture",
+                ])
+                .env(CHILD_DATABASE, &files[0])
+                .env_remove(CHILD_BACKUP)
+                .kill_on_drop(true);
+            if backup {
+                command.env(CHILD_BACKUP, directory.path().join("external.db"));
+            }
+            let output = tokio::time::timeout(std::time::Duration::from_secs(20), command.output())
+                .await
+                .expect("external SQLite reader timed out")
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            let shared_lock =
+                String::from_utf8_lossy(&output.stdout).contains("database lock retained=true");
+            let locks_retained = files.iter().zip(identities).all(|(path, identity)| {
+                std::fs::metadata(path)
+                    .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == identity)
+            });
+            store.insert_link(test_link("after-reader")).unwrap();
+            assert!(store.link("", "after-reader").unwrap().is_some());
+            let snapshot = store.backup_into(&directory.path().join("snapshot.db"));
+            drop(store);
+            let reopened = Store::open(directory.path()).unwrap();
+            let durable = reopened.link("", "after-reader").unwrap().is_some();
+            assert!(shared_lock && locks_retained && snapshot.is_ok() && durable,
+                "reopen={reopen}, external backup={backup}: shared lock={shared_lock}, database/WAL identities retained={locks_retained}, snapshot={snapshot:?}, acknowledged write survived={durable}");
+        }
     }
 
     pub(crate) fn test_link(id: &str) -> Link {
