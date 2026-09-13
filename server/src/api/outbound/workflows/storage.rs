@@ -729,44 +729,48 @@ fn sync_directory(path: &Path) -> ApiResult<()> {
 }
 
 pub(super) async fn export(app: &Arc<App>, job: &Job) -> ApiResult<()> {
-    let mut pending = vec![];
     app.store
         .require_delivery_export(&job.id, job.attempts)
         .map_err(conflict)?;
-    for id in &job.project.destinations {
-        if job.checks["destinations"][id]["state"] == "complete" {
-            continue;
-        }
-        let config = authorized_storage(app, &job.tenant, id)?;
-        if job.checks["destination_revisions"][id].as_u64() != Some(config.revision) {
-            return Err(conflict(
-                "storage configuration changed; submit a new delivery".into(),
-            ));
-        }
-        pending.push(config);
-    }
     let mut failures = vec![];
-    let mut transfers = futures_util::stream::iter(pending.into_iter().map(|config| async move {
-        let result = export_destination(app, job, &config).await;
-        (config, result)
+    let pending: Vec<_> = job
+        .project
+        .destinations
+        .iter()
+        .filter(|id| job.checks["destinations"][*id]["state"] != "complete")
+        .cloned()
+        .collect();
+    let mut transfers = futures_util::stream::iter(pending.into_iter().map(|id| async move {
+        let (label, result) =
+            match app
+                .store
+                .require_delivery_destination(&job.id, job.attempts, &id)
+            {
+                Ok(config) => (
+                    config.label.clone(),
+                    export_destination(app, job, &config).await,
+                ),
+                Err(error) => (id.clone(), Err(conflict(error))),
+            };
+        (id, label, result)
     }))
     .buffer_unordered(2);
-    while let Some((config, result)) = transfers.next().await {
+    while let Some((id, label, result)) = transfers.next().await {
         if let Err(error) = result {
             app.store
-                .fail_delivery_destination(&job.id, job.attempts, &config.id, &error.message)
+                .fail_delivery_destination(&job.id, job.attempts, &id, &error.message)
                 .map_err(conflict)?;
-            if job.checks["destinations"][&config.id]["state"] != "failed" {
+            if job.checks["destinations"][&id]["state"] != "failed" {
                 if let (Ok(route), Ok(policy)) = (
-                    app.store.trade_route(&job.tenant, &config.id),
+                    app.store.trade_route(&job.tenant, &id),
                     serde_json::from_value(
-                        job.checks["trade_routes"][&config.id]["notifications"].clone(),
+                        job.checks["trade_routes"][&id]["notifications"].clone(),
                     ),
                 ) {
                     crate::notify::trade_event(app, &route, &policy, "route_failed").await;
                 }
             }
-            failures.push(format!("{}: {}", config.label, error.message));
+            failures.push(format!("{}: {}", label, error.message));
         }
     }
     if failures.is_empty() {
@@ -794,7 +798,7 @@ async fn export_destination(app: &Arc<App>, job: &Job, config: &Storage) -> ApiR
     let mut files = vec![];
     for (index, file) in grant.files.iter().enumerate() {
         app.store
-            .require_delivery_export(&job.id, job.attempts)
+            .require_delivery_destination(&job.id, job.attempts, &config.id)
             .map_err(conflict)?;
         let key = config.key(&format!("{prefix}/files/{}", file.name))?;
         guard_folder_key(config, &key)?;
@@ -806,7 +810,7 @@ async fn export_destination(app: &Arc<App>, job: &Job, config: &Storage) -> ApiR
         files.push(json!({"name": file.name,"suite": file.suite,"root": file.root,"bytes": file.bytes,"key": key.to_string(),"receipt": receipt}));
     }
     app.store
-        .require_delivery_export(&job.id, job.attempts)
+        .require_delivery_destination(&job.id, job.attempts, &config.id)
         .map_err(conflict)?;
     let document = json!({"format": "votport-delivery-export-v1","job_id": job.id,"manifest": manifest,"metadata": job.request.metadata,"project_id": job.project.id,"policy_revision": job.project.revision,"approved_by": job.approved_by,"checks": export_checks(job),"files": files,"issuer": app.signer.public_hex});
     let attestation =
@@ -853,9 +857,6 @@ async fn export_destination(app: &Arc<App>, job: &Job, config: &Storage) -> ApiR
 }
 
 fn export_checks(job: &Job) -> serde_json::Value {
-    if let Some(checks) = job.checks.get("legacy_export_checks") {
-        return checks.clone();
-    }
     let mut checks = serde_json::Map::new();
     for key in [
         "metadata",

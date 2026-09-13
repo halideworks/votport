@@ -1,4 +1,5 @@
 use super::*;
+use crate::api::outbound::workflows::storage::Storage;
 use crate::workflow::{Job, JobRequest, Project};
 use rusqlite::params;
 
@@ -582,6 +583,17 @@ impl Store {
         export_in(&connection, id, attempt)
     }
 
+    pub fn require_delivery_destination(
+        &self,
+        id: &str,
+        attempt: u64,
+        destination: &str,
+    ) -> Result<Storage, String> {
+        let connection = self.connection.lock().expect("store poisoned");
+        let job = export_in(&connection, id, attempt)?;
+        check_job_destination(&connection, &job, destination)
+    }
+
     pub fn complete_delivery_export(
         &self,
         id: &str,
@@ -592,10 +604,7 @@ impl Store {
         let mut connection = self.connection.lock().expect("store poisoned");
         let tx = connection.transaction().map_err(|e| e.to_string())?;
         let mut job = export_in(&tx, id, attempt)?;
-        trade::check_destination(&tx, &job, destination)?;
-        if !job.project.destinations.iter().any(|id| id == destination) {
-            return Err("destination is not part of this job".into());
-        }
+        check_job_destination(&tx, &job, destination)?;
         job.checks["destinations"][destination] =
             serde_json::json!({"state":"complete", "location":key, "completed_at":now_unix()});
         if job
@@ -1089,40 +1098,65 @@ impl Store {
 }
 
 fn check_job_storage(connection: &Connection, job: &Job) -> Result<(), String> {
-    trade::check_export(connection, job)?;
-    let mut connections = job
-        .project
-        .destinations
-        .iter()
-        .map(|id| {
-            (
-                id.as_str(),
-                job.checks["destination_revisions"][id].as_u64(),
-            )
-        })
-        .collect::<Vec<_>>();
-    if let Some(import) = &job.request.import {
-        connections.push((
-            &import.storage_id,
-            job.checks["import_storage_revision"].as_u64(),
-        ));
-    }
-    for (id, revision) in connections {
-        let config = connection
-            .query_row(
-                "SELECT document FROM delivery_storage WHERE id=?1",
-                [id],
-                |row| decode::<crate::api::outbound::workflows::storage::Storage>(row.get(0)?),
-            )
-            .map_err(|_| "storage connection missing")?;
-        if !config.enabled
-            || !config.tenants.contains(&job.tenant)
-            || Some(config.revision) != revision
-        {
-            return Err("storage authorization changed; submit a new job".into());
+    check_job_source(connection, job)?;
+    for id in &job.project.destinations {
+        if job.checks["destinations"][id]["state"] != "complete" {
+            check_job_destination(connection, job, id)?;
         }
     }
     Ok(())
+}
+
+fn check_job_source(connection: &Connection, job: &Job) -> Result<(), String> {
+    trade::check_export(connection, job)?;
+    if let Some(import) = &job.request.import {
+        check_storage(
+            connection,
+            &job.tenant,
+            &import.storage_id,
+            job.checks["import_storage_revision"].as_u64(),
+        )?;
+    }
+    Ok(())
+}
+
+fn check_job_destination(
+    connection: &Connection,
+    job: &Job,
+    destination: &str,
+) -> Result<Storage, String> {
+    if !job.project.destinations.iter().any(|id| id == destination) {
+        return Err("destination is not part of this job".into());
+    }
+    trade::check_destination(connection, job, destination)?;
+    check_storage(
+        connection,
+        &job.tenant,
+        destination,
+        job.checks["destination_revisions"][destination].as_u64(),
+    )
+}
+
+fn check_storage(
+    connection: &Connection,
+    tenant: &str,
+    id: &str,
+    revision: Option<u64>,
+) -> Result<Storage, String> {
+    let config: Storage = connection
+        .query_row(
+            "SELECT document FROM delivery_storage WHERE id=?1",
+            [id],
+            |row| decode(row.get(0)?),
+        )
+        .map_err(|_| "storage connection missing")?;
+    if !config.enabled
+        || !config.tenants.iter().any(|allowed| allowed == tenant)
+        || Some(config.revision) != revision
+    {
+        return Err("storage authorization changed; submit a new job".into());
+    }
+    Ok(config)
 }
 
 fn retry_attempts(job: &Job) -> u64 {
@@ -1149,7 +1183,7 @@ fn export_in(connection: &Connection, id: &str, attempt: u64) -> Result<Job, Str
         return Err("delivery was revoked or expired".into());
     }
     actor_active(connection, &job)?;
-    check_job_storage(connection, &job)?;
+    check_job_source(connection, &job)?;
     Ok(job)
 }
 
@@ -1590,7 +1624,16 @@ mod tests {
                 None,
             )
             .unwrap();
-        let project = store.save_delivery_project("", "admin", project()).unwrap();
+        let mut remaining = config.clone();
+        remaining.id = "remaining".into();
+        remaining.revision = 0;
+        let remaining = store
+            .save_delivery_storage("admin", remaining, None)
+            .unwrap();
+        let mut policy = project();
+        policy.destinations = vec![config.id.clone(), remaining.id.clone()];
+        policy.release = crate::workflow::Release::Local;
+        let project = store.save_delivery_project("", "admin", policy).unwrap();
         let mut request = request();
         request.import = Some(crate::workflow::Import {
             storage_id: "s3".into(),
@@ -1604,6 +1647,8 @@ mod tests {
             .unwrap()
             .unwrap();
         job.checks["import_storage_revision"] = serde_json::json!(config.revision);
+        job.checks["destination_revisions"] =
+            serde_json::json!({"s3":config.revision,"remaining":remaining.revision});
         store
             .insert_workflow_grant(grant(&job), None, Some(&job))
             .unwrap();
@@ -1663,6 +1708,71 @@ mod tests {
             .delivery_access(&job.id, &grant(&job).token_hash)
             .unwrap()
             .is_some());
+        let exporting = store
+            .claim_delivery_job("worker", now_unix())
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .require_delivery_destination(&job.id, exporting.attempts, "remaining")
+            .is_ok());
+        for (attempt, destination) in [
+            (exporting.attempts - 1, "remaining"),
+            (exporting.attempts, "foreign"),
+        ] {
+            assert!(store
+                .require_delivery_destination(&job.id, attempt, destination)
+                .is_err());
+            assert!(store
+                .complete_delivery_export(&job.id, attempt, destination, "complete.json")
+                .is_err());
+            assert!(store
+                .fail_delivery_destination(&job.id, attempt, destination, "failed")
+                .is_err());
+        }
+        store
+            .complete_delivery_export(&job.id, exporting.attempts, "s3", "complete.json")
+            .unwrap();
+        let mut withdrawn = config.clone();
+        withdrawn.enabled = false;
+        store
+            .save_delivery_storage("admin", withdrawn, None)
+            .unwrap();
+        assert!(store
+            .require_delivery_export(&job.id, exporting.attempts)
+            .unwrap_err()
+            .contains("storage authorization"));
+        assert!(store
+            .require_delivery_destination(&job.id, exporting.attempts, "remaining")
+            .is_err());
+        assert!(store
+            .complete_delivery_export(&job.id, exporting.attempts, "remaining", "complete.json")
+            .is_err());
+        assert!(store
+            .fail_delivery_destination(&job.id, exporting.attempts, "remaining", "failed")
+            .is_err());
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE delivery_storage SET revision=?1,document=?2 WHERE id='s3'",
+                    params![
+                        config.revision as i64,
+                        serde_json::to_string(&config).unwrap()
+                    ],
+                )
+            })
+            .unwrap();
+        store
+            .change_delivery_job("", &job.id, "sender", false, "cancel", None)
+            .unwrap();
+        assert!(store
+            .require_delivery_destination(&job.id, exporting.attempts, "remaining")
+            .is_err());
+        assert!(store
+            .complete_delivery_export(&job.id, exporting.attempts, "remaining", "complete.json")
+            .is_err());
+        assert!(store
+            .fail_delivery_destination(&job.id, exporting.attempts, "remaining", "failed")
+            .is_err());
     }
 
     #[test]
