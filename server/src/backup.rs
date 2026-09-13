@@ -25,14 +25,13 @@ pub const SETTING_KEY: &str = "backup_config";
 pub const SECRETS_FILE: &str = "backup-secrets.json";
 pub const STATUS_FILE: &str = "backup-status.json";
 pub const PENDING_FILE: &str = ".votport-restore-pending.json";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 const MAX_MANIFEST: u64 = 64 * 1024;
 const MAX_MARKER: u64 = MAX_MANIFEST + 16 * 1024;
 const MAX_IDENTITY: u64 = 16 * 1024 * 1024;
 const PART_SIZE: usize = 5 * 1024 * 1024;
-const MANAGED_FILES: [&str; 6] = [
+const ARCHIVE_FILES: [&str; 5] = [
     "votport.db",
-    "secret",
     "receipt.key",
     "push-issuer.key",
     "push.crt",
@@ -589,7 +588,7 @@ fn sync_directory(path: &Path) -> Result<(), String> {
 
 fn owned_name(name: &str) -> bool {
     let bytes = name.as_bytes();
-    (name.starts_with("votport-backup-v1-")
+    (name.starts_with("votport-backup-v2-")
         && (name.ends_with(".tar") || name.ends_with(".tar.age")))
         && bytes
             .iter()
@@ -620,23 +619,19 @@ fn file_hash(path: &Path) -> Result<(u64, String), String> {
 }
 
 fn identities(data_dir: &Path) -> Vec<(&'static str, PathBuf)> {
-    [
-        "secret",
-        "receipt.key",
-        "push-issuer.key",
-        "push.crt",
-        "push.key",
-    ]
-    .into_iter()
-    .map(|name| (name, data_dir.join(name)))
-    .filter(|(_, p)| {
-        fs::symlink_metadata(p)
-            .map(|m| {
-                m.file_type().is_file() && !m.file_type().is_symlink() && m.len() <= MAX_IDENTITY
-            })
-            .unwrap_or(false)
-    })
-    .collect()
+    ["receipt.key", "push-issuer.key", "push.crt", "push.key"]
+        .into_iter()
+        .map(|name| (name, data_dir.join(name)))
+        .filter(|(_, p)| {
+            fs::symlink_metadata(p)
+                .map(|m| {
+                    m.file_type().is_file()
+                        && !m.file_type().is_symlink()
+                        && m.len() <= MAX_IDENTITY
+                })
+                .unwrap_or(false)
+        })
+        .collect()
 }
 
 fn add_file(builder: &mut Builder<File>, name: &str, path: &Path) -> Result<(), String> {
@@ -665,10 +660,8 @@ pub fn create_archive(
     store.backup_into(&snapshot)?;
     let identity_files = identities(data_dir);
     let identity_names: HashSet<_> = identity_files.iter().map(|(name, _)| *name).collect();
-    for required in ["secret", "receipt.key"] {
-        if !identity_names.contains(required) {
-            return Err(format!("required identity missing: {required}"));
-        }
+    if !identity_names.contains("receipt.key") {
+        return Err("required identity missing: receipt.key".into());
     }
     validate_identity_material(data_dir, &identity_names)?;
     let mut entries = Vec::new();
@@ -759,16 +752,7 @@ pub fn validate_and_extract(
         let path = entry.path().map_err(|e| e.to_string())?.into_owned();
         let name = path.to_str().ok_or("non-UTF8 archive path")?;
         if path.components().count() != 1
-            || !matches!(
-                name,
-                "manifest.json"
-                    | "votport.db"
-                    | "secret"
-                    | "receipt.key"
-                    | "push-issuer.key"
-                    | "push.crt"
-                    | "push.key"
-            )
+            || (name != "manifest.json" && !ARCHIVE_FILES.contains(&name))
             || !names.insert(name.to_owned())
         {
             return Err("archive contains an unexpected or duplicate entry".into());
@@ -792,11 +776,7 @@ pub fn validate_and_extract(
                 return Err("identity file too large".into());
             }
             let target = destination.join(name);
-            let mut output = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&target)
-                .map_err(|e| e.to_string())?;
+            let mut output = create_private_new(&target).map_err(|e| e.to_string())?;
             io::copy(&mut entry, &mut output).map_err(|e| e.to_string())?;
             output.sync_all().map_err(|e| e.to_string())?;
             crate::paths::tighten_private_file(&target)?;
@@ -836,11 +816,10 @@ fn validate_staged_restore(
         .collect();
     if expected.len() != manifest.entries.len()
         || !expected.contains("votport.db")
-        || !expected.contains("secret")
         || !expected.contains("receipt.key")
         || expected
             .iter()
-            .any(|name| !MANAGED_FILES.contains(name) || *name == "manifest.json")
+            .any(|name| !ARCHIVE_FILES.contains(name) || *name == "manifest.json")
     {
         return Err("manifest entries are invalid".into());
     }
@@ -855,7 +834,7 @@ fn validate_staged_restore(
         let meta = fs::symlink_metadata(item.path()).map_err(|e| e.to_string())?;
         if meta.file_type().is_symlink()
             || !meta.is_file()
-            || !MANAGED_FILES.contains(&name.as_str())
+            || !ARCHIVE_FILES.contains(&name.as_str())
             || !actual.insert(name)
         {
             return Err("invalid restore stage contents".into());
@@ -879,7 +858,7 @@ fn validate_staged_restore(
 }
 
 fn validate_identity_material(destination: &Path, names: &HashSet<&str>) -> Result<(), String> {
-    for name in ["secret", "receipt.key", "push-issuer.key"] {
+    for name in ["receipt.key", "push-issuer.key"] {
         if names.contains(name) && file_hash(&destination.join(name))?.0 != 32 {
             return Err(format!("invalid backup identity: {name}"));
         }
@@ -1047,9 +1026,9 @@ pub fn apply_pending_restore(data_dir: &Path, schema_version: u64) -> Result<(),
             }
             Err(error) => return Err(error.to_string()),
         }
-        for name in MANAGED_FILES
+        for name in ARCHIVE_FILES
             .into_iter()
-            .chain(["votport.db-wal", "votport.db-shm"])
+            .chain(["secret", "votport.db-wal", "votport.db-shm"])
         {
             let current = data_dir.join(name);
             let saved = rollback.join(name);
@@ -1070,9 +1049,6 @@ pub fn apply_pending_restore(data_dir: &Path, schema_version: u64) -> Result<(),
 
     if marker.phase == RestorePhase::OldMoved {
         for entry in &marker.manifest.entries {
-            if entry.name == "secret" {
-                continue;
-            }
             let source = stage.join(&entry.name);
             let installed = data_dir.join(&entry.name);
             match (
@@ -1144,7 +1120,7 @@ pub fn now() -> u64 {
 }
 pub fn backup_filename(encrypted: bool) -> String {
     format!(
-        "votport-backup-v1-{}-{}.tar{}",
+        "votport-backup-v2-{}-{}.tar{}",
         now(),
         crate::auth::random_token(),
         if encrypted { ".age" } else { "" }
@@ -1790,12 +1766,98 @@ mod tests {
         let extracted = root.path().join("extract");
         fs::create_dir(&extracted).unwrap();
         validate_and_extract(&raw, &extracted, crate::store::SCHEMA_VERSION).unwrap();
-        assert_eq!(fs::read(extracted.join("secret")).unwrap(), [7; 32]);
+        assert!(manifest.entries.iter().all(|entry| entry.name != "secret"));
+        assert!(!extracted.join("secret").exists());
+        assert_eq!(fs::read(extracted.join("receipt.key")).unwrap(), [8; 32]);
+        fs::remove_file(root.path().join("secret")).unwrap();
+        create_archive(
+            &store,
+            root.path(),
+            &root.path().join("without-cookie.tar"),
+            crate::store::SCHEMA_VERSION,
+        )
+        .unwrap();
         let encrypted = root.path().join("bundle.tar.age");
         encrypt_file(&raw, &encrypted, "test passphrase").unwrap();
         let decrypted = root.path().join("decrypted.tar");
         decrypt_file(&encrypted, &decrypted, "test passphrase").unwrap();
         assert_eq!(fs::read(raw).unwrap(), fs::read(decrypted).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_archive_extraction_keeps_partial_identity_private() {
+        use std::os::unix::{fs::PermissionsExt as _, process::ExitStatusExt as _};
+        const CHILD_ROOT: &str = "VOTPORT_TEST_EXTRACT_WRITE_FAILURE";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            rustix::process::umask(rustix::fs::Mode::empty());
+            let mut limit = rustix::process::getrlimit(rustix::process::Resource::Fsize);
+            limit.current = Some(0);
+            rustix::process::setrlimit(rustix::process::Resource::Fsize, limit).unwrap();
+            assert!(validate_and_extract(
+                &root.join("bundle.tar"),
+                &root.join("extract"),
+                crate::store::SCHEMA_VERSION
+            )
+            .is_err());
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut header = Header::new_gnu();
+        header.set_path("receipt.key").unwrap();
+        header.set_size(32);
+        header.set_mode(0o600);
+        header.set_cksum();
+        let mut builder = Builder::new(File::create(root.path().join("bundle.tar")).unwrap());
+        builder.append(&header, &[7; 32][..]).unwrap();
+        builder.finish().unwrap();
+        fs::create_dir(root.path().join("extract")).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "backup::tests::interrupted_archive_extraction_keeps_partial_identity_private",
+            ])
+            .env(CHILD_ROOT, root.path())
+            .status()
+            .unwrap();
+        assert!(
+            status.success() || status.signal() == Some(rustix::process::Signal::XFSZ.as_raw()),
+            "{status}"
+        );
+        let partial = fs::metadata(root.path().join("extract/receipt.key")).unwrap();
+        assert_eq!(partial.len(), 0);
+        assert_eq!(partial.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn archives_refuse_cookie_keys_and_unsupported_format_versions() {
+        let (root, store) = initialized_root();
+        let archive = root.path().join("bundle.tar");
+        create_archive(&store, root.path(), &archive, crate::store::SCHEMA_VERSION).unwrap();
+        let stage = root.path().join("extract");
+        fs::create_dir(&stage).unwrap();
+        let manifest =
+            validate_and_extract(&archive, &stage, crate::store::SCHEMA_VERSION).unwrap();
+        for version in [VERSION - 1, VERSION + 1] {
+            let mut unsupported = manifest.clone();
+            unsupported.version = version;
+            assert!(
+                validate_staged_restore(&stage, &unsupported, crate::store::SCHEMA_VERSION)
+                    .is_err()
+            );
+        }
+        fs::write(stage.join("secret"), [7; 32]).unwrap();
+        assert!(validate_staged_restore(&stage, &manifest, crate::store::SCHEMA_VERSION).is_err());
+        let smuggled = root.path().join("cookie-key.tar");
+        let mut builder = Builder::new(File::create(&smuggled).unwrap());
+        add_file(&mut builder, "secret", &stage.join("secret")).unwrap();
+        builder.finish().unwrap();
+        let refused = root.path().join("refused");
+        fs::create_dir(&refused).unwrap();
+        assert!(validate_and_extract(&smuggled, &refused, crate::store::SCHEMA_VERSION).is_err());
+        assert!(!refused.join("secret").exists());
+        assert!(validate_id("votport-backup-v1-1-a.tar").is_err());
     }
 
     #[test]
@@ -1842,18 +1904,12 @@ mod tests {
         let (root, store) = initialized_root();
         let snapshot = root.path().join("snapshot.db");
         store.backup_into(&snapshot).unwrap();
-        let mut entries = Vec::new();
-        for (name, path) in [
-            ("votport.db", snapshot.as_path()),
-            ("secret", &root.path().join("secret")),
-        ] {
-            let (size, sha256) = file_hash(path).unwrap();
-            entries.push(ManifestEntry {
-                name: name.into(),
-                size,
-                sha256,
-            });
-        }
+        let (size, sha256) = file_hash(&snapshot).unwrap();
+        let entries = vec![ManifestEntry {
+            name: "votport.db".into(),
+            size,
+            sha256,
+        }];
         let manifest = Manifest {
             version: VERSION,
             created_at: now(),
@@ -1872,7 +1928,6 @@ mod tests {
             .append_data(&mut header, "manifest.json", bytes.as_slice())
             .unwrap();
         add_file(&mut builder, "votport.db", &snapshot).unwrap();
-        add_file(&mut builder, "secret", &root.path().join("secret")).unwrap();
         add_file(
             &mut builder,
             "receipt.key",
@@ -2012,7 +2067,7 @@ mod tests {
                     validate_and_extract(&archive, &stage, crate::store::SCHEMA_VERSION).unwrap();
                 let rollback = root.path().join(".votport-restore-rollback-test");
                 fs::create_dir(&rollback).unwrap();
-                for name in MANAGED_FILES {
+                for name in ARCHIVE_FILES.into_iter().chain(["secret"]) {
                     let path = root.path().join(name);
                     if path.exists() {
                         fs::rename(path, rollback.join(name)).unwrap();
@@ -2020,9 +2075,7 @@ mod tests {
                 }
                 if installed {
                     for entry in &manifest.entries {
-                        if entry.name == "votport.db"
-                            || (phase == RestorePhase::NewInstalled && entry.name != "secret")
-                        {
+                        if entry.name == "votport.db" || phase == RestorePhase::NewInstalled {
                             fs::rename(stage.join(&entry.name), root.path().join(&entry.name))
                                 .unwrap();
                         }
@@ -2204,8 +2257,8 @@ mod tests {
     #[test]
     fn pruning_zero_means_unlimited() {
         let root = tempfile::tempdir().unwrap();
-        let first = "votport-backup-v1-1-a.tar";
-        let second = "votport-backup-v1-2-b.tar.age";
+        let first = "votport-backup-v2-1-a.tar";
+        let second = "votport-backup-v2-2-b.tar.age";
         fs::write(root.path().join(first), b"one").unwrap();
         fs::write(root.path().join(second), b"two").unwrap();
         prune_local_root(root.path(), 0, 0).unwrap();
@@ -2218,8 +2271,8 @@ mod tests {
     #[test]
     fn protected_local_backup_survives_retention_ties() {
         let root = tempfile::tempdir().unwrap();
-        let protected = "votport-backup-v1-1-a.tar";
-        let other = "votport-backup-v1-1-b.tar";
+        let protected = "votport-backup-v2-1-a.tar";
+        let other = "votport-backup-v2-1-b.tar";
         let modified =
             fs::FileTimes::new().set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1));
         for name in [protected, other] {
@@ -2238,8 +2291,8 @@ mod tests {
             s3_prefix: Some("backups".into()),
             ..BackupConfig::default()
         };
-        let protected = "votport-backup-v1-1-a.tar";
-        let other = "votport-backup-v1-1-b.tar";
+        let protected = "votport-backup-v2-1-a.tar";
+        let other = "votport-backup-v2-1-b.tar";
         let protected_path = s3_path(&config, protected);
         let other_path = s3_path(&config, other);
         loop {
@@ -2274,7 +2327,7 @@ mod tests {
             s3_prefix: Some("team/backups".into()),
             ..BackupConfig::default()
         };
-        let id = "votport-backup-v1-1-a.tar";
+        let id = "votport-backup-v2-1-a.tar";
         assert_eq!(
             owned_s3_id(&config, &ObjectPath::from(format!("team/backups/{id}"))),
             Some(id)

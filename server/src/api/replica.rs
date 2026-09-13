@@ -194,6 +194,8 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.name == "votport.db"));
+        assert!(manifest.entries.iter().all(|entry| entry.name != "secret"));
+        assert!(!extracted.join("secret").exists());
         assert!(std::fs::read_dir(&app.config.data_dir)
             .unwrap()
             .flatten()
