@@ -13,11 +13,13 @@ use crate::error::{Error, Result};
 use crate::package::Prepared;
 use crate::progress::{Event, Observer, Transport};
 
+const MAX_REBEGINS: usize = 100;
+
 /// Sends a prepared drop to `token` over the HTTP session protocol.
 ///
 /// # Errors
-/// A network failure, a server refusal, or a read failure. A `rebegin` and a
-/// not-fully-received finish are handled internally by beginning again.
+/// A network failure, a server refusal, a read failure, or recovery exhaustion.
+/// Chunk and finish rebegins share a limit of 100 recoveries per send.
 pub fn send(
     client: &Client,
     token: &str,
@@ -78,10 +80,11 @@ fn drive(
         }
     }
 
-    // Begin can ask for a re-begin after a chunk or at finish; the loop is
-    // bounded by the drop making progress, which the server guarantees by
-    // only re-beginning from a checkpointed prefix.
-    loop {
+    // Accepted chunks do not reset recovery: finish can still refuse forever.
+    for _ in 0..=MAX_REBEGINS {
+        if observer.cancelled() {
+            return Err(Error::Cancelled);
+        }
         let entries = client.begin(session)?;
         if entries.len() != prepared.objects.len() {
             return Err(Error::Other(format!(
@@ -111,6 +114,9 @@ fn drive(
             Err(error) => return Err(error),
         }
     }
+    Err(Error::Other(
+        "the server repeatedly restarted the upload; try again later".to_owned(),
+    ))
 }
 
 enum Outcome {
@@ -305,6 +311,198 @@ mod tests {
                 covered_bytes: 0,
             })
             .collect()
+    }
+
+    fn exercise_rebegin(mode: &'static str) {
+        use serde_json::json;
+        use std::io::{BufRead as _, Write as _};
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("frame");
+        let length = if mode == "resume" { 65537 } else { 7 };
+        std::fs::write(&source, vec![7; length]).unwrap();
+        let prepared = crate::package::build(
+            vec![crate::entries::Entry {
+                path: vot_manifest::PackagePath::portable(["frame".to_owned()]).unwrap(),
+                source,
+            }],
+            &directory.path().join("manifest"),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut begins = 0;
+            let mut offsets = Vec::new();
+            for _ in 0..400 {
+                let mut stream = (0..2000)
+                    .find_map(|_| match listener.accept() {
+                        Ok((stream, _)) => Some(stream),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                            None
+                        }
+                        Err(error) => panic!("{error}"),
+                    })
+                    .expect("HTTP upload fixture did not receive a request");
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let path = first.split_whitespace().nth(1).unwrap();
+                let mut body_length = 0;
+                for _ in 0..64 {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        body_length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                assert!(body_length < 128 * 1024);
+                reader.read_exact(&mut vec![0; body_length]).unwrap();
+                let (status, body, done) = if path == "/api/r/token/session" {
+                    (
+                        200,
+                        json!({"session":"upload", "chunk_bytes":65536, "resume":true}),
+                        false,
+                    )
+                } else if path.ends_with("/begin") {
+                    begins += 1;
+                    if begins > 101 {
+                        (
+                            400,
+                            json!({"error":"fixture observed an excess begin"}),
+                            false,
+                        )
+                    } else {
+                        (
+                            200,
+                            json!({"entries":[{"index":0, "path":"frame", "stored_as":"frame", "bytes":length,
+                            "complete":false, "covered_bytes":if mode == "resume" && begins > 1 { 65536 } else { 0 }}]}),
+                            false,
+                        )
+                    }
+                } else if path.contains("/chunk?") {
+                    let offset = path
+                        .split("offset=")
+                        .nth(1)
+                        .unwrap()
+                        .split('&')
+                        .next()
+                        .unwrap()
+                        .parse::<u64>()
+                        .unwrap();
+                    offsets.push(offset);
+                    let rebegin = mode == "chunk"
+                        || mode == "cancel"
+                        || (mode == "mixed" && begins % 2 == 1)
+                        || (mode == "resume" && begins == 1);
+                    (
+                        200,
+                        json!({"accepted":true, "replay":false, "covered_bytes":length,
+                        "total_bytes":length, "complete":!rebegin, "received":length, "rebegin":rebegin}),
+                        false,
+                    )
+                } else if path.ends_with("/finish") {
+                    if mode == "resume" {
+                        (
+                            200,
+                            json!({"upload_id":"finished", "files":[{"path":"frame"}]}),
+                            true,
+                        )
+                    } else {
+                        (422, json!({"error":"not fully received"}), false)
+                    }
+                } else {
+                    assert!(path.ends_with("/abort"), "unexpected request: {first}");
+                    (200, json!({"ok":true}), true)
+                };
+                let body = body.to_string();
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                if done {
+                    return (begins, offsets);
+                }
+            }
+            panic!("HTTP upload fixture exhausted its request bound");
+        });
+        struct CancelOnRebegin {
+            enabled: bool,
+            cancelled: bool,
+        }
+        impl Observer for CancelOnRebegin {
+            fn event(&mut self, event: Event) {
+                if self.enabled && matches!(event, Event::Rebegin) {
+                    self.cancelled = true;
+                }
+            }
+            fn cancelled(&self) -> bool {
+                self.cancelled
+            }
+        }
+        let client = Client::with_timeout(&url, Some(Duration::from_secs(2))).unwrap();
+        let result = send(
+            &client,
+            "token",
+            None,
+            &prepared,
+            &mut CancelOnRebegin {
+                enabled: mode == "cancel",
+                cancelled: false,
+            },
+        );
+        let (begins, offsets) = server.join().unwrap();
+        match mode {
+            "resume" => {
+                assert_eq!(result.unwrap().upload_id, "finished");
+                assert_eq!(begins, 2);
+                assert_eq!(offsets, [0, 65536]);
+            }
+            "cancel" => {
+                assert!(matches!(result, Err(Error::Cancelled)));
+                assert_eq!(begins, 1);
+            }
+            _ => {
+                assert!(
+                    matches!(result, Err(Error::Other(ref message)) if message == "the server repeatedly restarted the upload; try again later"),
+                    "{mode}: {result:?}"
+                );
+                assert_eq!(begins, 101);
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_rebegins_have_a_total_recovery_budget() {
+        exercise_rebegin("chunk");
+    }
+
+    #[test]
+    fn finish_rebegins_have_a_total_recovery_budget() {
+        exercise_rebegin("finish");
+    }
+
+    #[test]
+    fn mixed_rebegins_share_the_total_recovery_budget() {
+        exercise_rebegin("mixed");
+    }
+
+    #[test]
+    fn a_rebegin_resumes_from_the_verified_prefix() {
+        exercise_rebegin("resume");
+    }
+
+    #[test]
+    fn cancellation_after_rebegin_prevents_another_begin() {
+        exercise_rebegin("cancel");
     }
 
     #[test]
