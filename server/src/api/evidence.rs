@@ -18,6 +18,19 @@ pub struct ChallengeRequest {
     holder: String,
 }
 
+pub(crate) fn configured_origin(app: &App) -> ApiResult<String> {
+    let url = app.config.public_url.as_deref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "set VOTPORT_PUBLIC_URL to use signed recipient evidence and device authentication",
+        )
+    })?;
+    Ok(reqwest::Url::parse(url)
+        .map_err(|_| ApiError::internal("invalid VOTPORT_PUBLIC_URL"))?
+        .origin()
+        .ascii_serialization())
+}
+
 pub(crate) fn metadata_authorization(
     app: &App,
     grant: &crate::store::OutboundGrant,
@@ -41,7 +54,7 @@ pub(crate) fn metadata_authorization(
     }
     let now = now_unix();
     Ok(Some(app.signer.evidence_challenge(Challenge {
-        origin: admin::base_url(app, headers),
+        origin: configured_origin(app)?,
         grant_id: grant.id.clone(),
         manifest: manifest.into(),
         holder: holder.into(),
@@ -81,7 +94,7 @@ pub async fn challenge(
     }
     let now = now_unix();
     let authorization = app.signer.evidence_challenge(Challenge {
-        origin: admin::base_url(&app, &headers),
+        origin: configured_origin(&app)?,
         grant_id: grant.id.clone(),
         manifest: app
             .store
@@ -102,6 +115,7 @@ pub async fn submit(
     Json(evidence): Json<Evidence>,
 ) -> ApiResult<Response> {
     rate(&app, &headers, &peer)?;
+    let origin = configured_origin(&app)?;
     let challenge = &evidence.authorization.challenge;
     let now = now_unix();
     if !evidence.verify(&app.signer.public_hex)
@@ -112,7 +126,7 @@ pub async fn submit(
                 .delivery_evidence_recorded(&evidence.id())
                 .map_err(super::store_unavailable)?)
         || challenge.expires_at.saturating_sub(challenge.issued_at) > 7 * 86_400
-        || challenge.origin != admin::base_url(&app, &headers)
+        || challenge.origin != origin
     {
         return Err(ApiError::unauthorized());
     }

@@ -25,6 +25,12 @@ installed native application's screens or bundled MCP executable.
 
 ## Recipient verification and acceptance
 
+Set `VOTPORT_PUBLIC_URL` to the public origin recipients use, such as
+`https://drop.example.com`, for signed recipient evidence and enrolled-device
+authentication. These operations return a configuration error when it is unset;
+request headers never choose the signed origin. Downloads and metadata requests
+that do not request device evidence remain available without this setting.
+
 An ordered manifest digest commits to every filename, VOT hash suite, object
 root, file size, and file position. The server signs an authorization containing
 that digest, the grant ID, server origin, recipient device public key, nonce,

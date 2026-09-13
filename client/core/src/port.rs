@@ -98,7 +98,7 @@ fn drop_stored() {
 
 /// The origin `base` names, trimmed of a trailing slash, when it is an
 /// `http` or `https` URL with a host and nothing after it.
-fn origin(base: &str) -> Result<String> {
+pub(crate) fn origin(base: &str) -> Result<String> {
     let invalid = || Error::BadLink {
         link: base.to_owned(),
     };
