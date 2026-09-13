@@ -203,7 +203,7 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .starts_with(".votport-replica-")));
-        let rows = app.store.audit_export("", 0, 0, 100).unwrap();
+        let rows = app.store.audit_export(None, 0, 0, 100).unwrap();
         assert!(rows
             .iter()
             .any(|row| row.event == "replica_pulled" && row.subject == "10.3.0.1"));

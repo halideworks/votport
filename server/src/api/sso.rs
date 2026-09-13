@@ -373,7 +373,7 @@ pub async fn sso_exchange(
                 "sign-in expired or was already used; start again",
             )
         })?;
-    let cookie = super::admin::issue_admin_cookie(&app, &identity)?;
+    let cookie = super::admin::issue_admin_cookie(&app, &identity, None)?;
     let cookie = cookie.split(';').next().unwrap_or_default();
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
@@ -762,7 +762,7 @@ pub async fn sso_callback(
         )
             .into_response();
     }
-    let admin_cookie = match super::admin::issue_admin_cookie(&app, &identity) {
+    let admin_cookie = match super::admin::issue_admin_cookie(&app, &identity, None) {
         Ok(cookie) => cookie,
         Err(_) => return home("could not complete sign-in"),
     };
@@ -1080,7 +1080,7 @@ mod tests {
             credential_version: 1,
         };
         let token = auth::issue_admin_token(&secret, &identity, "version-1");
-        let verified = auth::verify_admin_token(&secret, "version-1", &token).unwrap();
+        let (verified, _) = auth::verify_admin_token(&secret, "version-1", &token).unwrap();
         assert_eq!(verified.subject, identity.subject);
         assert_eq!(verified.tenant, identity.tenant);
         assert_eq!(verified.role, identity.role);
@@ -1114,7 +1114,7 @@ mod tests {
 
     fn sso_login_events(store: &crate::store::Store) -> Vec<String> {
         store
-            .audit_export("", 0, 0, 100)
+            .audit_export(None, 0, 0, 100)
             .unwrap()
             .into_iter()
             .filter(|row| row.event == "sso_login")

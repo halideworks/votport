@@ -232,7 +232,15 @@ pub fn issue_admin_token_with_ttl(
     version: &str,
     ttl_secs: u64,
 ) -> String {
-    let expires = now_unix() + ttl_secs;
+    issue_admin_token_until(secret, id, version, now_unix().saturating_add(ttl_secs))
+}
+
+pub(crate) fn issue_admin_token_until(
+    secret: &[u8; 32],
+    id: &AdminIdentity,
+    version: &str,
+    expires: u64,
+) -> String {
     let nonce = random_token();
     let payload = identity_payload(id);
     let mac = admin_mac(secret, &payload, version, expires, &nonce);
@@ -244,9 +252,13 @@ pub fn issue_admin_token_with_ttl(
     )
 }
 
-/// Verifies an admin token and returns its identity. None when anything at
-/// all fails to match: wrong MAC, expired, malformed.
-pub fn verify_admin_token(secret: &[u8; 32], version: &str, token: &str) -> Option<AdminIdentity> {
+/// Returns the authenticated identity and expiry. Refuses a wrong MAC,
+/// expired token or malformed payload.
+pub fn verify_admin_token(
+    secret: &[u8; 32],
+    version: &str,
+    token: &str,
+) -> Option<(AdminIdentity, u64)> {
     let parts: Vec<&str> = token.split('.').collect();
     let [expires, payload_hex, nonce, mac] = parts.as_slice() else {
         return None;
@@ -263,7 +275,7 @@ pub fn verify_admin_token(secret: &[u8; 32], version: &str, token: &str) -> Opti
     if !constant_time_eq(expected.as_bytes(), mac.as_bytes()) {
         return None;
     }
-    serde_json::from_str(&payload).ok()
+    Some((serde_json::from_str(&payload).ok()?, expires))
 }
 
 #[cfg(test)]
@@ -609,7 +621,7 @@ mod tests {
         })
         .to_string();
         let token = issue_admin_token_from_payload(&secret, &payload, "v");
-        let identity = verify_admin_token(&secret, "v", &token).unwrap();
+        let (identity, _) = verify_admin_token(&secret, "v", &token).unwrap();
         assert_eq!(identity.credential_version, 1);
         assert_eq!(identity.subject, "user@example.com");
         assert!(!payload.contains("cv"));

@@ -4480,7 +4480,7 @@ mod retention_tests {
         assert!(!app.store.link("", "failed").unwrap().unwrap().uploads[0].files[0].deleted);
         assert!(app
             .store
-            .audit_export("", 0, 0, 100)
+            .audit_export(None, 0, 0, 100)
             .unwrap()
             .iter()
             .all(|row| row.subject != "failed"));

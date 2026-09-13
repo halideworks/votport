@@ -6499,7 +6499,7 @@ mod tests {
             upload("project/two.bin", b"second file").await.status(),
             StatusCode::OK
         );
-        let audits = app.store.audit_export("", 0, 0, 100).unwrap();
+        let audits = app.store.audit_export(None, 0, 0, 100).unwrap();
         assert!(audits.iter().any(|row| {
             row.event == "outbound_file_uploaded"
                 && row.actor == "local"
@@ -6974,7 +6974,7 @@ mod tests {
             .unwrap(),
             b"abc"
         );
-        assert!(app.store.audit_export("", 0, 0, 100).unwrap().is_empty());
+        assert!(app.store.audit_export(None, 0, 0, 100).unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -7038,7 +7038,7 @@ mod tests {
                 &upload_id,
             ))
             .exists());
-        let audits = app.store.audit_export("", 0, 0, 100).unwrap();
+        let audits = app.store.audit_export(None, 0, 0, 100).unwrap();
         assert_eq!(
             audits
                 .iter()
@@ -7914,7 +7914,7 @@ mod tests {
         assert_eq!(share("other").await, StatusCode::FORBIDDEN);
         let refusals: Vec<String> = app
             .store
-            .audit_export("", 0, 0, 100)
+            .audit_export(None, 0, 0, 100)
             .unwrap()
             .into_iter()
             .filter(|row| row.event == "automation_refused")
@@ -8009,7 +8009,7 @@ mod tests {
         }
         let refusals = app
             .store
-            .audit_export("", 0, 0, 100)
+            .audit_export(None, 0, 0, 100)
             .unwrap()
             .into_iter()
             .filter(|row| row.event == "automation_refused")
