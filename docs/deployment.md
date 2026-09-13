@@ -186,8 +186,8 @@ replica) remains the database RPO for deployments that need continuous
 replication. `/received` and `/outbound` stay on existing file backups.
 
 Automatic archives contain the SQLite database and VOTPort-managed identity
-files only: the cookie secret, receipt signer, native-push issuer, and
-VOTPort-generated push certificate pair. They exclude WAL/SHM files,
+files only: the receipt signer, native-push issuer, and VOTPort-generated
+push certificate pair. They exclude the live cookie-signing secret, WAL/SHM files,
 `data/backups/`, staging data, and everything under `/received` and
 `/outbound`. Configured external certificate files are not copied. The local
 path is interpreted inside the service filesystem and must be writable by the
@@ -198,7 +198,7 @@ use the configured bucket and prefix. The UI reports credential and passphrase
 configured flags, never their values.
 
 Pruning is owned by VOTPort for snapshots it created under the configured
-local path and for generated `votport-backup-v1-*` objects under the configured
+local path and for generated `votport-backup-v2-*` objects under the configured
 S3 prefix. It does not delete unrelated local files or bucket objects. Keep an
 external recovery copy of the encryption passphrase. An
 encrypted archive is unrecoverable without it, and storing that passphrase in
@@ -300,8 +300,10 @@ and leaves automatic backups disabled, preventing historical S3 targets from
 receiving data with current credentials. Re-save and re-enable backup settings
 after verifying the deployment.
 
-Restoring the managed cookie secret rotates the admin cookie signing key and
-signs out every existing admin session. Plan to sign in again after restart.
+Restore creates a fresh cookie-signing key and signs out existing sessions.
+Plan to sign in again after restart. Archives use format version 2; older
+archives containing a cookie-signing secret are refused. Create a new backup
+after upgrading, and keep older archives private until they can be discarded.
 
 For a manual restore, use the System action or place a validated archive in
 the pending restore workflow; do not copy archive members directly over a live
@@ -683,7 +685,7 @@ Layout:
   valid replica; an interrupted first pull cannot create an empty live
   instance. Like any restore, promotion rotates the cookie secret, so every admin signs in
   again; receipt and push identities carry over. Upgrade the standby binary
-  alongside the live one: replica pulls require matching database schemas.
+  alongside the live one: replica pulls require matching archive formats and database schemas.
   If a promotion boot is interrupted mid-restore, run `votport` normally to
   finish it before returning the directory to standby mode. The RPO is the
   interval: links, settings, and resume records written on the live

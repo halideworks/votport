@@ -137,7 +137,7 @@ the row so env applies again. Details: [`docs/deployment.md`](docs/deployment.md
 | `VOTPORT_SERVE_BIND` | unset | UDP address for serving Deliver grants to VOT clients over QUIC; off when unset. Same certificate and issuer key as push. |
 | `VOTPORT_SERVE_ADVERTISE` | derived | `host:port` that VOT fetch clients dial, on the same rules as `VOTPORT_PUSH_ADVERTISE`. |
 | `VOTPORT_PUSH_CERT` / `VOTPORT_PUSH_KEY` | generated | PEM certificate and private key for native push. Set both together to use those paths in place, or leave both unset for a persistent self-signed pair under `VOTPORT_DATA_DIR`. |
-| `VOTPORT_DATA_DIR` | `/data` | State: `votport.db` (links, upload records; legacy `state.json` is imported once) and the cookie secret. |
+| `VOTPORT_DATA_DIR` | `/data` | State: `votport.db` (links and upload records; current schema required) and the cookie secret. |
 | `VOTPORT_RECEIVE_DIR` | `/received` | Root folder received files are published into. |
 | `VOTPORT_OUTBOUND_DIR` | `/outbound` | Root folder for server-rendered projects and files uploaded by admins for outbound links. Nested project subdirectories are allowed. |
 | `VOTPORT_MAX_UPLOAD_BYTES` | 50 GiB | Hard cap per upload session (per-link caps can be lower). Accepts plain bytes or a `K/KiB/KB`, `M/MiB/MB`, `G/GiB/GB`, `T/TiB/TB` suffix, e.g. `500G`. |
