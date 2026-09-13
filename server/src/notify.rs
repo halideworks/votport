@@ -491,8 +491,8 @@ pub(crate) mod tests {
     use crate::app;
     use crate::session::FinishReport;
     use crate::store::{
-        FileRecord, NotificationDestination, NotificationMode, NotificationPolicy,
-        NotificationRule, OutboundDownloadResult, OutboundGrant, OutboundGrantFile,
+        Branding, FileRecord, NotificationDestination, NotificationMode, NotificationPolicy,
+        NotificationRule, OutboundDownloadResult, OutboundGrant, OutboundGrantFile, Tenant,
         NOTIFICATION_EVENTS,
     };
 
@@ -693,6 +693,32 @@ pub(crate) mod tests {
         let application = testing::build(directory.path());
         let destination =
             test_destination_config(&application, "ntfy", format!("http://{address}/topic"));
+        application
+            .store
+            .set_branding(&Branding {
+                name: "Müller 撮影".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        application
+            .store
+            .insert_tenant(Tenant {
+                key: "studio".into(),
+                incarnation: String::new(),
+                label: "Atelier été".into(),
+                admin_group: None,
+                max_total_bytes: None,
+                max_links: None,
+                max_sessions: None,
+                created_at: 0,
+            })
+            .unwrap();
+        let mut studio_destination = destination.clone();
+        studio_destination.revision = 0;
+        application
+            .store
+            .save_notification_destination("studio", &mut studio_destination)
+            .unwrap();
         let files = (0..100)
             .map(|index| FileRecord {
                 path: format!("{}-{index}.mov", "撮影🎬".repeat(8)),
@@ -727,9 +753,13 @@ pub(crate) mod tests {
                         Some(test_policy()),
                     )
                     .await;
-                    let tested = test_destination(&application, "", &destination).await;
+                    let branded = test_destination(&application, "", &destination).await;
+                    application.store.delete_branding("").unwrap();
+                    let default = test_destination(&application, "", &destination).await;
+                    let tenant =
+                        test_destination(&application, "studio", &studio_destination).await;
                     let _ = stop.send(());
-                    tested
+                    branded && default && tenant
                 }
             )
         })
@@ -738,17 +768,37 @@ pub(crate) mod tests {
         served.unwrap();
         assert!(tested);
         let messages = messages.lock().unwrap();
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 4);
         let (uri, headers, body) = &messages[0];
         assert!(!headers.contains_key("title"));
         let url = reqwest::Url::parse(&format!("http://localhost{uri}")).unwrap();
         assert!(url
             .query_pairs()
             .any(|(key, value)| key == "title" && value.contains("Müller\n撮影")));
+        assert!(url
+            .query_pairs()
+            .any(|(key, value)| key == "title" && value.starts_with("Müller 撮影:")));
         assert!(body.starts_with("ID: up-ntfy\n100 file(s), 100 bytes\n"));
         assert!(body.len() <= 4096 && body.ends_with('…'));
         assert!(body.contains("撮影🎬"));
-        assert_eq!(messages[1].2, "This is a VOTPort notification test.");
+        for ((uri, headers, body), brand) in
+            messages[1..]
+                .iter()
+                .zip(["Müller 撮影", "votport", "Atelier été"])
+        {
+            let url = reqwest::Url::parse(&format!("http://localhost{uri}")).unwrap();
+            assert!(
+                url.query_pairs()
+                    .any(|(key, value)| key == "title"
+                        && value == format!("{brand}: notification test")),
+                "{url}"
+            );
+            assert!(!headers.contains_key("title"));
+            assert_eq!(
+                body,
+                "This is a notification test.\nSample file: Résumé_撮影.mov"
+            );
+        }
     }
 
     #[test]
@@ -1084,7 +1134,10 @@ pub(crate) mod tests {
         let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let payload = request_json(&request);
         assert_eq!(payload["event"], "notification_test");
-        assert_eq!(payload["message"], "This is a VOTPort notification test.");
+        assert_eq!(
+            payload["message"],
+            "This is a notification test.\nSample file: Résumé_撮影.mov"
+        );
         assert_no_secrets(&request);
         thread.join().unwrap();
     }
@@ -1238,6 +1291,41 @@ pub(crate) mod tests {
         assert!(text.starts_with("ID: up-smtp\n100 file(s), 100 bytes\n"));
         assert!(text.contains("Müller_撮影-0.mov"));
         assert!(text.len() <= 64 * 1024 && text.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn notification_test_sends_unicode_smtp_sample() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let stub = tokio::spawn(async move { smtp_stub(listener).await });
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = testing::config(directory.path());
+        config.smtp_host = Some("127.0.0.1".into());
+        config.smtp_port = address.port();
+        config.smtp_starttls = false;
+        config.smtp_from = Some("votport@example.com".into());
+        let application = app::build(config).unwrap();
+        let destination = test_destination_config(&application, "email", String::new());
+        assert!(test_destination(&application, "", &destination).await);
+        let transcript = tokio::time::timeout(Duration::from_secs(10), stub)
+            .await
+            .expect("smtp stub timed out")
+            .unwrap()
+            .unwrap();
+        assert!(
+            transcript.contains("Subject: votport: notification test\r\n"),
+            "{transcript}"
+        );
+        assert!(transcript.contains("MIME-Version: 1.0\r\n"), "{transcript}");
+        assert!(
+            transcript.contains("Content-Type: text/plain; charset=utf-8\r\n"),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("Content-Transfer-Encoding: quoted-printable\r\n"),
+            "{transcript}"
+        );
+        assert!(transcript.contains("\r\n\r\nThis is a notification test.\r\nSample file: R=C3=A9sum=C3=A9_=E6=92=AE=E5=BD=B1.mov\r\n"), "{transcript}");
     }
 
     #[test]

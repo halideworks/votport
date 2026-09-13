@@ -195,12 +195,14 @@ pub async fn test_destination(
     tenant: &str,
     destination: &NotificationDestination,
 ) -> bool {
+    let title = format!("{}: notification test", title_brand(app, tenant));
+    let body = "This is a notification test.\nSample file: Résumé_撮影.mov";
     let delivered = send_destination(
         app,
         destination,
-        "VOTPort: notification test",
-        "This is a VOTPort notification test.",
-        &json!({"event":"notification_test","message":"This is a VOTPort notification test."}),
+        &title,
+        body,
+        &json!({"event":"notification_test","message":body}),
         "notification_test",
         None,
     )
