@@ -468,6 +468,10 @@ still contain the tenant's rows until they rotate. File backups of
 `/received` and `/outbound` retain bytes until they rotate. GDPR-style erasure
 of backups is an operator job, not an API.
 
+Once scheduled, the purge continues if the request is cancelled. The tenant key
+stays reserved for the whole purge, covering receive files, library files and
+logo cleanup. Recreating the key cannot overlap that purge.
+
 Retry DELETE if purge fails (the row is already gone; leftover retry removes
 the reserved directory). An unknown key with no leftover directory is 404
 and does not touch disk. A default-tenant path with the same name is separate
