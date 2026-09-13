@@ -105,6 +105,11 @@ as interrupted cards with Resume (and a password field when the entry
 needs one), offer Retry on a failed card the core kept, and forget an
 entry on Remove; the CLI gains `votport status` and `votport resume`.
 
+Each HTTP send allows 100 server-requested restarts after its initial attempt.
+Chunk and finish restarts share that budget, even when chunks are accepted.
+Exhaustion returns an error through the existing retry flow; cancellation stops
+before another begin request. Normal recovery still uses the verified prefix.
+
 Native push retries retain complete receiver objects until the configured session
 idle timeout (30 minutes by default). The same device, request link, and package
 can reuse them after reconnecting or restarting the server, including after the
