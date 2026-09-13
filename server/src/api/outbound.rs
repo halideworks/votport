@@ -979,6 +979,10 @@ fn list_library_dir(root: &Path, dir: &Path, files: &mut Vec<serde_json::Value>)
         return;
     };
     for entry in entries.flatten() {
+        let name = entry.file_name();
+        if is_private_library_name(&name) {
+            continue;
+        }
         let path = entry.path();
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
@@ -986,17 +990,12 @@ fn list_library_dir(root: &Path, dir: &Path, files: &mut Vec<serde_json::Value>)
         if meta.file_type().is_symlink() {
             continue;
         }
-        let name = entry.file_name();
-        let is_stage = name.to_str().is_some_and(|name| {
-            name.eq_ignore_ascii_case(".votport-workflows")
-                || (name.starts_with(".vot-") && name.ends_with(".stage"))
-        });
         if dir == root && name == crate::paths::TENANT_STORAGE_DIR {
             continue;
         }
         if meta.file_type().is_dir() {
             list_library_dir(root, &path, files);
-        } else if meta.file_type().is_file() && !is_stage {
+        } else if meta.file_type().is_file() {
             if let Ok(relative) = path.strip_prefix(root) {
                 files.push(json!({ "path": relative.to_string_lossy().replace('\\', "/"), "bytes": meta.len() }));
             }
@@ -1004,9 +1003,11 @@ fn list_library_dir(root: &Path, dir: &Path, files: &mut Vec<serde_json::Value>)
     }
 }
 
-fn is_library_stage_name(name: &std::ffi::OsStr) -> bool {
-    name.to_str()
-        .is_some_and(|name| name.starts_with(".vot-") && name.ends_with(".stage"))
+fn is_private_library_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        name.eq_ignore_ascii_case(".votport-workflows")
+            || (name.starts_with(".vot-") && name.ends_with(".stage"))
+    })
 }
 
 fn library_root_safe(root: &Path) -> bool {
@@ -1056,6 +1057,10 @@ fn direct_library_entries_page(
     let read_dir = std::fs::read_dir(directory)?;
     for entry in read_dir {
         let entry = entry?;
+        let name = entry.file_name();
+        if is_private_library_name(&name) {
+            continue;
+        }
         let path = entry.path();
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
@@ -1063,15 +1068,11 @@ fn direct_library_entries_page(
         if meta.file_type().is_symlink() {
             continue;
         }
-        let name = entry.file_name();
         if directory == root
             && name
                 .to_str()
                 .is_some_and(|name| name.eq_ignore_ascii_case(crate::paths::TENANT_STORAGE_DIR))
         {
-            continue;
-        }
-        if is_library_stage_name(&name) {
             continue;
         }
         let Some(relative) = path.strip_prefix(root).ok() else {
@@ -1131,6 +1132,10 @@ fn search_library_dir(
         return;
     };
     for entry in entries.flatten() {
+        let name = entry.file_name();
+        if is_private_library_name(&name) {
+            continue;
+        }
         let path = entry.path();
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
@@ -1138,15 +1143,11 @@ fn search_library_dir(
         if meta.file_type().is_symlink() {
             continue;
         }
-        let name = entry.file_name();
         if directory == root
             && name
                 .to_str()
                 .is_some_and(|name| name.eq_ignore_ascii_case(crate::paths::TENANT_STORAGE_DIR))
         {
-            continue;
-        }
-        if is_library_stage_name(&name) {
             continue;
         }
         if meta.file_type().is_dir() {
@@ -1826,6 +1827,9 @@ fn enumerate_automation_files(
         let entries = std::fs::read_dir(directory).map_err(|_| ApiError::not_found())?;
         for entry in entries {
             let entry = entry.map_err(|_| ApiError::not_found())?;
+            if is_private_library_name(&entry.file_name()) {
+                continue;
+            }
             let path = entry.path();
             let metadata = std::fs::symlink_metadata(&path).map_err(|_| ApiError::not_found())?;
             if metadata.file_type().is_symlink() {
@@ -1835,16 +1839,8 @@ fn enumerate_automation_files(
                 ));
             }
             if metadata.file_type().is_dir() {
-                let name = entry.file_name();
-                if is_library_stage_name(&name) {
-                    continue;
-                }
                 visit(root, &path, paths, max_files)?;
             } else if metadata.file_type().is_file() {
-                let name = entry.file_name();
-                if is_library_stage_name(&name) {
-                    continue;
-                }
                 let relative = path
                     .strip_prefix(root)
                     .map_err(|_| ApiError::not_found())?
@@ -7557,6 +7553,63 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
+    }
+
+    #[tokio::test]
+    async fn library_views_exclude_private_workflow_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let root = &app.config.outbound_dir;
+        for name in [
+            ".votport-workflows/job/secret.bin",
+            ".VOTPORT-WORKFLOWS/job/secret.bin",
+            "public/.votport-workflows/job/secret.bin",
+            "public/.VOTPORT-WORKFLOWS/job/secret.bin",
+            ".vot-hidden.stage/secret.bin",
+            "public/.vot-hidden.stage/secret.bin",
+            "public/visible.bin",
+            "public/.notes",
+            "public/.vot-workflows.txt",
+        ] {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"x").unwrap();
+        }
+        let expected = json!([
+            {"path":"public/.notes","bytes":1},
+            {"path":"public/.vot-workflows.txt","bytes":1},
+            {"path":"public/visible.bin","bytes":1},
+        ]);
+        for query in ["", "?directory=public", "?selection=public"] {
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::get(format!("/api/admin/outbound-files{query}"))
+                        .header("cookie", admin_cookie(&app))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{query}");
+            let listed = body(response).await;
+            assert_eq!(listed["files"], expected, "{query}: {listed}");
+            if query.contains("directory") {
+                assert_eq!(listed["directories"], json!([]));
+                assert_eq!(listed["truncated"], false);
+            }
+        }
+        let (matches, truncated) = list_library_search(root, "secret");
+        assert!(matches.is_empty() && !truncated);
+        let (matches, truncated) = list_library_search(root, "visible");
+        assert_eq!(
+            matches,
+            vec![json!({"path":"public/visible.bin","bytes":1})]
+        );
+        assert!(!truncated);
+        let (directories, files, has_more) =
+            direct_library_entries_page(root, root, "", 1).unwrap();
+        assert_eq!(directories, ["public"]);
+        assert!(files.is_empty() && !has_more);
     }
 
     #[test]
