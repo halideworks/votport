@@ -783,8 +783,10 @@ Layout:
   the lock file to force takeover: that would create independent lock inodes.
   Stop or fence the old host and let the filesystem release its lock first.
   `/readyz` and lease metrics expose ownership. Loss of ownership stops writes,
-  preserves recovery state and ends the instance. A clean shutdown releases
-  the lock; crash takeover waits for the NAS's lock recovery rules.
+  preserves recovery state and ends the instance. Both data and receiving
+  locks remain held until process exit, including while storage work is blocked.
+  A retained heartbeat record does not prevent the next holder from acquiring
+  the released kernel lock; crash takeover follows the NAS's lock recovery rules.
 - Where the data volume cannot move, run the standby in replica mode:
   `votport standby` with `VOTPORT_STANDBY_SOURCE` (the live instance's
   https URL), `VOTPORT_REPLICA_TOKEN` (the token saved under System >
@@ -910,6 +912,13 @@ not out. This is the deliberate trade for atomic verified publication with no
 external dependencies; see docs/multi-tenancy.md non-goals. Availability
 comes from a stopped standby instead, described under
 [High availability](#high-availability-active-passive) below.
+
+Receiving currentness checks take a snapshot of ownership before filesystem
+work, so a stalled check does not hold the ownership mutex or delay the lease
+worker through that mutex. HTTP and native session admission allow eight checks
+at once; further requests wait asynchronously. Cancelling a request does not
+release its slot until the blocking check finishes. File preparation keeps its
+existing concurrency. Lease renewal waits for one blocking job at a time.
 
 `GET /healthz` answers 200 when the database and both storage roots answer,
 and is what a proxy health check should poll. `GET /readyz` additionally

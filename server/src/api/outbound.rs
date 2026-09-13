@@ -1893,12 +1893,15 @@ async fn create_library_grant(
             format!("paths must contain 1..={max_files} files"),
         ));
     }
-    let received = options
+    let received = if let Some(job) = options
         .workflow
         .as_ref()
         .filter(|job| job.received.is_some())
-        .map(|job| workflows::received_files(app, job))
-        .transpose()?;
+    {
+        Some(workflows::received_files(app, job).await?)
+    } else {
+        None
+    };
     let root = if received.is_some() {
         crate::paths::join_under(
             &app.config.receive_dir,
@@ -2801,10 +2804,10 @@ pub async fn outbound_receipt_indexed(
     AxumPath((token, index)): AxumPath<(String, usize)>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let grant = active_grant(&app, &token)?;
-    let _operation = begin_outbound_operation(&app, &grant.tenant)?;
+    let grant = Arc::new(active_grant(&app, &token)?);
+    let operation = begin_outbound_operation_owned(&app, &grant.tenant)?;
     require_grant_access(&app, &grant, &headers)?;
-    let source = source_info_indexed(&app, &grant, index)?;
+    let (source, _operation) = source_info_async(&app, grant, index, None, operation).await?;
     let bytes = source.receipt.ok_or_else(ApiError::not_found)?;
     let filename = format!("{}.vot-receipt", source.name);
     let mut response = bytes.into_response();
@@ -2889,11 +2892,7 @@ pub async fn outbound_batch(
     }
     let active = ActiveDownload::claim(Arc::clone(&app), &format!("{}:batch", grant.token_hash))?;
     let chunks = batch_chunks(&grant, count);
-    // Permit first, then the pin: a legacy link stays open to uploads while
-    // this download waits its turn. An oversized first chunk pins the link
-    // itself inside its task, so pinning it here too would self-conflict.
     let permit = staging_permit(&app, &chunks[0]).await;
-    let _pin = legacy_link_pin(&app, &grant, grant.files.is_empty() && !chunks[0].oversized)?;
     let first_file = await_batch_chunk(start_batch_chunk(
         Arc::clone(&app),
         Arc::clone(&grant),
@@ -2902,7 +2901,6 @@ pub async fn outbound_batch(
     )?)
     .await?;
     let file = first_file;
-    drop(_pin);
     require_grant_access(&app, &grant, &headers)?;
     // Downloads are recorded per file as its last byte is handed to the
     // transport, not all up front: an interrupted batch must leave the
@@ -3094,24 +3092,35 @@ fn start_batch_chunk(
     chunk: BatchChunk,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> ApiResult<tokio::task::JoinHandle<io::Result<BatchFile>>> {
+    let operation = begin_outbound_operation_owned(&app, &grant.tenant)?;
     if chunk.oversized {
         drop(permit);
         return Ok(tokio::spawn(async move {
-            let pin =
-                legacy_link_pin(&app, &grant, grant.files.is_empty()).map_err(api_error_io)?;
-            let source = source_info_indexed(&app, &grant, chunk.start).map_err(api_error_io)?;
-            let proof_root = app.config.data_dir.join("outbound.proofs");
-            let source_path = source.path.clone();
-            let expected = source.object.clone();
-            let catalog = tokio::task::spawn_blocking(move || {
-                ensure_catalog(&proof_root, &source_path, &expected)
+            let worker = Arc::clone(&app);
+            let (source, catalog, pin, operation) = tokio::task::spawn_blocking(move || {
+                let pin = legacy_link_pin(&worker, &grant, grant.files.is_empty())
+                    .map_err(api_error_io)?;
+                let source =
+                    source_info_indexed(&worker, &grant, chunk.start).map_err(api_error_io)?;
+                let catalog = ensure_catalog(
+                    &worker.config.data_dir.join("outbound.proofs"),
+                    &source.path,
+                    &source.object,
+                )
+                .map_err(map_source_io_error)?;
+                Ok::<_, io::Error>((source, catalog, pin, operation))
             })
             .await
-            .map_err(|_| io::Error::other("catalog generation failed"))?
-            .map_err(map_source_io_error)?;
-            let stream =
-                start_verified_stream(source.path, source.object, catalog, None, None, None)
-                    .await?;
+            .map_err(|_| io::Error::other("catalog generation failed"))??;
+            let stream = start_verified_stream(
+                source.path,
+                source.object,
+                catalog,
+                None,
+                Some(operation),
+                None,
+            )
+            .await?;
             drop(pin);
             Ok(BatchFile::Verified(stream))
         }));
@@ -3143,7 +3152,8 @@ fn start_batch_chunk(
     // sequential re-fetches of one grant; add one keyed by grant id and file
     // range if that pattern shows.
     Ok(tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+        let (_operation, _permit) = (operation, permit);
+        let _pin = legacy_link_pin(&app, &grant, grant.files.is_empty()).map_err(api_error_io)?;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -3207,6 +3217,7 @@ async fn outbound_file_inner(
     index: usize,
 ) -> ApiResult<Response> {
     let (grant, leased, file) = active_download_grant(&app, &token, index, &headers)?;
+    let grant = Arc::new(grant);
     let operation = begin_outbound_operation_owned(&app, &grant.tenant)?;
     require_grant_access(&app, &grant, &headers)?;
     let allowed = app
@@ -3223,7 +3234,9 @@ async fn outbound_file_inner(
             "too many downloads; try again later",
         ));
     }
-    let source = source_info_indexed_with_file(&app, &grant, index, file.as_ref())?;
+    let legacy = grant.files.is_empty() && file.is_none();
+    let (source, operation) =
+        source_info_async(&app, Arc::clone(&grant), index, file, operation).await?;
     let range = requested_range(&headers, &source.object)?;
     let active = if leased {
         ActiveDownload::claim_with_grant(
@@ -3235,16 +3248,17 @@ async fn outbound_file_inner(
         ActiveDownload::claim(Arc::clone(&app), &format!("{}:{index}", grant.token_hash))?
     };
     {
-        let pin = legacy_link_pin(&app, &grant, grant.files.is_empty() && file.is_none())?;
+        let pin = legacy_link_pin(&app, &grant, legacy)?;
         let proof_root = app.config.data_dir.join("outbound.proofs");
         let source_path = source.path.clone();
         let expected = source.object.clone();
-        let catalog = tokio::task::spawn_blocking(move || {
-            ensure_catalog(&proof_root, &source_path, &expected)
+        let (catalog, pin, operation) = tokio::task::spawn_blocking(move || {
+            let catalog = ensure_catalog(&proof_root, &source_path, &expected)
+                .map_err(|_| ApiError::not_found())?;
+            Ok::<_, ApiError>((catalog, pin, operation))
         })
         .await
-        .map_err(|_| ApiError::internal("catalog generation failed"))?
-        .map_err(|_| ApiError::not_found())?;
+        .map_err(|_| ApiError::internal("catalog generation failed"))??;
         let stream = start_verified_stream(
             source.path.clone(),
             source.object.clone(),
@@ -3280,7 +3294,8 @@ async fn outbound_file_head_inner(
     index: usize,
 ) -> ApiResult<Response> {
     let (grant, _leased, file) = active_download_grant(&app, &token, index, &headers)?;
-    let _operation = begin_outbound_operation(&app, &grant.tenant)?;
+    let grant = Arc::new(grant);
+    let operation = begin_outbound_operation_owned(&app, &grant.tenant)?;
     require_grant_access(&app, &grant, &headers)?;
     if !app.outbound_rate.allow(&grant.token_hash) {
         return Err(ApiError::new(
@@ -3288,7 +3303,8 @@ async fn outbound_file_head_inner(
             "too many downloads; try again later",
         ));
     }
-    let source = source_info_indexed_with_file(&app, &grant, index, file.as_ref())?;
+    let (source, _operation) =
+        source_info_async(&app, Arc::clone(&grant), index, file, operation).await?;
     let mut response = Body::empty().into_response();
     add_file_headers(&mut response, &source, source.object.length, None)?;
     Ok(response)
@@ -3432,7 +3448,7 @@ pub async fn outbound_bundle(
     AxumPath(token): AxumPath<String>,
 ) -> ApiResult<Response> {
     let grant = active_grant(&app, &token)?;
-    let _operation = begin_outbound_operation(&app, &grant.tenant)?;
+    let operation = begin_outbound_operation_owned(&app, &grant.tenant)?;
     require_grant_access(&app, &grant, &headers)?;
     if !app.outbound_rate.allow(&grant.token_hash) {
         return Err(ApiError::new(
@@ -3460,19 +3476,25 @@ pub async fn outbound_bundle(
         ));
     }
     let active = ActiveDownload::claim(Arc::clone(&app), &format!("{}:bundle", grant.token_hash))?;
-    let _pin = legacy_link_pin(&app, &grant, grant.files.is_empty())?;
-    let mut files = Vec::with_capacity(count);
-    for index in 0..count {
-        let source = source_info_indexed(&app, &grant, index)?;
-        let relative = bundle_path(&source.name).ok_or_else(|| {
-            ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid filename in delivery",
-            )
-        })?;
-        files.push((source, relative));
-    }
-    let archive = build_bundle(&app, files).await?;
+    let worker = Arc::clone(&app);
+    let (grant, archive, _operation, active, _pin) = tokio::task::spawn_blocking(move || {
+        let _pin = legacy_link_pin(&worker, &grant, grant.files.is_empty())?;
+        let mut files = Vec::with_capacity(count);
+        for index in 0..count {
+            let source = source_info_indexed(&worker, &grant, index)?;
+            let relative = bundle_path(&source.name).ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid filename in delivery",
+                )
+            })?;
+            files.push((source, relative));
+        }
+        let archive = build_bundle(&worker, files)?;
+        Ok::<_, ApiError>((grant, archive, operation, active, _pin))
+    })
+    .await
+    .map_err(|_| ApiError::internal("bundle preparation failed"))??;
     let length = tokio::fs::metadata(&archive.path)
         .await
         .map_err(|_| ApiError::internal("inspect bundle failed"))?
@@ -3693,7 +3715,7 @@ fn bundle_path(name: &str) -> Option<String> {
 // ponytail: every request re-copies and re-verifies each source; cache the
 // built archive keyed by grant id + file set if concurrent same-ZIP fetches
 // are ever measured as a pattern.
-async fn build_bundle(app: &App, files: Vec<(Source, String)>) -> ApiResult<StagedFile> {
+fn build_bundle(app: &App, files: Vec<(Source, String)>) -> ApiResult<StagedFile> {
     crate::paths::admit_portable_paths(files.iter().map(|(_, name)| name.as_str()))
         .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     let bound = archive_size_bound(&files).ok_or_else(stage_capacity_error)?;
@@ -3713,7 +3735,7 @@ async fn build_bundle(app: &App, files: Vec<(Source, String)>) -> ApiResult<Stag
         reservation: Some(reservation),
     };
     let verifying_key = app.signer.verifying_key();
-    tokio::task::spawn_blocking(move || {
+    (|| {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -3735,9 +3757,7 @@ async fn build_bundle(app: &App, files: Vec<(Source, String)>) -> ApiResult<Stag
         let output = builder.finish()?;
         output.sync_all()?;
         Ok::<_, io::Error>(())
-    })
-    .await
-    .map_err(|_| ApiError::internal("bundle preparation failed"))?
+    })()
     .map_err(map_bundle_error)?;
     Ok(archive)
 }
@@ -4021,6 +4041,22 @@ fn produce_verified_stream(
     Ok(())
 }
 
+async fn source_info_async(
+    app: &Arc<App>,
+    grant: Arc<OutboundGrant>,
+    index: usize,
+    file: Option<OutboundGrantFile>,
+    operation: OwnedOutboundOperation,
+) -> ApiResult<(Source, OwnedOutboundOperation)> {
+    let app = Arc::clone(app);
+    tokio::task::spawn_blocking(move || {
+        let source = source_info_indexed_with_file(&app, &grant, index, file.as_ref())?;
+        Ok((source, operation))
+    })
+    .await
+    .map_err(|_| ApiError::internal("inspect delivery source failed"))?
+}
+
 fn source_info_indexed(app: &App, grant: &OutboundGrant, index: usize) -> ApiResult<Source> {
     source_info_indexed_with_file(app, grant, index, None)
 }
@@ -4134,11 +4170,11 @@ pub(crate) fn source_info_indexed_with_file(
     })
 }
 
-fn legacy_link_pin<'a>(
-    app: &'a App,
+fn legacy_link_pin(
+    app: &App,
     grant: &OutboundGrant,
     should_pin: bool,
-) -> ApiResult<Option<crate::session::LinkPin<'a>>> {
+) -> ApiResult<Option<crate::session::LinkPin>> {
     if !should_pin {
         return Ok(None);
     }
@@ -4483,6 +4519,75 @@ mod tests {
             first_download_at: None,
             last_download_at: None,
             files: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn receiving_source_check_retains_its_operation_when_cancelled() {
+        use std::time::Duration;
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        app.store
+            .insert_tenant(crate::store::tests::test_tenant("acme"))
+            .unwrap();
+        let mut grant = branding_grant(&"a".repeat(32), None);
+        grant.tenant = "acme".into();
+        grant.files.push(OutboundGrantFile {
+            source: "received:missing.bin".into(),
+            name: "file.bin".into(),
+            suite: "blake3".into(),
+            root: hex::encode([7; 32]),
+            bytes: 3,
+            receipt_b64: String::new(),
+            downloads: 0,
+            first_download_at: None,
+            last_download_at: None,
+        });
+        let destinations = app.receiving_destinations().unwrap();
+        let grant = Arc::new(grant);
+        for oversized in [None, Some(false), Some(true)] {
+            let pause = crate::receiving::CheckPause::new(&destinations, 1);
+            let worker = app.clone();
+            let grant = Arc::clone(&grant);
+            let serving = tokio::spawn(async move {
+                if let Some(oversized) = oversized {
+                    let chunk = BatchChunk {
+                        start: 0,
+                        end: 1,
+                        bytes: 3,
+                        oversized,
+                    };
+                    await_batch_chunk(start_batch_chunk(worker, grant, chunk, None)?)
+                        .await
+                        .map(|_| ())
+                } else {
+                    let operation = begin_outbound_operation_owned(&worker, "acme")?;
+                    source_info_async(&worker, grant, 0, None, operation)
+                        .await
+                        .map(|_| ())
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while pause.entered() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(app.receiving.try_lock().is_ok());
+            assert_eq!(app.receiving_permits.available_permits(), 8);
+            assert_eq!(app.sessions.active_outbound_for_tenant("acme"), 1);
+            serving.abort();
+            assert!(matches!(serving.await, Err(error) if error.is_cancelled()));
+            assert_eq!(app.sessions.active_outbound_for_tenant("acme"), 1);
+            pause.release();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while app.sessions.active_outbound_for_tenant("acme") != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
         }
     }
 
@@ -5464,8 +5569,8 @@ mod tests {
             .is_ok());
     }
 
-    #[tokio::test]
-    async fn build_bundle_verifies_sources_and_keeps_archive_readable() {
+    #[test]
+    fn build_bundle_verifies_sources_and_keeps_archive_readable() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
         let first_path = directory.path().join("first");
@@ -5526,7 +5631,6 @@ mod tests {
                 ),
             ],
         )
-        .await
         .unwrap();
 
         let entries = zip_entries(&std::fs::read(&archive.path).unwrap());
@@ -5535,8 +5639,8 @@ mod tests {
         drop(archive);
     }
 
-    #[tokio::test]
-    async fn build_bundle_rejects_ambiguous_names_before_staging() {
+    #[test]
+    fn build_bundle_rejects_ambiguous_names_before_staging() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
         for names in [
@@ -5561,15 +5665,15 @@ mod tests {
                     )
                 })
                 .collect();
-            let error = build_bundle(&app, files).await.err().unwrap();
+            let error = build_bundle(&app, files).err().unwrap();
             assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
             assert!(error.message.contains("collide"));
             assert!(!app.config.data_dir.join("outbound.stage").exists());
         }
     }
 
-    #[tokio::test]
-    async fn build_bundle_rejects_source_mismatch_without_archive() {
+    #[test]
+    fn build_bundle_rejects_source_mismatch_without_archive() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
         let source_path = directory.path().join("source");
@@ -5588,7 +5692,6 @@ mod tests {
                 "source.txt".to_owned(),
             )],
         )
-        .await
         .is_err());
         assert!(app
             .config

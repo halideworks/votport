@@ -935,9 +935,6 @@ pub async fn delete_tenant(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_platform_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    let destinations = app
-        .receiving_destinations()
-        .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
     let key = admit_tenant_ref(&key)?;
     let pin = app.sessions.try_pin_tenant(&key).ok_or_else(|| {
         ApiError::new(StatusCode::CONFLICT, "tenant mutation already in progress")
@@ -963,6 +960,10 @@ pub async fn delete_tenant(
             ),
         ));
     }
+    let destinations = app
+        .receiving_destinations_async()
+        .await
+        .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
     // The subtrees this delete would purge, if there are any. A key with a
     // separator was never usable as a namespace, and neither root is valid.
     let purge_targets = if purges_tenant_subtrees(&key) {
@@ -1980,19 +1981,25 @@ pub async fn get_settings(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _identity = require_platform_admin(&app, &headers)?;
-    Ok(Json(settings_json(&app)?))
+    let identity = require_platform_admin(&app, &headers)?;
+    settings_response(app, identity).await
 }
 
 pub async fn get_receiving_storage(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_platform_admin(&app, &headers)?;
-    let app = Arc::clone(&app);
-    tokio::task::spawn_blocking(move || receiving_storage_json(&app).map(Json))
+    let identity = require_platform_admin(&app, &headers)?;
+    let permit = Arc::clone(&app.receiving_permits)
+        .acquire_owned()
         .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
+        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "receiving storage stopped"))?;
+    tokio::task::spawn_blocking(move || {
+        let (_identity, _permit) = (identity, permit);
+        receiving_storage_json(&app).map(Json)
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
 }
 
 fn receiving_storage_json(app: &App) -> ApiResult<serde_json::Value> {
@@ -2039,13 +2046,22 @@ pub async fn check_receiving_storage(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_platform_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
+    let permit = Arc::clone(&app.receiving_reconfigure)
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "Storage is already being checked or is stopped.",
+            )
+        })?;
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let conflict = |message| ApiError::new(StatusCode::CONFLICT, message);
-        let mut state = app.receiving.lock().expect("receiving state poisoned");
+        let current = app.receiving.lock().expect("receiving state poisoned").clone();
         if crate::receiving::storage_identity(&app.config.receive_dir).map_err(ApiError::internal)? != request.storage {
             return Err(conflict("Storage changed. Refresh this page and review the current mount."));
         }
-        if let Ok(active) = state.as_ref() {
+        if let Ok(active) = current.as_ref() {
             active.destinations.probe().map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
         } else {
             let nas = storage_is_nas(Some(&request.storage));
@@ -2065,7 +2081,7 @@ pub async fn check_receiving_storage(
             if destinations.identity().map_err(ApiError::internal)? != request.storage {
                 return Err(conflict("Storage changed while checking it. Refresh and retry."));
             }
-            let mut active = crate::receiving::Active::open(destinations, &app.lease_holder)
+            let active = crate::receiving::Active::open(destinations, &app.lease_holder)
                 .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
             if nas {
                 let qualification = crate::receiving::Qualification { storage: request.storage, qualified_at: now_unix(), qualified_by: identity.subject.clone() };
@@ -2073,13 +2089,17 @@ pub async fn check_receiving_storage(
                     serde_json::to_string(&qualification).map_err(|e| ApiError::internal(e.to_string()))?
                 ))]).map_err(super::store_unavailable)?;
             }
-            if let Err(error) = app.resume_receiving(&mut active) {
+            if let Err(error) = app.resume_receiving(&active) {
                 app.lease_lost.store(true, std::sync::atomic::Ordering::Release);
                 return Err(super::store_unavailable(error));
             }
-            *state = Ok(active);
+            let mut state = app.receiving.lock().expect("receiving state poisoned");
+            if app.lease_lost.load(std::sync::atomic::Ordering::Acquire) || state.is_ok() {
+                drop(state);
+                return Err(conflict("Receiving ownership changed or transfers are active. Restart before reconfiguring storage."));
+            }
+            *state = Ok(Arc::new(active));
         }
-        drop(state);
         receiving_storage_json(&app).map(Json)
     }).await.map_err(|e| ApiError::internal(e.to_string()))?
 }
@@ -2098,6 +2118,27 @@ fn deployment_commit_profile(root: &std::path::Path) -> Option<&'static str> {
         let _ = root;
         None
     }
+}
+
+async fn settings_response(
+    app: Arc<App>,
+    identity: AdminSession,
+) -> ApiResult<Json<serde_json::Value>> {
+    let permit = Arc::clone(&app.receiving_permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "receiving storage is stopped",
+            )
+        })?;
+    tokio::task::spawn_blocking(move || {
+        let (_identity, _permit) = (identity, permit);
+        settings_json(&app).map(Json)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?
 }
 
 fn settings_json(app: &App) -> ApiResult<serde_json::Value> {
@@ -2400,7 +2441,7 @@ pub async fn put_settings(
             &json!({ "keys": keys, "reset": reset }),
         );
     }
-    Ok(Json(settings_json(&app)?))
+    settings_response(app, identity).await
 }
 
 #[derive(Deserialize)]
@@ -5861,30 +5902,16 @@ mod tenant_offboard_tests {
             .build()
             .unwrap();
         runtime.block_on(async move {
-            let (release_pool, wait_pool) = std::sync::mpsc::channel();
-            let (ready_pool, started_pool) = tokio::sync::oneshot::channel();
-            let blocker = tokio::task::spawn_blocking(move || {
-                ready_pool.send(()).unwrap();
-                wait_pool
-                    .recv_timeout(std::time::Duration::from_secs(10))
-                    .unwrap();
-            });
-            tokio::time::timeout(std::time::Duration::from_secs(2), started_pool)
-                .await
-                .unwrap()
-                .unwrap();
             let (entered_purge, release_purge) = application.sessions.arm_tenant_purge_stall();
             let request_app = application.clone();
             let request_cookie = cookie.clone();
             let request = tokio::spawn(async move {
                 delete_tenant_req(request_app, &request_cookie, "acme").await
             });
-            for _ in 0..200 {
-                if application.store.tenant("acme").unwrap().is_none() {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), entered_purge)
+                .await
+                .unwrap()
+                .unwrap();
             assert!(application.store.tenant("acme").unwrap().is_none());
             request.abort();
             assert!(request.await.unwrap_err().is_cancelled());
@@ -5895,12 +5922,6 @@ mod tenant_offboard_tests {
                     .status(),
                 StatusCode::CONFLICT
             );
-            release_pool.send(()).unwrap();
-            blocker.await.unwrap();
-            tokio::time::timeout(std::time::Duration::from_secs(2), entered_purge)
-                .await
-                .unwrap()
-                .unwrap();
             assert!(application.sessions.tenant_pinned("acme"));
             assert!(paths.iter().all(|path| path.exists()));
             assert_eq!(
@@ -6930,6 +6951,64 @@ mod settings_api_tests {
     }
 
     #[tokio::test]
+    async fn receiving_storage_probe_keeps_its_claim_when_cancelled() {
+        use std::time::Duration;
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let destinations = application.receiving_destinations().unwrap();
+        let pause = crate::receiving::CheckPause::new(&destinations, 1);
+        let cookie = cookie_for(&application, "", "admin");
+        let storage = crate::receiving::storage_identity(&application.config.receive_dir).unwrap();
+        let request = || {
+            Request::post("/api/admin/receiving-storage")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"storage":storage}).to_string()))
+                .unwrap()
+        };
+        let probing = tokio::spawn(send(application.clone(), request()));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pause.entered() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(application.receiving.try_lock().is_ok());
+        assert!(application.receiving_destinations_async().await.is_ok());
+        assert!(app::renew_lease(&application, now_unix()));
+        assert_eq!(
+            send(application.clone(), request()).await.0,
+            StatusCode::CONFLICT
+        );
+        probing.abort();
+        assert!(probing.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            send(application.clone(), request()).await.0,
+            StatusCode::CONFLICT
+        );
+        pause.release();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while application.receiving_reconfigure.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(send(application.clone(), request()).await.0, StatusCode::OK);
+        assert!(
+            std::fs::read_dir(application.config.receive_dir.join(".vot-stage"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("probe-"))
+        );
+    }
+
+    #[tokio::test]
     async fn corrected_local_storage_permissions_can_be_rechecked_in_the_ui() {
         use std::os::unix::fs::PermissionsExt as _;
         let directory = tempfile::tempdir().unwrap();
@@ -6939,6 +7018,44 @@ mod settings_api_tests {
             .unwrap();
         let application = app::build(config).unwrap();
         assert!(application.receiving_destinations().is_err());
+        application
+            .store
+            .insert_link(crate::store::Link {
+                id: "resume".into(),
+                tenant: String::new(),
+                label: "resume".into(),
+                dest: String::new(),
+                password_hash: None,
+                created_at: 0,
+                expires_at: None,
+                max_bytes: None,
+                active: true,
+                legal_hold: false,
+                notifications: None,
+                uploads: Vec::new(),
+                events: Vec::new(),
+            })
+            .unwrap();
+        application
+            .store
+            .insert_upload_session(&crate::store::PersistedUploadSession {
+                committed_upload_id: None,
+                push_key: None,
+                id: hex::encode([9; 16]),
+                link_id: "resume".into(),
+                tenant: String::new(),
+                dest_dir: application.config.receive_dir.clone(),
+                dest_rel: String::new(),
+                package: vot_sdk::object::ObjectId {
+                    suite: 1,
+                    root: [7; 32],
+                    length: 1,
+                },
+                max_total_bytes: Some(1),
+                started_at: now_unix(),
+                files: Vec::new(),
+            })
+            .unwrap();
         std::fs::set_permissions(
             &application.config.receive_dir,
             std::fs::Permissions::from_mode(0o1770),
@@ -6956,7 +7073,10 @@ mod settings_api_tests {
                 .unwrap(),
         )
         .await;
+        let resumed = application.sessions.total();
+        app::suspend_sessions(&application).await;
         assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(resumed, 1, "activation must retain the recovered session");
         assert_eq!(view["ready"], true);
         assert!(crate::receiving::saved_qualification(&application.store)
             .unwrap()

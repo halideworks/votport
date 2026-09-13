@@ -248,7 +248,7 @@ try {
   const suspended = logs.some((line) => line.includes("suspended upload sessions"));
   if (!suspended) throw new Error("server did not log the suspend");
   assert.equal(exit.code, 0, "live process must stop cleanly");
-  assert.ok(!fs.existsSync(leaseFile), "clean stop must remove its heartbeat");
+  assert.equal(JSON.parse(fs.readFileSync(leaseFile, "utf8")).holder, originalHolder, "process exit retains its final heartbeat");
   assert.equal(identity(leaseLock), originalLock, "clean stop must retain the lock inode");
   if (standby) {
     const stopped = await stopServer(standby);

@@ -89,9 +89,6 @@ async fn main() {
         Ok(listener) => listener,
         Err(error) => {
             tracing::error!("bind {bind}: {error}");
-            // The fences were taken in build; a boot that dies here must
-            // give them back or the next attempt waits out the lease.
-            app::release_data_lock(&application);
             std::process::exit(2);
         }
     };
@@ -111,10 +108,9 @@ async fn main() {
         std::process::exit(1);
     }
     // No handler can reach a session now; park the in-flight uploads on
-    // disk so the next boot re-attaches them, give the fences back, and
-    // exit before the runtime drop can let a blocking job write again.
+    // disk so the next boot re-attaches them. Process exit releases both
+    // kernel locks without waiting for NAS cleanup or blocking workers.
     app::suspend_sessions(&application).await;
-    app::release_data_lock(&application);
     std::process::exit(0);
 }
 

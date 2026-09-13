@@ -136,7 +136,9 @@ pub struct App {
     pub(crate) _data_lock: std::fs::File,
     /// This instance's name in the receive-root lease (crate::lease).
     pub lease_holder: String,
-    pub receiving: Mutex<Result<crate::receiving::Active, String>>,
+    pub receiving: Mutex<Result<Arc<crate::receiving::Active>, String>>,
+    pub(crate) receiving_permits: Arc<tokio::sync::Semaphore>,
+    pub(crate) receiving_reconfigure: Arc<tokio::sync::Semaphore>,
     /// Set when a heartbeat finds another holder in the lease file; the
     /// process is then shutting down and /readyz reports it.
     pub lease_lost: AtomicBool,
@@ -627,6 +629,8 @@ const SSO_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 /// Concurrent argon2 verifications allowed per unauthenticated password path.
 const VERIFY_PERMITS: usize = 2;
 
+const RECEIVING_CHECK_CONCURRENCY: usize = 8;
+
 /// Process-local OIDC client. Success is sticky; failure cools down 30s.
 pub struct SsoSlot<T = crate::api::sso::SsoClient> {
     inner: Mutex<SsoSlotState<T>>,
@@ -865,7 +869,9 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         workflow_ready: tokio::sync::Notify::new(),
         _data_lock: data_lock,
         lease_holder,
-        receiving: Mutex::new(receiving),
+        receiving: Mutex::new(receiving.map(Arc::new)),
+        receiving_permits: Arc::new(tokio::sync::Semaphore::new(RECEIVING_CHECK_CONCURRENCY)),
+        receiving_reconfigure: Arc::new(tokio::sync::Semaphore::new(1)),
         lease_lost: AtomicBool::new(false),
         health: HealthCache::default(),
         config,
@@ -874,19 +880,38 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
 
 impl App {
     pub fn receiving_destinations(&self) -> Result<Arc<crate::receiving::Destinations>, String> {
-        if self.lease_lost.load(Ordering::Relaxed) {
+        if self.lease_lost.load(Ordering::Acquire) {
             return Err("receiving storage ownership was lost".to_owned());
         }
-        let state = self.receiving.lock().expect("receiving state poisoned");
-        let active = state.as_ref().map_err(Clone::clone)?;
+        let active = self
+            .receiving
+            .lock()
+            .expect("receiving state poisoned")
+            .clone()?;
         active.destinations.check_current()?;
+        if self.lease_lost.load(Ordering::Acquire) {
+            return Err("receiving storage ownership was lost".to_owned());
+        }
         Ok(Arc::clone(&active.destinations))
     }
 
-    pub(crate) fn resume_receiving(
-        &self,
-        active: &mut crate::receiving::Active,
-    ) -> Result<(), String> {
+    pub(crate) async fn receiving_destinations_async(
+        self: &Arc<Self>,
+    ) -> Result<Arc<crate::receiving::Destinations>, String> {
+        let permit = Arc::clone(&self.receiving_permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| "receiving storage is stopped".to_owned())?;
+        let app = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            app.receiving_destinations()
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    pub(crate) fn resume_receiving(&self, active: &crate::receiving::Active) -> Result<(), String> {
         resume_upload_sessions(
             &self.config,
             &self.store,
@@ -936,7 +961,7 @@ fn resume_upload_sessions(
     signer: &Arc<crate::receipt::ReceiptSigner>,
     sessions: &Sessions,
     ended: &tokio::sync::mpsc::UnboundedSender<session::SessionEnded>,
-    active: &mut crate::receiving::Active,
+    active: &crate::receiving::Active,
 ) -> Result<HashSet<std::path::PathBuf>, String> {
     active.during_recovery(|destinations| {
         Ok(restore_upload_sessions(
@@ -1160,24 +1185,37 @@ pub(crate) fn lock_data_dir(data_dir: &std::path::Path) -> Result<std::fs::File,
     Ok(file)
 }
 
-/// Releases the data directory lock and the receive-root lease. main calls
-/// it as the last step of a clean shutdown, right before the process exits,
-/// so a standby (or the same host's next container) starts without waiting
-/// for the lease to go stale; the restart e2e tests, which boot a second
-/// App in the same process, call it too. A running health probe retains both
-/// fences until process exit. Otherwise nothing may write after release.
+/// Releases ownership for quiescent in-process restart fixtures. Production
+/// exits while holding both fences, so blocked work cannot outlive ownership.
 pub fn release_data_lock(app: &App) {
+    app.lease_lost.store(true, Ordering::Release);
+    app.receiving_permits.close();
+    app.receiving_reconfigure.close();
     if !app.health.stop() {
         tracing::warn!(
             "health probe still running; retaining storage ownership until process exit"
         );
         return;
     }
+    let Ok(mut state) = app.receiving.try_lock() else {
+        return;
+    };
+    if let Ok(active) = state.as_ref() {
+        active.destinations.stop();
+        if Arc::strong_count(active) != 1 {
+            return;
+        }
+    }
+    if app.receiving_reconfigure.available_permits() == 0
+        || app.receiving_permits.available_permits() != RECEIVING_CHECK_CONCURRENCY
+    {
+        return;
+    }
+    let previous = std::mem::replace(&mut *state, Err("receiving storage released".to_owned()));
+    drop(state);
+    drop(previous);
     #[cfg(unix)]
     let _ = rustix::fs::flock(&app._data_lock, rustix::fs::FlockOperation::Unlock);
-    *app.receiving.lock().expect("receiving state poisoned") =
-        Err("receiving storage released".to_owned());
-    app.lease_lost.store(true, Ordering::Relaxed);
 }
 
 /// Any failed ownership check stops receiving before another heartbeat can renew.
@@ -1185,8 +1223,12 @@ pub fn renew_lease(app: &App, now: u64) -> bool {
     if app.lease_lost.load(Ordering::Relaxed) {
         return false;
     }
-    let mut state = app.receiving.lock().expect("receiving state poisoned");
-    let Ok(active) = state.as_mut() else {
+    let state = app
+        .receiving
+        .lock()
+        .expect("receiving state poisoned")
+        .clone();
+    let Ok(active) = state else {
         return true;
     };
     match active.renew(now) {
@@ -1197,6 +1239,14 @@ pub fn renew_lease(app: &App, now: u64) -> bool {
             false
         }
     }
+}
+
+async fn renew_lease_once(app: &Arc<App>) -> bool {
+    let app = Arc::clone(app);
+    matches!(
+        tokio::task::spawn_blocking(move || renew_lease(&app, now_unix())).await,
+        Ok(true)
+    )
 }
 
 /// Heartbeats the lease for the life of the process. A loss is a hard stop:
@@ -1211,7 +1261,8 @@ pub async fn lease_keeper(app: Arc<App>) {
     tick.tick().await;
     loop {
         tick.tick().await;
-        if !renew_lease(&app, now_unix()) {
+        if !renew_lease_once(&app).await {
+            app.lease_lost.store(true, Ordering::Release);
             suspend_sessions(&app).await;
             std::process::exit(1);
         }
@@ -2109,6 +2160,177 @@ mod health_tests {
     use axum::http::Request;
     use tower::ServiceExt as _;
 
+    #[test]
+    fn receiving_checks_do_not_hold_ownership_state_or_delay_renewal() {
+        use std::time::{Duration, Instant};
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let destinations = app.receiving_destinations().unwrap();
+        let pause = crate::receiving::CheckPause::new(&destinations, 1);
+        let checking = app.clone();
+        let worker = std::thread::spawn(move || checking.receiving_destinations());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while pause.entered() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(pause.entered(), 1);
+        let state_available = app.receiving.try_lock().is_ok();
+        let renewing = app.clone();
+        let (done, completed) = std::sync::mpsc::channel();
+        let renewal = std::thread::spawn(move || {
+            done.send(renew_lease(&renewing, now_unix())).unwrap();
+        });
+        let renewed = completed.recv_timeout(Duration::from_millis(500)).ok();
+        pause.release();
+        worker.join().unwrap().unwrap();
+        renewal.join().unwrap();
+        assert!(
+            state_available,
+            "currentness check held the ownership mutex"
+        );
+        assert_eq!(renewed, Some(true), "currentness check blocked renewal");
+    }
+
+    #[tokio::test]
+    async fn receiving_checks_keep_their_bound_after_request_cancellation() {
+        use std::time::Duration;
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let destinations = app.receiving_destinations().unwrap();
+        let pause = crate::receiving::CheckPause::new(&destinations, usize::MAX);
+        let mut requests = Vec::new();
+        for _ in 0..24 {
+            let app = app.clone();
+            requests.push(tokio::spawn(async move {
+                app.receiving_destinations_async().await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pause.entered() < 8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(pause.entered(), 8, "only eight checks may reach storage");
+        for request in requests {
+            request.abort();
+            assert!(matches!(request.await, Err(error) if error.is_cancelled()));
+        }
+        let mut later = Vec::new();
+        for _ in 0..12 {
+            let app = app.clone();
+            later.push(tokio::spawn(async move {
+                app.receiving_destinations_async().await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            pause.entered(),
+            8,
+            "cancellation must not release running checks"
+        );
+        assert!(later.iter().all(|request| !request.is_finished()));
+        pause.release();
+        for request in later {
+            tokio::time::timeout(Duration::from_secs(2), request)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while app.receiving_permits.available_permits() != 8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(pause.entered(), 20, "cancelled waiters must never run");
+        assert_eq!(app.receiving_permits.available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn receiving_renewal_waits_off_the_executor_and_keeps_ownership() {
+        use std::time::{Duration, Instant};
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let destinations = app.receiving_destinations().unwrap();
+        let pause = crate::receiving::CheckPause::new(&destinations, 1);
+        let worker = app.clone();
+        let renewal = tokio::spawn(async move { renew_lease_once(&worker).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pause.entered() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(!renewal.is_finished());
+        assert!(app.receiving.try_lock().is_ok());
+        release_data_lock(&app);
+        assert!(lock_data_dir(&app.config.data_dir).is_err());
+        assert!(crate::lease::Guard::acquire(
+            &vot_platform_fs::Directory::open(&app.config.receive_dir).unwrap(),
+            "other",
+            now_unix()
+        )
+        .is_err());
+        pause.release();
+        assert!(!tokio::time::timeout(Duration::from_secs(2), renewal)
+            .await
+            .unwrap()
+            .unwrap());
+        assert!(destinations.check_current().is_err());
+        release_data_lock(&app);
+        assert!(lock_data_dir(&app.config.data_dir).is_ok());
+        assert!(crate::lease::Guard::acquire(
+            &vot_platform_fs::Directory::open(&app.config.receive_dir).unwrap(),
+            "other",
+            now_unix()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn receiving_shutdown_keeps_queued_check_and_reconfiguration_fences() {
+        for reconfigure in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let app = crate::api::testing::build(directory.path());
+            let permit = if reconfigure {
+                &app.receiving_reconfigure
+            } else {
+                &app.receiving_permits
+            }
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+            release_data_lock(&app);
+            assert!(lock_data_dir(&app.config.data_dir).is_err());
+            assert!(crate::lease::Guard::acquire(
+                &vot_platform_fs::Directory::open(&app.config.receive_dir).unwrap(),
+                "other",
+                now_unix()
+            )
+            .is_err());
+            assert!(app.receiving_permits.is_closed());
+            assert!(app.receiving_reconfigure.is_closed());
+            drop(permit);
+            release_data_lock(&app);
+            assert!(lock_data_dir(&app.config.data_dir).is_ok());
+            assert!(crate::lease::Guard::acquire(
+                &vot_platform_fs::Directory::open(&app.config.receive_dir).unwrap(),
+                "other",
+                now_unix()
+            )
+            .is_ok());
+        }
+    }
+
     async fn wait_health_idle(app: &App) {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while app.health.state.lock().unwrap().running {
@@ -2383,7 +2605,6 @@ mod health_tests {
                 let app = crate::api::testing::build(std::path::Path::new(&root));
                 let _pause = PausedHealth::new(&app, true);
                 assert!(health_snapshot(&app).await.is_none());
-                release_data_lock(&app);
                 assert!(app.health.state.lock().unwrap().running);
                 std::process::exit(0);
             });
@@ -2419,7 +2640,19 @@ mod health_tests {
             "probe shutdown failed: {}",
             std::fs::read_to_string(directory.path().join("child.log")).unwrap()
         );
+        use std::os::unix::fs::MetadataExt as _;
+        let config = crate::api::testing::config(directory.path());
+        let record = crate::lease::path(&config.receive_dir);
+        let previous: crate::lease::Lease =
+            serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        let lock = record.parent().unwrap().join("writer.lock");
+        let inode = std::fs::metadata(&lock).unwrap().ino();
         let app = crate::api::testing::build(directory.path());
+        let current: crate::lease::Lease =
+            serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        assert_ne!(previous.holder, current.holder);
+        assert_eq!(current.holder, app.lease_holder);
+        assert_eq!(std::fs::metadata(&lock).unwrap().ino(), inode);
         release_data_lock(&app);
     }
 

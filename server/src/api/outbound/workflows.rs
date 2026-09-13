@@ -666,7 +666,7 @@ async fn prepare(app: &Arc<App>, mut job: Job) -> ApiResult<()> {
         None
     };
     let mut paths = if job.received.is_some() {
-        received_files(app, &job)?.into_keys().collect()
+        received_files(app, &job).await?.into_keys().collect()
     } else if job.uses_snapshot() {
         freeze_files(app, &job).await?
     } else {
@@ -786,40 +786,48 @@ async fn prepare(app: &Arc<App>, mut job: Job) -> ApiResult<()> {
     Ok(())
 }
 
-pub(super) fn received_files(
-    app: &App,
+pub(super) async fn received_files(
+    app: &Arc<App>,
     job: &Job,
 ) -> ApiResult<std::collections::BTreeMap<String, crate::store::FileRecord>> {
-    app.receiving_destinations()
-        .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
-    let received = job.received.as_ref().ok_or_else(ApiError::not_found)?;
-    let upload = app
-        .store
-        .link_upload(&job.tenant, &received.link_id, &received.upload_id)
-        .map_err(crate::api::store_unavailable)?
-        .ok_or_else(ApiError::not_found)?;
-    if upload.partial
-        || upload.completed_at == 0
-        || upload.files.is_empty()
-        || upload.files.len() > MAX_LIBRARY_PROJECT_FILES
-        || upload.files.iter().any(|file| file.deleted)
-    {
-        return Err(conflict(
-            "incoming package is incomplete or unavailable".into(),
-        ));
-    }
-    let count = upload.files.len();
-    let files: std::collections::BTreeMap<_, _> = upload
-        .files
-        .into_iter()
-        .map(|file| (file.path.clone(), file))
-        .collect();
-    if files.len() != count {
-        return Err(conflict(
-            "incoming inventory contains duplicate filenames".into(),
-        ));
-    }
-    Ok(files)
+    let received = job.received.clone().ok_or_else(ApiError::not_found)?;
+    let tenant = job.tenant.clone();
+    let operation = begin_outbound_operation_owned(app, &tenant)?;
+    let app = Arc::clone(app);
+    tokio::task::spawn_blocking(move || {
+        let _operation = operation;
+        app.receiving_destinations()
+            .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
+        let upload = app
+            .store
+            .link_upload(&tenant, &received.link_id, &received.upload_id)
+            .map_err(crate::api::store_unavailable)?
+            .ok_or_else(ApiError::not_found)?;
+        if upload.partial
+            || upload.completed_at == 0
+            || upload.files.is_empty()
+            || upload.files.len() > MAX_LIBRARY_PROJECT_FILES
+            || upload.files.iter().any(|file| file.deleted)
+        {
+            return Err(conflict(
+                "incoming package is incomplete or unavailable".into(),
+            ));
+        }
+        let count = upload.files.len();
+        let files: std::collections::BTreeMap<_, _> = upload
+            .files
+            .into_iter()
+            .map(|file| (file.path.clone(), file))
+            .collect();
+        if files.len() != count {
+            return Err(conflict(
+                "incoming inventory contains duplicate filenames".into(),
+            ));
+        }
+        Ok(files)
+    })
+    .await
+    .map_err(|_| ApiError::internal("inspect incoming inventory failed"))?
 }
 
 pub(super) fn payload_root(app: &App, tenant: &str, id: &str) -> PathBuf {
@@ -967,15 +975,15 @@ fn copy_snapshot(
     )
 }
 
-async fn check_media(app: &App, job: &Job, names: &[String]) -> ApiResult<()> {
+async fn check_media(app: &Arc<App>, job: &Job, names: &[String]) -> ApiResult<()> {
     if job.project.media.is_none() && !job.project.scan_required {
         return Ok(());
     }
-    let received = job
-        .received
-        .as_ref()
-        .map(|_| received_files(app, job))
-        .transpose()?;
+    let received = if job.received.is_some() {
+        Some(received_files(app, job).await?)
+    } else {
+        None
+    };
     for name in names {
         let path = if let Some(received) = &received {
             let file = received.get(name).ok_or_else(ApiError::not_found)?;
