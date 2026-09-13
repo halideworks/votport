@@ -395,38 +395,27 @@ pub fn ensure_no_pending_restore(data_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The stage directory name a pending restore marker points at, whatever
-/// its phase; None when there is no marker or it is unreadable.
-pub fn pending_restore_stage(data_dir: &Path) -> Option<String> {
-    let bytes = fs::read(data_dir.join(PENDING_FILE)).ok()?;
-    let marker: PendingRestore = serde_json::from_slice(&bytes).ok()?;
-    Some(marker.stage)
-}
-
-/// Discards a prepared (not yet applied) pending restore and its stage so a
-/// newer one can replace it. A restore that a boot already started applying
-/// is left alone: that boot has to finish it.
-pub fn clear_pending_restore(data_dir: &Path) -> Result<(), String> {
-    let marker_path = data_dir.join(PENDING_FILE);
-    let bytes = match fs::read(&marker_path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+fn read_pending_restore(data_dir: &Path) -> Result<Option<PendingRestore>, String> {
+    let path = data_dir.join(PENDING_FILE);
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.to_string()),
     };
+    if !meta.file_type().is_file() || meta.len() > MAX_MARKER {
+        return Err("invalid pending restore marker".into());
+    }
     let marker: PendingRestore =
-        serde_json::from_slice(&bytes).map_err(|_| "invalid pending restore marker".to_owned())?;
-    if marker.phase != RestorePhase::Prepared {
-        return Err("a restore is being applied; restart to finish it first".into());
+        serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+            .map_err(|_| "invalid pending restore marker".to_owned())?;
+    if !marker.stage.starts_with(".votport-restore-stage-") || marker.stage.contains(['/', '\\']) {
+        return Err("invalid pending restore stage".into());
     }
-    if marker.stage.starts_with(".votport-restore-stage-") && !marker.stage.contains('/') {
-        let stage = data_dir.join(&marker.stage);
-        if let Ok(meta) = fs::symlink_metadata(&stage) {
-            if meta.file_type().is_dir() {
-                fs::remove_dir_all(&stage).map_err(|error| error.to_string())?;
-            }
-        }
-    }
-    fs::remove_file(&marker_path).map_err(|error| error.to_string())
+    Ok(Some(marker))
+}
+
+pub(crate) fn pending_restore_stage(data_dir: &Path) -> Result<Option<String>, String> {
+    read_pending_restore(data_dir).map(|marker| marker.map(|marker| marker.stage))
 }
 
 pub fn read_secrets(data_dir: &Path) -> Result<BackupSecrets, String> {
@@ -960,16 +949,27 @@ fn disable_restored_backups(path: &Path, schema_version: u64) -> Result<(), Stri
 /// Commit a validated extraction as a restart-time transaction. The marker
 /// contains only a basename, and the extracted directory has already passed
 /// the fixed archive allowlist above.
-pub fn write_pending_restore(
+pub(crate) fn write_pending_restore(
     data_dir: &Path,
-    extracted: &Path,
+    mut extracted: CleanupPath,
     manifest: Manifest,
 ) -> Result<(), String> {
+    let previous = read_pending_restore(data_dir)?;
+    if previous
+        .as_ref()
+        .is_some_and(|marker| marker.phase != RestorePhase::Prepared || marker.rollback.is_some())
+    {
+        return Err("a restore is being applied; restart to finish it first".into());
+    }
+    if !extracted.directory || extracted.path.parent() != Some(data_dir) {
+        return Err("invalid restore stage".into());
+    }
     let stage_name = extracted
+        .path
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or("invalid restore stage")?;
-    if !stage_name.starts_with(".votport-restore-stage-") || stage_name.contains('/') {
+    if !stage_name.starts_with(".votport-restore-stage-") || stage_name.contains(['/', '\\']) {
         return Err("invalid restore stage".into());
     }
     let marker = PendingRestore {
@@ -979,7 +979,17 @@ pub fn write_pending_restore(
         phase: RestorePhase::Prepared,
         rollback: None,
     };
-    persist_pending_restore(data_dir, &marker)
+    // A failed directory sync can leave the new marker installed. Retain both stages until success.
+    extracted.keep();
+    persist_pending_restore(data_dir, &marker)?;
+    if let Some(previous) = previous.filter(|previous| previous.stage != marker.stage) {
+        if let Err(error) = fs::remove_dir_all(data_dir.join(previous.stage)) {
+            if error.kind() != io::ErrorKind::NotFound {
+                tracing::warn!(%error, "previous replica stage cleanup failed");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn persist_pending_restore(data_dir: &Path, marker: &PendingRestore) -> Result<(), String> {
@@ -992,17 +1002,9 @@ fn persist_pending_restore(data_dir: &Path, marker: &PendingRestore) -> Result<(
 
 pub fn apply_pending_restore(data_dir: &Path, schema_version: u64) -> Result<(), String> {
     let marker_path = data_dir.join(PENDING_FILE);
-    let meta = match fs::symlink_metadata(&marker_path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.to_string()),
+    let Some(mut marker) = read_pending_restore(data_dir)? else {
+        return Ok(());
     };
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() || meta.len() > MAX_MARKER {
-        return Err("invalid pending restore marker".into());
-    }
-    let mut marker: PendingRestore =
-        serde_json::from_slice(&fs::read(&marker_path).map_err(|e| e.to_string())?)
-            .map_err(|_| "invalid pending restore marker".to_owned())?;
     if marker.version != VERSION
         || marker.manifest.version != VERSION
         || marker.manifest.schema_version != schema_version
@@ -1883,6 +1885,82 @@ mod tests {
         assert!(validate_and_extract(&archive_path, &stage, crate::store::SCHEMA_VERSION).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn replacement_preserves_recoverable_stages_until_the_marker_commits() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let stage = root.path().join(".votport-restore-stage-old");
+        fs::create_dir(&stage).unwrap();
+        let manifest = Manifest {
+            version: VERSION,
+            created_at: 1,
+            schema_version: crate::store::SCHEMA_VERSION,
+            entries: Vec::new(),
+        };
+        write_pending_restore(
+            root.path(),
+            CleanupPath::directory(stage.clone()),
+            manifest.clone(),
+        )
+        .unwrap();
+        let original = fs::read(root.path().join(PENDING_FILE)).unwrap();
+        let new = root.path().join(".votport-restore-stage-new");
+        fs::create_dir(&new).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let failed = write_pending_restore(
+            root.path(),
+            CleanupPath::directory(new.clone()),
+            manifest.clone(),
+        );
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(failed.is_err(), "test requires an unprivileged user");
+        assert_eq!(fs::read(root.path().join(PENDING_FILE)).unwrap(), original);
+        assert!(stage.is_dir());
+        assert!(
+            new.is_dir(),
+            "uncertain publication must retain the candidate"
+        );
+        write_pending_restore(
+            root.path(),
+            CleanupPath::directory(new.clone()),
+            manifest.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            pending_restore_stage(root.path()).unwrap().unwrap(),
+            new.file_name().unwrap().to_str().unwrap()
+        );
+        assert!(!stage.exists());
+        assert!(new.is_dir());
+
+        for phase in [
+            RestorePhase::Prepared,
+            RestorePhase::OldMoved,
+            RestorePhase::NewInstalled,
+        ] {
+            let mut pending = read_pending_restore(root.path()).unwrap().unwrap();
+            pending.phase = phase;
+            pending.rollback = Some(".votport-restore-rollback-test".into());
+            persist_pending_restore(root.path(), &pending).unwrap();
+            let before = fs::read(root.path().join(PENDING_FILE)).unwrap();
+            fs::create_dir(&stage).unwrap();
+            assert!(write_pending_restore(
+                root.path(),
+                CleanupPath::directory(stage.clone()),
+                manifest.clone()
+            )
+            .unwrap_err()
+            .contains("being applied"));
+            assert_eq!(fs::read(root.path().join(PENDING_FILE)).unwrap(), before);
+            assert!(new.is_dir());
+            assert!(
+                !stage.exists(),
+                "unpublished rejected candidate is cleaned up"
+            );
+        }
+    }
+
     #[test]
     fn pending_restore_rechecks_staged_hashes_before_moving_live_data() {
         let (root, store) = initialized_root();
@@ -1892,7 +1970,8 @@ mod tests {
         fs::create_dir(&stage).unwrap();
         let manifest =
             validate_and_extract(&archive, &stage, crate::store::SCHEMA_VERSION).unwrap();
-        write_pending_restore(root.path(), &stage, manifest).unwrap();
+        write_pending_restore(root.path(), CleanupPath::directory(stage.clone()), manifest)
+            .unwrap();
         fs::write(stage.join("receipt.key"), b"tampered").unwrap();
         drop(store);
         assert!(apply_pending_restore(root.path(), crate::store::SCHEMA_VERSION).is_err());
@@ -2060,7 +2139,8 @@ mod tests {
         fs::write(root.path().join("secret"), [9; 32]).unwrap();
         fs::write(root.path().join("votport.db-wal"), b"stale-wal").unwrap();
         fs::write(root.path().join("votport.db-shm"), b"stale-shm").unwrap();
-        write_pending_restore(root.path(), &stage, manifest).unwrap();
+        write_pending_restore(root.path(), CleanupPath::directory(stage.clone()), manifest)
+            .unwrap();
         apply_pending_restore(root.path(), crate::store::SCHEMA_VERSION).unwrap();
         let secret = fs::read(root.path().join("secret")).unwrap();
         assert_ne!(secret, [7; 32]);
