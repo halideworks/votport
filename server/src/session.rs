@@ -992,18 +992,17 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
 
     // A read failure also means finish cannot record the upload, so refuse
     // before opening destinations rather than leave untracked files.
-    let prior_uploads = setup
+    setup
         .store
-        .uploads_by_id(&setup.link_id)
+        .link_metadata(&setup.tenant, &setup.link_id)
         .map_err(|error| SessionError::internal(format!("link read failed: {error}")))?
         .ok_or_else(|| SessionError::conflict("request link no longer exists"))?;
-    let delivered = delivered_index(&prior_uploads);
 
     let destinations = entries
         .iter()
         .map(|entry| (entry.path().map(str::to_owned).collect(), entry.object_id()))
         .collect::<Vec<_>>();
-    let (files, allocation) = prepare_files(setup, &destinations, &delivered, || true)?;
+    let (files, allocation) = prepare_files(setup, &destinations, || true)?;
     persist_session(setup, &files)?;
     drop(allocation);
     *phase = Phase::Receiving { files };
@@ -1491,75 +1490,76 @@ struct Delivered {
     receipt: bool,
 }
 
-fn delivered_index(uploads: &[UploadRecord]) -> HashMap<(&str, &str), Vec<&FileRecord>> {
-    let mut index: HashMap<_, Vec<_>> = HashMap::new();
-    for record in uploads.iter().flat_map(|upload| &upload.files) {
-        if !record.deleted {
-            index
-                .entry((record.suite.as_str(), record.root.as_str()))
-                .or_default()
-                .push(record);
-        }
-    }
-    index
-}
-
 /// A file with this object root already delivered on this link and still on
 /// disk at its recorded name: the transfer is skipped and the existing copy
 /// reported, instead of publishing a suffixed duplicate.
 fn find_delivered(
     setup: &WorkerSetup,
-    delivered: &HashMap<(&str, &str), Vec<&FileRecord>>,
     object: &ObjectId,
     active: impl Fn() -> bool,
-) -> Option<Delivered> {
-    let suite = suite_name(object.suite);
-    let root = hex::encode(object.root);
-    for record in delivered.get(&(suite.as_str(), root.as_str()))? {
-        // stored_as is relative to the tenant's subtree: it carries the link
-        // dest but not the tenant prefix, which is why dest_rel is stripped
-        // before joining under dest_dir. A record made under a
-        // different link dest no longer lives beneath dest_dir; skip it.
-        let rel = if setup.dest_rel.is_empty() {
-            record.stored_as.as_str()
-        } else {
-            match record
-                .stored_as
-                .strip_prefix(&format!("{}/", setup.dest_rel))
-            {
-                Some(rest) => rest,
-                None => continue,
-            }
-        };
-        if rel.split('/').any(crate::protocol_paths::is_receipt_name) {
-            continue;
+) -> Result<Option<Delivered>, SessionError> {
+    let mut after = String::new();
+    loop {
+        if !active() {
+            return Err(SessionError::conflict("receive preparation cancelled"));
         }
-        if crate::protocol_paths::check_payload_name_length(
-            rel.rsplit('/').next().unwrap_or_default(),
-        )
-        .is_err()
-        {
-            continue;
-        }
-        let components: Vec<String> = rel.split('/').map(str::to_owned).collect();
-        let Ok(path) = paths::join_under(&setup.dest_dir, &components) else {
-            continue;
-        };
-        match fs::metadata(&path) {
-            Ok(meta)
-                if meta.is_file()
-                    && meta.len() == object.length
-                    && staged_object_valid(&path, object, &active).unwrap_or(false) =>
-            {
-                return Some(Delivered {
-                    stored_components: components,
-                    receipt: record.receipt,
-                });
+        let candidates = setup
+            .store
+            .delivered_candidates(&setup.tenant, &setup.link_id, object, &after)
+            .map_err(SessionError::internal)?;
+        let count = candidates.len();
+        for (stored_as, receipt) in candidates {
+            if stored_as == after {
+                continue;
             }
-            _ => {}
+            after = stored_as;
+            if !active() {
+                return Err(SessionError::conflict("receive preparation cancelled"));
+            }
+            // stored_as is relative to the tenant's subtree: it carries the link
+            // dest but not the tenant prefix, which is why dest_rel is stripped
+            // before joining under dest_dir. A record made under a
+            // different link dest no longer lives beneath dest_dir; skip it.
+            let rel = if setup.dest_rel.is_empty() {
+                after.as_str()
+            } else {
+                match after.strip_prefix(&format!("{}/", setup.dest_rel)) {
+                    Some(rest) => rest,
+                    None => continue,
+                }
+            };
+            if rel.split('/').any(crate::protocol_paths::is_receipt_name) {
+                continue;
+            }
+            if crate::protocol_paths::check_payload_name_length(
+                rel.rsplit('/').next().unwrap_or_default(),
+            )
+            .is_err()
+            {
+                continue;
+            }
+            let components: Vec<String> = rel.split('/').map(str::to_owned).collect();
+            let Ok(path) = paths::join_under(&setup.dest_dir, &components) else {
+                continue;
+            };
+            match fs::metadata(&path) {
+                Ok(meta)
+                    if meta.is_file()
+                        && meta.len() == object.length
+                        && staged_object_valid(&path, object, &active).unwrap_or(false) =>
+                {
+                    return Ok(Some(Delivered {
+                        stored_components: components,
+                        receipt,
+                    }));
+                }
+                _ => {}
+            }
+        }
+        if count < crate::store::DELIVERED_CANDIDATE_PAGE {
+            return Ok(None);
         }
     }
-    None
 }
 
 fn pending_upload_claims(store: &Store, tenant: &str) -> Result<HashSet<Vec<u8>>, SessionError> {
@@ -1604,7 +1604,6 @@ pub(crate) fn check_upload_directory(
 fn prepare_files<'a>(
     setup: &'a WorkerSetup,
     entries: &[(Vec<String>, ObjectId)],
-    delivered: &HashMap<(&str, &str), Vec<&FileRecord>>,
     active: impl Fn() -> bool + Sync,
 ) -> Result<(Vec<FileState>, std::sync::MutexGuard<'a, ()>), SessionError> {
     for (components, _) in entries {
@@ -1623,10 +1622,7 @@ fn prepare_files<'a>(
         ));
     }
     let existing = prepare_parallel(entries, |_, (_, object)| {
-        if !active() {
-            return Err(SessionError::conflict("receive preparation cancelled"));
-        }
-        Ok(find_delivered(setup, delivered, object, &active))
+        find_delivered(setup, object, &active)
     })?;
     // ponytail: large NAS manifests serialize metadata allocation; temporary claims can narrow it.
     let allocation = setup
@@ -2567,13 +2563,11 @@ impl PushReceive {
             .push_lease(&hex::encode(self.setup.session_id));
         self.check_active()?;
         let validated = validate_push_manifest(&self.setup, summary, records)?;
-        let prior_uploads = self
-            .setup
+        self.setup
             .store
-            .uploads_by_id(&self.setup.link_id)
+            .link_metadata(&self.setup.tenant, &self.setup.link_id)
             .map_err(|error| SessionError::internal(format!("link read failed: {error}")))?
             .ok_or_else(|| SessionError::conflict("request link no longer exists"))?;
-        let delivered = delivered_index(&prior_uploads);
         let mut saved = self
             .control
             .resume_key
@@ -2608,9 +2602,7 @@ impl PushReceive {
             Some(files) => (files, None),
             None => {
                 let (files, allocation) =
-                    prepare_files(&self.setup, &validated, &delivered, || {
-                        self.check_active().is_ok()
-                    })?;
+                    prepare_files(&self.setup, &validated, || self.check_active().is_ok())?;
                 (files, Some(allocation))
             }
         };
@@ -4882,6 +4874,117 @@ mod push_tests {
         }
     }
 
+    fn record_delivered_files(setup: &WorkerSetup, files: Vec<FileRecord>) {
+        let mut link = crate::store::tests::test_link(&setup.link_id);
+        link.uploads.push(UploadRecord {
+            id: "delivered".into(),
+            started_at: 0,
+            completed_at: 1,
+            replayed_chunks: 0,
+            rejected_chunks: 0,
+            transport: None,
+            package_root: hex::encode(setup.expected_package.root),
+            total_bytes: 0,
+            files,
+            partial: false,
+            log: Vec::new(),
+        });
+        setup.store.insert_link(link).unwrap();
+    }
+
+    #[tokio::test]
+    async fn admission_reads_policy_and_events_without_unrelated_upload_headers() {
+        use vot_sdk::package::{PackageBuilder, PackageEntry};
+
+        for native in [false, true] {
+            for count in [1, 0] {
+                if !native && count == 0 {
+                    continue;
+                }
+                for corruption in ["header", "events", "missing", "tenant"] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let app = crate::api::testing::build(directory.path());
+                    let expected = object(Suite::Blake3Bao64, b"new content");
+                    let (package, page, seal) = if count == 0 {
+                        (object(Suite::Blake3Bao64, b""), Vec::new(), Vec::new())
+                    } else {
+                        let mut builder = PackageBuilder::new().unwrap();
+                        assert!(builder
+                            .push(
+                                &PackageEntry::direct(
+                                    vec!["new".into(), "frame".into()],
+                                    &expected
+                                )
+                                .unwrap()
+                            )
+                            .unwrap()
+                            .is_none());
+                        let (summary, page, mut finalizer) = builder.finish().unwrap().into_parts();
+                        let page = finalizer.push(page).unwrap().into_bytes();
+                        let seal = finalizer.finish().unwrap().into_bytes();
+                        (summary.object_id().clone(), page, seal)
+                    };
+                    let mut setup = setup_with_app(directory.path(), package.clone(), &app);
+                    if corruption != "missing" {
+                        app.store
+                            .insert_link(crate::store::tests::test_link("link"))
+                            .unwrap();
+                    }
+                    match corruption {
+                        "header" => app.store.with(|c| c.execute_batch("INSERT INTO link_uploads (link_id, tenant, upload_id, document, file_count) VALUES ('link', '', 'unrelated', '{', 0)")).unwrap(),
+                        "events" => app.store.with(|c| c.execute_batch("UPDATE links SET events_json='{' WHERE id='link'")).unwrap(),
+                        "tenant" => setup.tenant = "other".into(),
+                        _ => {}
+                    }
+                    let result = if native {
+                        let (_seams, handle) = push_seams(
+                            app.clone(),
+                            setup,
+                            PushControl::default(),
+                            tokio::runtime::Handle::current(),
+                        );
+                        let receive = handle.0.upgrade().unwrap();
+                        let records = if count == 0 {
+                            Vec::new()
+                        } else {
+                            vec![record(
+                                vot_manifest::PackagePath::portable(["new", "frame"]).unwrap(),
+                                &expected,
+                            )]
+                        };
+                        receive.prepare_manifest(
+                            vot_cli::PackageSummary {
+                                root: package.root,
+                                logical_length: package.length,
+                                entries: count,
+                            },
+                            &records,
+                        )
+                    } else {
+                        let mut phase = Phase::AwaitSeal;
+                        handle_seal(&setup, &mut phase, &seal).unwrap();
+                        handle_page(&mut phase, &page).unwrap();
+                        handle_begin(&setup, &mut phase).map(|_| ())
+                    };
+                    if count == 0 {
+                        assert_eq!(result.unwrap_err().status, 422);
+                        assert!(!directory.path().join("receive/new").exists());
+                        assert!(app.store.load_upload_sessions().unwrap().is_empty());
+                    } else if corruption == "header" {
+                        assert!(result.is_ok(), "native={native}, count={count}: {result:?}");
+                    } else {
+                        assert!(
+                            result.is_err(),
+                            "native={native}, count={count}, corruption={corruption}"
+                        );
+                        assert!(!directory.path().join("receive/new").exists());
+                        assert!(app.store.load_upload_sessions().unwrap().is_empty());
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn concurrent_uploads_reserve_names_across_overlapping_destinations() {
         for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
@@ -4921,7 +5024,7 @@ mod push_tests {
                             ready.send(()).unwrap();
                             start.recv_timeout(Duration::from_secs(5)).unwrap();
                             let (files, allocation) =
-                                prepare_files(setup, entries, &HashMap::new(), || true).unwrap();
+                                prepare_files(setup, entries, || true).unwrap();
                             persist_session(setup, &files).unwrap();
                             drop(allocation);
                             files
@@ -4978,8 +5081,7 @@ mod push_tests {
             let source = directory.path().join("source");
             fs::write(&source, bytes).unwrap();
             let entries = [(vec![parent.clone(), name.clone()], object.clone())];
-            let (mut files, allocation) =
-                prepare_files(&setup, &entries, &HashMap::new(), || true).unwrap();
+            let (mut files, allocation) = prepare_files(&setup, &entries, || true).unwrap();
             drop(allocation);
             let file = &mut files[0];
             reprove_staging(&source, &object, vec![file], || true).unwrap();
@@ -4998,14 +5100,9 @@ mod push_tests {
             let private = destination.join(".vot-stage");
             let before = fs::read_dir(&private).unwrap().count();
             let other = self::object(Suite::Blake3Bao64, b"other");
-            let error = prepare_files(
-                &setup,
-                &[(entries[0].0.clone(), other)],
-                &HashMap::new(),
-                || true,
-            )
-            .err()
-            .expect("oversized collision candidate admitted");
+            let error = prepare_files(&setup, &[(entries[0].0.clone(), other)], || true)
+                .err()
+                .expect("oversized collision candidate admitted");
             assert!(error.message.contains("243 UTF-8 bytes; shorten"));
             assert_eq!(fs::read(destination.join(&name)).unwrap(), bytes);
             assert_eq!(fs::read(&sidecar).unwrap(), receipt);
@@ -5024,7 +5121,7 @@ mod push_tests {
                 (vec!["new".into(), "allowed".into()], object.clone()),
                 (vec!["new".into(), name], object),
             ];
-            let error = prepare_files(&setup, &entries, &HashMap::new(), || true)
+            let error = prepare_files(&setup, &entries, || true)
                 .err()
                 .expect("oversized payload admitted");
             assert!(error.message.contains("243 UTF-8 bytes; shorten"));
@@ -5109,13 +5206,11 @@ mod push_tests {
             for start in starts {
                 start.send(()).unwrap();
             }
-            let (files, allocation) = prepare_files(
-                &http,
-                &[(vec!["frame".into()], objects[0].clone())],
-                &HashMap::new(),
-                || true,
-            )
-            .unwrap();
+            let (files, allocation) =
+                prepare_files(&http, &[(vec!["frame".into()], objects[0].clone())], || {
+                    true
+                })
+                .unwrap();
             persist_session(&http, &files).unwrap();
             drop(allocation);
             for worker in workers {
@@ -5247,7 +5342,6 @@ mod push_tests {
         let (mut files, allocation) = prepare_files(
             &competing,
             &[(vec!["frame".into()], competing_object.clone())],
-            &HashMap::new(),
             || true,
         )
         .unwrap();
@@ -5268,7 +5362,15 @@ mod push_tests {
             tokio::runtime::Handle::current(),
         );
         let receive = handle.0.upgrade().unwrap();
+        application
+            .store
+            .with(|c| c.execute_batch("ALTER TABLE files RENAME TO held_files"))
+            .unwrap();
         receive.prepare_manifest(summary, &records).unwrap();
+        application
+            .store
+            .with(|c| c.execute_batch("ALTER TABLE held_files RENAME TO files"))
+            .unwrap();
         let resumed = application.store.load_push_sessions().unwrap().remove(0);
         assert_ne!(resumed.id, saved.id);
         assert_eq!(resumed.files[0], saved.files[0]);
@@ -5315,21 +5417,11 @@ mod push_tests {
                 .into_iter()
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
-            let (files, allocation) = prepare_files(
-                &first,
-                &[(first_path.clone(), expected.clone())],
-                &HashMap::new(),
-                || true,
-            )
-            .unwrap();
+            let (files, allocation) =
+                prepare_files(&first, &[(first_path.clone(), expected.clone())], || true).unwrap();
             persist_session(&first, &files).unwrap();
             drop(allocation);
-            let result = prepare_files(
-                &first,
-                &[(second_path.clone(), expected.clone())],
-                &HashMap::new(),
-                || true,
-            );
+            let result = prepare_files(&first, &[(second_path.clone(), expected.clone())], || true);
             if outcome == "conflict" {
                 assert_eq!(result.err().unwrap().status, 409);
             } else {
@@ -5353,15 +5445,13 @@ mod push_tests {
         let mut second = setup_with_app(directory.path(), expected.clone(), &application);
         second.session_id = [8; 16];
         let entries = [(vec!["frame".into()], expected)];
-        let (retained, allocation) =
-            prepare_files(&first, &entries, &HashMap::new(), || true).unwrap();
+        let (retained, allocation) = prepare_files(&first, &entries, || true).unwrap();
         persist_session(&first, &retained).unwrap();
         drop(allocation);
         application.store.with(|connection| connection.execute_batch(
             "CREATE TRIGGER fail_admission BEFORE INSERT ON upload_sessions BEGIN SELECT RAISE(ABORT, 'fixture'); END;"
         )).unwrap();
-        let (failed, allocation) =
-            prepare_files(&second, &entries, &HashMap::new(), || true).unwrap();
+        let (failed, allocation) = prepare_files(&second, &entries, || true).unwrap();
         let released_name = failed[0].stored_components.clone();
         assert!(persist_session(&second, &failed).is_err());
         drop(failed);
@@ -5371,12 +5461,12 @@ mod push_tests {
             .with(|connection| connection.execute_batch("DROP TRIGGER fail_admission;"))
             .unwrap();
         let active = AtomicUsize::new(0);
-        assert!(prepare_files(&second, &entries, &HashMap::new(), || active
-            .fetch_add(1, Ordering::Relaxed)
-            == 0)
-        .is_err());
-        let (retry, allocation) =
-            prepare_files(&second, &entries, &HashMap::new(), || true).unwrap();
+        assert!(
+            prepare_files(&second, &entries, || active.fetch_add(1, Ordering::Relaxed)
+                == 0)
+            .is_err()
+        );
+        let (retry, allocation) = prepare_files(&second, &entries, || true).unwrap();
         drop(allocation);
         assert_eq!(retry[0].stored_components, released_name);
         assert_ne!(retry[0].stored_components, retained[0].stored_components);
@@ -5384,8 +5474,7 @@ mod push_tests {
         second.tenant = "other".into();
         second.dest_dir =
             paths::join_under(&first.dest_dir, &paths::tenant_prefix("other")).unwrap();
-        let (independent, allocation) =
-            prepare_files(&second, &entries, &HashMap::new(), || true).unwrap();
+        let (independent, allocation) = prepare_files(&second, &entries, || true).unwrap();
         drop(allocation);
         assert_eq!(
             independent[0].stored_components,
@@ -5407,26 +5496,16 @@ mod push_tests {
             first.dest_rel = paths::admit_dest(destination).unwrap();
             first.dest_dir.push(destination);
             vot_manifest::PackagePath::portable(components.clone()).unwrap();
-            let (files, allocation) = prepare_files(
-                &first,
-                &[(components, expected.clone())],
-                &HashMap::new(),
-                || true,
-            )
-            .unwrap();
+            let (files, allocation) =
+                prepare_files(&first, &[(components, expected.clone())], || true).unwrap();
             persist_session(&first, &files).unwrap();
             drop(allocation);
             let mut second = setup_with_app(directory.path(), expected.clone(), &application);
             second.session_id = [8; 16];
             second.dest_rel = "unrelated".into();
             second.dest_dir.push("unrelated");
-            let (other, allocation) = prepare_files(
-                &second,
-                &[(vec!["frame".into()], expected)],
-                &HashMap::new(),
-                || true,
-            )
-            .unwrap();
+            let (other, allocation) =
+                prepare_files(&second, &[(vec!["frame".into()], expected)], || true).unwrap();
             drop(allocation);
             assert_eq!(other[0].stored_components, ["frame"]);
         }
@@ -5437,13 +5516,11 @@ mod push_tests {
         let directory = tempfile::tempdir().unwrap();
         let expected = object(Suite::Blake3Bao64, b"original");
         let first = setup(directory.path(), expected.clone());
-        let (pending, allocation) = prepare_files(
-            &first,
-            &[(vec!["folder".into()], expected.clone())],
-            &HashMap::new(),
-            || true,
-        )
-        .unwrap();
+        let (pending, allocation) =
+            prepare_files(&first, &[(vec!["folder".into()], expected.clone())], || {
+                true
+            })
+            .unwrap();
         persist_session(&first, &pending).unwrap();
         drop(allocation);
         fs::write(first.dest_dir.join("existing.bin"), b"original").unwrap();
@@ -5456,12 +5533,10 @@ mod push_tests {
             receipt: false,
             deleted: false,
         };
-        let delivered =
-            HashMap::from([((record.suite.as_str(), record.root.as_str()), vec![&record])]);
+        record_delivered_files(&first, vec![record]);
         let (files, allocation) = prepare_files(
             &first,
             &[(vec!["folder".into(), "copy.bin".into()], expected)],
-            &delivered,
             || true,
         )
         .unwrap();
@@ -5495,8 +5570,7 @@ mod push_tests {
                     }
                     entries.push((components, object.clone()));
                 }
-                let (mut files, allocation) =
-                    prepare_files(&setup, &entries, &HashMap::new(), || true).unwrap();
+                let (mut files, allocation) = prepare_files(&setup, &entries, || true).unwrap();
                 persist_session(&setup, &files).unwrap();
                 drop(allocation);
                 let mut names = HashSet::new();
@@ -5546,7 +5620,7 @@ mod push_tests {
                 .collect::<Vec<_>>();
             let workers = Mutex::new([HashSet::new(), HashSet::new()]);
             let checks = AtomicUsize::new(0);
-            let (files, allocation) = prepare_files(&setup, &entries, &HashMap::new(), || {
+            let (files, allocation) = prepare_files(&setup, &entries, || {
                 let phase = checks.fetch_add(1, Ordering::Relaxed) / count;
                 workers.lock().unwrap()[phase].insert(std::thread::current().id());
                 true
@@ -5571,7 +5645,7 @@ mod push_tests {
             }
             fs::write(setup.dest_dir.join("blocked"), b"unrelated").unwrap();
             entries[count / 2].0 = vec!["blocked".into(), "frame".into()];
-            assert!(prepare_files(&setup, &entries, &HashMap::new(), || true).is_err());
+            assert!(prepare_files(&setup, &entries, || true).is_err());
             assert_eq!(
                 fs::read(setup.dest_dir.join("blocked")).unwrap(),
                 b"unrelated"
@@ -5583,10 +5657,11 @@ mod push_tests {
                 0
             );
             let checks = AtomicU64::new(0);
-            assert!(prepare_files(&setup, &entries, &HashMap::new(), || checks
-                .fetch_add(1, Ordering::Relaxed)
-                < 1)
-            .is_err());
+            assert!(
+                prepare_files(&setup, &entries, || checks.fetch_add(1, Ordering::Relaxed)
+                    < 1)
+                .is_err()
+            );
             assert_eq!(
                 fs::read_dir(setup.dest_dir.join(".vot-stage"))
                     .unwrap()
@@ -6637,14 +6712,9 @@ mod push_tests {
             assert!(!setup.dest_dir.join("allowed").exists());
             assert!(!setup.dest_dir.join(names.join("/")).exists());
             if !destination.is_empty() {
-                let error = prepare_files(
-                    &setup,
-                    &[(vec!["new".into()], object.clone())],
-                    &HashMap::new(),
-                    || true,
-                )
-                .err()
-                .expect("reserved destination admitted without a checkpoint manifest");
+                let error = prepare_files(&setup, &[(vec!["new".into()], object.clone())], || true)
+                    .err()
+                    .expect("reserved destination admitted without a checkpoint manifest");
                 assert!(error.message.contains("reserved for signed receipts"));
                 assert!(!setup.dest_dir.join("new").exists());
             }
@@ -7072,6 +7142,98 @@ mod push_tests {
         }
     }
 
+    #[test]
+    fn deduplication_pages_skip_aliases_and_verify_remaining_candidates() {
+        let page = crate::store::DELIVERED_CANDIDATE_PAGE;
+        for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
+            for length in [0, (1 << 20) + 1] {
+                let directory = tempfile::tempdir().unwrap();
+                let bytes = vec![7; length];
+                let expected = object(suite, &bytes);
+                let mut setup = setup(directory.path(), expected.clone());
+                setup.dest_rel = "project".into();
+                setup.dest_dir.push("project");
+                fs::create_dir(&setup.dest_dir).unwrap();
+                let template = FileRecord {
+                    path: "original".into(),
+                    stored_as: "project/a-bad".into(),
+                    bytes: expected.length,
+                    suite: suite_name(expected.suite),
+                    root: hex::encode(expected.root),
+                    receipt: true,
+                    deleted: false,
+                };
+                let mut files = vec![template.clone(); page * 3 + 3];
+                for i in 0..=page {
+                    files.push(FileRecord {
+                        stored_as: format!("project/b-missing-{i:03}"),
+                        ..template.clone()
+                    });
+                }
+                for name in [
+                    "outside/elsewhere",
+                    "project/../escape",
+                    "project/c.vot-receipt",
+                    "project/d-short",
+                    "project/e-deleted",
+                    "project/f-record-length",
+                    "project/z-valid",
+                ] {
+                    files.push(FileRecord {
+                        stored_as: name.into(),
+                        deleted: name == "project/e-deleted",
+                        bytes: expected.length + u64::from(name == "project/f-record-length"),
+                        receipt: suite == Suite::Blake3Bao64,
+                        ..template.clone()
+                    });
+                }
+                record_delivered_files(&setup, files);
+                fs::create_dir(setup.dest_dir.join("outside")).unwrap();
+                fs::write(setup.dest_dir.join("outside/elsewhere"), &bytes).unwrap();
+                fs::write(setup.dest_dir.parent().unwrap().join("escape"), &bytes).unwrap();
+                fs::write(setup.dest_dir.join("a-bad"), vec![9; length.max(1)]).unwrap();
+                fs::write(setup.dest_dir.join("d-short"), vec![7; length + 1]).unwrap();
+                for name in ["c.vot-receipt", "e-deleted", "f-record-length", "z-valid"] {
+                    fs::write(setup.dest_dir.join(name), &bytes).unwrap();
+                }
+                let checks = AtomicUsize::new(0);
+                let found = find_delivered(&setup, &expected, || {
+                    let n = checks.fetch_add(1, Ordering::Relaxed);
+                    assert!(
+                        n < page + 40,
+                        "aliases were revisited or pagination failed to advance"
+                    );
+                    true
+                })
+                .unwrap()
+                .unwrap();
+                assert_eq!(found.stored_components, ["z-valid"]);
+                assert_eq!(found.receipt, suite == Suite::Blake3Bao64);
+                let checks = AtomicUsize::new(0);
+                assert_eq!(
+                    find_delivered(&setup, &expected, || checks.fetch_add(1, Ordering::Relaxed)
+                        < 2)
+                    .err()
+                    .unwrap()
+                    .status,
+                    409
+                );
+                assert_eq!(checks.load(Ordering::Relaxed), 3);
+                setup
+                    .store
+                    .with(|c| c.execute_batch("DROP TABLE files"))
+                    .unwrap();
+                let result = prepare_files(
+                    &setup,
+                    &[(vec!["new".into(), "frame".into()], expected)],
+                    || true,
+                );
+                assert_eq!(result.err().unwrap().status, 500);
+                assert!(!setup.dest_dir.join("new").exists());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn deduplication_and_published_recovery_reject_changed_bytes() {
         for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
@@ -7090,10 +7252,11 @@ mod push_tests {
                 receipt: true,
                 deleted: false,
             };
-            let delivered =
-                HashMap::from([((record.suite.as_str(), record.root.as_str()), vec![&record])]);
-            assert!(find_delivered(&setup, &delivered, &expected, || true).is_some());
-            assert!(find_delivered(&setup, &delivered, &expected, || false).is_none());
+            record_delivered_files(&setup, vec![record.clone()]);
+            assert!(find_delivered(&setup, &expected, || true)
+                .unwrap()
+                .is_some());
+            assert!(find_delivered(&setup, &expected, || false).is_err());
             for name in [
                 "old.vot-receipt".into(),
                 "old.vot-receI\u{307}pt/frame".into(),
@@ -7103,15 +7266,13 @@ mod push_tests {
                 let reserved = setup.dest_dir.join(&name);
                 fs::create_dir_all(reserved.parent().unwrap()).unwrap();
                 fs::write(&reserved, b"original").unwrap();
-                let old = FileRecord {
-                    stored_as: name,
-                    ..record.clone()
-                };
-                let prior = HashMap::from([((old.suite.as_str(), old.root.as_str()), vec![&old])]);
+                setup
+                    .store
+                    .with(|c| c.execute("UPDATE files SET stored_as=?1", [&name]))
+                    .unwrap();
                 let (files, _allocation) = prepare_files(
                     &setup,
                     &[(vec!["renamed.bin".into()], expected.clone())],
-                    &prior,
                     || true,
                 )
                 .unwrap();
@@ -7119,8 +7280,14 @@ mod push_tests {
                 assert!(!files[0].published);
                 assert_eq!(fs::read(&reserved).unwrap(), b"original");
             }
+            setup
+                .store
+                .with(|c| c.execute("UPDATE files SET stored_as=?1", [&record.stored_as]))
+                .unwrap();
             fs::write(&path, b"changed!").unwrap();
-            assert!(find_delivered(&setup, &delivered, &expected, || true).is_none());
+            assert!(find_delivered(&setup, &expected, || true)
+                .unwrap()
+                .is_none());
             let file = FileState {
                 display_path: record.path.clone(),
                 stored_components: vec![record.path],

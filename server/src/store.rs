@@ -463,7 +463,8 @@ pub struct SettingsOverlay {
     pub draining_source: &'static str,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 39;
+pub(crate) const SCHEMA_VERSION: u64 = 40;
+pub(crate) const DELIVERED_CANDIDATE_PAGE: usize = 128;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -527,6 +528,8 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE INDEX IF NOT EXISTS files_tenant_live ON files(tenant, deleted, bytes_hi, bytes_lo);
 CREATE INDEX IF NOT EXISTS files_link_path ON files(link_id, stored_as);
+CREATE INDEX IF NOT EXISTS files_delivered_object
+ON files(tenant, link_id, suite, root, bytes_hi, bytes_lo, stored_as) WHERE deleted = 0;
 CREATE TABLE IF NOT EXISTS link_uploads (
     position INTEGER PRIMARY KEY,
     link_id TEXT NOT NULL,
@@ -1360,6 +1363,38 @@ impl Store {
         upload_id: &str,
     ) -> Result<Option<UploadRecord>, String> {
         self.with(|connection| read_upload(connection, tenant, link_id, upload_id))
+    }
+
+    pub(crate) fn delivered_candidates(
+        &self,
+        tenant: &str,
+        link_id: &str,
+        object: &ObjectId,
+        after: &str,
+    ) -> Result<Vec<(String, bool)>, String> {
+        let (hi, lo) = split_bytes(object.length);
+        self.with(|connection| {
+            let mut statement = connection.prepare_cached(
+                "SELECT stored_as, receipt FROM files
+                 WHERE tenant=?1 AND link_id=?2 AND suite=?3 AND root=?4
+                   AND bytes_hi=?5 AND bytes_lo=?6 AND deleted=0 AND stored_as>?7
+                 ORDER BY stored_as LIMIT ?8",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![
+                    tenant,
+                    link_id,
+                    crate::session::suite_name(object.suite),
+                    hex::encode(object.root),
+                    hi,
+                    lo,
+                    after,
+                    DELIVERED_CANDIDATE_PAGE as i64,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            rows.collect()
+        })
     }
 
     pub fn uploads_by_id(&self, id: &str) -> Result<Option<Vec<UploadRecord>>, String> {
@@ -4156,11 +4191,11 @@ fn row_to_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<Link> {
 
         notifications: row
             .get::<_, Option<String>>("notifications_json")?
-            .map(|text| parse_json(&text, 12))
+            .map(|text| parse_json(&text, row.as_ref().column_index("notifications_json")?))
             .transpose()?
             .flatten(),
         uploads: Vec::new(),
-        events: parse_json(&events_json, 11)?,
+        events: parse_json(&events_json, row.as_ref().column_index("events_json")?)?,
     })
 }
 
@@ -5119,6 +5154,65 @@ pub(crate) mod tests {
             let durable = reopened.link("", "after-reader").unwrap().is_some();
             assert!(shared_lock && locks_retained && snapshot.is_ok() && durable,
                 "reopen={reopen}, external backup={backup}: shared lock={shared_lock}, database/WAL identities retained={locks_retained}, snapshot={snapshot:?}, acknowledged write survived={durable}");
+        }
+    }
+
+    #[test]
+    fn delivered_candidates_match_full_identity_and_seek_past_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        for suite in [1, 2] {
+            for length in [0, u64::from(u32::MAX), 1_u64 << 32, u64::MAX] {
+                let object = ObjectId {
+                    suite,
+                    root: [7; 32],
+                    length,
+                };
+                store.with(|c| {
+                    c.execute("DELETE FROM files", [])?;
+                    let mut insert = c.prepare("INSERT INTO files (tenant, link_id, upload_id, file_index, bytes_hi, bytes_lo, deleted, stored_as, path, suite, root, receipt) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, 'original', ?8, ?9, 1)")?;
+                    for variant in 0..8 {
+                        let (hi, lo) = split_bytes(if variant == 5 { length ^ (1_u64 << 32) } else if variant == 6 { length ^ 1 } else { length });
+                        insert.execute(rusqlite::params![
+                            if variant == 1 { "other" } else { "tenant" },
+                            if variant == 2 { "other" } else { "link" },
+                            variant.to_string(), hi, lo, variant == 7, format!("candidate-{variant}"),
+                            crate::session::suite_name(if variant == 3 { 3 - suite } else { suite }),
+                            hex::encode(if variant == 4 { [8; 32] } else { object.root }),
+                        ])?;
+                    }
+                    Ok(())
+                }).unwrap();
+                assert_eq!(
+                    store
+                        .delivered_candidates("tenant", "link", &object, "")
+                        .unwrap(),
+                    [("candidate-0".into(), true)]
+                );
+                assert!(store
+                    .delivered_candidates("tenant", "link", &object, "candidate-0")
+                    .unwrap()
+                    .is_empty());
+                store.with(|c| {
+                    let (hi, lo) = split_bytes(length);
+                    let mut insert = c.prepare("INSERT INTO files (tenant, link_id, upload_id, file_index, bytes_hi, bytes_lo, deleted, stored_as, path, suite, root, receipt) VALUES ('tenant', 'link', ?1, 0, ?2, ?3, 0, 'a-alias', 'original', ?4, ?5, 0)")?;
+                    for i in 0..DELIVERED_CANDIDATE_PAGE * 2 + 1 {
+                        insert.execute(rusqlite::params![format!("alias-{i}"), hi, lo, crate::session::suite_name(suite), hex::encode(object.root)])?;
+                    }
+                    Ok(())
+                }).unwrap();
+                let page = store
+                    .delivered_candidates("tenant", "link", &object, "")
+                    .unwrap();
+                assert_eq!(page.len(), DELIVERED_CANDIDATE_PAGE);
+                assert!(page.iter().all(|row| row == &("a-alias".into(), false)));
+                assert_eq!(
+                    store
+                        .delivered_candidates("tenant", "link", &object, &page.last().unwrap().0)
+                        .unwrap(),
+                    [("candidate-0".into(), true)]
+                );
+            }
         }
     }
 
