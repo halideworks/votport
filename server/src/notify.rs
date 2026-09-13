@@ -391,12 +391,12 @@ async fn log_failure(
     }
 }
 
-fn log_smtp_failure<E: std::fmt::Display>(
+fn log_smtp_failure<T, E: std::fmt::Display>(
     event: &str,
     transfer_id: Option<&str>,
-    result: Result<(), E>,
-) -> bool {
-    if let Err(error) = result {
+    result: Result<T, E>,
+) -> Result<T, E> {
+    if let Err(error) = &result {
         tracing::warn!(
             channel = "smtp",
             event,
@@ -404,10 +404,8 @@ fn log_smtp_failure<E: std::fmt::Display>(
             outcome = "failed",
             "notification failed: {error}"
         );
-        false
-    } else {
-        true
     }
+    result
 }
 
 async fn send_smtp(
@@ -415,27 +413,33 @@ async fn send_smtp(
     recipients: &[String],
     title: &str,
     body: &str,
-) -> Result<(), String> {
-    let mut builder = Message::builder()
-        .from(
-            smtp.from
+    event: &str,
+    transfer_id: Option<&str>,
+) -> Result<(), &'static str> {
+    let prepared = (|| -> Result<_, String> {
+        let mut builder = Message::builder()
+            .from(
+                smtp.from
+                    .parse()
+                    .map_err(|error| format!("smtp from: {error}"))?,
+            )
+            .subject(clipped_chars(title, 250).into_owned());
+        for recipient in recipients {
+            builder = builder.to(recipient
                 .parse()
-                .map_err(|error| format!("smtp from: {error}"))?,
-        )
-        .subject(clipped_chars(title, 250).into_owned());
-    for recipient in recipients {
-        builder = builder.to(recipient
-            .parse()
-            .map_err(|error| format!("smtp to: {error}"))?);
-    }
-    // Application summary bound before MIME encoding, not an SMTP size limit.
-    let message = builder
-        .singlepart(SinglePart::plain(
-            clipped_bytes(body, 64 * 1024).into_owned(),
-        ))
-        .map_err(|error| format!("smtp message: {error}"))?;
+                .map_err(|error| format!("smtp to: {error}"))?);
+        }
+        // Application summary bound before MIME encoding, not an SMTP size limit.
+        let message = builder
+            .singlepart(SinglePart::plain(
+                clipped_bytes(body, 64 * 1024).into_owned(),
+            ))
+            .map_err(|error| format!("smtp message: {error}"))?;
 
-    let tls = smtp_tls(smtp)?;
+        Ok((message, smtp_tls(smtp)?))
+    })();
+    let (message, tls) = log_smtp_failure(event, transfer_id, prepared)
+        .map_err(|_| "SMTP settings could not be used. Ask the platform administrator to check the sender and TLS settings.")?;
     let mut transport = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&smtp.host)
         .port(smtp.port)
         .tls(tls)
@@ -446,12 +450,21 @@ async fn send_smtp(
             smtp.password.clone().unwrap_or_default(),
         ));
     }
-    transport
-        .build()
-        .send(message)
-        .await
+    log_smtp_failure(event, transfer_id, transport.build().send(message).await)
         .map(|_| ())
-        .map_err(|error| error.to_string())
+        .map_err(|error| {
+            if error.is_transient() {
+                "SMTP relay temporarily refused the request. Try again later."
+            } else if error.is_permanent() {
+                "SMTP relay rejected the request. Check the recipients and ask the platform administrator to check relay policy and credentials."
+            } else if error.is_client() {
+                "SMTP settings are incompatible with the relay. Ask the platform administrator to check TLS and authentication settings."
+            } else if error.is_response() {
+                "SMTP relay returned an invalid response. Ask the platform administrator to check relay configuration."
+            } else {
+                "SMTP connection failed. Ask the platform administrator to check the host, port and TLS settings."
+            }
+        })
 }
 
 fn smtp_tls(smtp: &ResolvedSmtp) -> Result<Tls, String> {
@@ -491,8 +504,8 @@ pub(crate) mod tests {
     use crate::app;
     use crate::session::FinishReport;
     use crate::store::{
-        FileRecord, NotificationDestination, NotificationMode, NotificationPolicy,
-        NotificationRule, OutboundDownloadResult, OutboundGrant, OutboundGrantFile,
+        Branding, FileRecord, NotificationDestination, NotificationMode, NotificationPolicy,
+        NotificationRule, OutboundDownloadResult, OutboundGrant, OutboundGrantFile, Tenant,
         NOTIFICATION_EVENTS,
     };
 
@@ -693,6 +706,32 @@ pub(crate) mod tests {
         let application = testing::build(directory.path());
         let destination =
             test_destination_config(&application, "ntfy", format!("http://{address}/topic"));
+        application
+            .store
+            .set_branding(&Branding {
+                name: "Müller 撮影".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        application
+            .store
+            .insert_tenant(Tenant {
+                key: "studio".into(),
+                incarnation: String::new(),
+                label: "Atelier été".into(),
+                admin_group: None,
+                max_total_bytes: None,
+                max_links: None,
+                max_sessions: None,
+                created_at: 0,
+            })
+            .unwrap();
+        let mut studio_destination = destination.clone();
+        studio_destination.revision = 0;
+        application
+            .store
+            .save_notification_destination("studio", &mut studio_destination)
+            .unwrap();
         let files = (0..100)
             .map(|index| FileRecord {
                 path: format!("{}-{index}.mov", "撮影🎬".repeat(8)),
@@ -727,9 +766,18 @@ pub(crate) mod tests {
                         Some(test_policy()),
                     )
                     .await;
-                    let tested = test_destination(&application, "", &destination).await;
+                    let branded = test_destination(&application, "", &destination)
+                        .await
+                        .is_ok();
+                    application.store.delete_branding("").unwrap();
+                    let default = test_destination(&application, "", &destination)
+                        .await
+                        .is_ok();
+                    let tenant = test_destination(&application, "studio", &studio_destination)
+                        .await
+                        .is_ok();
                     let _ = stop.send(());
-                    tested
+                    branded && default && tenant
                 }
             )
         })
@@ -738,17 +786,37 @@ pub(crate) mod tests {
         served.unwrap();
         assert!(tested);
         let messages = messages.lock().unwrap();
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 4);
         let (uri, headers, body) = &messages[0];
         assert!(!headers.contains_key("title"));
         let url = reqwest::Url::parse(&format!("http://localhost{uri}")).unwrap();
         assert!(url
             .query_pairs()
             .any(|(key, value)| key == "title" && value.contains("Müller\n撮影")));
+        assert!(url
+            .query_pairs()
+            .any(|(key, value)| key == "title" && value.starts_with("Müller 撮影:")));
         assert!(body.starts_with("ID: up-ntfy\n100 file(s), 100 bytes\n"));
         assert!(body.len() <= 4096 && body.ends_with('…'));
         assert!(body.contains("撮影🎬"));
-        assert_eq!(messages[1].2, "This is a VOTPort notification test.");
+        for ((uri, headers, body), brand) in
+            messages[1..]
+                .iter()
+                .zip(["Müller 撮影", "votport", "Atelier été"])
+        {
+            let url = reqwest::Url::parse(&format!("http://localhost{uri}")).unwrap();
+            assert!(
+                url.query_pairs()
+                    .any(|(key, value)| key == "title"
+                        && value == format!("{brand}: notification test")),
+                "{url}"
+            );
+            assert!(!headers.contains_key("title"));
+            assert_eq!(
+                body,
+                "This is a notification test.\nSample file: Résumé_撮影.mov"
+            );
+        }
     }
 
     #[test]
@@ -891,7 +959,8 @@ pub(crate) mod tests {
         for destination in destinations {
             let channel = destination.channel.clone();
             let app = application.clone();
-            let one = tokio::spawn(async move { test_destination(&app, "", &destination).await });
+            let one =
+                tokio::spawn(async move { test_destination(&app, "", &destination).await.is_ok() });
             let (actual, _, _) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .unwrap()
@@ -961,7 +1030,9 @@ pub(crate) mod tests {
                 format!("http://{address}/{case}?secret=fixture"),
             );
             assert_eq!(
-                test_destination(&application, "", &destination).await,
+                test_destination(&application, "", &destination)
+                    .await
+                    .is_ok(),
                 delivered == 1,
                 "{case}"
             );
@@ -1080,11 +1151,16 @@ pub(crate) mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        assert!(test_destination(&application, "", &destination).await);
+        assert!(test_destination(&application, "", &destination)
+            .await
+            .is_ok());
         let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let payload = request_json(&request);
         assert_eq!(payload["event"], "notification_test");
-        assert_eq!(payload["message"], "This is a VOTPort notification test.");
+        assert_eq!(
+            payload["message"],
+            "This is a notification test.\nSample file: Résumé_撮影.mov"
+        );
         assert_no_secrets(&request);
         thread.join().unwrap();
     }
@@ -1096,7 +1172,12 @@ pub(crate) mod tests {
         let application = app::build(testing::config(directory.path())).unwrap();
         let destination =
             test_destination_config(&application, "webhook", format!("http://{addr}/failure"));
-        assert!(!test_destination(&application, "", &destination).await);
+        assert_eq!(test_destination(&application, "", &destination).await,
+            Err("The destination did not accept the test. Check its connection settings and try again."));
+        assert_eq!(
+            application.store.notification_outcomes("").unwrap()[&destination.id]["delivered"],
+            false
+        );
         thread.join().unwrap();
     }
 
@@ -1240,10 +1321,53 @@ pub(crate) mod tests {
         assert!(text.len() <= 64 * 1024 && text.ends_with('…'));
     }
 
+    #[tokio::test]
+    async fn notification_test_sends_unicode_smtp_sample() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let stub = tokio::spawn(async move { smtp_stub(listener).await });
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = testing::config(directory.path());
+        config.smtp_host = Some("127.0.0.1".into());
+        config.smtp_port = address.port();
+        config.smtp_starttls = false;
+        config.smtp_from = Some("votport@example.com".into());
+        let application = app::build(config).unwrap();
+        let destination = test_destination_config(&application, "email", String::new());
+        assert!(test_destination(&application, "", &destination)
+            .await
+            .is_ok());
+        let transcript = tokio::time::timeout(Duration::from_secs(10), stub)
+            .await
+            .expect("smtp stub timed out")
+            .unwrap()
+            .unwrap();
+        assert!(
+            transcript.contains("Subject: votport: notification test\r\n"),
+            "{transcript}"
+        );
+        assert!(transcript.contains("MIME-Version: 1.0\r\n"), "{transcript}");
+        assert!(
+            transcript.contains("Content-Type: text/plain; charset=utf-8\r\n"),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("Content-Transfer-Encoding: quoted-printable\r\n"),
+            "{transcript}"
+        );
+        assert!(transcript.contains("\r\n\r\nThis is a notification test.\r\nSample file: R=C3=A9sum=C3=A9_=E6=92=AE=E5=BD=B1.mov\r\n"), "{transcript}");
+    }
+
     #[test]
     fn log_smtp_failure_does_not_panic() {
-        log_smtp_failure("notification_test", None, Ok::<(), &str>(()));
-        log_smtp_failure("notification_test", None, Err("smtp boom"));
+        assert_eq!(
+            log_smtp_failure("notification_test", None, Ok::<(), &str>(())),
+            Ok(())
+        );
+        assert_eq!(
+            log_smtp_failure("notification_test", None, Err::<(), _>("smtp boom")),
+            Err("smtp boom")
+        );
     }
 
     async fn smtp_stub(listener: tokio::net::TcpListener) -> std::io::Result<String> {

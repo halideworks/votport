@@ -582,6 +582,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notification_catalog_matches_creation_surfaces_and_refusal_guidance() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        std::fs::create_dir_all(app.config.outbound_dir.join("project/share")).unwrap();
+        std::fs::write(
+            app.config.outbound_dir.join("project/share/frame"),
+            b"frame",
+        )
+        .unwrap();
+        let raw = token(&app, &PERMISSIONS);
+        let actor = app
+            .store
+            .authenticate_automation_token(&hash_token(&raw), now_unix())
+            .unwrap()
+            .unwrap();
+        let mut project = crate::workflow::tests::project();
+        project.directory = "project/jobs".into();
+        project
+            .members
+            .insert(format!("automation:{}", actor.id), "sender".into());
+        app.store
+            .save_delivery_project("", "local", project)
+            .unwrap();
+        let mut destination = serde_json::from_value(json!({"label":"Fixture", "channel":"webhook", "target":"Fixture", "enabled":true, "url":"https://example.invalid/private-secret"})).unwrap();
+        app.store
+            .save_notification_destination("", &mut destination)
+            .unwrap();
+        let (status, catalog) = request(
+            &app,
+            "GET",
+            "/api/automation/notifications",
+            &raw,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!catalog.to_string().contains("private-secret"));
+        assert!(catalog["destinations"][0].get("recipients").is_none());
+        for (tool, path, allowed, success) in [
+            (
+                "create_delivery",
+                "/api/automation/share",
+                crate::api::notifications::DOWNLOAD_EVENTS.as_slice(),
+                StatusCode::OK,
+            ),
+            (
+                "create_job",
+                "/api/workflows/jobs",
+                crate::api::notifications::WORKFLOW_EVENTS.as_slice(),
+                StatusCode::ACCEPTED,
+            ),
+        ] {
+            for event in crate::store::NOTIFICATION_EVENTS {
+                let mut body = if tool == "create_delivery" {
+                    json!({"directory":"project/share", "expires_days":1, "operation_id":format!("share-{event}")})
+                } else {
+                    let mut request = crate::workflow::tests::request();
+                    request.operation_id = format!("job-{event}");
+                    serde_json::to_value(request).unwrap()
+                };
+                body["notifications"] = json!({"mode":"custom", "rules":[{"destination_id":destination.id,"events":[event]}]});
+                let response = crate::app::router(app.clone())
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(path)
+                            .header("authorization", format!("Bearer {raw}"))
+                            .header("content-type", "application/json")
+                            .header("x-votport", "1")
+                            .extension(ConnectInfo(
+                                "127.0.0.1:8080".parse::<std::net::SocketAddr>().unwrap(),
+                            ))
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body: serde_json::Value = serde_json::from_slice(
+                    &response.into_body().collect().await.unwrap().to_bytes(),
+                )
+                .unwrap();
+                if allowed.contains(&event) {
+                    assert_eq!(status, success, "{tool} {event}: {body}");
+                } else {
+                    assert_eq!(
+                        status,
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "{tool} {event}: {body}"
+                    );
+                    assert_eq!(
+                        body["error"],
+                        format!(
+                            "Choose distinct supported events for each destination: {}",
+                            allowed.join(", ")
+                        )
+                    );
+                }
+            }
+            assert_eq!(catalog["events"][tool], json!(allowed));
+        }
+        assert_eq!(catalog["events"].as_object().unwrap().len(), 2);
+        assert_eq!(app.store.notification_outcomes("").unwrap(), json!({}));
+    }
+
+    #[tokio::test]
     async fn scoped_delivery_workflow_recovers_and_tracks_the_same_objects() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());

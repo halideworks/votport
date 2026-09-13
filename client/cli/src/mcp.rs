@@ -150,7 +150,7 @@ fn valid_arguments(args: &Value, schema: &Value) -> bool {
             return false;
         };
         if key == "notifications" {
-            return valid_notification_policy(value);
+            return valid_notification_policy(value, spec);
         }
         match spec["type"].as_str() {
             Some("string") => value.as_str().is_some_and(|s| {
@@ -182,7 +182,14 @@ fn valid_arguments(args: &Value, schema: &Value) -> bool {
     })
 }
 
-fn valid_notification_policy(value: &Value) -> bool {
+fn valid_notification_policy(value: &Value, schema: &Value) -> bool {
+    let Some(allowed) = schema["properties"]["rules"]["items"]["properties"]["events"]["items"]
+        ["enum"]
+        .as_array()
+        .filter(|events| !events.is_empty() && events.iter().all(Value::is_string))
+    else {
+        return false;
+    };
     let Some(object) = value.as_object() else {
         return false;
     };
@@ -207,19 +214,8 @@ fn valid_notification_policy(value: &Value) -> bool {
                         .is_some_and(|id| !id.is_empty() && id.len() <= 128)
                         && rule["events"].as_array().is_some_and(|events| {
                             !events.is_empty()
-                                && events.len() <= 6
-                                && events.iter().all(|event| {
-                                    event.as_str().is_some_and(|event| {
-                                        [
-                                            "upload_complete",
-                                            "upload_failed",
-                                            "outbound_download_started",
-                                            "outbound_delivery_complete",
-                                            "workflow_retry_scheduled",
-                                            "workflow_failed",
-                                        ]
-                                        .contains(&event)
-                                    })
+                                && events.iter().enumerate().all(|(index, event)| {
+                                    allowed.contains(event) && !events[..index].contains(event)
                                 })
                         })
                 })
@@ -229,16 +225,16 @@ fn valid_notification_policy(value: &Value) -> bool {
 }
 
 fn definitions() -> Vec<Value> {
-    let notifications = json!({"type":"object","required":["mode"],"additionalProperties":false,"properties":{"mode":{"type":"string","enum":["off","default","custom"]},"rules":{"type":"array","maxItems":32,"items":{"type":"object","required":["destination_id","events"],"additionalProperties":false,"properties":{"destination_id":{"type":"string","minLength":1,"maxLength":128},"events":{"type":"array","minItems":1,"maxItems":6,"items":{"type":"string","enum":["upload_complete","upload_failed","outbound_download_started","outbound_delivery_complete","workflow_retry_scheduled","workflow_failed"]}}}}}}});
+    let notifications = |events: &[&str]| json!({"type":"object","required":["mode"],"additionalProperties":false,"properties":{"mode":{"type":"string","enum":["off","default","custom"]},"rules":{"type":"array","maxItems":32,"items":{"type":"object","required":["destination_id","events"],"additionalProperties":false,"properties":{"destination_id":{"type":"string","minLength":1,"maxLength":128},"events":{"type":"array","minItems":1,"maxItems":events.len(),"uniqueItems":true,"items":{"type":"string","enum":events}}}}}}});
     let string = json!({"type": "string", "maxLength": 1024});
     let id = json!({"type": "string", "minLength": 1, "maxLength": 128});
     let limit = json!({"type": "integer", "minimum": 1, "maximum": 100, "default": 50});
     let offset = json!({"type": "integer", "minimum": 0});
     vec![
-        tool("list_notification_destinations", "List available notification destinations and tenant defaults. Requires job or delivery creation access. Webhook credentials remain private.", json!({}), &[], true, false),
+        tool("list_notification_destinations", "List notification destinations, tenant defaults and allowed events for create_delivery and create_job. Requires job or delivery creation access. Webhook credentials remain private.", json!({}), &[], true, false),
         tool("get_access", "Inspect this agent's tenant, folder, permissions and credential expiry.", json!({}), &[], true, false),
         tool("list_files", "List one library directory within the token's folder. Omit directory to start at that folder. Follow next_cursor with after.", json!({"directory": string, "after": {"type": "string", "maxLength": 4096}, "limit": limit}), &[], true, false),
-        tool("create_delivery", "Create an expiring link for a server-relative folder. Choose operation_id once and reuse it with identical parameters after a timeout. Returns the same delivery on retry. Passwords are supplied through VOTPORT_SHARE_PASSWORD.", json!({"directory": string, "operation_id": id, "label": {"type": "string", "maxLength": 200}, "expires_days": {"type": "integer", "minimum": 1, "maximum": 30}, "max_downloads": {"type": "integer", "minimum": 1, "maximum": 10000}, "notifications": notifications}), &["directory", "operation_id", "expires_days"], false, false),
+        tool("create_delivery", "Create an expiring link for a server-relative folder. Choose operation_id once and reuse it with identical parameters after a timeout. Returns the same delivery on retry. Passwords are supplied through VOTPORT_SHARE_PASSWORD.", json!({"directory": string, "operation_id": id, "label": {"type": "string", "maxLength": 200}, "expires_days": {"type": "integer", "minimum": 1, "maximum": 30}, "max_downloads": {"type": "integer", "minimum": 1, "maximum": 10000}, "notifications": notifications(&["outbound_download_started", "outbound_delivery_complete"])}), &["directory", "operation_id", "expires_days"], false, false),
         tool("recover_delivery", "Recover the URL and delivery for an operation_id, including after reconnecting or restarting. Requires deliveries:create.", json!({"operation_id": id}), &["operation_id"], true, false),
         tool("list_deliveries", "List deliveries created by this token, oldest first. Follow next_cursor with after.", json!({"after": offset, "limit": limit}), &[], true, false),
         tool("get_delivery", "Inspect a delivery owned by this token, including paginated object identities, signed receipts and per-file download starts. Counters do not prove recipient verification.", json!({"id": id, "offset": offset, "limit": limit}), &["id"], true, false),
@@ -246,7 +242,7 @@ fn definitions() -> Vec<Value> {
         tool("list_projects", "List the project's delivery rules, required metadata, enrolled recipient keys and agent roles. Requires jobs:read and project membership.", json!({}), &[], true, false),
         tool("list_jobs", "List durable jobs visible to this agent. Follow next with after.", json!({"after": id, "limit": limit}), &[], true, false),
         tool("get_job", "Read preparation, approval, checks, failures and a released delivery URL.", json!({"id": id}), &["id"], true, false),
-        tool("create_job", "Queue a project delivery. Reuse operation_id with identical arguments after a timeout. Optional schedule/deadline are Unix seconds. Approval is a separate human action. Requires jobs:create and project sender role.", json!({"operation_id": id,"project_id": id,"label": {"type":"string","minLength":1,"maxLength":200},"metadata": {"type":"object","maxProperties":50,"additionalProperties":{"type":"string","maxLength":4096}},"recipients":{"type":"array","maxItems":500,"items":{"type":"string","minLength":64,"maxLength":64}},"expires_days":{"type":"integer","minimum":1,"maximum":365},"not_before": offset,"deadline": offset,"import_storage_id": id,"import_prefix": string,"notifications":notifications}), &["operation_id","project_id","label","expires_days"], false, false),
+        tool("create_job", "Queue a project delivery. Reuse operation_id with identical arguments after a timeout. Optional schedule/deadline are Unix seconds. Approval is a separate human action. Requires jobs:create and project sender role.", json!({"operation_id": id,"project_id": id,"label": {"type":"string","minLength":1,"maxLength":200},"metadata": {"type":"object","maxProperties":50,"additionalProperties":{"type":"string","maxLength":4096}},"recipients":{"type":"array","maxItems":500,"items":{"type":"string","minLength":64,"maxLength":64}},"expires_days":{"type":"integer","minimum":1,"maximum":365},"not_before": offset,"deadline": offset,"import_storage_id": id,"import_prefix": string,"notifications":notifications(&["outbound_download_started", "outbound_delivery_complete", "workflow_retry_scheduled", "workflow_failed"])}), &["operation_id","project_id","label","expires_days"], false, false),
         tool("retry_job", "Retry a failed job without changing its request, frozen manifest or approval. Requires jobs:create.", json!({"id":id}), &["id"], false, false),
         tool("cancel_job", "Cancel a job and stop subsequent file admissions. Already admitted streams and delivered files cannot be recalled. Requires jobs:cancel.", json!({"id":id}), &["id"], false, true),
         tool("list_events", "Read signed delivery events. Follow next with after; gaps may represent projects outside this agent's scope.", json!({"after":offset,"limit":limit}), &[], true, false),
@@ -342,6 +338,9 @@ mod tests {
             .unwrap();
         let mut args = json!({"directory":"project","operation_id":"stable","expires_days":7,"notifications":{"mode":"custom","rules":[{"destination_id":"dest-id","events":["outbound_download_started"]}]}});
         assert!(valid_arguments(&args, &definition["inputSchema"]));
+        args["notifications"]["rules"][0]["events"] = json!(["upload_complete"]);
+        assert!(!valid_arguments(&args, &definition["inputSchema"]));
+        args["notifications"]["rules"][0]["events"] = json!(["outbound_download_started"]);
         args["notifications"]["url"] = json!("https://unexpected.example");
         assert!(!valid_arguments(&args, &definition["inputSchema"]));
         args["notifications"] =
@@ -352,6 +351,90 @@ mod tests {
         assert!(definitions()
             .iter()
             .any(|tool| tool["name"] == "list_notification_destinations"));
+    }
+
+    #[test]
+    fn notification_event_enums_match_each_creation_tool() {
+        for (tool, allowed, mut args) in [
+            (
+                "create_delivery",
+                vec!["outbound_download_started", "outbound_delivery_complete"],
+                json!({"directory":"project", "operation_id":"stable", "expires_days":1}),
+            ),
+            (
+                "create_job",
+                vec![
+                    "outbound_download_started",
+                    "outbound_delivery_complete",
+                    "workflow_retry_scheduled",
+                    "workflow_failed",
+                ],
+                json!({"project_id":"project", "operation_id":"stable", "label":"Delivery", "expires_days":1}),
+            ),
+        ] {
+            let schema = definitions()
+                .into_iter()
+                .find(|definition| definition["name"] == tool)
+                .unwrap()["inputSchema"]
+                .clone();
+            let events = &schema["properties"]["notifications"]["properties"]["rules"]["items"]
+                ["properties"]["events"];
+            assert_eq!(events["items"]["enum"], json!(allowed));
+            assert_eq!(events["maxItems"], allowed.len());
+            assert_eq!(events["uniqueItems"], true);
+            for event in [
+                "route_approval_requested",
+                "route_approved",
+                "route_identity_changed",
+                "route_failed",
+                "route_recovered",
+                "route_received",
+                "upload_complete",
+                "upload_failed",
+                "outbound_download_started",
+                "outbound_delivery_complete",
+                "workflow_retry_scheduled",
+                "workflow_failed",
+                "unknown",
+            ] {
+                args["notifications"] = json!({"mode":"custom", "rules":[{"destination_id":"destination", "events":[event]}]});
+                assert_eq!(
+                    valid_arguments(&args, &schema),
+                    allowed.contains(&event),
+                    "{tool}: {event}"
+                );
+            }
+            args["notifications"]["rules"][0]["events"] = json!(allowed);
+            assert!(valid_arguments(&args, &schema));
+            args["notifications"]["rules"][0]["events"] = json!([allowed[0], allowed[0]]);
+            assert!(!valid_arguments(&args, &schema));
+            args["notifications"]["rules"][0]["events"] = json!([]);
+            assert!(!valid_arguments(&args, &schema));
+            args["notifications"]["rules"][0]["events"] = json!([allowed[0]]);
+            for malformed in [
+                Value::Null,
+                json!([]),
+                json!("not an array"),
+                json!([1]),
+                json!([allowed[0], 1]),
+            ] {
+                let mut invalid = schema.clone();
+                invalid["properties"]["notifications"]["properties"]["rules"]["items"]
+                    ["properties"]["events"]["items"]["enum"] = malformed;
+                assert!(!valid_arguments(&args, &invalid));
+                for mode in ["off", "default"] {
+                    let mut without_rules = args.clone();
+                    without_rules["notifications"] = json!({"mode":mode});
+                    assert!(!valid_arguments(&without_rules, &invalid));
+                }
+            }
+            for mode in ["off", "default"] {
+                args["notifications"] = json!({"mode":mode});
+                assert!(valid_arguments(&args, &schema));
+                args["notifications"]["rules"] = json!([]);
+                assert!(valid_arguments(&args, &schema));
+            }
+        }
     }
 
     #[test]

@@ -2,6 +2,9 @@ use super::*;
 use crate::store::{NotificationDestination, NotificationMode, NotificationPolicy};
 use futures_util::{stream, StreamExt};
 
+const DESTINATION_FAILURE: &str =
+    "The destination did not accept the test. Check its connection settings and try again.";
+
 pub(super) struct Route<'a> {
     pub tenant: &'a str,
     pub policy: Option<&'a NotificationPolicy>,
@@ -72,7 +75,8 @@ pub(super) async fn send_policy(
                 event,
                 transfer_id,
             )
-            .await;
+            .await
+            .is_ok();
             if let Err(error) =
                 app.store
                     .record_notification_outcome(route.tenant, destination, delivered)
@@ -91,23 +95,41 @@ async fn send_destination(
     payload: &serde_json::Value,
     event: &str,
     transfer_id: Option<&str>,
-) -> bool {
+) -> Result<(), &'static str> {
+    let unavailable = |reason| {
+        tracing::warn!(
+            channel = destination.channel,
+            event,
+            transfer_id = transfer_id.unwrap_or("none"),
+            outcome = "failed",
+            reason,
+            "notification unavailable"
+        );
+        reason
+    };
     if destination.channel == "email" {
-        let Ok(settings) = app.store.resolved_settings(&app.config) else {
-            return false;
-        };
-        let Some(smtp) = settings.smtp else {
-            return false;
-        };
-        return log_smtp_failure(
+        let settings = app.store.resolved_settings(&app.config)
+            .map_err(|_| unavailable("SMTP settings could not be read. Ask the platform administrator to check server settings."))?;
+        let smtp = settings.smtp.ok_or_else(|| {
+            unavailable(
+                "SMTP is not configured. Ask the platform administrator to configure the relay.",
+            )
+        })?;
+        return send_smtp(
+            &smtp,
+            &destination.recipients,
+            title,
+            body,
             event,
             transfer_id,
-            send_smtp(&smtp, &destination.recipients, title, body).await,
-        );
+        )
+        .await;
     }
-    let Some(request) = destination_request(&app.http, destination, title, body, payload) else {
-        return false;
-    };
+    let request =
+        destination_request(&app.http, destination, title, body, payload).ok_or_else(|| {
+            unavailable("Invalid notification destination");
+            DESTINATION_FAILURE
+        })?;
     log_failure(
         &destination.channel,
         event,
@@ -115,6 +137,8 @@ async fn send_destination(
         request.send().await,
     )
     .await
+    .then_some(())
+    .ok_or(DESTINATION_FAILURE)
 }
 
 fn destination_request(
@@ -194,20 +218,22 @@ pub async fn test_destination(
     app: &App,
     tenant: &str,
     destination: &NotificationDestination,
-) -> bool {
+) -> Result<(), &'static str> {
+    let title = format!("{}: notification test", title_brand(app, tenant));
+    let body = "This is a notification test.\nSample file: Résumé_撮影.mov";
     let delivered = send_destination(
         app,
         destination,
-        "VOTPort: notification test",
-        "This is a VOTPort notification test.",
-        &json!({"event":"notification_test","message":"This is a VOTPort notification test."}),
+        &title,
+        body,
+        &json!({"event":"notification_test","message":body}),
         "notification_test",
         None,
     )
     .await;
     let _ = app
         .store
-        .record_notification_outcome(tenant, destination, delivered);
+        .record_notification_outcome(tenant, destination, delivered.is_ok());
     delivered
 }
 
@@ -231,6 +257,74 @@ mod tests {
             user: "fixture-user".into(),
             recipients: vec![],
             thread_id: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn early_notification_failures_are_logged_once() {
+        use tracing::instrument::WithSubscriber;
+        for case in ["settings", "unset", "discord", "unknown"] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = testing::config(directory.path());
+            config.smtp_host = Some("relay-secret.example.test".into());
+            config.smtp_from = Some("sender-secret@example.test".into());
+            let app = crate::app::build(config).unwrap();
+            let mut destination = push_destination(if case == "settings" || case == "unset" {
+                "email"
+            } else {
+                case
+            });
+            destination.recipients = vec!["recipient-secret@example.test".into()];
+            if case == "discord" {
+                destination.url = "malformed-secret".into();
+            }
+            app.store
+                .save_notification_destination("", &mut destination)
+                .unwrap();
+            if case == "settings" {
+                app.store
+                    .with(|connection| connection.execute("DROP TABLE settings", []))
+                    .unwrap();
+            } else if case == "unset" {
+                app.store
+                    .put_settings(
+                        "fixture",
+                        &[("smtp_host".into(), SettingWrite::Set(String::new()))],
+                    )
+                    .unwrap();
+            }
+            let log = tempfile::NamedTempFile::new().unwrap();
+            let writer = log.reopen().unwrap();
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.try_clone().unwrap())
+                .finish();
+            let result = send_destination(
+                &app,
+                &destination,
+                "Fixture",
+                "Body",
+                &json!({}),
+                "fixture_event",
+                Some("fixture-transfer"),
+            )
+            .with_subscriber(subscriber)
+            .await;
+            assert!(result.is_err(), "{case}");
+            let text = std::fs::read_to_string(log.path()).unwrap();
+            let records = text
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), 1, "{case}: {text}");
+            assert_eq!(records[0]["level"], "WARN");
+            let fields = &records[0]["fields"];
+            assert_eq!(fields["channel"], destination.channel);
+            assert_eq!(fields["event"], "fixture_event");
+            assert_eq!(fields["transfer_id"], "fixture-transfer");
+            assert_eq!(fields["outcome"], "failed");
         }
     }
 
@@ -371,7 +465,17 @@ mod tests {
         let mut first = make("first");
         let mut second = make("second");
         let mut unselected = make("unselected");
-        for destination in [&mut first, &mut second, &mut unselected] {
+        let mut email = make("unconfigured-email");
+        email.channel = "email".into();
+        email.url.clear();
+        email.recipients = vec!["ops@example.test".into()];
+        assert!(app
+            .store
+            .resolved_settings(&app.config)
+            .unwrap()
+            .smtp
+            .is_none());
+        for destination in [&mut first, &mut second, &mut unselected, &mut email] {
             app.store
                 .save_notification_destination("", destination)
                 .unwrap();
@@ -388,6 +492,10 @@ mod tests {
         let policy = NotificationPolicy {
             mode: NotificationMode::Custom,
             rules: vec![
+                NotificationRule {
+                    destination_id: email.id.clone(),
+                    events: vec!["outbound_download_started".into()],
+                },
                 NotificationRule {
                     destination_id: first.id.clone(),
                     events: vec!["outbound_download_started".into()],
@@ -419,6 +527,10 @@ mod tests {
         assert_eq!(
             app.store.notification_outcomes("").unwrap()["first"]["delivered"],
             true
+        );
+        assert_eq!(
+            app.store.notification_outcomes("").unwrap()[&email.id]["delivered"],
+            false
         );
         messages.lock().unwrap().clear();
         grant.notifications = Some(NotificationPolicy {
