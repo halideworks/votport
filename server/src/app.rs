@@ -4134,13 +4134,34 @@ fn sweep_push_staging(app: &App) {
 }
 
 pub async fn session_sweeper(app: Arc<App>) {
-    let mut day = tokio::time::interval(std::time::Duration::from_secs(86_400));
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => sweep_short(&app).await,
-            _ = day.tick() => sweep_daily(&app).await,
-        }
-    }
+    session_sweeper_with_delays(
+        app,
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(86_400),
+    )
+    .await;
+}
+
+async fn session_sweeper_with_delays(
+    app: Arc<App>,
+    short_delay: std::time::Duration,
+    daily_delay: std::time::Duration,
+) {
+    // ponytail: restart resets the daily delay; use calendar scheduling for short-lived deployments.
+    tokio::join!(
+        async {
+            loop {
+                tokio::time::sleep(short_delay).await;
+                sweep_short(&app).await;
+            }
+        },
+        async {
+            loop {
+                tokio::time::sleep(daily_delay).await;
+                sweep_daily(&app).await;
+            }
+        },
+    );
 }
 
 async fn sweep_task<T: Send + 'static>(
@@ -4331,6 +4352,111 @@ mod retention_tests {
                 "cleanup must not clear unsafe poisoned state"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn daily_cleanup_waits_and_does_not_block_idle_session_cleanup() {
+        use std::time::{Duration, SystemTime};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::api::testing::config(directory.path());
+        config.session_idle_secs = 0;
+        let app = build(config).unwrap();
+        let backups = crate::backup::ensure_backups_dir(&app.config.data_dir).unwrap();
+        let snapshot = backups.join("votport-1-deadbeef.db");
+        let add_expired = || {
+            let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+            app.sessions
+                .insert_admitted(
+                    session::SessionAdmission {
+                        id: "expired".into(),
+                        link_id: "link".into(),
+                        tenant: String::new(),
+                        reserved_bytes: 0,
+                        max_total_bytes: None,
+                        max_tenant_sessions: None,
+                        max_link_sessions: usize::MAX,
+                        max_sessions: usize::MAX,
+                        kind: session::SessionKind::Http,
+                    },
+                    sender,
+                    || Ok((0, Vec::new())),
+                )
+                .unwrap();
+            std::fs::File::create(&snapshot)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+                )
+                .unwrap();
+        };
+        add_expired();
+        let worker = tokio::spawn(session_sweeper_with_delays(
+            Arc::clone(&app),
+            Duration::from_millis(5),
+            Duration::from_secs(60),
+        ));
+        let short_ran = tokio::time::timeout(Duration::from_secs(5), async {
+            while app.sessions.total() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        worker.abort();
+        let _ = worker.await;
+        short_ran.expect("short cleanup must run before the first daily deadline");
+        assert!(
+            snapshot.exists(),
+            "daily cleanup must not run immediately at startup"
+        );
+
+        add_expired();
+        let (locked, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let store = Arc::clone(&app.store);
+        let blocker = tokio::task::spawn_blocking(move || {
+            store.with(|_| {
+                locked.send(()).unwrap();
+                released
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("test must release retention settings lock");
+                Ok(())
+            })
+        });
+        tokio::time::timeout(Duration::from_secs(5), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        let worker = tokio::spawn(session_sweeper_with_delays(
+            Arc::clone(&app),
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+        ));
+        let short_ran = tokio::time::timeout(Duration::from_secs(2), async {
+            while app.sessions.total() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let retained_while_blocked = snapshot.exists();
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), blocker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let daily_ran = tokio::time::timeout(Duration::from_secs(5), async {
+            while snapshot.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        worker.abort();
+        let _ = worker.await;
+        short_ran.expect("blocked daily cleanup must not stop idle-session expiry");
+        assert!(retained_while_blocked);
+        daily_ran.expect("daily cleanup must finish after its blocker clears");
     }
 
     #[test]
@@ -4590,7 +4716,8 @@ mod retention_tests {
             .iter()
             .all(|row| row.subject != "failed"));
 
-        let sweeper = tokio::spawn(session_sweeper(Arc::clone(&app)));
+        let sweep_app = Arc::clone(&app);
+        let sweeper = tokio::spawn(async move { sweep_daily(&sweep_app).await });
         for _ in 0..100 {
             if !expired_path.exists() {
                 break;

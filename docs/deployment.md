@@ -600,6 +600,12 @@ Upload retention defaults to keeping everything; audit rows default to
 from the automatic content sweep and records the change in the audit log.
 Explicit file, upload-record, link, and tenant deletion remain available.
 
+Idle-session and staging cleanup waits one minute between passes. Daily
+retention waits 24 hours after startup and after each completed pass, so it
+never runs immediately at boot. The two schedules run independently. Restarting
+resets these delays; a service restarted more often than daily will postpone
+daily retention until it stays up long enough.
+
 ## Performance
 
 Range size is 8 MiB, set by VOT, advertised as `chunk_bytes` on session
