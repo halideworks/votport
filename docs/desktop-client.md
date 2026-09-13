@@ -1,7 +1,7 @@
 # The desktop client: native apps on one Rust core
 
 Status: in progress, 2026-09-08. The VOT seams in "VOT changes" are available in
-vot-cli at pin `ed8a20b7` (`build_manifest`, `build_manifest_from`,
+vot-cli at the current pin `1010254b` (`build_manifest`, `build_manifest_from`,
 `push_from`, `fetch_bundle_with`, `probe_serve`, the proof-cache accessors,
 and the wire build on the platform-native CI job); the listener session cap
 is a separate follow-on. The core and CLI now move bytes end to end: C1 send
@@ -370,7 +370,8 @@ Server, the contract the client speaks (route table in `server/src/app.rs`):
 | `GET /api/s/{token}/{file,batch,bundle,receipt}` | HTTP delivery and receipts, the fallback. |
 | `GET /api/receipt-key`, `POST /api/verify` | Public receipt verification. |
 
-VOT at the pinned revision (`ed8a20b7`), the functions the core builds on:
+The original API inventory below predates C0. Its limitations are historical;
+the current core uses the seams listed in the status at the top of this document.
 
 - `push_bundle(bundle_dir, address, capability_path, key_source, identity)`
   dials `rails` sessions, each `ServeSession::begin_push_session` over a
@@ -428,8 +429,10 @@ VOT at the pinned revision (`ed8a20b7`), the functions the core builds on:
 
 Reference sender behaviour the core must match, from `upload.js` and
 `upload-entries.js`: dotfiles refused unless `allow_hidden`, `~` and
-reserved names refused, fold-collision paths refused at pick time, 20,000
-entries cap, one package per drop, all files hashed before any send.
+reserved names refused, fold-collision paths refused at pick time, the server's
+advertised `max_entries` cap (currently 2,000,000), one package per drop, all
+files hashed before any send. The 20,000-entry scenarios below are test targets,
+not the admission limit.
 
 ## Decisions
 
@@ -478,11 +481,12 @@ sees "UDP blocked" rather than "slow". The order matters: a push
 preflight registers a session that holds a per-link slot and reserved
 bytes until its idle expiry and then records an interrupted event, and a
 fetch mint reserves a delivery against `max_downloads`, so neither is
-spent on a path the probe has not proven. If the push cannot open after
-a successful preflight, the core sends `POST /api/session/{sid}/abort`
-before it opens the HTTP session. The choice is per transfer and re-probed on the next
-one; there is no sticky setting, only an override in Settings for a
-facility that knows its firewall.
+spent on a path the probe has not proven. Once push preflight succeeds, a push
+failure makes the core attempt `POST /api/session/{sid}/abort` and return the
+error. It does not open an HTTP session for that attempt. HTTP fallback is
+limited to push being disabled or unreachable before preflight; a certificate
+digest mismatch or preflight refusal is an error. The next transfer probes again.
+Desktop Settings has no transport override.
 
 The HTTP fallback is the exact session API `upload.js` speaks and the
 `/api/s/{token}/batch` and per-file routes for receive. It is not a second
@@ -490,23 +494,23 @@ protocol; the web client already proves it against every server change.
 
 ### 3. Send without copying: hash in place, manifest only
 
-The core never runs `build_bundle`. It walks the drop, hashes every file
-in place with the same leaf-aligned segmentation the web sender uses for
-files of 64 MiB and more (proof leaves per 64 KiB group, segments across a
-pool of `min(8, cores - 1)` workers), and keeps the leaves. From the roots
-it builds the manifest pages and seal into a small manifest directory
-under the app's state directory and assembles a `BundleServer` from
+The core never runs `build_bundle`. It walks the drop and hashes every file
+in place. Files of at least 64 MiB use sequential reads and up to eight
+hashing workers with one 1 MiB buffer each, retaining proof leaves per
+64 KiB group. From the roots
+it builds the manifest pages and seal into a temporary directory for that
+transfer and assembles a `BundleServer` from
 `ServedSource { path: <original file>, leaves }` for every entry. Every
 entry is a direct object; there are no packs, because votport refuses
 packed entries on both receive paths. The push then serves the original
 files where they sit. The only bytes written on the sender are the
-manifest and a leaves cache next to the state, never a copy of the
-payload.
+manifest, never a copy of the payload. Proof leaves stay in memory for the
+prepared transfer, and its temporary manifest directory is removed on drop.
 
-The leaves cache is keyed by path, length, and mtime, so a re-send of the
-same sequence (a corrected shot in a folder that was already sent) hashes
-only the changed files and the receiver's dedupe skips the rest at the
-manifest hook, exactly as the browser's `find_delivered` path does.
+A persistent leaves cache keyed by path, length, and mtime is unimplemented.
+Every new send hashes every selected file, including an explicit retry. The
+receiver can still skip content it already holds after verifying those bytes;
+that saves transfer work, not the sender's initial hash pass.
 
 Hashing runs before the transfer opens, as the web sender does since
 #166, because the preflight binds the package root. Hashing at wire speed
@@ -596,36 +600,13 @@ highlight borders anywhere; a selected transfer expands.
 
 ### Repository layout
 
-```
-client/
-  core/            votport-core: the Rust crate, its own workspace like server/
-    Cargo.toml     [workspace] empty, VOT git deps at the server's pin
-    src/
-      api.rs       HTTPS client for the routes above (reqwest, rustls)
-      identity.rs  device key, keychain adapters, link password store
-      hash.rs      in-place leaf hashing pool, leaves cache
-      package.rs   drop walk, entry rules, manifest builder
-      transfer.rs  the transfer state machine and observer
-      send.rs      push path and HTTP session path
-      receive.rs   fetch path, HTTP path, publish with receipt
-      probe.rs     the UDP handshake probe
-      journal.rs   SQLite persistence and resume at launch
-      watch.rs     watch folders (notify crate), debounce, one drop per settle
-      verify.rs    receipt verification
-      ffi.rs       the UniFFI surface: commands in, change stream out
-    votport_core.udl
-  cli/             votport: send, receive, verify, watch, status; JSON lines
-  macos/           Xcode project, SwiftUI, the generated Swift package
-  windows/         Visual Studio solution, WinUI 3, C#, the generated bindings
-  design/          tokens.json (generated), app icons, fonts
-```
-
-`client/core` mirrors `server/Cargo.toml`: an empty `[workspace]` so it
-never joins a surrounding workspace, the quiche patch, and the VOT git
-dependencies at the same revision as the server. The repin procedure
-gains one sync point, `client/core/Cargo.toml` and its lock. Cargo target
-directories under `client/` follow the `target-*` naming and go into
-`.dockerignore` with the server's, so an image build never ships them.
+The [client Cargo workspace](../client/Cargo.toml) contains the shared Rust
+[core](../client/core/), the [CLI](../client/cli/), and the
+[UniFFI binding generator](../client/uniffi-bindgen/). It owns the client
+lockfile and quiche patch; the core's VOT dependencies use the server's pin.
+The [macOS](../client/macos/) and [Windows](../client/windows/) directories
+contain the native shells and their build scripts.
+[Design assets](../client/design/) include generated design tokens.
 
 ### The transfer state machine
 
@@ -654,15 +635,15 @@ are coalesced to ten per second before they cross the FFI.
    reported before anything else happens, as the web sender does.
 2. Password gate if `needs_password` and no keychain entry:
    `POST /api/r/{token}/verify`.
-3. Hash in place on the pool; leaves cached; manifest written to the
-   state directory; package root and length known.
+3. Hash in place on the pool; leaves kept in memory; manifest written to a
+   per-transfer temporary directory; package root and length known.
 4. If `push` is true: the probe against the address and digest from
    `GET /api/push-identity`. If it completes, `POST /api/r/{token}/push`
    with the holder key and the package descriptor, then
-   `push_from(assembled server, options)` with rails `min(cores, 4)` and
-   the observer (four, because the push listener admits eight sessions
-   in total and a rail is a session; VOT change 6 lifts this). If the probe fails, or `push` is false, the HTTP
-   session:
+   `push_from(assembled server, options)` with four rails, reduced to one
+   for macOS loopback, and the observer. Fetch uses the same rail selection.
+   Only a disabled push listener or an unreachable carrier before preflight
+   selects HTTP; failures after preflight end the attempt. The HTTP path is
    `POST /api/r/{token}/session`, seal, pages, begin, chunks with the
    server's `chunk_bytes` and parallel ranges, finish. The HTTP finish
    report and the push's completed cursor both end the transfer; the core
@@ -698,11 +679,11 @@ are coalesced to ten per second before they cross the FFI.
 
 ### Speed budget
 
-- Hash: BLAKE3 on `min(8, cores - 1)` workers reading 16 MiB segments,
+- Hash: BLAKE3 on up to eight workers with 1 MiB buffers and sequential reads,
   bounded by the source disk; native on an M-series or a desktop Ryzen
   should read at the disk's rate (2 to 7 GB/s on NVMe, the NAS's rate on
   a NAS). Measure on the Studio and the Windows desktop in C1.
-- Push: four rails in version one (eight after VOT change 6), sixteen
+- Push: four rails, reduced to one for macOS loopback, sixteen
   objects in flight (ADR-0051), FEC automatic,
   the sender's per-byte cost is the read plus AES-GCM. The single-transfer
   ceiling is a per-byte copy cost inside quiche and BLAKE3, the same one
@@ -734,10 +715,10 @@ certificate. Minimum Windows 10 22H2 (the SDK's build floor is 10.0.19041). The 
 generated C# bindings.
 
 CLI (`client/cli`): `votport send <link> <path>...`, `votport receive
-<link> <dest>`, `votport verify <receipt> <file>`, `votport watch <dir>
-<link>`, `votport status`. Every command prints JSON lines on `--json`
-(the change stream verbatim) and a human progress line otherwise. The
-Linux build is the agent's base and the facility's headless watch folder.
+<link> <dest>`, `votport status`, and `votport resume <id>`. `votport help`
+lists the watch, agent, and operator commands. A standalone command to verify
+receipts is unimplemented; use the server's `/verify` page for a file and its
+receipt. The Linux build supports headless sending, receiving, and watch folders.
 
 Operator mode (phase C8, every shell and the CLI): sign in to a votport
 with the admin password (`POST /api/admin/login`, the same session
@@ -779,10 +760,10 @@ one votport repin across the server, the client, and the docs.
 1. `build_manifest(source, manifest_root, suite) -> (PackageSummary,
    BTreeMap<[u8; 32], ServedSource>)`: the walk and entry rules of
    `build_bundle`, no packs (every entry a direct object, which is what
-   votport accepts), every file hashed in place with its leaves written
-   to a cache the caller names, and returned as a `ServedSource` instead
-   of being copied. `build_bundle` stays for the CLI. The proof cache
-   writer (`package/proof_cache.rs`) becomes public for the leaves cache.
+   votport accepts), every file hashed in place with its leaves returned
+   in a `ServedSource` instead of being copied. `build_bundle` stays for the
+   CLI. The public proof-cache writer is available to callers; the desktop
+   core does not use it to persist leaves.
 2. `push_from(server: &BundleServer, options: PushOptions) ->
    Result<PackageSummary, Error>` with `PushOptions { address, holder:
    Arc<authz::Holder>, identity: [u8; 32], rails, extensions, progress:
@@ -819,7 +800,8 @@ one votport repin across the server, the client, and the docs.
    before accept. The cap becomes a per-peer cap plus
    a larger global one that the receiver sets (mirroring item 6 of the
    serve seam in `docs/deliver-over-quic.md`), so a client can use eight
-   rails without starving the next. Until it lands the client uses four.
+   rails without starving the next. The current client uses four rails,
+   reduced to one for macOS loopback.
 
 ## Platform build status
 
@@ -865,7 +847,7 @@ machines on 2026-09-04, `cargo +1.97.1 build -p vot-cli --features wire
 
 | Phase | Repo | Content | Done when |
 | --- | --- | --- | --- |
-| C0 | VOT | `build_manifest`, `build_manifest_from`, `push_from`, `fetch_bundle_with`, `probe_serve`, progress observers, wire on the platform-native job (the listener session cap is a follow-on) | Loopback push from an assembled server and fetch with options pass on Linux, macOS, and Windows in CI (landed, pin `0a129ea`) |
+| C0 | VOT | `build_manifest`, `build_manifest_from`, `push_from`, `fetch_bundle_with`, `probe_serve`, progress observers, wire on the platform-native job (the listener session cap is a follow-on) | Loopback push from an assembled server and fetch with options pass on Linux, macOS, and Windows in CI (landed at `0a129ea`; current pin `1010254b`) |
 | C1 | votport | `client/core` and `client/cli`: api, identity, hash, package, transfer, send over push and HTTP, journal, e2e on loopback | `votport send` moves a 20,000-entry drop and a 4 GiB file over both paths on all three platforms; the HTTP path resumes after a kill; hash and transfer rates recorded on the two target machines |
 | C2 | votport | Receive over fetch and HTTP, publish with receipt, verify | `votport receive` publishes a grant with a verified receipt and the delivery counts on the server |
 | C3 | votport | Push resume on the receiver: staging keyed by link, package root, and holder key, kept across a disconnect and by the boot sweep, adopted by a new preflight once the old session is gone, sink factory re-proves and skips complete staged objects; the core aborts the cut session, re-preflights, and re-dials | A push killed at 90% of a 20,000-entry drop, resumed after the ticket expired and after a server restart, finishes by sending only the objects that were not complete |
@@ -904,8 +886,9 @@ Studio and erebus over the wired LAN.
 
 ## Upstream repin validation, 2026-09-08
 
-Server, native core, and browser WASM use VOT
-`a93f5d86a4da23744f8f8268054414b812b72c46`. The desktop wrappers retain four
+The validation below used VOT
+`a93f5d86a4da23744f8f8268054414b812b72c46`, before the current `1010254b` pin.
+The desktop wrappers retain four
 QUIC rails for remote peers and select one for macOS loopback, including
 IPv4-mapped loopback addresses.
 

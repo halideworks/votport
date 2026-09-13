@@ -192,9 +192,10 @@ returns a capability, advertised address, certificate digest, and expiry. The
 receiver checks the manifest entry count later against `MAX_ENTRIES`. Native
 pushes then use the UDP listener. They share tenant/link
 quotas, sessions, upload history, receipts, retention, and the admin UI with
-browser uploads. A native package is staged and published after the complete
-package verifies; a failed or cancelled native push does not leave partial
-destination files.
+browser uploads. Each completed object publishes its destination files before
+the rest of the package finishes. A failed or cancelled native push can leave
+completed files at their final names and retain incomplete files for retry;
+publication is not atomic across the package. See [direct receiving](direct-receiving.md).
 
 The VOT b14 CLI requires a numeric IPv4 or bracketed IPv6 `SocketAddr` for
 `vot push`; it does not resolve the advertised DNS name. Use a numeric
@@ -648,7 +649,8 @@ records' live status) older than N days, swept daily with audit events.
 Upload retention defaults to keeping everything; audit rows default to
 400 days. A link's **Legal hold** action excludes all of that link's uploads
 from the automatic content sweep and records the change in the audit log.
-Explicit file, upload-record, link, and tenant deletion remain available.
+Explicit file, upload-record, and link deletion require releasing the hold
+first. Tenant deletion requires removing its links first.
 
 Idle-session and staging cleanup waits one minute between passes. Daily
 retention waits 24 hours after startup and after each completed pass, so it
@@ -664,11 +666,10 @@ drains the in-flight window as one batch and verifies and writes those
 ranges in parallel (VOT's `accept` takes shared access since ADR-0046),
 so a single fast upload is no longer bottlenecked on one-at-a-time verify.
 Measured single-stream upload rose about a quarter (256 MiB baseline,
-1258 to 1580 MiB/s median on the same rig). The native-push receive path
-still verifies serially and is the next candidate.
+1258 to 1580 MiB/s median on the same rig).
 
 Do not raise `CHUNK_BYTES` in votport until VOT changes its server verify
-path to support larger ranges; the `ed8a20b7` pin does not. Any VOT re-pin
+path to support larger ranges; the `1010254b` pin does not. Any VOT re-pin
 moves the VOT dependencies and Dockerfile `ARG` together, then relocks
 Cargo.lock. Measure with:
 

@@ -128,9 +128,10 @@ per ten minutes; other automation calls allow 6,000 per IP per ten minutes.
 The client CLI implements MCP 2026-07-28 over stdio using JSON-RPC 2.0. It exposes
 `get_access`, `list_files`, `create_delivery`, `recover_delivery`, `list_deliveries`,
 `get_delivery`, `revoke_delivery`, `list_projects`, `list_jobs`, `get_job`,
-`create_job`, `retry_job`, `cancel_job`, `list_events`, and `get_job_evidence`,
-with input schemas and structured results. The 15 tools include durable project
-workflows described in [Delivery workflows](delivery-workflows.md).
+`create_job`, `retry_job`, `cancel_job`, `list_events`, `get_job_evidence`, and
+`list_notification_destinations`, with input schemas and structured results.
+The 16 tools include durable project workflows described in
+[Delivery workflows](delivery-workflows.md).
 The adapter calls the shared Rust client and does not inherit desktop admin
 credentials. Configuration for hosts using the `mcpServers` format:
 
