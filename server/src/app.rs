@@ -978,11 +978,15 @@ fn restore_upload_sessions(
             &mut session,
         ) {
             Ok(paths) => {
-                tracing::info!(
-                    target: "audit", event = "upload_session_resumed", link = %session.link_id,
-                    session_tag = %session_tag, files = session.files.len(),
-                    "re-attached upload session after restart"
-                );
+                if session.committed_upload_id.is_some() {
+                    tracing::info!(target: "audit", event = "upload_session_cleaned", session_tag = %session_tag, "cleaned completed upload journals");
+                } else {
+                    tracing::info!(
+                        target: "audit", event = "upload_session_resumed", link = %session.link_id,
+                        session_tag = %session_tag, files = session.files.len(),
+                        "re-attached upload session after restart"
+                    );
+                }
                 kept.extend(paths);
             }
             Err(error) => {
@@ -1007,6 +1011,10 @@ fn resume_upload_session(
     destinations: &Arc<crate::receiving::Destinations>,
     session: &mut crate::store::PersistedUploadSession,
 ) -> Result<Vec<std::path::PathBuf>, String> {
+    if session.committed_upload_id.is_some() {
+        session::cleanup_committed_session(store, session, destinations)?;
+        return Ok(Vec::new());
+    }
     let link = store
         .upload_link(&session.link_id)?
         .ok_or_else(|| "link no longer exists".to_owned())?;
@@ -2867,6 +2875,7 @@ mod push_tests {
         let object_path = stage.join("objects/retained.stage");
         std::fs::write(&object_path, b"staged bytes").unwrap();
         let mut persisted = crate::store::PersistedUploadSession {
+            committed_upload_id: None,
             id: hex::encode([5; 16]),
             push_key: Some(key.clone()),
             link_id: "resume".to_owned(),
