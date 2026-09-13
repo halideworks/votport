@@ -132,10 +132,12 @@ the histogram buckets are fixed and cheap.
 
 ## The Grafana dashboard
 
-`ops/grafana-votport.json` covers the whole `/metrics` surface: traffic by
-status class and 5xx ratio, latency percentiles from the request-duration
-histogram, active sessions against the configured cap, native-push activity
-and refusals, per-tenant links and received bytes, and audit health.
+[The Grafana dashboard](../ops/grafana-votport.json) shows drain and storage
+ownership, traffic and latency, upload capacity and outcomes, native push,
+QUIC fetch sessions, reported bytes, completions and refusals, per-tenant usage,
+audit health, and free and total disk space. Lease age is diagnostic; the lease
+status panel reports ownership. QUIC byte counters update at session end, so
+short-window rates can be bursty.
 
 Import it with Dashboards, then Import, then Upload JSON file (or `curl` it
 at `/api/dashboards/import`), and pick the Prometheus datasource when asked.

@@ -647,6 +647,13 @@ Transfers are covered by `votport_upload_sessions_ended_total` with a fixed
 published uploads (1 MiB through 16 GiB, and 1s through 6h), the
 `votport_upload_bytes_in_flight` gauge, and `votport_disk_free_bytes` and
 `votport_disk_total_bytes` per `volume` (`receive`, `outbound`).
+Ownership and admission state use the `votport_draining`, `votport_lease_held`
+and diagnostic `votport_lease_age_seconds` gauges. QUIC delivery exports
+`votport_serve_sessions_active`, `votport_serve_bytes_total`,
+`votport_serve_deliveries_total` and `votport_serve_refused_total{reason}`
+(`rate`, `capability`, `unknown`, `closed`, `busy`). Served bytes update when
+sessions end; completions count successfully recorded fetch acknowledgements.
+[The Grafana dashboard](../ops/grafana-votport.json) includes these series.
 Request metrics never include paths, tenants, addresses,
 methods, or tokens. Set `VOTPORT_METRICS_TOKEN` to require a bearer token, and
 scrape the private upstream directly. The public Caddy examples return 404 for

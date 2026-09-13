@@ -1,7 +1,7 @@
 {
   "title": "votport",
   "uid": "votport",
-  "description": "Traffic, latency, session capacity, per-tenant usage, and audit health for a votport instance, from the built-in /metrics endpoint.",
+  "description": "Storage ownership, traffic, HTTP and QUIC transfers, session capacity, disk space, per-tenant usage, and audit health from the built-in /metrics endpoint.",
   "tags": ["votport"],
   "schemaVersion": 39,
   "version": 1,
@@ -33,17 +33,121 @@
   },
   "panels": [
     {
+      "id": 25,
       "type": "row",
-      "title": "Traffic and errors",
+      "title": "Storage ownership and drain",
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
       "collapsed": false,
       "panels": []
     },
     {
+      "id": 26,
+      "type": "stat",
+      "title": "Upload drain",
+      "description": "Drain mode refuses new upload sessions while existing transfers finish.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "noValue": "No data",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "Drain off", "color": "green" },
+                "1": { "text": "Draining", "color": "yellow" }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "votport_draining",
+          "legendFormat": "{{instance}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "id": 27,
+      "type": "stat",
+      "title": "Receive-root lease",
+      "description": "Held means this process owns the recorded lease and has not marked ownership lost.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "noValue": "No data",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "Not held", "color": "red" },
+                "1": { "text": "Held", "color": "green" }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "votport_lease_held",
+          "legendFormat": "{{instance}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "Lease heartbeat age",
+      "description": "Diagnostic age of the last heartbeat. Zero also represents an unavailable lease record; heartbeat age never authorizes takeover.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "votport_lease_age_seconds",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Traffic and errors",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 2,
       "type": "timeseries",
       "title": "Request rate by status class",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 10, "x": 0, "y": 1 },
+      "gridPos": { "h": 8, "w": 10, "x": 0, "y": 10 },
       "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
       "targets": [
         {
@@ -54,11 +158,12 @@
       ]
     },
     {
+      "id": 3,
       "type": "timeseries",
       "title": "5xx ratio",
       "description": "Server-error share of all responses. Sustained non-zero values during a load run point at the store or the audit path before anything else.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 7, "x": 10, "y": 1 },
+      "gridPos": { "h": 8, "w": 7, "x": 10, "y": 10 },
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
@@ -83,10 +188,11 @@
       ]
     },
     {
+      "id": 4,
       "type": "timeseries",
       "title": "In-flight request handlers",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 7, "x": 17, "y": 1 },
+      "gridPos": { "h": 8, "w": 7, "x": 17, "y": 10 },
       "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
       "targets": [
         {
@@ -97,18 +203,20 @@
       ]
     },
     {
+      "id": 5,
       "type": "row",
       "title": "Latency",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
       "collapsed": false,
       "panels": []
     },
     {
+      "id": 6,
       "type": "timeseries",
       "title": "Time to response headers",
       "description": "Percentiles from the fixed-bucket histogram (10ms to 5s). Streamed body transfer time is excluded, so this is queueing and handler time, not link speed.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 19 },
       "fieldConfig": { "defaults": { "unit": "s", "min": 0 }, "overrides": [] },
       "targets": [
         {
@@ -129,11 +237,12 @@
       ]
     },
     {
+      "id": 7,
       "type": "timeseries",
       "title": "Outbound library upload duration",
       "description": "Time to response headers for admin outbound library uploads only.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 19 },
       "fieldConfig": { "defaults": { "unit": "s", "min": 0 }, "overrides": [] },
       "targets": [
         {
@@ -149,18 +258,20 @@
       ]
     },
     {
+      "id": 8,
       "type": "row",
       "title": "Sessions and capacity",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 },
       "collapsed": false,
       "panels": []
     },
     {
+      "id": 9,
       "type": "timeseries",
       "title": "Active upload sessions vs configured cap",
       "description": "The cap line is the session_cap dashboard variable; keep it matched to VOTPORT_MAX_TOTAL_SESSIONS on the target. Sessions riding the line mean senders are being refused with 429s.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 19 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
       "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
       "targets": [
         {
@@ -176,10 +287,11 @@
       ]
     },
     {
+      "id": 10,
       "type": "timeseries",
       "title": "Native push",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 19 },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 28 },
       "fieldConfig": {
         "defaults": { "unit": "short", "min": 0 },
         "overrides": [
@@ -203,10 +315,11 @@
       ]
     },
     {
+      "id": 11,
       "type": "timeseries",
       "title": "Push refusals by reason",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 19 },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 28 },
       "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
       "targets": [
         {
@@ -217,17 +330,91 @@
       ]
     },
     {
+      "id": 29,
       "type": "row",
-      "title": "Per-tenant usage",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 },
+      "title": "QUIC delivery",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 36 },
       "collapsed": false,
       "panels": []
     },
     {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Active QUIC fetch sessions",
+      "description": "Admitted fetch sessions, including concurrent rails.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 37 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "votport_serve_sessions_active",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "QUIC served byte rate",
+      "description": "Bytes are reported when a session ends, including interrupted sessions. Short-window rates can arrive in bursts.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 37 },
+      "fieldConfig": { "defaults": { "unit": "Bps", "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "rate(votport_serve_bytes_total[$__rate_interval])",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Completed QUIC deliveries",
+      "description": "Successfully recorded fetch completion acknowledgements over the query window.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 37 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "increase(votport_serve_deliveries_total[$__rate_interval])",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "QUIC refusals by reason",
+      "description": "Refused admissions over the query window, grouped by bounded reason.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 37 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum by (instance, reason) (increase(votport_serve_refused_total[$__rate_interval]))",
+          "legendFormat": "{{instance}} {{reason}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "row",
+      "title": "Per-tenant usage",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 45 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 13,
       "type": "stat",
       "title": "Tenants",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 4, "x": 0, "y": 28 },
+      "gridPos": { "h": 8, "w": 4, "x": 0, "y": 46 },
       "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
       "targets": [
         {
@@ -238,10 +425,11 @@
       ]
     },
     {
+      "id": 14,
       "type": "timeseries",
       "title": "Request links per tenant",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 10, "x": 4, "y": 28 },
+      "gridPos": { "h": 8, "w": 10, "x": 4, "y": 46 },
       "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
       "targets": [
         {
@@ -252,10 +440,11 @@
       ]
     },
     {
+      "id": 15,
       "type": "timeseries",
       "title": "Received bytes per tenant",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 10, "x": 14, "y": 28 },
+      "gridPos": { "h": 8, "w": 10, "x": 14, "y": 46 },
       "fieldConfig": { "defaults": { "unit": "bytes", "min": 0 }, "overrides": [] },
       "targets": [
         {
@@ -266,17 +455,19 @@
       ]
     },
     {
+      "id": 16,
       "type": "row",
       "title": "Audit health",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 36 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 54 },
       "collapsed": false,
       "panels": []
     },
     {
+      "id": 17,
       "type": "timeseries",
       "title": "Audit rows",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 37 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 55 },
       "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
       "targets": [
         {
@@ -287,11 +478,12 @@
       ]
     },
     {
+      "id": 18,
       "type": "timeseries",
       "title": "Audit insert failures",
       "description": "Any non-zero value means audit events are being dropped; treat it as an incident, not noise.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 37 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 55 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -315,18 +507,20 @@
       ]
     },
     {
+      "id": 19,
       "type": "row",
       "title": "Transfers",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 45 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 63 },
       "collapsed": false,
       "panels": []
     },
     {
+      "id": 20,
       "type": "timeseries",
       "title": "Upload sessions ended by outcome",
       "description": "Rate of session ends by fixed outcome; the failure webhook reports rejected ends and interrupted ends that had received bytes.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 46 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 64 },
       "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
       "targets": [
         {
@@ -337,11 +531,12 @@
       ]
     },
     {
+      "id": 21,
       "type": "timeseries",
       "title": "Published upload size",
       "description": "Percentiles from the fixed-bucket size histogram of published uploads.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 46 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 64 },
       "fieldConfig": { "defaults": { "unit": "bytes", "min": 0 }, "overrides": [] },
       "targets": [
         {
@@ -357,11 +552,12 @@
       ]
     },
     {
+      "id": 22,
       "type": "timeseries",
       "title": "Published upload duration",
       "description": "Session creation to publication, percentiles.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 46 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 64 },
       "fieldConfig": { "defaults": { "unit": "s", "min": 0 }, "overrides": [] },
       "targets": [
         {
@@ -377,11 +573,12 @@
       ]
     },
     {
+      "id": 23,
       "type": "timeseries",
       "title": "Bytes in flight",
       "description": "Bytes accepted so far by live upload sessions.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 54 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 72 },
       "fieldConfig": { "defaults": { "unit": "bytes", "min": 0 }, "overrides": [] },
       "targets": [
         {
@@ -392,17 +589,23 @@
       ]
     },
     {
+      "id": 24,
       "type": "timeseries",
-      "title": "Disk free by volume",
-      "description": "Free space on the receive and outbound volumes.",
+      "title": "Disk free and total by volume",
+      "description": "Available and total filesystem space. Receive and outbound may share one filesystem; each volume is shown separately.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 54 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 72 },
       "fieldConfig": { "defaults": { "unit": "bytes", "min": 0 }, "overrides": [] },
       "targets": [
         {
           "expr": "votport_disk_free_bytes",
-          "legendFormat": "{{volume}}",
+          "legendFormat": "{{instance}} {{volume}} free",
           "refId": "A"
+        },
+        {
+          "expr": "votport_disk_total_bytes",
+          "legendFormat": "{{instance}} {{volume}} total",
+          "refId": "B"
         }
       ]
     }
