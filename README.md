@@ -126,6 +126,10 @@ GET. A restore rotates the cookie secret and signs out existing sessions. A
 written settings key wins; `""` disables a URL or token; JSON `null` deletes
 the row so env applies again. Details: [`docs/deployment.md`](docs/deployment.md).
 
+Boolean settings accept `1/true/yes/on` and `0/false/no/off`, ignoring case and
+surrounding whitespace. Unset settings use the defaults below; empty or invalid
+boolean values stop startup.
+
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `VOTPORT_ADMIN_PASSWORD` | — | Admin password (hashed with argon2id at startup). Required unless the hash is set. At least 12 characters; a shorter one refuses to start, because this is the credential that still works when the identity provider does not. |
@@ -146,7 +150,7 @@ the row so env applies again. Details: [`docs/deployment.md`](docs/deployment.md
 | `VOTPORT_WEB_ROOT` | `./web` | Static assets directory (`/app/web` in Docker). |
 | `VOTPORT_NOTIFY_SMTP_HOST` | — | Shared SMTP relay host. Configure recipients on named email destinations. |
 | `VOTPORT_NOTIFY_SMTP_PORT` | `587` | SMTP port. Port 465 uses implicit TLS. |
-| `VOTPORT_NOTIFY_SMTP_STARTTLS` | on | SMTP STARTTLS. Off only when `0`. Port 465 uses implicit TLS regardless. |
+| `VOTPORT_NOTIFY_SMTP_STARTTLS` | on | SMTP STARTTLS. Set `0` or `false` to disable. Port 465 uses implicit TLS regardless. |
 | `VOTPORT_NOTIFY_SMTP_USERNAME` | — | Optional SMTP AUTH username. |
 | `VOTPORT_NOTIFY_SMTP_PASSWORD` | — | Optional SMTP AUTH password. |
 | `VOTPORT_SCIM_TOKEN` | — | Bearer for the SCIM 2.0 provisioning endpoint at `/scim/v2`; unset disables it. Overridable via `PUT /api/admin/settings`. |

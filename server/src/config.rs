@@ -352,7 +352,7 @@ pub fn from_env() -> Result<Config, String> {
             .map_err(|error| format!("VOTPORT_WORKFLOW_SNAPSHOT_BYTES: {error}"))?,
         Err(_) => max_upload_bytes.saturating_mul(4),
     };
-    let allow_hidden = env::var("VOTPORT_ALLOW_HIDDEN").is_ok_and(|value| value == "1");
+    let allow_hidden = env_bool("VOTPORT_ALLOW_HIDDEN", false)?;
 
     let upload_retention_days = match env::var("VOTPORT_UPLOAD_RETENTION_DAYS") {
         Ok(value) => value
@@ -438,12 +438,8 @@ pub fn from_env() -> Result<Config, String> {
     let default_max_total_bytes = optional_positive_u64("VOTPORT_DEFAULT_MAX_TOTAL_BYTES")?;
     let default_max_links = optional_positive_u64("VOTPORT_DEFAULT_MAX_LINKS")?;
     let default_max_sessions = optional_positive_u64("VOTPORT_DEFAULT_MAX_SESSIONS")?;
-    let public_password_login = env::var("VOTPORT_PUBLIC_PASSWORD_LOGIN")
-        .ok()
-        .is_none_or(|value| value != "0");
-    let require_provisioning = env::var("VOTPORT_SCIM_REQUIRE_PROVISIONING")
-        .ok()
-        .is_some_and(|value| value == "1");
+    let public_password_login = env_bool("VOTPORT_PUBLIC_PASSWORD_LOGIN", true)?;
+    let require_provisioning = env_bool("VOTPORT_SCIM_REQUIRE_PROVISIONING", false)?;
 
     let session_idle_secs = match env::var("VOTPORT_SESSION_IDLE_SECS") {
         Ok(value) => value
@@ -464,9 +460,7 @@ pub fn from_env() -> Result<Config, String> {
         }
         _ => 587,
     };
-    let smtp_starttls = env::var("VOTPORT_NOTIFY_SMTP_STARTTLS")
-        .ok()
-        .is_none_or(|value| value != "0");
+    let smtp_starttls = env_bool("VOTPORT_NOTIFY_SMTP_STARTTLS", true)?;
 
     let oidc = match (
         optional("VOTPORT_OIDC_ISSUER"),
@@ -640,6 +634,18 @@ fn listener_address(
         return Err(format!("VOTPORT_{kind}_ADVERTISE must be host:port"));
     }
     Ok(address)
+}
+
+fn env_bool(name: &str, default: bool) -> Result<bool, String> {
+    let value = match env::var(name) {
+        Err(env::VarError::NotPresent) => return Ok(default),
+        value => value.map_err(|_| format!("{name} is not valid Unicode"))?,
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!("{name} must be 1/0, true/false, yes/no or on/off")),
+    }
 }
 
 fn env_or(name: &str, default: &str) -> String {
@@ -889,6 +895,97 @@ mod cidr_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boolean_environment_settings_are_explicit() {
+        const KEYS: [&str; 4] = [
+            "VOTPORT_ALLOW_HIDDEN",
+            "VOTPORT_PUBLIC_PASSWORD_LOGIN",
+            "VOTPORT_SCIM_REQUIRE_PROVISIONING",
+            "VOTPORT_NOTIFY_SMTP_STARTTLS",
+        ];
+        if let Ok(expected) = env::var("VOTPORT_TEST_BOOLEAN_CASE") {
+            let config = from_env();
+            if let Some(key) = expected.strip_prefix("reject:") {
+                assert!(config.unwrap_err().contains(key));
+            } else {
+                let config = config.unwrap();
+                let actual = [
+                    config.allow_hidden,
+                    config.public_password_login,
+                    config.require_provisioning,
+                    config.smtp_starttls,
+                ];
+                assert_eq!(
+                    actual,
+                    match expected.as_str() {
+                        "default" => [false, true, false, true],
+                        "true" => [true; 4],
+                        "false" => [false; 4],
+                        _ => panic!("unexpected boolean test case"),
+                    }
+                );
+            }
+            return;
+        }
+        let child = |expected: &str| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args([
+                "--exact",
+                "config::tests::boolean_environment_settings_are_explicit",
+                "--nocapture",
+            ]);
+            for (key, _) in
+                env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("VOTPORT_"))
+            {
+                command.env_remove(key);
+            }
+            command
+                .env("VOTPORT_TEST_BOOLEAN_CASE", expected)
+                .env("VOTPORT_ADMIN_PASSWORD_HASH", "test-config-only");
+            command
+        };
+        let check = |mut command: std::process::Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        check(child("default"));
+        for (value, expected) in [
+            ("1", "true"),
+            ("true", "true"),
+            (" YES ", "true"),
+            ("On", "true"),
+            ("0", "false"),
+            ("false", "false"),
+            (" NO ", "false"),
+            ("Off", "false"),
+        ] {
+            let mut command = child(expected);
+            for key in KEYS {
+                command.env(key, value);
+            }
+            check(command);
+        }
+        for key in KEYS {
+            for value in ["", " ", "enabled", "2"] {
+                let mut command = child(&format!("reject:{key}"));
+                command.env(key, value);
+                check(command);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt as _;
+                let mut command = child(&format!("reject:{key}"));
+                command.env(key, std::ffi::OsString::from_vec(vec![0xff]));
+                check(command);
+            }
+        }
+    }
 
     #[test]
     fn byte_counts_accept_suffixes() {

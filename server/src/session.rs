@@ -1469,6 +1469,14 @@ fn prepare_files(
     delivered: &HashMap<(&str, &str), Vec<&FileRecord>>,
     active: impl Fn() -> bool + Sync,
 ) -> Result<Vec<FileState>, SessionError> {
+    // Staging creation does not reserve the final path.
+    let mut claimed = HashSet::new();
+    for (components, _) in entries {
+        for end in 1..components.len() {
+            claimed.insert(stored_path_key(&components[..end])?);
+        }
+    }
+    let claimed = Mutex::new(claimed);
     let prepare = |(components, object): &(Vec<String>, ObjectId)| {
         if !active() {
             return Err(SessionError::conflict("receive preparation cancelled"));
@@ -1489,7 +1497,7 @@ fn prepare_files(
         if !active() {
             return Err(SessionError::conflict("receive preparation cancelled"));
         }
-        open_destination_for(setup, components.clone(), object.clone())
+        open_destination_for(setup, components.clone(), object.clone(), &claimed)
     };
     if entries.len() < MAX_CHUNK_BATCH * 2 {
         return entries.iter().map(prepare).collect();
@@ -1532,10 +1540,18 @@ fn prepare_files(
     })
 }
 
+fn stored_path_key(components: &[String]) -> Result<Vec<u8>, SessionError> {
+    let path = vot_manifest::PackagePath::portable(components.iter().cloned())
+        .map_err(|error| SessionError::bad(format!("stored path rejected: {error:?}")))?;
+    vot_manifest::canonical_path_key(&path, vot_manifest::PathProfile::Portable)
+        .map_err(|error| SessionError::bad(format!("stored path key rejected: {error:?}")))
+}
+
 fn open_destination_for(
     setup: &WorkerSetup,
     components: Vec<String>,
     object: ObjectId,
+    claimed: &Mutex<HashSet<Vec<u8>>>,
 ) -> Result<FileState, SessionError> {
     let display_path = components.join("/");
     let parent = paths::join_under(&setup.dest_dir, &components[..components.len() - 1])
@@ -1552,6 +1568,14 @@ fn open_destination_for(
             .map_err(SessionError::internal)?;
         let mut stored = components.clone();
         *stored.last_mut().expect("non-empty") = paths::with_suffix(name, attempt);
+        let key = stored_path_key(&stored)?;
+        if !claimed
+            .lock()
+            .expect("name claims poisoned")
+            .insert(key.clone())
+        {
+            continue;
+        }
         // The full stored path including the file name; `parent` above is
         // only for creating intermediate directories.
         let destination =
@@ -1581,7 +1605,9 @@ fn open_destination_for(
                     rehash: false,
                 });
             }
-            Err(error) if error.kind() == vot_sdk_file::ErrorKind::AlreadyExists => {}
+            Err(error) if error.kind() == vot_sdk_file::ErrorKind::AlreadyExists => {
+                claimed.lock().expect("name claims poisoned").remove(&key);
+            }
             Err(error) => {
                 return Err(SessionError::internal(format!(
                     "prepare {display_path}: {error}"
@@ -4540,6 +4566,14 @@ mod push_tests {
     use super::*;
     use vot_sdk::object::{InMemoryObjectBuilder, Suite};
 
+    fn open_destination_for(
+        setup: &WorkerSetup,
+        components: Vec<String>,
+        object: ObjectId,
+    ) -> Result<FileState, SessionError> {
+        super::open_destination_for(setup, components, object, &Mutex::default())
+    }
+
     fn object(suite: Suite, data: &[u8]) -> ObjectId {
         let mut builder =
             InMemoryObjectBuilder::new(suite, Some(data.len() as u64), data.len() as u64).unwrap();
@@ -4581,6 +4615,67 @@ mod push_tests {
             started_at: 1,
             quiet_after_secs: 5,
             ended: mpsc::unbounded_channel().0,
+        }
+    }
+
+    #[test]
+    fn preparation_reserves_distinct_names_before_publication() {
+        for count in [2, 32] {
+            for (extension, nested) in [("pdf", false), ("PDF", false), ("pdf", true)] {
+                let directory = tempfile::tempdir().unwrap();
+                let object = object(Suite::Blake3Bao64, b"");
+                let setup = setup(directory.path(), object.clone());
+                let mut entries = Vec::new();
+                for index in 0..count / 2 {
+                    let parent = format!("pair-{index}");
+                    fs::create_dir(setup.dest_dir.join(&parent)).unwrap();
+                    fs::write(setup.dest_dir.join(&parent).join("report.pdf"), b"existing")
+                        .unwrap();
+                    entries.push((vec![parent, "report.pdf".into()], object.clone()));
+                }
+                for index in 0..count / 2 {
+                    let mut components =
+                        vec![format!("pair-{index}"), format!("report-1.{extension}")];
+                    if nested {
+                        components.push("child".into());
+                    }
+                    entries.push((components, object.clone()));
+                }
+                let mut files = prepare_files(&setup, &entries, &HashMap::new(), || true).unwrap();
+                persist_session(&setup, &files).unwrap();
+                let mut names = HashSet::new();
+                for file in &mut files {
+                    let path =
+                        vot_manifest::PackagePath::portable(file.stored_components.iter().cloned())
+                            .unwrap();
+                    let key = vot_manifest::canonical_path_key(
+                        &path,
+                        vot_manifest::PathProfile::Portable,
+                    )
+                    .unwrap();
+                    assert!(
+                        names.insert(key),
+                        "stored name claimed twice: {}",
+                        file.stored_components.join("/")
+                    );
+                    publish_file(&setup, file, || true).unwrap();
+                    assert_eq!(
+                        fs::metadata(
+                            paths::join_under(&setup.dest_dir, &file.stored_components).unwrap()
+                        )
+                        .unwrap()
+                        .len(),
+                        0
+                    );
+                }
+                assert!(checkpoint_session(&setup, &mut files));
+                for index in 0..count / 2 {
+                    assert_eq!(
+                        fs::read(setup.dest_dir.join(format!("pair-{index}/report.pdf"))).unwrap(),
+                        b"existing"
+                    );
+                }
+            }
         }
     }
 
