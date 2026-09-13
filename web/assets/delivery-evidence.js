@@ -210,6 +210,7 @@ export function initDeliveryEvidence(getMetadata, savedNames) {
     for (const [index, expected] of metadata.files.entries()) {
       const file = selectedByName.get(names[index]);
       if (!file || file.size !== expected.bytes || expected.suite !== 'blake3') throw new Error(`Missing or wrong-sized file: ${names[index]}`);
+      selectedByName.delete(names[index]);
       status.textContent = `Verifying saved files: ${index + 1} of ${metadata.files.length}`;
       const actual = await hashFile(file);
       if (actual.root !== expected.root || actual.bytes !== expected.bytes) throw new Error(`Verification failed: ${names[index]}`);

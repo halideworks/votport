@@ -9,9 +9,10 @@ const root = process.env.WORKFLOW_TEST_ROOT;
 if (!base || !root || !process.env.ADMIN_PASSWORD) throw new Error('Set BASE_URL, WORKFLOW_TEST_ROOT and ADMIN_PASSWORD for an isolated test instance.');
 const project = `browser-${Date.now()}`;
 const directory = path.join(root, 'library', project);
-await fs.mkdir(directory, { recursive: true });
-await fs.writeFile(path.join(directory, 'saved.bin'), 'Recipient verification fixture.\n');
-await fs.writeFile(path.join(directory, 'saved (2).bin'), 'Second verification fixture.\n');
+for (const part of ['a', 'b']) {
+  await fs.mkdir(path.join(directory, part), { recursive: true });
+  await fs.writeFile(path.join(directory, part, 'saved.bin'), 'Recipient verification fixture.\n');
+}
 const browser = await chromium.launch();
 const context = await browser.newContext();
 const page = await context.newPage();
@@ -83,6 +84,21 @@ try {
     await writable.write('Keep this existing file.');
     await writable.close();
   });
+  await page.route('**/api/s/*/files/1', (route) => route.fulfill({ status: 404 }));
+  await page.getByRole('button', { name: 'Download all files', exact: true }).click();
+  await page.waitForFunction(() => document.getElementById('separate-download-status').textContent.startsWith('Downloaded 1/2.'), null, { timeout: 10000 });
+  await page.evaluate(async () => {
+    const selected = new DataTransfer();
+    selected.items.add(await (await window.savedDirectory.getFileHandle('saved (2).bin')).getFile());
+    document.getElementById('evidence-files').files = selected.files;
+    window.partialEntries = new Set();
+    for await (const name of window.savedDirectory.keys()) window.partialEntries.add(name);
+  });
+  await page.click('#evidence-verify');
+  await page.waitForFunction(() => document.getElementById('evidence-status').textContent.startsWith('Missing or wrong-sized file:') || document.getElementById('evidence-records').textContent.includes('Verification reported to the sender.'), null, { timeout: 10000 });
+  assert.match(await page.locator('#evidence-status').textContent(), /^Missing or wrong-sized file:/, 'one saved file must not verify both identical manifest entries');
+  assert.equal((await request(`workflows/jobs/${id}/evidence`)).evidence.length, 0);
+  await page.unroute('**/api/s/*/files/1');
   await page.getByRole('button', { name: 'Download all files', exact: true }).click();
   await page.waitForFunction(() => document.getElementById('separate-download-status').textContent === 'Downloaded 2 files.', null, { timeout: 10000 });
   await page.evaluate(async () => {
@@ -90,7 +106,7 @@ try {
     if (await (await existing.getFile()).text() !== 'Keep this existing file.') throw new Error('existing file was overwritten');
     const selected = new DataTransfer();
     for await (const [name, handle] of window.savedDirectory.entries()) {
-      if (name !== 'saved.bin') selected.items.add(await handle.getFile());
+      if (!window.partialEntries.has(name)) selected.items.add(await handle.getFile());
     }
     document.getElementById('evidence-files').files = selected.files;
   });
