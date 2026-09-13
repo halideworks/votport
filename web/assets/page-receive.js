@@ -498,7 +498,7 @@ function renderLink(link) {
     editor.element.addEventListener('input', () => { details.dataset.dirty = 'true'; });
     const save = button('Save reception workflow', 'ghost', async () => {
       save.disabled = true;
-      try { const workflow = editor.read(); editor.element.disabled = true; await api(`/api/admin/links/${link.id}`, { method: 'PATCH', body: JSON.stringify({ workflow: workflow || { project_id: '', metadata: {}, recipients: [] } }) }); linksRevision++; link.workflow = workflow; markFormSaved(details); delete details.dataset.dirty; result.textContent = 'Saved. This applies to future uploads; existing jobs keep their captured rules.'; }
+      try { const workflow = editor.read(); editor.element.disabled = true; await api(`/api/admin/links/${link.id}`, { method: 'PATCH', body: JSON.stringify({ workflow: workflow || { project_id: '', metadata: {}, recipients: [] } }) }); linksRevision++; link.workflow = workflow; markFormSaved(details); delete details.dataset.dirty; result.textContent = 'Saved. These settings apply to future uploads. Deliveries that failed before their files were prepared use these settings when retried.'; }
       catch (error) { result.textContent = error.message; }
       finally { save.disabled = false; editor.element.disabled = false; }
     });

@@ -260,6 +260,15 @@ pub(super) fn set_receive_workflow(
     Ok(())
 }
 
+fn receive_workflow_in(
+    connection: &Connection,
+    tenant: &str,
+    link_id: &str,
+) -> rusqlite::Result<Option<crate::workflow::ReceiveWorkflow>> {
+    connection.prepare_cached("SELECT r.document FROM receive_workflows r JOIN links l ON l.id=r.link_id WHERE l.tenant=?1 AND l.id=?2")?
+        .query_row(params![tenant,link_id], |row| decode(row.get(0)?)).optional()
+}
+
 pub(super) fn queue_received(
     connection: &Connection,
     signer: &crate::receipt::ReceiptSigner,
@@ -267,14 +276,7 @@ pub(super) fn queue_received(
     link_id: &str,
     upload: &UploadRecord,
 ) -> Result<(), String> {
-    let workflow: Option<crate::workflow::ReceiveWorkflow> = connection
-        .prepare_cached("SELECT document FROM receive_workflows WHERE link_id=?1")
-        .and_then(|mut statement| {
-            statement
-                .query_row([link_id], |row| decode(row.get(0)?))
-                .optional()
-        })
-        .map_err(|e| e.to_string())?;
+    let workflow = receive_workflow_in(connection, tenant, link_id).map_err(|e| e.to_string())?;
     let Some(workflow) = workflow else {
         return Ok(());
     };
@@ -340,7 +342,7 @@ impl Store {
         tenant: &str,
         link_id: &str,
     ) -> Result<Option<crate::workflow::ReceiveWorkflow>, String> {
-        self.with(|connection| connection.prepare_cached("SELECT r.document FROM receive_workflows r JOIN links l ON l.id=r.link_id WHERE l.tenant=?1 AND l.id=?2")?.query_row(params![tenant,link_id],|row| decode(row.get(0)?)).optional())
+        self.with(|connection| receive_workflow_in(connection, tenant, link_id))
     }
 
     pub fn set_receive_workflow(
@@ -975,10 +977,21 @@ impl Store {
                 if !project.allows(actor, "sender", administrator) && actor != job.actor {
                     return Err("sender permission required".into());
                 }
-                if !["failed", "retrying"].contains(&job.state.as_str())
-                    || project.revision != job.project.revision
-                {
-                    return Err("only a failed job with unchanged policy can retry".into());
+                if !["failed", "retrying"].contains(&job.state.as_str()) {
+                    return Err("only a failed job can retry".into());
+                }
+                if let (Some(received), None) = (&job.received, &job.manifest) {
+                    let workflow = receive_workflow_in(&tx, tenant, &received.link_id)
+                        .map_err(|e| e.to_string())?
+                        .filter(|workflow| workflow.project_id == project.id)
+                        .ok_or("the receive request must still select this project")?;
+                    job.request.metadata = workflow.metadata;
+                    job.request.recipients = workflow.recipients;
+                    job.request.notifications = workflow.notifications;
+                    job.project = project.clone();
+                    job.checks = trade::snapshot(&tx, tenant, &project)?;
+                } else if project.revision != job.project.revision {
+                    return Err("this delivery requires its original project policy".into());
                 }
                 actor_active(&tx, &job)?;
                 project.validate_job(&job.request, job.created_at)?;
@@ -1249,7 +1262,7 @@ mod tests {
         let policy = store.save_delivery_project("", "admin", policy).unwrap();
         let workflow = crate::workflow::ReceiveWorkflow {
             notifications: None,
-            project_id: policy.id,
+            project_id: policy.id.clone(),
             metadata: request().metadata,
             recipients: vec![],
         };
@@ -1278,7 +1291,7 @@ mod tests {
                 deleted: false,
             }],
         };
-        store.append_upload("", &link.id, upload).unwrap();
+        store.append_upload("", &link.id, upload.clone()).unwrap();
         // The upload is recorded and the job waits with an empty grant that
         // preparation fills in once enrollment finishes.
         let jobs = store.delivery_jobs("", "", 100, None, "", "").unwrap();
@@ -1287,6 +1300,119 @@ mod tests {
         assert_eq!(
             jobs[0].checks["trade_routes"][&route.id]["permission"]["grant"],
             ""
+        );
+        store
+            .change_delivery_job("", &jobs[0].id, "admin", true, "cancel", None)
+            .unwrap();
+        let mut updated = policy.clone();
+        updated.required_metadata.push("take".into());
+        updated.recipients.push(crate::workflow::Recipient {
+            email: "editor@example.com".into(),
+            holder: store.event_signer.public_hex.clone(),
+        });
+        let mut updated = store.save_delivery_project("", "admin", updated).unwrap();
+        let mut upload = upload;
+        upload.id = "missing-metadata".into();
+        store.append_upload("", &link.id, upload.clone()).unwrap();
+        let failed = store
+            .delivery_jobs("", "", 100, None, "", "")
+            .unwrap()
+            .into_iter()
+            .find(|job| job.request.operation_id == upload.id)
+            .unwrap();
+        assert_eq!(failed.project.revision, updated.revision);
+        assert_eq!(failed.state, "failed");
+        let retry = || store.change_delivery_job("", &failed.id, "admin", true, "retry", None);
+        assert!(retry().unwrap_err().contains("metadata"));
+        let mut corrected = workflow.clone();
+        corrected.metadata.insert("take".into(), "02".into());
+        corrected
+            .recipients
+            .push(store.event_signer.public_hex.clone());
+        corrected.notifications = Some(crate::store::NotificationPolicy {
+            mode: crate::store::NotificationMode::Default,
+            rules: vec![],
+        });
+        store
+            .set_receive_workflow("", &link.id, &corrected)
+            .unwrap();
+        store
+            .finish_trade_enrollment("", &route.id, "enrolled-grant", "active")
+            .unwrap();
+        let retried = retry().unwrap();
+        assert_eq!(retried.project.revision, failed.project.revision);
+        assert_eq!(retried.request.metadata, corrected.metadata);
+        assert_eq!(retried.request.recipients, corrected.recipients);
+        assert_eq!(retried.request.notifications, corrected.notifications);
+        assert_eq!(
+            retried.checks["trade_routes"][&route.id]["permission"]["grant"],
+            "enrolled-grant"
+        );
+        let running = store
+            .claim_delivery_job("worker", now_unix())
+            .unwrap()
+            .unwrap();
+        assert_eq!(running.id, failed.id);
+        store
+            .fail_delivery_job(&failed.id, running.attempts, "preparation failed")
+            .unwrap();
+        assert_eq!(
+            store.delivery_job(&failed.id).unwrap().unwrap().state,
+            "failed"
+        );
+        let before =
+            serde_json::to_value(store.delivery_job(&failed.id).unwrap().unwrap()).unwrap();
+        let mut detached = corrected.clone();
+        detached.project_id.clear();
+        store.set_receive_workflow("", &link.id, &detached).unwrap();
+        assert!(retry().unwrap_err().contains("must still select"));
+        let mut other = project();
+        other.id = "other".into();
+        other.directory = "other".into();
+        other.receive = true;
+        other.recipients = updated.recipients.clone();
+        store.save_delivery_project("", "admin", other).unwrap();
+        detached.project_id = "other".into();
+        store.set_receive_workflow("", &link.id, &detached).unwrap();
+        assert!(retry().unwrap_err().contains("must still select"));
+        assert_eq!(
+            serde_json::to_value(store.delivery_job(&failed.id).unwrap().unwrap()).unwrap(),
+            before
+        );
+        store
+            .set_receive_workflow("", &link.id, &corrected)
+            .unwrap();
+        updated.receive = false;
+        updated = store.save_delivery_project("", "admin", updated).unwrap();
+        assert!(retry().unwrap_err().contains("no longer accepts"));
+        updated.receive = true;
+        updated = store.save_delivery_project("", "admin", updated).unwrap();
+        let retried = retry().unwrap();
+        assert_eq!(retried.project, updated);
+        assert_eq!(retried.id, failed.id);
+        assert_eq!(retried.received, failed.received);
+        store.append_upload("", &link.id, upload).unwrap();
+        assert_eq!(
+            store
+                .delivery_jobs("", "", 100, None, "", "")
+                .unwrap()
+                .len(),
+            2
+        );
+        let mut frozen = retried;
+        frozen.state = "failed".into();
+        frozen.manifest = Some("frozen-manifest".into());
+        frozen.approved_by = Some("approver".into());
+        frozen.checks["destinations"][&route.id] = serde_json::json!({"state":"complete"});
+        store
+            .with(|connection| save_job(connection, &frozen))
+            .unwrap();
+        updated.label = "Changed project".into();
+        store.save_delivery_project("", "admin", updated).unwrap();
+        assert!(retry().is_err());
+        assert_eq!(
+            serde_json::to_value(store.delivery_job(&failed.id).unwrap().unwrap()).unwrap(),
+            serde_json::to_value(frozen).unwrap()
         );
     }
 
