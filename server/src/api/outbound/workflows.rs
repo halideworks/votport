@@ -1706,6 +1706,56 @@ mod tests {
                 .claim_delivery_job("worker", now_unix())
                 .unwrap()
                 .unwrap();
+            let stale = job.clone();
+            let mut edited = project.clone();
+            edited.required_metadata.push("take".into());
+            let edited = app
+                .store
+                .save_delivery_project("", "local", edited)
+                .unwrap();
+            let error = prepare(&app, job.clone()).await.unwrap_err();
+            app.store
+                .fail_delivery_job(&job.id, job.attempts, &error.message)
+                .unwrap();
+            assert!(app.store.outbound_grant_by_id(&job.id).unwrap().is_none());
+            assert!(app
+                .store
+                .change_delivery_job("", &job.id, "local", true, "retry", None)
+                .is_err());
+            let mut corrected = workflow.clone();
+            corrected.metadata.insert("take".into(), "02".into());
+            app.store
+                .set_receive_workflow("", &link.id, &corrected)
+                .unwrap();
+            let retried = app
+                .store
+                .change_delivery_job("", &job.id, "local", true, "retry", None)
+                .unwrap();
+            assert_eq!(retried.id, job.id);
+            assert_eq!(retried.received, job.received);
+            assert_eq!(retried.project.revision, edited.revision);
+            assert_eq!(retried.request.metadata["take"], "02");
+            app.store
+                .fail_delivery_job(&job.id, stale.attempts, "late failure")
+                .unwrap();
+            assert_eq!(
+                app.store.delivery_job(&job.id).unwrap().unwrap().state,
+                "queued"
+            );
+            let job = app
+                .store
+                .claim_delivery_job("worker", now_unix())
+                .unwrap()
+                .unwrap();
+            assert!(prepare(&app, stale.clone()).await.is_err());
+            app.store
+                .fail_delivery_job(&job.id, stale.attempts, "late failure")
+                .unwrap();
+            assert_eq!(
+                app.store.delivery_job(&job.id).unwrap().unwrap().state,
+                "preparing"
+            );
+            assert!(app.store.outbound_grant_by_id(&job.id).unwrap().is_none());
             prepare(&app, job.clone()).await.unwrap();
             assert_eq!(
                 std::fs::read(app.config.receive_dir.join("file.bin")).unwrap(),
@@ -1862,7 +1912,7 @@ mod tests {
             app.store
                 .change_delivery_job("", &queued.id, "local", true, "cancel", None)
                 .unwrap();
-            let mut disabled = project.clone();
+            let mut disabled = edited.clone();
             disabled.receive = false;
             app.store
                 .save_delivery_project("", "local", disabled)

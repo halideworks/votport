@@ -108,6 +108,13 @@ still works; storage administrators can manage deletion there. Reception jobs
 release their source-file pins when archived, including tenants that never use
 an outbound library.
 
+If a reception delivery fails before its manifest is prepared, correct its saved
+reception workflow settings on the Receive page and retry the delivery. Retry
+adopts the current rules, metadata, recipients and notifications for the same
+project without creating another job or upload. A detached or reassigned request,
+or a project that no longer accepts incoming files, remains refused. Prepared
+deliveries keep their recorded policy and delivery progress.
+
 File deletion verifies the stored content and any signed receipt before committing
 its tombstone, then removes the verified file handles. Changed or unverified files
 are retained. Retention verifies again after its batch tombstone commit to bound
