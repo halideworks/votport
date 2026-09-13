@@ -2552,6 +2552,8 @@ mod tests {
                 job.checks["route_revocations"] =
                     serde_json::json!({"destination":{"state":"pending"}});
                 let mut grant = test_outbound_grant(&job.id, "", 0);
+                grant.token_hash =
+                    crate::auth::hash_token(&store.delivery_job_token("", &job.id).unwrap());
                 grant.expires_at = now() + 3600;
                 if state == "retired" {
                     grant.revoked_at = Some(7);
@@ -2580,7 +2582,14 @@ mod tests {
                     c.execute("INSERT INTO outbound_routes(job_id,destination_id,origin,route_id,peer_key,source) VALUES (?1,'destination','http://localhost','route',?2,?3)", params![job.id,store.event_signer.public_hex,serde_json::to_string(&source).unwrap()])?;
                     Ok(())
                 }).unwrap();
-                jobs.push((job, source));
+                if state == "ready" {
+                    store
+                        .rotate_delivery_job_token("", &job.id, 0, &crate::auth::random_token())
+                        .unwrap();
+                    job = store.delivery_job(&job.id).unwrap().unwrap();
+                }
+                let token = store.delivery_job_token("", &job.id).unwrap();
+                jobs.push((job, source, token));
             }
             store.with(|c| c.execute_batch(
                 "INSERT INTO settings(key,value,updated_at) VALUES ('backup_config','{}',1),('scim_token','current',1),('scim_token_previous','previous',1),('replica_token','replica',1),('upload_retention_days','30',1);
@@ -2634,6 +2643,7 @@ mod tests {
             .unwrap();
             let store = crate::store::Store::open(root.path()).unwrap();
             let historical = mode == RestoreMode::Historical;
+            assert_ne!(fs::read(root.path().join("secret")).unwrap(), [7; 32]);
             assert_eq!(store.link("", "link").unwrap().unwrap().active, !historical);
             let backup_setting = store
                 .setting(SETTING_KEY)
@@ -2662,8 +2672,16 @@ mod tests {
                     })
                 );
             }
-            for (job, source) in &jobs {
+            for (job, source, token) in &jobs {
                 let restored = store.delivery_job(&job.id).unwrap().unwrap();
+                assert_eq!(store.delivery_job_token("", &job.id).unwrap(), *token);
+                assert_eq!(restored.token_generation, job.token_generation);
+                assert_eq!(
+                    store
+                        .delivery_token_active(&job.id, &crate::auth::hash_token(token))
+                        .unwrap(),
+                    !historical && job.state != "retired"
+                );
                 assert_eq!(
                     restored.state,
                     if historical { "suspended" } else { &job.state }

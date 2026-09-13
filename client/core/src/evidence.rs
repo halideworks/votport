@@ -419,6 +419,65 @@ mod tests {
     use super::*;
     use crate::delivery_protocol::Challenge;
 
+    #[test]
+    fn canonical_client_origins_preserve_signed_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let device = Device::load_or_create_in(directory.path()).unwrap();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let root = "12".repeat(32);
+        let manifest = manifest_digest([("file.bin", "blake3", root.as_str(), 8)]);
+        for (base, origin) in [
+            ("https://DROP.EXAMPLE.com:443/", "https://drop.example.com"),
+            ("http://LOCALHOST:80/", "http://localhost"),
+            ("http://[::1]:80/", "http://[::1]"),
+        ] {
+            let authorization = SignedChallenge::issue(
+                Challenge {
+                    origin: origin.into(),
+                    grant_id: "grant".into(),
+                    manifest: manifest.clone(),
+                    holder: device.holder_key_hex(),
+                    nonce: "nonce".into(),
+                    issued_at: 1,
+                    expires_at: u64::MAX,
+                },
+                &signer,
+            );
+            let metadata: OutboundMetadata = serde_json::from_value(serde_json::json!({
+                "grant_id": "grant", "delivery_manifest": manifest,
+                "evidence_authorization": authorization,
+                "receipt_key": hex::encode(signer.verifying_key().to_bytes()),
+                "has_password": false,
+                "files": [{"name":"file.bin","suite":"blake3","root":root,"bytes":8,"download_url":"/file"}],
+            })).unwrap();
+            let client = Client::new(base).unwrap();
+            let prepared = prepare_receive(
+                &client,
+                &metadata,
+                Some(&device),
+                &mut crate::progress::Silent,
+            )
+            .unwrap()
+            .expect("equivalent origin spellings must retain signed evidence");
+            assert_eq!(prepared.authorization, authorization);
+            assert!(prepared.authorization.verify(&authorization.issuer));
+            for other in [
+                "https://other.example.com",
+                "http://drop.example.com",
+                "https://drop.example.com:444",
+            ] {
+                assert!(prepare_receive(
+                    &Client::new(other).unwrap(),
+                    &metadata,
+                    Some(&device),
+                    &mut crate::progress::Silent,
+                )
+                .unwrap()
+                .is_none());
+            }
+        }
+    }
+
     fn report(base: &str, nonce: &str, expires_at: u64, kind: EvidenceKind) -> Evidence {
         let server = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
         let key = ed25519_dalek::SigningKey::from_bytes(&[2; 32]);

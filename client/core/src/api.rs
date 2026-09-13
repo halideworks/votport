@@ -379,7 +379,7 @@ impl Client {
     /// A client for `base` (the origin, e.g. `https://drop.example`).
     ///
     /// # Errors
-    /// A TLS or client build failure.
+    /// An invalid origin, or a TLS or client build failure.
     pub fn new(base: impl Into<String>) -> Result<Self> {
         Self::with_timeout(base, None)
     }
@@ -387,7 +387,7 @@ impl Client {
     /// Creates a peer sender with a bound on each HTTP request.
     ///
     /// # Errors
-    /// TLS or HTTP client setup failure.
+    /// An invalid origin, or a TLS or HTTP client setup failure.
     pub fn for_route(base: impl Into<String>, route: String) -> Result<Self> {
         let mut client = Self::with_timeout(base, Some(std::time::Duration::from_secs(300)))?;
         client.route = Some(route);
@@ -406,6 +406,7 @@ impl Client {
         base: impl Into<String>,
         timeout: Option<std::time::Duration>,
     ) -> Result<Self> {
+        let base = crate::port::origin(&base.into())?;
         let http = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("votport-client/", env!("CARGO_PKG_VERSION")))
@@ -422,7 +423,7 @@ impl Client {
             http,
             recipient_cookie: std::sync::Mutex::new(None),
             route: None,
-            base: base.into().trim_end_matches('/').to_owned(),
+            base,
         })
     }
 

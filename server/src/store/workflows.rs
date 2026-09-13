@@ -7,7 +7,7 @@ pub(super) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS delivery_policy_cache(grant_id TEXT PRIMARY KEY,protected INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS delivery_storage(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,document TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS delivery_projects(tenant TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL, document TEXT NOT NULL, PRIMARY KEY(tenant,id));
-CREATE TABLE IF NOT EXISTS delivery_jobs(id TEXT PRIMARY KEY, tenant TEXT NOT NULL, actor TEXT NOT NULL, operation_id TEXT NOT NULL, project_id TEXT NOT NULL, state TEXT NOT NULL, owner TEXT NOT NULL DEFAULT '', not_before INTEGER NOT NULL, deadline INTEGER, escalated INTEGER NOT NULL DEFAULT 0, document TEXT NOT NULL, UNIQUE(tenant,actor,operation_id));
+CREATE TABLE IF NOT EXISTS delivery_jobs(id TEXT PRIMARY KEY, tenant TEXT NOT NULL, actor TEXT NOT NULL, operation_id TEXT NOT NULL, project_id TEXT NOT NULL, state TEXT NOT NULL, owner TEXT NOT NULL DEFAULT '', not_before INTEGER NOT NULL, deadline INTEGER, escalated INTEGER NOT NULL DEFAULT 0, token TEXT NOT NULL, document TEXT NOT NULL, UNIQUE(tenant,actor,operation_id));
 CREATE INDEX IF NOT EXISTS delivery_jobs_ready ON delivery_jobs(state,not_before);
 CREATE INDEX IF NOT EXISTS delivery_jobs_tenant ON delivery_jobs(tenant,id);
 ";
@@ -347,7 +347,7 @@ pub(super) fn queue_received(
         reprocessed_from: None,
         reprocessed_as: None,
     };
-    connection.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,document) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",params![job.id,tenant,job.actor,job.request.operation_id,job.project.id,job.state,now as i64,serde_json::to_string(&job).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
+    connection.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,document,token) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![job.id,tenant,job.actor,job.request.operation_id,job.project.id,job.state,now as i64,serde_json::to_string(&job).map_err(|e| e.to_string())?,crate::auth::random_token()]).map_err(|e| e.to_string())?;
     evidence::delivery_event(connection,signer,tenant,&job.id,"reception_queued",&serde_json::json!({"project_id":job.project.id,"link_id":link_id,"upload_id":upload.id,"state":job.state,"error":job.error}),now).map_err(|e|e.to_string())
 }
 
@@ -798,7 +798,7 @@ impl Store {
             reprocessed_as: None,
         };
         actor_active(&tx, &job)?;
-        tx.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,deadline,document) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![job.id,tenant,actor,job.request.operation_id,job.project.id,job.state,job.request.not_before.unwrap_or(now) as i64,job.request.deadline.map(|t| t as i64),serde_json::to_string(&job).expect("job serializes")]).map_err(|e| e.to_string())?;
+        tx.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,deadline,document,token) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![job.id,tenant,actor,job.request.operation_id,job.project.id,job.state,job.request.not_before.unwrap_or(now) as i64,job.request.deadline.map(|t| t as i64),serde_json::to_string(&job).expect("job serializes"),crate::auth::random_token()]).map_err(|e| e.to_string())?;
         evidence::delivery_event(
             &tx,
             &self.event_signer,
@@ -1070,7 +1070,7 @@ impl Store {
             [&original.id],
         )
         .map_err(|e| e.to_string())?;
-        tx.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,document) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",params![replacement.id,replacement.tenant,replacement.actor,replacement.request.operation_id,replacement.project.id,replacement.state,now as i64,serde_json::to_string(&replacement).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
+        tx.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,document,token) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![replacement.id,replacement.tenant,replacement.actor,replacement.request.operation_id,replacement.project.id,replacement.state,now as i64,serde_json::to_string(&replacement).map_err(|e| e.to_string())?,crate::auth::random_token()]).map_err(|e| e.to_string())?;
         evidence::delivery_event(&tx,&self.event_signer,&identity.tenant,&original.id,"delivery_reprocessed",&serde_json::json!({"actor":identity.subject,"manifest":manifest,"project_id":replacement.project.id,"original_revision":original.project.revision,"revision":replacement.project.revision,"replacement_id":replacement.id}),now).map_err(|e| e.to_string())?;
         evidence::delivery_event(&tx,&self.event_signer,&identity.tenant,&replacement.id,"reception_queued",&serde_json::json!({"actor":identity.subject,"project_id":replacement.project.id,"reprocessed_from":original.id,"received":replacement.received}),now).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
@@ -1208,12 +1208,22 @@ impl Store {
         release_in(&connection, grant_id)
     }
 
+    pub(crate) fn delivery_job_token(&self, tenant: &str, id: &str) -> Result<String, String> {
+        self.with(|connection| {
+            connection.query_row(
+                "SELECT token FROM delivery_jobs WHERE tenant=?1 AND id=?2",
+                params![tenant, id],
+                |row| row.get(0),
+            )
+        })
+    }
+
     pub fn rotate_delivery_job_token(
         &self,
         tenant: &str,
         id: &str,
         generation: u64,
-        token_hash: &str,
+        token: &str,
     ) -> Result<bool, String> {
         let mut connection = self.connection.lock().expect("store poisoned");
         let tx = connection.transaction().map_err(|e| e.to_string())?;
@@ -1227,12 +1237,18 @@ impl Store {
         if job.token_generation != generation {
             return Err("delivery changed; reload before rotating".into());
         }
+        let token_hash = crate::auth::hash_token(token);
         let changed = tx.execute("UPDATE outbound_grants SET token_hash=?3 WHERE tenant=?1 AND id=?2 AND revoked_at IS NULL",params![tenant,id,token_hash]).map_err(|e| e.to_string())?;
         if changed == 0 {
             return Ok(false);
         }
         job.token_generation += 1;
         job.updated_at = now_unix();
+        tx.execute(
+            "UPDATE delivery_jobs SET token=?3 WHERE tenant=?1 AND id=?2",
+            params![tenant, id, token],
+        )
+        .map_err(|e| e.to_string())?;
         save_job(&tx, &job).map_err(|e| e.to_string())?;
         evidence::delivery_event(
             &tx,
@@ -1866,6 +1882,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         let (original, _) = prepared_reception(&store);
+        let original_token = store.delivery_job_token("", &original.id).unwrap();
+        assert_eq!(hex::decode(&original_token).unwrap().len(), 16);
         let mut project = original.project.clone();
         project.label.push_str(" changed");
         let project = store.save_delivery_project("", "local", project).unwrap();
@@ -1888,6 +1906,12 @@ mod tests {
             (first.join().unwrap(), second.join().unwrap())
         });
         assert_eq!(replacement.id, repeated.id);
+        let replacement_token = store.delivery_job_token("", &replacement.id).unwrap();
+        assert_eq!(hex::decode(&replacement_token).unwrap().len(), 16);
+        assert_ne!(replacement_token, original_token);
+        assert!(!serde_json::to_string(&replacement)
+            .unwrap()
+            .contains(&replacement_token));
         assert_eq!(
             replacement.reprocessed_from.as_deref(),
             Some(original.id.as_str())
@@ -1906,6 +1930,14 @@ mod tests {
             .unwrap()
             .unwrap();
         store.append_upload("", "incoming", upload).unwrap();
+        assert_eq!(
+            store.delivery_job_token("", &original.id).unwrap(),
+            original_token
+        );
+        assert_eq!(
+            store.delivery_job_token("", &replacement.id).unwrap(),
+            replacement_token
+        );
         assert_eq!(
             store
                 .delivery_jobs("", "", 100, None, "", "")
@@ -1950,6 +1982,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(recovered.id, replacement.id);
+        assert_eq!(
+            store.delivery_job_token("", &recovered.id).unwrap(),
+            replacement_token
+        );
         assert_eq!(recovered.project.revision, later.revision);
         store.provision_principal("sender", None).unwrap();
         store.revoke_principal("sender").unwrap();
@@ -2060,7 +2096,7 @@ mod tests {
                 )
             })
             .unwrap();
-        store.with(|c| c.execute("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1000) INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,document) SELECT 'busy_'||i,'','sender','busy_'||i,'project','queued',0,'{}' FROM n",[])).unwrap();
+        store.with(|c| c.execute("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1000) INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,document,token) SELECT 'busy_'||i,'','sender','busy_'||i,'project','queued',0,'{}','unused' FROM n",[])).unwrap();
         assert!(attempt().unwrap_err().contains("active job limit"));
         assert_eq!(
             serde_json::to_value(store.delivery_job(&original.id).unwrap().unwrap()).unwrap(),
@@ -2589,6 +2625,161 @@ mod tests {
     }
 
     #[test]
+    fn workflow_tokens_survive_retries_and_rotate_atomically() {
+        use crate::auth::{hash_token, random_token};
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let project = store.save_delivery_project("", "admin", project()).unwrap();
+        let original = store
+            .enqueue_delivery_job("", "sender", 1, None, project.clone(), request())
+            .unwrap();
+        let token = store.delivery_job_token("", &original.id).unwrap();
+        assert_eq!(hex::decode(&token).unwrap().len(), 16);
+        assert_ne!(token, original.id);
+        assert!(store.delivery_job_token("other", &original.id).is_err());
+        assert!(store.delivery_job_token("", "missing").is_err());
+        let repeated = store
+            .enqueue_delivery_job("", "sender", 1, None, project, request())
+            .unwrap();
+        assert_eq!(store.delivery_job_token("", &repeated.id).unwrap(), token);
+        assert!(!serde_json::to_string(&repeated).unwrap().contains(&token));
+        assert!(!store
+            .rotate_delivery_job_token("", &original.id, 0, &random_token())
+            .unwrap());
+        let mut grant = crate::store::tests::test_outbound_grant(&original.id, "", 0);
+        grant.token_hash = hash_token(&token);
+        grant.expires_at = now_unix() + 3600;
+        store.insert_outbound_grant(grant).unwrap();
+        let snapshot_directory = tempfile::tempdir().unwrap();
+        store
+            .backup_into(&snapshot_directory.path().join("votport.db"))
+            .unwrap();
+        let before_events =
+            serde_json::to_value(store.delivery_events("", 0, 100).unwrap()).unwrap();
+        for trigger in [
+            "BEFORE UPDATE OF token_hash ON outbound_grants",
+            "BEFORE UPDATE OF token ON delivery_jobs",
+            "BEFORE UPDATE OF document ON delivery_jobs",
+            "BEFORE INSERT ON delivery_events",
+        ] {
+            store.with(|connection| connection.execute_batch(&format!(
+                "CREATE TEMP TRIGGER fail_rotation {trigger} BEGIN SELECT RAISE(FAIL,'rotation fixture'); END;"
+            ))).unwrap();
+            assert!(store
+                .rotate_delivery_job_token("", &original.id, 0, &random_token())
+                .is_err());
+            assert_eq!(store.delivery_job_token("", &original.id).unwrap(), token);
+            assert_eq!(
+                store
+                    .outbound_grant_by_id(&original.id)
+                    .unwrap()
+                    .unwrap()
+                    .token_hash,
+                hash_token(&token)
+            );
+            assert_eq!(
+                store
+                    .delivery_job(&original.id)
+                    .unwrap()
+                    .unwrap()
+                    .token_generation,
+                0
+            );
+            assert_eq!(
+                serde_json::to_value(store.delivery_events("", 0, 100).unwrap()).unwrap(),
+                before_events
+            );
+            store
+                .with(|connection| connection.execute_batch("DROP TRIGGER fail_rotation"))
+                .unwrap();
+        }
+        assert!(store
+            .rotate_delivery_job_token("other", &original.id, 0, &random_token())
+            .is_err());
+        let candidates = [random_token(), random_token()];
+        let results = std::thread::scope(|threads| {
+            let workers: Vec<_> = candidates
+                .iter()
+                .map(|candidate| {
+                    let store = &store;
+                    let id = &original.id;
+                    threads.spawn(move || store.rotate_delivery_job_token("", id, 0, candidate))
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Ok(true)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result
+                    .as_ref()
+                    .is_err_and(|error| error.contains("delivery changed")))
+                .count(),
+            1
+        );
+        let current = candidates[results
+            .iter()
+            .position(|result| matches!(result, Ok(true)))
+            .unwrap()]
+        .clone();
+        assert_eq!(store.delivery_job_token("", &original.id).unwrap(), current);
+        assert_ne!(current, token);
+        assert!(store
+            .delivery_token_active(&original.id, &hash_token(&current))
+            .unwrap());
+        assert!(!store
+            .delivery_token_active(&original.id, &hash_token(&token))
+            .unwrap());
+        let events = store.delivery_events("", 0, 100).unwrap();
+        assert!(events.iter().all(|event| event.verify()));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "delivery_link_rotated")
+                .count(),
+            1
+        );
+        assert!(!serde_json::to_string(&events).unwrap().contains(&current));
+        let snapshot = Store::open(snapshot_directory.path()).unwrap();
+        assert_eq!(
+            snapshot.delivery_job_token("", &original.id).unwrap(),
+            token
+        );
+        assert_eq!(
+            snapshot
+                .delivery_job(&original.id)
+                .unwrap()
+                .unwrap()
+                .token_generation,
+            0
+        );
+        drop(store);
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(store.delivery_job_token("", &original.id).unwrap(), current);
+        let restored = store.delivery_job(&original.id).unwrap().unwrap();
+        assert_eq!(restored.token_generation, 1);
+        assert!(!serde_json::to_string(&restored).unwrap().contains(&current));
+        store
+            .revoke_outbound_grant("", &original.id, now_unix())
+            .unwrap();
+        assert!(!store
+            .rotate_delivery_job_token("", &original.id, 1, &random_token())
+            .unwrap());
+        assert_eq!(store.delivery_job_token("", &original.id).unwrap(), current);
+    }
+
+    #[test]
     fn jobs_recover_idempotently_and_approve_only_the_frozen_manifest() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -2678,7 +2869,9 @@ mod tests {
         store
             .rotate_delivery_job_token("", &job.id, 0, "rotated")
             .unwrap();
-        assert!(store.delivery_token_active(&job.id, "rotated").unwrap());
+        assert!(store
+            .delivery_token_active(&job.id, &crate::auth::hash_token("rotated"))
+            .unwrap());
         assert!(!store
             .delivery_token_active(&job.id, &grant(&job).token_hash)
             .unwrap());

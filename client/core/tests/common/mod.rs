@@ -56,6 +56,7 @@ pub fn start_server(bin: &str, extra_env: &[(&str, String)]) -> Server {
     let mut command = Command::new(bin);
     command
         .env("VOTPORT_BIND", format!("127.0.0.1:{port}"))
+        .env("VOTPORT_PUBLIC_URL", format!("http://127.0.0.1:{port}"))
         .env("VOTPORT_DATA_DIR", data.path().join("data"))
         .env("VOTPORT_RECEIVE_DIR", &received)
         .env("VOTPORT_OUTBOUND_DIR", &outbound)

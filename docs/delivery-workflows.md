@@ -25,6 +25,12 @@ installed native application's screens or bundled MCP executable.
 
 ## Recipient verification and acceptance
 
+Set `VOTPORT_PUBLIC_URL` to the public origin recipients use, such as
+`https://drop.example.com`, for signed recipient evidence and enrolled-device
+authentication. These operations return a configuration error when it is unset;
+request headers never choose the signed origin. Downloads and metadata requests
+that do not request device evidence remain available without this setting.
+
 An ordered manifest digest commits to every filename, VOT hash suite, object
 root, file size, and file position. The server signs an authorization containing
 that digest, the grant ID, server origin, recipient device public key, nonce,
@@ -104,6 +110,12 @@ HTTP metadata, files, ranges, bundles and download leases, plus QUIC ticket
 issuance and session admission, enforce release and recipient policy. Rotating a
 share invalidates its previous token and QUIC tickets. Already-admitted streams
 may finish; previously delivered bytes cannot be recalled.
+
+Workflow links use independent random bearers retained privately in the database,
+separate from the receipt-signing key. Rotation replaces the stored bearer and
+grant hash together. A backup can reproduce the links current at its snapshot,
+but cannot derive later rotations. Replica promotion preserves current links,
+while historical restore suspends their jobs and revokes grants.
 
 ## Durable preparation, schedules and deadlines
 

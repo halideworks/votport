@@ -163,16 +163,19 @@ pub async fn create(
 }
 
 fn public_job(app: &App, headers: &HeaderMap, job: Job) -> serde_json::Value {
-    let token = app
-        .signer
-        .delivery_token(&format!("{}:{}", job.id, job.token_generation));
-    let url = (job.released()
-        && app.store.delivery_release(&job.id).is_ok()
-        && app
-            .store
-            .delivery_token_active(&job.id, &hash_token(&token))
-            .unwrap_or(false))
-    .then(|| format!("{}/s/{token}", admin::base_url(app, headers)));
+    let url = if job.released() && app.store.delivery_release(&job.id).is_ok() {
+        app.store
+            .delivery_job_token(&job.tenant, &job.id)
+            .ok()
+            .filter(|token| {
+                app.store
+                    .delivery_token_active(&job.id, &hash_token(token))
+                    .unwrap_or(false)
+            })
+            .map(|token| format!("{}/s/{token}", admin::base_url(app, headers)))
+    } else {
+        None
+    };
     let notifications_override = app
         .store
         .notification_job_override(&job.tenant, &job.id)
@@ -1101,7 +1104,7 @@ pub async fn recipient_challenge(
     let challenge = app
         .signer
         .evidence_challenge(crate::delivery_protocol::Challenge {
-            origin: admin::base_url(&app, &headers),
+            origin: crate::api::evidence::configured_origin(&app)?,
             grant_id: grant.id,
             manifest: job.manifest.ok_or_else(ApiError::not_found)?,
             holder: request.holder,
@@ -1127,13 +1130,14 @@ pub async fn recipient_verify(
     recipient_rate(&app, &headers, &peer)?;
     let grant = readable_grant(&app, &token)?;
     let job = release(&app, &grant)?.ok_or_else(ApiError::not_found)?;
+    let origin = crate::api::evidence::configured_origin(&app)?;
     let challenge = &proof.authorization.challenge;
     let now = now_unix();
     if !proof.verify(&app.signer.public_hex)
         || challenge.grant_id != grant.id
         || Some(&challenge.manifest) != job.manifest.as_ref()
         || !job.request.recipients.contains(&challenge.holder)
-        || challenge.origin != admin::base_url(&app, &headers)
+        || challenge.origin != origin
         || challenge.issued_at > now
         || challenge.expires_at <= now
         || challenge.expires_at.saturating_sub(challenge.issued_at) > 300
@@ -1155,7 +1159,7 @@ pub async fn recipient_verify(
             &challenge.holder
         )
     );
-    let secure = if admin::base_url(&app, &headers).starts_with("https://") {
+    let secure = if origin.starts_with("https://") {
         "; Secure"
     } else {
         ""
@@ -2098,7 +2102,10 @@ mod tests {
                 assert_eq!(retained.project, original.project);
                 assert_eq!(retained.manifest, original.manifest);
                 assert_eq!(retained.checks, original.checks);
-                let old_token = app.signer.delivery_token(&format!("{}:0", original.id));
+                let old_token = app
+                    .store
+                    .delivery_job_token(&original.tenant, &original.id)
+                    .unwrap();
                 assert_ne!(
                     call(
                         &app,
@@ -3287,6 +3294,399 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signed_evidence_requires_the_configured_origin_across_public_routes() {
+        async fn request(
+            app: &Arc<App>,
+            method: Method,
+            path: &str,
+            holder: Option<&str>,
+            cookie: Option<&str>,
+            payload: Option<serde_json::Value>,
+        ) -> (StatusCode, HeaderMap, serde_json::Value) {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(path)
+                .extension(ConnectInfo(
+                    "203.0.113.10:34567"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
+                .header("X-Votport", "1")
+                .header(header::HOST, "caller.invalid")
+                .header("X-Forwarded-Proto", "http");
+            if let Some(holder) = holder {
+                request = request.header("X-Votport-Device", holder);
+            }
+            if let Some(cookie) = cookie {
+                request = request.header(header::COOKIE, cookie);
+            }
+            let body = if let Some(payload) = payload {
+                request = request.header(header::CONTENT_TYPE, "application/json");
+                Body::from(payload.to_string())
+            } else {
+                Body::empty()
+            };
+            let response = crate::app::router(Arc::clone(app))
+                .oneshot(request.body(body).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, headers, serde_json::from_slice(&bytes).unwrap())
+        }
+
+        for (configured, expected) in [
+            (None, None),
+            (
+                Some("https://DROP.EXAMPLE.com:443/"),
+                Some("https://drop.example.com"),
+            ),
+            (
+                Some("http://LOCALHOST:8080/"),
+                Some("http://localhost:8080"),
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = crate::api::testing::config(directory.path());
+            config.public_url = configured.map(str::to_owned);
+            let app = crate::app::build(config).unwrap();
+            let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+            let holder = hex::encode(key.verifying_key().to_bytes());
+            for enrolled in [false, true] {
+                let mut project = crate::workflow::tests::project();
+                project.id = format!("project_{enrolled}");
+                project.directory = project.id.clone();
+                project.require_approval = false;
+                let library = app.config.outbound_dir.join(&project.directory);
+                std::fs::create_dir_all(&library).unwrap();
+                std::fs::write(library.join("file.bin"), b"original").unwrap();
+                if enrolled {
+                    project.recipients.push(crate::workflow::Recipient {
+                        email: "recipient@example.com".into(),
+                        holder: holder.clone(),
+                    });
+                }
+                let project = app
+                    .store
+                    .save_delivery_project("", "local", project)
+                    .unwrap();
+                let mut job_request = crate::workflow::tests::request();
+                job_request.project_id = project.id.clone();
+                job_request.operation_id = format!("origin_{enrolled}");
+                if enrolled {
+                    job_request.recipients.push(holder.clone());
+                }
+                let job = app
+                    .store
+                    .enqueue_delivery_job("", "sender", 1, None, project.clone(), job_request)
+                    .unwrap();
+                let running = app
+                    .store
+                    .claim_delivery_job("boot", now_unix())
+                    .unwrap()
+                    .unwrap();
+                prepare(&app, running).await.unwrap();
+                let token = app.store.delivery_job_token(&job.tenant, &job.id).unwrap();
+                let path = format!("/api/s/{token}");
+                let grant = app.store.outbound_grant_by_id(&job.id).unwrap().unwrap();
+                let manifest = app.store.delivery_manifest(&job.id).unwrap();
+                let origin = expected.unwrap_or("http://caller.invalid");
+                let now = now_unix();
+                let mut authorization =
+                    app.signer
+                        .evidence_challenge(crate::delivery_protocol::Challenge {
+                            origin: origin.into(),
+                            grant_id: job.id.clone(),
+                            manifest: manifest.clone(),
+                            holder: holder.clone(),
+                            nonce: format!("{}.{}.fixture", grant.token_hash, project.revision),
+                            issued_at: now,
+                            expires_at: now + 300,
+                        });
+
+                if !enrolled {
+                    for suffix in ["", "?offset=0&limit=1"] {
+                        let response = request(
+                            &app,
+                            Method::GET,
+                            &format!("{path}{suffix}"),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
+                        assert_eq!(response.0, StatusCode::OK, "{}", response.2);
+                        assert!(response.2["evidence_authorization"].is_null());
+                    }
+                    let response =
+                        call(&app, Method::GET, &format!("{path}/file"), None, None).await;
+                    assert_eq!(response.0, StatusCode::OK);
+                    assert_eq!(response.2, b"original");
+                }
+
+                let routes = if enrolled {
+                    vec![(Method::POST, "/recipient-challenge")]
+                } else {
+                    vec![
+                        (Method::GET, ""),
+                        (Method::GET, "?offset=0&limit=1"),
+                        (Method::POST, "/evidence-challenge"),
+                    ]
+                };
+                for (method, suffix) in routes {
+                    let payload = (method == Method::POST).then(|| json!({"holder": holder}));
+                    let response = request(
+                        &app,
+                        method,
+                        &format!("{path}{suffix}"),
+                        Some(&holder),
+                        None,
+                        payload,
+                    )
+                    .await;
+                    if expected.is_none() {
+                        assert_eq!(
+                            response.0,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "{suffix}: {}",
+                            response.2
+                        );
+                        assert!(response.2["error"]
+                            .as_str()
+                            .unwrap()
+                            .contains("VOTPORT_PUBLIC_URL"));
+                    } else {
+                        assert_eq!(response.0, StatusCode::OK, "{suffix}: {}", response.2);
+                        let value = if suffix.starts_with('/') {
+                            response.2
+                        } else {
+                            response.2["evidence_authorization"].clone()
+                        };
+                        authorization = serde_json::from_value(value).unwrap();
+                        assert!(authorization.verify(&app.signer.public_hex));
+                        assert_eq!(authorization.challenge.origin, origin);
+                        assert_eq!(authorization.challenge.grant_id, job.id);
+                        assert_eq!(authorization.challenge.manifest, manifest);
+                        assert_eq!(authorization.challenge.holder, holder);
+                    }
+                }
+
+                let (submit_path, payload) = if enrolled {
+                    (
+                        format!("{path}/recipient-verify"),
+                        json!(AccessProof::sign(authorization.clone(), &key)),
+                    )
+                } else {
+                    (
+                        "/api/evidence".into(),
+                        json!(Evidence::sign(
+                            authorization.clone(),
+                            EvidenceKind::Verified,
+                            &key
+                        )),
+                    )
+                };
+                let response =
+                    request(&app, Method::POST, &submit_path, None, None, Some(payload)).await;
+                if expected.is_none() {
+                    assert_eq!(
+                        response.0,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "{submit_path}: {}",
+                        response.2
+                    );
+                    assert!(response.2["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("VOTPORT_PUBLIC_URL"));
+                    assert!(!response.1.contains_key(header::SET_COOKIE));
+                    assert!(app
+                        .store
+                        .delivery_evidence(&job.id, 0, 10)
+                        .unwrap()
+                        .is_empty());
+                } else {
+                    assert_eq!(response.0, StatusCode::OK, "{submit_path}: {}", response.2);
+                    if enrolled {
+                        let cookie = response.1[header::SET_COOKIE].to_str().unwrap();
+                        assert_eq!(cookie.contains("; Secure"), origin.starts_with("https://"));
+                        let cookie = cookie.split(';').next().unwrap();
+                        let metadata =
+                            request(&app, Method::GET, &path, Some(&holder), Some(cookie), None)
+                                .await;
+                        assert_eq!(metadata.0, StatusCode::OK, "{}", metadata.2);
+                        assert_eq!(
+                            metadata.2["evidence_authorization"]["challenge"]["origin"],
+                            origin
+                        );
+                        let response = call(
+                            &app,
+                            Method::GET,
+                            &format!("{path}/file"),
+                            Some(cookie),
+                            None,
+                        )
+                        .await;
+                        assert_eq!(response.0, StatusCode::OK);
+                        assert_eq!(response.2, b"original");
+                    } else {
+                        let recorded = app.store.delivery_evidence(&job.id, 0, 10).unwrap();
+                        assert_eq!(recorded.len(), 1);
+                        assert_eq!(
+                            recorded[0]["evidence"]["authorization"]["challenge"]["origin"],
+                            origin
+                        );
+                    }
+                }
+
+                // A previously signed caller-selected origin cannot be rescued by matching headers.
+                authorization.challenge.origin = "http://caller.invalid".into();
+                let wrong_origin = app.signer.evidence_challenge(authorization.challenge);
+                assert!(wrong_origin.verify(&app.signer.public_hex));
+                let payload = if enrolled {
+                    json!(AccessProof::sign(wrong_origin, &key))
+                } else {
+                    json!(Evidence::sign(wrong_origin, EvidenceKind::Verified, &key))
+                };
+                let response =
+                    request(&app, Method::POST, &submit_path, None, None, Some(payload)).await;
+                assert_eq!(
+                    response.0,
+                    if expected.is_some() {
+                        StatusCode::UNAUTHORIZED
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    },
+                    "{submit_path}: {}",
+                    response.2
+                );
+                assert!(!response.1.contains_key(header::SET_COOKIE));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_bearers_are_independent_of_the_receipt_key() {
+        use ed25519_dalek::Signer as _;
+        use sha2::{Digest as _, Sha256};
+
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        std::fs::create_dir_all(app.config.outbound_dir.join("project")).unwrap();
+        std::fs::write(
+            app.config.outbound_dir.join("project/file.bin"),
+            b"original",
+        )
+        .unwrap();
+        let mut project = crate::workflow::tests::project();
+        project.require_approval = false;
+        let project = app
+            .store
+            .save_delivery_project("", "local", project)
+            .unwrap();
+        let job = app
+            .store
+            .enqueue_delivery_job(
+                "",
+                "sender",
+                1,
+                None,
+                project,
+                crate::workflow::tests::request(),
+            )
+            .unwrap();
+        let running = app
+            .store
+            .claim_delivery_job("boot", now_unix())
+            .unwrap()
+            .unwrap();
+        prepare(&app, running).await.unwrap();
+        let seed: [u8; 32] = std::fs::read(app.config.data_dir.join("receipt.key"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let compromised = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let cookie = admin_cookie(&app);
+        let mut previous = None;
+        for generation in 0..=1 {
+            let response = call(
+                &app,
+                Method::GET,
+                &format!("/api/workflows/jobs/{}", job.id),
+                Some(&cookie),
+                None,
+            )
+            .await;
+            assert_eq!(response.0, StatusCode::OK);
+            let public: serde_json::Value = serde_json::from_slice(&response.2).unwrap();
+            let token = public["url"].as_str().unwrap().rsplit('/').next().unwrap();
+            let message = format!("votport-job-token-v1\0{}:{generation}", job.id);
+            let derived = hex::encode(Sha256::digest(
+                compromised.sign(message.as_bytes()).to_bytes(),
+            ))[..32]
+                .to_owned();
+            assert_eq!(
+                call(
+                    &app,
+                    Method::GET,
+                    &format!("/api/s/{derived}/file"),
+                    None,
+                    None
+                )
+                .await
+                .0,
+                StatusCode::NOT_FOUND,
+                "the receipt key must not reproduce a workflow bearer"
+            );
+            assert_ne!(token, derived);
+            let downloaded = call(
+                &app,
+                Method::GET,
+                &format!("/api/s/{token}/file"),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(downloaded.0, StatusCode::OK);
+            assert_eq!(downloaded.2, b"original");
+            assert!(!public["job"].to_string().contains(token));
+            assert!(
+                !serde_json::to_string(&app.store.delivery_events("", 0, 100).unwrap())
+                    .unwrap()
+                    .contains(token)
+            );
+            if let Some(previous) = previous {
+                assert_ne!(token, previous);
+                assert_eq!(
+                    call(
+                        &app,
+                        Method::GET,
+                        &format!("/api/s/{previous}/file"),
+                        None,
+                        None
+                    )
+                    .await
+                    .0,
+                    StatusCode::NOT_FOUND
+                );
+            }
+            previous = Some(token.to_owned());
+            if generation == 0 {
+                let rotated = call(
+                    &app,
+                    Method::PATCH,
+                    &format!("/api/admin/outbound-grants/{}", job.id),
+                    Some(&cookie),
+                    Some(json!({"rotate":true})),
+                )
+                .await;
+                assert_eq!(rotated.0, StatusCode::OK);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn workflow_reuses_library_bytes_and_enforces_recipient_approval_and_evidence() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
@@ -3319,7 +3719,7 @@ mod tests {
             .unwrap()
             .unwrap();
         prepare(&app, running).await.unwrap();
-        let token = app.signer.delivery_token(&format!("{}:0", job.id));
+        let token = app.store.delivery_job_token(&job.tenant, &job.id).unwrap();
         let path = format!("/api/s/{token}");
         for suffix in [
             "",

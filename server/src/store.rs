@@ -465,7 +465,7 @@ pub struct SettingsOverlay {
     pub draining_source: &'static str,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 37;
+pub(crate) const SCHEMA_VERSION: u64 = 38;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
