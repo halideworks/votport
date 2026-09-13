@@ -4,8 +4,8 @@
 //! snapshot plus identity files), validates it, and stages it as the
 //! pending restore that the next normal boot applies. Promotion is therefore
 //! an ordinary `votport` start over this data directory. The standby never
-//! opens the database or touches the receive root, so it holds neither
-//! fence; the lease on the receive root is what stops it from being
+//! opens the live database or touches the receive root. It holds the data
+//! directory lock; the lease on the receive root stops it from being
 //! promoted while the live instance is still serving.
 //!
 //! The RPO is the pull interval: links, settings, and resume records
@@ -109,13 +109,7 @@ pub struct Status {
 
 fn write_status(data_dir: &Path, status: &Status) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(status).map_err(|error| error.to_string())?;
-    let temporary = data_dir.join(format!("{STATUS_FILE}.{}.tmp", crate::auth::random_token()));
-    std::fs::write(&temporary, bytes)
-        .and_then(|()| std::fs::rename(&temporary, data_dir.join(STATUS_FILE)))
-        .map_err(|error| {
-            let _ = std::fs::remove_file(&temporary);
-            format!("write standby status: {error}")
-        })
+    crate::backup::atomic_write_private(&data_dir.join(STATUS_FILE), &bytes)
 }
 
 pub fn read_status(data_dir: &Path) -> Option<Status> {
@@ -123,9 +117,27 @@ pub fn read_status(data_dir: &Path) -> Option<Status> {
     serde_json::from_slice(&bytes).ok()
 }
 
+fn prepare_data(config: &Config) -> Result<std::fs::File, String> {
+    std::fs::create_dir_all(&config.data_dir).map_err(|error| error.to_string())?;
+    let lock = crate::app::lock_data_dir(&config.data_dir)?;
+    crate::paths::tighten_private_dir(&config.data_dir)?;
+    let mut status = read_status(&config.data_dir).unwrap_or_default();
+    status.source = config.source.clone();
+    write_status(&config.data_dir, &status)?;
+    Ok(lock)
+}
+
 /// One pull: download, validate, replace the pending restore. Returns the
 /// archive's manifest.
 pub async fn pull_once(
+    client: &reqwest::Client,
+    config: &Config,
+) -> Result<crate::backup::Manifest, String> {
+    let _data_lock = prepare_data(config)?;
+    pull_replica(client, config).await
+}
+
+async fn pull_replica(
     client: &reqwest::Client,
     config: &Config,
 ) -> Result<crate::backup::Manifest, String> {
@@ -173,7 +185,7 @@ pub async fn pull_once(
         crate::auth::random_token()
     ));
     std::fs::create_dir(&stage).map_err(|error| format!("create stage: {error}"))?;
-    let mut stage_cleanup = crate::backup::CleanupPath::directory(stage.clone());
+    let stage_cleanup = crate::backup::CleanupPath::directory(stage.clone());
     crate::paths::tighten_private_dir(&stage)?;
     let manifest = {
         let download = download.clone();
@@ -184,18 +196,15 @@ pub async fn pull_once(
         .await
         .map_err(|error| error.to_string())??
     };
-    // The previous pull's stage is replaced, never applied twice.
-    crate::backup::clear_pending_restore(&config.data_dir)?;
-    crate::backup::write_pending_restore(&config.data_dir, &stage, manifest.clone())?;
-    stage_cleanup.keep();
+    crate::backup::write_pending_restore(&config.data_dir, stage_cleanup, manifest.clone())?;
     Ok(manifest)
 }
 
 /// Removes what a pull killed mid-way left behind: downloads, and stage
 /// directories the pending marker does not point at. The marker's own
 /// stage is never touched, whatever phase it is in.
-pub fn sweep_orphans(data_dir: &Path) -> Result<usize, String> {
-    let keep = crate::backup::pending_restore_stage(data_dir);
+fn sweep_orphans(data_dir: &Path) -> Result<usize, String> {
+    let keep = crate::backup::pending_restore_stage(data_dir)?;
     let mut removed = 0;
     for entry in std::fs::read_dir(data_dir).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
@@ -222,9 +231,7 @@ pub fn sweep_orphans(data_dir: &Path) -> Result<usize, String> {
 
 /// Runs pulls forever and serves /healthz and /readyz on the bind address.
 pub async fn run(config: Config) -> Result<(), String> {
-    std::fs::create_dir_all(&config.data_dir)
-        .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
-    crate::paths::tighten_private_dir(&config.data_dir).map_err(|error| error.to_string())?;
+    let _data_lock = prepare_data(&config)?;
     match sweep_orphans(&config.data_dir) {
         Ok(0) => {}
         Ok(count) => tracing::info!(count, "removed leftovers of an interrupted pull"),
@@ -256,6 +263,7 @@ pub async fn run(config: Config) -> Result<(), String> {
         let status = Arc::clone(&status);
         async move {
             let mut tick = tokio::time::interval(config.interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
                 let now = crate::store::now_unix();
@@ -263,7 +271,7 @@ pub async fn run(config: Config) -> Result<(), String> {
                     let mut status = status.lock().expect("status poisoned");
                     status.last_attempt_at = Some(now);
                 }
-                match pull_once(&client, &config).await {
+                match pull_replica(&client, &config).await {
                     Ok(manifest) => {
                         tracing::info!(
                             created_at = manifest.created_at,
@@ -314,7 +322,7 @@ pub fn status_router(status: Arc<Mutex<Status>>, interval: Duration) -> Router {
 fn healthy(status: &Status, interval: Duration, now: u64) -> bool {
     status
         .last_success_at
-        .is_some_and(|at| now.saturating_sub(at) <= interval.as_secs() * 2)
+        .is_some_and(|at| now.saturating_sub(at) <= interval.as_secs().saturating_mul(2))
 }
 
 async fn standby_healthz(State(state): State<StatusState>) -> Response {
@@ -355,6 +363,95 @@ mod tests {
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn standby_and_live_exclude_each_other_before_changing_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let live_config = crate::api::testing::config(directory.path());
+        let config = Config {
+            data_dir: live_config.data_dir.clone(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            source: "http://127.0.0.1:1".into(),
+            token: "unused".into(),
+            interval: Duration::from_secs(60),
+        };
+        let live = crate::app::build(live_config.clone()).unwrap();
+        for result in [
+            run(config.clone()).await,
+            pull_once(&reqwest::Client::new(), &config)
+                .await
+                .map(|_| ()),
+        ] {
+            assert!(result
+                .unwrap_err()
+                .contains("held by another votport process"));
+        }
+        assert!(!config.data_dir.join(STATUS_FILE).exists());
+        assert!(!config.data_dir.join(crate::backup::PENDING_FILE).exists());
+        crate::app::release_data_lock(&live);
+        drop(live);
+
+        let standby = prepare_data(&config).unwrap();
+        assert!(prepare_data(&config)
+            .unwrap_err()
+            .contains("held by another votport process"));
+        let Err(error) = crate::app::build(live_config.clone()) else {
+            panic!("live started over standby")
+        };
+        assert!(error.contains("held by another votport process"));
+        drop(standby);
+        crate::app::build(live_config).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_standby_without_a_replica_cannot_boot_an_empty_live_instance() {
+        let directory = tempfile::tempdir().unwrap();
+        let live = crate::api::testing::config(directory.path());
+        let config = Config {
+            data_dir: live.data_dir.clone(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            source: "http://127.0.0.1:1".into(),
+            token: "unused".into(),
+            interval: Duration::from_secs(60),
+        };
+        // Cancellation before the first response still leaves the durable standby identity.
+        let mut standby = Box::pin(run(config.clone()));
+        tokio::select! {
+            result = &mut standby => panic!("standby stopped: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert!(config.data_dir.join(STATUS_FILE).exists());
+        drop(standby);
+        for file in [
+            None,
+            Some(Vec::new()),
+            Some({
+                let path = directory.path().join("empty.db");
+                let connection = rusqlite::Connection::open(&path).unwrap();
+                connection.execute_batch("VACUUM").unwrap();
+                drop(connection);
+                std::fs::read(path).unwrap()
+            }),
+        ] {
+            let database = config.data_dir.join("votport.db");
+            if let Some(bytes) = &file {
+                std::fs::write(&database, bytes).unwrap();
+            }
+            let Err(error) = crate::app::build(live.clone()) else {
+                panic!("empty standby promoted")
+            };
+            assert!(error.contains("pull a valid replica"), "{error}");
+            if let Some(bytes) = &file {
+                assert_eq!(&std::fs::read(&database).unwrap(), bytes);
+            } else {
+                assert!(!database.exists());
+            }
+            for name in ["secret", "receipt.key"] {
+                assert!(!config.data_dir.join(name).exists(), "created {name}");
+            }
+        }
+    }
+
     #[test]
     fn orphan_sweep_keeps_the_marked_stage_and_removes_the_rest() {
         let directory = tempfile::tempdir().unwrap();
@@ -371,7 +468,7 @@ mod tests {
         };
         crate::backup::write_pending_restore(
             data,
-            &data.join(".votport-restore-stage-live"),
+            crate::backup::CleanupPath::directory(data.join(".votport-restore-stage-live")),
             manifest,
         )
         .unwrap();
@@ -381,6 +478,20 @@ mod tests {
         assert!(!data.join(".votport-restore-abc.download").exists());
         assert!(data.join("keep.txt").exists());
         assert_eq!(sweep_orphans(data).unwrap(), 0);
+    }
+
+    #[test]
+    fn an_unreadable_pending_marker_preserves_every_stage() {
+        let directory = tempfile::tempdir().unwrap();
+        let stage = directory.path().join(".votport-restore-stage-keep");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(
+            directory.path().join(crate::backup::PENDING_FILE),
+            b"invalid",
+        )
+        .unwrap();
+        assert!(sweep_orphans(directory.path()).is_err());
+        assert!(stage.is_dir());
     }
 
     #[tokio::test]

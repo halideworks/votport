@@ -1763,7 +1763,7 @@ pub async fn restore_backup(
     ));
     std::fs::create_dir(&stage).map_err(|e| ApiError::internal(e.to_string()))?;
     paths::tighten_private_dir(&stage).map_err(ApiError::internal)?;
-    let mut stage_cleanup = crate::backup::CleanupPath::directory(stage.clone());
+    let stage_cleanup = crate::backup::CleanupPath::directory(stage.clone());
     let incoming = app.config.data_dir.join(format!(
         ".votport-restore-{}.download",
         crate::auth::random_token()
@@ -1833,9 +1833,8 @@ pub async fn restore_backup(
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
     .map_err(ApiError::internal)?;
-    crate::backup::write_pending_restore(&app.config.data_dir, &stage, result.clone())
+    crate::backup::write_pending_restore(&app.config.data_dir, stage_cleanup, result.clone())
         .map_err(ApiError::internal)?;
-    stage_cleanup.keep();
     app.store.audit(
         "",
         &identity.subject,

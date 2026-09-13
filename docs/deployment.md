@@ -669,15 +669,19 @@ Layout:
   (default 60). On each interval it pulls `GET /api/replica`, a fresh
   archive of the database and identity files, validates it, and stages it
   as the pending restore that its next normal boot applies; the standby
-  never opens the database or touches the receive root. Its `/healthz` is
+  holds the same `data/lock` as a live instance and never opens the live
+  database or touches the receive root. A replacement keeps the previous
+  replica until the new marker is durable. Its `/healthz` is
   200 while pulls land within two intervals and its `/readyz` is always
   503 with `replica_lag_secs`, so a failover script can see how fresh the
   copy is. A replica-mode standby serves nothing else, so it is not a proxy
   upstream until it has been promoted: the Caddy pair below is for the
   shared-volume topology, and its `/healthz` exists for the container
   runtime's health check. Promotion is stopping the standby process and
-  starting `votport` normally over the same data directory. Like any
-  restore, promotion rotates the cookie secret, so every admin signs in
+  starting `votport` normally over the same data directory. Promotion requires
+  an initialized, compatible database. A fresh standby must first receive a
+  valid replica; an interrupted first pull cannot create an empty live
+  instance. Like any restore, promotion rotates the cookie secret, so every admin signs in
   again; receipt and push identities carry over. Upgrade the standby binary
   alongside the live one: replica pulls require matching database schemas.
   If a promotion boot is interrupted mid-restore, run `votport` normally to

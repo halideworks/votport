@@ -735,9 +735,16 @@ impl Store {
             .map_err(|error| format!("create {}: {error}", data_dir.display()))?;
         crate::paths::tighten_private_dir(data_dir)?;
         crate::paths::tighten_private_dir_contents(&data_dir.join("backups"))?;
+        let promotion = data_dir
+            .join(crate::standby::STATUS_FILE)
+            .try_exists()
+            .map_err(|e| e.to_string())?;
         let path = data_dir.join("votport.db");
         match crate::paths::tighten_private_file(&path)? {
             true => {}
+            false if promotion => {
+                return Err("standby has no database; pull a valid replica before promotion".into())
+            }
             false => match crate::paths::create_private_file(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -773,7 +780,12 @@ impl Store {
                 },
             )
             .map_err(|e| e.to_string())?;
-        initialize_schema(&mut connection)?;
+        if promotion {
+            validate_schema(&connection, SCHEMA_VERSION)
+                .map_err(|e| format!("pull a valid replica before promotion: {e}"))?;
+        } else {
+            initialize_schema(&mut connection)?;
+        }
         connection
             .set_db_config(
                 rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,

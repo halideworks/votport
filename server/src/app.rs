@@ -1131,7 +1131,7 @@ fn web_build(web_root: &std::path::Path) -> String {
 /// Takes the single-writer lock. flock is advisory and per open file
 /// description, so the returned handle must stay open; it is released by
 /// the kernel when the process exits, however it exits.
-fn lock_data_dir(data_dir: &std::path::Path) -> Result<std::fs::File, String> {
+pub(crate) fn lock_data_dir(data_dir: &std::path::Path) -> Result<std::fs::File, String> {
     let path = data_dir.join("lock");
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
