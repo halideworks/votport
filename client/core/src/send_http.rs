@@ -224,25 +224,25 @@ fn send_entry(
         });
         return Ok(Outcome::Sent);
     }
-    let object = prepared
+    let entry = prepared
         .objects
         .get(info.index)
         .ok_or_else(|| Error::Other(format!("begin named entry {} the drop lacks", info.index)))?;
-    let prover = object.prover()?;
-    let mut file = File::open(&object.source).map_err(|source| Error::Read {
-        path: object.source.clone(),
+    let prover = entry.prover()?;
+    let mut file = File::open(&entry.source).map_err(|source| Error::Read {
+        path: entry.source.clone(),
         source,
     })?;
     // Begin's covered_bytes is the contiguous verified prefix, always on a
     // group boundary, so a resumed chunk stays 64 KiB-aligned.
-    let mut offset = info.covered_bytes.min(object.length);
+    let mut offset = info.covered_bytes.min(entry.object.length);
     file.seek(SeekFrom::Start(offset))
         .map_err(|source| Error::Read {
-            path: object.source.clone(),
+            path: entry.source.clone(),
             source,
         })?;
-    while offset < object.length {
-        let length = chunk_bytes.min(object.length - offset);
+    while offset < entry.object.length {
+        let length = chunk_bytes.min(entry.object.length - offset);
         let cover = prover.prove(offset, length)?;
         // The server verifies at the offset the sender sends, so the proof
         // must cover exactly the requested range from that offset.
@@ -260,7 +260,7 @@ fn send_entry(
                 .map_err(|_| Error::Other("chunk too large".to_owned()))?
         ];
         file.read_exact(&mut data).map_err(|source| Error::Read {
-            path: object.source.clone(),
+            path: entry.source.clone(),
             source,
         })?;
         if observer.cancelled() {

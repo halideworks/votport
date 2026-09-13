@@ -1561,9 +1561,13 @@ mod tests {
 
     #[tokio::test]
     async fn reception_pins_originals_and_gates_verified_copies_without_snapshots() {
-        for release in [
-            crate::workflow::Release::AllDestinations,
-            crate::workflow::Release::Local,
+        for (release, suite) in [
+            (
+                crate::workflow::Release::AllDestinations,
+                Suite::Blake3Bao64,
+            ),
+            (crate::workflow::Release::Local, Suite::Blake3Bao64),
+            (crate::workflow::Release::Local, Suite::Sha256Bep52),
         ] {
             let directory = tempfile::tempdir().unwrap();
             let app = crate::api::testing::build(directory.path());
@@ -1616,14 +1620,30 @@ mod tests {
             std::fs::create_dir_all(&app.config.receive_dir).unwrap();
             let bytes = b"original";
             std::fs::write(app.config.receive_dir.join("file.bin"), bytes).unwrap();
-            let mut builder = InMemoryObjectBuilder::new(
-                Suite::Blake3Bao64,
-                Some(bytes.len() as u64),
-                bytes.len() as u64,
+            let mut builder =
+                InMemoryObjectBuilder::new(suite, Some(bytes.len() as u64), bytes.len() as u64)
+                    .unwrap();
+            builder.update(bytes).unwrap();
+            let prepared = builder.finish().unwrap();
+            let root = hex::encode(prepared.object_id().root);
+            let original_receipt = app
+                .signer
+                .encode(
+                    prepared.object_id(),
+                    [41; 16],
+                    vot_sdk_file::PublishObservation {
+                        incarnation: [42; 16],
+                        sequence: 19,
+                    },
+                    vot_sdk_file::CommitProfile::Balanced,
+                    vot_sdk_file::NasContract::ServerAcknowledged,
+                )
+                .unwrap();
+            std::fs::write(
+                receipt_path(&app.config.receive_dir.join("file.bin")),
+                &original_receipt,
             )
             .unwrap();
-            builder.update(bytes).unwrap();
-            let root = hex::encode(builder.finish().unwrap().object_id().root);
             let mut upload = crate::store::UploadRecord {
                 id: "upload".into(),
                 started_at: now_unix(),
@@ -1637,7 +1657,12 @@ mod tests {
                     path: "file.bin".into(),
                     stored_as: "file.bin".into(),
                     bytes: bytes.len() as u64,
-                    suite: "blake3".into(),
+                    suite: if suite == Suite::Blake3Bao64 {
+                        "blake3"
+                    } else {
+                        "sha256"
+                    }
+                    .into(),
                     root,
                     receipt: true,
                     deleted: false,
@@ -1697,8 +1722,43 @@ mod tests {
             std::fs::write(app.config.receive_dir.join("file.bin"), b"changed!").unwrap();
             let grant = app.store.outbound_grant_by_id(&job.id).unwrap().unwrap();
             assert_eq!(grant.files[0].source, "received:file.bin");
+            assert_eq!(
+                base64::prelude::BASE64_STANDARD
+                    .decode(&grant.files[0].receipt_b64)
+                    .unwrap(),
+                original_receipt
+            );
+            let mut cached_grant = grant.clone();
+            cached_grant.files[0].receipt_b64 = base64::prelude::BASE64_STANDARD.encode(
+                app.signer
+                    .encode(
+                        prepared.object_id(),
+                        [51; 16],
+                        vot_sdk_file::PublishObservation {
+                            incarnation: [52; 16],
+                            sequence: 1,
+                        },
+                        vot_sdk_file::CommitProfile::Fast,
+                        vot_sdk_file::NasContract::Unqualified,
+                    )
+                    .unwrap(),
+            );
+            assert_eq!(
+                source_info_indexed(&app, &cached_grant, 0)
+                    .unwrap()
+                    .receipt
+                    .as_ref(),
+                Some(&original_receipt)
+            );
+            let sidecar = receipt_path(&app.config.receive_dir.join("file.bin"));
+            std::fs::write(&sidecar, b"invalid").unwrap();
+            assert!(source_info_indexed(&app, &cached_grant, 0).is_err());
+            std::fs::remove_file(&sidecar).unwrap();
+            assert!(source_info_indexed(&app, &cached_grant, 0).is_err());
+            std::fs::write(&sidecar, &original_receipt).unwrap();
             let source = source_info_indexed(&app, &grant, 0).unwrap();
             assert_eq!(source.path, app.config.receive_dir.join("file.bin"));
+            assert_eq!(source.receipt.as_ref(), Some(&original_receipt));
             assert!(write_verified_source(
                 &mut Vec::new(),
                 source,
@@ -1742,6 +1802,11 @@ mod tests {
                 .unwrap();
             let completion = directory.path().join("online").join(key);
             let signed = std::fs::read(&completion).unwrap();
+            let document: serde_json::Value = serde_json::from_slice(&signed).unwrap();
+            assert_eq!(
+                document["document"]["files"][0]["receipt"],
+                base64::prelude::BASE64_STANDARD.encode(&original_receipt)
+            );
             assert_eq!(
                 std::fs::read(completion.parent().unwrap().join("files/file.bin")).unwrap(),
                 bytes

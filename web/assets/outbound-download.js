@@ -185,13 +185,13 @@ export function appendMetadataPage(state, page) {
   for (const [index, file] of page.files.entries()) {
     const globalIndex = page.offset + index;
     const indexedUrls = typeof file?.download_url === 'string' &&
-      typeof file?.receipt_url === 'string' &&
       file.download_url.endsWith(`/files/${globalIndex}`) &&
-      file.receipt_url.endsWith(`/receipts/${globalIndex}`);
+      (file.receipt_url === null || (typeof file.receipt_url === 'string' &&
+        file.receipt_url.endsWith(`/receipts/${globalIndex}`)));
     const legacyUrl = globalIndex === 0 && typeof file?.download_url === 'string' &&
       typeof file?.receipt_url === 'string' && file.download_url.endsWith('/file') &&
       file.receipt_url.endsWith('/receipt');
-    if (!file || typeof file.download_url !== 'string' || typeof file.receipt_url !== 'string' ||
+    if (!file || typeof file.download_url !== 'string' ||
         urls.has(file.download_url) ||
         (!indexedUrls && !legacyUrl)) {
       throw new Error('invalid or duplicate file metadata');

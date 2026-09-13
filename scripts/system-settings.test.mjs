@@ -200,11 +200,11 @@ test('filesystem notices follow detected profiles and clear stale warnings', () 
       const notice = elements.get(id);
       assert.equal(notice.classList.warning, profile === 'fast');
       assert.equal(elements.get(`${id}-docs`).hidden, profile !== 'fast');
-      if (kind === 'outbound') assert.match(notice.textContent, /^Library receipts use Fast\./);
+      if (kind === 'outbound') assert.doesNotMatch(notice.textContent, /Library receipts use Fast/);
       const network = 'Network filesystem detected. Receiving qualification is managed in Storage.';
       const expected = profile === 'fast' ? network : profile === 'balanced' ? 'Balanced publication enabled.' : 'Receiving is unavailable. Review the checks in Storage.';
       assert.equal(notice.textContent, kind === 'outbound'
-        ? `Library receipts use Fast.${profile === 'fast' ? ` ${network}` : profile ? '' : ' Filesystem detection unavailable.'}`
+        ? `Sharing library files verifies their content without creating publication receipts.${profile === 'fast' ? ' Network filesystem detected.' : profile ? '' : ' Filesystem detection unavailable.'}`
         : expected);
       assert.match(html, new RegExp(`id="${id}-docs" href="https://github.com/halideworks/votport/blob/main/docs/deployment.md#network-filesystems"`));
     }

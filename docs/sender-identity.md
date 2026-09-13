@@ -279,7 +279,7 @@ Value is `app.signer.public_hex`, the same string `list_links` already returns a
 | `CommitProfile::Balanced` | `"balanced"` |
 | `CommitProfile::Strict` | `"strict"` |
 
-votport issues Object / Published with Fast or Balanced according to the receive filesystem. Grants for existing outbound library files use Fast because hashing those files does not establish a durable publication. Still match every variant so a future sidecar cannot leak Debug casing. Unknown numeric values: 422 `"This receipt could not be checked."` rather than a raw number.
+votport issues Object / Published with Fast or Balanced according to the receive filesystem. Grants for existing outbound library files have no publication receipt because hashing those files does not publish them. Received files retain their original publication receipts when shared. Still match every variant so a future sidecar cannot leak Debug casing. Unknown numeric values: 422 `"This receipt could not be checked."` rather than a raw number.
 
 Do not `spawn_blocking`. This is not argon2. Do not write `store.audit` (unauthenticated log injection / disk fill). `tracing::info!(target: "audit", event = "receipt_checked", ok = true, suite, length)` is enough.
 

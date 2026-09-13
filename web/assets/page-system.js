@@ -41,7 +41,7 @@ function deploymentProfile(id, profile, outbound = false) {
     balanced: 'Balanced publication enabled.',
   };
   let note = messages[profile] || 'Receiving is unavailable. Review the checks in Storage.';
-  if (outbound) note = `Library receipts use Fast.${profile === 'fast' ? ` ${messages.fast}` : profile ? '' : ' Filesystem detection unavailable.'}`;
+  if (outbound) note = `Sharing library files verifies their content without creating publication receipts.${profile === 'fast' ? ' Network filesystem detected.' : profile ? '' : ' Filesystem detection unavailable.'}`;
   deploymentValue(id, note);
   $(id).classList.toggle('warning', profile === 'fast');
   $(`${id}-docs`).hidden = profile !== 'fast';

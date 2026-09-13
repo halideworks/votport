@@ -1689,14 +1689,7 @@ pub async fn create_outbound_grant(
             root,
             length: file.bytes,
         };
-        let receipt = read_source_receipt(&Source {
-            path: source.clone(),
-            object: expected.clone(),
-            name: file.path.clone(),
-            receipt: None,
-        })
-        .map_err(|_| ApiError::not_found())?;
-        verify_receipt(&app, &receipt, &expected).map_err(|_| ApiError::not_found())?;
+        read_verified_receipt(&app, &source, &expected)?;
         let proof_root = app.config.data_dir.join("outbound.proofs");
         let source_for_catalog = source.clone();
         tokio::task::spawn_blocking(move || {
@@ -2036,36 +2029,28 @@ async fn create_library_grant(
     }
     let files = hashed
         .into_iter()
-        .map(|file| {
-            let object = ObjectId {
-                suite: 1,
-                root: hex::decode(&file.root)
-                    .ok()
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .unwrap_or([0; 32]),
-                length: file.bytes,
-            };
-            let session_id: [u8; 16] = hex::decode(auth::random_token())
-                .unwrap()
-                .try_into()
-                .unwrap();
-            let incarnation_id: [u8; 16] = hex::decode(auth::random_token())
-                .unwrap()
-                .try_into()
-                .unwrap();
-            let receipt = app
-                .signer
-                .encode(
-                    &object,
-                    session_id,
-                    vot_sdk_file::PublishObservation {
-                        incarnation: incarnation_id,
-                        sequence: 1,
+        .map(|mut file| {
+            if let Some(received) = &received {
+                let original = received.get(&file.name).ok_or_else(ApiError::not_found)?;
+                file.suite.clone_from(&original.suite);
+                file.root.clone_from(&original.root);
+                let object = ObjectId {
+                    suite: match file.suite.as_str() {
+                        "blake3" => 1,
+                        "sha256" => 2,
+                        _ => return Err(ApiError::not_found()),
                     },
-                    vot_sdk_file::CommitProfile::Fast,
-                    vot_sdk_file::NasContract::Unqualified,
-                )
-                .map_err(ApiError::internal)?;
+                    root: hex::decode(&file.root)
+                        .ok()
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .ok_or_else(ApiError::not_found)?,
+                    length: file.bytes,
+                };
+                let path = admin::stored_path(app, &identity.tenant, &original.stored_as)
+                    .ok_or_else(ApiError::not_found)?;
+                file.receipt_b64 = base64::prelude::BASE64_STANDARD
+                    .encode(read_verified_receipt(app, &path, &object)?);
+            }
             let name = options
                 .workflow
                 .as_ref()
@@ -2078,7 +2063,6 @@ async fn create_library_grant(
                 .to_owned();
             Ok(OutboundGrantFile {
                 name,
-                receipt_b64: base64::prelude::BASE64_STANDARD.encode(receipt),
                 source: if let Some(received) = &received {
                     format!(
                         "received:{}",
@@ -2578,6 +2562,12 @@ pub async fn outbound_metadata(
             &manifest,
             recipient.as_deref(),
         )?;
+        let receipt_url = (!grant.link_id.is_empty()
+            || page
+                .files
+                .iter()
+                .any(|(index, file)| *index == 0 && file.source.starts_with("received:")))
+        .then(|| format!("/api/s/{token}/receipt"));
         let files = page
             .files
             .into_iter()
@@ -2606,7 +2596,7 @@ pub async fn outbound_metadata(
                 "grant_id": grant.id,
                 "delivery_manifest": manifest,
                 "evidence_authorization": evidence_authorization,
-                "receipt_url": format!("/api/s/{token}/receipt"),
+                "receipt_url": receipt_url,
                 "download_url": format!("/api/s/{token}/file"),
                 "bundle_url": format!("/api/s/{token}/bundle"),
                 "batch_url": format!("/api/s/{token}/batch"),
@@ -2656,16 +2646,7 @@ pub async fn outbound_metadata(
             .files
             .iter()
             .enumerate()
-            .map(|(index, file)| {
-                json!({
-                    "name": file.name,
-                    "suite": file.suite,
-                    "root": file.root,
-                    "bytes": file.bytes,
-                    "receipt_url": format!("/api/s/{token}/receipts/{index}"),
-                    "download_url": format!("/api/s/{token}/files/{index}")
-                })
-            })
+            .map(|(index, file)| outbound_metadata_file(&token, index, file))
             .collect()
     };
     let branding = super::public_branding(&app, &grant.tenant).map_err(super::store_unavailable)?;
@@ -2689,7 +2670,7 @@ pub async fn outbound_metadata(
                 "grant_id": grant.id,
                 "delivery_manifest": manifest,
                 "evidence_authorization": evidence_authorization,
-            "receipt_url": format!("/api/s/{token}/receipt"),
+            "receipt_url": (grant.files.is_empty() || grant.files[0].source.starts_with("received:")).then(|| format!("/api/s/{token}/receipt")),
             "download_url": format!("/api/s/{token}/file"),
             "bundle_url": format!("/api/s/{token}/bundle"),
             "batch_url": format!("/api/s/{token}/batch"),
@@ -2782,7 +2763,7 @@ fn outbound_metadata_file(
         "suite": file.suite,
         "root": file.root,
         "bytes": file.bytes,
-        "receipt_url": format!("/api/s/{token}/receipts/{index}"),
+        "receipt_url": (file.source.is_empty() || file.source.starts_with("received:")).then(|| format!("/api/s/{token}/receipts/{index}")),
         "download_url": format!("/api/s/{token}/files/{index}"),
     })
 }
@@ -2837,18 +2818,7 @@ pub async fn outbound_receipt_indexed(
     let _operation = begin_outbound_operation(&app, &grant.tenant)?;
     require_grant_access(&app, &grant, &headers)?;
     let source = source_info_indexed(&app, &grant, index)?;
-    let bytes = if let Some(bytes) = source.receipt.clone() {
-        bytes
-    } else {
-        tokio::fs::read(receipt_path(&source.path))
-            .await
-            .map_err(|_| ApiError::not_found())?
-    };
-    if bytes.len() as u64 > MAX_RECEIPT_BYTES
-        || verify_receipt(&app, &bytes, &source.object).is_err()
-    {
-        return Err(ApiError::not_found());
-    }
+    let bytes = source.receipt.ok_or_else(ApiError::not_found)?;
     let filename = format!("{}.vot-receipt", safe_filename(&source.name));
     let mut response = bytes.into_response();
     response.headers_mut().insert(
@@ -3145,9 +3115,6 @@ fn start_batch_chunk(
             let pin =
                 legacy_link_pin(&app, &grant, grant.files.is_empty()).map_err(api_error_io)?;
             let source = source_info_indexed(&app, &grant, chunk.start).map_err(api_error_io)?;
-            let receipt = read_source_receipt(&source).map_err(map_source_io_error)?;
-            verify_receipt(&app, &receipt, &source.object)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "receipt"))?;
             let proof_root = app.config.data_dir.join("outbound.proofs");
             let source_path = source.path.clone();
             let expected = source.object.clone();
@@ -3284,8 +3251,6 @@ async fn outbound_file_inner(
     };
     {
         let pin = legacy_link_pin(&app, &grant, grant.files.is_empty() && file.is_none())?;
-        let receipt = read_source_receipt(&source).map_err(|_| ApiError::not_found())?;
-        verify_receipt(&app, &receipt, &source.object).map_err(|_| ApiError::not_found())?;
         let proof_root = app.config.data_dir.join("outbound.proofs");
         let source_path = source.path.clone();
         let expected = source.object.clone();
@@ -3836,23 +3801,15 @@ fn write_verified_source<W: io::Write>(
             "source mismatch",
         ));
     }
-    let receipt = if let Some(receipt) = source.receipt {
-        receipt
-    } else {
-        let mut receipt = Vec::new();
-        std::fs::File::open(receipt_path(&source.path))
-            .map_err(map_source_io_error)?
-            .take(MAX_RECEIPT_BYTES + 1)
-            .read_to_end(&mut receipt)?;
-        receipt
-    };
-    if receipt.len() as u64 > MAX_RECEIPT_BYTES
-        || verify_receipt_with_key(verifying_key, &receipt, &expected).is_err()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "receipt verification failed",
-        ));
+    if let Some(receipt) = source.receipt {
+        if receipt.len() as u64 > MAX_RECEIPT_BYTES
+            || verify_receipt_with_key(verifying_key, &receipt, &expected).is_err()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "receipt verification failed",
+            ));
+        }
     }
     Ok(())
 }
@@ -3943,20 +3900,16 @@ pub(crate) struct Source {
     pub(crate) receipt: Option<Vec<u8>>,
 }
 
-fn read_source_receipt(source: &Source) -> io::Result<Vec<u8>> {
+fn read_verified_receipt(app: &App, path: &Path, object: &ObjectId) -> ApiResult<Vec<u8>> {
     use std::io::Read as _;
-    if let Some(receipt) = &source.receipt {
-        if receipt.len() as u64 > MAX_RECEIPT_BYTES {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "receipt"));
-        }
-        return Ok(receipt.clone());
-    }
     let mut receipt = Vec::new();
-    std::fs::File::open(receipt_path(&source.path))?
+    std::fs::File::open(receipt_path(path))
+        .map_err(|_| ApiError::not_found())?
         .take(MAX_RECEIPT_BYTES + 1)
-        .read_to_end(&mut receipt)?;
-    if receipt.len() as u64 > MAX_RECEIPT_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "receipt"));
+        .read_to_end(&mut receipt)
+        .map_err(|_| ApiError::not_found())?;
+    if receipt.len() as u64 > MAX_RECEIPT_BYTES || verify_receipt(app, &receipt, object).is_err() {
+        return Err(ApiError::not_found());
     }
     Ok(receipt)
 }
@@ -4132,24 +4085,28 @@ pub(crate) fn source_info_indexed_with_file(
             .ok_or_else(ApiError::not_found)?;
         let suite = match file.suite.as_str() {
             "blake3" => 1,
+            "sha256" => 2,
             _ => return Err(ApiError::not_found()),
         };
-        let receipt = base64::prelude::BASE64_STANDARD
-            .decode(&file.receipt_b64)
-            .map_err(|_| ApiError::not_found())?;
         let metadata = std::fs::symlink_metadata(&path).map_err(|_| ApiError::not_found())?;
         if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
             return Err(ApiError::not_found());
         }
+        let object = ObjectId {
+            suite,
+            root,
+            length: file.bytes,
+        };
+        let receipt = file
+            .source
+            .starts_with("received:")
+            .then(|| read_verified_receipt(app, &path, &object))
+            .transpose()?;
         return Ok(Source {
             path,
-            object: ObjectId {
-                suite,
-                root,
-                length: file.bytes,
-            },
+            object,
             name: file.name.clone(),
-            receipt: Some(receipt),
+            receipt,
         });
     }
     if index != 0 {
@@ -4189,15 +4146,17 @@ pub(crate) fn source_info_indexed_with_file(
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         return Err(ApiError::not_found());
     }
+    let object = ObjectId {
+        suite,
+        root,
+        length: file.bytes,
+    };
+    let receipt = Some(read_verified_receipt(app, &path, &object)?);
     Ok(Source {
         path,
-        object: ObjectId {
-            suite,
-            root,
-            length: file.bytes,
-        },
+        object,
         name: file.path.clone(),
-        receipt: None,
+        receipt,
     })
 }
 
@@ -6657,6 +6616,12 @@ mod tests {
             .unwrap();
         let metadata = body(metadata).await;
         assert_eq!(metadata["files"].as_array().unwrap().len(), 2);
+        assert!(metadata["receipt_url"].is_null());
+        assert!(metadata["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|file| file["receipt_url"].is_null()));
         // The unpaged shape sums every file too, not the first file's bytes.
         let expected: u64 = metadata["files"]
             .as_array()
@@ -6699,6 +6664,8 @@ mod tests {
             assert_eq!(page["files"].as_array().unwrap().len(), 1);
             assert_eq!(page["files"][0]["name"], expected_name);
             assert_eq!(page["files"][0]["download_url"], expected_url);
+            assert!(page["receipt_url"].is_null());
+            assert!(page["files"][0]["receipt_url"].is_null());
         }
         let end = crate::app::router(app.clone())
             .oneshot(
@@ -6780,16 +6747,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(receipt.status(), StatusCode::OK);
-            let receipt = receipt.into_body().collect().await.unwrap().to_bytes();
-            let decoded = vot_receipt::decode_authenticated(&receipt).unwrap();
-            let verified =
-                vot_receipt::verify_ed25519(&decoded, &app.signer.verifying_key()).unwrap();
-            assert_eq!(
-                verified.receipt().subject_kind,
-                vot_receipt::SubjectKind::Object
-            );
-            assert_eq!(verified.receipt().subject_length, expected.len() as u64);
+            assert_eq!(receipt.status(), StatusCode::NOT_FOUND);
         }
         std::fs::write(app.config.outbound_dir.join("project/one.bin"), b"mutated").unwrap();
         let batch = crate::app::router(app.clone())
@@ -6861,16 +6819,38 @@ mod tests {
             .outbound_grant_by_token_hash(&hash_token(&token))
             .unwrap()
             .unwrap();
-        let bytes = base64::prelude::BASE64_STANDARD
-            .decode(&grant.files[0].receipt_b64)
-            .unwrap();
-        let decoded = vot_receipt::decode_authenticated(&bytes).unwrap();
-        let verified = vot_receipt::verify_ed25519(&decoded, &app.signer.verifying_key()).unwrap();
-        assert_eq!(verified.receipt().profile, vot_receipt::CommitProfile::Fast);
-        assert_eq!(
-            verified.receipt().actual_predecessor,
-            vot_receipt::required_predecessor(vot_receipt::CommitProfile::Fast)
+        assert!(grant.files[0].receipt_b64.is_empty());
+        let mut cached = grant.files[0].clone();
+        cached.receipt_b64 = base64::prelude::BASE64_STANDARD.encode(
+            app.signer
+                .encode(
+                    &object_id(&expected),
+                    [61; 16],
+                    PublishObservation {
+                        incarnation: [62; 16],
+                        sequence: 1,
+                    },
+                    vot_sdk_file::CommitProfile::Fast,
+                    vot_sdk_file::NasContract::Unqualified,
+                )
+                .unwrap(),
         );
+        assert!(
+            source_info_indexed_with_file(&app, &grant, 0, Some(&cached))
+                .unwrap()
+                .receipt
+                .is_none()
+        );
+
+        let receipt = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/receipts/0"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.status(), StatusCode::NOT_FOUND);
 
         let snapshot = directory.path().join("backup.db");
         app.store.backup_into(&snapshot).unwrap();

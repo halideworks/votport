@@ -420,7 +420,7 @@ fn delivery_page(
     } else {
         "active"
     };
-    let files = page.files.iter().map(|(index, file)| json!({"index": index, "name": file.name, "suite": file.suite, "root": file.root, "bytes": file.bytes, "receipt_b64": file.receipt_b64, "download_starts": file.downloads, "first_download_at": file.first_download_at, "last_download_at": file.last_download_at})).collect::<Vec<_>>();
+    let files = page.files.iter().map(|(index, file)| json!({"index": index, "name": file.name, "suite": file.suite, "root": file.root, "bytes": file.bytes, "download_starts": file.downloads, "first_download_at": file.first_download_at, "last_download_at": file.last_download_at})).collect::<Vec<_>>();
     Ok(
         json!({"grant": public_grant_with_file_count(page.grant, page.file_count), "state": state, "total_bytes": page.total_bytes, "files": files, "offset": offset, "has_more": has_more, "next_offset": has_more.then_some(offset + files.len())}),
     )
@@ -675,10 +675,7 @@ mod tests {
         assert_eq!(detail["total_bytes"], 9);
         assert_eq!(detail["files"][0]["name"], "project/a.txt");
         assert_eq!(detail["files"][0]["root"].as_str().unwrap().len(), 64);
-        assert!(!detail["files"][0]["receipt_b64"]
-            .as_str()
-            .unwrap()
-            .is_empty());
+        assert!(detail["files"][0].get("receipt_b64").is_none());
         assert_eq!(detail["next_offset"], 1);
         for method in ["GET", "DELETE"] {
             assert_eq!(

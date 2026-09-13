@@ -56,9 +56,9 @@ independent server-side readback. Strict is not offered for NAS. macOS SMB and
 Windows receiving are not qualified by this Linux server implementation; desktop
 senders can transfer to a qualified Linux port using either transport.
 
-Keep SQLite and control data on local storage. `/outbound` still follows its
-existing library storage checks and issues Fast receipts for existing files;
-qualifying receiving storage does not change those claims.
+Keep SQLite and control data on local storage. Sharing existing `/outbound`
+library files verifies their content without creating publication receipts.
+Received files retain their original publication receipts when shared.
 
 ## Quick start
 

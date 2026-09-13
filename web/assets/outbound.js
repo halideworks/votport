@@ -103,8 +103,8 @@ function renderNextFileBatch() {
   for (const [offset, file] of batch.entries()) {
     const extras = [
       downloadButton('Download file', file.download_url, 'tiny'),
-      downloadButton('Download receipt', file.receipt_url, 'tiny ghost'),
     ];
+    if (file.receipt_url) extras.push(downloadButton('Download receipt', file.receipt_url, 'tiny ghost'));
     const row = appendObjectCard(
       $('object'),
       { name: file.name, suite: file.suite, root: file.root },
@@ -141,7 +141,7 @@ function showMetadataProgress() {
 function validateMetadataFiles(files) {
   if (files.some((file) =>
     !file.download_url ||
-    !file.receipt_url ||
+    (file.receipt_url !== null && typeof file.receipt_url !== 'string') ||
     !file.name ||
     !file.suite ||
     !file.root ||
@@ -264,7 +264,7 @@ async function fetchMetadataPage(offset, limit = FILE_RENDER_BATCH_SIZE) {
   }
   const files = Array.isArray(body?.files) && body.files.length
     ? body.files
-    : body?.download_url && body.receipt_url
+    : body?.download_url
       ? [{
           name: body.name,
           suite: body.suite,

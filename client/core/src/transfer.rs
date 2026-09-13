@@ -211,10 +211,10 @@ fn announce(prepared: &Prepared, observer: &mut dyn Observer) {
             .objects
             .iter()
             .enumerate()
-            .map(|(index, object)| PlannedFile {
+            .map(|(index, entry)| PlannedFile {
                 index,
-                path: object.path.clone(),
-                bytes: object.length,
+                path: entry.path.clone(),
+                bytes: entry.object.length,
             })
             .collect(),
     });
