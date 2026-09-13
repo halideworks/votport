@@ -3900,12 +3900,10 @@ mod request_metrics_tests {
 }
 
 async fn expire_link_uploads(app: &Arc<App>, candidate: crate::store::Link, cutoff: u64) {
-    let app = Arc::clone(app);
-    if let Err(error) =
-        tokio::task::spawn_blocking(move || expire_link_uploads_sync(&app, candidate, cutoff)).await
-    {
-        tracing::error!(%error, "retention worker failed");
-    }
+    sweep_task(app, "upload retention", move |app| {
+        expire_link_uploads_sync(app, candidate, cutoff);
+    })
+    .await;
 }
 
 fn expire_link_uploads_sync(app: &App, candidate: crate::store::Link, cutoff: u64) {
@@ -4136,69 +4134,92 @@ fn sweep_push_staging(app: &App) {
 }
 
 pub async fn session_sweeper(app: Arc<App>) {
-    let idle = app.config.session_idle_secs;
     let mut day = tokio::time::interval(std::time::Duration::from_secs(86_400));
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                app.sessions.sweep(idle);
-                sweep_push_tickets(&app);
-                crate::api::serve::prune(&app);
-                let sweep_app = Arc::clone(&app);
-                if let Err(error) = tokio::task::spawn_blocking(move || {
-                    sweep_push_staging(&sweep_app);
-                    crate::api::outbound::sweep_upload_stages(&sweep_app, std::time::SystemTime::now());
-                }).await {
-                    tracing::warn!(%error, "library upload cleanup task failed");
-                }
-            }
-            _ = day.tick() => {
-                // Skip this tick rather than sweep on guessed settings: a
-                // retention sweep deletes, and a wrong answer here deletes
-                // the wrong things.
-                let settings = match app.store.resolved_settings(&app.config) {
-                    Ok(settings) => settings,
-                    Err(error) => {
-                        tracing::error!(%error, "settings read failed; skipping this sweep");
-                        continue;
-                    }
-                };
-                clean_outbound_proofs(&app.config.data_dir, &app.store, crate::store::now_unix());
-                if settings.audit_retention_days > 0 {
-                    let cutoff =
-                        crate::store::now_unix().saturating_sub(settings.audit_retention_days.saturating_mul(86_400));
-                    match app.store.audit_prune(cutoff) {
-                        Ok(count) if count > 0 => {
-                            tracing::info!(count, "pruned expired audit rows");
-                        }
-                        Ok(_) => {}
-                        Err(error) => tracing::warn!("audit prune failed: {error}"),
-                    }
-                }
-                // Snapshots from /api/admin/backup accumulate on disk;
-                // keep the newest month's worth.
-                let backup_dir = app.config.data_dir.join("backups");
-                let cutoff_modified =
-                    std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
-                prune_legacy_snapshots(&backup_dir, cutoff_modified);
+            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => sweep_short(&app).await,
+            _ = day.tick() => sweep_daily(&app).await,
+        }
+    }
+}
 
-                // Commit tombstones before removing verified files. Failed unlinks
-                // retain bytes without reauthorizing deletion of a reused name.
-                if settings.upload_retention_days > 0 {
-                    let cutoff = crate::store::now_unix()
-                        .saturating_sub(settings.upload_retention_days.saturating_mul(86_400));
-                    let links = match app.store.all_links() {
-                        Ok(links) => links,
-                        Err(error) => {
-                            tracing::error!(%error, "link read failed; skipping the retention sweep");
-                            continue;
-                        }
-                    };
-                    for link in links {
-                        expire_link_uploads(&app, link, cutoff).await;
-                    }
-                }
+async fn sweep_task<T: Send + 'static>(
+    app: &Arc<App>,
+    duty: &'static str,
+    work: impl FnOnce(&App) -> T + Send + 'static,
+) -> Option<T> {
+    let app = Arc::clone(app);
+    tokio::task::spawn_blocking(move || work(&app))
+        .await
+        .map_err(|error| tracing::error!(duty, %error, "cleanup duty failed"))
+        .ok()
+}
+
+async fn sweep_short(app: &Arc<App>) {
+    sweep_task(app, "idle sessions", |app| {
+        app.sessions.sweep(app.config.session_idle_secs)
+    })
+    .await;
+    sweep_task(app, "push tickets", sweep_push_tickets).await;
+    sweep_task(app, "serve cache", crate::api::serve::prune).await;
+    sweep_task(app, "push staging", sweep_push_staging).await;
+    sweep_task(app, "library staging", |app| {
+        crate::api::outbound::sweep_upload_stages(app, std::time::SystemTime::now());
+    })
+    .await;
+}
+
+async fn sweep_daily(app: &Arc<App>) {
+    // Destructive cleanup requires current settings; a failed read skips this pass.
+    let settings = match sweep_task(app, "retention settings", |app| {
+        app.store.resolved_settings(&app.config)
+    })
+    .await
+    {
+        Some(Ok(settings)) => settings,
+        Some(Err(error)) => {
+            tracing::error!(%error, "settings read failed; skipping this sweep");
+            return;
+        }
+        None => return,
+    };
+    sweep_task(app, "outbound proofs", |app| {
+        clean_outbound_proofs(&app.config.data_dir, &app.store, crate::store::now_unix());
+    })
+    .await;
+    if settings.audit_retention_days > 0 {
+        let cutoff = crate::store::now_unix()
+            .saturating_sub(settings.audit_retention_days.saturating_mul(86_400));
+        sweep_task(app, "audit rows", move |app| {
+            match app.store.audit_prune(cutoff) {
+                Ok(count) if count > 0 => tracing::info!(count, "pruned expired audit rows"),
+                Ok(_) => {}
+                Err(error) => tracing::warn!("audit prune failed: {error}"),
             }
+        })
+        .await;
+    }
+    sweep_task(app, "database snapshots", |app| {
+        let backup_dir = app.config.data_dir.join("backups");
+        let cutoff_modified =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+        prune_legacy_snapshots(&backup_dir, cutoff_modified);
+    })
+    .await;
+
+    if settings.upload_retention_days > 0 {
+        let cutoff = crate::store::now_unix()
+            .saturating_sub(settings.upload_retention_days.saturating_mul(86_400));
+        let links = match sweep_task(app, "retention links", |app| app.store.all_links()).await {
+            Some(Ok(links)) => links,
+            Some(Err(error)) => {
+                tracing::error!(%error, "link read failed; skipping the retention sweep");
+                return;
+            }
+            None => return,
+        };
+        for link in links {
+            expire_link_uploads(app, link, cutoff).await;
         }
     }
 }
@@ -4227,6 +4248,90 @@ fn prune_legacy_snapshots(backup_dir: &std::path::Path, cutoff: std::time::Syste
 mod retention_tests {
     use super::*;
     use crate::store::{FileRecord, Link, OutboundGrant, SettingWrite, UploadRecord};
+
+    #[tokio::test]
+    async fn poisoned_cleanup_duties_leave_other_work_and_later_passes_running() {
+        use std::time::{Duration, SystemTime};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::api::testing::config(directory.path());
+        config.push_bind = Some("127.0.0.1:0".parse().unwrap());
+        config.push_advertise = Some("push.example.test:8322".into());
+        let mut app = build(config).unwrap();
+        Arc::get_mut(&mut app).unwrap().config.session_idle_secs = 0;
+        let poisoned = Arc::clone(&app);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoned.push_tickets.lock().unwrap();
+            panic!("poison ticket registry");
+        })
+        .join()
+        .is_err());
+        assert!(app.push_tickets.is_poisoned());
+        let backups = crate::backup::ensure_backups_dir(&app.config.data_dir).unwrap();
+        let snapshot = backups.join("votport-1-deadbeef.db");
+        let old =
+            std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        for round in 0..3 {
+            if round == 2 {
+                let store = Arc::clone(&app.store);
+                assert!(std::thread::spawn(move || {
+                    let _ = store.with::<()>(|_| panic!("poison store"));
+                })
+                .join()
+                .is_err());
+                std::fs::File::create(&snapshot)
+                    .unwrap()
+                    .set_times(old)
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), sweep_daily(&app))
+                    .await
+                    .expect("failed settings must not terminate or stall the daily pass");
+                assert!(
+                    snapshot.exists(),
+                    "unreadable settings must prevent destructive cleanup"
+                );
+            }
+            let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+            app.sessions
+                .insert_admitted(
+                    session::SessionAdmission {
+                        id: format!("expired-{round}"),
+                        link_id: "link".into(),
+                        tenant: String::new(),
+                        reserved_bytes: 0,
+                        max_total_bytes: None,
+                        max_tenant_sessions: None,
+                        max_link_sessions: usize::MAX,
+                        max_sessions: usize::MAX,
+                        kind: session::SessionKind::Http,
+                    },
+                    sender,
+                    || Ok((0, Vec::new())),
+                )
+                .unwrap();
+            let stage = app
+                .config
+                .outbound_dir
+                .join(format!(".vot-outbound-00-{}.stage", "a".repeat(64)));
+            std::fs::File::create(&stage)
+                .unwrap()
+                .set_times(old)
+                .unwrap();
+            assert_eq!(app.sessions.total(), 1);
+            tokio::time::timeout(Duration::from_secs(5), sweep_short(&app))
+                .await
+                .expect("one poisoned duty must not stall unrelated cleanup");
+            assert_eq!(app.sessions.total(), 0);
+            assert!(
+                !stage.exists(),
+                "library cleanup must run after the failed duty"
+            );
+            assert!(
+                app.push_tickets.is_poisoned(),
+                "cleanup must not clear unsafe poisoned state"
+            );
+        }
+    }
 
     #[test]
     fn legacy_snapshot_pruning_keeps_operator_files() {
