@@ -730,12 +730,11 @@ pub async fn create_tenant(
     let identity = require_platform_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
     let key = admit_tenant_key(&request.key)?;
-    if app.sessions.tenant_pinned(&key) {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "tenant delete already in progress",
-        ));
-    }
+    let _pin = app.sessions.try_pin_tenant(&key).ok_or_else(|| {
+        ApiError::new(StatusCode::CONFLICT, "tenant mutation already in progress")
+    })?;
+    #[cfg(test)]
+    app.sessions.wait_delete_stall().await;
     let defaults = app
         .store
         .resolved_settings(&app.config)
@@ -940,21 +939,14 @@ pub async fn delete_tenant(
         .receiving_destinations()
         .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
     let key = admit_tenant_ref(&key)?;
-    if !app.sessions.pin_tenant_for_delete(&key) {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "tenant delete already in progress",
-        ));
-    }
-    let count = match app.store.tenant_link_count(&key) {
-        Ok(count) => count,
-        Err(error) => {
-            app.sessions.unpin_tenant(&key);
-            return Err(super::store_unavailable(error));
-        }
-    };
+    let pin = app.sessions.try_pin_tenant(&key).ok_or_else(|| {
+        ApiError::new(StatusCode::CONFLICT, "tenant mutation already in progress")
+    })?;
+    let count = app
+        .store
+        .tenant_link_count(&key)
+        .map_err(super::store_unavailable)?;
     if count > 0 {
-        app.sessions.unpin_tenant(&key);
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             format!("{count} link(s) still reference this tenant; delete them first"),
@@ -963,7 +955,6 @@ pub async fn delete_tenant(
     let active = app.sessions.active_for_tenant(&key);
     let outbound_active = app.sessions.active_outbound_for_tenant(&key);
     if active > 0 || outbound_active > 0 {
-        app.sessions.unpin_tenant(&key);
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             format!(
@@ -975,23 +966,14 @@ pub async fn delete_tenant(
     // The subtrees this delete would purge, if there are any. A key with a
     // separator was never usable as a namespace, and neither root is valid.
     let purge_targets = if purges_tenant_subtrees(&key) {
-        let receive = match tenant_receive_dir(&app.config.receive_dir, &key) {
-            Ok(path) if path.is_dir() => Some(path),
-            Ok(_) => None,
-            Err(error) => {
-                app.sessions.unpin_tenant(&key);
-                return Err(ApiError::internal(error));
-            }
-        };
-        let outbound = match tenant_outbound_dir(&app.config.outbound_dir, &key) {
-            Ok(path) if path.is_dir() => Some(path),
-            Ok(_) => None,
-            Err(error) => {
-                app.sessions.unpin_tenant(&key);
-                return Err(ApiError::internal(error));
-            }
-        };
-        (receive, outbound)
+        let receive =
+            tenant_receive_dir(&app.config.receive_dir, &key).map_err(ApiError::internal)?;
+        let outbound =
+            tenant_outbound_dir(&app.config.outbound_dir, &key).map_err(ApiError::internal)?;
+        (
+            receive.is_dir().then_some(receive),
+            outbound.is_dir().then_some(outbound),
+        )
     } else {
         (None, None)
     };
@@ -1006,12 +988,10 @@ pub async fn delete_tenant(
     use crate::store::TenantRemoval;
     let row_deleted = match app.store.remove_tenant(&key) {
         Ok(TenantRemoval::HasRoutes) => {
-            app.sessions.unpin_tenant(&key);
             return Err(ApiError::new(StatusCode::CONFLICT, "cancel this tenant's trade routes and wait for destination acknowledgments before deleting it"));
         }
         Ok(TenantRemoval::Deleted) => true,
         Ok(TenantRemoval::HasLinks) => {
-            app.sessions.unpin_tenant(&key);
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "a link was created concurrently; delete them first",
@@ -1019,59 +999,55 @@ pub async fn delete_tenant(
         }
         Ok(TenantRemoval::Absent) => {
             if purge_targets.0.is_none() && purge_targets.1.is_none() {
-                app.sessions.unpin_tenant(&key);
                 return Err(ApiError::not_found());
             }
             false
         }
         Err(error) => {
-            app.sessions.unpin_tenant(&key);
             return Err(ApiError::internal(error));
         }
     };
     let purged_receive = purge_targets.0.is_some();
     let purged_outbound = purge_targets.1.is_some();
-    for (name, path) in [("receive", purge_targets.0), ("outbound", purge_targets.1)].into_iter() {
-        let Some(path) = path else { continue };
+    #[cfg(test)]
+    if purged_receive {
+        app.sessions.wait_delete_stall().await;
+    }
+    let app_for_purge = Arc::clone(&app);
+    let purge_key = key.clone();
+    tokio::task::spawn_blocking(move || {
+        let _pin = pin;
+        let app = app_for_purge;
         #[cfg(test)]
-        if name == "receive" {
-            app.sessions.wait_delete_stall().await;
-        }
-        let purge = if name == "receive" {
-            let destinations = Arc::clone(&destinations);
-            let components = paths::tenant_prefix(&key);
-            tokio::task::spawn_blocking(move || destinations.remove_tree(&components))
-                .await
-                .map_err(|error| std::io::Error::other(error.to_string()))
-                .and_then(|result| result.map_err(std::io::Error::other))
-        } else {
-            tokio::fs::remove_dir_all(&path).await
-        };
-        match purge {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && row_deleted => {}
-            Err(error) => {
-                tracing::error!(
-                    key = %key,
-                    subtree = name,
-                    error = %error,
-                    "tenant subtree purge failed"
-                );
-                app.sessions.unpin_tenant(&key);
-                return Err(ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "tenant subtree purge failed; retry DELETE",
-                ));
+        app.sessions.wait_tenant_purge_stall();
+        for (name, path) in [("receive", purge_targets.0), ("outbound", purge_targets.1)] {
+            let Some(path) = path else { continue };
+            let purge = if name == "receive" {
+                destinations.remove_tree(&paths::tenant_prefix(&purge_key))
+                    .map_err(std::io::Error::other)
+            } else {
+                std::fs::remove_dir_all(&path)
+            };
+            match purge {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && row_deleted => {}
+                Err(error) => {
+                    tracing::error!(key = %purge_key, subtree = name, %error, "tenant subtree purge failed");
+                    return Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "tenant subtree purge failed; retry DELETE"));
+                }
             }
         }
-    }
-    if row_deleted {
-        if let Some(ext) = logo_ext {
-            let stale = paths::branding_logo_path(&app.config.data_dir, &key, &ext);
-            let _ = tokio::fs::remove_file(stale).await;
+        if row_deleted {
+            if let Some(ext) = logo_ext {
+                let stale = paths::branding_logo_path(&app.config.data_dir, &purge_key, &ext);
+                let _ = std::fs::remove_file(stale);
+            }
         }
-    }
-    app.sessions.unpin_tenant(&key);
+        Ok(())
+    }).await.map_err(|error| {
+        tracing::error!(key = %key, %error, "tenant subtree purge worker failed");
+        ApiError::internal("tenant subtree purge failed; retry DELETE")
+    })??;
     tracing::info!(target: "audit", event = "tenant_deleted", key = %key, "tenant namespace deleted");
     app.store.audit(
         "",
@@ -5756,10 +5732,214 @@ mod tenant_offboard_tests {
     }
 
     #[tokio::test]
+    async fn tenant_mutation_cancelled_before_purge_releases_its_pin() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(named_tenant("acme"))
+            .unwrap();
+        let path = tenant_receive_dir(&application.config.receive_dir, "acme").unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("frame"), b"old").unwrap();
+        let cookie = super::test_admin_cookie(&application, &auth::AdminIdentity::local_admin());
+        let (entered, _release) = application.sessions.arm_delete_stall();
+        let request_app = application.clone();
+        let request_cookie = cookie.clone();
+        let request =
+            tokio::spawn(
+                async move { delete_tenant_req(request_app, &request_cookie, "acme").await },
+            );
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(!application.sessions.tenant_pinned("acme"));
+        assert!(application.store.tenant("acme").unwrap().is_none());
+        assert!(path.join("frame").exists());
+        assert_eq!(
+            delete_tenant_req(application.clone(), &cookie, "acme")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert!(!path.exists());
+        assert_eq!(
+            create_tenant_req(application, &cookie, "acme")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_mutation_creation_excludes_deletion_until_insert_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(named_tenant("acme"))
+            .unwrap();
+        let path = tenant_receive_dir(&application.config.receive_dir, "acme").unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("frame"), b"old").unwrap();
+        let cookie = super::test_admin_cookie(&application, &auth::AdminIdentity::local_admin());
+        let (entered, release) = application.sessions.arm_delete_stall();
+        let request_app = application.clone();
+        let request_cookie = cookie.clone();
+        let request =
+            tokio::spawn(
+                async move { create_tenant_req(request_app, &request_cookie, "acme").await },
+            );
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        let deletion = delete_tenant_req(application.clone(), &cookie, "acme")
+            .await
+            .status();
+        let retained =
+            application.store.tenant("acme").unwrap().is_some() && path.join("frame").exists();
+        release.send(()).unwrap();
+        let creation = request.await.unwrap().status();
+        assert_eq!(deletion, StatusCode::CONFLICT);
+        assert!(retained);
+        assert_eq!(creation, StatusCode::CONFLICT);
+        assert!(!application.sessions.tenant_pinned("acme"));
+        assert_eq!(
+            delete_tenant_req(application.clone(), &cookie, "acme")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            create_tenant_req(application, &cookie, "acme")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[test]
+    fn tenant_mutation_cancelled_purge_retains_ownership_until_all_files_are_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(named_tenant("acme"))
+            .unwrap();
+        application
+            .store
+            .set_branding(&crate::store::Branding {
+                tenant: "acme".into(),
+                logo_ext: "png".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let paths = [
+            tenant_receive_dir(&application.config.receive_dir, "acme")
+                .unwrap()
+                .join("received"),
+            tenant_outbound_dir(&application.config.outbound_dir, "acme")
+                .unwrap()
+                .join("library"),
+            paths::branding_logo_path(&application.config.data_dir, "acme", "png"),
+        ];
+        for path in &paths {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"old").unwrap();
+        }
+        let cookie = super::test_admin_cookie(&application, &auth::AdminIdentity::local_admin());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let (release_pool, wait_pool) = std::sync::mpsc::channel();
+            let (ready_pool, started_pool) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                ready_pool.send(()).unwrap();
+                wait_pool
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), started_pool)
+                .await
+                .unwrap()
+                .unwrap();
+            let (entered_purge, release_purge) = application.sessions.arm_tenant_purge_stall();
+            let request_app = application.clone();
+            let request_cookie = cookie.clone();
+            let request = tokio::spawn(async move {
+                delete_tenant_req(request_app, &request_cookie, "acme").await
+            });
+            for _ in 0..200 {
+                if application.store.tenant("acme").unwrap().is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(application.store.tenant("acme").unwrap().is_none());
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            assert!(application.sessions.tenant_pinned("acme"));
+            assert_eq!(
+                create_tenant_req(application.clone(), &cookie, "acme")
+                    .await
+                    .status(),
+                StatusCode::CONFLICT
+            );
+            release_pool.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), entered_purge)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(application.sessions.tenant_pinned("acme"));
+            assert!(paths.iter().all(|path| path.exists()));
+            assert_eq!(
+                create_tenant_req(application.clone(), &cookie, "acme")
+                    .await
+                    .status(),
+                StatusCode::CONFLICT
+            );
+            let weak = Arc::downgrade(&application);
+            drop(application);
+            let application = weak
+                .upgrade()
+                .expect("the purge must retain the application and its storage leases");
+            release_purge.send(()).unwrap();
+            for _ in 0..200 {
+                if !application.sessions.tenant_pinned("acme") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(!application.sessions.tenant_pinned("acme"));
+            assert!(paths.iter().all(|path| !path.exists()));
+            assert_eq!(
+                create_tenant_req(application, &cookie, "acme")
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            for path in paths {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, b"new").unwrap();
+                assert_eq!(std::fs::read(path).unwrap(), b"new");
+            }
+        });
+    }
+
+    #[tokio::test]
     async fn create_tenant_refuses_a_pinned_key() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
-        assert!(application.sessions.pin_tenant_for_delete("acme"));
+        let _pin = application.sessions.try_pin_tenant("acme").unwrap();
 
         let router = app::router(application.clone());
         let cookie = login_cookie(router).await;
@@ -6018,7 +6198,7 @@ mod tenant_offboard_tests {
     #[test]
     fn insert_returns_pinned_while_delete_holds_the_pin() {
         let sessions = crate::session::Sessions::new();
-        assert!(sessions.pin_tenant_for_delete("acme"));
+        let _pin = sessions.try_pin_tenant("acme").unwrap();
         let err = sessions
             .insert(
                 "s".to_owned(),

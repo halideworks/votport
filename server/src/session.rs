@@ -3573,6 +3573,21 @@ pub struct Sessions {
     inner: Arc<Mutex<SessionsInner>>,
 }
 
+pub struct TenantPin {
+    inner: Arc<Mutex<SessionsInner>>,
+    tenant: String,
+}
+
+impl Drop for TenantPin {
+    fn drop(&mut self) {
+        self.inner
+            .lock()
+            .expect("sessions poisoned")
+            .pinned
+            .remove(&self.tenant);
+    }
+}
+
 pub struct LinkPin<'a> {
     sessions: &'a Sessions,
     link_id: String,
@@ -3595,6 +3610,8 @@ struct SessionsInner {
     pinned_links: HashSet<String>,
     #[cfg(test)]
     delete_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    #[cfg(test)]
+    tenant_purge_stall: Option<(oneshot::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     #[cfg(test)]
     session_create_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
     #[cfg(test)]
@@ -3741,6 +3758,8 @@ impl Sessions {
                 #[cfg(test)]
                 delete_stall: None,
                 #[cfg(test)]
+                tenant_purge_stall: None,
+                #[cfg(test)]
                 session_create_stall: None,
                 #[cfg(test)]
                 finish_stall: None,
@@ -3748,26 +3767,20 @@ impl Sessions {
         }
     }
 
-    /// Blocks new sessions for `tenant` until the owner calls
-    /// [`Self::unpin_tenant`]. Returns whether this caller acquired the pin.
+    /// Excludes other tenant mutations and new sessions until the guard drops.
     /// The default tenant (`""`) is never pinned.
-    pub fn pin_tenant_for_delete(&self, tenant: &str) -> bool {
+    pub fn try_pin_tenant(&self, tenant: &str) -> Option<TenantPin> {
         if tenant.is_empty() {
-            return false;
+            return None;
         }
-        self.inner
-            .lock()
-            .expect("sessions poisoned")
-            .pinned
-            .insert(tenant.to_owned())
-    }
-
-    pub fn unpin_tenant(&self, tenant: &str) {
-        self.inner
-            .lock()
-            .expect("sessions poisoned")
-            .pinned
-            .remove(tenant);
+        let mut inner = self.inner.lock().expect("sessions poisoned");
+        if !inner.pinned.insert(tenant.to_owned()) {
+            return None;
+        }
+        Some(TenantPin {
+            inner: Arc::clone(&self.inner),
+            tenant: tenant.to_owned(),
+        })
     }
 
     pub fn tenant_pinned(&self, tenant: &str) -> bool {
@@ -3862,6 +3875,33 @@ impl Sessions {
         let (release_tx, release_rx) = oneshot::channel();
         self.inner.lock().expect("sessions poisoned").delete_stall = Some((entered_tx, release_rx));
         (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub fn arm_tenant_purge_stall(&self) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        self.inner
+            .lock()
+            .expect("sessions poisoned")
+            .tenant_purge_stall = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub fn wait_tenant_purge_stall(&self) {
+        let stall = self
+            .inner
+            .lock()
+            .expect("sessions poisoned")
+            .tenant_purge_stall
+            .take();
+        if let Some((entered, release)) = stall {
+            let _ = entered.send(());
+            release
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("tenant purge stall was not released");
+        }
     }
 
     #[cfg(test)]
@@ -4358,7 +4398,7 @@ mod pin_tests {
     #[test]
     fn insert_fails_while_the_tenant_is_pinned() {
         let sessions = Sessions::new();
-        assert!(sessions.pin_tenant_for_delete("acme"));
+        let _pin = sessions.try_pin_tenant("acme").unwrap();
         assert!(sessions.tenant_pinned("acme"));
         let err = sessions
             .insert(
@@ -4371,7 +4411,7 @@ mod pin_tests {
         assert_eq!(err, InsertError::TenantPinned);
         assert_eq!(sessions.total(), 0);
 
-        sessions.unpin_tenant("acme");
+        drop(_pin);
         assert!(!sessions.tenant_pinned("acme"));
         sessions
             .insert(
@@ -4387,12 +4427,12 @@ mod pin_tests {
     #[test]
     fn pin_is_exclusive() {
         let sessions = Sessions::new();
-        assert!(sessions.pin_tenant_for_delete("acme"));
-        assert!(!sessions.pin_tenant_for_delete("acme"));
+        let _pin = sessions.try_pin_tenant("acme").unwrap();
+        assert!(sessions.try_pin_tenant("acme").is_none());
         assert!(sessions.tenant_pinned("acme"));
-        sessions.unpin_tenant("acme");
+        drop(_pin);
         assert!(!sessions.tenant_pinned("acme"));
-        assert!(sessions.pin_tenant_for_delete("acme"));
+        let _pin = sessions.try_pin_tenant("acme").unwrap();
     }
 
     #[test]
@@ -4400,11 +4440,11 @@ mod pin_tests {
         let sessions = Sessions::new();
         let operation = sessions.try_begin_outbound("acme").unwrap();
         assert_eq!(sessions.active_outbound_for_tenant("acme"), 1);
-        assert!(sessions.pin_tenant_for_delete("acme"));
+        let _pin = sessions.try_pin_tenant("acme").unwrap();
         assert!(sessions.try_begin_outbound("acme").is_none());
         drop(operation);
         assert_eq!(sessions.active_outbound_for_tenant("acme"), 0);
-        sessions.unpin_tenant("acme");
+        drop(_pin);
     }
 
     #[test]
@@ -4412,17 +4452,17 @@ mod pin_tests {
         let sessions = Sessions::new();
         let operation = sessions.try_begin_outbound_owned("acme").unwrap();
         assert_eq!(sessions.active_outbound_for_tenant("acme"), 1);
-        assert!(sessions.pin_tenant_for_delete("acme"));
+        let _pin = sessions.try_pin_tenant("acme").unwrap();
         assert!(sessions.try_begin_outbound_owned("acme").is_none());
         drop(operation);
         assert_eq!(sessions.active_outbound_for_tenant("acme"), 0);
-        sessions.unpin_tenant("acme");
+        drop(_pin);
     }
 
     #[test]
     fn pin_does_not_apply_to_the_default_tenant() {
         let sessions = Sessions::new();
-        assert!(!sessions.pin_tenant_for_delete(""));
+        assert!(sessions.try_pin_tenant("").is_none());
         assert!(!sessions.tenant_pinned(""));
         sessions
             .insert(
