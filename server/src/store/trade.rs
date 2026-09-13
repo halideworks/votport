@@ -964,7 +964,7 @@ mod tests {
             name: "Masters".into(),
             category: "external".into(),
             forwarding: false,
-            metadata_keys: vec!["episode".into()],
+            metadata_keys: vec!["episode".into(), "scene".into(), "take".into()],
             notifications: NotificationPolicy::default(),
         };
         let link:Link=serde_json::from_value(serde_json::json!({"id":endpoint.id,"label":"Masters","dest":"","tenant":"","created_at":now_unix(),"active":true})).unwrap();
@@ -1066,6 +1066,25 @@ mod tests {
                 .unwrap()
                 .id
         );
+        store.with(|c| c.execute(
+            "WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<999)
+             INSERT INTO inbound_routes(id,tenant,link_id,issuer,operation_id,source,ancestry,revoked_at,created_at)
+             SELECT 'retained-'||n,'',?1,'previous-peer','retained-'||n,?2,'[]',1,1 FROM numbers",
+            params![endpoint.id, serde_json::to_string(&signed).unwrap()]
+        )).unwrap();
+        let mut large = document.clone();
+        large.operation_id = "large-paired".into();
+        large.metadata = endpoint
+            .metadata_keys
+            .iter()
+            .map(|key| (key.clone(), "\0".repeat(4096)))
+            .collect();
+        let large = sender.sign_route(large);
+        assert!(large.admits(&store.event_signer.public_hex));
+        assert!(serde_json::to_string(&large).unwrap().len() > 65536);
+        assert!(store
+            .receive_route_authorized("", &endpoint.id, &large, &[], Some(&credential))
+            .is_ok());
         document.operation_id = "wrong-metadata".into();
         document.metadata.insert("private".into(), "secret".into());
         assert!(store
