@@ -758,6 +758,7 @@ pub async fn create_push_session(
     }
 
     if let Err(error) = session::persist_push(&setup, key) {
+        app.sessions.remove(&session_id);
         control.park();
         return Err(ApiError::internal(format!("persist push session: {error}")));
     }
@@ -1460,6 +1461,50 @@ mod push_preflight_tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn completed_push_refusal_releases_runtime_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = testing::config(directory.path());
+        config.push_bind = Some("127.0.0.1:0".parse().unwrap());
+        config.push_advertise = Some("push.example.test:8322".into());
+        let application = app::build(config).unwrap();
+        application.store.insert_link(open_link("retry")).unwrap();
+        let holder = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
+        let first = post_push(application.clone(), "retry", request_body(&holder, 7)).await;
+        assert!(first.status().is_success());
+        let id = response_json(first).await["session"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let _ = upload_abort(State(application.clone()), Path(id.clone())).await;
+        application.sessions.remove(&id);
+        application
+            .store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE upload_sessions SET committed_upload_id='committed' WHERE id=?1",
+                    [&id],
+                )
+            })
+            .unwrap();
+        let saved = application.store.load_push_sessions().unwrap();
+        let usage = application.store.tenant_admission_usage("").unwrap().0;
+        for _ in 0..2 {
+            let response = post_push(application.clone(), "retry", request_body(&holder, 7)).await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(
+                application.sessions.total(),
+                0,
+                "refusal must release runtime reservation"
+            );
+            assert_eq!(application.store.load_push_sessions().unwrap(), saved);
+            assert_eq!(
+                application.store.tenant_admission_usage("").unwrap().0,
+                usage
+            );
+        }
     }
 
     #[tokio::test]

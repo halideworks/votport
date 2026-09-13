@@ -301,6 +301,7 @@ pub struct Branding {
 /// re-attach after a restart instead of the transfer starting over.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersistedUploadSession {
+    pub committed_upload_id: Option<String>,
     pub push_key: Option<String>,
     pub id: String,
     pub link_id: String,
@@ -462,7 +463,7 @@ pub struct SettingsOverlay {
     pub draining_source: &'static str,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 35;
+pub(crate) const SCHEMA_VERSION: u64 = 36;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -647,7 +648,8 @@ CREATE TABLE IF NOT EXISTS upload_sessions (
     max_total_bytes INTEGER,
     started_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
-    push_key TEXT
+    push_key TEXT,
+    committed_upload_id TEXT
 );
 CREATE UNIQUE INDEX upload_sessions_push_key ON upload_sessions(push_key) WHERE push_key IS NOT NULL;
 CREATE TABLE IF NOT EXISTS upload_session_files (
@@ -1478,6 +1480,7 @@ impl Store {
         upload: UploadRecord,
     ) -> Result<bool, String> {
         self.append_upload_inner(tenant, id, upload, None)
+            .map(|id| id.is_some())
     }
 
     pub fn append_upload_from_session(
@@ -1486,7 +1489,7 @@ impl Store {
         id: &str,
         upload: UploadRecord,
         session: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<String>, String> {
         self.append_upload_inner(tenant, id, upload, Some(session))
     }
 
@@ -1496,12 +1499,23 @@ impl Store {
         id: &str,
         upload: UploadRecord,
         session: Option<&str>,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<String>, String> {
         let upload_json = serde_json::to_string(&upload).map_err(|error| error.to_string())?;
         let mut connection = self.connection.lock().expect("store poisoned");
         let transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
+        if let Some(session) = session {
+            let committed = transaction.query_row(
+                "SELECT committed_upload_id FROM upload_sessions WHERE id=?1 AND tenant=?2 AND link_id=?3",
+                rusqlite::params![session, tenant, id],
+                |row| row.get::<_, Option<String>>(0),
+            ).optional().map_err(|error| error.to_string())?
+                .ok_or("upload admission is missing at completion")?;
+            if committed.is_some() {
+                return Ok(committed);
+            }
+        }
         let Some((uploads_json, events_json)) = transaction
             .query_row(
                 "SELECT uploads_json, events_json FROM links WHERE tenant = ?1 AND id = ?2",
@@ -1511,7 +1525,7 @@ impl Store {
             .optional()
             .map_err(|error| error.to_string())?
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let uploads: Vec<UploadRecord> =
             parse_json(&uploads_json, 0).map_err(|error| error.to_string())?;
@@ -1554,7 +1568,7 @@ impl Store {
             write_link_row(&transaction, &link).map_err(|e| e.to_string())?;
             sync_link_files(&transaction, &link).map_err(|e| e.to_string())?;
             transaction.commit().map_err(|e| e.to_string())?;
-            return Ok(true);
+            return Ok(Some(upload.id));
         }
         let upload_index = i64::try_from(uploads.len()).unwrap_or(i64::MAX);
         drop((uploads, uploads_json, events_json));
@@ -1579,8 +1593,17 @@ impl Store {
         insert_upload_files(&transaction, id, tenant, upload_index, &upload)
             .map_err(|error| error.to_string())?;
         workflows::queue_received(&transaction, &self.event_signer, tenant, id, &upload)?;
+        if let Some(session) = session.filter(|_| !upload.partial) {
+            let changed = transaction.execute(
+                "UPDATE upload_sessions SET committed_upload_id=?2 WHERE id=?1 AND committed_upload_id IS NULL",
+                rusqlite::params![session, upload.id],
+            ).map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("upload admission changed at completion".into());
+            }
+        }
         transaction.commit().map_err(|error| error.to_string())?;
-        Ok(true)
+        Ok(Some(upload.id))
     }
 
     pub fn tombstone_files(
@@ -1926,13 +1949,19 @@ impl Store {
 
     // ------------------------------------------------- upload session resume
 
-    /// Records an in-progress session and its files. Replaces any prior rows
-    /// for the id, so a re-persist after progress is idempotent.
+    /// Replaces in-progress session metadata, refusing completed IDs and push keys.
     pub fn insert_upload_session(&self, session: &PersistedUploadSession) -> Result<(), String> {
         let mut connection = self.connection.lock().expect("store poisoned");
         let transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
+        let committed: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM upload_sessions WHERE (id=?1 OR push_key=?2) AND committed_upload_id IS NOT NULL)",
+            rusqlite::params![session.id, session.push_key], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if committed || session.committed_upload_id.is_some() {
+            return Err("completed upload is awaiting publication cleanup".into());
+        }
         transaction
             .execute(
                 "INSERT OR REPLACE INTO upload_sessions
@@ -2060,11 +2089,12 @@ impl Store {
             let mut sessions = Vec::new();
             let mut statement = connection.prepare(
                 "SELECT id, link_id, tenant, dest_dir, dest_rel, package_suite,
-                        package_root, package_length, max_total_bytes, started_at, push_key
+                        package_root, package_length, max_total_bytes, started_at, push_key, committed_upload_id
                  FROM upload_sessions WHERE (NOT ?1 OR push_key IS NOT NULL) AND (?2 IS NULL OR push_key = ?2) ORDER BY created_at",
             )?;
             let rows = statement.query_map(rusqlite::params![push_only, push_key], |row| {
                 Ok(PersistedUploadSession {
+                    committed_upload_id: row.get(11)?,
                     push_key: row.get(10)?,
                     id: row.get(0)?,
                     link_id: row.get(1)?,
@@ -2685,7 +2715,7 @@ impl Store {
     ) -> Result<(u64, Vec<RetainedReservation>), String> {
         let received = self.tenant_received_bytes(tenant)?;
         let retained = self.with(|connection| {
-            let mut statement = connection.prepare_cached("SELECT id,push_key,package_length FROM upload_sessions WHERE tenant=?1 AND EXISTS(SELECT 1 FROM upload_session_files WHERE session_id=upload_sessions.id)")?;
+            let mut statement = connection.prepare_cached("SELECT id,push_key,package_length FROM upload_sessions WHERE tenant=?1 AND committed_upload_id IS NULL AND EXISTS(SELECT 1 FROM upload_session_files WHERE session_id=upload_sessions.id)")?;
             let rows = statement.query_map([tenant], |row| Ok(RetainedReservation {
                 id: row.get(0)?, push_key: row.get(1)?, bytes: row.get::<_, i64>(2)?.max(0) as u64,
             }))?;
@@ -7465,12 +7495,15 @@ mod settings_tests {
 
     #[test]
     fn unsupported_schema_is_refused_without_rewriting_data() {
+        let previous = (SCHEMA_VERSION - 1).to_string();
+        let future = (SCHEMA_VERSION + 1).to_string();
         for version in [
             None,
             Some("3"),
             Some("31"),
             Some("34"),
-            Some("36"),
+            Some(previous.as_str()),
+            Some(future.as_str()),
             Some("99"),
             Some("invalid"),
             Some("-1"),
@@ -7697,6 +7730,7 @@ mod settings_tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         let mut session = PersistedUploadSession {
+            committed_upload_id: None,
             push_key: None,
             id: "abcd1234".to_owned(),
             link_id: "link-1".to_owned(),

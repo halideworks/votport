@@ -1045,6 +1045,9 @@ impl PersistTracker {
 pub(crate) fn persist_push(setup: &WorkerSetup, key: String) -> Result<(), String> {
     let mut session = persisted_session(setup, &[]);
     if let Some(previous) = setup.store.load_push_session(&key)? {
+        if previous.committed_upload_id.is_some() {
+            return Err("completed upload is awaiting publication cleanup".into());
+        }
         if previous.link_id != session.link_id
             || previous.tenant != session.tenant
             || previous.dest_dir != session.dest_dir
@@ -1106,6 +1109,7 @@ fn persisted_session<'a>(
         })
         .collect();
     PersistedUploadSession {
+        committed_upload_id: None,
         push_key: None,
         id: hex::encode(setup.session_id),
         link_id: setup.link_id.clone(),
@@ -1229,11 +1233,84 @@ pub fn resume_worker(
     Ok((kept, already))
 }
 
+fn persisted_resume_state(file: &PersistedUploadFile) -> vot_sdk_file::ResumeState {
+    vot_sdk_file::ResumeState {
+        staging_name: file.staging_path.file_name().unwrap_or_default().to_owned(),
+        journal_name: file.journal_path.file_name().unwrap_or_default().to_owned(),
+        incarnation: file.incarnation,
+        profile: file.profile,
+        nas_contract: file.nas_contract,
+        runs: (file.prefix_bytes > 0)
+            .then_some((0, file.prefix_bytes))
+            .into_iter()
+            .collect(),
+    }
+}
+
+pub(crate) fn cleanup_committed_session(
+    store: &Store,
+    session: &PersistedUploadSession,
+    destinations: &crate::receiving::Destinations,
+) -> Result<(), String> {
+    if session.committed_upload_id.is_none() {
+        return Err("upload has not committed".into());
+    }
+    for file in &session.files {
+        if file.staging_path.as_os_str().is_empty() && file.journal_path.as_os_str().is_empty() {
+            continue;
+        }
+        let destination = paths::join_under(&session.dest_dir, &file.stored_components)?;
+        let parent = destination.parent().ok_or("missing destination parent")?;
+        let name = destination.file_name().ok_or("missing destination name")?;
+        let state = persisted_resume_state(file);
+        if file.staging_path != parent.join(".vot-stage").join(&state.staging_name)
+            || file.journal_path != parent.join(".vot-stage").join(&state.journal_name)
+        {
+            return Err("resume metadata is outside the private receiving namespace".into());
+        }
+        let location = destinations.location(&destination)?;
+        let directory =
+            vot_sdk_file::ReceiveDirectory::from_directory(location.directory().clone())
+                .map_err(|error| error.to_string())?;
+        let journal = destinations.location(&file.journal_path)?;
+        destinations.check_location(&journal)?;
+        match journal.identity() {
+            Ok(_) => directory
+                .forget_publication(name, &state)
+                .map_err(|error| error.to_string())?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let staging = destinations.location(&file.staging_path)?;
+                match staging.identity() {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(error) => return Err(error.to_string()),
+                    Ok(_) => {
+                        return Err("publication journal is missing but staging remains".into())
+                    }
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+        destinations.check_location(&location)?;
+        destinations.check_location(&journal)?;
+        match journal.identity() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.to_string()),
+            Ok(_) => return Err("publication journal changed during cleanup".into()),
+        }
+        // Journal unlink must survive before the database forgets the completion fence.
+        journal.sync_parent().map_err(|error| error.to_string())?;
+    }
+    store.delete_upload_session(&session.id)
+}
+
 fn restore_files(
     setup: &WorkerSetup,
     persisted: &mut PersistedUploadSession,
     active: impl Fn() -> bool,
 ) -> Result<(Vec<FileState>, Vec<PathBuf>), String> {
+    if persisted.committed_upload_id.is_some() {
+        return Err("completed upload cannot resume receiving".into());
+    }
     let mut files = Vec::with_capacity(persisted.files.len());
     let mut kept = Vec::new();
     for file in &mut persisted.files {
@@ -1245,14 +1322,7 @@ fn restore_files(
         let directory = setup.destinations.directory(parent, false)?;
         let name = destination.file_name().ok_or("missing destination name")?;
         let runs = (file.prefix_bytes > 0).then_some((0, file.prefix_bytes));
-        let state = vot_sdk_file::ResumeState {
-            staging_name: file.staging_path.file_name().unwrap_or_default().to_owned(),
-            journal_name: file.journal_path.file_name().unwrap_or_default().to_owned(),
-            incarnation: file.incarnation,
-            profile: file.profile,
-            nas_contract: file.nas_contract,
-            runs: runs.into_iter().collect(),
-        };
+        let state = persisted_resume_state(file);
         let native = if file.published
             && !file.journal_path.try_exists().map_err(|e| e.to_string())?
         {
@@ -2101,6 +2171,9 @@ pub fn commit_persisted_interruption(
     session: &crate::store::PersistedUploadSession,
     detail: &str,
 ) {
+    if session.committed_upload_id.is_some() {
+        return;
+    }
     let records: Vec<FileRecord> = session
         .files
         .iter()
@@ -2206,8 +2279,7 @@ fn commit_upload_records(
         total_bytes: records.iter().map(|record| record.bytes).sum(),
         files: records.clone(),
     };
-    let upload_id = upload.id.clone();
-    let recorded = setup
+    let upload_id = setup
         .store
         .append_upload_from_session(
             &setup.tenant,
@@ -2215,10 +2287,8 @@ fn commit_upload_records(
             upload,
             &hex::encode(setup.session_id),
         )
-        .map_err(SessionError::internal)?;
-    if !recorded {
-        return Err(SessionError::conflict("request link no longer exists"));
-    }
+        .map_err(SessionError::internal)?
+        .ok_or_else(|| SessionError::conflict("request link no longer exists"))?;
     Ok(FinishReport {
         upload_id,
         files: records,
@@ -2707,7 +2777,8 @@ impl Drop for PushReceive {
         drop(inner);
         crate::app::remove_push_ticket(&self.app, &sid);
         if retain {
-            if self.control.park() {
+            let parked = self.control.park();
+            if !succeeded && parked {
                 let _ = self.app.sessions.mark_active(&sid);
             } else {
                 self.app.sessions.remove(&sid);
@@ -5256,18 +5327,260 @@ mod push_tests {
                     .execute_batch("DROP TRIGGER IF EXISTS fail_checkpoint;")
                     .unwrap();
                 let journal_before = fs::read(&journal).unwrap();
-                let checks = AtomicU64::new(0);
-                assert!(restore_files(&retry_setup, &mut persisted, || {
-                    checks.fetch_add(1, Ordering::Relaxed) < 2
-                })
-                .is_err());
-                assert_eq!(checks.load(Ordering::Relaxed), 3);
+                assert!(persisted.committed_upload_id.is_some());
+                assert!(restore_files(&retry_setup, &mut persisted, || true).is_err());
                 assert_eq!(fs::read(&journal).unwrap(), journal_before);
-                let (files, _) = restore_files(&retry_setup, &mut persisted, || true).unwrap();
-                assert!(files[0].published);
+                cleanup_committed_session(&store, &persisted, &retry_setup.destinations).unwrap();
+                assert!(store.load_upload_sessions().unwrap().is_empty());
                 assert!(!journal.exists());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn committed_upload_recovery_never_readmits_or_recreates_deleted_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+        for (checkpoint, final_state) in [
+            (true, "original"),
+            (false, "original"),
+            (true, "missing"),
+            (false, "replaced"),
+            (false, "cleaned"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = crate::api::testing::config(directory.path());
+            config.receive_dir = directory.path().join("receive");
+            let app = crate::app::build(config.clone()).unwrap();
+            let bytes = b"frame";
+            let object = object(Suite::Blake3Bao64, bytes);
+            let setup = setup_with_app(directory.path(), object.clone(), &app);
+            app.store
+                .insert_link(crate::store::tests::test_link(&setup.link_id))
+                .unwrap();
+            let source = directory.path().join("source");
+            fs::write(&source, bytes).unwrap();
+            let mut file =
+                open_destination_for(&setup, vec!["frame".into()], object.clone()).unwrap();
+            persist_session(&setup, std::slice::from_ref(&file)).unwrap();
+            reprove_staging(&source, &object, vec![&mut file], || true).unwrap();
+            publish_file(&setup, &mut file, || true).unwrap();
+            let journal = file.native.as_ref().unwrap().journal.clone();
+            let private = setup.dest_dir.join(".vot-stage");
+            if checkpoint {
+                app.store.with(|connection| connection.execute_batch("CREATE TRIGGER fail_checkpoint BEFORE UPDATE ON upload_session_files BEGIN SELECT RAISE(FAIL, 'checkpoint failure'); END;")).unwrap();
+            } else {
+                fs::set_permissions(&private, fs::Permissions::from_mode(0o770)).unwrap();
+            }
+            let mut phase = Phase::Receiving { files: vec![file] };
+            let report =
+                handle_finish(&setup, &mut phase, 0, 0, 5, &TransferLog::default()).unwrap();
+            assert!(journal.exists());
+            assert_eq!(app.store.load_upload_sessions().unwrap().len(), 1);
+            let (received, retained) = app.store.tenant_admission_usage("").unwrap();
+            assert_eq!(received, 5);
+            assert!(
+                retained.is_empty(),
+                "committed uploads must not reserve their bytes again"
+            );
+            app.store
+                .with(|connection| {
+                    connection.execute_batch("DROP TRIGGER IF EXISTS fail_checkpoint;")
+                })
+                .unwrap();
+            fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+            let final_path = setup.dest_dir.join("frame");
+            if final_state != "original" {
+                app.store
+                    .update_link_uploads("", &setup.link_id, |link| {
+                        link.uploads.clear();
+                        link.active = false;
+                    })
+                    .unwrap();
+                match final_state {
+                    "missing" => fs::remove_file(&final_path).unwrap(),
+                    "replaced" => {
+                        fs::rename(&final_path, directory.path().join("original")).unwrap();
+                        fs::write(&final_path, b"operator replacement").unwrap();
+                    }
+                    "cleaned" => fs::remove_file(&journal).unwrap(),
+                    _ => unreachable!(),
+                }
+            }
+            drop(phase);
+            drop(setup);
+            drop(app);
+            for _ in 0..2 {
+                let app = crate::app::build(config.clone()).unwrap();
+                assert_eq!(
+                    app.sessions.total(),
+                    0,
+                    "completed recovery must not start a receiver"
+                );
+                app.sessions.sweep(0);
+                let link = app.store.link("", "link").unwrap().unwrap();
+                if final_state == "original" {
+                    assert_eq!(link.uploads.len(), 1);
+                    assert_eq!(link.uploads[0].id, report.upload_id);
+                    assert!(!link.uploads[0].partial);
+                    assert_eq!(fs::read(&final_path).unwrap(), bytes);
+                } else {
+                    assert!(link.uploads.is_empty(), "deleted history must stay deleted");
+                    assert!(!link.active);
+                }
+                assert!(
+                    link.events.is_empty(),
+                    "cleanup must not record an interrupted transfer"
+                );
+                let unresolved = matches!(final_state, "missing" | "replaced");
+                assert_eq!(
+                    app.store.load_upload_sessions().unwrap().len(),
+                    usize::from(unresolved)
+                );
+                assert!(app.store.tenant_admission_usage("").unwrap().1.is_empty());
+                assert_eq!(journal.exists(), unresolved);
+                if final_state == "missing" {
+                    assert!(!final_path.exists());
+                }
+                if final_state == "replaced" {
+                    assert_eq!(fs::read(&final_path).unwrap(), b"operator replacement");
+                }
+                drop(app);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_refuses_a_displaced_journal_directory() {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let object = object(Suite::Blake3Bao64, b"");
+        let setup = setup(root.path(), object.clone());
+        setup
+            .store
+            .insert_link(crate::store::tests::test_link(&setup.link_id))
+            .unwrap();
+        let mut file = open_destination_for(&setup, vec!["frame".into()], object).unwrap();
+        persist_session(&setup, std::slice::from_ref(&file)).unwrap();
+        publish_file(&setup, &mut file, || true).unwrap();
+        commit_upload(
+            &setup,
+            std::slice::from_ref(&file),
+            0,
+            0,
+            Some("http"),
+            Vec::new(),
+        )
+        .unwrap();
+        let session = setup.store.load_upload_sessions().unwrap().remove(0);
+        let journal = &session.files[0].journal_path;
+        let private = setup.dest_dir.join(".vot-stage");
+        let held = setup.dest_dir.join("held-stage");
+        fs::rename(&private, &held).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&private).unwrap();
+        let previous = held.join(journal.file_name().unwrap());
+        fs::copy(&previous, journal).unwrap();
+        let bytes = fs::read(&previous).unwrap();
+        assert!(cleanup_committed_session(&setup.store, &session, &setup.destinations).is_err());
+        assert_eq!(setup.store.load_upload_sessions().unwrap(), vec![session]);
+        assert_eq!(fs::read(previous).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn completion_fence_commits_atomically_and_survives_history_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let object = object(Suite::Blake3Bao64, b"");
+        let setup = setup(directory.path(), object.clone());
+        setup
+            .store
+            .insert_link(crate::store::tests::test_link(&setup.link_id))
+            .unwrap();
+        let mut file = open_destination_for(&setup, vec!["frame".into()], object).unwrap();
+        persist_session(&setup, std::slice::from_ref(&file)).unwrap();
+        publish_file(&setup, &mut file, || true).unwrap();
+        assert!(checkpoint_session(&setup, std::slice::from_mut(&mut file)));
+        setup.store.with(|connection| connection.execute_batch("CREATE TRIGGER fail_completion BEFORE UPDATE OF committed_upload_id ON upload_sessions BEGIN SELECT RAISE(ABORT, 'completion failure'); END;")).unwrap();
+        assert!(commit_upload(
+            &setup,
+            std::slice::from_ref(&file),
+            0,
+            0,
+            Some("http"),
+            Vec::new()
+        )
+        .unwrap_err()
+        .message
+        .contains("completion failure"));
+        let mut saved = setup.store.load_upload_sessions().unwrap().remove(0);
+        assert!(saved.committed_upload_id.is_none());
+        assert!(saved.files[0].published);
+        assert!(setup
+            .store
+            .link("", "link")
+            .unwrap()
+            .unwrap()
+            .uploads
+            .is_empty());
+        assert_eq!(
+            setup
+                .store
+                .with(|connection| connection
+                    .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0)))
+                .unwrap(),
+            0
+        );
+        let (files, _) = restore_files(&setup, &mut saved, || true).unwrap();
+        assert!(
+            files[0].published,
+            "an uncommitted publication must remain recoverable"
+        );
+        setup
+            .store
+            .with(|connection| connection.execute_batch("DROP TRIGGER fail_completion;"))
+            .unwrap();
+        let report = commit_upload(&setup, &files, 0, 0, Some("http"), Vec::new()).unwrap();
+        assert_eq!(
+            commit_upload(&setup, &files, 0, 0, Some("http"), Vec::new())
+                .unwrap()
+                .upload_id,
+            report.upload_id
+        );
+        assert_eq!(
+            setup.store.link("", "link").unwrap().unwrap().uploads.len(),
+            1
+        );
+        setup
+            .store
+            .update_link_uploads("", "link", |link| {
+                link.uploads.clear();
+                link.active = false;
+            })
+            .unwrap();
+        for partial in [false, true] {
+            assert_eq!(
+                commit_upload_records(
+                    &setup,
+                    file_records(&setup, files.iter()),
+                    0,
+                    0,
+                    Some("http"),
+                    partial,
+                    Vec::new()
+                )
+                .unwrap()
+                .upload_id,
+                report.upload_id
+            );
+            assert!(setup
+                .store
+                .link("", "link")
+                .unwrap()
+                .unwrap()
+                .uploads
+                .is_empty());
+        }
+        assert!(setup.store.load_upload_sessions().unwrap()[0]
+            .committed_upload_id
+            .is_some());
     }
 
     #[tokio::test]
@@ -5277,6 +5590,10 @@ mod push_tests {
             let application = crate::api::testing::build(directory.path());
             let object = object(Suite::Blake3Bao64, b"");
             let setup = setup_with_app(directory.path(), object.clone(), &application);
+            application
+                .store
+                .insert_link(crate::store::tests::test_link(&setup.link_id))
+                .unwrap();
             let key = hex::encode([5; 16]);
             let stage = setup.destinations.push_directory(&key).unwrap();
             let lock = lock_push_directory(&stage, vot_sdk_file::NasContract::Unqualified).unwrap();
@@ -5293,10 +5610,39 @@ mod push_tests {
             if cleaned {
                 assert!(forget_publications(std::slice::from_mut(&mut file)));
             }
+            let report = commit_upload(
+                &setup,
+                std::slice::from_ref(&file),
+                0,
+                0,
+                Some("push"),
+                Vec::new(),
+            )
+            .unwrap();
+            let control = PushControl::resumable(key.clone(), Some(lock));
+            let (sender, _) = mpsc::channel(1);
+            application
+                .sessions
+                .insert_admitted(
+                    SessionAdmission {
+                        id: record.id.clone(),
+                        link_id: setup.link_id.clone(),
+                        tenant: String::new(),
+                        reserved_bytes: 0,
+                        max_total_bytes: None,
+                        max_tenant_sessions: None,
+                        max_link_sessions: usize::MAX,
+                        max_sessions: usize::MAX,
+                        kind: SessionKind::Push(control.clone()),
+                    },
+                    sender,
+                    || Ok((0, Vec::new())),
+                )
+                .unwrap();
             let (seams, handle) = push_seams(
                 Arc::clone(&application),
                 setup,
-                PushControl::resumable(key.clone(), Some(lock)),
+                control,
                 tokio::runtime::Handle::current(),
             );
             let receive = handle.0.upgrade().unwrap();
@@ -5313,6 +5659,37 @@ mod push_tests {
                 application.store.load_push_session(&key).unwrap().is_some(),
                 !cleaned
             );
+            assert_eq!(application.sessions.total(), 0);
+            if !cleaned {
+                let saved = application.store.load_push_session(&key).unwrap().unwrap();
+                assert_eq!(
+                    saved.committed_upload_id.as_deref(),
+                    Some(report.upload_id.as_str())
+                );
+                let mut retry =
+                    setup_with_app(directory.path(), saved.package.clone(), &application);
+                retry.session_id = [8; 16];
+                assert!(persist_push(&retry, key.clone())
+                    .unwrap_err()
+                    .contains("completed upload"));
+                for same_id in [false, true] {
+                    let mut replacement = record.clone();
+                    if same_id {
+                        replacement.push_key = Some(hex::encode([9; 16]));
+                    } else {
+                        replacement.id = hex::encode([8; 16]);
+                    }
+                    assert!(application
+                        .store
+                        .insert_upload_session(&replacement)
+                        .unwrap_err()
+                        .contains("completed upload"));
+                    assert_eq!(
+                        application.store.load_push_session(&key).unwrap().unwrap(),
+                        saved
+                    );
+                }
+            }
             assert!(directory.path().join("receive/frame").exists());
         }
     }

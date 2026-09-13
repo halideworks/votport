@@ -470,6 +470,14 @@ Existing receiving directories are never relocated automatically. Preserve the
 database and payload directories and use a matching release to export data
 before an intentional schema or storage-layout transition.
 
+Schema 36 records upload completion atomically with history and workflow
+creation. Completed uploads awaiting journal cleanup are never resumed or
+charged as retained transfers. A transition from schema 35 requires draining
+all upload sessions, stopping VOTPort and making a verified cold backup before
+an explicit offline database conversion. Do not infer completion from published
+file flags or discard unresolved session rows. Older archives require a matching
+binary; take fresh backups after the transition and upgrade replicas together.
+
 The local platform password is break-glass for every namespace; named
 tenants have no separate password.
 
