@@ -109,17 +109,23 @@ pub fn mark_needs_password(id: &str) {
     }
 }
 
+fn protect_directory(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 fn write_in(dir: &std::path::Path, entry: &Entry) -> Result<()> {
     fs::create_dir_all(dir)?;
+    protect_directory(dir)?;
     let bytes = serde_json::to_vec_pretty(entry)
         .map_err(|error| Error::Other(format!("encoding a journal entry: {error}")))?;
-    // Written whole under a temp name, so a crash mid-write never leaves a
-    // half entry for the next launch to refuse.
-    // Not a `.json` name, so a listing never sees a half-written entry.
-    let temp = dir.join(format!("{}.{}.tmp", entry.id, std::process::id()));
-    fs::write(&temp, bytes)?;
-    fs::rename(&temp, path_of(dir, &entry.id))?;
-    Ok(())
+    crate::identity::write_private(&path_of(dir, &entry.id), &bytes)
 }
 
 /// Forgets the pending send entries that name exactly `path`: a watch drop
@@ -150,7 +156,7 @@ pub fn pending() -> Vec<Entry> {
 }
 
 fn pending_in(dir: &std::path::Path) -> Vec<Entry> {
-    let Ok(read) = fs::read_dir(dir) else {
+    let Ok(read) = protect_directory(dir).and_then(|()| fs::read_dir(dir)) else {
         return Vec::new();
     };
     let mut entries: Vec<Entry> = read
@@ -172,8 +178,9 @@ pub fn get(id: &str) -> Result<Entry> {
 }
 
 fn get_in(dir: &std::path::Path, id: &str) -> Result<Entry> {
-    let bytes =
-        fs::read(path_of(dir, id)).map_err(|_| Error::UnknownTransfer { id: id.to_owned() })?;
+    let bytes = protect_directory(dir)
+        .and_then(|()| fs::read(path_of(dir, id)))
+        .map_err(|_| Error::UnknownTransfer { id: id.to_owned() })?;
     serde_json::from_slice(&bytes).map_err(|_| Error::UnknownTransfer { id: id.to_owned() })
 }
 
@@ -203,8 +210,52 @@ mod tests {
             needs_password: false,
             started_unix: 2,
         };
+        fs::create_dir_all(&dir).unwrap();
+        let retained = serde_json::to_vec(&first).unwrap();
+        fs::write(path_of(&dir, &first.id), &retained).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(path_of(&dir, &first.id), fs::Permissions::from_mode(0o644))
+                .unwrap();
+            for lookup in ["pending", "get"] {
+                fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+                let entries = if lookup == "pending" {
+                    pending_in(&dir)
+                } else {
+                    vec![get_in(&dir, &first.id).unwrap()]
+                };
+                assert_eq!(entries, std::slice::from_ref(&first), "{lookup}");
+                assert_eq!(
+                    fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                    0o700,
+                    "{lookup} must protect existing journal credentials"
+                );
+                assert_eq!(fs::read(path_of(&dir, &first.id)).unwrap(), retained);
+            }
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         write_in(&dir, &second).unwrap();
         write_in(&dir, &first).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for entry in [&first, &second] {
+                assert_eq!(
+                    fs::metadata(path_of(&dir, &entry.id))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600,
+                    "journal link credentials must be private"
+                );
+            }
+            assert_eq!(
+                fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
         fs::write(dir.join("junk.json"), b"{not json").unwrap();
         fs::write(dir.join("note.txt"), b"ignored").unwrap();
         assert_eq!(pending_in(&dir), vec![first.clone(), second.clone()]);
