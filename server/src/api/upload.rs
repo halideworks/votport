@@ -392,6 +392,16 @@ async fn prepare_session(
             .quotas_for("", &app.config)
             .map_err(super::store_unavailable)?
     };
+    if link
+        .dest
+        .split('/')
+        .any(crate::protocol_paths::is_receipt_name)
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "receiving destination uses a name reserved for signed receipts",
+        ));
+    }
     // Compute the destination before either transport reserves capacity. Link
     // creation already vets these components; join_under repeats the boundary
     // check so native push and HTTP fail admission in the same place.
@@ -1438,6 +1448,50 @@ mod push_preflight_tests {
             )
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stored_receipt_destinations_refuse_both_transports_before_reserving() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = push_app(directory.path());
+        let mut link = open_link("old-destination");
+        link.dest = "deliveries/report.vot-receI\u{307}pt/child".into();
+        application.store.insert_link(link.clone()).unwrap();
+        let holder = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        for transport in ["session", "push"] {
+            let mut body = request_body(&holder, 7);
+            if transport == "session" {
+                body.as_object_mut().unwrap().remove("holder_key");
+                body["package"]["suite"] = json!("blake3");
+            }
+            let response = app::router(application.clone())
+                .oneshot(
+                    Request::post(format!("/api/r/{}/{transport}", link.id))
+                        .header("content-type", "application/json")
+                        .extension(ConnectInfo(std::net::SocketAddr::from((
+                            [127, 0, 0, 1],
+                            1234,
+                        ))))
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{transport}"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(
+                String::from_utf8_lossy(&body).contains("reserved for signed receipts"),
+                "{transport}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(application.sessions.active_for_link(&link.id), 0);
+            assert!(application.push_tickets.lock().unwrap().is_empty());
+            assert!(!application.config.receive_dir.join("deliveries").exists());
+        }
     }
 
     async fn response_json(response: Response) -> serde_json::Value {

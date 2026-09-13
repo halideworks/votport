@@ -5,6 +5,7 @@
 //! votport policy (hidden files off by default), applied before any path
 //! touches the disk.
 
+use crate::protocol_paths::is_receipt_name;
 use std::path::{Path, PathBuf};
 
 /// Private subtree for named tenants. Package paths can never name it, so
@@ -322,6 +323,9 @@ pub fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String
                 .to_owned(),
         );
     }
+    if is_receipt_name(component) {
+        return Err("name is reserved for signed receipts".into());
+    }
     if !allow_hidden && component.starts_with('.') {
         return Err(
             "hidden file names are not accepted (VOTPORT_ALLOW_HIDDEN=1 to allow)".to_owned(),
@@ -371,6 +375,9 @@ pub fn admit_dest(dest: &str) -> Result<String, String> {
     let mut parts = Vec::new();
     for component in trimmed.split('/') {
         let component = component.trim();
+        if is_receipt_name(component) {
+            return Err("name is reserved for signed receipts".into());
+        }
         if component.is_empty() || component == "." || component == ".." {
             return Err(
                 "destination folder may not contain empty, '.' or '..' segments".to_owned(),
@@ -419,6 +426,11 @@ pub(crate) fn admit_portable_paths<'a>(
     use unicode_normalization::UnicodeNormalization as _;
     let mut keyed = Vec::new();
     for name in names {
+        if name.split('/').any(is_receipt_name) {
+            return Err(format!(
+                "filename {name:?} is reserved for signed receipts; rename it before sharing"
+            ));
+        }
         let invalid = || format!("filename {name:?} is not portable; rename it before sharing");
         let path = vot_manifest::PackagePath::portable(name.split('/')).map_err(|_| invalid())?;
         let key = vot_manifest::canonical_path_key(&path, vot_manifest::PathProfile::Portable)
@@ -705,6 +717,31 @@ mod tests {
         assert!(admit_component(".VOT-TENANTS.STAGE", true).is_err());
         assert!(admit_component(".VOT-TENANTſ.STAGE", true).is_err());
         assert!(admit_component("VOTTEN~1", true).is_err());
+        for name in [
+            "report.vot-receipt",
+            "report.VOT-RECEIPT",
+            "report.vot-receI\u{307}pt",
+            ".vot-receipt",
+            "report.vot-receipt. ",
+        ] {
+            for hidden in [false, true] {
+                assert!(admit_component(name, hidden)
+                    .unwrap_err()
+                    .contains("reserved for signed receipts"));
+            }
+            for path in [
+                name.to_owned(),
+                format!("folder/{name}"),
+                format!("{name}/child"),
+            ] {
+                assert!(admit_dest(&path)
+                    .unwrap_err()
+                    .contains("reserved for signed receipts"));
+                assert!(admit_portable_paths([path.as_str()])
+                    .unwrap_err()
+                    .contains("reserved for signed receipts"));
+            }
+        }
     }
 
     #[test]

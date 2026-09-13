@@ -1391,6 +1391,38 @@ async fn changing_the_admin_password_evicts_other_sessions_but_not_the_actor() {
     assert_eq!(response.status(), 401, "other sessions are evicted");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn receipt_names_are_refused_before_publication() {
+    let server = start_server().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    for reserved in [
+        "report.pdf.vot-receipt",
+        "report.pdf.VOT-RECEIPT",
+        "report.pdf.vot-receipt/child",
+        "report.pdf.vot-receI\u{307}pt/child",
+    ] {
+        let files = [
+            prepare(vec!["report.pdf"], b"payload".to_vec()),
+            prepare(reserved.split('/').collect(), b"sender-sidecar".to_vec()),
+        ];
+        let (_, session) = open_session(&client, &server.base, "receipt collision", &files).await;
+        let (status, body) = begin(&client, &server.base, &session).await;
+        assert_eq!(status, 422, "{reserved}: {body}");
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("reserved for signed receipts"));
+        assert!(!server.receive_dir.join("report.pdf").exists());
+        assert!(!server
+            .receive_dir
+            .join(reserved.split('/').next().unwrap())
+            .exists());
+    }
+}
+
 /// Every published file gets a signed receipt sidecar that verifies against
 /// the advertised key, and the admin can delete files and clear history.
 #[tokio::test(flavor = "multi_thread")]

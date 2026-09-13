@@ -1311,6 +1311,20 @@ fn restore_files(
     if persisted.committed_upload_id.is_some() {
         return Err("completed upload cannot resume receiving".into());
     }
+    if setup
+        .dest_rel
+        .split('/')
+        .chain(persisted.dest_rel.split('/'))
+        .chain(
+            persisted
+                .files
+                .iter()
+                .flat_map(|file| file.stored_components.iter().map(String::as_str)),
+        )
+        .any(crate::protocol_paths::is_receipt_name)
+    {
+        return Err("resume path uses a name reserved for signed receipts".into());
+    }
     let mut files = Vec::with_capacity(persisted.files.len());
     let mut kept = Vec::new();
     for file in &mut persisted.files {
@@ -1512,6 +1526,9 @@ fn find_delivered(
                 None => continue,
             }
         };
+        if rel.split('/').any(crate::protocol_paths::is_receipt_name) {
+            continue;
+        }
         let components: Vec<String> = rel.split('/').map(str::to_owned).collect();
         let Ok(path) = paths::join_under(&setup.dest_dir, &components) else {
             continue;
@@ -1578,6 +1595,15 @@ fn prepare_files<'a>(
     delivered: &HashMap<(&str, &str), Vec<&FileRecord>>,
     active: impl Fn() -> bool + Sync,
 ) -> Result<(Vec<FileState>, std::sync::MutexGuard<'a, ()>), SessionError> {
+    if setup
+        .dest_rel
+        .split('/')
+        .any(crate::protocol_paths::is_receipt_name)
+    {
+        return Err(SessionError::bad(
+            "receiving destination uses a name reserved for signed receipts",
+        ));
+    }
     let existing = prepare_parallel(entries, |_, (_, object)| {
         if !active() {
             return Err(SessionError::conflict("receive preparation cancelled"));
@@ -6383,6 +6409,73 @@ mod push_tests {
     }
 
     #[test]
+    fn receipt_name_recovery_preserves_staging_before_publication() {
+        for (destination, names) in [
+            ("", vec!["frame.vot-receipt"]),
+            ("", vec!["frame.VOT-RECEIPT", "child"]),
+            ("old.vot-receI\u{307}pt", vec!["frame"]),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let bytes = b"frame";
+            let object = object(Suite::Blake3Bao64, bytes);
+            let mut setup = setup(directory.path(), object.clone());
+            setup.dest_rel = destination.into();
+            setup.dest_dir = setup.dest_dir.join(destination);
+            let source = directory.path().join("source");
+            fs::write(&source, bytes).unwrap();
+            let mut files = [
+                open_destination_for(&setup, vec!["allowed".into()], object.clone()).unwrap(),
+                open_destination_for(
+                    &setup,
+                    names.iter().map(|name| (*name).into()).collect(),
+                    object.clone(),
+                )
+                .unwrap(),
+            ];
+            reprove_staging(&source, &object, files.iter_mut().collect(), || true).unwrap();
+            persist_session(&setup, &files).unwrap();
+            for file in &mut files {
+                file.native.take().unwrap().abandon();
+            }
+            let mut saved = setup.store.load_upload_sessions().unwrap().remove(0);
+            assert!(saved
+                .files
+                .iter()
+                .all(|file| file.prefix_bytes == bytes.len() as u64));
+            let before = saved.clone();
+            let retained: Vec<_> = saved
+                .files
+                .iter()
+                .flat_map(|file| [&file.staging_path, &file.journal_path])
+                .map(|path| (path.clone(), fs::read(path).unwrap()))
+                .collect();
+            assert!(restore_files(&setup, &mut saved, || true)
+                .err()
+                .expect("reserved checkpoint resumed")
+                .contains("reserved for signed receipts"));
+            assert_eq!(saved, before);
+            assert_eq!(setup.store.load_upload_sessions().unwrap(), [before]);
+            for (path, data) in retained {
+                assert_eq!(fs::read(path).unwrap(), data);
+            }
+            assert!(!setup.dest_dir.join("allowed").exists());
+            assert!(!setup.dest_dir.join(names.join("/")).exists());
+            if !destination.is_empty() {
+                let error = prepare_files(
+                    &setup,
+                    &[(vec!["new".into()], object.clone())],
+                    &HashMap::new(),
+                    || true,
+                )
+                .err()
+                .expect("reserved destination admitted without a checkpoint manifest");
+                assert!(error.message.contains("reserved for signed receipts"));
+                assert!(!setup.dest_dir.join("new").exists());
+            }
+        }
+    }
+
+    #[test]
     fn publication_refuses_a_replaced_visible_parent_after_cache_eviction() {
         let directory = tempfile::tempdir().unwrap();
         let object = object(Suite::Blake3Bao64, b"");
@@ -6825,6 +6918,26 @@ mod push_tests {
                 HashMap::from([((record.suite.as_str(), record.root.as_str()), vec![&record])]);
             assert!(find_delivered(&setup, &delivered, &expected, || true).is_some());
             assert!(find_delivered(&setup, &delivered, &expected, || false).is_none());
+            for name in ["old.vot-receipt", "old.vot-receI\u{307}pt/frame"] {
+                let reserved = setup.dest_dir.join(name);
+                fs::create_dir_all(reserved.parent().unwrap()).unwrap();
+                fs::write(&reserved, b"original").unwrap();
+                let old = FileRecord {
+                    stored_as: name.into(),
+                    ..record.clone()
+                };
+                let prior = HashMap::from([((old.suite.as_str(), old.root.as_str()), vec![&old])]);
+                let (files, _allocation) = prepare_files(
+                    &setup,
+                    &[(vec!["renamed.bin".into()], expected.clone())],
+                    &prior,
+                    || true,
+                )
+                .unwrap();
+                assert_eq!(files[0].stored_components, ["renamed.bin"]);
+                assert!(!files[0].published);
+                assert_eq!(fs::read(&reserved).unwrap(), b"original");
+            }
             fs::write(&path, b"changed!").unwrap();
             assert!(find_delivered(&setup, &delivered, &expected, || true).is_none());
             let file = FileState {
@@ -7075,6 +7188,15 @@ mod push_tests {
             entries: 1,
         };
         assert!(validate_push_manifest(&setup, summary, std::slice::from_ref(&direct)).is_ok());
+        for path in [
+            vec!["report.vot-receipt"],
+            vec!["report.VOT-RECEIPT", "child"],
+            vec!["report.vot-receI\u{307}pt"],
+        ] {
+            let reserved = record(vot_manifest::PackagePath::portable(path).unwrap(), &logical);
+            let error = validate_push_manifest(&setup, summary, &[reserved]).unwrap_err();
+            assert!(error.message.contains("reserved for signed receipts"));
+        }
 
         let mut mismatch = summary;
         mismatch.root[0] ^= 1;

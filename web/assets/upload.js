@@ -378,6 +378,7 @@ function validateComponent(component) {
   const compatibility = component.normalize('NFKC');
   if (compatibility === '.' || compatibility === '..') return 'name is a directory reference';
   const folded = fold(component);
+  if (folded.endsWith('.vot-receipt')) return 'this name is reserved for signed receipts';
   if (folded === '' || folded === '.' || folded === '..') return 'name is a directory reference';
   const stem = folded.split('.')[0];
   if (/^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])$/.test(stem)) {
