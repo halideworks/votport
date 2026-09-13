@@ -939,7 +939,6 @@ fn resume_upload_sessions(
     active: &mut crate::receiving::Active,
 ) -> Result<HashSet<std::path::PathBuf>, String> {
     active.during_recovery(|destinations| {
-        store.migrate_tenant_storage(&config.receive_dir, || destinations.check_live())?;
         Ok(restore_upload_sessions(
             config,
             store,

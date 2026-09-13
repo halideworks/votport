@@ -27,29 +27,20 @@ A tenant is an isolated namespace:
 Tenants never share links, files, history, or quota. There is no cross-tenant
 sharing feature; if two teams need the same drop folder, that is one tenant.
 
-## Phase 1: SQLite store (no behavior change)
+## SQLite store
 
-`state.json` is one mutex-guarded JSON document rewritten per mutation. It cannot
-carry per-tenant rows, an append-only audit log, or concurrent writers. Replace the
-implementation, not the API.
+VOTPort uses bundled SQLite in `data/votport.db`, with WAL mode and
+`synchronous=FULL`. Links, audit events, tenant quotas and settings share the
+store. Completed uploads and capped session events remain embedded in each link;
+an exact-byte `files` projection is updated atomically for quota and holdings
+accounting.
 
-- rusqlite (bundled SQLite, WAL mode), one database file `data/votport.db`.
-- `Store` keeps its current method set; signatures gain no tenant concept yet.
-- Schema began with `links`, `meta` (schema version), and an `audit_log` table
-  written from phase 2. Completed uploads and capped session events remain
-  embedded in each link row; schema v7 adds an exact-byte `files` projection
-  for quota and holdings accounting, updated atomically by upload append and
-  file deletion. Full history normalization remains deferred until the
-  embedded representation measurably limits a deployment.
-- Migration: whenever legacy `state.json` remains, import it with idempotent
-  inserts and rename it to `state.json.imported`. This safely resumes a crash
-  after the database commit but before the rename. The importer runs before the
-  listener binds; a failed import refuses startup rather than dropping links.
-- `persist()`'s temp-file-plus-fsync dance disappears; SQLite WAL + `synchronous
-  FULL` gives the same durability with less code.
-
-Why not later: every subsequent phase (audit log, tenancy, quotas) needs rows, and
-retrofitting tenancy onto the JSON document twice is wasted work.
+An empty database receives the complete current schema in one transaction.
+Existing databases must match the binary's schema version and use the reserved
+tenant storage layout. Older schemas, newer schemas and `state.json` imports are
+refused without automatic conversion. Preserve those files and use a matching
+release to export data before an intentional transition. Startup never moves
+existing receiving directories.
 
 ## Phase 2: Queryable audit log
 

@@ -452,15 +452,6 @@ pub struct SettingsOverlay {
     pub draining_source: &'static str,
 }
 
-/// The pre-SQLite state document, kept only to import legacy state.json files.
-#[derive(Deserialize)]
-struct LegacyDocument {
-    #[serde(default)]
-    links: Vec<Link>,
-    #[serde(default)]
-    admin_password_hash: Option<String>,
-}
-
 pub(crate) const SCHEMA_VERSION: u64 = 35;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
@@ -488,16 +479,10 @@ CREATE TABLE IF NOT EXISTS principals (
 );
 ";
 
-// v22: SCIM identity. created_at is 0 for rows from before the columns.
-const PRINCIPALS_IDENTITY_SCHEMA: &str = "
-ALTER TABLE principals ADD COLUMN external_id TEXT;
-ALTER TABLE principals ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;
-";
 const PRINCIPALS_IDENTITY_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS principals_external_id ON principals (external_id);";
 
-// v23: SCIM Groups. Membership is by subject so a group can name a user the
-// provider has not created yet; a name is unique so it can map to a role.
+// Membership can name a subject before provisioning; group names map to roles.
 const SCIM_GROUPS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS scim_groups (
     id TEXT PRIMARY KEY,
@@ -513,9 +498,6 @@ CREATE TABLE IF NOT EXISTS scim_group_members (
 CREATE INDEX IF NOT EXISTS scim_group_members_subject ON scim_group_members (subject);
 ";
 
-const LEGAL_HOLD_SCHEMA: &str =
-    "ALTER TABLE links ADD COLUMN legal_hold INTEGER NOT NULL DEFAULT 0;";
-
 const FILES_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS files (
     link_id TEXT NOT NULL,
@@ -529,19 +511,6 @@ CREATE TABLE IF NOT EXISTS files (
     PRIMARY KEY (link_id, upload_index, file_index)
 );
 CREATE INDEX IF NOT EXISTS files_tenant_live ON files(tenant, deleted, bytes_hi, bytes_lo);
-";
-
-// A deduped re-send and a partial record both reference a file another
-// record already counts; byte totals group live rows by path so a physical
-// file counts once. Tables created before v19 gain the column here; the
-// backfill reads the path out of the link's records.
-const FILES_STORED_AS_COLUMN: &str =
-    "ALTER TABLE files ADD COLUMN stored_as TEXT NOT NULL DEFAULT '';";
-const FILES_STORED_AS_BACKFILL: &str = "
-UPDATE files SET stored_as = COALESCE((
-    SELECT json_extract(links.uploads_json,
-        '$[' || files.upload_index || '].files[' || files.file_index || '].stored_as')
-    FROM links WHERE links.id = files.link_id), '');
 ";
 
 /// A grant's VOT package root, and the capabilities minted for it. A root
@@ -560,14 +529,14 @@ const OUTBOUND_GRANT_MANIFESTS_SCHEMA: &str = "
         grant_id TEXT NOT NULL,
         manifest_root TEXT NOT NULL,
         expires_at INTEGER NOT NULL,
-        delivered_at INTEGER
+        delivered_at INTEGER,
+        holder TEXT NOT NULL DEFAULT '',
+        grant_token_hash TEXT NOT NULL DEFAULT '',
+        policy_revision INTEGER NOT NULL DEFAULT 0,
+        admitted_at INTEGER
     );
     CREATE INDEX IF NOT EXISTS outbound_fetch_tickets_grant ON outbound_fetch_tickets(grant_id, expires_at);
 ";
-
-// Tokens issued before v20 carry no folder scope; the column is nullable.
-const AUTOMATION_TOKEN_DIRECTORY_SCHEMA: &str =
-    "ALTER TABLE automation_tokens ADD COLUMN directory TEXT;";
 
 const OUTBOUND_GRANTS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS outbound_grants (
@@ -593,21 +562,13 @@ CREATE TABLE IF NOT EXISTS outbound_grants (
     first_download_at INTEGER,
     last_download_at INTEGER,
     files_json TEXT NOT NULL DEFAULT '[]',
-    file_count INTEGER NOT NULL DEFAULT 1
+    file_count INTEGER NOT NULL DEFAULT 1,
+    notifications_json TEXT
 );
 CREATE INDEX IF NOT EXISTS outbound_grants_tenant_created ON outbound_grants(tenant, created_at);
 CREATE INDEX IF NOT EXISTS outbound_grants_file
     ON outbound_grants(tenant, link_id, upload_id, file_index);
 ";
-
-const OUTBOUND_GRANTS_FILES_SCHEMA: &str =
-    "ALTER TABLE outbound_grants ADD COLUMN files_json TEXT NOT NULL DEFAULT '[]';";
-
-const OUTBOUND_GRANTS_FILE_COUNT_SCHEMA: &str =
-    "ALTER TABLE outbound_grants ADD COLUMN file_count INTEGER NOT NULL DEFAULT 1;
-     UPDATE outbound_grants
-     SET file_count = CASE WHEN json_array_length(files_json) = 0
-                           THEN 1 ELSE json_array_length(files_json) END;";
 
 const OUTBOUND_GRANT_FILES_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS outbound_grant_files (
@@ -629,13 +590,6 @@ CREATE INDEX IF NOT EXISTS outbound_grant_files_downloads
     ON outbound_grant_files(grant_id, downloads);
 ";
 
-const OUTBOUND_GRANTS_PASSWORD_SCHEMA: &str =
-    "ALTER TABLE outbound_grants ADD COLUMN password_hash TEXT;";
-
-const OUTBOUND_GRANTS_DELIVERY_SCHEMA: &str =
-    "ALTER TABLE outbound_grants ADD COLUMN first_download_at INTEGER;
-     ALTER TABLE outbound_grants ADD COLUMN last_download_at INTEGER;";
-
 const AUTOMATION_TOKENS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS automation_tokens (
     id TEXT PRIMARY KEY,
@@ -646,14 +600,12 @@ CREATE TABLE IF NOT EXISTS automation_tokens (
     expires_at INTEGER NOT NULL,
     revoked_at INTEGER,
     last_used_at INTEGER,
-    directory TEXT
+    directory TEXT,
+    permissions TEXT NOT NULL DEFAULT '[\"deliveries:create\"]'
 );
 CREATE INDEX IF NOT EXISTS automation_tokens_tenant_created
     ON automation_tokens(tenant, created_at);
 ";
-
-const OUTBOUND_GRANTS_LIMIT_SCHEMA: &str =
-    "ALTER TABLE outbound_grants ADD COLUMN max_downloads INTEGER;";
 
 const BRANDING_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS branding (
@@ -661,7 +613,10 @@ CREATE TABLE IF NOT EXISTS branding (
     name TEXT NOT NULL,
     color TEXT NOT NULL DEFAULT '',
     logo_ext TEXT NOT NULL DEFAULT '',
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    footer_text TEXT NOT NULL DEFAULT '',
+    footer_link_label TEXT NOT NULL DEFAULT '',
+    footer_link_url TEXT NOT NULL DEFAULT ''
 );
 ";
 
@@ -681,8 +636,10 @@ CREATE TABLE IF NOT EXISTS upload_sessions (
     package_length INTEGER NOT NULL,
     max_total_bytes INTEGER,
     started_at INTEGER NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    push_key TEXT
 );
+CREATE UNIQUE INDEX upload_sessions_push_key ON upload_sessions(push_key) WHERE push_key IS NOT NULL;
 CREATE TABLE IF NOT EXISTS upload_session_files (
     session_id TEXT NOT NULL,
     entry INTEGER NOT NULL,
@@ -697,6 +654,8 @@ CREATE TABLE IF NOT EXISTS upload_session_files (
     prefix_bytes INTEGER NOT NULL DEFAULT 0,
     published INTEGER NOT NULL DEFAULT 0,
     receipt INTEGER NOT NULL DEFAULT 0,
+    commit_profile TEXT NOT NULL DEFAULT 'balanced' CHECK (commit_profile IN ('fast', 'balanced', 'strict')),
+    nas_contract TEXT NOT NULL DEFAULT 'unqualified' CHECK (nas_contract IN ('unqualified', 'server_acknowledged')),
     PRIMARY KEY (session_id, entry)
 );
 ";
@@ -735,8 +694,22 @@ CREATE TABLE IF NOT EXISTS links (
     max_bytes INTEGER,
     active INTEGER NOT NULL DEFAULT 1,
     uploads_json TEXT NOT NULL DEFAULT '[]',
-    events_json TEXT NOT NULL DEFAULT '[]'
+    events_json TEXT NOT NULL DEFAULT '[]',
+    legal_hold INTEGER NOT NULL DEFAULT 0,
+    notifications_json TEXT
 );
+CREATE INDEX links_tenant ON links(tenant);
+CREATE INDEX links_tenant_created ON links(tenant, created_at DESC, id DESC);
+CREATE TABLE automation_operations (
+    token_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    grant_id TEXT NOT NULL UNIQUE,
+    PRIMARY KEY (token_id, operation_id)
+);
+CREATE TABLE delivery_storage_credentials(id TEXT PRIMARY KEY REFERENCES delivery_storage(id), document TEXT NOT NULL);
+CREATE TABLE receive_workflows(link_id TEXT PRIMARY KEY REFERENCES links(id) ON DELETE CASCADE, document TEXT NOT NULL);
+CREATE TABLE receive_workflow_uploads(link_id TEXT NOT NULL REFERENCES links(id) ON DELETE CASCADE, upload_id TEXT NOT NULL, PRIMARY KEY(link_id,upload_id));
 ";
 
 /// Audit rows the store failed to persist since boot; exported on /metrics.
@@ -751,6 +724,13 @@ pub struct Store {
 
 impl Store {
     pub fn open(data_dir: &Path) -> Result<Self, String> {
+        if data_dir
+            .join("state.json")
+            .try_exists()
+            .map_err(|e| e.to_string())?
+        {
+            return Err("state.json is unsupported; preserve it and use a matching release to export the data".into());
+        }
         std::fs::create_dir_all(data_dir)
             .map_err(|error| format!("create {}: {error}", data_dir.display()))?;
         crate::paths::tighten_private_dir(data_dir)?;
@@ -770,8 +750,15 @@ impl Store {
         let shm = path.with_file_name("votport.db-shm");
         crate::paths::tighten_private_file(&wal)?;
         crate::paths::tighten_private_file(&shm)?;
-        let connection =
+        let mut connection =
             Connection::open(&path).map_err(|error| format!("open {}: {error}", path.display()))?;
+        // Refusing an unsupported database must not checkpoint its surviving WAL.
+        connection
+            .set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )
+            .map_err(|e| e.to_string())?;
         connection
             .create_scalar_function(
                 "votport_within",
@@ -786,11 +773,17 @@ impl Store {
                 },
             )
             .map_err(|e| e.to_string())?;
+        initialize_schema(&mut connection)?;
+        connection
+            .set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                false,
+            )
+            .map_err(|e| e.to_string())?;
         connection
             .pragma_update(None, "journal_mode", "WAL")
             .map_err(|error| error.to_string())?;
-        // Durability matches the old fsync-per-persist store: a completed
-        // mutation survives power loss.
+        // A completed mutation must survive power loss.
         connection
             .pragma_update(None, "synchronous", "FULL")
             .map_err(|error| error.to_string())?;
@@ -809,14 +802,9 @@ impl Store {
         // The hot-path statement set must fit or the LRU silently defeats
         // prepare_cached; default capacity is too small at 16.
         connection.set_prepared_statement_cache_capacity(64);
-        connection
-            .execute_batch(SCHEMA)
-            .map_err(|error| format!("schema: {error}"))?;
-        // The db/-wal directory entries are new; sync them like the old JSON
-        // store synced its renames.
-        if let Ok(dir) = std::fs::File::open(data_dir) {
-            let _ = dir.sync_all();
-        }
+        std::fs::File::open(data_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync {}: {error}", data_dir.display()))?;
         let store = Self {
             connection: Mutex::new(connection),
             event_signer: std::sync::Arc::new(crate::receipt::ReceiptSigner::load_or_create(
@@ -824,629 +812,10 @@ impl Store {
             )?),
             path: path.clone(),
         };
-        // v1/v2 databases predate tenant scoping: existing links belong to
-        // the default tenant (""). Idempotent: ignored when the column exists.
-        store
-            .with(|connection| {
-                connection
-                    .execute_batch("ALTER TABLE links ADD COLUMN tenant TEXT NOT NULL DEFAULT ''")
-            })
-            .ok();
-        store.with(|connection| {
-            connection.execute_batch(
-                "CREATE INDEX IF NOT EXISTS links_tenant ON links(tenant);
-                 CREATE INDEX IF NOT EXISTS links_tenant_created
-                 ON links(tenant, created_at DESC, id DESC)",
-            )
-        })?;
-        store.migrate()?;
-        store.import_legacy(data_dir)?;
         crate::paths::tighten_private_file(&path)?;
         crate::paths::tighten_private_file(&wal)?;
         crate::paths::tighten_private_file(&shm)?;
         Ok(store)
-    }
-
-    /// Moves pre-isolation named-tenant subtrees under the reserved storage
-    /// directory. The marker is written last, so a crash between renames can
-    /// resume without moving a subtree twice.
-    pub fn migrate_tenant_storage(
-        &self,
-        receive_dir: &Path,
-        check_live: impl Fn() -> Result<(), String>,
-    ) -> Result<(), String> {
-        const KEY: &str = "tenant_storage_layout";
-        const LAYOUT: &str = "reserved-v1";
-        let marker = self.with(|connection| {
-            connection
-                .query_row("SELECT value FROM meta WHERE key = ?1", [KEY], |row| {
-                    row.get::<_, String>(0)
-                })
-                .optional()
-        })?;
-        if let Some(marker) = marker {
-            return if marker == LAYOUT {
-                Ok(())
-            } else {
-                Err(format!("unsupported tenant storage layout {marker:?}"))
-            };
-        }
-
-        let target_root = receive_dir.join(crate::paths::TENANT_STORAGE_DIR);
-        let metadata = |path: &Path| match std::fs::symlink_metadata(path) {
-            Ok(metadata) => Ok(Some(metadata)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(format!("inspect {}: {error}", path.display())),
-        };
-        let target_root_metadata = metadata(&target_root)?;
-        if target_root_metadata
-            .as_ref()
-            .is_some_and(|metadata| !metadata.file_type().is_dir())
-        {
-            return Err(format!(
-                "tenant storage migration expected a directory at {}; move it aside",
-                target_root.display()
-            ));
-        }
-
-        let default_links = self.links("")?;
-        let default_owns_prefix = |key: &str| {
-            let uses_prefix = |path: &str| {
-                let component = path.split('/').next().unwrap_or_default();
-                component.contains('~')
-                    || !component.is_ascii()
-                    || component.eq_ignore_ascii_case(key)
-            };
-            default_links.iter().any(|link| {
-                uses_prefix(&link.dest)
-                    || link
-                        .uploads
-                        .iter()
-                        .flat_map(|upload| &upload.files)
-                        .any(|file| !file.deleted && uses_prefix(&file.stored_as))
-            })
-        };
-        if target_root_metadata.is_some() && default_owns_prefix(crate::paths::TENANT_STORAGE_DIR) {
-            return Err(format!(
-                "tenant storage migration cannot determine ownership of {}; a default-tenant link also uses that prefix",
-                target_root.display()
-            ));
-        }
-        let tenants = self.tenants()?;
-        let mut moves = Vec::new();
-        for tenant in tenants {
-            if !crate::paths::portable_tenant_key(&tenant.key) {
-                return Err(format!(
-                    "tenant key {:?} is not portable; rename it using lowercase ASCII letters, digits, '-' or '_'",
-                    tenant.key
-                ));
-            }
-            let source = crate::paths::join_under(receive_dir, std::slice::from_ref(&tenant.key))?;
-            let target = target_root.join(&tenant.key);
-            let source_metadata = metadata(&source)?;
-            let target_metadata = metadata(&target)?;
-            for (path, metadata) in [(&source, &source_metadata), (&target, &target_metadata)] {
-                if metadata
-                    .as_ref()
-                    .is_some_and(|metadata| !metadata.file_type().is_dir())
-                {
-                    return Err(format!(
-                        "tenant storage migration expected a directory at {}; move it aside",
-                        path.display()
-                    ));
-                }
-            }
-            let source_exists = source_metadata.is_some();
-            let target_exists = target_metadata.is_some();
-            if source_exists && target_exists {
-                return Err(format!(
-                    "tenant storage migration found both {} and {}; move one aside",
-                    source.display(),
-                    target.display()
-                ));
-            }
-            if (source_exists || target_exists) && default_owns_prefix(&tenant.key) {
-                return Err(format!(
-                    "tenant storage migration cannot determine ownership of {}; a default-tenant link also uses that prefix",
-                    source.display()
-                ));
-            }
-            moves.push((source, target, source_exists));
-        }
-
-        for (source, target, source_exists) in moves {
-            if !source_exists {
-                continue;
-            }
-            check_live()?;
-            std::fs::create_dir_all(&target_root)
-                .map_err(|error| format!("create {}: {error}", target_root.display()))?;
-            check_live()?;
-            crate::paths::tighten_dir(&target_root);
-            check_live()?;
-            std::fs::rename(&source, &target).map_err(|error| {
-                format!("move {} to {}: {error}", source.display(), target.display())
-            })?;
-        }
-        // The database marker must not reach durable storage before the
-        // directory renames it represents, including renames resumed from an
-        // earlier process.
-        #[cfg(unix)]
-        {
-            check_live()?;
-            if target_root.exists() {
-                std::fs::File::open(&target_root)
-                    .and_then(|directory| directory.sync_all())
-                    .map_err(|error| format!("sync {}: {error}", target_root.display()))?;
-            }
-            check_live()?;
-            std::fs::File::open(receive_dir)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| format!("sync {}: {error}", receive_dir.display()))?;
-        }
-        check_live()?;
-        self.with(|connection| {
-            connection.execute(
-                "INSERT INTO meta (key, value) VALUES (?1, ?2)",
-                [KEY, LAYOUT],
-            )
-        })?;
-        Ok(())
-    }
-
-    /// Forward-only schema steps. A file written by a newer binary is refused
-    /// rather than stamped down: rewriting `schema_version` would hide tables
-    /// this process cannot read.
-    fn migrate(&self) -> Result<(), String> {
-        let mut connection = self.connection.lock().expect("store poisoned");
-        let stored = schema_version_stored(&connection)?;
-        if stored > SCHEMA_VERSION {
-            return Err(format!(
-                "database schema version {stored} is newer than this binary ({SCHEMA_VERSION}); refusing to start"
-            ));
-        }
-        if stored == SCHEMA_VERSION {
-            return Ok(());
-        }
-        let transaction = connection
-            .transaction()
-            .map_err(|error| error.to_string())?;
-        if stored < 4 {
-            transaction
-                .execute_batch(SETTINGS_SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if stored < 5 {
-            transaction
-                .execute_batch(PRINCIPALS_SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if stored < 6 {
-            transaction
-                .execute_batch(LEGAL_HOLD_SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if stored < 7 {
-            transaction
-                .execute_batch(FILES_SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-            let links = {
-                let mut statement = transaction
-                    .prepare(
-                        "SELECT id, tenant, label, dest, password_hash, created_at, expires_at,
-                                max_bytes, active, legal_hold, uploads_json, events_json, NULL AS notifications_json
-                         FROM links ORDER BY rowid",
-                    )
-                    .map_err(|error| error.to_string())?;
-                let rows = statement
-                    .query_map([], row_to_link)
-                    .map_err(|error| error.to_string())?;
-                rows.collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| error.to_string())?
-            };
-            for link in &links {
-                rebuild_link_files(&transaction, link).map_err(|error| error.to_string())?;
-            }
-        }
-        if stored < 8 {
-            transaction
-                .execute_batch(OUTBOUND_GRANTS_SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-        } else if stored < 9 {
-            transaction
-                .execute_batch(OUTBOUND_GRANTS_FILES_SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if (8..10).contains(&stored) {
-            transaction
-                .execute_batch(OUTBOUND_GRANTS_PASSWORD_SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if (8..11).contains(&stored) {
-            transaction
-                .execute_batch(OUTBOUND_GRANTS_DELIVERY_SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if stored < 12 {
-            transaction
-                .execute_batch(AUTOMATION_TOKENS_SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if (8..13).contains(&stored) {
-            transaction
-                .execute_batch(OUTBOUND_GRANTS_LIMIT_SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if (8..15).contains(&stored) {
-            transaction
-                .execute_batch(OUTBOUND_GRANTS_FILE_COUNT_SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if stored < 16 {
-            transaction
-                .execute_batch(OUTBOUND_GRANT_FILES_SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-            let grant_ids = {
-                let mut statement = transaction
-                    .prepare("SELECT id FROM outbound_grants WHERE length(trim(files_json)) > 2")
-                    .map_err(|error| error.to_string())?;
-                let rows = statement
-                    .query_map([], |row| row.get::<_, String>(0))
-                    .map_err(|error| error.to_string())?;
-                rows.collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| error.to_string())?
-            };
-            let mut insert = transaction
-                .prepare(
-                    "INSERT INTO outbound_grant_files
-                     (grant_id, file_index, source, name, suite, root, bytes_hi, bytes_lo,
-                      receipt_b64, downloads, first_download_at, last_download_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                )
-                .map_err(|error| error.to_string())?;
-            for id in grant_ids {
-                let files_json: String = transaction
-                    .query_row(
-                        "SELECT files_json FROM outbound_grants WHERE id = ?1",
-                        [&id],
-                        |row| row.get(0),
-                    )
-                    .map_err(|error| error.to_string())?;
-                let files: Vec<OutboundGrantFile> =
-                    serde_json::from_str(&files_json).map_err(|error| {
-                        format!("parse outbound grant files during migration: {error}")
-                    })?;
-                for (index, file) in files.into_iter().enumerate() {
-                    let (bytes_hi, bytes_lo) = split_bytes(file.bytes);
-                    insert
-                        .execute(rusqlite::params![
-                            id,
-                            i64::try_from(index).unwrap_or(i64::MAX),
-                            file.source,
-                            file.name,
-                            file.suite,
-                            file.root,
-                            bytes_hi,
-                            bytes_lo,
-                            file.receipt_b64,
-                            i64::try_from(file.downloads).unwrap_or(i64::MAX),
-                            file.first_download_at
-                                .map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
-                            file.last_download_at
-                                .map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
-                        ])
-                        .map_err(|error| error.to_string())?;
-                }
-            }
-        }
-        if stored < 17 {
-            transaction
-                .execute_batch(BRANDING_SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if stored < 18 {
-            transaction
-                .execute_batch(UPLOAD_SESSIONS_SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if stored < 19 {
-            // Synthetic fixtures from before v7 may lack the table entirely.
-            transaction
-                .execute_batch(FILES_SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-            let has_column: bool = transaction
-                .query_row(
-                    "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = 'stored_as'",
-                    [],
-                    |row| row.get::<_, i64>(0).map(|count| count > 0),
-                )
-                .map_err(|error| format!("schema: {error}"))?;
-            if !has_column {
-                transaction
-                    .execute_batch(FILES_STORED_AS_COLUMN)
-                    .map_err(|error| format!("schema: {error}"))?;
-            }
-            transaction
-                .execute_batch(FILES_STORED_AS_BACKFILL)
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if stored < 20 {
-            // Tables created before v20 gain the column; fresh ones have it.
-            let has_column: bool = transaction
-                .query_row(
-                    "SELECT COUNT(*) FROM pragma_table_info('automation_tokens')
-                     WHERE name = 'directory'",
-                    [],
-                    |row| row.get::<_, i64>(0).map(|count| count > 0),
-                )
-                .map_err(|error| format!("schema: {error}"))?;
-            if !has_column {
-                transaction
-                    .execute_batch(AUTOMATION_TOKEN_DIRECTORY_SCHEMA)
-                    .map_err(|error| format!("schema: {error}"))?;
-            }
-        }
-        if stored < 21 {
-            // A grant's manifest root, recorded when its package is first
-            // built for a VOT fetch. Grants from before have no row and get
-            // one at their first mint; nothing to backfill.
-            transaction
-                .execute_batch(OUTBOUND_GRANT_MANIFESTS_SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if stored < 22 {
-            // Tables created by PRINCIPALS_SCHEMA at this version have the
-            // columns, and so does a database rolled back to an older
-            // version number (the migration tests do that); only a table
-            // from before v22 needs the ALTER. A hand-built fixture without
-            // the table stays without it; no real database passes v5
-            // without creating it.
-            let columns: i64 = transaction
-                .query_row(
-                    "SELECT COUNT(*) FROM pragma_table_info('principals')
-                     WHERE name IN ('subject', 'external_id')",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|error| format!("schema: {error}"))?;
-            if columns == 1 {
-                transaction
-                    .execute_batch(PRINCIPALS_IDENTITY_SCHEMA)
-                    .map_err(|error| format!("schema: {error}"))?;
-            }
-            if columns > 0 {
-                transaction
-                    .execute_batch(PRINCIPALS_IDENTITY_INDEX)
-                    .map_err(|error| format!("schema: {error}"))?;
-            }
-        }
-        if stored < 23 {
-            transaction
-                .execute_batch(SCIM_GROUPS_SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if stored < 24 {
-            let present: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('upload_session_files') WHERE name = 'commit_profile')",
-                [], |row| row.get(0),
-            ).map_err(|error| format!("schema: {error}"))?;
-            if !present {
-                transaction.execute_batch("ALTER TABLE upload_session_files ADD COLUMN commit_profile TEXT NOT NULL DEFAULT 'balanced' CHECK (commit_profile IN ('fast', 'balanced', 'strict'));")
-                    .map_err(|error| format!("schema: {error}"))?;
-            }
-        }
-        if stored < 25 {
-            let present: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('upload_sessions') WHERE name = 'push_key')",
-                [], |row| row.get(0),
-            ).map_err(|error| format!("schema: {error}"))?;
-            if !present {
-                transaction
-                    .execute_batch("ALTER TABLE upload_sessions ADD COLUMN push_key TEXT;")
-                    .map_err(|error| format!("schema: {error}"))?;
-            }
-            transaction.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS upload_sessions_push_key ON upload_sessions(push_key) WHERE push_key IS NOT NULL;")
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if stored < 26 {
-            let present: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('automation_tokens') WHERE name = 'permissions')",
-                [], |row| row.get(0),
-            ).map_err(|error| format!("schema: {error}"))?;
-            if !present {
-                transaction.execute_batch("ALTER TABLE automation_tokens ADD COLUMN permissions TEXT NOT NULL DEFAULT '[\"deliveries:create\"]';")
-                    .map_err(|error| format!("schema: {error}"))?;
-            }
-            transaction
-                .execute_batch(
-                    "CREATE TABLE IF NOT EXISTS automation_operations (
-                token_id TEXT NOT NULL,
-                operation_id TEXT NOT NULL,
-                request_hash TEXT NOT NULL,
-                grant_id TEXT NOT NULL UNIQUE,
-                PRIMARY KEY (token_id, operation_id)
-            );",
-                )
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if stored < 27 {
-            transaction
-                .execute_batch(evidence::SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if stored < 27 {
-            transaction
-                .execute_batch(workflows::SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-            transaction
-                .execute_batch(webhooks::SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if stored < 27 {
-            for (name, definition) in [
-                ("holder", "TEXT NOT NULL DEFAULT ''"),
-                ("grant_token_hash", "TEXT NOT NULL DEFAULT ''"),
-                ("policy_revision", "INTEGER NOT NULL DEFAULT 0"),
-                ("admitted_at", "INTEGER"),
-            ] {
-                let present: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('outbound_fetch_tickets') WHERE name=?1)", [name], |row| row.get(0)).map_err(|e| e.to_string())?;
-                if !present {
-                    transaction
-                        .execute_batch(&format!(
-                            "ALTER TABLE outbound_fetch_tickets ADD COLUMN {name} {definition}"
-                        ))
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-        }
-        if stored < 28 {
-            transaction.execute_batch("CREATE TABLE IF NOT EXISTS delivery_storage_credentials(id TEXT PRIMARY KEY REFERENCES delivery_storage(id), document TEXT NOT NULL);")
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if stored < 29 {
-            transaction
-                .execute_batch(routes::SCHEMA)
-                .map_err(|error| format!("schema: {error}"))?;
-            transaction.execute_batch("CREATE TABLE IF NOT EXISTS receive_workflows(link_id TEXT PRIMARY KEY REFERENCES links(id) ON DELETE CASCADE, document TEXT NOT NULL);
-                CREATE INDEX IF NOT EXISTS delivery_jobs_received ON delivery_jobs(tenant,json_extract(document,'$.received.link_id')) WHERE json_extract(document,'$.received') IS NOT NULL;
-                UPDATE delivery_jobs SET document=json_set(document,'$.checks.legacy_export_checks',json_extract(document,'$.checks')) WHERE json_extract(document,'$.project.export_storage') IS NOT NULL AND json_extract(document,'$.manifest') IS NOT NULL;
-                UPDATE delivery_jobs SET document=json_set(document,'$.checks.destination_revisions',json_object(json_extract(document,'$.project.export_storage'),json_extract(document,'$.checks.export_storage_revision'))) WHERE json_extract(document,'$.project.export_storage') IS NOT NULL;")
-                .map_err(|error| format!("schema: {error}"))?;
-            transaction.execute_batch("UPDATE delivery_projects SET document=json_remove(json_set(document,'$.destinations',json(CASE WHEN json_extract(document,'$.export_storage') IS NULL THEN '[]' ELSE json_array(json_extract(document,'$.export_storage')) END)),'$.export_storage') WHERE json_type(document,'$.export_storage') IS NOT NULL;
-                UPDATE delivery_jobs SET document=json_remove(json_set(document,'$.project.destinations',json(CASE WHEN json_extract(document,'$.project.export_storage') IS NULL THEN '[]' ELSE json_array(json_extract(document,'$.project.export_storage')) END)),'$.project.export_storage') WHERE json_type(document,'$.project.export_storage') IS NOT NULL;")
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if stored < 30 {
-            transaction.execute_batch("CREATE TABLE IF NOT EXISTS receive_workflow_uploads(link_id TEXT NOT NULL REFERENCES links(id) ON DELETE CASCADE, upload_id TEXT NOT NULL, PRIMARY KEY(link_id,upload_id));
-                INSERT OR IGNORE INTO receive_workflow_uploads SELECT json_extract(j.document,'$.received.link_id'),json_extract(j.document,'$.received.upload_id') FROM delivery_jobs j JOIN links l ON l.id=json_extract(j.document,'$.received.link_id') AND l.tenant=j.tenant WHERE json_extract(j.document,'$.received') IS NOT NULL;
-                DELETE FROM delivery_policy_cache;")
-                .map_err(|error| format!("schema: {error}"))?;
-        }
-        if stored < 31 {
-            let present: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('upload_session_files') WHERE name='nas_contract')", [], |row| row.get(0))
-                .map_err(|error| format!("schema: {error}"))?;
-            if !present {
-                transaction.execute_batch("ALTER TABLE upload_session_files ADD COLUMN nas_contract TEXT NOT NULL DEFAULT 'unqualified' CHECK (nas_contract IN ('unqualified', 'server_acknowledged'));")
-                    .map_err(|error| format!("schema: {error}"))?;
-            }
-        }
-        if stored < 32 {
-            transaction
-                .execute_batch(notifications::SCHEMA)
-                .map_err(|e| e.to_string())?;
-            for table in ["links", "outbound_grants"] {
-                let present: bool = transaction.query_row(&format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name='notifications_json')"), [], |row| row.get(0)).map_err(|e| e.to_string())?;
-                if !present {
-                    transaction
-                        .execute_batch(&format!(
-                            "ALTER TABLE {table} ADD COLUMN notifications_json TEXT;"
-                        ))
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-        }
-        if stored < 33 {
-            for column in ["footer_text", "footer_link_label", "footer_link_url"] {
-                let present: bool = transaction.query_row(&format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('branding') WHERE name='{column}')"), [], |row| row.get(0)).map_err(|e| e.to_string())?;
-                if !present {
-                    transaction
-                        .execute_batch(&format!(
-                            "ALTER TABLE branding ADD COLUMN {column} TEXT NOT NULL DEFAULT '';"
-                        ))
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-        }
-        if stored < 34 {
-            transaction
-                .execute_batch(trade::SCHEMA)
-                .map_err(|e| e.to_string())?;
-        }
-        if stored < 35 {
-            for (table, column) in [
-                ("links", "notify_on_upload"),
-                ("outbound_grants", "notify_on_download"),
-            ] {
-                let present: bool = transaction.query_row(&format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name='{column}')"), [], |row| row.get(0)).map_err(|e| e.to_string())?;
-                if present {
-                    transaction.execute(&format!("UPDATE {table} SET notifications_json='{{\"mode\":\"off\",\"rules\":[]}}' WHERE {column}=0"), []).map_err(|e| e.to_string())?;
-                    transaction
-                        .execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column};"))
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-            transaction.execute("DELETE FROM settings WHERE key IN ('notify_webhook','notify_slack','notify_teams','notify_google_chat','notify_discord','notify_ntfy','notify_ntfy_token','notify_pushover_token','notify_pushover_user','smtp_to')", []).map_err(|e| e.to_string())?;
-        }
-        transaction
-            .execute(
-                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                [SCHEMA_VERSION.to_string()],
-            )
-            .map_err(|error| error.to_string())?;
-        transaction.commit().map_err(|error| error.to_string())?;
-        Ok(())
-    }
-
-    /// Imports a legacy state.json once: links and the admin hash move into
-    /// the database, the file is renamed so a later crash cannot re-import
-    /// stale state over newer rows.
-    fn import_legacy(&self, data_dir: &Path) -> Result<(), String> {
-        let path = data_dir.join("state.json");
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(format!("read {}: {error}", path.display())),
-        };
-        let document: LegacyDocument = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("parse {}: {error}", path.display()))?;
-        {
-            let mut connection = self.connection.lock().expect("store poisoned");
-            let transaction = connection
-                .transaction()
-                .map_err(|error| error.to_string())?;
-            for link in &document.links {
-                // OR IGNORE keeps a retry idempotent: if a previous run
-                // committed the import but died before the rename, the rows
-                // are already there and identical.
-                let inserted = transaction
-                    .execute(
-                        "INSERT OR IGNORE INTO links (id, tenant, label, dest, password_hash,
-                                                      created_at, expires_at, max_bytes, active,
-                                                      legal_hold, uploads_json, events_json, notifications_json)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                        link_params(link),
-                    )
-                    .map_err(|error| error.to_string())?;
-                if inserted > 0 {
-                    rebuild_link_files(&transaction, link).map_err(|error| error.to_string())?;
-                }
-            }
-            if let Some(hash) = &document.admin_password_hash {
-                transaction
-                    .execute(
-                        "INSERT OR IGNORE INTO meta (key, value) VALUES ('admin_password_hash', ?1)",
-                        [hash],
-                    )
-                    .map_err(|error| error.to_string())?;
-            }
-            transaction.commit().map_err(|error| error.to_string())?;
-        }
-        let imported = data_dir.join("state.json.imported");
-        std::fs::rename(&path, imported).map_err(|error| error.to_string())?;
-        tracing::info!(
-            target: "audit",
-            links = document.links.len(),
-            "imported legacy state.json into sqlite"
-        );
-        self.audit(
-            "",
-            "",
-            "legacy_state_imported",
-            "",
-            &serde_json::json!({ "links": document.links.len() }),
-        );
-        Ok(())
     }
 
     /// Runs `f` with the connection, mapping SQL errors into strings.
@@ -5132,21 +4501,84 @@ pub enum InsertLinkError {
     Store(String),
 }
 
-fn schema_version_stored(connection: &Connection) -> Result<u64, String> {
-    let value: Option<String> = connection
+fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
+    let empty: bool = connection
         .query_row(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
+            "SELECT NOT EXISTS(SELECT 1 FROM sqlite_schema)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !empty {
+        return validate_schema(connection, SCHEMA_VERSION);
+    }
+    let transaction = connection.transaction().map_err(|e| e.to_string())?;
+    for schema in [
+        SCHEMA,
+        SETTINGS_SCHEMA,
+        PRINCIPALS_SCHEMA,
+        PRINCIPALS_IDENTITY_INDEX,
+        SCIM_GROUPS_SCHEMA,
+        FILES_SCHEMA,
+        OUTBOUND_GRANTS_SCHEMA,
+        OUTBOUND_GRANT_FILES_SCHEMA,
+        AUTOMATION_TOKENS_SCHEMA,
+        BRANDING_SCHEMA,
+        UPLOAD_SESSIONS_SCHEMA,
+        OUTBOUND_GRANT_MANIFESTS_SCHEMA,
+        evidence::SCHEMA,
+        workflows::SCHEMA,
+        webhooks::SCHEMA,
+        routes::SCHEMA,
+        notifications::SCHEMA,
+        trade::SCHEMA,
+    ] {
+        transaction
+            .execute_batch(schema)
+            .map_err(|e| format!("schema: {e}"))?;
+    }
+    transaction.execute_batch("CREATE INDEX delivery_jobs_received ON delivery_jobs(tenant,json_extract(document,'$.received.link_id')) WHERE json_extract(document,'$.received') IS NOT NULL;
+        INSERT INTO meta(key,value) VALUES ('tenant_storage_layout','reserved-v1');")
+        .map_err(|e| e.to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO meta(key,value) VALUES ('schema_version',?1)",
+            [SCHEMA_VERSION.to_string()],
+        )
+        .map_err(|e| e.to_string())?;
+    transaction.commit().map_err(|e| e.to_string())?;
+    tracing::info!(schema_version = SCHEMA_VERSION, "initialized database");
+    Ok(())
+}
+
+pub(crate) fn validate_schema(connection: &Connection, expected: u64) -> Result<(), String> {
+    let version: Option<String> = connection
+        .query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
             [],
             |row| row.get(0),
         )
         .optional()
-        .map_err(|error| error.to_string())?;
-    match value {
-        None => Ok(3),
-        Some(raw) => raw
-            .parse::<u64>()
-            .map_err(|_| format!("meta.schema_version is not a number ({raw})")),
+        .map_err(|e| format!("unsupported database schema: {e}"))?;
+    let version = version.ok_or("database schema version is missing; refusing to start")?;
+    let stored = version
+        .parse::<u64>()
+        .map_err(|_| "database schema version is invalid; refusing to start")?;
+    if stored != expected {
+        return Err(format!("database schema version {stored} is unsupported by this binary ({expected}); preserve the database and use a matching release"));
     }
+    let layout: Option<String> = connection
+        .query_row(
+            "SELECT value FROM meta WHERE key='tenant_storage_layout'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if layout.as_deref() != Some("reserved-v1") {
+        return Err("unsupported tenant storage layout; preserve the database and receiving files and use a matching release".into());
+    }
+    Ok(())
 }
 
 fn overlay_rows(rows: &HashMap<String, String>, config: &Config) -> SettingsOverlay {
@@ -5471,13 +4903,12 @@ mod tests {
     }
 
     #[test]
-    fn automation_schema_migrates_existing_tokens_without_broadening_permissions() {
+    fn automation_tokens_preserve_permissions_across_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         store
             .insert_automation_token(test_automation_token("agent", "tenant"))
             .unwrap();
-        store.with(|connection| connection.execute_batch("ALTER TABLE automation_tokens DROP COLUMN permissions; DROP TABLE automation_operations; UPDATE meta SET value = '25' WHERE key = 'schema_version';")).unwrap();
         drop(store);
         let reopened = Store::open(directory.path()).unwrap();
         let token = reopened
@@ -5508,7 +4939,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_grants_migrate_and_round_trip_full_byte_range() {
+    fn outbound_grants_round_trip_full_byte_range() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         let schema = store
@@ -5751,76 +5182,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(page.files.is_empty());
-    }
-
-    #[test]
-    fn v15_migration_backfills_exact_normalized_rows() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut grant = test_outbound_grant("migrate", "acme", 0);
-        grant.files = vec![OutboundGrantFile {
-            source: "objects/large".to_owned(),
-            name: "large.bin".to_owned(),
-            suite: "blake3".to_owned(),
-            root: "root".to_owned(),
-            bytes: u64::MAX,
-            receipt_b64: "receipt".to_owned(),
-            downloads: 7,
-            first_download_at: Some(11),
-            last_download_at: Some(22),
-        }];
-        {
-            let store = Store::open(directory.path()).unwrap();
-            store.insert_outbound_grant(grant.clone()).unwrap();
-            let files_json = serde_json::to_string(&grant.files).unwrap();
-            store
-                .with(|connection| {
-                    connection.execute(
-                        "UPDATE outbound_grants SET files_json = ?1 WHERE id = 'migrate'",
-                        [&files_json],
-                    )
-                })
-                .unwrap();
-        }
-        let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        connection
-            .execute_batch(
-                "DROP TABLE outbound_grant_files;
-                 UPDATE meta SET value = '15' WHERE key = 'schema_version';",
-            )
-            .unwrap();
-        drop(connection);
-        let store = Store::open(directory.path()).unwrap();
-        let row = store
-            .with(|connection| {
-                connection.query_row(
-                    "SELECT source, bytes_hi, bytes_lo, downloads, first_download_at, last_download_at
-                     FROM outbound_grant_files WHERE grant_id = 'migrate' AND file_index = 0",
-                    [],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, i64>(4)?,
-                            row.get::<_, i64>(5)?,
-                        ))
-                    },
-                )
-            })
-            .unwrap();
-        assert_eq!(
-            row,
-            (
-                "objects/large".to_owned(),
-                i64::from(u32::MAX),
-                i64::from(u32::MAX),
-                7,
-                11,
-                22
-            )
-        );
-        assert_eq!(store.outbound_grants("acme").unwrap()[0], grant);
     }
 
     #[test]
@@ -6752,238 +6113,6 @@ mod tests {
     }
 
     #[test]
-    fn tenant_storage_migration_stops_before_mutation_and_does_not_mark_completion() {
-        for stop_after in 0..6 {
-            let directory = tempfile::tempdir().unwrap();
-            let receive = directory.path().join("receive");
-            std::fs::create_dir_all(receive.join("acme")).unwrap();
-            std::fs::write(receive.join("acme/frame"), b"media").unwrap();
-            let store = Store::open(&directory.path().join("data")).unwrap();
-            store.insert_tenant(test_tenant("acme")).unwrap();
-            let checks = std::cell::Cell::new(0);
-            assert!(store
-                .migrate_tenant_storage(&receive, || {
-                    let count = checks.get();
-                    checks.set(count + 1);
-                    if count >= stop_after {
-                        Err("ownership lost".into())
-                    } else {
-                        Ok(())
-                    }
-                })
-                .is_err());
-            assert_eq!(checks.get(), stop_after + 1);
-            let marked: bool = store
-                .with(|connection| {
-                    connection.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM meta WHERE key = 'tenant_storage_layout')",
-                        [],
-                        |row| row.get(0),
-                    )
-                })
-                .unwrap();
-            assert!(!marked);
-            if stop_after < 3 {
-                assert!(receive.join("acme/frame").is_file());
-            }
-            store.migrate_tenant_storage(&receive, || Ok(())).unwrap();
-            assert_eq!(
-                std::fs::read(
-                    receive
-                        .join(crate::paths::TENANT_STORAGE_DIR)
-                        .join("acme/frame")
-                )
-                .unwrap(),
-                b"media"
-            );
-        }
-    }
-
-    #[test]
-    fn tenant_storage_migration_resumes_and_marks_completion() {
-        let directory = tempfile::tempdir().unwrap();
-        let data = directory.path().join("data");
-        let receive = directory.path().join("receive");
-        std::fs::create_dir_all(&receive).unwrap();
-        let store = Store::open(&data).unwrap();
-        store.insert_tenant(test_tenant("acme")).unwrap();
-        store.insert_tenant(test_tenant("globex")).unwrap();
-
-        std::fs::create_dir_all(receive.join("acme")).unwrap();
-        std::fs::write(receive.join("acme/invoice.pdf"), b"acme").unwrap();
-        let target_root = receive.join(crate::paths::TENANT_STORAGE_DIR);
-        std::fs::create_dir_all(target_root.join("globex")).unwrap();
-        std::fs::write(target_root.join("globex/done.pdf"), b"globex").unwrap();
-
-        store.migrate_tenant_storage(&receive, || Ok(())).unwrap();
-        assert!(!receive.join("acme").exists());
-        assert_eq!(
-            std::fs::read(target_root.join("acme/invoice.pdf")).unwrap(),
-            b"acme"
-        );
-        assert!(target_root.join("globex/done.pdf").exists());
-
-        // Once marked, a root path named after a tenant belongs to the
-        // default tenant and must never be reinterpreted on restart.
-        std::fs::create_dir_all(receive.join("acme")).unwrap();
-        std::fs::write(receive.join("acme/root.txt"), b"root").unwrap();
-        store.migrate_tenant_storage(&receive, || Ok(())).unwrap();
-        assert!(receive.join("acme/root.txt").exists());
-    }
-
-    #[test]
-    fn tenant_storage_migration_refuses_ambiguous_subtrees() {
-        let directory = tempfile::tempdir().unwrap();
-        let data = directory.path().join("data");
-        let receive = directory.path().join("receive");
-        let store = Store::open(&data).unwrap();
-        store.insert_tenant(test_tenant("acme")).unwrap();
-        std::fs::create_dir_all(receive.join("acme")).unwrap();
-        std::fs::create_dir_all(receive.join(crate::paths::TENANT_STORAGE_DIR).join("acme"))
-            .unwrap();
-
-        let error = store
-            .migrate_tenant_storage(&receive, || Ok(()))
-            .unwrap_err();
-        assert!(error.contains("found both"), "{error}");
-
-        std::fs::remove_dir_all(receive.join(crate::paths::TENANT_STORAGE_DIR)).unwrap();
-        std::fs::remove_dir_all(receive.join("acme")).unwrap();
-        std::fs::write(receive.join("acme"), b"default tenant").unwrap();
-        let error = store
-            .migrate_tenant_storage(&receive, || Ok(()))
-            .unwrap_err();
-        assert!(error.contains("expected a directory"), "{error}");
-    }
-
-    #[test]
-    fn tenant_storage_migration_refuses_default_owned_prefixes() {
-        let directory = tempfile::tempdir().unwrap();
-        let data = directory.path().join("data");
-        let receive = directory.path().join("receive");
-        let store = Store::open(&data).unwrap();
-        store.insert_tenant(test_tenant("acme")).unwrap();
-        std::fs::create_dir_all(receive.join("acme")).unwrap();
-        std::fs::write(receive.join("acme/invoice.pdf"), b"default").unwrap();
-        let mut link = test_link("root");
-        link.uploads.push(UploadRecord {
-            partial: false,
-            log: Vec::new(),
-            id: "upload".to_owned(),
-            started_at: 0,
-            completed_at: 1,
-            replayed_chunks: 0,
-            rejected_chunks: 0,
-            transport: None,
-            package_root: "root".to_owned(),
-            total_bytes: 7,
-            files: vec![FileRecord {
-                path: "acme/invoice.pdf".to_owned(),
-                stored_as: "Acme/invoice.pdf".to_owned(),
-                bytes: 7,
-                suite: "blake3".to_owned(),
-                root: "object".to_owned(),
-                receipt: false,
-                deleted: false,
-            }],
-        });
-        store.insert_link(link).unwrap();
-
-        let error = store
-            .migrate_tenant_storage(&receive, || Ok(()))
-            .unwrap_err();
-        assert!(error.contains("cannot determine ownership"), "{error}");
-        assert!(receive.join("acme/invoice.pdf").exists());
-        assert!(!receive.join(crate::paths::TENANT_STORAGE_DIR).exists());
-
-        std::fs::remove_dir_all(receive.join("acme")).unwrap();
-        std::fs::create_dir_all(receive.join(crate::paths::TENANT_STORAGE_DIR).join("acme"))
-            .unwrap();
-        store
-            .update_link("", "root", |link| {
-                link.uploads[0].files[0].stored_as =
-                    ".VOT-TENANTS.STAGE/acme/invoice.pdf".to_owned();
-            })
-            .unwrap();
-
-        let error = store
-            .migrate_tenant_storage(&receive, || Ok(()))
-            .unwrap_err();
-        assert!(error.contains("cannot determine ownership"), "{error}");
-        assert!(receive
-            .join(crate::paths::TENANT_STORAGE_DIR)
-            .join("acme")
-            .exists());
-    }
-
-    #[test]
-    fn tenant_storage_migration_refuses_nonportable_legacy_keys() {
-        let directory = tempfile::tempdir().unwrap();
-        let data = directory.path().join("data");
-        let receive = directory.path().join("receive");
-        let store = Store::open(&data).unwrap();
-        store.insert_tenant(test_tenant("Acme")).unwrap();
-        assert_eq!(
-            store.insert_tenant(test_tenant("acme")).unwrap_err(),
-            InsertTenantError::AlreadyExists
-        );
-
-        let error = store
-            .migrate_tenant_storage(&receive, || Ok(()))
-            .unwrap_err();
-        assert!(error.contains("is not portable"), "{error}");
-
-        store
-            .with(|connection| {
-                connection.execute("DELETE FROM tenants", [])?;
-                connection.execute(
-                    "INSERT INTO tenants (key, label) VALUES ('가', 'legacy unicode')",
-                    [],
-                )
-            })
-            .unwrap();
-
-        let error = store
-            .migrate_tenant_storage(&receive, || Ok(()))
-            .unwrap_err();
-        assert!(error.contains("is not portable"), "{error}");
-    }
-
-    #[test]
-    fn tenant_storage_migration_case_folds_default_destinations() {
-        let directory = tempfile::tempdir().unwrap();
-        let data = directory.path().join("data");
-        let receive = directory.path().join("receive");
-        let store = Store::open(&data).unwrap();
-        store.insert_tenant(test_tenant("s")).unwrap();
-        std::fs::create_dir_all(receive.join("s")).unwrap();
-        let mut link = test_link("dest");
-        link.dest = "S".to_owned();
-        store.insert_link(link).unwrap();
-
-        let error = store
-            .migrate_tenant_storage(&receive, || Ok(()))
-            .unwrap_err();
-        assert!(error.contains("cannot determine ownership"), "{error}");
-
-        store
-            .update_link("", "dest", |link| link.dest = "ſ".to_owned())
-            .unwrap();
-        let error = store
-            .migrate_tenant_storage(&receive, || Ok(()))
-            .unwrap_err();
-        assert!(error.contains("cannot determine ownership"), "{error}");
-
-        store
-            .update_link("", "dest", |link| link.dest = "TENANT~1".to_owned())
-            .unwrap();
-        let error = store
-            .migrate_tenant_storage(&receive, || Ok(()))
-            .unwrap_err();
-        assert!(error.contains("cannot determine ownership"), "{error}");
-    }
-
-    #[test]
     fn update_and_remove_report_presence() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -7056,43 +6185,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_import_read_errors_refuse_startup() {
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::create_dir(directory.path().join("state.json")).unwrap();
-        assert!(Store::open(directory.path()).is_err());
-    }
-
-    #[test]
-    fn interrupted_import_retries_cleanly() {
-        let directory = tempfile::tempdir().unwrap();
-        // Simulate a crash after the first link was committed but before the
-        // rename: the database already holds old-link-a while state.json
-        // still lists both.
-        let store = Store::open(directory.path()).unwrap();
-        store
-            .insert_link(test_link_with_label("old-link-a", "old"))
-            .unwrap();
-        drop(store);
-        std::fs::write(
-            directory.path().join("state.json"),
-            r#"{"links":[
-                {"id":"old-link-a","label":"old","dest":"","created_at":0,"active":true},
-                {"id":"old-link-b","label":"old","dest":"","created_at":0,"active":true}]}"#,
-        )
-        .unwrap();
-        let reopened = Store::open(directory.path()).unwrap();
-        assert!(reopened.link("", "old-link-a").unwrap().is_some());
-        assert!(reopened.link("", "old-link-b").unwrap().is_some());
-        assert!(!directory.path().join("state.json").exists());
-    }
-
-    fn test_link_with_label(id: &str, label: &str) -> Link {
-        let mut link = test_link(id);
-        link.label = label.to_owned();
-        link
-    }
-
-    #[test]
     fn audit_rows_round_trip_export_and_prune() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -7128,32 +6220,6 @@ mod tests {
             .with(|connection| connection.execute("UPDATE audit_log SET detail = 'broken'", []))
             .unwrap();
         assert!(store.audit_export("", 0, 0, 100).is_err());
-    }
-
-    #[test]
-    fn legacy_state_json_is_imported_and_renamed() {
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::write(
-            directory.path().join("state.json"),
-            r#"{"links":[{"id":"old-link","label":"old","dest":"","created_at":0,"active":true,
-                "uploads":[{"id":"up","completed_at":1,"package_root":"root","total_bytes":3,
-                "files":[{"path":"a","stored_as":"a","bytes":3,"suite":"blake3","root":"object","receipt":false}]}]}],
-                "admin_password_hash":"old-hash"}"#,
-        )
-        .unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        assert!(store.link("", "old-link").unwrap().is_some());
-        assert_eq!(
-            store.admin_password_hash().unwrap().as_deref(),
-            Some("old-hash")
-        );
-        assert_eq!(store.tenant_received_bytes("").unwrap(), 3);
-        assert!(!directory.path().join("state.json").exists());
-        assert!(directory.path().join("state.json.imported").exists());
-        // Reopening must not re-import stale state over newer rows.
-        drop(store);
-        let reopened = Store::open(directory.path()).unwrap();
-        assert!(reopened.link("", "old-link").unwrap().is_some());
     }
 }
 
@@ -7361,116 +6427,6 @@ mod tenant_tests {
         );
     }
 
-    /// v18 rows carry no path; the v19 backfill reads it from the records so
-    /// a shared file stops double counting on the first boot.
-    #[test]
-    fn v19_backfills_stored_paths_and_dedupes_totals() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        store.insert_tenant(test_tenant("acme")).unwrap();
-        let file = FileRecord {
-            path: "a.bin".to_owned(),
-            stored_as: "a.bin".to_owned(),
-            bytes: 300,
-            suite: "blake3".to_owned(),
-            root: "00".to_owned(),
-            receipt: true,
-            deleted: false,
-        };
-        let record = |id: &str| UploadRecord {
-            partial: false,
-            log: Vec::new(),
-            id: id.to_owned(),
-            started_at: 0,
-            completed_at: 0,
-            replayed_chunks: 0,
-            rejected_chunks: 0,
-            transport: None,
-            package_root: "cc".to_owned(),
-            total_bytes: 300,
-            files: vec![file.clone()],
-        };
-        let mut link = link_in("acme", "link-1");
-        link.uploads.push(record("one"));
-        link.uploads.push(record("two"));
-        store.insert_link(link).unwrap();
-        // Simulate a v18 database: no path column, so both rows count.
-        store
-            .with(|connection| {
-                connection.execute_batch(
-                    "ALTER TABLE files DROP COLUMN stored_as;
-                     UPDATE meta SET value = '18' WHERE key = 'schema_version';",
-                )
-            })
-            .unwrap();
-        drop(store);
-        let store = Store::open(directory.path()).unwrap();
-        let version: String = store
-            .with(|connection| {
-                connection.query_row(
-                    "SELECT value FROM meta WHERE key = 'schema_version'",
-                    [],
-                    |row| row.get(0),
-                )
-            })
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION.to_string());
-        let paths: Vec<String> = store
-            .with(|connection| {
-                let mut statement =
-                    connection.prepare("SELECT stored_as FROM files ORDER BY upload_index")?;
-                let rows = statement.query_map([], |row| row.get(0))?;
-                rows.collect()
-            })
-            .unwrap();
-        assert_eq!(paths, ["a.bin", "a.bin"]);
-        assert_eq!(store.tenant_received_bytes("acme").unwrap(), 300);
-    }
-
-    /// A v21 principals table gains external_id and created_at; the columns
-    /// then round-trip through provision and lookup.
-    #[test]
-    fn v21_adds_principal_identity_columns() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        store
-            .upsert_sso_principal("old@example.com", &[], &serde_json::json!([]))
-            .unwrap();
-        store
-            .with(|connection| {
-                connection.execute_batch(
-                    "DROP INDEX principals_external_id;
-                     ALTER TABLE principals DROP COLUMN external_id;
-                     ALTER TABLE principals DROP COLUMN created_at;
-                     UPDATE meta SET value = '21' WHERE key = 'schema_version';",
-                )
-            })
-            .unwrap();
-        drop(store);
-        let store = Store::open(directory.path()).unwrap();
-        let row = store.principal("old@example.com").unwrap().unwrap();
-        assert_eq!(row.external_id, None);
-        assert_eq!(
-            row.created_at, 0,
-            "rows from before v22 carry no creation time"
-        );
-        assert!(store
-            .provision_principal("new@example.com", Some("ext-1"))
-            .unwrap());
-        assert!(!store.provision_principal("new@example.com", None).unwrap());
-        let row = store.principal_by_external_id("ext-1").unwrap().unwrap();
-        assert_eq!(row.subject, "new@example.com");
-        assert!(row.created_at > 0);
-        assert!(store.principal_by_external_id("ext-9").unwrap().is_none());
-        // Sign-in after provisioning keeps the identity columns.
-        store
-            .upsert_sso_principal("new@example.com", &["g".to_owned()], &serde_json::json!([]))
-            .unwrap();
-        let row = store.principal("new@example.com").unwrap().unwrap();
-        assert_eq!(row.external_id.as_deref(), Some("ext-1"));
-        assert_eq!(row.source, "scim");
-    }
-
     #[test]
     fn scim_groups_round_trip_and_map_to_subjects() {
         let directory = tempfile::tempdir().unwrap();
@@ -7558,39 +6514,6 @@ mod tenant_tests {
         assert!(!store.delete_scim_group(&admins.id).unwrap());
         assert!(store.scim_groups_of("z@example.com").unwrap().is_empty());
         assert_eq!(store.scim_groups_page(10, 0).unwrap().1, 1);
-    }
-
-    #[test]
-    fn v20_adds_the_token_directory_column() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        store
-            .insert_automation_token(AutomationToken {
-                id: "t1".to_owned(),
-                token_hash: "hash-t1".to_owned(),
-                tenant: String::new(),
-                label: "Token".to_owned(),
-                directory: None,
-                permissions: vec!["deliveries:create".to_owned()],
-                created_at: 10,
-                expires_at: 20,
-                revoked_at: None,
-                last_used_at: None,
-            })
-            .unwrap();
-        store
-            .with(|connection| {
-                connection.execute_batch(
-                    "ALTER TABLE automation_tokens DROP COLUMN directory;
-                     UPDATE meta SET value = '19' WHERE key = 'schema_version';",
-                )
-            })
-            .unwrap();
-        drop(store);
-        let store = Store::open(directory.path()).unwrap();
-        let tokens = store.automation_tokens("").unwrap();
-        assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0].directory, None);
     }
 
     #[test]
@@ -7931,37 +6854,6 @@ mod ops_tests {
 mod phase4_review_tests {
     use super::tests::{link_in, test_outbound_grant, test_tenant};
     use super::*;
-
-    #[test]
-    fn v1_database_without_tenant_column_migrates() {
-        let directory = tempfile::tempdir().unwrap();
-        // Simulate a v1 database: links table without the tenant column.
-        {
-            let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-            connection
-                .execute_batch(
-                    "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                     CREATE TABLE links (
-                        id TEXT PRIMARY KEY,
-                        label TEXT NOT NULL DEFAULT '',
-                        dest TEXT NOT NULL DEFAULT '',
-                        password_hash TEXT,
-                        created_at INTEGER NOT NULL,
-                        expires_at INTEGER,
-                        max_bytes INTEGER,
-                        active INTEGER NOT NULL DEFAULT 1,
-                        uploads_json TEXT NOT NULL DEFAULT '[]',
-                        events_json TEXT NOT NULL DEFAULT '[]'
-                     );
-                     INSERT INTO links (id, label, created_at, active)
-                     VALUES ('v1-link', 'old', 0, 1);",
-                )
-                .unwrap();
-        }
-        let store = Store::open(directory.path()).unwrap();
-        assert!(store.link("", "v1-link").unwrap().is_some());
-        assert_eq!(store.link("", "v1-link").unwrap().unwrap().tenant, "");
-    }
 
     #[test]
     fn link_by_id_spans_tenants_for_the_public_protocol() {
@@ -8322,7 +7214,7 @@ mod phase4_review_tests {
 
 #[cfg(test)]
 mod settings_tests {
-    use super::tests::test_link;
+    use super::tests::{test_link, test_tenant};
     use super::*;
 
     fn test_config() -> Config {
@@ -8503,6 +7395,127 @@ mod settings_tests {
     }
 
     #[test]
+    fn unsupported_schema_is_refused_without_rewriting_data() {
+        for version in [
+            None,
+            Some("3"),
+            Some("31"),
+            Some("34"),
+            Some("36"),
+            Some("99"),
+            Some("invalid"),
+            Some("-1"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            store.insert_link(test_link("preserved")).unwrap();
+            drop(store);
+            let path = directory.path().join("votport.db");
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch("PRAGMA journal_mode=DELETE; DROP INDEX links_tenant; DROP INDEX links_tenant_created; DELETE FROM meta WHERE key='schema_version';").unwrap();
+            if let Some(version) = version {
+                connection
+                    .execute(
+                        "INSERT INTO meta(key,value) VALUES ('schema_version',?1)",
+                        [version],
+                    )
+                    .unwrap();
+            }
+            drop(connection);
+            let before = std::fs::read(&path).unwrap();
+            assert!(
+                Store::open(directory.path()).is_err(),
+                "version {version:?}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before, "version {version:?}");
+            assert!(!directory.path().join("votport.db-wal").exists());
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("votport.db");
+        Connection::open(&path).unwrap().execute_batch("CREATE TABLE sqliteX_private(value TEXT); INSERT INTO sqliteX_private VALUES ('preserve');").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(Store::open(directory.path()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!directory.path().join("receipt.key").exists());
+    }
+
+    #[test]
+    fn unsupported_storage_layout_is_refused_without_relayout() {
+        for layout in [None, Some("old"), Some("")] {
+            let directory = tempfile::tempdir().unwrap();
+            let data = directory.path().join("data");
+            let receive = directory.path().join("receive/acme");
+            std::fs::create_dir_all(&receive).unwrap();
+            std::fs::write(receive.join("frame.mov"), b"preserved payload").unwrap();
+            let store = Store::open(&data).unwrap();
+            store.insert_tenant(test_tenant("acme")).unwrap();
+            store
+                .with(|connection| {
+                    connection.execute("DELETE FROM meta WHERE key='tenant_storage_layout'", [])?;
+                    if let Some(layout) = layout {
+                        connection.execute(
+                            "INSERT INTO meta(key,value) VALUES ('tenant_storage_layout',?1)",
+                            [layout],
+                        )?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            drop(store);
+            let path = data.join("votport.db");
+            let before = std::fs::read(&path).unwrap();
+            let error = Store::open(&data).err().expect("unsupported layout");
+            assert!(error.contains("unsupported tenant storage layout"));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(
+                std::fs::read(receive.join("frame.mov")).unwrap(),
+                b"preserved payload"
+            );
+            assert!(!directory.path().join("receive/.vot-tenants.stage").exists());
+        }
+    }
+
+    #[test]
+    fn unsupported_schema_does_not_checkpoint_a_surviving_wal() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .with(|connection| {
+                connection.set_db_config(
+                    rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                    true,
+                )?;
+                connection.execute("UPDATE meta SET value='34' WHERE key='schema_version'", [])?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        let database = directory.path().join("votport.db");
+        let wal = directory.path().join("votport.db-wal");
+        let database_before = std::fs::read(&database).unwrap();
+        let wal_before = std::fs::read(&wal).unwrap();
+        assert!(!wal_before.is_empty());
+        assert!(Store::open(directory.path()).is_err());
+        assert_eq!(std::fs::read(&database).unwrap(), database_before);
+        assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+    }
+
+    #[test]
+    fn state_json_is_preserved_and_refused_before_creating_a_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state.json");
+        std::fs::write(&state, br#"{"links":[{"id":"preserved"}]}"#).unwrap();
+        let before = std::fs::read(&state).unwrap();
+        assert!(Store::open(directory.path())
+            .err()
+            .unwrap()
+            .contains("state.json is unsupported"));
+        assert_eq!(std::fs::read(&state).unwrap(), before);
+        assert!(!directory.path().join("votport.db").exists());
+        assert!(!directory.path().join("receipt.key").exists());
+    }
+
+    #[test]
     fn open_refuses_a_newer_schema_version() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -8521,7 +7534,7 @@ mod settings_tests {
             Ok(_) => panic!("expected open to refuse a newer schema"),
         };
         assert!(error.contains("99"), "{error}");
-        assert!(error.contains("newer"), "{error}");
+        assert!(error.contains("unsupported"), "{error}");
         assert_eq!(schema_version(directory.path()), "99");
     }
 
@@ -8611,24 +7624,9 @@ mod settings_tests {
     }
 
     #[test]
-    fn upload_sessions_round_trip_and_v17_gains_the_tables() {
+    fn upload_sessions_round_trip() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
-        // Simulate a v17 database that predates the resume tables.
-        store
-            .with(|connection| {
-                connection.execute_batch(
-                    "DROP TABLE upload_sessions;
-                     DROP TABLE upload_session_files;
-                     UPDATE meta SET value = '17' WHERE key = 'schema_version';",
-                )
-            })
-            .unwrap();
-        drop(store);
-        let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
-        assert!(store.load_upload_sessions().unwrap().is_empty());
-
         let mut session = PersistedUploadSession {
             push_key: None,
             id: "abcd1234".to_owned(),
@@ -8712,406 +7710,12 @@ mod settings_tests {
             .with(|connection| connection.execute_batch("DROP TRIGGER fail_second_checkpoint"))
             .unwrap();
 
-        store
-            .with(|connection| {
-                connection.execute_batch(
-                    "ALTER TABLE upload_session_files DROP COLUMN commit_profile;
-             UPDATE meta SET value = '23' WHERE key = 'schema_version';",
-                )
-            })
-            .unwrap();
         drop(store);
         let store = Store::open(directory.path()).unwrap();
-        let legacy = store.load_upload_sessions().unwrap();
-        assert!(legacy[0]
-            .files
-            .iter()
-            .all(|file| file.profile == vot_sdk_file::CommitProfile::Balanced));
-        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
+        assert_eq!(store.load_upload_sessions().unwrap(), vec![session.clone()]);
 
         store.delete_upload_session(&session.id).unwrap();
         assert!(store.load_upload_sessions().unwrap().is_empty());
-    }
-
-    #[test]
-    fn v16_database_gains_the_branding_table() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        store
-            .with(|connection| {
-                connection.execute_batch(
-                    "DROP TABLE branding;
-                     UPDATE meta SET value = '16' WHERE key = 'schema_version';",
-                )
-            })
-            .unwrap();
-        drop(store);
-
-        let reopened = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
-        assert!(reopened.branding("acme").unwrap().is_none());
-        reopened
-            .set_branding(&Branding {
-                tenant: "acme".to_owned(),
-                name: "Acme".to_owned(),
-                color: String::new(),
-                logo_ext: String::new(),
-                updated_at: 1,
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(reopened.branding("acme").unwrap().unwrap().name, "Acme");
-    }
-
-    #[test]
-    fn v4_database_migrates_to_current_schema() {
-        let directory = tempfile::tempdir().unwrap();
-        {
-            let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-            connection
-                .execute_batch(
-                    "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                     CREATE TABLE settings (
-                        key TEXT PRIMARY KEY,
-                        value TEXT NOT NULL,
-                        updated_at INTEGER NOT NULL,
-                        updated_by TEXT NOT NULL DEFAULT ''
-                     );
-                     INSERT INTO meta (key, value) VALUES ('schema_version', '4');",
-                )
-                .unwrap();
-        }
-        let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
-        assert!(store.principals_page(50, 0, None).unwrap().0.is_empty());
-        assert!(store.principal("nobody").unwrap().is_none());
-    }
-
-    #[test]
-    fn v5_database_migrates_to_current_schema() {
-        let directory = tempfile::tempdir().unwrap();
-        {
-            let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-            connection.execute_batch(SCHEMA).unwrap();
-            connection.execute_batch(SETTINGS_SCHEMA).unwrap();
-            connection.execute_batch(PRINCIPALS_SCHEMA).unwrap();
-            connection
-                .execute_batch(
-                    "INSERT INTO meta (key, value) VALUES ('schema_version', '5');
-                     INSERT INTO links (id, label, created_at) VALUES ('old-link', 'old', 0);",
-                )
-                .unwrap();
-        }
-
-        let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
-        assert!(!store.link("", "old-link").unwrap().unwrap().legal_hold);
-    }
-
-    #[test]
-    fn v6_database_migrates_to_current_schema() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        let mut link = test_link("old-link");
-        link.uploads.push(UploadRecord {
-            partial: false,
-            log: Vec::new(),
-            id: "up".to_owned(),
-            started_at: 0,
-            completed_at: 1,
-            replayed_chunks: 0,
-            rejected_chunks: 0,
-            transport: None,
-            package_root: "root".to_owned(),
-            total_bytes: 9,
-            files: vec![FileRecord {
-                path: "a".to_owned(),
-                stored_as: "a".to_owned(),
-                bytes: 9,
-                suite: "blake3".to_owned(),
-                root: "object".to_owned(),
-                receipt: false,
-                deleted: false,
-            }],
-        });
-        store.insert_link(link).unwrap();
-        store
-            .with(|connection| {
-                connection.execute_batch(
-                    "DROP TABLE files;
-                     DROP TABLE outbound_grants;
-
-                     UPDATE meta SET value = '6' WHERE key = 'schema_version';",
-                )
-            })
-            .unwrap();
-        drop(store);
-
-        let reopened = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
-        assert_eq!(reopened.tenant_received_bytes("").unwrap(), 9);
-    }
-
-    #[test]
-    fn v8_database_adds_empty_outbound_files_json() {
-        let directory = tempfile::tempdir().unwrap();
-        {
-            let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-            connection.execute_batch(SCHEMA).unwrap();
-            connection.execute_batch(SETTINGS_SCHEMA).unwrap();
-            connection
-                .execute_batch(
-                    "CREATE TABLE outbound_grants (
-                         id TEXT PRIMARY KEY,
-                         token_hash TEXT UNIQUE NOT NULL,
-                         tenant TEXT NOT NULL,
-                         link_id TEXT NOT NULL,
-                         upload_id TEXT NOT NULL,
-                         package_root TEXT NOT NULL,
-                         name TEXT NOT NULL,
-                         suite TEXT NOT NULL,
-                         root TEXT NOT NULL,
-                         file_index INTEGER NOT NULL,
-                         bytes_hi INTEGER NOT NULL,
-                         bytes_lo INTEGER NOT NULL,
-                         label TEXT NOT NULL,
-                         created_at INTEGER NOT NULL,
-                         expires_at INTEGER NOT NULL,
-                         revoked_at INTEGER,
-                         downloads INTEGER NOT NULL DEFAULT 0
-                     );
-                     INSERT INTO outbound_grants
-                         (id, token_hash, tenant, link_id, upload_id, package_root, name, suite,
-                          root, file_index, bytes_hi, bytes_lo, label, created_at, expires_at)
-                     VALUES ('g1', 'hash-g1', 'acme', 'link', 'upload', 'package', 'file.bin',
-                             'blake3', 'root', 0, 0, 1, 'download', 10, 20);
-                     INSERT INTO meta (key, value) VALUES ('schema_version', '8');",
-                )
-                .unwrap();
-        }
-
-        let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
-        let grant = store
-            .outbound_grant_by_token_hash("hash-g1")
-            .unwrap()
-            .unwrap();
-        assert!(grant.files.is_empty());
-        assert!(grant.password_hash.is_none());
-        assert!(grant.first_download_at.is_none());
-        assert!(grant.last_download_at.is_none());
-    }
-
-    #[test]
-    fn v9_database_adds_nullable_outbound_password_hash() {
-        let directory = tempfile::tempdir().unwrap();
-        {
-            let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-            connection.execute_batch(SCHEMA).unwrap();
-            connection.execute_batch(SETTINGS_SCHEMA).unwrap();
-            connection
-                .execute_batch(
-                    r#"CREATE TABLE outbound_grants (
-                         id TEXT PRIMARY KEY,
-                         token_hash TEXT UNIQUE NOT NULL,
-                         tenant TEXT NOT NULL,
-                         link_id TEXT NOT NULL,
-                         upload_id TEXT NOT NULL,
-                         package_root TEXT NOT NULL,
-                         name TEXT NOT NULL,
-                         suite TEXT NOT NULL,
-                         root TEXT NOT NULL,
-                         file_index INTEGER NOT NULL,
-                         bytes_hi INTEGER NOT NULL,
-                         bytes_lo INTEGER NOT NULL,
-                         label TEXT NOT NULL,
-                         created_at INTEGER NOT NULL,
-                         expires_at INTEGER NOT NULL,
-                         revoked_at INTEGER,
-                         downloads INTEGER NOT NULL DEFAULT 0,
-                         files_json TEXT NOT NULL DEFAULT '[]'
-                     );
-                     INSERT INTO outbound_grants
-                         (id, token_hash, tenant, link_id, upload_id, package_root, name, suite,
-                         root, file_index, bytes_hi, bytes_lo, label, created_at, expires_at,
-                         files_json)
-                     VALUES ('g1', 'hash-g1', 'acme', 'link', 'upload', 'package', 'file.bin',
-                             'blake3', 'root', 0, 0, 1, 'download', 10, 20,
-                             '[{"source":"objects/a","name":"a.txt","suite":"blake3","root":"aa","bytes":3,"receipt_b64":"receipt-a"}]');
-                     INSERT INTO meta (key, value) VALUES ('schema_version', '9');"#,
-                )
-                .unwrap();
-        }
-
-        let store = Store::open(directory.path()).unwrap();
-        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
-        let grant = store
-            .outbound_grant_by_token_hash("hash-g1")
-            .unwrap()
-            .unwrap();
-        assert!(grant.password_hash.is_none());
-        assert!(grant.first_download_at.is_none());
-        assert!(grant.last_download_at.is_none());
-        assert_eq!(grant.files[0].downloads, 0);
-        assert!(grant.files[0].first_download_at.is_none());
-        assert!(grant.files[0].last_download_at.is_none());
-    }
-
-    #[test]
-    fn v10_database_adds_outbound_delivery_timestamps() {
-        let directory = tempfile::tempdir().unwrap();
-        drop(Store::open(directory.path()).unwrap());
-        {
-            let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-            connection
-                .execute_batch(
-                    "DROP TABLE automation_tokens;
-                     ALTER TABLE outbound_grants DROP COLUMN max_downloads;
-                     ALTER TABLE outbound_grants DROP COLUMN first_download_at;
-                     ALTER TABLE outbound_grants DROP COLUMN last_download_at;
-                     ALTER TABLE outbound_grants DROP COLUMN file_count;
-
-
-                     UPDATE meta SET value = '10' WHERE key = 'schema_version';",
-                )
-                .unwrap();
-        }
-
-        drop(Store::open(directory.path()).unwrap());
-        let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
-        let columns: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('outbound_grants')
-                 WHERE name IN ('first_download_at', 'last_download_at')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(columns, 2);
-    }
-
-    #[test]
-    fn v11_database_adds_automation_tokens() {
-        let directory = tempfile::tempdir().unwrap();
-        drop(Store::open(directory.path()).unwrap());
-        {
-            let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-            connection
-                .execute_batch(
-                    "DROP TABLE automation_tokens;
-                     ALTER TABLE outbound_grants DROP COLUMN max_downloads;
-                     ALTER TABLE outbound_grants DROP COLUMN file_count;
-
-
-                     UPDATE meta SET value = '11' WHERE key = 'schema_version';",
-                )
-                .unwrap();
-        }
-
-        drop(Store::open(directory.path()).unwrap());
-        let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
-        let table_exists: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name = 'automation_tokens'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(table_exists, 1);
-        let index_exists: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'index' AND name = 'automation_tokens_tenant_created'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(index_exists, 1);
-    }
-
-    #[test]
-    fn v12_database_adds_nullable_outbound_download_limit() {
-        let directory = tempfile::tempdir().unwrap();
-        drop(Store::open(directory.path()).unwrap());
-        {
-            let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-            connection
-                .execute_batch(
-                    "ALTER TABLE outbound_grants DROP COLUMN max_downloads;
-                     ALTER TABLE outbound_grants DROP COLUMN file_count;
-
-
-                     UPDATE meta SET value = '12' WHERE key = 'schema_version';",
-                )
-                .unwrap();
-        }
-
-        drop(Store::open(directory.path()).unwrap());
-        let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
-        let default: Option<String> = connection
-            .query_row(
-                "SELECT dflt_value FROM pragma_table_info('outbound_grants')
-                 WHERE name = 'max_downloads'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(default.is_none());
-    }
-
-    #[test]
-    fn v15_database_backfills_outbound_file_counts() {
-        let directory = tempfile::tempdir().unwrap();
-        drop(Store::open(directory.path()).unwrap());
-        {
-            let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-            connection
-                .execute_batch(
-                    "ALTER TABLE outbound_grants DROP COLUMN file_count;
-                     INSERT INTO outbound_grants
-                         (id, token_hash, tenant, link_id, upload_id, package_root, name, suite,
-                          root, file_index, bytes_hi, bytes_lo, label, created_at, expires_at,
-                          files_json)
-                     VALUES
-                         ('empty', 'hash-empty', 'acme', 'link', 'upload', 'package', 'empty.bin',
-                          'blake3', 'root', 0, 0, 1, 'download', 10, 20, '[]'),
-                         ('single', 'hash-single', 'acme', 'link', 'upload', 'package', 'single.bin',
-                         'blake3', 'root', 0, 0, 1, 'download', 10, 20,
-                         '[{\"source\":\"objects/single\",\"name\":\"single.bin\",\"suite\":\"blake3\",\"root\":\"root\",\"bytes\":1,\"receipt_b64\":\"\"}]'),
-                         ('multi', 'hash-multi', 'acme', 'link', 'upload', 'package', 'multi.bin',
-                         'blake3', 'root', 0, 0, 1, 'download', 10, 20,
-                         '[{\"source\":\"objects/multi-0\",\"name\":\"multi-0.bin\",\"suite\":\"blake3\",\"root\":\"root\",\"bytes\":1,\"receipt_b64\":\"\"},
-                           {\"source\":\"objects/multi-1\",\"name\":\"multi-1.bin\",\"suite\":\"blake3\",\"root\":\"root\",\"bytes\":2,\"receipt_b64\":\"\"}]');
-                     UPDATE meta SET value = '14' WHERE key = 'schema_version';",
-                )
-                .unwrap();
-        }
-
-        drop(Store::open(directory.path()).unwrap());
-        let connection = Connection::open(directory.path().join("votport.db")).unwrap();
-        assert_eq!(schema_version(directory.path()), SCHEMA_VERSION.to_string());
-        let counts: Vec<(String, i64)> = {
-            let mut statement = connection
-                .prepare("SELECT id, file_count FROM outbound_grants ORDER BY id")
-                .unwrap();
-            statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap()
-        };
-        assert_eq!(
-            counts,
-            [
-                ("empty".to_owned(), 1),
-                ("multi".to_owned(), 2),
-                ("single".to_owned(), 1),
-            ]
-        );
     }
 
     #[test]
