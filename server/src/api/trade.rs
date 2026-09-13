@@ -22,7 +22,7 @@ fn notify_later(app: &Arc<App>, route: &TradeRoute, event: &'static str) {
         crate::notify::trade_event(&app, &route, &route.notifications, event).await;
     });
 }
-fn write(app: &App, headers: &HeaderMap) -> ApiResult<crate::auth::AdminIdentity> {
+fn write(app: &App, headers: &HeaderMap) -> ApiResult<admin::AdminSession> {
     let identity = admin::require_operator(app, headers)?;
     admin::require_admin_write(headers, &identity)?;
     Ok(identity)
@@ -348,7 +348,7 @@ pub async fn accept(
     let route = TradeRoute {
         id: crate::auth::random_token(),
         revision: 1,
-        tenant: actor.tenant,
+        tenant: actor.tenant.clone(),
         direction: "outgoing".into(),
         name: body.name,
         peer_name: peer.document.body["name"]

@@ -749,6 +749,7 @@ mod handler_tests {
         application
             .store
             .insert_tenant(crate::store::Tenant {
+                incarnation: String::new(),
                 key: "acme".to_owned(),
                 label: "Acme Legal".to_owned(),
                 admin_group: None,

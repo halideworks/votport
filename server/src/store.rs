@@ -271,6 +271,8 @@ impl Link {
 pub struct Tenant {
     /// URL-safe key used in paths and tokens ("" is reserved for default).
     pub key: String,
+    #[serde(skip)]
+    pub incarnation: String,
     pub label: String,
     /// Group whose members administer this tenant's links (SSO mapping).
     pub admin_group: Option<String>,
@@ -463,7 +465,7 @@ pub struct SettingsOverlay {
     pub draining_source: &'static str,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 36;
+pub(crate) const SCHEMA_VERSION: u64 = 37;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
@@ -688,6 +690,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE INDEX IF NOT EXISTS audit_log_at ON audit_log(at);
 CREATE TABLE IF NOT EXISTS tenants (
     key TEXT PRIMARY KEY,
+    incarnation TEXT NOT NULL,
     label TEXT NOT NULL DEFAULT '',
     admin_group TEXT,
     max_total_bytes INTEGER,
@@ -1710,8 +1713,8 @@ impl Store {
             }
             drop(statement);
             connection.execute(
-                "INSERT INTO tenants (key, label, admin_group, max_total_bytes, max_links, max_sessions, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO tenants (key, label, admin_group, max_total_bytes, max_links, max_sessions, created_at, incarnation)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
                     tenant.key,
                     tenant.label,
@@ -1719,7 +1722,8 @@ impl Store {
                     tenant.max_total_bytes.map(encode_quota),
                     tenant.max_links.map(encode_quota),
                     tenant.max_sessions.map(encode_quota),
-                    i64::try_from(tenant.created_at).unwrap_or(0)
+                    i64::try_from(tenant.created_at).unwrap_or(0),
+                    crate::auth::random_token()
                 ],
             )?;
             Ok(None)
@@ -1735,7 +1739,7 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT key, label, admin_group, CAST(max_total_bytes AS TEXT),
-                        CAST(max_links AS TEXT), CAST(max_sessions AS TEXT), created_at
+                        CAST(max_links AS TEXT), CAST(max_sessions AS TEXT), created_at, incarnation
                  FROM tenants ORDER BY rowid",
             )?;
             let rows = statement.query_map([], map_tenant)?;
@@ -1748,12 +1752,32 @@ impl Store {
             connection
                 .query_row(
                     "SELECT key, label, admin_group, CAST(max_total_bytes AS TEXT),
-                            CAST(max_links AS TEXT), CAST(max_sessions AS TEXT), created_at
+                            CAST(max_links AS TEXT), CAST(max_sessions AS TEXT), created_at, incarnation
                      FROM tenants WHERE key = ?1",
                     [key],
                     map_tenant,
                 )
                 .optional()
+        })
+    }
+
+    pub(crate) fn tenant_incarnations<'a>(
+        &self,
+        keys: impl IntoIterator<Item = &'a str>,
+    ) -> Result<HashMap<String, String>, String> {
+        self.with(|connection| {
+            let mut statement =
+                connection.prepare_cached("SELECT incarnation FROM tenants WHERE key=?1")?;
+            let mut incarnations = HashMap::new();
+            for key in keys {
+                if let Some(incarnation) = statement
+                    .query_row([key], |row| row.get::<_, String>(0))
+                    .optional()?
+                {
+                    incarnations.insert(key.to_owned(), incarnation);
+                }
+            }
+            Ok(incarnations)
         })
     }
 
@@ -1811,6 +1835,10 @@ impl Store {
             }
         };
         if matches!(removal, TenantRemoval::Deleted | TenantRemoval::Absent) {
+            transaction.execute("DELETE FROM upload_session_files WHERE session_id IN (SELECT id FROM upload_sessions WHERE tenant=?1)", [key]).map_err(|error| error.to_string())?;
+            transaction
+                .execute("DELETE FROM upload_sessions WHERE tenant=?1", [key])
+                .map_err(|error| error.to_string())?;
             transaction.execute("DELETE FROM trade_rotations WHERE route_id IN (SELECT id FROM trade_routes WHERE tenant=?1)",[key]).map_err(|e|e.to_string())?;
             transaction.execute("DELETE FROM trade_delivery_policies WHERE route_id IN (SELECT id FROM inbound_routes WHERE tenant=?1)",[key]).map_err(|e|e.to_string())?;
             transaction.execute("DELETE FROM delivery_storage_credentials WHERE id IN (SELECT id FROM trade_routes WHERE tenant=?1 AND direction='outgoing')",[key]).map_err(|e|e.to_string())?;
@@ -4278,6 +4306,7 @@ pub struct AuditFilters<'a> {
 
 fn map_tenant(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tenant> {
     Ok(Tenant {
+        incarnation: row.get(7)?,
         key: row.get(0)?,
         label: row.get(1)?,
         admin_group: row.get(2)?,
@@ -4946,6 +4975,7 @@ pub(crate) mod tests {
 
     pub(crate) fn test_tenant(key: &str) -> Tenant {
         Tenant {
+            incarnation: String::new(),
             key: key.to_owned(),
             label: key.to_owned(),
             admin_group: None,
@@ -4982,6 +5012,126 @@ pub(crate) mod tests {
             last_download_at: None,
             files: Vec::new(),
         }
+    }
+
+    #[test]
+    fn tenant_incarnation_survives_updates_and_reopen_but_not_recreation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.insert_tenant(test_tenant("acme")).unwrap();
+        let mut tenant = store.tenant("acme").unwrap().unwrap();
+        let incarnation = tenant.incarnation.clone();
+        assert_eq!(hex::decode(&incarnation).unwrap().len(), 16);
+        tenant.label = "updated".into();
+        tenant.incarnation = "must-not-replace".into();
+        assert!(store.update_tenant(&tenant).unwrap());
+        assert_eq!(
+            store.tenant("acme").unwrap().unwrap().incarnation,
+            incarnation
+        );
+        drop(store);
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(
+            store.tenant("acme").unwrap().unwrap().incarnation,
+            incarnation
+        );
+        assert_eq!(store.remove_tenant("acme").unwrap(), TenantRemoval::Deleted);
+        store.insert_tenant(test_tenant("acme")).unwrap();
+        let replacement = store.tenant("acme").unwrap().unwrap();
+        assert_eq!(replacement.created_at, tenant.created_at);
+        assert_ne!(replacement.incarnation, incarnation);
+    }
+
+    #[test]
+    fn tenant_removal_clears_retained_uploads_atomically_and_only_in_that_tenant() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        for key in ["acme", "other"] {
+            store.insert_tenant(test_tenant(key)).unwrap();
+        }
+        let object = vot_sdk::object::ObjectId {
+            suite: 1,
+            root: [7; 32],
+            length: 8,
+        };
+        for (id, tenant, committed) in [
+            ("pending", "acme", false),
+            ("committed", "acme", true),
+            ("other", "other", false),
+        ] {
+            store
+                .insert_upload_session(&PersistedUploadSession {
+                    id: id.into(),
+                    tenant: tenant.into(),
+                    link_id: "removed-link".into(),
+                    push_key: None,
+                    committed_upload_id: None,
+                    dest_dir: directory.path().join(tenant),
+                    dest_rel: String::new(),
+                    package: object.clone(),
+                    max_total_bytes: None,
+                    started_at: 0,
+                    files: vec![PersistedUploadFile {
+                        entry: 0,
+                        display_path: "frame".into(),
+                        stored_components: vec!["frame".into()],
+                        object: object.clone(),
+                        staging_path: Default::default(),
+                        journal_path: Default::default(),
+                        incarnation: [0; 16],
+                        profile: vot_sdk_file::CommitProfile::Balanced,
+                        nas_contract: vot_sdk_file::NasContract::Unqualified,
+                        prefix_bytes: 0,
+                        published: false,
+                        receipt: false,
+                    }],
+                })
+                .unwrap();
+            if committed {
+                store
+                    .with(|connection| {
+                        connection.execute(
+                            "UPDATE upload_sessions SET committed_upload_id='finished' WHERE id=?1",
+                            [id],
+                        )
+                    })
+                    .unwrap();
+            }
+        }
+        store.with(|connection| connection.execute_batch("CREATE TRIGGER fail_upload_removal BEFORE DELETE ON upload_session_files WHEN OLD.session_id='pending' BEGIN SELECT RAISE(ABORT, 'fixture'); END;")).unwrap();
+        assert!(store.remove_tenant("acme").is_err());
+        assert!(store.tenant("acme").unwrap().is_some());
+        assert_eq!(store.load_upload_sessions().unwrap().len(), 3);
+        assert_eq!(
+            store
+                .with(|connection| connection.query_row(
+                    "SELECT COUNT(*) FROM upload_session_files",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                ))
+                .unwrap(),
+            3
+        );
+        store
+            .with(|connection| connection.execute_batch("DROP TRIGGER fail_upload_removal;"))
+            .unwrap();
+        assert_eq!(store.remove_tenant("acme").unwrap(), TenantRemoval::Deleted);
+        let remaining = store.load_upload_sessions().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].tenant, "other");
+        assert_eq!(
+            store
+                .with(|connection| connection.query_row(
+                    "SELECT COUNT(*) FROM upload_session_files",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                ))
+                .unwrap(),
+            1
+        );
+        store.insert_tenant(test_tenant("acme")).unwrap();
+        assert!(store.tenant_admission_usage("acme").unwrap().1.is_empty());
+        assert_eq!(store.tenant_admission_usage("other").unwrap().1.len(), 1);
     }
 
     #[test]
@@ -6352,6 +6502,7 @@ mod tenant_tests {
         let store = Store::open(directory.path()).unwrap();
         store
             .insert_tenant(Tenant {
+                incarnation: String::new(),
                 key: "acme".to_owned(),
                 label: "Acme".to_owned(),
                 admin_group: None,
@@ -6379,6 +6530,7 @@ mod tenant_tests {
         let store = Store::open(directory.path()).unwrap();
         store
             .insert_tenant(Tenant {
+                incarnation: String::new(),
                 key: "acme".to_owned(),
                 label: String::new(),
                 admin_group: Some("acme-admins".to_owned()),
@@ -7724,6 +7876,7 @@ mod settings_tests {
         let store = Store::open(directory.path()).unwrap();
         store
             .insert_tenant(Tenant {
+                incarnation: String::new(),
                 key: "acme".to_owned(),
                 label: String::new(),
                 admin_group: None,

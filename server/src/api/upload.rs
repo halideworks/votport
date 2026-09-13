@@ -1725,6 +1725,7 @@ mod push_preflight_tests {
         application
             .store
             .insert_tenant(Tenant {
+                incarnation: String::new(),
                 key: "gone".to_owned(),
                 label: "gone".to_owned(),
                 admin_group: None,
@@ -1775,6 +1776,7 @@ mod push_preflight_tests {
         application
             .store
             .insert_tenant(Tenant {
+                incarnation: String::new(),
                 key: "no-sessions".to_owned(),
                 label: "no sessions".to_owned(),
                 admin_group: None,
@@ -1861,6 +1863,7 @@ mod push_preflight_tests {
         application
             .store
             .insert_tenant(Tenant {
+                incarnation: String::new(),
                 key: "tenant".to_owned(),
                 label: "tenant".to_owned(),
                 admin_group: None,

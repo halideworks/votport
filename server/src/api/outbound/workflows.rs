@@ -6,6 +6,7 @@ use crate::workflow::{Job, JobRequest, Project};
 
 struct Actor {
     identity: auth::AdminIdentity,
+    _operation: Option<Arc<crate::session::OwnedOutboundOperation>>,
     token: Option<AutomationToken>,
 }
 
@@ -47,11 +48,14 @@ fn actor(
         };
         Ok(Actor {
             identity,
+            _operation: None,
             token: Some(token),
         })
     } else {
+        let session = admin::require_operator(app, headers)?;
         Ok(Actor {
-            identity: admin::require_operator(app, headers)?,
+            identity: session.identity,
+            _operation: Some(session.operation),
             token: None,
         })
     }
@@ -2021,6 +2025,7 @@ mod tests {
             let receiver = crate::app::build(config).unwrap();
             crate::app::start_push_receiver(Arc::clone(&receiver));
             let mut tenant = crate::store::Tenant {
+                incarnation: String::new(),
                 key: "nyc".into(),
                 label: "Independent NYC tenant".into(),
                 admin_group: None,
@@ -3218,6 +3223,7 @@ mod tests {
             let mut identity = auth::AdminIdentity::local_admin();
             identity.subject = subject.into();
             identity.role = role.into();
+            identity.grants[0].role = role.into();
             let cookie = format!(
                 "votport_admin={}",
                 auth::issue_admin_token(&app.secret, &identity, &app.config.admin_token_tag)

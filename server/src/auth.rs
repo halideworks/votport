@@ -154,6 +154,7 @@ pub fn verify_recipient(
 /// One tenant the principal may act in, with its role.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TenantGrant {
+    pub incarnation: Option<String>,
     /// "" is the default tenant.
     pub tenant: String,
     /// "admin" (full control) or "viewer" (read-only dashboard).
@@ -188,6 +189,7 @@ impl AdminIdentity {
             tenant: String::new(),
             role: "admin".to_owned(),
             grants: vec![TenantGrant {
+                incarnation: None,
                 tenant: String::new(),
                 role: "admin".to_owned(),
             }],

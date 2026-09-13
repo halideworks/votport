@@ -27,9 +27,19 @@ const PRINCIPAL_PAGE_MAX: usize = 100;
 /// test module's `cookie_for`.
 #[cfg(test)]
 pub(crate) fn test_admin_cookie(app: &App, identity: &auth::AdminIdentity) -> String {
+    let mut identity = identity.clone();
+    for grant in &mut identity.grants {
+        if !grant.tenant.is_empty() {
+            grant.incarnation = app
+                .store
+                .tenant(&grant.tenant)
+                .unwrap()
+                .map(|tenant| tenant.incarnation);
+        }
+    }
     format!(
         "votport_admin={}; Path=/",
-        auth::issue_admin_token(&app.secret, identity, &admin_token_phc(app).unwrap())
+        auth::issue_admin_token(&app.secret, &identity, &admin_token_phc(app).unwrap())
     )
 }
 
@@ -45,12 +55,42 @@ fn admin_token_phc(app: &App) -> ApiResult<String> {
         .unwrap_or_else(|| app.config.admin_token_tag.clone()))
 }
 
+#[derive(Clone)]
+pub(crate) struct AdminSession {
+    pub(crate) identity: auth::AdminIdentity,
+    pub(crate) operation: Arc<crate::session::OwnedOutboundOperation>,
+}
+
+impl std::ops::Deref for AdminSession {
+    type Target = auth::AdminIdentity;
+
+    fn deref(&self) -> &Self::Target {
+        &self.identity
+    }
+}
+
+impl std::fmt::Debug for AdminSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.identity.fmt(formatter)
+    }
+}
+
+fn tenant_operation(
+    app: &App,
+    tenant: &str,
+) -> ApiResult<Arc<crate::session::OwnedOutboundOperation>> {
+    app.sessions
+        .try_begin_outbound_owned(tenant)
+        .map(Arc::new)
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "tenant deletion is in progress"))
+}
+
 /// Returns the authenticated principal, or unauthorized.
-pub(crate) fn require_admin(app: &App, headers: &HeaderMap) -> ApiResult<auth::AdminIdentity> {
+pub(crate) fn require_admin(app: &App, headers: &HeaderMap) -> ApiResult<AdminSession> {
     require_admin_session(app, headers).map(|(identity, _)| identity)
 }
 
-fn require_admin_session(app: &App, headers: &HeaderMap) -> ApiResult<(auth::AdminIdentity, u64)> {
+fn require_admin_session(app: &App, headers: &HeaderMap) -> ApiResult<(AdminSession, u64)> {
     let token = headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
@@ -68,8 +108,10 @@ fn require_admin_session(app: &App, headers: &HeaderMap) -> ApiResult<(auth::Adm
     {
         return Err(ApiError::unauthorized());
     }
+    let operation = tenant_operation(app, &identity.tenant)?;
     if identity.subject == "local" {
-        identity.grants = local_admin_grants(app).map_err(super::store_unavailable)?;
+        let tenants = app.store.tenants().map_err(super::store_unavailable)?;
+        identity.grants = local_admin_grants(&tenants);
         if !identity
             .grants
             .iter()
@@ -78,15 +120,48 @@ fn require_admin_session(app: &App, headers: &HeaderMap) -> ApiResult<(auth::Adm
             identity.tenant = String::new();
             identity.role = "admin".to_owned();
         }
+    } else {
+        let incarnations = app
+            .store
+            .tenant_incarnations(
+                identity
+                    .grants
+                    .iter()
+                    .filter(|grant| !grant.tenant.is_empty())
+                    .map(|grant| grant.tenant.as_str()),
+            )
+            .map_err(super::store_unavailable)?;
+        identity.grants.retain(|grant| {
+            if grant.tenant.is_empty() {
+                grant.incarnation.is_none()
+            } else {
+                grant.incarnation.as_deref().is_some_and(|generation| {
+                    incarnations.get(grant.tenant.as_str()).map(String::as_str) == Some(generation)
+                })
+            }
+        });
+        if !identity
+            .grants
+            .iter()
+            .any(|grant| grant.tenant == identity.tenant && grant.role == identity.role)
+        {
+            return Err(ApiError::unauthorized());
+        }
     }
-    Ok((identity, expires))
+    Ok((
+        AdminSession {
+            identity,
+            operation,
+        },
+        expires,
+    ))
 }
 
 /// Read routes for operators: admins and viewers pass, auditors do not.
 /// The auditor role sees only its own session and the audit trail; every
 /// link, file, grant, and settings route goes through this gate instead of
 /// bare `require_admin`.
-pub(crate) fn require_operator(app: &App, headers: &HeaderMap) -> ApiResult<auth::AdminIdentity> {
+pub(crate) fn require_operator(app: &App, headers: &HeaderMap) -> ApiResult<AdminSession> {
     let identity = require_admin(app, headers)?;
     if identity.role == "auditor" {
         return Err(ApiError::new(StatusCode::FORBIDDEN, "audit-only session"));
@@ -94,26 +169,23 @@ pub(crate) fn require_operator(app: &App, headers: &HeaderMap) -> ApiResult<auth
     Ok(identity)
 }
 
-fn local_admin_grants(app: &App) -> Result<Vec<auth::TenantGrant>, String> {
+fn local_admin_grants(tenants: &[crate::store::Tenant]) -> Vec<auth::TenantGrant> {
     let mut grants = vec![auth::TenantGrant {
+        incarnation: None,
         tenant: String::new(),
         role: "admin".to_owned(),
     }];
-    grants.extend(
-        app.store
-            .tenants()?
-            .into_iter()
-            .map(|tenant| auth::TenantGrant {
-                tenant: tenant.key,
-                role: "admin".to_owned(),
-            }),
-    );
-    Ok(grants)
+    grants.extend(tenants.iter().map(|tenant| auth::TenantGrant {
+        incarnation: Some(tenant.incarnation.clone()),
+        tenant: tenant.key.clone(),
+        role: "admin".to_owned(),
+    }));
+    grants
 }
 
 /// Default-tenant admin only. Same gate as database backup: viewers and
 /// named-tenant admins cannot read platform configuration.
-fn require_platform_admin(app: &App, headers: &HeaderMap) -> ApiResult<auth::AdminIdentity> {
+fn require_platform_admin(app: &App, headers: &HeaderMap) -> ApiResult<AdminSession> {
     let identity = require_admin(app, headers)?;
     if !identity.tenant.is_empty() || identity.role != "admin" {
         return Err(ApiError::new(
@@ -297,6 +369,7 @@ pub async fn admin_audit_export(
     let after_rowid = query.after_rowid;
     let before_rowid = query.before_rowid;
     let store = Arc::clone(&app.store);
+    let _operation = Arc::clone(&identity.operation);
     let rows = tokio::task::spawn_blocking(move || {
         let tenant_filter = audit_tenant(&identity);
         let filters = AuditFilters {
@@ -566,13 +639,11 @@ pub async fn admin_session(
     Ok(Json(admin_session_view(&identity)))
 }
 
-pub(crate) fn admin_page_session(app: &App, headers: &HeaderMap) -> Option<serde_json::Value> {
-    require_admin(app, headers)
-        .ok()
-        .map(|identity| admin_session_view(&identity))
+pub(crate) fn admin_page_session(app: &App, headers: &HeaderMap) -> Option<AdminSession> {
+    require_admin(app, headers).ok()
 }
 
-fn admin_session_view(identity: &auth::AdminIdentity) -> serde_json::Value {
+pub(crate) fn admin_session_view(identity: &auth::AdminIdentity) -> serde_json::Value {
     // Which dashboard pages this principal may open. Named tenants get their
     // own links plus a tenant-filtered audit view; platform administration
     // (tenants, system) is default-tenant admin only.
@@ -670,6 +741,7 @@ pub async fn create_tenant(
         .resolved_settings(&app.config)
         .map_err(super::store_unavailable)?;
     let tenant = crate::store::Tenant {
+        incarnation: String::new(),
         key: key.clone(),
         label: request.label.trim().to_owned(),
         admin_group: request.admin_group.filter(|group| !group.trim().is_empty()),
@@ -1107,7 +1179,11 @@ pub(crate) const MAX_LOGO_BYTES: usize = 512 * 1024;
 
 /// Maps the branding path key to a stored tenant: "default" is the default
 /// tenant (""), anything else must name an existing tenant row.
-fn branding_tenant(app: &App, key: &str, identity: &auth::AdminIdentity) -> ApiResult<String> {
+fn branding_tenant(
+    app: &App,
+    key: &str,
+    identity: &auth::AdminIdentity,
+) -> ApiResult<(String, Arc<crate::session::OwnedOutboundOperation>)> {
     let tenant = if key == "default" {
         String::new()
     } else {
@@ -1125,16 +1201,29 @@ fn branding_tenant(app: &App, key: &str, identity: &auth::AdminIdentity) -> ApiR
             "no admin access to that tenant",
         ));
     }
-    if !tenant.is_empty()
-        && app
+    let operation = tenant_operation(app, &tenant)?;
+    if !tenant.is_empty() {
+        let current = app
             .store
             .tenant(&tenant)
             .map_err(super::store_unavailable)?
-            .is_none()
-    {
-        return Err(ApiError::not_found());
+            .ok_or_else(ApiError::not_found)?;
+        let platform = identity
+            .grants
+            .iter()
+            .any(|grant| grant.tenant.is_empty() && grant.role == "admin");
+        if identity.subject != "local"
+            && !platform
+            && !identity.grants.iter().any(|grant| {
+                grant.tenant == tenant
+                    && grant.role == "admin"
+                    && grant.incarnation.as_deref() == Some(current.incarnation.as_str())
+            })
+        {
+            return Err(ApiError::unauthorized());
+        }
     }
-    Ok(tenant)
+    Ok((tenant, operation))
 }
 
 fn admit_brand_color(color: &str) -> ApiResult<()> {
@@ -1168,7 +1257,7 @@ pub async fn get_branding(
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_operator(&app, &headers)?;
-    let tenant = branding_tenant(&app, &key, &identity)?;
+    let (tenant, _target_operation) = branding_tenant(&app, &key, &identity)?;
     let branding = app
         .store
         .branding(&tenant)
@@ -1206,7 +1295,7 @@ pub async fn put_branding(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_operator(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    let tenant = branding_tenant(&app, &key, &identity)?;
+    let (tenant, _target_operation) = branding_tenant(&app, &key, &identity)?;
     admit_brand_color(&request.color)?;
     let previous = app
         .store
@@ -1290,6 +1379,17 @@ fn admit_footer(branding: &crate::store::Branding) -> ApiResult<()> {
     Ok(())
 }
 
+async fn remove_branding_file(
+    path: std::path::PathBuf,
+    operation: Arc<crate::session::OwnedOutboundOperation>,
+) {
+    let _ = tokio::task::spawn_blocking(move || {
+        let _operation = operation;
+        std::fs::remove_file(path)
+    })
+    .await;
+}
+
 /// Removes a tenant's branding row and any stored logo file.
 pub async fn delete_branding(
     State(app): State<Arc<App>>,
@@ -1298,7 +1398,7 @@ pub async fn delete_branding(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_operator(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    let tenant = branding_tenant(&app, &key, &identity)?;
+    let (tenant, _target_operation) = branding_tenant(&app, &key, &identity)?;
     let logo_ext = app
         .store
         .branding(&tenant)
@@ -1310,7 +1410,7 @@ pub async fn delete_branding(
         .map_err(ApiError::internal)?;
     if !logo_ext.is_empty() {
         let path = paths::branding_logo_path(&app.config.data_dir, &tenant, &logo_ext);
-        let _ = tokio::fs::remove_file(path).await;
+        remove_branding_file(path, Arc::clone(&_target_operation)).await;
     }
     tracing::info!(target: "audit", event = "branding_deleted", tenant = %tenant, "tenant branding removed");
     app.store.audit(
@@ -1360,7 +1460,7 @@ pub async fn put_branding_logo(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_operator(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    let tenant = branding_tenant(&app, &key, &identity)?;
+    let (tenant, _target_operation) = branding_tenant(&app, &key, &identity)?;
     if body.len() > MAX_LOGO_BYTES {
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1380,7 +1480,9 @@ pub async fn put_branding_logo(
     let bytes = body.to_vec();
     let written: Result<(), String> = tokio::task::spawn_blocking({
         let target = target.clone();
+        let operation = Arc::clone(&_target_operation);
         move || {
+            let _operation = operation;
             std::fs::create_dir_all(&directory)
                 .map_err(|error| format!("create {}: {error}", directory.display()))?;
             paths::tighten_private_dir(&directory)?;
@@ -1426,7 +1528,7 @@ pub async fn put_branding_logo(
         .map_err(ApiError::internal)?;
     if !previous_ext.is_empty() && previous_ext != ext {
         let stale = paths::branding_logo_path(&app.config.data_dir, &tenant, &previous_ext);
-        let _ = tokio::fs::remove_file(stale).await;
+        remove_branding_file(stale, Arc::clone(&_target_operation)).await;
     }
     tracing::info!(target: "audit", event = "branding_logo_updated", tenant = %tenant, "tenant logo stored");
     app.store.audit(
@@ -1447,7 +1549,7 @@ pub async fn delete_branding_logo(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_operator(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    let tenant = branding_tenant(&app, &key, &identity)?;
+    let (tenant, _target_operation) = branding_tenant(&app, &key, &identity)?;
     let branding = app
         .store
         .branding(&tenant)
@@ -1462,7 +1564,7 @@ pub async fn delete_branding_logo(
             ..branding
         })
         .map_err(ApiError::internal)?;
-    let _ = tokio::fs::remove_file(path).await;
+    remove_branding_file(path, Arc::clone(&_target_operation)).await;
     tracing::info!(target: "audit", event = "branding_logo_deleted", tenant = %tenant, "tenant logo removed");
     app.store.audit(
         &tenant,
@@ -2350,6 +2452,17 @@ pub async fn switch_tenant(
             "no access to that tenant",
         ));
     };
+    let _target_operation = tenant_operation(&app, &grant.tenant)?;
+    if !grant.tenant.is_empty() {
+        let current = app
+            .store
+            .tenant(&grant.tenant)
+            .map_err(super::store_unavailable)?
+            .ok_or_else(ApiError::unauthorized)?;
+        if grant.incarnation.as_deref() != Some(current.incarnation.as_str()) {
+            return Err(ApiError::unauthorized());
+        }
+    }
     let switched = auth::AdminIdentity {
         tenant: grant.tenant.clone(),
         role: grant.role.clone(),
@@ -4060,6 +4173,7 @@ mod tenant_authz_tests {
             tenant: tenant.to_owned(),
             role: role.to_owned(),
             grants: vec![TenantGrant {
+                incarnation: None,
                 tenant: tenant.to_owned(),
                 role: role.to_owned(),
             }],
@@ -4073,6 +4187,12 @@ mod tenant_authz_tests {
         use http_body_util::BodyExt as _;
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
+        for key in ["acme", "other"] {
+            application
+                .store
+                .insert_tenant(crate::store::tests::test_tenant(key))
+                .unwrap();
+        }
         for tenant in ["", "acme", "other"] {
             application.store.audit(
                 tenant,
@@ -4291,6 +4411,7 @@ mod tenant_authz_tests {
         application
             .store
             .insert_tenant(crate::store::Tenant {
+                incarnation: String::new(),
                 key: "acme".to_owned(),
                 label: String::new(),
                 admin_group: None,
@@ -4506,6 +4627,7 @@ mod branding_tests {
             tenant: tenant.to_owned(),
             role: role.to_owned(),
             grants: vec![TenantGrant {
+                incarnation: None,
                 tenant: tenant.to_owned(),
                 role: role.to_owned(),
             }],
@@ -4517,6 +4639,7 @@ mod branding_tests {
     fn insert_tenant(app: &App, key: &str) {
         app.store
             .insert_tenant(crate::store::Tenant {
+                incarnation: String::new(),
                 key: key.to_owned(),
                 label: String::new(),
                 admin_group: None,
@@ -4564,6 +4687,119 @@ mod branding_tests {
             .await
             .unwrap()
             .status()
+    }
+
+    #[test]
+    fn cancelled_branding_unlink_keeps_its_target_admitted() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        for key in ["acme", "other"] {
+            application
+                .store
+                .insert_tenant(crate::store::tests::test_tenant(key))
+                .unwrap();
+        }
+        application
+            .store
+            .set_branding(&crate::store::Branding {
+                tenant: "acme".into(),
+                logo_ext: "png".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let path = paths::branding_logo_path(&application.config.data_dir, "acme", "png");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"old").unwrap();
+        let mut identity = auth::AdminIdentity::local_admin();
+        identity.subject = "sso:editor".into();
+        identity.tenant = "other".into();
+        identity.grants = ["acme", "other"]
+            .map(|tenant| auth::TenantGrant {
+                incarnation: None,
+                tenant: tenant.into(),
+                role: "admin".into(),
+            })
+            .to_vec();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            super::test_admin_cookie(&application, &identity)
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-votport", "1".parse().unwrap());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release, wait) = std::sync::mpsc::channel();
+            let (ready, started) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                ready.send(()).unwrap();
+                wait.recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), started)
+                .await
+                .unwrap()
+                .unwrap();
+            let request = tokio::spawn(delete_branding(
+                State(application.clone()),
+                Path("acme".into()),
+                headers,
+            ));
+            for _ in 0..200 {
+                if application.store.branding("acme").unwrap().is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(application.store.branding("acme").unwrap().is_none());
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            let held = application.sessions.active_outbound_for_tenant("acme");
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::COOKIE,
+                super::test_admin_cookie(&application, &auth::AdminIdentity::local_admin())
+                    .parse()
+                    .unwrap(),
+            );
+            headers.insert("x-votport", "1".parse().unwrap());
+            let deletion = delete_tenant(
+                State(application.clone()),
+                Path("acme".into()),
+                headers.clone(),
+            )
+            .await;
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            assert_eq!(
+                held, 1,
+                "the queued unlink must retain its target guard after cancellation"
+            );
+            assert_eq!(deletion.unwrap_err().status, StatusCode::CONFLICT);
+            for _ in 0..200 {
+                if application.sessions.active_outbound_for_tenant("acme") == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert_eq!(application.sessions.active_outbound_for_tenant("acme"), 0);
+            assert!(!path.exists());
+            let _ = delete_tenant(State(application.clone()), Path("acme".into()), headers)
+                .await
+                .unwrap();
+            application
+                .store
+                .insert_tenant(crate::store::tests::test_tenant("acme"))
+                .unwrap();
+            std::fs::write(&path, b"new").unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        });
     }
 
     #[tokio::test]
@@ -4958,6 +5194,7 @@ mod tenant_offboard_tests {
 
     fn named_tenant(key: &str) -> Tenant {
         Tenant {
+            incarnation: String::new(),
             key: key.to_owned(),
             label: key.to_owned(),
             admin_group: None,
@@ -5051,6 +5288,110 @@ mod tenant_offboard_tests {
             )
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn recreated_tenant_rejects_active_and_inactive_old_grants() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        for key in ["acme", "other"] {
+            application.store.insert_tenant(named_tenant(key)).unwrap();
+        }
+        let mut identity = auth::AdminIdentity::local_admin();
+        identity.subject = "sso:editor".into();
+        identity.tenant = "acme".into();
+        identity.grants = ["acme", "other"]
+            .map(|tenant| auth::TenantGrant {
+                incarnation: None,
+                tenant: tenant.into(),
+                role: "admin".into(),
+            })
+            .to_vec();
+        let active = super::test_admin_cookie(&application, &identity);
+        identity.tenant = "other".into();
+        let inactive = super::test_admin_cookie(&application, &identity);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, active.parse().unwrap());
+        assert!(require_admin(&application, &headers).is_ok());
+        assert_eq!(
+            application.store.remove_tenant("acme").unwrap(),
+            crate::store::TenantRemoval::Deleted
+        );
+        application
+            .store
+            .insert_tenant(named_tenant("acme"))
+            .unwrap();
+        assert!(
+            require_admin(&application, &headers).is_err(),
+            "a recreated tenant must not inherit an old active grant"
+        );
+        headers.insert(header::COOKIE, inactive.parse().unwrap());
+        headers.insert("x-votport", "1".parse().unwrap());
+        let authenticated = require_admin(&application, &headers).unwrap();
+        assert_eq!(authenticated.tenant, "other");
+        assert!(branding_tenant(&application, "acme", &authenticated).is_err());
+        assert!(switch_tenant(
+            State(application.clone()),
+            headers,
+            Json(SwitchTenantRequest {
+                tenant: "acme".into()
+            })
+        )
+        .await
+        .is_err());
+        let local = super::test_admin_cookie(&application, &auth::AdminIdentity::local_admin());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, local.parse().unwrap());
+        assert!(require_admin(&application, &headers)
+            .unwrap()
+            .grants
+            .iter()
+            .any(|grant| grant.tenant == "acme"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_tenant_requests_fence_deletion_only_for_their_namespace() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        for key in ["acme", "other"] {
+            application.store.insert_tenant(named_tenant(key)).unwrap();
+        }
+        let mut identity = auth::AdminIdentity::local_admin();
+        identity.subject = "sso:editor".into();
+        identity.tenant = "acme".into();
+        identity.grants = vec![auth::TenantGrant {
+            incarnation: None,
+            tenant: "acme".into(),
+            role: "admin".into(),
+        }];
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            super::test_admin_cookie(&application, &identity)
+                .parse()
+                .unwrap(),
+        );
+        let admitted = require_admin(&application, &headers).unwrap();
+        let local = super::test_admin_cookie(&application, &auth::AdminIdentity::local_admin());
+        assert_eq!(
+            delete_tenant_req(application.clone(), &local, "acme")
+                .await
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            delete_tenant_req(application.clone(), &local, "other")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        drop(admitted);
+        assert_eq!(
+            delete_tenant_req(application.clone(), &local, "acme")
+                .await
+                .status(),
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
@@ -5462,6 +5803,7 @@ mod tenant_offboard_tests {
         application
             .store
             .insert_tenant(crate::store::Tenant {
+                incarnation: String::new(),
                 key: "clients/acme".to_owned(),
                 label: "legacy".to_owned(),
                 admin_group: None,
@@ -5492,6 +5834,7 @@ mod tenant_offboard_tests {
         application
             .store
             .insert_tenant(crate::store::Tenant {
+                incarnation: String::new(),
                 key: "acme".to_owned(),
                 label: "acme".to_owned(),
                 admin_group: None,
@@ -6278,6 +6621,7 @@ mod settings_api_tests {
             tenant: String::new(),
             role: "admin".to_owned(),
             grants: vec![TenantGrant {
+                incarnation: None,
                 tenant: String::new(),
                 role: "admin".to_owned(),
             }],
@@ -6323,6 +6667,7 @@ mod settings_api_tests {
             tenant: tenant.to_owned(),
             role: role.to_owned(),
             grants: vec![TenantGrant {
+                incarnation: None,
                 tenant: tenant.to_owned(),
                 role: role.to_owned(),
             }],
@@ -6346,6 +6691,10 @@ mod settings_api_tests {
     async fn receiving_storage_checks_require_platform_admin_csrf_and_current_identity() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(crate::store::tests::test_tenant("team"))
+            .unwrap();
         let url = "/api/admin/receiving-storage";
         for (tenant, role) in [("", "viewer"), ("", "auditor"), ("team", "admin")] {
             let (status, _) = send(
@@ -6479,6 +6828,12 @@ mod settings_api_tests {
     async fn admin_html_bootstraps_only_the_authenticated_navigation() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
+        for key in ["team", "</script><script>oops</script>"] {
+            application
+                .store
+                .insert_tenant(crate::store::tests::test_tenant(key))
+                .unwrap();
+        }
         for (tenant, role) in [
             ("", "admin"),
             ("team", "operator"),
@@ -6915,6 +7270,10 @@ mod settings_api_tests {
     async fn viewer_and_named_admin_cannot_read_settings_or_tenants() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(crate::store::tests::test_tenant("acme"))
+            .unwrap();
         let viewer = cookie_for(&application, "", "viewer");
         let named = cookie_for(&application, "acme", "admin");
 
@@ -6967,6 +7326,7 @@ mod settings_api_tests {
         application
             .store
             .insert_tenant(crate::store::Tenant {
+                incarnation: String::new(),
                 key: "acme".to_owned(),
                 label: String::new(),
                 admin_group: None,
@@ -7212,6 +7572,7 @@ mod principals_api_tests {
             tenant: String::new(),
             role: "admin".to_owned(),
             grants: vec![TenantGrant {
+                incarnation: None,
                 tenant: String::new(),
                 role: "admin".to_owned(),
             }],
@@ -7224,7 +7585,7 @@ mod principals_api_tests {
             "subject": subject,
             "tenant": "",
             "role": "admin",
-            "grants": []
+            "grants": [{"tenant": "", "role": "admin", "incarnation": null}]
         })
         .to_string();
         format!(
@@ -7278,6 +7639,7 @@ mod principals_api_tests {
         application
             .store
             .insert_tenant(crate::store::Tenant {
+                incarnation: String::new(),
                 key: "acme".to_owned(),
                 label: String::new(),
                 admin_group: None,
@@ -7447,6 +7809,14 @@ mod principals_api_tests {
                 identity.role = role.into();
                 identity.grants[0].role = role.into();
                 identity.grants.push(TenantGrant {
+                    incarnation: Some(
+                        application
+                            .store
+                            .tenant("acme")
+                            .unwrap()
+                            .unwrap()
+                            .incarnation,
+                    ),
                     tenant: "acme".to_owned(),
                     role: target_role.to_owned(),
                 });
@@ -7580,6 +7950,10 @@ mod principals_api_tests {
         let application = testing::build(directory.path());
         application
             .store
+            .insert_tenant(crate::store::tests::test_tenant("acme"))
+            .unwrap();
+        application
+            .store
             .upsert_sso_principal("Alice%literal", &[], &json!([]))
             .unwrap();
         let named = cookie_for(
@@ -7589,6 +7963,7 @@ mod principals_api_tests {
                 tenant: "acme".to_owned(),
                 role: "admin".to_owned(),
                 grants: vec![TenantGrant {
+                    incarnation: None,
                     tenant: "acme".to_owned(),
                     role: "admin".to_owned(),
                 }],
@@ -7673,6 +8048,7 @@ mod principals_api_tests {
     async fn named_tenant_admin_cannot_revoke() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
+        insert_acme(&application);
         application
             .store
             .upsert_sso_principal("user@example.com", &[], &json!([]))
@@ -7684,6 +8060,7 @@ mod principals_api_tests {
                 tenant: "acme".to_owned(),
                 role: "admin".to_owned(),
                 grants: vec![TenantGrant {
+                    incarnation: None,
                     tenant: "acme".to_owned(),
                     role: "admin".to_owned(),
                 }],
@@ -7720,6 +8097,7 @@ mod principals_api_tests {
                 tenant: String::new(),
                 role: "viewer".to_owned(),
                 grants: vec![TenantGrant {
+                    incarnation: None,
                     tenant: String::new(),
                     role: "viewer".to_owned(),
                 }],

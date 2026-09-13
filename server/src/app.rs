@@ -2343,45 +2343,47 @@ pub fn router(app: Arc<App>) -> Router {
                                 Some("index" | "verify")
                             ))
                         .then(String::new);
-                        if admin_page {
-                            if let Some(session) = api::admin::admin_page_session(&app, &headers) {
-                                footer_tenant = session["tenant"].as_str().map(str::to_owned);
-                                let mut nav = String::new();
-                                for (page, label) in [
-                                    ("receive", "Receive"),
-                                    ("deliver", "Deliver"),
-                                    ("workflows", "Workflows"),
-                                    ("trade-routes", "Trade routes"),
-                                    ("storage", "Storage"),
-                                    ("automation", "Automation"),
-                                    ("notifications", "Notifications"),
-                                    ("tenants", "Tenants"),
-                                    ("audit", "Audit"),
-                                    ("system", "System"),
-                                ] {
-                                    if session["pages"].as_array().is_some_and(|pages| {
-                                        pages.iter().any(|value| value == page)
-                                    }) {
-                                        let active =
-                                            if path.file_stem().and_then(|name| name.to_str())
-                                                == Some(page)
-                                            {
-                                                " class=\"active\" aria-current=\"page\""
-                                            } else {
-                                                ""
-                                            };
-                                        nav.push_str(&format!(
-                                            "<a href=\"/{page}\"{active}>{label}</a>"
-                                        ));
-                                    }
+                        let page_session = admin_page
+                            .then(|| api::admin::admin_page_session(&app, &headers))
+                            .flatten();
+                        if let Some(session) = &page_session {
+                            let session = api::admin::admin_session_view(session);
+                            footer_tenant = session["tenant"].as_str().map(str::to_owned);
+                            let mut nav = String::new();
+                            for (page, label) in [
+                                ("receive", "Receive"),
+                                ("deliver", "Deliver"),
+                                ("workflows", "Workflows"),
+                                ("trade-routes", "Trade routes"),
+                                ("storage", "Storage"),
+                                ("automation", "Automation"),
+                                ("notifications", "Notifications"),
+                                ("tenants", "Tenants"),
+                                ("audit", "Audit"),
+                                ("system", "System"),
+                            ] {
+                                if session["pages"]
+                                    .as_array()
+                                    .is_some_and(|pages| pages.iter().any(|value| value == page))
+                                {
+                                    let active = if path.file_stem().and_then(|name| name.to_str())
+                                        == Some(page)
+                                    {
+                                        " class=\"active\" aria-current=\"page\""
+                                    } else {
+                                        ""
+                                    };
+                                    nav.push_str(&format!(
+                                        "<a href=\"/{page}\"{active}>{label}</a>"
+                                    ));
                                 }
-                                contents = contents.replace(
-                                    "<nav id=\"nav\" class=\"nav\"></nav>",
-                                    &format!("<nav id=\"nav\" class=\"nav\">{nav}</nav>"),
-                                );
-                                let bootstrap = session.to_string().replace('<', "\\u003c");
-                                contents = contents.replace("</head>", &format!("<script id=\"admin-session\" type=\"application/json\">{bootstrap}</script></head>"));
                             }
+                            contents = contents.replace(
+                                "<nav id=\"nav\" class=\"nav\"></nav>",
+                                &format!("<nav id=\"nav\" class=\"nav\">{nav}</nav>"),
+                            );
+                            let bootstrap = session.to_string().replace('<', "\\u003c");
+                            contents = contents.replace("</head>", &format!("<script id=\"admin-session\" type=\"application/json\">{bootstrap}</script></head>"));
                         }
                         if let Some(tenant) = footer_tenant {
                             if let Ok(Some(branding)) = app.store.branding(&tenant) {

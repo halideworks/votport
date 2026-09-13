@@ -250,7 +250,7 @@ pub async fn list_outbound_files(
                 "selection is too long",
             ));
         }
-        let tenant = identity.tenant;
+        let tenant = identity.tenant.clone();
         let app_for_selection = Arc::clone(&app);
         let result = tokio::task::spawn_blocking(move || {
             let directory = automation_directory(&app_for_selection, &tenant, &selection)?;
@@ -610,7 +610,7 @@ async fn prepare_outbound_chunk<'a>(
 
 async fn upload_outbound_chunk(
     app: Arc<App>,
-    identity: auth::AdminIdentity,
+    identity: admin::AdminSession,
     headers: HeaderMap,
     requested_path: String,
     body: Body,
@@ -1529,7 +1529,7 @@ pub async fn delete_automation_token(
     Ok(Json(json!({ "ok": true })))
 }
 
-fn require_automation_admin(app: &App, headers: &HeaderMap) -> ApiResult<auth::AdminIdentity> {
+fn require_automation_admin(app: &App, headers: &HeaderMap) -> ApiResult<admin::AdminSession> {
     let identity = admin::require_operator(app, headers)?;
     if identity.role != "admin" {
         return Err(ApiError::new(StatusCode::FORBIDDEN, "admin role required"));
