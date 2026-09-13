@@ -62,6 +62,18 @@ connection does not prevent the other selected destinations from receiving their
 messages. These notifications do not replace the signed, retrying delivery-event
 webhook under Workflows.
 
+Long text summaries end with an ellipsis at the destination's limit. [Pushover](https://pushover.net/api#limits)
+allows 250 characters in the title and 1,024 in the message; [ntfy](https://docs.ntfy.sh/publish/#limitations) allows 1 KiB
+in the title and 4 KiB in the message, measured in UTF-8 bytes. ntfy titles
+use an encoded query parameter so Unicode and line breaks cannot make an
+invalid HTTP header. Transfer IDs precede the summary and remain visible when
+its file list is shortened. JSON webhook records keep their structured fields.
+
+Email uses a UTF-8 plain-text MIME part. Votport bounds email summaries to
+64 KiB before MIME encoding and subjects to 250 characters; these are application
+bounds, not SMTP protocol limits. Individual mail providers can impose other
+limits.
+
 ## Named-destination API
 
 Destination mutations require an administrator cookie and `X-Votport: 1`.
