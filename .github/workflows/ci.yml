@@ -48,12 +48,12 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Tests
         run: |
-          cargo test
-          cargo test --lib -- --ignored --exact session::push_tests::dormant_staging_preserves_ranges_and_cleans_up_under_low_descriptor_limit
+          cargo test --locked
+          cargo test --locked --lib -- --ignored --exact session::push_tests::dormant_staging_preserves_ranges_and_cleans_up_under_low_descriptor_limit
 
   client:
     runs-on: ubuntu-24.04
@@ -81,18 +81,18 @@ jobs:
 
       - name: Clippy
         working-directory: client
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       # The HTTP end-to-end test drives a real server. A debug build is enough
       # and skips the release profile's slow codegen; the wire feature it
       # carries still builds BoringSSL, cached across runs.
       - name: Build the server for the end-to-end test
         working-directory: server
-        run: cargo build
+        run: cargo build --locked
 
       - name: Tests
         working-directory: client
-        run: VOTPORT_BIN="$GITHUB_WORKSPACE/server/target/debug/votport" cargo test
+        run: VOTPORT_BIN="$GITHUB_WORKSPACE/server/target/debug/votport" cargo test --locked
 
       # The shells build only on their own machines, so the FFI surface is
       # checked here: the bindgen reads the built library and fails on a
@@ -100,8 +100,8 @@ jobs:
       - name: Generate the Swift bindings
         working-directory: client
         run: |
-          cargo build -p votport-client-core
-          cargo run -p uniffi-bindgen -- generate --library target/debug/libvotport_client_core.so --language swift --out-dir target/bindings
+          cargo build --locked -p votport-client-core
+          cargo run --locked -p uniffi-bindgen -- generate --library target/debug/libvotport_client_core.so --language swift --out-dir target/bindings
 
   client-windows:
     # The client carries a QUIC push carrier, so it builds BoringSSL through
@@ -138,8 +138,8 @@ jobs:
           LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
         run: |
           export PATH="$PATH:/c/Program Files/NASM"
-          cargo clippy --all-targets -- -D warnings
-          cargo test --no-run
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked --no-run
 
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
         with:

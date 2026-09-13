@@ -13,8 +13,8 @@ package="$here/VotportCore"
 cargo="${CARGO:-cargo}"
 
 cd "$client"
-"$cargo" build --release -p votport-client-core -p votport-client
-"$cargo" run -q -p uniffi-bindgen -- generate \
+"$cargo" build --locked --release -p votport-client-core -p votport-client
+"$cargo" run --locked -q -p uniffi-bindgen -- generate \
     --library "$target/release/libvotport_client_core.dylib" \
     --language swift --out-dir "$target/bindings"
 
