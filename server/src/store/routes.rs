@@ -273,7 +273,11 @@ impl Store {
         )
         .map_err(|e| e.to_string())?;
         tx.execute("UPDATE outbound_grants SET revoked_at=COALESCE(revoked_at,?2) WHERE upload_id IN (SELECT upload_id FROM route_uploads WHERE route_id=?1) OR id IN (SELECT j.id FROM delivery_jobs j JOIN route_uploads u ON u.upload_id=json_extract(j.document,'$.received.upload_id') WHERE u.route_id=?1)",params![id,now as i64]).map_err(|e|e.to_string())?;
-        tx.execute("UPDATE delivery_jobs SET state='cancelled',document=json_set(document,'$.state','cancelled','$.updated_at',?2,'$.error','Source port revoked this route') WHERE json_extract(document,'$.received.upload_id') IN (SELECT upload_id FROM route_uploads WHERE route_id=?1)",params![id,now as i64]).map_err(|e|e.to_string())?;
+        tx.execute("UPDATE delivery_jobs
+            SET state=CASE WHEN state IN ('retiring','retired','suspended') THEN state ELSE 'cancelled' END,
+                document=json_set(document,'$.state',CASE WHEN state IN ('retiring','retired','suspended') THEN state ELSE 'cancelled' END,
+                    '$.updated_at',?2,'$.error','Source port revoked this route','$.checks.source_revoked_at',?2)
+            WHERE json_extract(document,'$.received.upload_id') IN (SELECT upload_id FROM route_uploads WHERE route_id=?1)",params![id,now as i64]).map_err(|e|e.to_string())?;
         evidence::delivery_event(&tx,&self.event_signer,&route.tenant,"","route_revoked",&serde_json::json!({"source":route.source.document.issuer,"operation_id":route.source.document.operation_id,"manifest":route.source.document.manifest}),now).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         route.revoked_at = Some(now);
@@ -379,7 +383,11 @@ impl Store {
     pub fn claim_route_revocation(&self, now: u64) -> Result<Option<OutboundControl>, String> {
         let mut connection = self.connection.lock().expect("store poisoned");
         let tx = connection.transaction().map_err(|e| e.to_string())?;
-        let row = tx.query_row("SELECT r.job_id,r.destination_id,r.origin,r.route_id,r.source,r.peer_key,r.revocation,r.attempts FROM outbound_routes r LEFT JOIN delivery_jobs j ON j.id=r.job_id LEFT JOIN outbound_grants g ON g.id=r.job_id WHERE j.id IS NOT NULL AND j.state<>'suspended' AND r.ack IS NULL AND r.next_attempt<=?1 AND (r.revocation IS NOT NULL OR j.state IN ('cancelled','retiring','retired') OR g.id IS NULL OR g.revoked_at IS NOT NULL OR g.expires_at<=?1) ORDER BY r.next_attempt,r.job_id,r.destination_id LIMIT 1",[now as i64],|row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,parse_json::<SignedRoute>(&row.get::<_,String>(4)?,4)?,row.get::<_,String>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,i64>(7)?))).optional().map_err(|e|e.to_string())?;
+        let row = tx.query_row("SELECT r.job_id,r.destination_id,r.origin,r.route_id,r.source,r.peer_key,r.revocation,r.attempts FROM outbound_routes r LEFT JOIN delivery_jobs j ON j.id=r.job_id LEFT JOIN outbound_grants g ON g.id=r.job_id WHERE j.id IS NOT NULL AND j.state<>'suspended' AND r.ack IS NULL AND r.next_attempt<=?1 AND (r.revocation IS NOT NULL OR j.state='cancelled'
+                OR (j.state IN ('retiring','retired') AND json_extract(j.document,'$.checks.retired_from')='cancelled')
+                OR json_extract(j.document,'$.checks.source_revoked_at') IS NOT NULL
+                OR (COALESCE(json_extract(j.document,'$.checks.destinations.' || r.destination_id || '.state'),'')<>'complete'
+                    AND (j.state IN ('retiring','retired') OR g.id IS NULL OR g.revoked_at IS NOT NULL OR g.expires_at<=?1))) ORDER BY r.next_attempt,r.job_id,r.destination_id LIMIT 1",[now as i64],|row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,parse_json::<SignedRoute>(&row.get::<_,String>(4)?,4)?,row.get::<_,String>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,i64>(7)?))).optional().map_err(|e|e.to_string())?;
         let Some((job_id, destination, origin, route_id, source, receiver, request, attempts)) =
             row
         else {
@@ -462,5 +470,248 @@ impl Store {
             .map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inbound_revocation_preserves_retirement_and_restore_holds() {
+        for state in ["retired", "retiring", "suspended", "ready"] {
+            let directory = tempfile::tempdir().unwrap();
+            let source_directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            let signer =
+                crate::receipt::ReceiptSigner::load_or_create(source_directory.path()).unwrap();
+            let link = super::super::tests::test_link("incoming");
+            store.insert_link(link.clone()).unwrap();
+            let project = store
+                .save_delivery_project("", "admin", crate::workflow::tests::project())
+                .unwrap();
+            let mut job = store
+                .enqueue_delivery_job(
+                    "",
+                    "sender",
+                    1,
+                    None,
+                    project,
+                    crate::workflow::tests::request(),
+                )
+                .unwrap();
+            job.state = state.into();
+            job.received = Some(crate::workflow::Received {
+                link_id: link.id.clone(),
+                upload_id: "upload".into(),
+            });
+            job.checks["retired_from"] = serde_json::json!("ready");
+            job.checks["destinations"]["downstream"] = serde_json::json!({"state":"complete"});
+            store
+                .with(|c| {
+                    c.execute(
+                        "UPDATE delivery_jobs SET state=?2,document=?3 WHERE id=?1",
+                        params![job.id, job.state, serde_json::to_string(&job).unwrap()],
+                    )
+                })
+                .unwrap();
+            let source = signer.sign_route(crate::route_protocol::RouteDocument {
+                issuer: signer.public_hex.clone(),
+                operation_id: "incoming-operation".into(),
+                manifest: "ab".repeat(32),
+                label: "delivery".into(),
+                metadata: Default::default(),
+                parent_receipt: None,
+                visited: vec![signer.public_hex.clone()],
+                permission: None,
+            });
+            let route = store.receive_route("", &link.id, &source, &[]).unwrap();
+            store.with(|c| c.execute("INSERT INTO route_uploads(route_id,upload_id,partial) VALUES (?1,'upload',0)", [&route.id])).unwrap();
+            store
+                .insert_outbound_grant(super::super::tests::test_outbound_grant(&job.id, "", 0))
+                .unwrap();
+            let downstream = store
+                .event_signer
+                .sign_route(crate::route_protocol::RouteDocument {
+                    issuer: store.event_signer.public_hex.clone(),
+                    visited: vec![store.event_signer.public_hex.clone()],
+                    ..source.document.clone()
+                });
+            store
+                .bind_outbound_route(
+                    &job,
+                    "downstream",
+                    "http://localhost",
+                    "next-route",
+                    &signer.public_hex,
+                    &downstream,
+                )
+                .unwrap();
+            let pending = store.receive_workflow_pending("", &link.id).unwrap();
+            let request =
+                signer.revoke_route(source, store.event_signer.public_hex.clone(), &route.id);
+            assert!(store
+                .revoke_inbound_route(&route.id, &request)
+                .unwrap()
+                .unwrap()
+                .revoked_at
+                .is_some());
+            let revoked = store.delivery_job(&job.id).unwrap().unwrap();
+            assert_eq!(
+                revoked.state,
+                if state == "ready" { "cancelled" } else { state }
+            );
+            assert_eq!(revoked.checks["retired_from"], "ready");
+            assert!(revoked.checks["source_revoked_at"].as_u64().is_some());
+            assert_eq!(
+                store.receive_workflow_pending("", &link.id).unwrap(),
+                pending
+            );
+            assert!(store
+                .outbound_grant_by_id(&job.id)
+                .unwrap()
+                .unwrap()
+                .revoked_at
+                .is_some());
+            let control = store.claim_route_revocation(now_unix()).unwrap();
+            assert_eq!(control.is_some(), state != "suspended", "{state}");
+            if let Some(control) = control {
+                assert!(control.request.verify());
+            }
+        }
+    }
+
+    #[test]
+    fn completed_routes_survive_cleanup_but_explicit_revocations_block_tenant_removal() {
+        for complete in [false, true] {
+            for trigger in [
+                "active",
+                "expired",
+                "revoked",
+                "missing",
+                "retiring",
+                "retired",
+                "cancelled",
+                "retired_cancelled",
+                "queued",
+                "source_revoked",
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let store = Store::open(directory.path()).unwrap();
+                store
+                    .with(|c| {
+                        c.execute(
+                            "INSERT INTO tenants(key,label) VALUES ('cleanup','Cleanup')",
+                            [],
+                        )
+                    })
+                    .unwrap();
+                let project = store
+                    .save_delivery_project("cleanup", "admin", crate::workflow::tests::project())
+                    .unwrap();
+                let mut job = store
+                    .enqueue_delivery_job(
+                        "cleanup",
+                        "sender",
+                        1,
+                        None,
+                        project,
+                        crate::workflow::tests::request(),
+                    )
+                    .unwrap();
+                job.state = match trigger {
+                    "retiring" => "retiring",
+                    "retired" | "retired_cancelled" | "source_revoked" => "retired",
+                    "cancelled" => "cancelled",
+                    _ => "ready",
+                }
+                .into();
+                job.checks["destinations"]["destination"] =
+                    serde_json::json!({"state": if complete { "complete" } else { "sending" }});
+                if trigger == "retired_cancelled" {
+                    job.checks["retired_from"] = serde_json::json!("cancelled");
+                }
+                if trigger == "source_revoked" {
+                    job.checks["source_revoked_at"] = serde_json::json!(now_unix());
+                }
+                store
+                    .with(|c| {
+                        c.execute(
+                            "UPDATE delivery_jobs SET state=?2,document=?3 WHERE id=?1",
+                            params![job.id, job.state, serde_json::to_string(&job).unwrap()],
+                        )
+                    })
+                    .unwrap();
+                let source = store
+                    .event_signer
+                    .sign_route(crate::route_protocol::RouteDocument {
+                        issuer: store.event_signer.public_hex.clone(),
+                        operation_id: job.id.clone(),
+                        manifest: "ab".repeat(32),
+                        label: "delivery".into(),
+                        metadata: Default::default(),
+                        parent_receipt: None,
+                        visited: vec![store.event_signer.public_hex.clone()],
+                        permission: None,
+                    });
+                store
+                    .bind_outbound_route(
+                        &job,
+                        "destination",
+                        "http://localhost",
+                        "route",
+                        &store.event_signer.public_hex,
+                        &source,
+                    )
+                    .unwrap();
+                if trigger != "missing" {
+                    let mut grant = super::super::tests::test_outbound_grant(&job.id, "cleanup", 0);
+                    grant.expires_at = if trigger == "expired" {
+                        1
+                    } else {
+                        now_unix() + 86400
+                    };
+                    grant.revoked_at = (trigger == "revoked").then_some(1);
+                    store.insert_outbound_grant(grant).unwrap();
+                }
+                if trigger == "queued" {
+                    let request = store.event_signer.revoke_route(
+                        source,
+                        store.event_signer.public_hex.clone(),
+                        "route",
+                    );
+                    store
+                        .with(|c| {
+                            c.execute(
+                                "UPDATE outbound_routes SET revocation=?1",
+                                [serde_json::to_string(&request).unwrap()],
+                            )
+                        })
+                        .unwrap();
+                }
+                let explicit = ["cancelled", "retired_cancelled", "queued", "source_revoked"]
+                    .contains(&trigger);
+                if !complete || explicit {
+                    assert_eq!(
+                        store.remove_tenant("cleanup").unwrap(),
+                        TenantRemoval::HasRoutes,
+                        "{trigger}, complete={complete} before control claim"
+                    );
+                }
+                let expected = explicit || (!complete && trigger != "active");
+                assert_eq!(
+                    store.claim_route_revocation(now_unix()).unwrap().is_some(),
+                    expected,
+                    "{trigger}, complete={complete}"
+                );
+                if complete && !explicit {
+                    assert_eq!(
+                        store.remove_tenant("cleanup").unwrap(),
+                        TenantRemoval::Deleted,
+                        "{trigger}"
+                    );
+                }
+            }
+        }
     }
 }

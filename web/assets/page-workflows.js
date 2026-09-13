@@ -243,7 +243,8 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
       const leg = node('div', '', 'destination-status'), name = storage.find((item) => item.id === id)?.label || id;
       const status = job.state === 'suspended' ? 'Historical record; no further transfers will run.' : result?.state === 'complete' ? (receipt ? 'Destination signed its receipt' : 'Verified copy complete') : result?.state === 'sending' ? `${formatBytes(result.transferred)} transferred this attempt` : result?.error || 'Pending';
       leg.append(node('p', `${name}: ${status}`, result?.error ? 'error' : 'connection-meta'));
-      if (job.state !== 'suspended' && (revoked || (receipt && ['cancelled', 'retiring', 'retired'].includes(job.state)))) {
+      const cancelled = job.state === 'cancelled' || Number.isFinite(job.checks.source_revoked_at) || (['retiring', 'retired'].includes(job.state) && job.checks.retired_from === 'cancelled');
+      if (job.state !== 'suspended' && (revoked || (receipt && cancelled))) {
         leg.append(node('p', revoked?.state === 'acknowledged' ? 'Revocation acknowledged by the destination port.' : `Revocation awaiting destination acknowledgment.${revoked?.retry_at ? ` Next attempt ${formatWhen(revoked.retry_at)}.` : ''}`, 'field-help'));
       }
       if (receipt) leg.append(button('Download custody evidence', 'tiny ghost', () => download(`trade-route-${job.id}-${id}.json`, {

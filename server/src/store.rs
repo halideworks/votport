@@ -1742,7 +1742,11 @@ impl Store {
         let transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
-        let routes_pending: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM outbound_routes r JOIN delivery_jobs j ON j.id=r.job_id WHERE j.tenant=?1 AND j.state<>'suspended' AND r.ack IS NULL)",[key],|row|row.get(0)).map_err(|e|e.to_string())?;
+        let routes_pending: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM outbound_routes r JOIN delivery_jobs j ON j.id=r.job_id WHERE j.tenant=?1 AND j.state<>'suspended' AND r.ack IS NULL
+            AND (r.revocation IS NOT NULL OR j.state='cancelled'
+                OR (j.state IN ('retiring','retired') AND json_extract(j.document,'$.checks.retired_from')='cancelled')
+                OR json_extract(j.document,'$.checks.source_revoked_at') IS NOT NULL
+                OR COALESCE(json_extract(j.document,'$.checks.destinations.' || r.destination_id || '.state'),'')<>'complete'))",[key],|row|row.get(0)).map_err(|e|e.to_string())?;
         if routes_pending {
             return Ok(TenantRemoval::HasRoutes);
         }
