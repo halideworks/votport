@@ -312,6 +312,11 @@ evidence remain. Pending transfers and route-control messages do not resume.
 
 Automatic backups, received-file retention, storage exports, notifications and
 webhooks stay disabled until an administrator reviews and re-enables them.
+Backup schedule, destination and encryption settings are preserved from the
+snapshot. Backup credentials, the encryption passphrase and previous run status
+are cleared during activation; re-enter secrets before running encrypted or
+remote backups. Keep the external recovery copy of the old passphrase to read
+existing encrypted archives. Staging alone does not change these settings.
 Disabled storage and notification destinations retain their saved credentials.
 Restore still loads the archived users, roles and administrator password;
 review access and reconcile the file volumes before enabling links or retention.
@@ -705,8 +710,10 @@ Layout:
   instance. Like any restore, promotion rotates the cookie secret, so every admin signs in
   again; receipt and push identities carry over. Replica promotion preserves
   the snapshot's links, credentials, jobs and resume records. Historical-restore
-  suspension does not apply to promotion. Automatic backups remain disabled
-  until reconfigured. Upgrade the standby binary
+  suspension does not apply to promotion. Backup schedule settings are retained,
+  but backup credentials, encryption passphrase and run status are cleared.
+  Automatic backups remain disabled until their secrets are re-entered and
+  scheduling is re-enabled. Upgrade the standby binary
   alongside the live one: replica pulls require matching archive formats and database schemas.
   If a promotion boot is interrupted mid-restore, run `votport` normally to
   finish it before returning the directory to standby mode. The RPO is the

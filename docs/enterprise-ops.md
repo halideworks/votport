@@ -748,8 +748,11 @@ database and VOTPort-managed identity files, but not `/received` or
 live `-wal` over a restored database. Failed activation keeps the private
 rollback directory for recovery. File installation removes the restore stage
 and marker before later application initialization, so keep the rollback until
-health checks pass. The restored backup destination is cleared and automatic
-backups remain disabled until an admin re-saves them. `paths::clean_staging`
+health checks pass. Backup schedule, destination and encryption settings are
+retained from the snapshot, with automatic backups disabled. Activation clears
+backup credentials, the encryption passphrase and previous run status. Re-enter
+the required secrets before running backups, and re-enable scheduling after
+reviewing the destination. `paths::clean_staging`
 only sweeps receive/outbound staging, not restore stages.
 
 Worked Litestream snippet (document, do not add a sidecar to `docker-compose.yml` in this stack):
