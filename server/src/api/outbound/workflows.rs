@@ -1563,13 +1563,42 @@ mod tests {
 
     #[tokio::test]
     async fn reception_pins_originals_and_gates_verified_copies_without_snapshots() {
-        for (release, suite) in [
+        for (release, suite, failure) in [
             (
                 crate::workflow::Release::AllDestinations,
                 Suite::Blake3Bao64,
+                "lost_ack",
             ),
-            (crate::workflow::Release::Local, Suite::Blake3Bao64),
-            (crate::workflow::Release::Local, Suite::Sha256Bep52),
+            (
+                crate::workflow::Release::Local,
+                Suite::Blake3Bao64,
+                "lost_ack",
+            ),
+            (
+                crate::workflow::Release::Local,
+                Suite::Sha256Bep52,
+                "lost_ack",
+            ),
+            (
+                crate::workflow::Release::AllDestinations,
+                Suite::Blake3Bao64,
+                "completed_changed",
+            ),
+            (
+                crate::workflow::Release::AllDestinations,
+                Suite::Blake3Bao64,
+                "disabled",
+            ),
+            (
+                crate::workflow::Release::AllDestinations,
+                Suite::Blake3Bao64,
+                "revision",
+            ),
+            (
+                crate::workflow::Release::AllDestinations,
+                Suite::Blake3Bao64,
+                "tenant",
+            ),
         ] {
             let directory = tempfile::tempdir().unwrap();
             let app = crate::api::testing::build(directory.path());
@@ -1829,6 +1858,24 @@ mod tests {
                 exporting.released(),
                 release == crate::workflow::Release::Local
             );
+            let unavailable = ["disabled", "revision", "tenant"].contains(&failure);
+            if unavailable {
+                let mut config = app
+                    .store
+                    .delivery_storages()
+                    .unwrap()
+                    .into_iter()
+                    .find(|config| config.id == "offline")
+                    .unwrap();
+                match failure {
+                    "disabled" => config.enabled = false,
+                    "tenant" => config.tenants.clear(),
+                    _ => config.label.push_str(" changed"),
+                }
+                app.store
+                    .save_delivery_storage("local", config, None)
+                    .unwrap();
+            }
             let error = prepare(&app, exporting.clone()).await.unwrap_err();
             let progress = app.store.delivery_job(&job.id).unwrap().unwrap();
             assert_eq!(
@@ -1863,10 +1910,35 @@ mod tests {
                 std::fs::read(completion.parent().unwrap().join("files/file.bin")).unwrap(),
                 bytes
             );
-            // A completion response can be lost after the remote filesystem commits it.
-            let connection =
-                rusqlite::Connection::open(app.config.data_dir.join("votport.db")).unwrap();
-            connection.execute("UPDATE delivery_jobs SET document=json_remove(document,'$.checks.destinations.online') WHERE id=?1",[&job.id]).unwrap();
+            if unavailable {
+                assert!(error.message.contains("offline"));
+                assert!(app
+                    .store
+                    .delivery_events("", 0, 100)
+                    .unwrap()
+                    .iter()
+                    .any(|event| event.kind == "destination_failed" && event.verify()));
+                continue;
+            }
+            if failure == "completed_changed" {
+                let mut config = app
+                    .store
+                    .delivery_storages()
+                    .unwrap()
+                    .into_iter()
+                    .find(|config| config.id == "online")
+                    .unwrap();
+                config.enabled = false;
+                config.label.push_str(" changed");
+                app.store
+                    .save_delivery_storage("local", config, None)
+                    .unwrap();
+            } else {
+                // A completion response can be lost after the remote filesystem commits it.
+                let connection =
+                    rusqlite::Connection::open(app.config.data_dir.join("votport.db")).unwrap();
+                connection.execute("UPDATE delivery_jobs SET document=json_remove(document,'$.checks.destinations.online') WHERE id=?1",[&job.id]).unwrap();
+            }
             std::fs::create_dir(directory.path().join("offline")).unwrap();
             let retry = app
                 .store
@@ -1884,6 +1956,9 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|event| event.kind == "destination_failed" && event.verify()));
+            if failure == "completed_changed" {
+                continue;
+            }
             std::fs::write(app.config.receive_dir.join("file.bin"), b"changed!").unwrap();
             let mut changed = app
                 .store

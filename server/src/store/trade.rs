@@ -700,22 +700,6 @@ pub(super) fn check_export(
             }
         }
     }
-    for id in &job.project.destinations {
-        let route: Option<TradeRoute> = connection
-            .query_row(
-                "SELECT document FROM trade_routes WHERE id=?1",
-                [id],
-                decode,
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-        if route
-            .as_ref()
-            .is_some_and(|route| route.tenant != job.tenant || route.direction != "outgoing")
-        {
-            return Err("trade route is unavailable to this tenant".into());
-        }
-    }
     Ok(())
 }
 

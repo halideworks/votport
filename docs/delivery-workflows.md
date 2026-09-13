@@ -176,8 +176,11 @@ The release choice is explicit:
 - **After local checks and approval** releases the local link and copies in the
   background. A failed destination does not retract that local release.
 
-Two destination legs can run concurrently. Completed legs are retained across
-retries. Failed exports use persistent exponential backoff, with an initial
+Two destination legs can run concurrently. After preparation and approval, an
+unavailable destination records its own failure while other authorized destinations
+continue. Completed copies remain recorded if their connection is later changed
+or disabled. Source access and the recorded revisions for unfinished connections
+remain required. Failed exports use persistent exponential backoff, with an initial
 failure notification and signed events for the existing webhook queue. After
 five worker attempts, explicit **Retry** starts another cycle. Native peer
 transfers use QUIC when available and HTTP otherwise. Both reuse verified

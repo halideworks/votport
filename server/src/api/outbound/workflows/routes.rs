@@ -179,24 +179,18 @@ impl votport_client_core::progress::Observer for Progress {
     fn cancelled(&self) -> bool {
         if self.checked.get().elapsed() >= std::time::Duration::from_millis(250) {
             self.checked.set(std::time::Instant::now());
-            let route_cancelled = self.job.checks["trade_routes"]
-                .get(&self.destination)
-                .is_some()
-                && self
-                    .app
-                    .store
-                    .require_trade_destination(&self.job, &self.destination)
-                    .is_err();
             self.cancelled.set(
-                route_cancelled
-                    || self
-                        .app
-                        .lease_lost
-                        .load(std::sync::atomic::Ordering::Relaxed)
+                self.app
+                    .lease_lost
+                    .load(std::sync::atomic::Ordering::Relaxed)
                     || self
                         .app
                         .store
-                        .require_delivery_export(&self.job.id, self.job.attempts)
+                        .require_delivery_destination(
+                            &self.job.id,
+                            self.job.attempts,
+                            &self.destination,
+                        )
                         .is_err(),
             );
         }
