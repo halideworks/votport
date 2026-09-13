@@ -6,6 +6,7 @@ which adds ADR-0051, the fetch window of up to sixteen objects, the
 concurrent sink gate (#406), settled-work fetch progress (#405),
 admit-before-handout on a rail (#407), and completion syncs on a per-plan
 flusher (#408, ADR-0052). P3, the agent, and phase W remain.
+The current server, native core, and browser WASM pin is `1010254b`.
 
 | Field | Value |
 | --- | --- |
@@ -60,9 +61,10 @@ first, then serving grants, then the feed and the agent, then the S3 target.
 - The multi-box control plane, billing, or signup for votdock. This design
   builds the transport and replication half and names the rest.
 
-## What VOT provides today, and what it does not
+## Original VOT API inventory
 
-From the pinned revision and the current VOT main:
+This inventory records the design baseline before the serving and fetch seams
+landed. It does not describe the current pin's API limitations.
 
 - Serving is `serve_bundle(bundle_dir, address, credentials, sessions,
   listening)`. It binds its own socket, takes one bundle directory

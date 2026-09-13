@@ -344,13 +344,12 @@ delivery.
 The wire unit is an 8 MiB proven range (`CHUNK_BYTES` in `session.rs`). That
 ceiling is protocol-level in VOT, not a votport knob. The browser keeps up to
 eight range PUTs in flight and hashes ahead in module workers. The server
-worker verifies ranges serially against the announced merkle root, then
-publishes each file the moment its coverage is complete.
+worker drains up to eight queued ranges into a batch, verifies and writes
+them in parallel against the announced Merkle root, then publishes completed
+files in a separate pass.
 
-That serial verify is what leaves headroom on a fast NIC. Raising the range
-size or verifying in parallel needs VOT changes on the server verify path;
-the current VOT pin does not include a larger range ceiling. Do not raise `CHUNK_BYTES`
-in votport ahead of that work.
+The current VOT pin retains the 8 MiB range ceiling. Do not raise
+`CHUNK_BYTES` without upstream support for larger ranges.
 
 Measure on this box:
 
@@ -459,10 +458,9 @@ VOT is pinned at `1010254b553b6e2b5b0a660b08fc6380897d8da5`. Server, desktop cor
 
 Native push remains disabled unless `VOTPORT_PUSH_BIND` is set. Browser uploads use HTTP through the reverse proxy, with bounded parallel range acceptance and the existing 8 MiB range ceiling.
 
-Product next, each as its own design first:
-
-* Content dedup when two entries share an object root
-* Legal hold versus upload retention (a do-not-sweep flag)
+Uploads reuse previously delivered content on the same request link after
+verifying the stored bytes. Per-link legal hold blocks upload retention and
+received-file deletion until the hold is released.
 
 Not on the table: Postgres, a second store backend, horizontal replicas, SAML.
 
