@@ -17,6 +17,7 @@ use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
 use object_store::{MultipartUpload, ObjectStore, ObjectStoreExt as _};
 use rand::RngCore as _;
+use rusqlite::OptionalExtension as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tar::{Archive, Builder, Header};
@@ -913,7 +914,20 @@ fn validate_database_connection(
     if integrity != "ok" {
         return Err("backup database integrity check failed".into());
     }
-    crate::store::validate_schema(connection, schema_version)
+    crate::store::validate_schema(connection, schema_version)?;
+    read_backup_config(connection).map(|_| ())
+}
+
+fn read_backup_config(connection: &rusqlite::Connection) -> Result<BackupConfig, String> {
+    let setting = connection
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [SETTING_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    decode_config(setting)
 }
 
 fn prepare_restored_database(
@@ -930,9 +944,17 @@ fn prepare_restored_database(
         .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
         .map_err(|e| format!("cannot prepare restored database: {e}"))?;
     let transaction = connection.transaction().map_err(|e| e.to_string())?;
+    let mut config = read_backup_config(&transaction)?;
+    config.enabled = false;
     transaction
-        .execute("DELETE FROM settings WHERE key = ?1", [SETTING_KEY])
-        .map_err(|e| e.to_string())?;
+        .execute(
+            "UPDATE settings SET value=?1 WHERE key=?2",
+            [
+                serde_json::to_string(&config).map_err(|error| error.to_string())?,
+                SETTING_KEY.into(),
+            ],
+        )
+        .map_err(|error| error.to_string())?;
     if mode == RestoreMode::Historical {
         let at = now().min(i64::MAX as u64) as i64;
         for table in ["outbound_grants", "automation_tokens", "inbound_routes"] {
@@ -1143,6 +1165,8 @@ pub fn apply_pending_restore(data_dir: &Path, schema_version: u64) -> Result<(),
     }
 
     prepare_restored_database(&data_dir.join("votport.db"), schema_version, marker.mode)?;
+    write_secrets(data_dir, &BackupSecrets::default())?;
+    write_status(data_dir, BackupStatus::default())?;
 
     // Restoring data must invalidate every pre-restore browser session. If a
     // crash occurs after this write, the existing new secret is retained.
@@ -2299,6 +2323,151 @@ mod tests {
     }
 
     #[test]
+    fn archive_validation_refuses_invalid_backup_settings_before_activation() {
+        for value in ["not json", r#"{"unknown":true}"#] {
+            let (root, store) = initialized_root();
+            store
+                .put_settings(
+                    "test",
+                    &[(
+                        SETTING_KEY.into(),
+                        crate::store::SettingWrite::Set(value.into()),
+                    )],
+                )
+                .unwrap();
+            let archive = root.path().join("backup.tar");
+            create_archive(&store, root.path(), &archive, crate::store::SCHEMA_VERSION).unwrap();
+            drop(store);
+            let database = fs::read(root.path().join("votport.db")).unwrap();
+            let secret = fs::read(root.path().join("secret")).unwrap();
+            let stage = root.path().join(".votport-restore-stage-invalid-settings");
+            fs::create_dir(&stage).unwrap();
+            assert_eq!(
+                validate_and_extract(&archive, &stage, crate::store::SCHEMA_VERSION).unwrap_err(),
+                "invalid backup configuration"
+            );
+            assert_eq!(fs::read(root.path().join("votport.db")).unwrap(), database);
+            assert_eq!(fs::read(root.path().join("secret")).unwrap(), secret);
+            assert!(!root.path().join(PENDING_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn restore_preserves_backup_settings_and_clears_target_secrets_and_history() {
+        for mode in [RestoreMode::Historical, RestoreMode::Replica] {
+            for interrupted in [false, true] {
+                let (root, store) = initialized_root();
+                let mut config = BackupConfig {
+                    enabled: true,
+                    interval_secs: 12_345,
+                    retention_days: 7,
+                    retention_count: 4,
+                    destination: Destination::Both,
+                    local_path: Some(
+                        root.path()
+                            .join("unmounted-backups")
+                            .to_str()
+                            .unwrap()
+                            .into(),
+                    ),
+                    s3_endpoint: Some("https://backups.example.invalid".into()),
+                    s3_region: Some("custom-region".into()),
+                    s3_bucket: Some("archived-bucket".into()),
+                    s3_prefix: Some("saved-prefix".into()),
+                    encrypt: true,
+                    s3_path_style: true,
+                };
+                store
+                    .put_settings(
+                        "test",
+                        &[(
+                            SETTING_KEY.into(),
+                            crate::store::SettingWrite::Set(
+                                serde_json::to_string(&config).unwrap(),
+                            ),
+                        )],
+                    )
+                    .unwrap();
+                let archive = root.path().join("backup.tar");
+                create_archive(&store, root.path(), &archive, crate::store::SCHEMA_VERSION)
+                    .unwrap();
+                drop(store);
+                write_secrets(
+                    root.path(),
+                    &BackupSecrets {
+                        access_key_id: Some("target-key".into()),
+                        secret_access_key: Some("target-secret".into()),
+                        passphrase: Some("target-passphrase".into()),
+                    },
+                )
+                .unwrap();
+                write_status(
+                    root.path(),
+                    BackupStatus {
+                        last_attempt_at: Some(123),
+                        last_success_at: Some(100),
+                        last_error: Some("target failure".into()),
+                        ..BackupStatus::default()
+                    },
+                )
+                .unwrap();
+                let secret_path = root.path().join(SECRETS_FILE);
+                let status_path = root.path().join(STATUS_FILE);
+                let secrets = fs::read(&secret_path).unwrap();
+                let history = fs::read(&status_path).unwrap();
+                let stage = root.path().join(".votport-restore-stage-backups");
+                fs::create_dir(&stage).unwrap();
+                let manifest =
+                    validate_and_extract(&archive, &stage, crate::store::SCHEMA_VERSION).unwrap();
+                write_pending_restore(root.path(), CleanupPath::directory(stage), manifest, mode)
+                    .unwrap();
+                assert_eq!(fs::read(&secret_path).unwrap(), secrets);
+                assert_eq!(fs::read(&status_path).unwrap(), history);
+                if interrupted {
+                    fs::remove_file(&status_path).unwrap();
+                    fs::create_dir(&status_path).unwrap();
+                    assert!(
+                        apply_pending_restore(root.path(), crate::store::SCHEMA_VERSION).is_err()
+                    );
+                    assert_eq!(
+                        read_pending_restore(root.path()).unwrap().unwrap().phase,
+                        RestorePhase::NewInstalled
+                    );
+                    fs::remove_dir(&status_path).unwrap();
+                }
+                apply_pending_restore(root.path(), crate::store::SCHEMA_VERSION).unwrap();
+                prepare_restored_database(
+                    &root.path().join("votport.db"),
+                    crate::store::SCHEMA_VERSION,
+                    mode,
+                )
+                .unwrap();
+                let restored = crate::store::Store::open(root.path()).unwrap();
+                config.enabled = false;
+                assert_eq!(
+                    decode_config(restored.setting(SETTING_KEY).unwrap()).unwrap(),
+                    config
+                );
+                assert_eq!(
+                    fs::read(&secret_path).unwrap(),
+                    serde_json::to_vec(&BackupSecrets::default()).unwrap()
+                );
+                assert_eq!(
+                    fs::read(&status_path).unwrap(),
+                    serde_json::to_vec(&BackupStatus::default()).unwrap()
+                );
+                assert!(!root.path().join(PENDING_FILE).exists());
+                drop(restored);
+                fs::write(&secret_path, &secrets).unwrap();
+                fs::write(&status_path, &history).unwrap();
+                apply_pending_restore(root.path(), crate::store::SCHEMA_VERSION).unwrap();
+                assert_eq!(fs::read(&secret_path).unwrap(), secrets);
+                assert_eq!(fs::read(&status_path).unwrap(), history);
+            }
+        }
+    }
+
+    #[test]
     fn restore_removes_wal_rotates_sessions_and_keeps_rollback() {
         let (root, store) = initialized_root();
         let historical = BackupConfig {
@@ -2346,7 +2515,13 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".votport-restore-rollback-")));
         let restored = crate::store::Store::open(root.path()).unwrap();
-        assert_eq!(restored.setting(SETTING_KEY).unwrap(), None);
+        assert_eq!(
+            decode_config(restored.setting(SETTING_KEY).unwrap()).unwrap(),
+            BackupConfig {
+                enabled: false,
+                ..historical
+            }
+        );
     }
 
     #[test]
@@ -2460,7 +2635,14 @@ mod tests {
             let store = crate::store::Store::open(root.path()).unwrap();
             let historical = mode == RestoreMode::Historical;
             assert_eq!(store.link("", "link").unwrap().unwrap().active, !historical);
-            assert!(store.setting(SETTING_KEY).unwrap().is_none());
+            let backup_setting = store
+                .setting(SETTING_KEY)
+                .unwrap()
+                .expect("backup settings retained");
+            assert_eq!(
+                decode_config(Some(backup_setting)).unwrap(),
+                BackupConfig::default()
+            );
             for (key, previous) in [
                 ("scim_token", "current"),
                 ("scim_token_previous", "previous"),

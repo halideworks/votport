@@ -223,7 +223,7 @@ test('backup pause overrides activity and clears without replacing run history',
     formatWhen: String,
   };
   runInNewContext(script.slice(script.indexOf('function fillBackups('), script.indexOf('function setBackupActions(')), context);
-  const data = { inventory: [], status: { running: true, last_success_at: 123, last_error: 'Upload failed' }, paused_reason: 'restore pending; restart required' };
+  const data = { config: { enabled: true }, inventory: [], status: { running: true, last_success_at: 123, last_error: 'Upload failed' }, paused_reason: 'restore pending; restart required' };
   context.fillBackups(data);
   assert.equal(elements.get('backup-status').textContent, 'Backups paused: restore pending; restart required');
   assert.equal(elements.get('backup-status-error').hidden, false);
@@ -237,4 +237,20 @@ test('backup pause overrides activity and clears without replacing run history',
   context.fillBackups(data);
   assert.equal(elements.get('backup-status').textContent, 'Last successful run 123');
   assert.equal(elements.get('backup-status-error').hidden, true);
+  data.config.enabled = false;
+  context.fillBackups(data);
+  assert.equal(elements.get('backup-status').textContent, 'Automatic backups are off. Last successful run 123');
+  data.status.last_success_at = null;
+  context.fillBackups(data);
+  assert.equal(elements.get('backup-status').textContent, 'Automatic backups are off. No backup run recorded.');
+  data.status.running = true;
+  context.fillBackups(data);
+  assert.equal(elements.get('backup-status').textContent, 'Backup running…');
+  data.status.running = false;
+  data.status.last_error = 'Manual run failed';
+  context.fillBackups(data);
+  assert.equal(elements.get('backup-status').textContent, 'Automatic backups are off. Last run failed: Manual run failed');
+  data.paused_reason = 'restore pending; restart required';
+  context.fillBackups(data);
+  assert.equal(elements.get('backup-status').textContent, 'Backups paused: restore pending; restart required');
 });

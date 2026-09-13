@@ -244,8 +244,10 @@ function fillBackups(data) {
           ? `Last successful run ${formatWhen(status.last_success_at)}`
           : status.last_attempt_at
             ? `Last attempt ${formatWhen(status.last_attempt_at)}`
-            : 'No backup has run yet.';
-  $('backup-status').textContent = statusText;
+            : 'No backup run recorded.';
+  $('backup-status').textContent = data.config.enabled === false && !data.paused_reason && !status.running
+    ? `Automatic backups are off. ${statusText}`
+    : statusText;
   $('backup-status-error').hidden = !status.last_error;
   if (status.last_error) $('backup-status-error').textContent = status.last_error;
   if (!status.last_error && data.inventory_error) {
@@ -629,7 +631,7 @@ $('backup-restore-snapshot').addEventListener('change', async (event) => {
   const name = option.textContent;
   const confirmed = await confirmModal(
     'Restore this snapshot?',
-    `Restore ${name}. Current application state will be replaced; the cookie secret will rotate and every existing admin session will be signed out. Existing request links, download links and integration tokens will be disabled. Deliveries will be held, and automatic backups, notifications, exports and received-file retention will stop until you review the restored settings. The staged restore will restart the supervised service.`,
+    `Restore ${name}. Current application state will be replaced; the cookie secret will rotate and every existing admin session will be signed out. Existing request links, download links and integration tokens will be disabled. Deliveries will be held, and automatic backups, notifications, exports and received-file retention will stop until you review the restored settings. Backup schedule settings will be kept, but backup credentials, the encryption passphrase and previous run status will be cleared. The staged restore will restart the supervised service.`,
     'Restore and restart',
   );
   select.value = '';
