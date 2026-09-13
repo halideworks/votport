@@ -837,7 +837,7 @@ fn validate_staged_restore(
     manifest: &Manifest,
     schema_version: u64,
 ) -> Result<(), String> {
-    if manifest.version != VERSION || manifest.schema_version > schema_version {
+    if manifest.version != VERSION || manifest.schema_version != schema_version {
         return Err("unsupported backup version or schema".into());
     }
     let expected: HashSet<_> = manifest
@@ -916,48 +916,40 @@ fn validate_identity_material(destination: &Path, names: &HashSet<&str>) -> Resu
 }
 
 fn validate_database(path: &Path, expected_schema: u64, current_schema: u64) -> Result<(), String> {
+    if expected_schema != current_schema {
+        return Err("backup database schema does not match this binary".into());
+    }
     let connection =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| format!("invalid backup database: {e}"))?;
+    validate_database_connection(&connection, current_schema)
+}
+
+fn validate_database_connection(
+    connection: &rusqlite::Connection,
+    schema_version: u64,
+) -> Result<(), String> {
     let integrity: String = connection
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .map_err(|e| format!("invalid backup database: {e}"))?;
     if integrity != "ok" {
         return Err("backup database integrity check failed".into());
     }
-    let actual_schema = connection
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|e| format!("invalid backup schema: {e}"))?
-        .parse::<u64>()
-        .map_err(|_| "invalid backup schema".to_owned())?;
-    if actual_schema != expected_schema || actual_schema > current_schema {
-        return Err("backup database schema does not match its manifest or is too new".into());
-    }
-    Ok(())
+    crate::store::validate_schema(connection, schema_version)
 }
 
-fn disable_restored_backups(path: &Path) -> Result<(), String> {
-    let connection = rusqlite::Connection::open(path)
-        .map_err(|e| format!("cannot disable restored backups: {e}"))?;
+fn disable_restored_backups(path: &Path, schema_version: u64) -> Result<(), String> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|e| format!("cannot disable restored backups: {e}"))?;
+    // SQLite must recover a hot rollback journal before validating a resumed restore.
+    validate_database_connection(&connection, schema_version)?;
     let _: String = connection
         .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
         .map_err(|e| format!("cannot disable restored backups: {e}"))?;
-    let has_settings: bool = connection
-        .query_row(
-            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("cannot inspect restored settings: {e}"))?;
-    if has_settings {
-        connection
-            .execute("DELETE FROM settings WHERE key = ?1", [SETTING_KEY])
-            .map_err(|e| format!("cannot disable restored backups: {e}"))?;
-    }
+    connection
+        .execute("DELETE FROM settings WHERE key = ?1", [SETTING_KEY])
+        .map_err(|e| format!("cannot disable restored backups: {e}"))?;
     drop(connection);
     File::open(path)
         .map_err(|e| e.to_string())?
@@ -1012,6 +1004,8 @@ pub fn apply_pending_restore(data_dir: &Path, schema_version: u64) -> Result<(),
         serde_json::from_slice(&fs::read(&marker_path).map_err(|e| e.to_string())?)
             .map_err(|_| "invalid pending restore marker".to_owned())?;
     if marker.version != VERSION
+        || marker.manifest.version != VERSION
+        || marker.manifest.schema_version != schema_version
         || marker.stage.contains('/')
         || !marker.stage.starts_with(".votport-restore-stage-")
     {
@@ -1024,6 +1018,14 @@ pub fn apply_pending_restore(data_dir: &Path, schema_version: u64) -> Result<(),
             return Err("invalid restore stage".into());
         }
         validate_staged_restore(&stage, &marker.manifest, schema_version)?;
+    } else if marker.phase == RestorePhase::OldMoved {
+        let staged_database = stage.join("votport.db");
+        let database = if staged_database.try_exists().map_err(|e| e.to_string())? {
+            staged_database
+        } else {
+            data_dir.join("votport.db")
+        };
+        validate_database(&database, marker.manifest.schema_version, schema_version)?;
     }
 
     if marker.phase == RestorePhase::Prepared {
@@ -1105,7 +1107,7 @@ pub fn apply_pending_restore(data_dir: &Path, schema_version: u64) -> Result<(),
 
     // Historical backup destinations must never become active with the
     // deployment's current credentials. An admin explicitly re-enables them.
-    disable_restored_backups(&data_dir.join("votport.db"))?;
+    disable_restored_backups(&data_dir.join("votport.db"), schema_version)?;
 
     // Restoring data must invalidate every pre-restore browser session. If a
     // crash occurs after this write, the existing new secret is retained.
@@ -1795,6 +1797,45 @@ mod tests {
     }
 
     #[test]
+    fn restore_refuses_unsupported_schema_and_layout_before_installation() {
+        for (version, layout) in [
+            (crate::store::SCHEMA_VERSION - 1, Some("reserved-v1")),
+            (crate::store::SCHEMA_VERSION + 1, Some("reserved-v1")),
+            (crate::store::SCHEMA_VERSION, Some("old")),
+            (crate::store::SCHEMA_VERSION, None),
+        ] {
+            let (root, store) = initialized_root();
+            store
+                .with(|connection| {
+                    connection.execute(
+                        "UPDATE meta SET value=?1 WHERE key='schema_version'",
+                        [version.to_string()],
+                    )?;
+                    connection.execute("DELETE FROM meta WHERE key='tenant_storage_layout'", [])?;
+                    if let Some(layout) = layout {
+                        connection.execute(
+                            "INSERT INTO meta(key,value) VALUES ('tenant_storage_layout',?1)",
+                            [layout],
+                        )?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let snapshot = root.path().join("unsupported.db");
+            store.backup_into(&snapshot).unwrap();
+            assert!(validate_database(&snapshot, version, crate::store::SCHEMA_VERSION).is_err());
+            let archive = root.path().join("unsupported.tar");
+            create_archive(&store, root.path(), &archive, version).unwrap();
+            let stage = root.path().join("extract");
+            fs::create_dir(&stage).unwrap();
+            assert!(validate_and_extract(&archive, &stage, crate::store::SCHEMA_VERSION).is_err());
+            assert!(!root.path().join(PENDING_FILE).exists());
+            assert!(store.setting("missing").unwrap().is_none());
+            assert_eq!(fs::read(root.path().join("receipt.key")).unwrap(), [8; 32]);
+        }
+    }
+
+    #[test]
     fn archive_manifest_must_name_every_member() {
         let (root, store) = initialized_root();
         let snapshot = root.path().join("snapshot.db");
@@ -1857,6 +1898,140 @@ mod tests {
         assert!(apply_pending_restore(root.path(), crate::store::SCHEMA_VERSION).is_err());
         assert!(root.path().join("votport.db").exists());
         assert_eq!(fs::read(root.path().join("secret")).unwrap(), [7; 32]);
+    }
+
+    #[test]
+    fn resumed_restore_validates_every_phase_before_changing_files() {
+        const CHILD_DATABASE: &str = "VOTPORT_TEST_RESTORE_HOT_JOURNAL";
+        if let Some(path) = std::env::var_os(CHILD_DATABASE) {
+            let connection = rusqlite::Connection::open(path).unwrap();
+            connection.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA cache_size=1;
+                BEGIN IMMEDIATE;
+                INSERT INTO settings(key,value,updated_at) VALUES ('uncommitted',hex(zeroblob(65536)),1);").unwrap();
+            std::process::exit(0);
+        }
+        for (phase, installed) in [
+            (RestorePhase::OldMoved, false),
+            (RestorePhase::OldMoved, true),
+            (RestorePhase::NewInstalled, true),
+        ] {
+            for (version, layout) in [
+                (crate::store::SCHEMA_VERSION - 1, Some("reserved-v1")),
+                (crate::store::SCHEMA_VERSION + 1, Some("reserved-v1")),
+                (crate::store::SCHEMA_VERSION, Some("old")),
+                (crate::store::SCHEMA_VERSION, None),
+                (crate::store::SCHEMA_VERSION, Some("reserved-v1")),
+            ] {
+                let (root, store) = initialized_root();
+                let archive = root.path().join("bundle.tar");
+                create_archive(&store, root.path(), &archive, crate::store::SCHEMA_VERSION)
+                    .unwrap();
+                drop(store);
+                let stage = root.path().join(".votport-restore-stage-test");
+                fs::create_dir(&stage).unwrap();
+                let mut manifest =
+                    validate_and_extract(&archive, &stage, crate::store::SCHEMA_VERSION).unwrap();
+                let rollback = root.path().join(".votport-restore-rollback-test");
+                fs::create_dir(&rollback).unwrap();
+                for name in MANAGED_FILES {
+                    let path = root.path().join(name);
+                    if path.exists() {
+                        fs::rename(path, rollback.join(name)).unwrap();
+                    }
+                }
+                if installed {
+                    for entry in &manifest.entries {
+                        if entry.name == "votport.db"
+                            || (phase == RestorePhase::NewInstalled && entry.name != "secret")
+                        {
+                            fs::rename(stage.join(&entry.name), root.path().join(&entry.name))
+                                .unwrap();
+                        }
+                    }
+                }
+                let database = if installed {
+                    root.path().join("votport.db")
+                } else {
+                    stage.join("votport.db")
+                };
+                let connection = rusqlite::Connection::open(&database).unwrap();
+                connection
+                    .execute(
+                        "UPDATE meta SET value=?1 WHERE key='schema_version'",
+                        [version.to_string()],
+                    )
+                    .unwrap();
+                connection
+                    .execute("DELETE FROM meta WHERE key='tenant_storage_layout'", [])
+                    .unwrap();
+                if let Some(layout) = layout {
+                    connection
+                        .execute(
+                            "INSERT INTO meta(key,value) VALUES ('tenant_storage_layout',?1)",
+                            [layout],
+                        )
+                        .unwrap();
+                }
+                drop(connection);
+                manifest.schema_version = version;
+                let entry = manifest
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.name == "votport.db")
+                    .unwrap();
+                (entry.size, entry.sha256) = file_hash(&database).unwrap();
+                persist_pending_restore(
+                    root.path(),
+                    &PendingRestore {
+                        stage: ".votport-restore-stage-test".into(),
+                        version: VERSION,
+                        manifest,
+                        phase,
+                        rollback: Some(".votport-restore-rollback-test".into()),
+                    },
+                )
+                .unwrap();
+                if version == crate::store::SCHEMA_VERSION && layout == Some("reserved-v1") {
+                    if phase == RestorePhase::NewInstalled {
+                        let status = std::process::Command::new(std::env::current_exe().unwrap())
+                            .args(["--exact", "backup::tests::resumed_restore_validates_every_phase_before_changing_files"])
+                            .env(CHILD_DATABASE, &database).status().unwrap();
+                        assert!(status.success());
+                        let mut journal =
+                            File::open(root.path().join("votport.db-journal")).unwrap();
+                        let mut header = [0; 8];
+                        journal.read_exact(&mut header).unwrap();
+                        assert_eq!(header, [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7]);
+                    }
+                    apply_pending_restore(root.path(), crate::store::SCHEMA_VERSION).unwrap();
+                    assert!(!root.path().join(PENDING_FILE).exists());
+                    assert!(!stage.exists());
+                    assert_ne!(fs::read(root.path().join("secret")).unwrap(), [7; 32]);
+                    assert_eq!(fs::read(rollback.join("secret")).unwrap(), [7; 32]);
+                    let restored = crate::store::Store::open(root.path()).unwrap();
+                    assert!(restored.setting("uncommitted").unwrap().is_none());
+                    continue;
+                }
+                let paths = [root.path(), stage.as_path(), rollback.as_path()]
+                    .into_iter()
+                    .flat_map(|directory| {
+                        fs::read_dir(directory)
+                            .unwrap()
+                            .map(|entry| entry.unwrap().path())
+                    })
+                    .filter(|path| path.is_file())
+                    .collect::<Vec<_>>();
+                let before = paths
+                    .iter()
+                    .map(|path| fs::read(path).unwrap())
+                    .collect::<Vec<_>>();
+                assert!(apply_pending_restore(root.path(), crate::store::SCHEMA_VERSION).is_err());
+                for (path, bytes) in paths.iter().zip(before) {
+                    assert_eq!(fs::read(path).unwrap(), bytes, "{}", path.display());
+                }
+                assert!(!root.path().join("secret").exists());
+            }
+        }
     }
 
     #[test]

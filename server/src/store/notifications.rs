@@ -330,11 +330,11 @@ pub(super) fn notification_job_override_in(
 }
 
 #[cfg(test)]
-mod cleanup_tests {
+mod persistence_tests {
     use super::*;
 
     #[test]
-    fn upgrade_removes_broadcast_configuration_and_preserves_named_destinations() {
+    fn named_destinations_and_policies_survive_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         let mut destination: NotificationDestination = serde_json::from_value(serde_json::json!({
@@ -353,7 +353,10 @@ mod cleanup_tests {
             }],
         };
         store.save_notification_defaults("", &policy).unwrap();
-        for id in ["disabled", "enabled"] {
+        for (id, notifications) in [
+            ("disabled", NotificationPolicy::default()),
+            ("enabled", policy.clone()),
+        ] {
             store
                 .insert_link(Link {
                     id: id.into(),
@@ -366,7 +369,7 @@ mod cleanup_tests {
                     max_bytes: None,
                     active: true,
                     legal_hold: false,
-                    notifications: Some(policy.clone()),
+                    notifications: Some(notifications),
                     uploads: vec![],
                     events: vec![],
                 })
@@ -375,19 +378,8 @@ mod cleanup_tests {
         let mut grant = crate::notify::tests::test_grant(vec![]);
         grant.notifications = Some(policy.clone());
         store.insert_outbound_grant(grant).unwrap();
-        store.with(|connection| connection.execute_batch("ALTER TABLE links ADD COLUMN notify_on_upload INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE outbound_grants ADD COLUMN notify_on_download INTEGER NOT NULL DEFAULT 0;
-            UPDATE links SET notify_on_upload=1 WHERE id='enabled';
-            INSERT INTO settings(key,value,updated_at) VALUES ('notify_slack','old-secret',1),('smtp_to','old@example.test',1),('smtp_host','smtp.example.test',1);
-            UPDATE meta SET value='34' WHERE key='schema_version';")).unwrap();
         drop(store);
         let store = Store::open(directory.path()).unwrap();
-        assert!(store.setting("notify_slack").unwrap().is_none());
-        assert!(store.setting("smtp_to").unwrap().is_none());
-        assert_eq!(
-            store.setting("smtp_host").unwrap().as_deref(),
-            Some("smtp.example.test")
-        );
         assert_eq!(store.notification_defaults("").unwrap(), policy);
         assert_eq!(
             store.link("", "disabled").unwrap().unwrap().notifications,
@@ -399,7 +391,7 @@ mod cleanup_tests {
         );
         assert_eq!(
             store.outbound_grants("").unwrap()[0].notifications,
-            Some(NotificationPolicy::default())
+            Some(policy.clone())
         );
         assert_eq!(
             store

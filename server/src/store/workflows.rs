@@ -1365,66 +1365,11 @@ mod tests {
         upload.partial = false;
         upload.id = "complete".into();
         store.append_upload("", &link.id, upload).unwrap();
-        store.with(|connection| connection.execute_batch("DROP TABLE receive_workflow_uploads; UPDATE meta SET value='29' WHERE key='schema_version';")).unwrap();
         drop(store);
-        let upgraded = Store::open(directory.path()).unwrap();
-        let connection = upgraded.connection.lock().unwrap();
+        let reopened = Store::open(directory.path()).unwrap();
+        let connection = reopened.connection.lock().unwrap();
         assert!(received_requires_workflow(&connection, "", &link.id, "complete").unwrap());
         assert!(!received_requires_workflow(&connection, "other", &link.id, "complete").unwrap());
-    }
-
-    #[test]
-    fn upgrade_preserves_only_already_frozen_export_attestations() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        let mut policy = project();
-        policy.destinations = vec!["s3".into()];
-        let policy = store.save_delivery_project("", "admin", policy).unwrap();
-        for frozen in [false, true] {
-            let mut request = request();
-            request.operation_id = format!("legacy-{frozen}");
-            let job = store
-                .enqueue_delivery_job("", "sender", 1, None, policy.clone(), request)
-                .unwrap();
-            let mut document = serde_json::to_value(job).unwrap();
-            document["project"]
-                .as_object_mut()
-                .unwrap()
-                .remove("destinations");
-            document["project"]["export_storage"] = serde_json::json!("s3");
-            if frozen {
-                document["manifest"] = serde_json::json!("frozen");
-                document["checks"] =
-                    serde_json::json!({"metadata":"passed","export_storage_revision":1});
-            }
-            store
-                .with(|connection| {
-                    connection.execute(
-                        "UPDATE delivery_jobs SET document=?2 WHERE id=?1",
-                        params![document["id"].as_str().unwrap(), document.to_string()],
-                    )
-                })
-                .unwrap();
-        }
-        store.with(|connection| connection.execute_batch("UPDATE delivery_projects SET document=json_remove(json_set(document,'$.export_storage','s3'),'$.destinations'); UPDATE meta SET value='28' WHERE key='schema_version';")).unwrap();
-        drop(store);
-        let upgraded = Store::open(directory.path()).unwrap();
-        assert_eq!(
-            upgraded.delivery_project("", &policy.id).unwrap().unwrap(),
-            policy
-        );
-        for job in upgraded.delivery_jobs("", "", 100, None, "", "").unwrap() {
-            assert_eq!(job.project, policy);
-            if job.manifest.is_some() {
-                assert_eq!(
-                    job.checks["legacy_export_checks"],
-                    serde_json::json!({"metadata":"passed","export_storage_revision":1})
-                );
-                assert_eq!(job.checks["destination_revisions"]["s3"], 1);
-            } else {
-                assert!(job.checks.get("legacy_export_checks").is_none());
-            }
-        }
     }
 
     fn grant(job: &Job) -> OutboundGrant {

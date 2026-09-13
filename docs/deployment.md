@@ -215,13 +215,13 @@ the same deployment backup defeats recovery isolation.
 
 `GET /api/admin/backup` (admin session plus the `X-Votport: 1` header) streams a consistent snapshot produced
 by SQLite's `VACUUM INTO`, with `Content-Length`. Snapshots land under
-`data/backups/` and are swept after 30 days. Manually:
+`data/backups/` and are swept after 30 days. Use this endpoint or the scheduled
+archive service for a live snapshot. Never open the running container's database
+with a host SQLite client, including a read-only query or `.backup`: closing that
+connection can invalidate the live WAL and lose acknowledged writes. Inspect an
+exported snapshot instead. Stop the service before opening its database directly.
 
-```sh
-sqlite3 data/votport.db ".backup data/backups/manual.db"
-```
-
-The legacy Download snapshot action remains database-only. It is useful for a
+The Download snapshot action remains database-only. It is useful for a
 quick copy home, but it is not a replacement for the scheduled archive or the
 external `/received` and `/outbound` backups.
 
@@ -285,7 +285,7 @@ and asks the supervised service to restart. At boot, VOTPort moves the current
 managed files into a private `.votport-restore-rollback-<token>/` directory
 under `data/`, installs the staged database and identity files, then removes
 the restore stage and marker after the file installation and integrity checks
-finish. Later database migration, receipt signer, or push initialization can
+finish. Later database validation, receipt signer, or push initialization can
 still fail; the private rollback directory remains for operator recovery and
 can be removed after the restored deployment is accepted. The archive still
 does not restore `/received` or `/outbound`; use the matching operator-owned
@@ -436,13 +436,13 @@ the reserved directory). An unknown key with no leftover directory is 404
 and does not touch disk. A default-tenant path with the same name is separate
 and is never purged.
 
-The first start after upgrading moves each existing named tenant from
-`<receive>/<key>/` into the reserved subtree. The move is same-filesystem and
-resumable. If both old and new paths exist for a tenant, startup refuses so an
-operator can move one aside instead of guessing which data owns the name.
-Startup also refuses when a default-tenant link or live record uses the legacy
-prefix, or when a legacy tenant key falls outside `[a-z0-9_-]`. Reconcile those
-names and records before retrying the upgrade.
+An empty database is initialized directly with the current schema and reserved
+tenant storage layout. Startup and archive restore require the exact schema
+version supported by the binary. Older databases, newer databases, missing or
+unsupported storage-layout markers, and `state.json` imports are refused.
+Existing receiving directories are never relocated automatically. Preserve the
+database and payload directories and use a matching release to export data
+before an intentional schema or storage-layout transition.
 
 The local platform password is break-glass for every namespace; named
 tenants have no separate password.
@@ -679,7 +679,7 @@ Layout:
   starting `votport` normally over the same data directory. Like any
   restore, promotion rotates the cookie secret, so every admin signs in
   again; receipt and push identities carry over. Upgrade the standby binary
-  before the live one, since a pull refuses an archive from a newer schema.
+  alongside the live one: replica pulls require matching database schemas.
   If a promotion boot is interrupted mid-restore, run `votport` normally to
   finish it before returning the directory to standby mode. The RPO is the
   interval: links, settings, and resume records written on the live
