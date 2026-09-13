@@ -3379,12 +3379,17 @@ async fn restart_preserves_a_truncated_staging_session() {
     assert_eq!(ended.event.received_bytes, event.received_bytes);
     assert_eq!(ended.event.detail, event.detail);
     assert_eq!(begin(&client, &base, &session).await.0, 404);
-    // A fresh session over the same link completes normally.
+    // The unresolved original keeps its name and recovery evidence.
     run_upload(&client, &base, &token, "", &files).await;
     assert_eq!(
-        std::fs::read(receive_dir.join("resume.bin")).unwrap(),
+        std::fs::read(receive_dir.join("resume-1.bin")).unwrap(),
         file.bytes
     );
+    assert!(!receive_dir.join("resume.bin").exists());
+    assert_eq!(std::fs::metadata(&staging).unwrap().len(), 1024 * 1024);
+    let retained = server.application.store.load_upload_sessions().unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].id, session);
 }
 
 /// The end event of a re-attached session counts the bytes accepted before

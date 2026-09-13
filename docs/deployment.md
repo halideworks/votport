@@ -50,6 +50,17 @@ Native push carries verified ranges directly into the same receiver. Reception
 workflows keep and verify the original received files instead of taking another
 payload snapshot.
 
+HTTP and native uploads reserve final filenames together when their manifests
+are admitted. Reservations include unfinished sessions retained across restart
+and overlapping link destinations within a tenant. Conflicting filenames get a
+suffix; a file reserved as a parent folder causes admission to refuse. Existing
+verified files can still be reused without creating the requested path.
+
+Admission serializes staging metadata allocation and its database transaction.
+Very large manifests or slow NAS metadata operations can delay other admissions;
+payload verification and transfer run outside that lock. Temporary memory scales
+with filename keys and directory prefixes, not payload size.
+
 NAS receipts identify provider `POSIX_NAS` (`0x0005`) and Balanced publication.
 They distinguish verified content and server-acknowledged durability from
 independent server-side readback. Strict is not offered for NAS. macOS SMB and

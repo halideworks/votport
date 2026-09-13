@@ -729,6 +729,7 @@ pub static AUDIT_INSERT_FAILURES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 pub struct Store {
+    pub(crate) upload_allocation: Mutex<()>,
     connection: Mutex<Connection>,
     pub(crate) event_signer: std::sync::Arc<crate::receipt::ReceiptSigner>,
     path: PathBuf,
@@ -830,6 +831,7 @@ impl Store {
             .and_then(|directory| directory.sync_all())
             .map_err(|error| format!("sync {}: {error}", data_dir.display()))?;
         let store = Self {
+            upload_allocation: Mutex::new(()),
             connection: Mutex::new(connection),
             event_signer: std::sync::Arc::new(crate::receipt::ReceiptSigner::load_or_create(
                 data_dir,
@@ -2065,6 +2067,29 @@ impl Store {
             }
         }
         transaction.commit().map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn visit_pending_upload_paths(
+        &self,
+        tenant: &str,
+        mut visit: impl FnMut(&str, &[String]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.with(|connection| {
+            let mut statement = connection.prepare_cached(
+                "SELECT s.dest_rel,f.stored_components FROM upload_sessions s
+                 JOIN upload_session_files f ON f.session_id=s.id
+                 WHERE s.tenant=?1 AND s.committed_upload_id IS NULL AND f.published=0",
+            )?;
+            let mut rows = statement.query([tenant])?;
+            while let Some(row) = rows.next()? {
+                let destination: String = row.get(0)?;
+                let components: Vec<String> = parse_json(&row.get::<_, String>(1)?, 1)?;
+                if let Err(error) = visit(&destination, &components) {
+                    return Ok(Err(error));
+                }
+            }
+            Ok(Ok(()))
+        })?
     }
 
     /// Every persisted session with its files, for boot re-attach.
