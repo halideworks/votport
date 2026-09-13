@@ -977,6 +977,9 @@ impl Store {
                 if !project.allows(actor, "sender", administrator) && actor != job.actor {
                     return Err("sender permission required".into());
                 }
+                if ["retiring", "retired"].contains(&job.state.as_str()) {
+                    return Err("delivery is retiring or retired".into());
+                }
                 if job.state == "cancelled" {
                     return Ok(job);
                 }

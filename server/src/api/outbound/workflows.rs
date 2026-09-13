@@ -3328,6 +3328,20 @@ mod tests {
             .store
             .change_delivery_job("", &job.id, "sender", false, "cancel", None)
             .unwrap();
+        let events = serde_json::to_value(app.store.delivery_events("", 0, 100).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                app.store
+                    .change_delivery_job("", &job.id, "sender", false, "cancel", None)
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&cancelled).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(app.store.delivery_events("", 0, 100).unwrap()).unwrap(),
+            events
+        );
         assert!(app
             .store
             .claim_snapshot_retirement(cancelled.updated_at + 7 * 86400 - 1)
@@ -3341,7 +3355,29 @@ mod tests {
                 .id,
             job.id
         );
-        retire_snapshot(&app).await.unwrap();
+        for state in ["retiring", "retired"] {
+            let before = app.store.delivery_job(&job.id).unwrap().unwrap();
+            assert_eq!(before.state, state);
+            let events =
+                serde_json::to_value(app.store.delivery_events("", 0, 100).unwrap()).unwrap();
+            assert_eq!(
+                app.store
+                    .change_delivery_job("", &job.id, "sender", false, "cancel", None)
+                    .unwrap_err(),
+                "delivery is retiring or retired"
+            );
+            assert_eq!(
+                serde_json::to_value(app.store.delivery_job(&job.id).unwrap().unwrap()).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(app.store.delivery_events("", 0, 100).unwrap()).unwrap(),
+                events
+            );
+            if state == "retiring" {
+                retire_snapshot(&app).await.unwrap();
+            }
+        }
         assert!(!root.exists());
         let retired = app.store.delivery_job(&job.id).unwrap().unwrap();
         assert_eq!(retired.state, "retired");
