@@ -1459,6 +1459,44 @@ async fn receipts_are_written_and_files_are_manageable() {
     assert!(upload["files"][0]["receipt"].as_bool().unwrap());
     let upload_id = upload["id"].as_str().unwrap();
 
+    let payload = server.receive_dir.join("receipted.bin");
+    for changed in [b"short".to_vec(), vec![6; 300_000]] {
+        std::fs::write(&payload, &changed).unwrap();
+        let response = client
+            .delete(format!(
+                "{base}/api/admin/links/{token}/uploads/{upload_id}/files/0"
+            ))
+            .header("X-Votport", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            409,
+            "changed bytes cannot be deleted through the old record"
+        );
+        assert_eq!(std::fs::read(&payload).unwrap(), changed);
+        assert!(sidecar.exists());
+        if changed.len() != 300_000 {
+            let listing = client
+                .get(format!("{base}/api/admin/links"))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap();
+            let current = listing["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|link| link["id"] == token)
+                .unwrap();
+            assert_eq!(current["uploads"][0]["files"][0]["exists"], false);
+        }
+    }
+    std::fs::write(&payload, vec![5; 300_000]).unwrap();
+
     let response = client
         .delete(format!(
             "{base}/api/admin/links/{token}/uploads/{upload_id}/files/0"
@@ -2209,6 +2247,57 @@ async fn identical_resend_is_deduped_not_suffixed() {
                 .map(|index| (upload["id"].as_str().unwrap().to_owned(), index))
         })
         .expect("a record for dup.bin");
+    let shared_upload = uploads
+        .iter()
+        .find(|upload| {
+            upload["id"] != upload_id
+                && upload["files"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|file| file["stored_as"] == "dup.bin")
+        })
+        .unwrap();
+    let shared_index = shared_upload["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|file| file["stored_as"] == "dup.bin")
+        .unwrap();
+    let response = client
+        .post(format!("{base}/api/admin/outbound-grants"))
+        .header("X-Votport", "1")
+        .json(&json!({"link_id":token,"upload_id":shared_upload["id"],"file_index":shared_index}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let grant = response.json::<Value>().await.unwrap();
+    let response = client
+        .delete(format!(
+            "{base}/api/admin/links/{token}/uploads/{upload_id}/files/{file_index}"
+        ))
+        .header("X-Votport", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        409,
+        "a grant through another deduplicated record protects the file"
+    );
+    assert!(server.receive_dir.join("dup.bin").exists());
+    let response = client
+        .delete(format!(
+            "{base}/api/admin/outbound-grants/{}",
+            grant["grant"]["id"].as_str().unwrap()
+        ))
+        .header("X-Votport", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
     let response = client
         .delete(format!(
             "{base}/api/admin/links/{token}/uploads/{upload_id}/files/{file_index}"
@@ -2227,6 +2316,21 @@ async fn identical_resend_is_deduped_not_suffixed() {
     assert_eq!(
         std::fs::read(server.receive_dir.join("dup.bin")).unwrap(),
         impostor_bytes
+    );
+
+    let response = client
+        .delete(format!(
+            "{base}/api/admin/links/{token}/uploads/{upload_id}/files/{file_index}"
+        ))
+        .header("X-Votport", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "repeated deletion is idempotent");
+    assert_eq!(
+        std::fs::read(server.receive_dir.join("dup.bin")).unwrap(),
+        impostor_bytes,
+        "a tombstoned record must not remove the new occupant"
     );
 
     // Re-announcing the original root must transfer for real and publish

@@ -2569,8 +2569,12 @@ fn link_view(
                 .files
                 .into_iter()
                 .map(|file| FileView {
-                    exists: stored_path(app, &tenant, &file.stored_as)
-                        .is_some_and(|path| path.is_file()),
+                    exists: !file.deleted
+                        && stored_path(app, &tenant, &file.stored_as)
+                            .and_then(|path| std::fs::symlink_metadata(path).ok())
+                            .is_some_and(|metadata| {
+                                metadata.is_file() && metadata.len() == file.bytes
+                            }),
                     path: file.path,
                     stored_as: file.stored_as,
                     bytes: file.bytes,
@@ -3156,12 +3160,26 @@ pub async fn delete_received_file(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_operator(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
+    tokio::task::spawn_blocking(move || {
+        delete_received_file_sync(&app, &identity, &id, &upload, index)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?
+}
+
+fn delete_received_file_sync(
+    app: &App,
+    identity: &auth::AdminIdentity,
+    id: &str,
+    upload: &str,
+    index: usize,
+) -> ApiResult<Json<serde_json::Value>> {
     let destinations = app
         .receiving_destinations()
         .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
     if app
         .store
-        .link(&identity.tenant, &id)
+        .link(&identity.tenant, id)
         .map_err(super::store_unavailable)?
         .is_none()
     {
@@ -3169,9 +3187,9 @@ pub async fn delete_received_file(
     }
     let _pin = app
         .sessions
-        .try_pin_link(&id)
+        .try_pin_link(id)
         .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "file deletion already in progress"))?;
-    if app.sessions.active_for_link(&id) > 0 {
+    if app.sessions.active_for_link(id) > 0 {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "uploads are in flight; try again when they finish",
@@ -3179,7 +3197,7 @@ pub async fn delete_received_file(
     }
     if app
         .store
-        .receive_workflow_pending(&identity.tenant, &id)
+        .receive_workflow_pending(&identity.tenant, id)
         .map_err(super::store_unavailable)?
     {
         return Err(ApiError::new(
@@ -3189,7 +3207,7 @@ pub async fn delete_received_file(
     }
     let link = app
         .store
-        .link(&identity.tenant, &id)
+        .link(&identity.tenant, id)
         .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
     if link.legal_hold {
@@ -3204,34 +3222,53 @@ pub async fn delete_received_file(
         .find(|entry| entry.id == upload)
         .and_then(|entry| entry.files.get(index))
         .ok_or_else(ApiError::not_found)?;
-    if app
+    if record.deleted {
+        return Ok(Json(json!({ "ok": true })));
+    }
+    let active = app
         .store
-        .has_active_outbound_grant(&identity.tenant, &id, &upload, index, now_unix())
+        .active_outbound_file_keys(&identity.tenant, id, now_unix())
+        .map_err(ApiError::internal)?;
+    for (upload_id, file_index) in active {
+        let protected = link
+            .uploads
+            .iter()
+            .find(|upload| upload.id == upload_id)
+            .and_then(|upload| upload.files.get(file_index));
+        if protected.is_none_or(|file| file.stored_as == record.stored_as) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "active download links must be revoked first",
+            ));
+        }
+    }
+    let mut components = paths::tenant_prefix(&identity.tenant);
+    components.extend(record.stored_as.split('/').map(str::to_owned));
+    let prepared = destinations
+        .prepare_received_removal(&components, record, &app.signer)
+        .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
+    if !app
+        .store
+        .tombstone_files(&identity.tenant, id, |file| {
+            file.stored_as == record.stored_as
+        })
         .map_err(ApiError::internal)?
     {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
-            "active download links must be revoked first",
+            "request disappeared during deletion; files were retained",
         ));
     }
-    let mut components = paths::tenant_prefix(&identity.tenant);
-    components.extend(record.stored_as.split('/').map(str::to_owned));
-    destinations
-        .remove_received(&components)
+    prepared
+        .remove(&destinations)
         .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
-    // Tombstone every record naming this path, not just the one deleted
-    // through: the freed name can be reused by different content, and any
-    // record still pointing there must never satisfy dedupe again.
-    let stored_as = record.stored_as.clone();
-    app.store
-        .tombstone_files(&identity.tenant, &id, |file| file.stored_as == stored_as)
-        .map_err(ApiError::internal)?;
+    let stored_as = &record.stored_as;
     tracing::info!(target: "audit", event = "received_file_deleted", link = %id, stored_as = %stored_as, "received file deleted from disk");
     app.store.audit(
         &identity.tenant,
         &identity.subject,
         "received_file_deleted",
-        &id,
+        id,
         &serde_json::json!({ "stored_as": stored_as }),
     );
     Ok(Json(json!({ "ok": true })))

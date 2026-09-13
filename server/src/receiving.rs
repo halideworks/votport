@@ -203,6 +203,50 @@ pub struct Destinations {
     directories: Mutex<Vec<(PathBuf, ReceiveDirectory)>>,
 }
 
+pub struct PreparedRemoval {
+    files: Vec<(vot_platform_fs::FileLocation, File, std::fs::Metadata)>,
+    directory: Option<Directory>,
+}
+
+impl PreparedRemoval {
+    fn check(&self, destinations: &Destinations) -> Result<(), String> {
+        destinations.check_current()?;
+        for (location, file, before) in &self.files {
+            destinations.check_location(location)?;
+            let after = file.metadata().map_err(|e| e.to_string())?;
+            if (
+                before.len(),
+                before.mtime(),
+                before.mtime_nsec(),
+                before.ctime(),
+                before.ctime_nsec(),
+            ) != (
+                after.len(),
+                after.mtime(),
+                after.mtime_nsec(),
+                after.ctime(),
+                after.ctime_nsec(),
+            ) || !location.same_file(file).map_err(|e| e.to_string())?
+            {
+                return Err("stored file changed during deletion; files were retained".into());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn remove(self, destinations: &Destinations) -> Result<(), String> {
+        self.check(destinations)?;
+        for (location, file, _) in self.files {
+            destinations.check_live()?;
+            location.remove_owned(&file).map_err(|e| e.to_string())?;
+        }
+        if let Some(directory) = self.directory {
+            directory.sync().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+
 impl Destinations {
     pub fn open(path: &Path, contract: NasContract) -> Result<Self, String> {
         Ok(Self::from_directory(
@@ -376,27 +420,110 @@ impl Destinations {
         Ok(())
     }
 
-    pub fn remove_received(&self, components: &[String]) -> Result<(), String> {
+    pub fn prepare_received_removal(
+        &self,
+        components: &[String],
+        record: &crate::store::FileRecord,
+        signer: &crate::receipt::ReceiptSigner,
+    ) -> Result<PreparedRemoval, String> {
+        use std::io::Read as _;
+        if record.deleted {
+            return Err("file record is already deleted".into());
+        }
+        let suite = match record.suite.as_str() {
+            "blake3" => vot_verifier::Suite::Blake3Bao64,
+            "sha256" => vot_verifier::Suite::Sha256Bep52,
+            _ => return Err("unsupported stored file hash suite".into()),
+        };
+        let object = vot_sdk::object::ObjectId {
+            suite: suite.identifier(),
+            root: hex::decode(&record.root)
+                .ok()
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or("invalid stored file root")?,
+            length: record.bytes,
+        };
         let Some(payload) = self.removal_location(components)? else {
-            return Ok(());
+            return Ok(PreparedRemoval {
+                files: Vec::new(),
+                directory: None,
+            });
         };
         let mut name = payload.name().to_owned();
         name.push(".vot-receipt");
         let sidecar = payload.sibling(&name).map_err(|e| e.to_string())?;
         let directory = payload.directory().clone();
-        let files = [payload, sidecar]
+        let mut files = [payload, sidecar]
             .into_iter()
             .map(|location| match location.open_read() {
-                Ok(file) => Ok(Some((location, file))),
+                Ok(file) => {
+                    let metadata = file.metadata().map_err(|e| e.to_string())?;
+                    if !metadata.is_file() || metadata.uid() != rustix::process::geteuid().as_raw()
+                    {
+                        return Err("stored file is not an owned regular file".to_owned());
+                    }
+                    Ok(Some((location, file, metadata)))
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(error) => Err(error.to_string()),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        for (location, file) in files.into_iter().flatten() {
-            self.check_live()?;
-            location.remove_owned(&file).map_err(|e| e.to_string())?;
+        if let Some((_, sidecar, _)) = &mut files[1] {
+            let mut receipt = Vec::new();
+            sidecar
+                .take(64 * 1024 + 1)
+                .read_to_end(&mut receipt)
+                .map_err(|e| e.to_string())?;
+            if receipt.len() > 64 * 1024
+                || crate::receipt::verify_receipt_with_key(
+                    &signer.verifying_key(),
+                    &receipt,
+                    &object,
+                )
+                .is_err()
+            {
+                return Err(
+                    "stored receipt does not match this file record; files were retained".into(),
+                );
+            }
+        } else if record.receipt && files[0].is_some() {
+            return Err("stored receipt is missing; file was retained".into());
         }
-        directory.sync().map_err(|e| e.to_string())
+        if let Some((_, input, metadata)) = &mut files[0] {
+            if metadata.len() != object.length {
+                return Err("stored file length changed; file was retained".into());
+            }
+            let mut verifier = vot_verifier::StreamVerifier::new(suite);
+            let mut buffer = vec![0; 1 << 20];
+            let mut remaining = object.length;
+            for _ in 0..object.length.div_ceil(buffer.len() as u64) {
+                self.check_live()?;
+                let count = remaining.min(buffer.len() as u64) as usize;
+                input
+                    .read_exact(&mut buffer[..count])
+                    .map_err(|e| e.to_string())?;
+                verifier
+                    .update(&buffer[..count])
+                    .map_err(|e| format!("verify stored file: {e:?}"))?;
+                remaining -= count as u64;
+            }
+            if input.read(&mut [0]).map_err(|e| e.to_string())? != 0 {
+                return Err("stored file length changed; file was retained".into());
+            }
+            verifier
+                .finish(vot_verifier::ExpectedObject::new(
+                    suite,
+                    object.root,
+                    object.length,
+                ))
+                .map_err(|_| "stored file content changed; file was retained".to_owned())?;
+        }
+        let prepared = PreparedRemoval {
+            files: files.into_iter().flatten().collect(),
+            directory: Some(directory),
+        };
+        prepared.check(self)?;
+        Ok(prepared)
     }
 
     fn removal_location(
@@ -562,8 +689,123 @@ impl Destinations {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn published_file(
+        path: &Path,
+        bytes: &[u8],
+        suite: vot_verifier::Suite,
+        signer: &crate::receipt::ReceiptSigner,
+    ) -> crate::store::FileRecord {
+        std::fs::write(path, bytes).unwrap();
+        let root = vot_verifier::root(suite, bytes).unwrap();
+        let object = vot_sdk::object::ObjectId {
+            suite: suite.identifier(),
+            root,
+            length: bytes.len() as u64,
+        };
+        let directory =
+            Directory::open_with_nas(path.parent().unwrap(), NasContract::Unqualified).unwrap();
+        signer
+            .write_sidecar(
+                &directory.entry(path.file_name().unwrap()).unwrap(),
+                &object,
+                [1; 16],
+                vot_sdk_file::PublishObservation {
+                    incarnation: [2; 16],
+                    sequence: 1,
+                },
+                vot_sdk_file::CommitProfile::Balanced,
+            )
+            .unwrap();
+        crate::store::FileRecord {
+            path: path.file_name().unwrap().to_str().unwrap().into(),
+            stored_as: path.file_name().unwrap().to_str().unwrap().into(),
+            bytes: object.length,
+            suite: match suite {
+                vot_verifier::Suite::Blake3Bao64 => "blake3",
+                vot_verifier::Suite::Sha256Bep52 => "sha256",
+            }
+            .into(),
+            root: hex::encode(root),
+            receipt: true,
+            deleted: false,
+        }
+    }
+
+    #[test]
+    fn deletion_verifies_content_receipt_and_retained_identity() {
+        for suite in [
+            vot_verifier::Suite::Blake3Bao64,
+            vot_verifier::Suite::Sha256Bep52,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            crate::paths::tighten_dir(root.path());
+            let signer = crate::receipt::ReceiptSigner::load_or_create(root.path()).unwrap();
+            let destinations = Destinations::open(root.path(), NasContract::Unqualified).unwrap();
+            let path = root.path().join("frame");
+            let sidecar = root.path().join("frame.vot-receipt");
+            let record = published_file(&path, b"original", suite, &signer);
+            let components = vec!["frame".into()];
+            let prepare = || destinations.prepare_received_removal(&components, &record, &signer);
+            drop(prepare().unwrap());
+            assert_eq!(std::fs::read(&path).unwrap(), b"original");
+            std::fs::write(&path, b"modified").unwrap();
+            assert!(prepare().is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"modified");
+            std::fs::write(&path, b"original").unwrap();
+            let receipt = std::fs::read(&sidecar).unwrap();
+            std::fs::write(&sidecar, vec![0; 64 * 1024 + 1]).unwrap();
+            assert!(prepare().is_err());
+            std::fs::write(&sidecar, &receipt).unwrap();
+            let prepared = prepare().unwrap();
+            std::fs::rename(&path, root.path().join("old")).unwrap();
+            std::fs::write(&path, b"replaced").unwrap();
+            assert!(prepared.remove(&destinations).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"replaced");
+            std::fs::remove_file(&path).unwrap();
+            std::fs::rename(root.path().join("old"), &path).unwrap();
+            let prepared = prepare().unwrap();
+            std::fs::write(&path, b"modified").unwrap();
+            assert!(prepared.remove(&destinations).is_err());
+            std::fs::write(&path, b"original").unwrap();
+            prepare().unwrap().remove(&destinations).unwrap();
+            assert!(!path.exists() && !sidecar.exists());
+            prepare().unwrap().remove(&destinations).unwrap();
+            let mut deleted = record.clone();
+            deleted.deleted = true;
+            assert!(destinations
+                .prepare_received_removal(&components, &deleted, &signer)
+                .is_err());
+            let multi = published_file(&path, &vec![7; (1 << 20) + 17], suite, &signer);
+            destinations
+                .prepare_received_removal(&components, &multi, &signer)
+                .unwrap()
+                .remove(&destinations)
+                .unwrap();
+            assert!(!path.exists());
+            let empty = published_file(&path, b"", suite, &signer);
+            destinations
+                .prepare_received_removal(&components, &empty, &signer)
+                .unwrap()
+                .remove(&destinations)
+                .unwrap();
+            assert!(!path.exists());
+            let mut unreceipted = published_file(&path, b"original", suite, &signer);
+            std::fs::remove_file(&sidecar).unwrap();
+            assert!(destinations
+                .prepare_received_removal(&components, &unreceipted, &signer)
+                .is_err());
+            unreceipted.receipt = false;
+            destinations
+                .prepare_received_removal(&components, &unreceipted, &signer)
+                .unwrap()
+                .remove(&destinations)
+                .unwrap();
+            assert!(!path.exists());
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -636,13 +878,23 @@ mod tests {
             .mode(0o700)
             .create(&folder)
             .unwrap();
-        std::fs::write(folder.join("frame"), b"payload").unwrap();
-        std::fs::write(folder.join("frame.vot-receipt"), b"receipt").unwrap();
+        let signer = crate::receipt::ReceiptSigner::load_or_create(root.path()).unwrap();
+        let record = published_file(
+            &folder.join("frame"),
+            b"payload",
+            vot_verifier::Suite::Blake3Bao64,
+            &signer,
+        );
+        let remove = |components: &[String]| {
+            destinations
+                .prepare_received_removal(components, &record, &signer)
+                .and_then(|prepared| prepared.remove(&destinations))
+        };
         let components = vec!["project".into(), "frame".into()];
         for shared in [root.path(), folder.as_path()] {
             let mode = std::fs::metadata(shared).unwrap().permissions();
             std::fs::set_permissions(shared, std::fs::Permissions::from_mode(0o770)).unwrap();
-            assert!(destinations.remove_received(&components).is_err());
+            assert!(remove(&components).is_err());
             assert!(destinations.remove_tree(&["project".into()]).is_err());
             assert_eq!(std::fs::read(folder.join("frame")).unwrap(), b"payload");
             assert!(folder.join("frame.vot-receipt").exists());
@@ -650,14 +902,10 @@ mod tests {
         }
         std::fs::write(outside.path().join("frame"), b"unrelated").unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("alias")).unwrap();
-        assert!(destinations
-            .remove_received(&["alias".into(), "frame".into()])
-            .is_err());
-        assert!(destinations
-            .remove_received(&["..".into(), "frame".into()])
-            .is_err());
-        destinations.remove_received(&components).unwrap();
-        destinations.remove_received(&components).unwrap();
+        assert!(remove(&["alias".into(), "frame".into()]).is_err());
+        assert!(remove(&["..".into(), "frame".into()]).is_err());
+        remove(&components).unwrap();
+        remove(&components).unwrap();
         assert!(!folder.join("frame.vot-receipt").exists());
         std::os::unix::fs::symlink(outside.path(), folder.join("alias")).unwrap();
         destinations.remove_tree(&["project".into()]).unwrap();
