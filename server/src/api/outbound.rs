@@ -18,13 +18,13 @@ use serde::Deserialize;
 
 pub mod automation;
 pub mod workflows;
+use crate::receipt::verify_receipt_with_key;
 pub use automation::automation_share;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncSeekExt as _, AsyncWriteExt as _, ReadBuf, SeekFrom};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio_util::io::ReaderStream;
-use vot_receipt::SubjectKind;
 use vot_sdk::object::{InMemoryObjectBuilder, ObjectId, Suite};
 use vot_sdk::proof::{self, CatalogHeader};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
@@ -4180,24 +4180,6 @@ fn legacy_link_pin<'a>(
 
 fn verify_receipt(app: &App, bytes: &[u8], object: &ObjectId) -> Result<(), ()> {
     verify_receipt_with_key(&app.signer.verifying_key(), bytes, object)
-}
-
-fn verify_receipt_with_key(
-    verifying_key: &ed25519_dalek::VerifyingKey,
-    bytes: &[u8],
-    object: &ObjectId,
-) -> Result<(), ()> {
-    let decoded = vot_receipt::decode_authenticated(bytes).map_err(|_| ())?;
-    let verified = vot_receipt::verify_ed25519(&decoded, verifying_key).map_err(|_| ())?;
-    let receipt = verified.receipt();
-    if receipt.subject_kind != SubjectKind::Object
-        || receipt.suite_id != object.suite
-        || receipt.subject_digest != object.root
-        || receipt.subject_length != object.length
-    {
-        return Err(());
-    }
-    Ok(())
 }
 
 fn receipt_path(path: &Path) -> PathBuf {

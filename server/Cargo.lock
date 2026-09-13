@@ -5011,6 +5011,7 @@ dependencies = [
  "vot-sdk",
  "vot-sdk-file",
  "vot-transport-api",
+ "vot-verifier",
  "votport-client-core",
  "x509-parser",
  "zip",

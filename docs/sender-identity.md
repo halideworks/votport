@@ -30,11 +30,11 @@ Object identity is already on every completed upload. `server/src/store.rs` `Fil
 | `suite` | `"blake3"` or `"sha256"` from `session::suite_name` |
 | `root` | Hex of the 32-byte object root |
 | `receipt` | Whether `<stored_as>.vot-receipt` was written |
-| `deleted` | Tombstone after admin or retention delete |
+| `deleted` | Tombstone committed before admin or retention unlinks the verified file |
 
 `UploadRecord.package_root` is the hex root of the verified package manifest. The sender in `upload.js` `sendDrop` builds **one VOT package per drop** (every selected file as one entry each), so a listing row has both a file object id and the drop's package root. They are different hashes (the package hashes its entries). The product card is the **file object**, not the package.
 
-`server/src/api/admin.rs` `FileView` is that record plus a live `exists` boolean. `GET /api/admin/links` also returns `receipt_key: app.signer.public_hex`. `FinishReport.files` in `session.rs` `handle_finish` is `Vec<FileRecord>`, so the sender's `#done-list` already receives `suite`, `root`, `bytes`, `receipt`, `path`.
+`server/src/api/admin.rs` `FileView` is that record plus an `exists` boolean that requires a live record and a regular file of the recorded length. This display check does not verify content identity. `GET /api/admin/links` also returns `receipt_key: app.signer.public_hex`. `FinishReport.files` in `session.rs` `handle_finish` is `Vec<FileRecord>`, so the sender's `#done-list` already receives `suite`, `root`, `bytes`, `receipt`, `path`.
 
 Receipts are already the right evidence. `ReceiptSigner::write_sidecar` (`server/src/receipt.rs`) writes canonical vot-receipt CBOR, ed25519-signed, `SubjectKind::Object`, `AssuranceLevel::Published`, the actual commit profile (Balanced on local storage and explicitly qualified Linux CIFS/SMB or NFS). The crate cap is `decode_authenticated` rejecting input longer than 65_536 bytes. The e2e `receipts_are_written_and_files_are_manageable` already round-trips `decode_authenticated` plus `verify_ed25519` against `listing["receipt_key"]`.
 

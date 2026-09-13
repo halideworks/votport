@@ -108,6 +108,12 @@ still works; storage administrators can manage deletion there. Reception jobs
 release their source-file pins when archived, including tenants that never use
 an outbound library.
 
+File deletion verifies the stored content and any signed receipt before committing
+its tombstone, then removes the verified file handles. Changed or unverified files
+are retained. Retention verifies again after its batch tombstone commit to bound
+open handles. A later unlink failure leaves retained bytes for storage-administrator
+cleanup; it never makes the old record eligible to delete a reused filename.
+
 ## Large-file preparation
 
 Desktop and CLI uploads overlap sequential source reads with up to eight hash

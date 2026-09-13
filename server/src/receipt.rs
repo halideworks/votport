@@ -242,6 +242,24 @@ impl ReceiptSigner {
     }
 }
 
+pub(crate) fn verify_receipt_with_key(
+    verifying_key: &ed25519_dalek::VerifyingKey,
+    bytes: &[u8],
+    object: &ObjectId,
+) -> Result<(), ()> {
+    let decoded = vot_receipt::decode_authenticated(bytes).map_err(|_| ())?;
+    let verified = vot_receipt::verify_ed25519(&decoded, verifying_key).map_err(|_| ())?;
+    let receipt = verified.receipt();
+    if receipt.subject_kind != SubjectKind::Object
+        || receipt.suite_id != object.suite
+        || receipt.subject_digest != object.root
+        || receipt.subject_length != object.length
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
 fn write_sidecar_file(
     sidecar: &vot_platform_fs::FileLocation,
     bytes: &[u8],

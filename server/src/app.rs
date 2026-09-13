@@ -3899,7 +3899,16 @@ mod request_metrics_tests {
     }
 }
 
-async fn expire_link_uploads(app: &App, candidate: crate::store::Link, cutoff: u64) {
+async fn expire_link_uploads(app: &Arc<App>, candidate: crate::store::Link, cutoff: u64) {
+    let app = Arc::clone(app);
+    if let Err(error) =
+        tokio::task::spawn_blocking(move || expire_link_uploads_sync(&app, candidate, cutoff)).await
+    {
+        tracing::error!(%error, "retention worker failed");
+    }
+}
+
+fn expire_link_uploads_sync(app: &App, candidate: crate::store::Link, cutoff: u64) {
     if app.receiving_destinations().is_err() {
         return;
     }
@@ -3966,61 +3975,76 @@ async fn expire_link_uploads(app: &App, candidate: crate::store::Link, cutoff: u
         tracing::error!("outbound grant references a missing file; skipping retention for link");
         return;
     }
-    let candidates: HashSet<&str> = link
+    let candidates: std::collections::HashMap<&str, &crate::store::FileRecord> = link
         .uploads
         .iter()
         .filter(|upload| upload.completed_at > 0 && upload.completed_at < cutoff)
         .flat_map(|upload| &upload.files)
         .filter(|file| !file.deleted && !protected.contains(file.stored_as.as_str()))
-        .map(|file| file.stored_as.as_str())
+        .map(|file| (file.stored_as.as_str(), file))
         .collect();
-    let mut removed = HashSet::new();
-    for stored_as in candidates {
-        let Ok(destinations) = app.receiving_destinations() else {
-            return;
-        };
-        let mut components = crate::paths::tenant_prefix(&link.tenant);
-        components.extend(stored_as.split('/').map(str::to_owned));
-        match destinations.remove_received(&components) {
-            Ok(()) => {
-                removed.insert(stored_as.to_owned());
-            }
-            Err(error) => {
-                tracing::warn!(path = %stored_as, %error, "could not delete expired file");
-            }
-        }
-    }
-    if removed.is_empty() {
+    let candidates: Vec<_> = candidates.into_values().collect();
+    if candidates.is_empty() {
         return;
     }
-    match app.store.tombstone_files(&link.tenant, &link.id, |file| {
-        removed.contains(&file.stored_as)
-    }) {
-        Ok(true) => {
-            tracing::info!(
-                target: "audit",
-                event = "uploads_expired",
-                link = %link.id,
-                tenant = %link.tenant,
-                files = removed.len(),
-                "expired received files deleted"
-            );
+    let Ok(destinations) = app.receiving_destinations() else {
+        return;
+    };
+    let removed = (|| -> Result<usize, String> {
+        let prepare = |record: &crate::store::FileRecord| {
+            let mut components = crate::paths::tenant_prefix(&link.tenant);
+            components.extend(record.stored_as.split('/').map(str::to_owned));
+            destinations.prepare_received_removal(&components, record, &app.signer)
+        };
+        // ponytail: verify twice to bound descriptors with one history rewrite.
+        // Normalized file records allow one verified deletion per transaction.
+        let eligible: Vec<_> = candidates.into_iter().filter(|record| {
+            match prepare(record) {
+                Ok(_) => true,
+                Err(error) => {
+                    tracing::warn!(path = %record.stored_as, %error, "expired file retained before tombstone");
+                    false
+                }
+            }
+        }).collect();
+        if eligible.is_empty() {
+            return Ok(0);
+        }
+        let paths: HashSet<_> = eligible
+            .iter()
+            .map(|file| file.stored_as.as_str())
+            .collect();
+        if !app.store.tombstone_files(&link.tenant, &link.id, |file| {
+            paths.contains(file.stored_as.as_str())
+        })? {
+            return Err("request disappeared before retention; files were retained".into());
+        }
+        let mut removed = 0;
+        for record in &eligible {
+            match prepare(record).and_then(|prepared| prepared.remove(&destinations)) {
+                Ok(()) => removed += 1,
+                Err(error) => {
+                    tracing::warn!(path = %record.stored_as, %error, "expired file retained after tombstone")
+                }
+            }
+        }
+        Ok(removed)
+    })();
+    match removed {
+        Ok(0) => {}
+        Ok(count) => {
+            tracing::info!(target: "audit", event = "uploads_expired", link = %link.id,
+                tenant = %link.tenant, files = count, "expired received files deleted");
             app.store.audit(
                 &link.tenant,
                 "",
                 "uploads_expired",
                 &link.id,
-                &serde_json::json!({
-                    "tenant": link.tenant,
-                    "files": removed.len()
-                }),
+                &serde_json::json!({"tenant": link.tenant, "files": count}),
             );
         }
-        Ok(false) => {
-            tracing::warn!(link = %link.id, "expired files removed after link disappeared");
-        }
         Err(error) => {
-            tracing::error!(link = %link.id, %error, "expired files removed but tombstone failed");
+            tracing::error!(link = %link.id, %error, "retention failed; files were retained")
         }
     }
 }
@@ -4158,10 +4182,8 @@ pub async fn session_sweeper(app: Arc<App>) {
                     std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
                 prune_legacy_snapshots(&backup_dir, cutoff_modified);
 
-                // Received-content lifecycle: delete expired uploads from
-                // disk and tombstone their records, per tenant. Only records
-                // whose bytes were actually removed are tombstoned; a failed
-                // disk delete leaves the record live so the sweep retries.
+                // Commit tombstones before removing verified files. Failed unlinks
+                // retain bytes without reauthorizing deletion of a reused name.
                 if settings.upload_retention_days > 0 {
                     let cutoff = crate::store::now_unix()
                         .saturating_sub(settings.upload_retention_days.saturating_mul(86_400));
@@ -4319,6 +4341,18 @@ mod retention_tests {
         outbound.uploads[0].files[0].path = "outbound.txt".to_owned();
         outbound.uploads[0].files[0].stored_as = "outbound.txt".to_owned();
         app.store.insert_link(held.clone()).unwrap();
+        expired.uploads[0].files[0] = crate::receiving::tests::published_file(
+            &expired_path,
+            b"expired",
+            vot_verifier::Suite::Blake3Bao64,
+            &app.signer,
+        );
+        failed.uploads[0].files[0] = crate::receiving::tests::published_file(
+            &failed_path,
+            b"failed",
+            vot_verifier::Suite::Blake3Bao64,
+            &app.signer,
+        );
         app.store.insert_link(expired).unwrap();
         app.store.insert_link(active).unwrap();
         app.store.insert_link(shared).unwrap();
@@ -4442,7 +4476,7 @@ mod retention_tests {
         connection
             .execute_batch("DROP TRIGGER fail_link_update")
             .unwrap();
-        assert!(!failed_path.exists());
+        assert!(failed_path.exists());
         assert!(!app.store.link("", "failed").unwrap().unwrap().uploads[0].files[0].deleted);
         assert!(app
             .store
@@ -4467,8 +4501,19 @@ mod retention_tests {
         assert!(!app.store.link("", "held").unwrap().unwrap().uploads[0].files[0].deleted);
         assert!(app.store.link("", "expired").unwrap().unwrap().uploads[0].files[0].deleted);
         assert!(!app.store.link("", "active").unwrap().unwrap().uploads[0].files[0].deleted);
-        assert!(app.sessions.pin_link_for_delete("expired"));
-        app.sessions.unpin_link("expired");
+        let mut released = false;
+        for _ in 0..100 {
+            if app.sessions.pin_link_for_delete("expired") {
+                released = true;
+                app.sessions.unpin_link("expired");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            released,
+            "the blocking deletion must finish and release its pin after sweeper cancellation"
+        );
     }
 }
 
