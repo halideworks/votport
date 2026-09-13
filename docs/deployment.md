@@ -390,6 +390,10 @@ disclosure when SSO is configured; the form stays in the page. Without SSO
 the form stays expanded even if `VOTPORT_PUBLIC_PASSWORD_LOGIN=0`. An
 unreachable IdP may mute the SSO button, never the password form.
 
+Groups from the verified ID token and matching-subject UserInfo response are
+combined with SCIM group memberships before roles are assigned. Direct group
+claims must be arrays of strings; malformed claims refuse sign-in.
+
 SSO start and callback requests share a limit of 200 per ten minutes for each
 client address (IPv6 addresses share a /64 bucket). A normal sign-in uses two
 requests. Excess requests return HTTP 429 with `Retry-After: 600` before provider
@@ -437,6 +441,13 @@ offboarding is a two-step action across the IdP and votport.
 4. Token configuration > Add groups claim (security groups, emitted as group
    IDs); use the object ID of your admin group as `VOTPORT_OIDC_ADMIN_GROUP`,
    or expose group names via directory roles/attributes as your policy allows.
+
+Entra supplies these groups in the ID token; its UserInfo endpoint does not
+return groups. Tokens with group overage (`hasgroups`) or distributed groups
+(`_claim_names.groups`) refuse sign-in with a group-verification error. Votport
+does not fetch external claim sources. Configure a complete direct group list,
+or disable OIDC group emission and provision memberships through SCIM instead,
+using SCIM group display names in Votport's group settings.
 
 ### SCIM provisioning
 
