@@ -1518,7 +1518,7 @@ pub async fn run(
             Ok(id)
         }
         Err(error) => {
-            if error.published {
+            if error.copies_complete {
                 status.last_success_at = Some(now());
             }
             status.last_error = Some(error.message.chars().take(512).collect());
@@ -1530,21 +1530,21 @@ pub async fn run(
 
 struct RunFailure {
     message: String,
-    published: bool,
+    copies_complete: bool,
 }
 
 impl RunFailure {
     fn before(message: impl ToString) -> Self {
         Self {
             message: message.to_string(),
-            published: false,
+            copies_complete: false,
         }
     }
 
-    fn after(message: impl ToString, published: bool) -> Self {
+    fn after(message: impl ToString, copies_complete: bool) -> Self {
         Self {
             message: message.to_string(),
-            published,
+            copies_complete,
         }
     }
 }
@@ -1611,26 +1611,26 @@ async fn run_inner(
         raw_cleanup.keep();
     }
     sync_directory(&backups).map_err(RunFailure::before)?;
-    let mut published = false;
+    let mut copies_complete = false;
     if matches!(config.destination, Destination::Local | Destination::Both) {
         final_cleanup.keep();
-        published = true;
+        copies_complete = config.destination == Destination::Local;
         prune_local_root_protected(
             &backups,
             config.retention_days,
             config.retention_count,
             Some(&id),
         )
-        .map_err(|error| RunFailure::after(error, published))?;
+        .map_err(|error| RunFailure::after(error, copies_complete))?;
     }
     if matches!(config.destination, Destination::S3 | Destination::Both) {
         upload_s3(&config, &secrets, &final_path, &id)
             .await
-            .map_err(|error| RunFailure::after(error, published))?;
-        published = true;
+            .map_err(|error| RunFailure::after(error, copies_complete))?;
+        copies_complete = true;
     }
     if matches!(config.destination, Destination::S3) {
-        fs::remove_file(&final_path).map_err(|error| RunFailure::after(error, published))?;
+        fs::remove_file(&final_path).map_err(|error| RunFailure::after(error, copies_complete))?;
         final_cleanup.keep();
     }
     if matches!(config.destination, Destination::S3 | Destination::Both) {
@@ -1642,7 +1642,7 @@ async fn run_inner(
             Some(&id),
         )
         .await
-        .map_err(|error| RunFailure::after(error, published))?;
+        .map_err(|error| RunFailure::after(error, copies_complete))?;
     }
     Ok(id)
 }
@@ -2672,6 +2672,90 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn partial_backup_failure_preserves_success_and_retries_after_backoff() {
+        let requested = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&requested);
+        let router = axum::Router::new().fallback(move || {
+            seen.store(true, Ordering::Relaxed);
+            async { axum::http::StatusCode::FORBIDDEN }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        for previous in [None, Some(now() - 90_000)] {
+            requested.store(false, Ordering::Relaxed);
+            let root = tempfile::tempdir().unwrap();
+            let app = crate::api::testing::build(root.path());
+            let config = BackupConfig {
+                enabled: true,
+                destination: Destination::Both,
+                s3_endpoint: Some(endpoint.clone()),
+                s3_bucket: Some("backups".into()),
+                s3_region: Some("us-east-1".into()),
+                s3_path_style: true,
+                ..BackupConfig::default()
+            };
+            write_status(
+                &app.config.data_dir,
+                BackupStatus {
+                    last_success_at: previous,
+                    ..BackupStatus::default()
+                },
+            )
+            .unwrap();
+            let secrets = BackupSecrets {
+                access_key_id: Some("test-key".into()),
+                secret_access_key: Some("test-secret".into()),
+                ..BackupSecrets::default()
+            };
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                run(Arc::clone(&app), config.clone(), secrets),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(requested.load(Ordering::Relaxed));
+            assert_eq!(error, "S3 upload could not start");
+            assert_eq!(
+                local_files(&config.local_root(&app.config.data_dir).unwrap())
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let failed = read_status(&app.config.data_dir).unwrap();
+            assert_eq!(failed.last_success_at, previous);
+            assert_eq!(failed.last_error.as_deref(), Some(error.as_str()));
+            let attempt = failed.last_attempt_at.unwrap();
+            assert!(!scheduler_due(&config, &failed, attempt + 299));
+            assert!(scheduler_due(&config, &failed, attempt + 300));
+            let local = BackupConfig {
+                destination: Destination::Local,
+                ..config
+            };
+            run(Arc::clone(&app), local.clone(), BackupSecrets::default())
+                .await
+                .unwrap();
+            let succeeded = read_status(&app.config.data_dir).unwrap();
+            assert!(succeeded.last_error.is_none());
+            assert!(succeeded
+                .last_success_at
+                .is_some_and(|success| success >= attempt));
+            assert!(!scheduler_due(&local, &succeeded, attempt + 300));
+        }
+        stop.send(()).unwrap();
+        server.await.unwrap();
     }
 
     #[test]
