@@ -391,6 +391,25 @@ try {
   await page.selectOption('#workflow-filter-state', 'suspended');
   await heldCard.waitFor();
   await layout('restored-delivery');
+  for (const [state, retiredFrom, sourceRevoked, saved, expected] of [
+    ['retired', 'ready', null, null, false],
+    ['retiring', 'ready', null, null, false],
+    ['cancelled', 'ready', null, null, true],
+    ['retired', 'cancelled', null, null, true],
+    ['retired', 'ready', 1, null, true],
+    ['retired', 'ready', null, { state: 'pending' }, true],
+    ['suspended', 'cancelled', 1, { state: 'pending' }, false],
+  ]) {
+    held.job.state = state;
+    held.job.checks.retired_from = retiredFrom;
+    held.job.checks.source_revoked_at = sourceRevoked;
+    held.job.checks.destinations = { 'restored-destination': { state: 'complete' } };
+    held.job.checks.route_receipts = { 'restored-destination': {} };
+    held.job.checks.route_revocations = saved ? { 'restored-destination': saved } : {};
+    await page.goto(`${base}/workflows`);
+    await heldCard.waitFor();
+    assert.equal(await heldCard.getByText(/Revocation awaiting/).count(), expected ? 1 : 0, `${state}/${retiredFrom}: completed retirement must not imply revocation`);
+  }
   await page.unroute('**/api/workflows/jobs?*');
 
   const session = await api('admin/session');

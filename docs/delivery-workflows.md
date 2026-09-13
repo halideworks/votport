@@ -201,13 +201,16 @@ users, credentials, request links, tenant names, memberships or project policy.
 The destination receive request selects its own tenant, quota and reception
 project. An LA tenant does not create or select a same-named NYC tenant.
 
-Cancelling, revoking or expiring the LA delivery queues a source-signed
-revocation independently of payload work. NYC stops route-managed sharing and
-forwarding and signs an acknowledgment. Subsequent managed ports receive their
-own revocation requests. The UI distinguishes pending and acknowledged status;
+Expiring or archiving the LA delivery stops incomplete route transfers; completed
+copies remain available at NYC. Explicitly cancelling the LA delivery queues a
+source-signed revocation even for completed legs. NYC stops route-managed sharing
+and forwarding and signs an acknowledgment. Subsequent managed ports receive their
+own revocation requests. Archived jobs keep their retirement state; jobs held after
+restore remain suspended. The UI distinguishes pending and acknowledged status;
 an offline port retries with capped backoff until it responds. Already-downloaded
 files, S3 exports, shared-folder copies and independent manual copies cannot be
-recalled. Deleting a source tenant requires its outgoing route acknowledgments.
+recalled. Deleting a source tenant requires acknowledgments for incomplete legs
+and explicit revocations, but completed legs alone do not block deletion.
 If a destination tenant was deleted first, its port can sign that the exact
 route is absent without retaining the deleted tenant's metadata.
 
