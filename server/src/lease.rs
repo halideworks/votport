@@ -170,6 +170,8 @@ impl Drop for Guard {
                 let _ = self.location.sync_parent();
             }
         }
+        // A child can inherit the open description between fork and exec, despite CLOEXEC.
+        let _ = rustix::fs::flock(&self.lock, rustix::fs::FlockOperation::Unlock);
     }
 }
 
@@ -234,9 +236,12 @@ mod tests {
         assert_eq!(read(&first.location).unwrap().unwrap().renewed_at, 30);
         let lock_identity = first.lock_location.identity().unwrap();
         let location = first.location.clone();
+        let inherited = first.lock.try_clone().unwrap();
         drop(first);
         assert!(read(&location).unwrap().is_none());
         let second = Guard::acquire(&directory, "second", 31).unwrap();
+        drop(inherited);
+        assert!(Guard::acquire(&directory, "third", 32).is_err());
         assert_eq!(second.lock_location.identity().unwrap(), lock_identity);
         assert_eq!(read(&location).unwrap().unwrap().holder, "second");
     }

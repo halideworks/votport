@@ -1669,6 +1669,8 @@ pub async fn create_outbound_grant(
     if upload.completed_at == 0 || file.deleted || !file.receipt {
         return Err(ApiError::not_found());
     }
+    crate::paths::admit_portable_paths([file.path.as_str()])
+        .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     let source = admin::stored_path(&app, &identity.tenant, &file.stored_as)
         .ok_or_else(ApiError::not_found)?;
     if !source.is_file() || !receipt_path(&source).is_file() {
@@ -1919,8 +1921,20 @@ async fn create_library_grant(
             .map(|job| workflows::payload_root(app, &identity.tenant, &job.id))
             .unwrap_or_else(|| library_root(app, &identity.tenant))
     };
+    let source_prefix = options
+        .workflow
+        .as_ref()
+        .filter(|job| job.received.is_none() && !job.uses_snapshot())
+        .map(|job| format!("{}/", job.project.directory));
+    crate::paths::admit_portable_paths(requested.iter().map(|name| {
+        let name = name.trim_matches('/');
+        source_prefix
+            .as_deref()
+            .and_then(|prefix| name.strip_prefix(prefix))
+            .unwrap_or(name)
+    }))
+    .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     let mut selections = Vec::with_capacity(requested.len());
-    let mut selected = std::collections::HashSet::with_capacity(requested.len());
     let mut total_bytes = 0u64;
     for name in requested {
         let path = if let Some(received) = &received {
@@ -1940,12 +1954,6 @@ async fn create_library_grant(
             return Err(ApiError::not_found());
         }
         let name = name.trim_matches('/').to_owned();
-        if !selected.insert(name.clone()) {
-            return Err(ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "paths must not contain duplicates",
-            ));
-        }
         total_bytes = total_bytes
             .checked_add(meta.len())
             .filter(|total| *total <= app.config.max_upload_bytes)
@@ -2051,14 +2059,9 @@ async fn create_library_grant(
                 file.receipt_b64 = base64::prelude::BASE64_STANDARD
                     .encode(read_verified_receipt(app, &path, &object)?);
             }
-            let name = options
-                .workflow
-                .as_ref()
-                .filter(|job| job.received.is_none() && !job.uses_snapshot())
-                .and_then(|job| {
-                    file.name
-                        .strip_prefix(&format!("{}/", job.project.directory))
-                })
+            let name = source_prefix
+                .as_deref()
+                .and_then(|prefix| file.name.strip_prefix(prefix))
                 .unwrap_or(&file.name)
                 .to_owned();
             Ok(OutboundGrantFile {
@@ -3487,13 +3490,14 @@ pub async fn outbound_bundle(
     let active = ActiveDownload::claim(Arc::clone(&app), &format!("{}:bundle", grant.token_hash))?;
     let _pin = legacy_link_pin(&app, &grant, grant.files.is_empty())?;
     let mut files = Vec::with_capacity(count);
-    let mut names = std::collections::HashSet::with_capacity(count);
     for index in 0..count {
         let source = source_info_indexed(&app, &grant, index)?;
-        let relative = bundle_path(&source.name).ok_or_else(ApiError::not_found)?;
-        if !names.insert(bundle_collision_key(&relative)) {
-            return Err(ApiError::not_found());
-        }
+        let relative = bundle_path(&source.name).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid filename in delivery",
+            )
+        })?;
         files.push((source, relative));
     }
     let archive = build_bundle(&app, files).await?;
@@ -3714,14 +3718,12 @@ fn bundle_path(name: &str) -> Option<String> {
     (!components.is_empty()).then(|| components.join("/"))
 }
 
-fn bundle_collision_key(name: &str) -> String {
-    name.to_lowercase()
-}
-
 // ponytail: every request re-copies and re-verifies each source; cache the
 // built archive keyed by grant id + file set if concurrent same-ZIP fetches
 // are ever measured as a pattern.
 async fn build_bundle(app: &App, files: Vec<(Source, String)>) -> ApiResult<StagedFile> {
+    crate::paths::admit_portable_paths(files.iter().map(|(_, name)| name.as_str()))
+        .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     let bound = archive_size_bound(&files).ok_or_else(stage_capacity_error)?;
     let stage_root = app.config.data_dir.join("outbound.stage");
     std::fs::create_dir_all(&stage_root)
@@ -5430,10 +5432,6 @@ mod tests {
         assert!(bundle_path("/file.bin").is_none());
         assert!(bundle_path("project/../file.bin").is_none());
         assert!(bundle_path("").is_none());
-        assert_eq!(
-            bundle_collision_key("Project/FINAL.MOV"),
-            bundle_collision_key("project/final.mov")
-        );
     }
     #[test]
     fn drop_guards_remove_stage_and_active_grant() {
@@ -5531,6 +5529,39 @@ mod tests {
         assert_eq!(entries["first.txt"], b"first payload");
         assert_eq!(entries["second.txt"], b"second payload");
         drop(archive);
+    }
+
+    #[tokio::test]
+    async fn build_bundle_rejects_ambiguous_names_before_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        for names in [
+            ["Café.mov", "Cafe\u{301}.mov"],
+            ["folder", "FOLDER/clip.mov"],
+        ] {
+            let files = names
+                .into_iter()
+                .map(|name| {
+                    (
+                        Source {
+                            path: directory.path().join(name),
+                            object: ObjectId {
+                                suite: 1,
+                                root: [0; 32],
+                                length: 1,
+                            },
+                            name: name.into(),
+                            receipt: None,
+                        },
+                        bundle_path(name).unwrap(),
+                    )
+                })
+                .collect();
+            let error = build_bundle(&app, files).await.err().unwrap();
+            assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(error.message.contains("collide"));
+            assert!(!app.config.data_dir.join("outbound.stage").exists());
+        }
     }
 
     #[tokio::test]
@@ -6472,6 +6503,48 @@ mod tests {
                 response.into_body().collect().await.unwrap().to_bytes(),
                 expected
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn library_grants_reject_nonportable_names_before_source_access() {
+        let (_directory, app, cookie, _) = fixture().await;
+        let library = library_root(&app, "");
+        std::fs::create_dir_all(&library).unwrap();
+        for names in [
+            vec!["Café.mov", "Cafe\u{301}.mov"],
+            vec!["ΣΊΣΥΦΟΣ.mov", "σίσυφος.mov"],
+            vec!["ſtraße.mov", "strasse.mov"],
+            vec!["I.mov", "ı.mov"],
+            vec!["XML:EDL/clip.mov"],
+            vec!["clip.mov."],
+        ] {
+            for materialized in [false, true] {
+                if materialized {
+                    for (index, name) in names.iter().enumerate() {
+                        let path = library.join(name);
+                        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                        std::fs::write(path, [index as u8]).unwrap();
+                    }
+                }
+                let response = crate::app::router(app.clone())
+                    .oneshot(
+                        Request::post("/api/admin/outbound-grants")
+                            .header("cookie", &cookie)
+                            .header("x-votport", "1")
+                            .header("content-type", "application/json")
+                            .body(Body::from(json!({"paths":names}).to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "{names:?}"
+                );
+                assert!(app.store.outbound_grants("").unwrap().is_empty());
+            }
         }
     }
 

@@ -181,6 +181,13 @@ test('deduplicates case-insensitive names before extensions', () => {
   );
 });
 
+test('deduplicates canonically equivalent Unicode names and suffixes', () => {
+  assert.deepEqual(
+    dedupeFilenames(['one/Café.mov', 'two/Cafe\u0301.mov', 'CAFÉ.MOV', 'Cafe\u0301 (2).mov']),
+    ['Café.mov', 'Cafe\u0301 (2).mov', 'CAFÉ (3).MOV', 'Cafe\u0301 (2) (2).mov'],
+  );
+});
+
 test('deduplicates repeated names across folders and existing numbered names', () => {
   assert.deepEqual(
     dedupeFilenames(['a/frame.exr', 'frame (2).exr', 'b/frame.exr', 'FRAME.EXR',
