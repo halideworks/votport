@@ -111,23 +111,24 @@ the dashboard below tell you what the server thought was happening.
 ## Scraping /metrics into Prometheus
 
 `GET /metrics` is Prometheus text format. Set `VOTPORT_METRICS_TOKEN` on the
-server and give Prometheus the same value as a bearer token:
+server and give Prometheus the same value as a bearer token. Scrape the private
+upstream directly, for example when Prometheus shares votport's container network:
 
 ```yaml
 scrape_configs:
   - job_name: votport
     metrics_path: /metrics
-    scheme: https
+    scheme: http
     authorization:
       type: Bearer
       credentials: <VOTPORT_METRICS_TOKEN value>
     static_configs:
-      - targets: ["drop.example.com:443"]
+      - targets: ["votport:8080"]
 ```
 
-Scrape over an internal interface where you can; the token gates the route
-but the metrics are still counts you may not want on the public path. A 15s
-scrape interval is plenty; the histogram buckets are fixed and cheap.
+The public Caddy examples return 404 for `/metrics`; keep the upstream reachable
+only through trusted internal networking. A 15s scrape interval is plenty;
+the histogram buckets are fixed and cheap.
 
 ## The Grafana dashboard
 

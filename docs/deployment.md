@@ -649,7 +649,9 @@ published uploads (1 MiB through 16 GiB, and 1s through 6h), the
 `votport_disk_total_bytes` per `volume` (`receive`, `outbound`).
 Request metrics never include paths, tenants, addresses,
 methods, or tokens. Set `VOTPORT_METRICS_TOKEN` to require a bearer token, and
-scrape it over an internal interface only.
+scrape the private upstream directly. The public Caddy examples return 404 for
+`/metrics`, including requests with a bearer token. See the
+[Prometheus example](load-testing.md#scraping-metrics-into-prometheus).
 Platform admins can fetch the same per-tenant link and live-byte totals as JSON
 from `GET /api/admin/holdings`.
 
@@ -798,10 +800,13 @@ Layout:
   over once it is up:
 
 ```caddyfile
-reverse_proxy live:8321 standby:8321 {
-	lb_policy first
-	health_uri /healthz
-	health_interval 5s
+drop.example.com {
+	respond /metrics 404
+	reverse_proxy live:8321 standby:8321 {
+		lb_policy first
+		health_uri /healthz
+		health_interval 5s
+	}
 }
 ```
 
