@@ -59,6 +59,10 @@ pub struct DeliveryEvent {
 }
 
 impl DeliveryEvent {
+    fn verify_for(&self, issuer: &str, tenant: &str) -> bool {
+        self.issuer == issuer && self.tenant == tenant && self.id > 0 && self.verify()
+    }
+
     pub fn verify(&self) -> bool {
         use sha2::{Digest, Sha256};
         let document = self.document();
@@ -86,6 +90,138 @@ impl DeliveryEvent {
     pub fn document(&self) -> serde_json::Value {
         serde_json::json!({"id": self.id,"tenant": self.tenant,"grant_id": self.grant_id,"kind": self.kind,"created_at": self.created_at,"payload": self.payload,"previous_hash": self.previous_hash,"issuer": self.issuer})
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventCheckpoint {
+    pub id: u64,
+    pub hash: String,
+}
+
+impl EventCheckpoint {
+    fn of(event: &DeliveryEvent) -> Self {
+        Self {
+            id: event.id,
+            hash: event.hash.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct EventExport {
+    pub format: &'static str,
+    pub issuer: String,
+    pub tenant: String,
+    pub start: EventCheckpoint,
+    pub end: EventCheckpoint,
+    pub terminal: EventCheckpoint,
+    pub complete: bool,
+    pub events: Vec<DeliveryEvent>,
+}
+
+const EVENT_COLUMNS: &str =
+    "id,tenant,grant_id,kind,created_at,payload,previous_hash,hash,issuer,signature";
+pub const MAX_EVENT_PAGE_BYTES: usize = 16 * 1024 * 1024;
+
+fn invalid_chain() -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure("invalid or incomplete delivery event chain".into())
+}
+
+fn event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryEvent> {
+    for column in [1, 2, 3, 5, 6, 7, 8, 9] {
+        if matches!(row.get_ref(column)?, rusqlite::types::ValueRef::Text(bytes) if bytes.len() > MAX_EVENT_PAGE_BYTES)
+        {
+            return Err(invalid_chain());
+        }
+    }
+    let payload: String = row.get(5)?;
+    Ok(DeliveryEvent {
+        id: row.get::<_, i64>(0)? as u64,
+        tenant: row.get(1)?,
+        grant_id: row.get(2)?,
+        kind: row.get(3)?,
+        created_at: row.get::<_, i64>(4)? as u64,
+        payload: serde_json::from_str(&payload).map_err(|_| invalid_chain())?,
+        previous_hash: row.get(6)?,
+        hash: row.get(7)?,
+        issuer: row.get(8)?,
+        signature: row.get(9)?,
+    })
+}
+
+fn predecessor(
+    connection: &Connection,
+    issuer: &str,
+    tenant: &str,
+    through: u64,
+) -> rusqlite::Result<EventCheckpoint> {
+    let event = connection.query_row(&format!("SELECT {EVENT_COLUMNS} FROM delivery_events WHERE tenant=?1 AND id<=?2 ORDER BY id DESC LIMIT 1"), params![tenant, through as i64], event_row).optional()?;
+    match event {
+        Some(event) if event.verify_for(issuer, tenant) => Ok(EventCheckpoint::of(&event)),
+        Some(_) => Err(invalid_chain()),
+        None => Ok(EventCheckpoint::default()),
+    }
+}
+
+fn require_checkpoint(
+    connection: &Connection,
+    issuer: &str,
+    tenant: &str,
+    checkpoint: &EventCheckpoint,
+) -> rusqlite::Result<()> {
+    if checkpoint.id > i64::MAX as u64
+        || predecessor(connection, issuer, tenant, checkpoint.id)? != *checkpoint
+    {
+        return Err(invalid_chain());
+    }
+    Ok(())
+}
+
+fn event_page(
+    connection: &Connection,
+    issuer: &str,
+    tenant: &str,
+    start: &EventCheckpoint,
+    through: u64,
+    limit: usize,
+    byte_budget: usize,
+) -> rusqlite::Result<Vec<DeliveryEvent>> {
+    let mut query = connection.prepare(&format!("SELECT {EVENT_COLUMNS} FROM delivery_events WHERE tenant=?1 AND id>?2 AND id<=?3 ORDER BY id LIMIT ?4"))?;
+    let rows = query.query_map(
+        params![
+            tenant,
+            start.id as i64,
+            through as i64,
+            limit.min(100) as i64
+        ],
+        event_row,
+    )?;
+    let mut previous = start.clone();
+    let mut events = vec![];
+    let mut bytes = 0;
+    for row in rows {
+        let event = row?;
+        if !event.verify_for(issuer, tenant)
+            || event.id <= previous.id
+            || event.previous_hash != previous.hash
+        {
+            return Err(invalid_chain());
+        }
+        bytes += serde_json::to_vec(&event)
+            .map_err(|_| invalid_chain())?
+            .len()
+            + 1;
+        if bytes > byte_budget {
+            if events.is_empty() {
+                return Err(invalid_chain());
+            }
+            break;
+        }
+        previous = EventCheckpoint::of(&event);
+        events.push(event);
+    }
+    Ok(events)
 }
 
 pub(crate) fn delivery_event(
@@ -241,12 +377,399 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<DeliveryEvent>, String> {
         self.with(|connection| {
-            let mut query = connection.prepare("SELECT id,tenant,grant_id,kind,created_at,payload,previous_hash,hash,issuer,signature FROM delivery_events WHERE tenant=?1 AND id>?2 ORDER BY id LIMIT ?3")?;
-            let rows = query.query_map(params![tenant, after as i64, limit.min(100) as i64], |row| {
-                let payload: String = row.get(5)?;
-                Ok(DeliveryEvent { previous_hash: row.get(6)?, hash: row.get(7)?, issuer: row.get(8)?, signature: row.get(9)?, id: row.get::<_,i64>(0)? as u64, tenant: row.get(1)?, grant_id: row.get(2)?, kind: row.get(3)?, created_at: row.get::<_,i64>(4)? as u64, payload: serde_json::from_str(&payload).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))? })
-            })?;
-            rows.collect()
+            if after > i64::MAX as u64 {
+                return Err(invalid_chain());
+            }
+            let start = predecessor(connection, &self.event_signer.public_hex, tenant, after)?;
+            event_page(
+                connection,
+                &self.event_signer.public_hex,
+                tenant,
+                &start,
+                i64::MAX as u64,
+                limit,
+                MAX_EVENT_PAGE_BYTES - 128,
+            )
         })
+    }
+
+    pub fn delivery_event_export(
+        &self,
+        tenant: &str,
+        start: EventCheckpoint,
+        terminal: Option<EventCheckpoint>,
+        limit: usize,
+    ) -> Result<EventExport, String> {
+        self.with(|connection| {
+            let issuer = &self.event_signer.public_hex;
+            if !(1..=100).contains(&limit) {
+                return Err(invalid_chain());
+            }
+            require_checkpoint(connection, issuer, tenant, &start)?;
+            let terminal = match terminal {
+                Some(terminal) => {
+                    require_checkpoint(connection, issuer, tenant, &terminal)?;
+                    terminal
+                }
+                None => predecessor(connection, issuer, tenant, i64::MAX as u64)?,
+            };
+            if start.id > terminal.id {
+                return Err(invalid_chain());
+            }
+            let mut export = EventExport {
+                format: "votport-delivery-events-v1",
+                issuer: issuer.clone(),
+                tenant: tenant.into(),
+                start,
+                end: terminal.clone(),
+                terminal,
+                complete: false,
+                events: vec![],
+            };
+            let envelope_bytes = serde_json::to_vec(&export)
+                .map_err(|_| invalid_chain())?
+                .len();
+            let budget = MAX_EVENT_PAGE_BYTES
+                .checked_sub(envelope_bytes)
+                .ok_or_else(invalid_chain)?;
+            export.events = event_page(
+                connection,
+                issuer,
+                tenant,
+                &export.start,
+                export.terminal.id,
+                limit,
+                budget,
+            )?;
+            export.end = export
+                .events
+                .last()
+                .map_or_else(|| export.start.clone(), EventCheckpoint::of);
+            export.complete = export.end == export.terminal;
+            if !export.complete && export.events.is_empty() {
+                return Err(invalid_chain());
+            }
+            Ok(export)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn append(store: &Store, tenant: &str, index: usize) {
+        let mut connection = store.connection.lock().unwrap();
+        let tx = connection.transaction().unwrap();
+        delivery_event(
+            &tx,
+            &store.event_signer,
+            tenant,
+            "",
+            "fixture",
+            &serde_json::json!({"index":index}),
+            1,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn delivery_events_reject_tampering_before_returning_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        append(&store, "", 1);
+        store
+            .with(|c| c.execute("UPDATE delivery_events SET payload='{}'", []))
+            .unwrap();
+        assert!(store.delivery_events("", 0, 100).is_err());
+    }
+
+    #[test]
+    fn event_exports_keep_checkpoints_across_pages_append_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let tx = connection.transaction().unwrap();
+            for index in 0..205 {
+                for tenant in ["tenant", "other"] {
+                    delivery_event(
+                        &tx,
+                        &store.event_signer,
+                        tenant,
+                        "",
+                        "fixture",
+                        &serde_json::json!({"index":index}),
+                        1,
+                    )
+                    .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        let first = store
+            .delivery_event_export("tenant", EventCheckpoint::default(), None, 100)
+            .unwrap();
+        assert_eq!(store.delivery_events("tenant", 2, 1).unwrap()[0].id, 3);
+        assert_eq!(store.delivery_events("tenant", 4, 1).unwrap()[0].id, 5);
+        assert_eq!(first.events.len(), 100);
+        assert!(!first.complete);
+        assert!(first
+            .events
+            .windows(2)
+            .all(|pair| pair[1].id == pair[0].id + 2));
+        assert!(store
+            .delivery_event_export(
+                "other",
+                first.end.clone(),
+                Some(first.terminal.clone()),
+                100
+            )
+            .is_err());
+        append(&store, "tenant", 206);
+        drop(store);
+        let store = Store::open(directory.path()).unwrap();
+        let second = store
+            .delivery_event_export("tenant", first.end, Some(first.terminal.clone()), 100)
+            .unwrap();
+        assert_eq!(second.events.len(), 100);
+        assert!(!second.complete);
+        let last = store
+            .delivery_event_export("tenant", second.end, Some(first.terminal.clone()), 100)
+            .unwrap();
+        assert_eq!(last.events.len(), 5);
+        assert_eq!(last.end, first.terminal);
+        assert!(last.complete);
+        let empty = store
+            .delivery_event_export("tenant", last.end.clone(), Some(last.terminal.clone()), 100)
+            .unwrap();
+        assert!(empty.complete && empty.events.is_empty());
+        let next = store
+            .delivery_event_export("tenant", last.end, None, 100)
+            .unwrap();
+        assert_eq!(next.events.len(), 1);
+        assert!(next.complete);
+    }
+
+    #[test]
+    fn event_exports_reject_deleted_interior_and_retained_tail() {
+        for removed in [2, 3, 0] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            for index in 1..=3 {
+                append(&store, "", index);
+            }
+            let first = store
+                .delivery_event_export("", EventCheckpoint::default(), None, 1)
+                .unwrap();
+            store
+                .with(|c| c.execute("DELETE FROM delivery_events WHERE id=?1 OR ?1=0", [removed]))
+                .unwrap();
+            drop(store);
+            let store = Store::open(directory.path()).unwrap();
+            assert!(store
+                .delivery_event_export("", first.end, Some(first.terminal.clone()), 100)
+                .is_err());
+            assert!(store
+                .delivery_event_export("", EventCheckpoint::default(), Some(first.terminal), 100)
+                .is_err());
+            if removed != 2 {
+                // A new observation alone cannot reveal a previously removed valid tail.
+                assert!(store
+                    .delivery_event_export("", EventCheckpoint::default(), None, 100)
+                    .is_ok());
+            } else {
+                assert!(store.delivery_events("", 1, 100).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn event_checkpoints_reject_mismatch_and_invalid_ranges() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let empty = store
+            .delivery_event_export("", EventCheckpoint::default(), None, 100)
+            .unwrap();
+        assert!(empty.complete && empty.events.is_empty());
+        append(&store, "", 1);
+        append(&store, "other", 2);
+        append(&store, "", 3);
+        let all = store
+            .delivery_event_export("", EventCheckpoint::default(), None, 100)
+            .unwrap();
+        for point in [
+            EventCheckpoint {
+                id: 0,
+                hash: "not-genesis".into(),
+            },
+            EventCheckpoint {
+                id: 1,
+                hash: "0".repeat(64),
+            },
+            EventCheckpoint {
+                id: 2,
+                hash: all.events[0].hash.clone(),
+            },
+            EventCheckpoint {
+                id: u64::MAX,
+                hash: all.terminal.hash.clone(),
+            },
+        ] {
+            assert!(store
+                .delivery_event_export("", point.clone(), None, 100)
+                .is_err());
+            assert!(store
+                .delivery_event_export("", EventCheckpoint::default(), Some(point), 100)
+                .is_err());
+        }
+        assert!(store
+            .delivery_event_export(
+                "",
+                all.terminal,
+                Some(EventCheckpoint::of(&all.events[0])),
+                100
+            )
+            .is_err());
+        for limit in [0, 101] {
+            assert!(store
+                .delivery_event_export("", EventCheckpoint::default(), None, limit)
+                .is_err());
+        }
+        assert!(store.delivery_events("", u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn ordinary_appends_do_not_authenticate_a_corrupt_predecessor() {
+        for foreign_key in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let foreign = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            append(&store, "", 0);
+            let trusted = store
+                .delivery_event_export("", EventCheckpoint::default(), None, 100)
+                .unwrap()
+                .terminal;
+            let signer = crate::receipt::ReceiptSigner::load_or_create(foreign.path()).unwrap();
+            {
+                let mut connection = store.connection.lock().unwrap();
+                let tx = connection.transaction().unwrap();
+                delivery_event(
+                    &tx,
+                    if foreign_key {
+                        &signer
+                    } else {
+                        &store.event_signer
+                    },
+                    "",
+                    "",
+                    "fixture",
+                    &serde_json::json!({"original": true}),
+                    1,
+                )
+                .unwrap();
+                if !foreign_key {
+                    tx.execute(
+                        "UPDATE delivery_events SET payload='{}' WHERE id=?1",
+                        [tx.last_insert_rowid()],
+                    )
+                    .unwrap();
+                }
+                tx.commit().unwrap();
+            }
+            assert!(store.delivery_events("", trusted.id, 100).is_err());
+            let project = store
+                .save_delivery_project("", "local", crate::workflow::tests::project())
+                .unwrap();
+            let now = now_unix();
+            let mut request = crate::workflow::tests::request();
+            request.deadline = Some(now + 60);
+            let job = store
+                .enqueue_delivery_job("", "local", 1, None, project, request)
+                .unwrap();
+            assert_eq!(
+                store.claim_delivery_job("worker", now).unwrap().unwrap().id,
+                job.id
+            );
+            store.escalate_delivery_jobs(now + 120).unwrap();
+            let last = store
+                .with(|c| {
+                    c.query_row(
+                        &format!(
+                            "SELECT {EVENT_COLUMNS} FROM delivery_events ORDER BY id DESC LIMIT 1"
+                        ),
+                        [],
+                        event_row,
+                    )
+                })
+                .unwrap();
+            assert_eq!(last.kind, "delivery_deadline_missed");
+            assert!(last.verify_for(&store.event_signer.public_hex, ""));
+            let terminal = EventCheckpoint::of(&last);
+            for start in [EventCheckpoint::default(), trusted] {
+                assert!(store
+                    .delivery_event_export("", start, Some(terminal.clone()), 100)
+                    .is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn event_append_rollback_leaves_previous_checkpoint_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        append(&store, "", 1);
+        let before = store
+            .delivery_event_export("", EventCheckpoint::default(), None, 100)
+            .unwrap();
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let tx = connection.transaction().unwrap();
+            delivery_event(
+                &tx,
+                &store.event_signer,
+                "",
+                "",
+                "fixture",
+                &serde_json::json!({}),
+                1,
+            )
+            .unwrap();
+        }
+        drop(store);
+        let store = Store::open(directory.path()).unwrap();
+        let after = store
+            .delivery_event_export("", EventCheckpoint::default(), Some(before.terminal), 100)
+            .unwrap();
+        assert_eq!(after.events.len(), 1);
+        append(&store, "", 2);
+        assert_eq!(store.delivery_events("", 0, 100).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn event_export_bounds_encoded_page_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let tx = connection.transaction().unwrap();
+            let payload = serde_json::json!({"text":"x".repeat(MAX_EVENT_PAGE_BYTES / 2)});
+            for _ in 0..2 {
+                delivery_event(&tx, &store.event_signer, "", "", "fixture", &payload, 1).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let first = store
+            .delivery_event_export("", EventCheckpoint::default(), None, 100)
+            .unwrap();
+        assert_eq!(first.events.len(), 1);
+        assert!(serde_json::to_vec(&first).unwrap().len() <= MAX_EVENT_PAGE_BYTES);
+        let last = store
+            .delivery_event_export("", first.end, Some(first.terminal), 100)
+            .unwrap();
+        assert!(last.complete);
+        assert_eq!(last.events.len(), 1);
+        assert!(serde_json::to_vec(&last).unwrap().len() <= MAX_EVENT_PAGE_BYTES);
     }
 }

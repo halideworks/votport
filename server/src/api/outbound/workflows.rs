@@ -530,9 +530,66 @@ pub async fn events(
     }
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({"events": visible,"next": next})),
+        Json(json!({"events": visible,"next": next,"complete_chain": false})),
     )
         .into_response())
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventExportPage {
+    after: Option<u64>,
+    after_hash: Option<String>,
+    through: Option<u64>,
+    through_hash: Option<String>,
+    limit: Option<usize>,
+}
+
+pub async fn export_events(
+    State(app): State<Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    Query(page): Query<EventExportPage>,
+) -> ApiResult<Response> {
+    let actor = actor(&app, &headers, peer, "jobs:read", false)?;
+    if actor.token.is_some() || actor.identity.role != "admin" {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "tenant administrator required for complete event exports",
+        ));
+    }
+    let checkpoint = |id: Option<u64>, hash: Option<String>| match (id, hash) {
+        (None, None) => Ok(None),
+        (Some(id), Some(hash))
+            if id <= i64::MAX as u64
+                && ((id == 0 && hash.is_empty())
+                    || (id > 0
+                        && hash.len() == 64
+                        && hash.bytes().all(|byte| {
+                            byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                        }))) =>
+        {
+            Ok(Some(crate::store::EventCheckpoint { id, hash }))
+        }
+        _ => Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "event checkpoint requires a matching ID and hash",
+        )),
+    };
+    let start = checkpoint(page.after, page.after_hash)?.unwrap_or_default();
+    let terminal = checkpoint(page.through, page.through_hash)?;
+    let limit = page.limit.unwrap_or(100);
+    if !(1..=100).contains(&limit) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid event page",
+        ));
+    }
+    let export = app
+        .store
+        .delivery_event_export(&actor.identity.tenant, start, terminal, limit)
+        .map_err(conflict)?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(export)).into_response())
 }
 
 pub async fn worker(app: Arc<App>) {
@@ -1351,15 +1408,23 @@ async fn dispatch_events(app: &App, client: &reqwest::Client) -> Result<(), Stri
         else {
             continue;
         };
-        let event = app
-            .store
-            .delivery_events(&attempt.tenant, attempt.event_id.saturating_sub(1), 1)?
-            .into_iter()
-            .find(|event| event.id == attempt.event_id);
-        let Some(event) = event.filter(|event| event.verify()) else {
+        let event = match app.store.delivery_events(
+            &attempt.tenant,
+            attempt.event_id.saturating_sub(1),
+            1,
+        ) {
+            Ok(events) => events
+                .into_iter()
+                .find(|event| event.id == attempt.event_id),
+            Err(error) => {
+                tracing::error!(%error, tenant=%attempt.tenant, event_id=attempt.event_id, "read delivery webhook event");
+                None
+            }
+        };
+        let Some(event) = event else {
             app.store.finish_delivery_webhook(
                 &attempt,
-                Some("event missing or signature invalid"),
+                Some("event missing or chain invalid"),
                 now_unix(),
             )?;
             continue;
@@ -1524,6 +1589,293 @@ mod tests {
                 &app.config.admin_token_tag
             )
         )
+    }
+
+    #[tokio::test]
+    async fn invalid_event_chain_does_not_starve_other_webhook_tenants() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        app.store
+            .insert_tenant(crate::store::tests::test_tenant("healthy"))
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/events", listener.local_addr().unwrap());
+        app.store
+            .save_delivery_webhook("", "local", &url, true, 0)
+            .unwrap();
+        app.store
+            .save_delivery_webhook("healthy", "local", &url, true, 0)
+            .unwrap();
+        app.store
+            .with(|c| {
+                c.execute(
+                    "UPDATE delivery_events SET payload='{}' WHERE tenant=''",
+                    [],
+                )
+            })
+            .unwrap();
+        let received = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let recorded = Arc::clone(&received);
+        let sink = axum::Router::new().route(
+            "/events",
+            axum::routing::post(move |Json(event): Json<serde_json::Value>| {
+                recorded.lock().unwrap().push(event);
+                async { (StatusCode::NO_CONTENT, [(header::CONNECTION, "close")]) }
+            }),
+        );
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let (served, dispatched) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                async {
+                    axum::serve(listener, sink)
+                        .with_graceful_shutdown(async {
+                            let _ = stopped.await;
+                        })
+                        .await
+                },
+                async {
+                    let result = dispatch_events(&app, &client).await;
+                    let _ = stop.send(());
+                    result
+                }
+            )
+        })
+        .await
+        .unwrap();
+        served.unwrap();
+        dispatched.unwrap();
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["tenant"], "healthy");
+        let failed = app.store.delivery_webhook_attempts("", 0, 100).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].attempts, 1);
+        assert_eq!(
+            failed[0].error.as_deref(),
+            Some("event missing or chain invalid")
+        );
+        let delivered = app
+            .store
+            .delivery_webhook_attempts("healthy", 0, 100)
+            .unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].status, "delivered");
+    }
+
+    #[tokio::test]
+    async fn event_exports_require_admin_and_verify_hidden_activity() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let cookie = admin_cookie(&app);
+        let mut private = crate::workflow::tests::project();
+        private.id = "private".into();
+        private.directory = "private".into();
+        private.members.clear();
+        app.store
+            .save_delivery_project("", "local", private)
+            .unwrap();
+        app.store
+            .save_delivery_project("", "local", crate::workflow::tests::project())
+            .unwrap();
+        let mut identity = auth::AdminIdentity::local_admin();
+        identity.subject = "observer".into();
+        identity.role = "operator".into();
+        identity.grants[0].role = "operator".into();
+        let viewer = format!(
+            "votport_admin={}",
+            auth::issue_admin_token(&app.secret, &identity, &app.config.admin_token_tag)
+        );
+        let path = "/api/workflows/events/export";
+        assert_eq!(
+            call(&app, Method::GET, path, None, None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(&app, Method::GET, path, Some(&viewer), None).await.0,
+            StatusCode::FORBIDDEN
+        );
+        let raw = auth::random_token();
+        app.store
+            .insert_automation_token(AutomationToken {
+                id: auth::random_token(),
+                token_hash: hash_token(&raw),
+                tenant: String::new(),
+                label: "events".into(),
+                directory: None,
+                permissions: vec!["jobs:read".into()],
+                created_at: now_unix(),
+                expires_at: now_unix() + 3600,
+                revoked_at: None,
+                last_used_at: None,
+            })
+            .unwrap();
+        let request = Request::builder()
+            .uri(path)
+            .extension(ConnectInfo(
+                "127.0.0.1:34567".parse::<std::net::SocketAddr>().unwrap(),
+            ))
+            .header(header::COOKIE, &cookie)
+            .header(header::AUTHORIZATION, format!("Bearer {raw}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            crate::app::router(Arc::clone(&app))
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let (status, _, body) = call(
+            &app,
+            Method::GET,
+            "/api/workflows/events?limit=1",
+            Some(&viewer),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let hidden: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(hidden["events"], json!([]));
+        assert_eq!(hidden["next"], 1);
+        assert_eq!(hidden["complete_chain"], false);
+        let (_, _, body) = call(
+            &app,
+            Method::GET,
+            "/api/workflows/events?after=1&limit=1",
+            Some(&viewer),
+            None,
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let (status, headers, body) = call(&app, Method::GET, path, Some(&cookie), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        let export: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(export["events"].as_array().unwrap().len(), 2);
+        assert_eq!(export["tenant"], "");
+        assert_eq!(export["issuer"], app.signer.public_hex);
+        assert_eq!(export["start"], json!({"id":0,"hash":""}));
+        assert_eq!(export["end"], export["terminal"]);
+        assert_eq!(export["complete"], true);
+        app.store
+            .with(|c| c.execute("UPDATE delivery_events SET payload='{}' WHERE id=1", []))
+            .unwrap();
+        assert_eq!(
+            call(
+                &app,
+                Method::GET,
+                "/api/workflows/events?limit=1",
+                Some(&viewer),
+                None
+            )
+            .await
+            .0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            call(&app, Method::GET, path, Some(&cookie), None).await.0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn event_export_http_pages_enforce_frozen_endpoints() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let cookie = admin_cookie(&app);
+        let project = app
+            .store
+            .save_delivery_project("", "local", crate::workflow::tests::project())
+            .unwrap();
+        let project = app
+            .store
+            .save_delivery_project("", "local", project)
+            .unwrap();
+        let (status, _, body) = call(
+            &app,
+            Method::GET,
+            "/api/workflows/events/export?limit=1",
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let first: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(first["complete"], false);
+        let after = first["end"]["id"].as_u64().unwrap();
+        let hash = first["end"]["hash"].as_str().unwrap();
+        let through = first["terminal"]["id"].as_u64().unwrap();
+        let terminal_hash = first["terminal"]["hash"].as_str().unwrap();
+        app.store
+            .save_delivery_project("", "local", project)
+            .unwrap();
+        let path = format!("/api/workflows/events/export?after={after}&after_hash={hash}&through={through}&through_hash={terminal_hash}&limit=1");
+        let (status, _, body) = call(&app, Method::GET, &path, Some(&cookie), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let last: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(last["events"].as_array().unwrap().len(), 1);
+        assert_eq!(last["terminal"], first["terminal"]);
+        assert_eq!(last["complete"], true);
+        for query in [
+            "after=1",
+            "after_hash=bad",
+            "through=1",
+            "through_hash=bad",
+            "after=0&after_hash=bad",
+            "after=18446744073709551615&after_hash=bad",
+            "limit=0",
+            "limit=101",
+        ] {
+            assert_eq!(
+                call(
+                    &app,
+                    Method::GET,
+                    &format!("/api/workflows/events/export?{query}"),
+                    Some(&cookie),
+                    None
+                )
+                .await
+                .0,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{query}"
+            );
+        }
+        assert_eq!(
+            call(
+                &app,
+                Method::GET,
+                "/api/workflows/events/export?project=private",
+                Some(&cookie),
+                None
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        let wrong = path.replace(terminal_hash, &"0".repeat(64));
+        assert_eq!(
+            call(&app, Method::GET, &wrong, Some(&cookie), None).await.0,
+            StatusCode::CONFLICT
+        );
+        app.store
+            .with(|c| c.execute("DELETE FROM delivery_events WHERE id>=?1", [through as i64]))
+            .unwrap();
+        assert_eq!(
+            call(&app, Method::GET, &path, Some(&cookie), None).await.0,
+            StatusCode::CONFLICT
+        );
     }
 
     #[tokio::test]

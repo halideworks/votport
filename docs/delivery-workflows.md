@@ -309,10 +309,34 @@ evidence and events remain. Tenant deletion removes that tenant's records.
 ## Events, webhooks and MAM integration
 
 `GET /api/workflows/events` returns paginated signed events visible to the caller.
-Each includes the previous event hash for its tenant. Verify signatures against
-a separately trusted server receipt public key. A complete tenant chain can be
-checked for missing or reordered records; a project-filtered page may contain
-intentional gaps.
+Each includes the previous event hash for its tenant. The server verifies the
+unfiltered page against its receipt key and predecessor before applying access
+rules. Activity responses and browser exports carry `complete_chain: false`:
+they can omit other projects and are not complete chain proofs.
+
+Human tenant administrators can use `GET /api/workflows/events/export` for full
+tenant records. Each page includes `issuer`, `tenant`, `start`, `end`, `terminal`,
+`complete` and `events`. A checkpoint is `{ "id": number, "hash": string }`;
+genesis is `{ "id": 0, "hash": "" }`. Pages contain at most 100 events and
+16 MiB of compact JSON, including the envelope. A smaller page can be returned
+to stay within the byte limit; follow `complete`, not the event count.
+
+The initial request starts at genesis and captures a terminal checkpoint. Save
+that checkpoint separately. Continue with `after=<end.id>&after_hash=<end.hash>`
+and the unchanged `through=<terminal.id>&through_hash=<terminal.hash>`; `limit`
+defaults to 100 and accepts 1 through 100. Both checkpoint fields are required
+together. A retained start or terminal must still match the stored row, even
+for an empty page. Concurrent appends beyond `through` do not extend the export.
+Exporting a suffix requires its independently retained start checkpoint.
+
+The first terminal capture establishes trust; it cannot reveal a valid tail
+removed before that observation. Reusing a retained terminal detects later
+truncation or rollback. Store checkpoints outside the server database and its
+backups. A restore behind one must fail verification rather than silently
+replacing it. Appending records the previous hash without certifying earlier
+history. Read and export verification rejects invalid records and broken links;
+a later valid signature does not repair them. The server keeps no independent
+durable head and does not automatically detect rollback or quarantine writes.
 
 The administrator webhook sends the signed event JSON with:
 
@@ -342,12 +366,30 @@ node examples/delivery-event-receiver.mjs
 ```
 
 Consume the archived events from your MAM integration using job IDs to query
-metadata, manifests, checks and recipient evidence. To verify an exported event
-array, use the same issuer and run:
+metadata, manifests, checks and recipient evidence. Save each compact export
+page as one line in `pages.ndjson`, in order. Capture the first page with:
 
 ```sh
-node examples/delivery-event-receiver.mjs verify events.json [previous-hash]
+curl --fail --cookie "$VOTPORT_ADMIN_COOKIE" --write-out '\n' \
+  "$VOTPORT_URL/api/workflows/events/export?limit=100" > pages.ndjson
 ```
+
+Append subsequent pages using the checkpoints above and `>> pages.ndjson`.
+Verify against a separately trusted receipt public key, tenant and retained
+terminal, rather than taking those trust parameters from the file being checked:
+
+```sh
+VOTPORT_EVENT_ISSUER='<trusted server receipt public key>' \
+node examples/delivery-event-receiver.mjs verify pages.ndjson '<tenant>' \
+  '<terminal-id>' '<terminal-hash>'
+```
+
+Use `''` for the default tenant. For a suffix, append the retained start ID and
+hash as two arguments. The verifier reads at most one 16 MiB page at a
+time, checks issuer, tenant, increasing IDs and hash linkage, and refuses missing,
+reordered or truncated pages, including an empty file. IDs can have gaps because
+other tenants share the global sequence. A valid empty log still needs its
+complete genesis page and the explicitly expected `0` / empty-hash endpoint.
 
 Signatures and chaining detect edits relative to a trusted key and checkpoint.
 A local database and a signing key controlled by the same administrator are not

@@ -160,7 +160,7 @@ try {
   await page.waitForFunction(() => document.querySelectorAll('#workflow-events .event-row').length === 2);
   await page.click('#workflow-events-next'); await page.getByRole('button', { name: 'Check for new activity' }).waitFor();
   const download = page.waitForEvent('download'); await page.click('#workflow-events-export');
-  assert.deepEqual(JSON.parse(await fs.readFile(await (await download).path(), 'utf8')), records);
+  assert.deepEqual(JSON.parse(await fs.readFile(await (await download).path(), 'utf8')), { complete_chain: false, events: records });
 
   await page.locator('#nav .nav-more > summary').click();
   await page.getByRole('link', { name: 'Storage', exact: true }).click();

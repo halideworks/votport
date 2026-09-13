@@ -1,7 +1,8 @@
 // Persist authenticated delivery events before acknowledging them to Votport.
 import { createHash, createHmac, createPublicKey, randomUUID, timingSafeEqual, verify } from 'node:crypto';
 import { createServer } from 'node:http';
-import { open, readFile, rename, rm } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { open, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -35,19 +36,69 @@ export function verifyWebhook(body, headers, secret, issuer, now = Math.floor(Da
   return String(event.id) === headers['x-votport-event-id'] && verifyEvent(event, issuer);
 }
 
-export function verifyChain(events, issuer, previousHash = '') {
+function checkpoint(value) {
+  if (!value || !Number.isSafeInteger(value.id) || value.id < 0 || (value.id === 0 ? value.hash !== '' : !/^[0-9a-f]{64}$/.test(value.hash))) throw new Error('Invalid event checkpoint');
+  return value;
+}
+
+function sameCheckpoint(left, right) {
+  return left.id === right.id && left.hash === right.hash;
+}
+
+export function verifyChain(events, issuer, tenant, start, terminal) {
+  checkpoint(start); checkpoint(terminal);
+  if (!/^[0-9a-f]{64}$/.test(issuer) || !Array.isArray(events) || events.length > 100 || typeof tenant !== 'string') throw new Error('Invalid event page');
+  let previous = start;
   for (const event of events) {
-    if (!verifyEvent(event, issuer) || event.previous_hash !== previousHash) throw new Error(`Invalid or incomplete event chain at ${event.id}`);
-    previousHash = event.hash;
+    if (!Number.isSafeInteger(event.id) || event.id <= previous.id || event.tenant !== tenant || !verifyEvent(event, issuer) || event.previous_hash !== previous.hash) throw new Error(`Invalid or incomplete event chain at ${event.id}`);
+    previous = { id: event.id, hash: event.hash };
   }
-  return previousHash;
+  if (!sameCheckpoint(previous, terminal)) throw new Error('Expected terminal event checkpoint was not reached');
+  return previous;
+}
+
+export async function verifyExport(source, issuer, tenant, start, terminal) {
+  checkpoint(start); checkpoint(terminal);
+  if (!/^[0-9a-f]{64}$/.test(issuer) || typeof tenant !== 'string' || start.id > terminal.id) throw new Error('Invalid export trust parameters');
+  let previous = start, complete = false, pages = 0, parts = [], length = 0;
+  function page(bytes) {
+    const value = JSON.parse(bytes.toString('utf8'));
+    if (complete || value.format !== 'votport-delivery-events-v1' || value.issuer !== issuer || value.tenant !== tenant || !sameCheckpoint(checkpoint(value.start), previous) || !sameCheckpoint(checkpoint(value.terminal), terminal)) throw new Error('Event export page does not match the expected checkpoints');
+    previous = verifyChain(value.events, issuer, tenant, previous, value.end);
+    if (previous.id > terminal.id || value.complete !== sameCheckpoint(previous, terminal) || (!value.complete && value.events.length === 0)) throw new Error('Invalid event export completion');
+    complete = value.complete;
+    pages++;
+  }
+  for await (const chunk of source) {
+    const bytes = Buffer.from(chunk);
+    let start = 0;
+    while (start < bytes.length) {
+      const newline = bytes.indexOf(10, start);
+      const end = newline < 0 ? bytes.length : newline;
+      const part = bytes.subarray(start, end);
+      length += part.length;
+      if (length > 16 * 1024 * 1024) throw new Error('Event export page exceeds 16 MiB');
+      parts.push(part);
+      if (newline >= 0) {
+        page(Buffer.concat(parts, length));
+        parts = []; length = 0;
+      }
+      start = end + 1;
+    }
+  }
+  if (length) page(Buffer.concat(parts, length));
+  if (!pages || !complete || !sameCheckpoint(previous, terminal)) throw new Error('Expected terminal event checkpoint was not reached');
+  return previous;
 }
 
 async function main() {
   const issuer = process.env.VOTPORT_EVENT_ISSUER;
   if (process.argv[2] === 'verify') {
-    const events = JSON.parse(await readFile(process.argv[3], 'utf8'));
-    console.log(verifyChain(events, issuer, process.argv[4] || ''));
+    const args = process.argv.slice(3);
+    if (args.length !== 4 && args.length !== 6) throw new Error('verify requires <pages.ndjson> <tenant> <terminal-id> <terminal-hash> [<start-id> <start-hash>]');
+    const [file, tenant, id, hash, startId = '0', startHash = ''] = args;
+    const result = await verifyExport(createReadStream(file, { highWaterMark: 64 * 1024 }), issuer, tenant, { id: Number(startId), hash: startHash }, { id: Number(id), hash });
+    console.log(JSON.stringify(result));
     return;
   }
   const secret = process.env.VOTPORT_WEBHOOK_SECRET;
