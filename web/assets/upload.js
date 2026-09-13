@@ -1072,7 +1072,6 @@ async function runUpload() {
     }
   }
 
-  setPhase('Preparing');
   $('progress-note').textContent = 'verifying files locally';
   setMeter(0);
 
@@ -1109,6 +1108,7 @@ function showDone(report) {
   const bytes = report.files.reduce((sum, file) => sum + file.bytes, 0);
   const at = new Date().toLocaleString();
   const count = report.files.length;
+  $('upload-status').textContent = `${count} file${count === 1 ? '' : 's'} shipped and verified.`;
   deliveredPaths = new Set(report.files.map((file) => file.path));
   const visible = Math.min(count, MAX_VISIBLE_FILE_ROWS);
   const preview = count > visible
@@ -1255,6 +1255,9 @@ $('upload-form').addEventListener('submit', async (event) => {
   controller = new AbortController();
   startWorkers();
   keepAwake();
+  setPhase('Preparing');
+  if (document.activeElement === $('send')) $('cancel').focus();
+  $('upload-status').textContent = '';
   $('send').disabled = true;
   $('clear-files').disabled = true;
   $('upload-error').hidden = true;
