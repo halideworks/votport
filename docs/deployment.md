@@ -53,8 +53,14 @@ payload snapshot.
 File and folder components ending in `.vot-receipt` are reserved for signed
 receipts, including portable case and Unicode aliases. Uploads, receive
 destinations and shared payload names reject them before new transfer work.
-Generated receipt downloads and verification remain available; existing damaged
-payload/receipt pairs require separate recovery.
+Generated receipt downloads and verification remain available. Recovery reuses
+an existing receipt only when its signature, object and publication identity
+match. Existing damaged payload/receipt pairs require separate recovery.
+
+Payload filenames may use at most 243 UTF-8 bytes so the signed receipt's
+`.vot-receipt` suffix fits the filesystem's 255-byte component limit. Parent
+directories may still use 255 bytes. A collision that would exceed the filename
+budget is refused with a shorten-name error; names are never truncated.
 
 HTTP and native uploads reserve final filenames together when their manifests
 are admitted. Reservations include unfinished sessions retained across restart

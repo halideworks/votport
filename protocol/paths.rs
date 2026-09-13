@@ -1,3 +1,15 @@
+pub(crate) const MAX_PAYLOAD_NAME_BYTES: usize = 255 - ".vot-receipt".len();
+
+pub(crate) fn check_payload_name_length(name: &str) -> Result<(), String> {
+    if name.len() <= MAX_PAYLOAD_NAME_BYTES {
+        Ok(())
+    } else {
+        Err(format!(
+            "filename {name:?} exceeds {MAX_PAYLOAD_NAME_BYTES} UTF-8 bytes; shorten it to leave room for its signed receipt"
+        ))
+    }
+}
+
 pub(crate) fn is_receipt_name(component: &str) -> bool {
     let Some((_, extension)) = component.trim_end_matches(['.', ' ']).rsplit_once('.') else {
         return false;
@@ -15,7 +27,23 @@ pub(crate) fn is_receipt_name(component: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_receipt_name;
+    use super::{check_payload_name_length, is_receipt_name};
+
+    #[test]
+    fn payload_name_length_counts_utf8_bytes() {
+        for name in ["a".repeat(242), "a".repeat(243), "ア".repeat(81)] {
+            assert!(check_payload_name_length(&name).is_ok(), "{name:?}");
+        }
+        for name in [
+            "a".repeat(244),
+            format!("{}a", "ア".repeat(81)),
+            "ア".repeat(82),
+        ] {
+            let error = check_payload_name_length(&name).unwrap_err();
+            assert!(error.contains("243 UTF-8 bytes; shorten"));
+            assert!(error.contains(&format!("{name:?}")));
+        }
+    }
 
     #[test]
     fn receipt_names_follow_portable_aliases() {

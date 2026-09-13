@@ -216,12 +216,12 @@ async fn start_server_in(
 }
 
 struct ClientFile {
-    path: Vec<&'static str>,
+    path: Vec<String>,
     bytes: Vec<u8>,
     prepared: InMemoryPreparedObject,
 }
 
-fn prepare(path: Vec<&'static str>, bytes: Vec<u8>) -> ClientFile {
+fn prepare(path: Vec<&str>, bytes: Vec<u8>) -> ClientFile {
     let mut builder = InMemoryObjectBuilder::new(
         Suite::Blake3Bao64,
         Some(bytes.len() as u64),
@@ -230,7 +230,7 @@ fn prepare(path: Vec<&'static str>, bytes: Vec<u8>) -> ClientFile {
     .expect("builder");
     builder.update(&bytes).expect("update");
     ClientFile {
-        path,
+        path: path.into_iter().map(str::to_owned).collect(),
         bytes,
         prepared: builder.finish().expect("finish"),
     }
@@ -242,11 +242,8 @@ fn build_package(files: &[ClientFile]) -> (Value, Vec<Vec<u8>>, Vec<u8>) {
     let mut builder = PackageBuilder::new().expect("package builder");
     let mut drafts = Vec::new();
     for file in files {
-        let entry = PackageEntry::direct(
-            file.path.iter().map(|s| (*s).to_owned()).collect(),
-            file.prepared.object_id(),
-        )
-        .expect("entry");
+        let entry =
+            PackageEntry::direct(file.path.clone(), file.prepared.object_id()).expect("entry");
         if let Some(draft) = builder.push(&entry).expect("push") {
             drafts.push(draft);
         }
@@ -1420,6 +1417,27 @@ async fn receipt_names_are_refused_before_publication() {
             .receive_dir
             .join(reserved.split('/').next().unwrap())
             .exists());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_payload_names_are_refused_before_staging() {
+    let server = start_server().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let parent = "p".repeat(255);
+    for name in ["a".repeat(244), format!("{}a", "ア".repeat(81))] {
+        let files = [prepare(vec![&parent, &name], b"payload".to_vec())];
+        let (_, session) = open_session(&client, &server.base, "filename budget", &files).await;
+        let (status, body) = begin(&client, &server.base, &session).await;
+        assert_eq!(status, 422, "{body}");
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("243 UTF-8 bytes; shorten"));
+        assert!(!server.receive_dir.join(&parent).exists());
     }
 }
 

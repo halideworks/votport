@@ -177,6 +177,24 @@ for (const name of ["report.pdf.vot-receipt", "report.VOT-RECEIPT", "report.vot-
 }
 console.log("Receipt filenames are refused before browser selection: ok");
 
+for (const name of ["a".repeat(244), "ア".repeat(81) + "a"]) {
+  await page.setInputFiles("#file-input", { name, mimeType: "application/octet-stream", buffer: Buffer.from("x") });
+  const error = page.locator("#upload-error");
+  if (!(await error.isVisible()) || !(await error.textContent()).includes("243 UTF-8 bytes; shorten")) {
+    throw new Error(`oversized payload filename was not refused: ${name}`);
+  }
+  if (await page.locator("#file-list > li").count() !== 0 || !(await page.locator("#send").isDisabled())) {
+    throw new Error("an oversized filename changed the selection");
+  }
+}
+for (const name of ["a".repeat(243), "ア".repeat(81)]) {
+  await page.setInputFiles("#file-input", { name, mimeType: "application/octet-stream", buffer: Buffer.from("x") });
+  if (await page.locator("#upload-error").isVisible() || await page.locator("#file-list > li").count() !== 1 || await page.locator("#send").isDisabled()) {
+    throw new Error(`243-byte payload filename was not admitted: ${name}`);
+  }
+  await page.click("#clear-files");
+}
+
 const previewFiles = Array.from({ length: 100_000 }, (_, index) => ({
   name: `preview-${String(index).padStart(6, "0")}.exr`,
   mimeType: "application/octet-stream",
@@ -453,6 +471,24 @@ if (!pdfId || `${verdict.suite}:${verdict.root}` !== pdfId) {
 }
 console.log("verified:", pdfId);
 
+const links = await (await page.request.get(`${base}/api/admin/links`)).json();
+const receivedLink = links.links.find((link) => link.url === linkUrl);
+const receivedUpload = receivedLink.uploads.find((upload) => upload.files.some((file) => file.path === "Résumé Draft.pdf"));
+const receiptShare = await page.request.post(`${base}/api/admin/outbound-grants`, {
+  headers: { "X-Votport": "1" },
+  data: { link_id: receivedLink.id, upload_id: receivedUpload.id, file_index: receivedUpload.files.findIndex((file) => file.path === "Résumé Draft.pdf") },
+});
+if (!receiptShare.ok()) throw new Error(`received-file share: ${receiptShare.status()} ${await receiptShare.text()}`);
+await page.goto((await receiptShare.json()).url);
+await page.getByRole("button", { name: "Download file: Résumé Draft.pdf", exact: true }).waitFor();
+const [receiptDownload] = await collectDownloads(
+  () => page.getByRole("button", { name: "Download receipt: Résumé Draft.pdf", exact: true }).click(), 1,
+);
+if (!fs.readFileSync(await receiptDownload.path()).equals(fs.readFileSync(path.join(receiveDir, dest, sidecarName)))) {
+  throw new Error("receipt button returned different evidence");
+}
+console.log("received-file and receipt buttons expose filename-specific names: ok");
+
 // The /verify page itself: slot UI, sidecar-only, full match, mismatch.
 const stored = path.join(receiveDir, dest);
 const payloadPath = path.join(stored, "Résumé Draft.pdf");
@@ -690,6 +726,9 @@ console.log("outbound link:", outboundUrl);
 
 await page.goto(outboundUrl);
 await page.waitForSelector("#download-content:not([hidden])", { timeout: 30000 });
+for (const file of outboundFiles) {
+  await page.getByRole("button", { name: `Download file: ${PROJECT}/${file.name}`, exact: true }).waitFor();
+}
 if (await page.$eval("#bundle-download", (el) => el.hidden)) {
   throw new Error("bundle download action is missing");
 }
@@ -709,33 +748,32 @@ const streamedBatch = await page.evaluate(async (names) => {
     credentials: "same-origin",
   }).then((response) => response.json());
   const { saveBatchFiles } = await import("/assets/outbound-download.js");
-  const files = new Map();
-  const directory = {
-    async getFileHandle(name) {
-      return {
-        async createWritable() {
-          const chunks = [];
-          return {
-            async write(chunk) { chunks.push(new Uint8Array(chunk)); },
-            async close() {
-              const bytes = new Uint8Array(chunks.reduce((size, chunk) => size + chunk.length, 0));
-              let offset = 0;
-              for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-              files.set(name, new TextDecoder().decode(bytes));
-            },
-            async abort() { chunks.length = 0; },
-          };
-        },
-      };
-    },
-  };
-  await saveBatchFiles(
-    await fetch(metadata.batch_url, { credentials: "same-origin" }),
-    directory,
-    metadata.files,
-    names,
-  );
-  return Object.fromEntries(files);
+  const root = await navigator.storage.getDirectory();
+  const folder = `download-collisions-${Date.now()}`;
+  const directory = await root.getDirectoryHandle(folder, { create: true });
+  try {
+    const existing = await directory.getFileHandle(names[0], { create: true });
+    const writable = await existing.createWritable();
+    await writable.write("keep original");
+    await writable.close();
+    await directory.getDirectoryHandle(names[1], { create: true });
+    await saveBatchFiles(
+      await fetch(metadata.batch_url, { credentials: "same-origin" }),
+      directory,
+      metadata.files,
+      names,
+    );
+    if (await (await existing.getFile()).text() !== "keep original") throw new Error("batch replaced an existing file");
+    await directory.getDirectoryHandle(names[1]);
+    const files = {};
+    for (const [index, name] of names.entries()) {
+      const storedName = index < 2 ? name.replace(/(\.[^.]*)?$/, " (2)$1") : name;
+      files[name] = await (await (await directory.getFileHandle(storedName)).getFile()).text();
+    }
+    return files;
+  } finally {
+    await root.removeEntry(folder, { recursive: true });
+  }
 }, outboundFiles.map((file) => file.name));
 if (Object.keys(streamedBatch).length !== outboundFiles.length ||
     outboundFiles.some((file) => streamedBatch[file.name] !== file.content)) {

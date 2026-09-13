@@ -1311,6 +1311,11 @@ fn restore_files(
     if persisted.committed_upload_id.is_some() {
         return Err("completed upload cannot resume receiving".into());
     }
+    for file in &persisted.files {
+        crate::protocol_paths::check_payload_name_length(
+            file.stored_components.last().map_or("", String::as_str),
+        )?;
+    }
     if setup
         .dest_rel
         .split('/')
@@ -1529,6 +1534,13 @@ fn find_delivered(
         if rel.split('/').any(crate::protocol_paths::is_receipt_name) {
             continue;
         }
+        if crate::protocol_paths::check_payload_name_length(
+            rel.rsplit('/').next().unwrap_or_default(),
+        )
+        .is_err()
+        {
+            continue;
+        }
         let components: Vec<String> = rel.split('/').map(str::to_owned).collect();
         let Ok(path) = paths::join_under(&setup.dest_dir, &components) else {
             continue;
@@ -1595,6 +1607,12 @@ fn prepare_files<'a>(
     delivered: &HashMap<(&str, &str), Vec<&FileRecord>>,
     active: impl Fn() -> bool + Sync,
 ) -> Result<(Vec<FileState>, std::sync::MutexGuard<'a, ()>), SessionError> {
+    for (components, _) in entries {
+        crate::protocol_paths::check_payload_name_length(
+            components.last().map_or("", String::as_str),
+        )
+        .map_err(SessionError::bad)?;
+    }
     if setup
         .dest_rel
         .split('/')
@@ -1766,6 +1784,8 @@ fn open_destination_for(
             .map_err(SessionError::internal)?;
         let mut stored = components.clone();
         *stored.last_mut().expect("non-empty") = paths::with_suffix(name, attempt);
+        crate::protocol_paths::check_payload_name_length(stored.last().expect("non-empty"))
+            .map_err(SessionError::bad)?;
         let key = stored_path_key(&setup.dest_rel, &stored)?;
         if !claimed
             .lock()
@@ -4947,6 +4967,71 @@ mod push_tests {
         }
     }
 
+    #[test]
+    fn publication_reserves_receipt_filename_bytes() {
+        for name in ["a".repeat(243), "ア".repeat(81)] {
+            let directory = tempfile::tempdir().unwrap();
+            let bytes = b"frame";
+            let object = object(Suite::Blake3Bao64, bytes);
+            let setup = setup(directory.path(), object.clone());
+            let parent = "p".repeat(255);
+            let source = directory.path().join("source");
+            fs::write(&source, bytes).unwrap();
+            let entries = [(vec![parent.clone(), name.clone()], object.clone())];
+            let (mut files, allocation) =
+                prepare_files(&setup, &entries, &HashMap::new(), || true).unwrap();
+            drop(allocation);
+            let file = &mut files[0];
+            reprove_staging(&source, &object, vec![file], || true).unwrap();
+            publish_file(&setup, file, || true).unwrap();
+            let destination = setup.dest_dir.join(&parent);
+            assert_eq!(fs::read(destination.join(&name)).unwrap(), bytes);
+            assert!(file.receipt);
+            let sidecar = destination.join(format!("{name}.vot-receipt"));
+            let receipt = fs::read(&sidecar).unwrap();
+            crate::receipt::verify_receipt_with_key(
+                &setup.signer.verifying_key(),
+                &receipt,
+                &object,
+            )
+            .unwrap();
+            let private = destination.join(".vot-stage");
+            let before = fs::read_dir(&private).unwrap().count();
+            let other = self::object(Suite::Blake3Bao64, b"other");
+            let error = prepare_files(
+                &setup,
+                &[(entries[0].0.clone(), other)],
+                &HashMap::new(),
+                || true,
+            )
+            .err()
+            .expect("oversized collision candidate admitted");
+            assert!(error.message.contains("243 UTF-8 bytes; shorten"));
+            assert_eq!(fs::read(destination.join(&name)).unwrap(), bytes);
+            assert_eq!(fs::read(&sidecar).unwrap(), receipt);
+            assert!(!destination.join(paths::with_suffix(&name, 1)).exists());
+            assert_eq!(fs::read_dir(&private).unwrap().count(), before);
+        }
+    }
+
+    #[test]
+    fn oversized_payload_names_refuse_preparation_before_staging() {
+        for name in ["a".repeat(244), format!("{}a", "ア".repeat(81))] {
+            let directory = tempfile::tempdir().unwrap();
+            let object = object(Suite::Blake3Bao64, b"frame");
+            let setup = setup(directory.path(), object.clone());
+            let entries = [
+                (vec!["new".into(), "allowed".into()], object.clone()),
+                (vec!["new".into(), name], object),
+            ];
+            let error = prepare_files(&setup, &entries, &HashMap::new(), || true)
+                .err()
+                .expect("oversized payload admitted");
+            assert!(error.message.contains("243 UTF-8 bytes; shorten"));
+            assert!(!setup.dest_dir.join("new").exists());
+        }
+    }
+
     #[tokio::test]
     async fn native_and_http_admissions_share_persisted_names() {
         let directory = tempfile::tempdir().unwrap();
@@ -4985,6 +5070,23 @@ mod push_tests {
                     scope.spawn(move || {
                         ready.send(()).unwrap();
                         waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+                        for name in ["a".repeat(244), format!("{}a", "ア".repeat(81))] {
+                            let error = receive
+                                .prepare_manifest(
+                                    vot_cli::PackageSummary {
+                                        root: object.root,
+                                        logical_length: object.length,
+                                        entries: 1,
+                                    },
+                                    &[record(
+                                        vot_manifest::PackagePath::portable([&name]).unwrap(),
+                                        object,
+                                    )],
+                                )
+                                .unwrap_err();
+                            assert!(error.message.contains("243 UTF-8 bytes; shorten"));
+                            assert!(!receive.setup.dest_dir.join(name).exists());
+                        }
                         receive
                             .prepare_manifest(
                                 vot_cli::PackageSummary {
@@ -5914,6 +6016,31 @@ mod push_tests {
     }
 
     #[test]
+    fn publication_recovery_recognizes_its_existing_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"frame";
+        let object = object(Suite::Blake3Bao64, bytes);
+        let setup = setup(directory.path(), object.clone());
+        let source = directory.path().join("source");
+        fs::write(&source, bytes).unwrap();
+        let mut file = open_destination_for(&setup, vec!["frame".into()], object).unwrap();
+        reprove_staging(&source, &file.object.clone(), vec![&mut file], || true).unwrap();
+        persist_session(&setup, std::slice::from_ref(&file)).unwrap();
+        publish_file(&setup, &mut file, || true).unwrap();
+        assert!(file.published && file.receipt);
+        let sidecar = setup.dest_dir.join("frame.vot-receipt");
+        let evidence = fs::read(&sidecar).unwrap();
+        file.native.take().unwrap().abandon();
+        let mut saved = setup.store.load_upload_sessions().unwrap().remove(0);
+        assert!(!saved.files[0].published && !saved.files[0].receipt);
+        let (files, _) = restore_files(&setup, &mut saved, || true).unwrap();
+        assert!(files[0].published && files[0].receipt);
+        assert_eq!(fs::read(&sidecar).unwrap(), evidence);
+        assert_eq!(fs::read(setup.dest_dir.join("frame")).unwrap(), bytes);
+        assert!(setup.store.load_upload_sessions().unwrap()[0].files[0].receipt);
+    }
+
+    #[test]
     fn publication_journal_remains_until_the_database_checkpoints_it() {
         let directory = tempfile::tempdir().unwrap();
         let object = object(Suite::Blake3Bao64, b"");
@@ -6410,10 +6537,28 @@ mod push_tests {
 
     #[test]
     fn receipt_name_recovery_preserves_staging_before_publication() {
-        for (destination, names) in [
-            ("", vec!["frame.vot-receipt"]),
-            ("", vec!["frame.VOT-RECEIPT", "child"]),
-            ("old.vot-receI\u{307}pt", vec!["frame"]),
+        for (destination, names, error) in [
+            (
+                "",
+                vec!["frame.vot-receipt".into()],
+                "reserved for signed receipts",
+            ),
+            (
+                "",
+                vec!["frame.VOT-RECEIPT".into(), "child".into()],
+                "reserved for signed receipts",
+            ),
+            (
+                "old.vot-receI\u{307}pt",
+                vec!["frame".into()],
+                "reserved for signed receipts",
+            ),
+            ("", vec!["a".repeat(244)], "243 UTF-8 bytes; shorten"),
+            (
+                "",
+                vec![format!("{}a", "ア".repeat(81))],
+                "243 UTF-8 bytes; shorten",
+            ),
         ] {
             let directory = tempfile::tempdir().unwrap();
             let bytes = b"frame";
@@ -6423,14 +6568,37 @@ mod push_tests {
             setup.dest_dir = setup.dest_dir.join(destination);
             let source = directory.path().join("source");
             fs::write(&source, bytes).unwrap();
+            let legacy_destination = setup.dest_dir.join(names.join("/"));
+            let native = setup
+                .destinations
+                .directory(legacy_destination.parent().unwrap(), true)
+                .unwrap()
+                .create(
+                    &object,
+                    legacy_destination.file_name().unwrap(),
+                    CommitProfile::Balanced,
+                )
+                .unwrap();
+            let legacy = FileState {
+                display_path: names.join("/"),
+                stored_components: names.clone(),
+                object: object.clone(),
+                native: Some(StagedFile::new(
+                    native,
+                    legacy_destination,
+                    ObjectCoverage::new(&object),
+                    CommitProfile::Balanced,
+                    Arc::clone(&setup.destinations),
+                )),
+                published: false,
+                receipt: false,
+                checkpointed: Mutex::new(None),
+                first_range_at: None,
+                rehash: false,
+            };
             let mut files = [
                 open_destination_for(&setup, vec!["allowed".into()], object.clone()).unwrap(),
-                open_destination_for(
-                    &setup,
-                    names.iter().map(|name| (*name).into()).collect(),
-                    object.clone(),
-                )
-                .unwrap(),
+                legacy,
             ];
             reprove_staging(&source, &object, files.iter_mut().collect(), || true).unwrap();
             persist_session(&setup, &files).unwrap();
@@ -6451,8 +6619,8 @@ mod push_tests {
                 .collect();
             assert!(restore_files(&setup, &mut saved, || true)
                 .err()
-                .expect("reserved checkpoint resumed")
-                .contains("reserved for signed receipts"));
+                .expect("invalid checkpoint resumed")
+                .contains(error));
             assert_eq!(saved, before);
             assert_eq!(setup.store.load_upload_sessions().unwrap(), [before]);
             for (path, data) in retained {
@@ -6918,12 +7086,17 @@ mod push_tests {
                 HashMap::from([((record.suite.as_str(), record.root.as_str()), vec![&record])]);
             assert!(find_delivered(&setup, &delivered, &expected, || true).is_some());
             assert!(find_delivered(&setup, &delivered, &expected, || false).is_none());
-            for name in ["old.vot-receipt", "old.vot-receI\u{307}pt/frame"] {
-                let reserved = setup.dest_dir.join(name);
+            for name in [
+                "old.vot-receipt".into(),
+                "old.vot-receI\u{307}pt/frame".into(),
+                "a".repeat(244),
+                format!("{}a", "ア".repeat(81)),
+            ] {
+                let reserved = setup.dest_dir.join(&name);
                 fs::create_dir_all(reserved.parent().unwrap()).unwrap();
                 fs::write(&reserved, b"original").unwrap();
                 let old = FileRecord {
-                    stored_as: name.into(),
+                    stored_as: name,
                     ..record.clone()
                 };
                 let prior = HashMap::from([((old.suite.as_str(), old.root.as_str()), vec![&old])]);
