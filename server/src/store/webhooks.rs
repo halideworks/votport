@@ -171,7 +171,7 @@ impl Store {
         let mut connection = self.connection.lock().expect("store poisoned");
         let tx = connection.transaction().map_err(|e| e.to_string())?;
         let due = {
-            let mut query = tx.prepare("SELECT j.id,j.tenant FROM delivery_jobs j WHERE j.deadline<=?1 AND j.escalated=0 AND COALESCE(json_extract(j.document,'$.checks.retired_from'),j.state)<>'cancelled' AND (CASE WHEN json_array_length(json_extract(j.document,'$.request.recipients'))=0 THEN NOT EXISTS(SELECT 1 FROM delivery_evidence e WHERE e.grant_id=j.id AND e.kind='accepted') ELSE EXISTS(SELECT 1 FROM json_each(json_extract(j.document,'$.request.recipients')) r WHERE NOT EXISTS(SELECT 1 FROM delivery_evidence e WHERE e.grant_id=j.id AND e.kind='accepted' AND e.holder=r.value)) END) ORDER BY j.deadline LIMIT 100").map_err(|e| e.to_string())?;
+            let mut query = tx.prepare("SELECT j.id,j.tenant FROM delivery_jobs j WHERE j.deadline<=?1 AND j.escalated=0 AND j.state<>'suspended' AND COALESCE(json_extract(j.document,'$.checks.retired_from'),j.state)<>'cancelled' AND (CASE WHEN json_array_length(json_extract(j.document,'$.request.recipients'))=0 THEN NOT EXISTS(SELECT 1 FROM delivery_evidence e WHERE e.grant_id=j.id AND e.kind='accepted') ELSE EXISTS(SELECT 1 FROM json_each(json_extract(j.document,'$.request.recipients')) r WHERE NOT EXISTS(SELECT 1 FROM delivery_evidence e WHERE e.grant_id=j.id AND e.kind='accepted' AND e.holder=r.value)) END) ORDER BY j.deadline LIMIT 100").map_err(|e| e.to_string())?;
             let rows = query
                 .query_map([now as i64], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))

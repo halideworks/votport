@@ -217,6 +217,7 @@ pub async fn list(
             "cancelled",
             "retiring",
             "retired",
+            "suspended",
         ]
         .contains(&state.as_str())
     {
@@ -1516,6 +1517,7 @@ mod tests {
             "project=private",
             "state=attention",
             "state=failed",
+            "state=suspended",
             "q=does-not-exist",
             "q=%25",
         ] {

@@ -105,12 +105,17 @@ Jobs retain their request and policy revision across server restarts and recover
 interrupted preparation or export. Recovery is bounded to five worker attempts per retry cycle; failed jobs remain visible and can be explicitly retried or cancelled.
 
 States include `queued`, `preparing`, `awaiting_approval`, `exporting`, `ready`,
-`retrying`, `failed`, `cancelled`, `retiring`, and `retired`. Download URLs are exposed only
+`retrying`, `failed`, `cancelled`, `retiring`, `retired`, and `suspended`. Download URLs are exposed only
 for a released job under its current policy and grant lifecycle. A scheduled job
 starts at or after `not_before`. When an acceptance deadline passes, a durable
 `delivery_deadline_missed` event is emitted once if any selected recipient has
 not accepted. For a job without selected recipients, any recorded acceptance
-satisfies the deadline. Cancelled jobs do not escalate.
+satisfies the deadline. Cancelled and suspended jobs do not escalate.
+
+Historical backup restore suspends jobs, displayed as **Held after restore**.
+Their files and signed evidence remain, but transfers, revocation messages and
+automatic snapshot cleanup stop. Create a new job after reviewing the restored
+destinations and files. Replica promotion preserves normal job recovery.
 
 ```json
 {

@@ -627,7 +627,7 @@ $('backup-restore-snapshot').addEventListener('change', async (event) => {
   const name = option.textContent;
   const confirmed = await confirmModal(
     'Restore this snapshot?',
-    `Restore ${name}. Current application state will be replaced; the cookie secret will rotate and every existing admin session will be signed out. Automatic backups will be disabled until re-enabled by an admin. The staged restore will restart the supervised service.`,
+    `Restore ${name}. Current application state will be replaced; the cookie secret will rotate and every existing admin session will be signed out. Existing request links, download links and integration tokens will be disabled. Deliveries will be held, and automatic backups, notifications, exports and received-file retention will stop until you review the restored settings. The staged restore will restart the supervised service.`,
     'Restore and restart',
   );
   select.value = '';

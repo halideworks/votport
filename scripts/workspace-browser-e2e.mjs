@@ -376,6 +376,23 @@ try {
   assert.equal(initialReads, 2, 'An abandoned initial request must not mark an unrendered panel loaded');
   await page.unroute('**/api/workflows/jobs?*');
 
+  const held = (await api('workflows/jobs?limit=100')).jobs[0];
+  held.job.state = 'suspended'; held.url = null;
+  held.job.error = 'Held after restoring a backup. Create a new job to deliver these files.';
+  held.job.project.destinations = ['restored-destination'];
+  held.job.checks.route_revocations = { 'restored-destination': { state: 'pending' } };
+  await page.route('**/api/workflows/jobs?*', (route) => route.fulfill({ json: { jobs: [held], next: null } }));
+  await page.goto(`${base}/workflows`);
+  const heldCard = page.locator(`#job-${held.job.id}`);
+  await heldCard.getByText('Held after restore', { exact: true }).waitFor();
+  assert.equal(await heldCard.getByRole('button', { name: /^(Retry|Approve delivery|Cancel delivery|Copy download link)$/ }).count(), 0);
+  assert.equal(await heldCard.getByText(/Revocation awaiting/).count(), 0);
+  assert.ok(await heldCard.getByText(/Create a new job to deliver/).isVisible());
+  await page.selectOption('#workflow-filter-state', 'suspended');
+  await heldCard.waitFor();
+  await layout('restored-delivery');
+  await page.unroute('**/api/workflows/jobs?*');
+
   const session = await api('admin/session');
   await page.goto(`${base}/receive`);
   await page.route(/\/(workflows|storage)$/, async (route) => {

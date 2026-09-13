@@ -866,7 +866,7 @@ pub(super) fn queue_cancelled(
     signer: &crate::receipt::ReceiptSigner,
     id: &str,
 ) -> Result<(), String> {
-    let rows=c.prepare("SELECT r.job_id,r.route_id,r.peer_key,r.source FROM outbound_routes r JOIN trade_routes t ON t.id=r.destination_id JOIN delivery_jobs j ON j.id=r.job_id WHERE t.id=?1 AND t.direction='outgoing' AND json_extract(t.document,'$.state')<>'active' AND json_extract(t.document,'$.cancel_active')=1 AND COALESCE(json_extract(j.document,?2),'')<>'complete' AND r.revocation IS NULL AND r.ack IS NULL").map_err(|e|e.to_string())?.query_map(params![id,format!("$.checks.destinations.{id}.state")],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,parse_json::<SignedRoute>(&r.get::<_,String>(3)?,3)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;
+    let rows=c.prepare("SELECT r.job_id,r.route_id,r.peer_key,r.source FROM outbound_routes r JOIN trade_routes t ON t.id=r.destination_id JOIN delivery_jobs j ON j.id=r.job_id WHERE t.id=?1 AND t.direction='outgoing' AND j.state<>'suspended' AND json_extract(t.document,'$.state')<>'active' AND json_extract(t.document,'$.cancel_active')=1 AND COALESCE(json_extract(j.document,?2),'')<>'complete' AND r.revocation IS NULL AND r.ack IS NULL").map_err(|e|e.to_string())?.query_map(params![id,format!("$.checks.destinations.{id}.state")],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,parse_json::<SignedRoute>(&r.get::<_,String>(3)?,3)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;
     for (job, route, key, source) in rows {
         let request = signer.revoke_route(source, key, &route);
         c.execute("UPDATE outbound_routes SET revocation=?3,next_attempt=0 WHERE job_id=?1 AND destination_id=?2",params![job,id,serde_json::to_string(&request).expect("revocation serializes")]).map_err(|e|e.to_string())?;
@@ -888,6 +888,86 @@ impl Store {
 mod tests {
     use super::*;
     use crate::route_protocol::{RouteDocument, RoutePermission};
+
+    #[test]
+    fn suspended_and_orphaned_route_controls_never_requeue_and_allow_explicit_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let project = store
+            .save_delivery_project("", "admin", crate::workflow::tests::project())
+            .unwrap();
+        let mut job = store
+            .enqueue_delivery_job(
+                "",
+                "sender",
+                1,
+                None,
+                project,
+                crate::workflow::tests::request(),
+            )
+            .unwrap();
+        job.state = "suspended".into();
+        let source = store
+            .event_signer
+            .sign_route(crate::route_protocol::RouteDocument {
+                issuer: store.event_signer.public_hex.clone(),
+                operation_id: job.id.clone(),
+                manifest: "ab".repeat(32),
+                label: "delivery".into(),
+                metadata: Default::default(),
+                parent_receipt: None,
+                visited: vec![store.event_signer.public_hex.clone()],
+                permission: None,
+            });
+        store.with(|c| {
+            c.execute("UPDATE delivery_jobs SET state=?2,document=?3 WHERE id=?1", params![job.id,job.state,serde_json::to_string(&job).unwrap()])?;
+            c.execute("INSERT INTO trade_routes(id,tenant,direction,peer_key,endpoint,document,credential) VALUES ('destination','','outgoing',?1,'endpoint','{\"state\":\"revoked\",\"cancel_active\":true}','credential')", [&store.event_signer.public_hex])?;
+            c.execute("INSERT INTO outbound_routes(job_id,destination_id,origin,route_id,peer_key,source) VALUES (?1,'destination','http://localhost','route',?2,?3)", params![job.id,store.event_signer.public_hex,serde_json::to_string(&source).unwrap()])?;
+            Ok(())
+        }).unwrap();
+        let requeue = || {
+            let connection = store.connection.lock().unwrap();
+            queue_cancelled(&connection, &store.event_signer, "destination").unwrap();
+        };
+        requeue();
+        assert!(store
+            .with(
+                |c| c.query_row("SELECT revocation FROM outbound_routes", [], |r| r
+                    .get::<_, Option<String>>(0))
+            )
+            .unwrap()
+            .is_none());
+        assert!(store.claim_route_revocation(now_unix()).unwrap().is_none());
+        store.with(|c| c.execute("UPDATE delivery_jobs SET state='cancelled',document=json_set(document,'$.state','cancelled') WHERE id=?1", [&job.id])).unwrap();
+        requeue();
+        assert!(store.claim_route_revocation(now_unix()).unwrap().is_some());
+        store
+            .with(|c| c.execute("DELETE FROM delivery_jobs WHERE id=?1", [&job.id]))
+            .unwrap();
+        assert!(store
+            .claim_route_revocation(now_unix() + 1000)
+            .unwrap()
+            .is_none());
+        job.tenant = "cleanup".into();
+        store.with(|c| {
+            c.execute("INSERT INTO tenants(key,label) VALUES ('cleanup','Restored tenant')", [])?;
+            c.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,document) VALUES (?1,'cleanup','sender','operation','project','suspended',0,?2)", params![job.id,serde_json::to_string(&job).unwrap()])?;
+            Ok(())
+        }).unwrap();
+        assert!(matches!(
+            store.remove_tenant("cleanup").unwrap(),
+            TenantRemoval::Deleted
+        ));
+        assert_eq!(
+            store
+                .with(
+                    |c| c.query_row("SELECT COUNT(*) FROM outbound_routes", [], |r| r
+                        .get::<_, i64>(0))
+                )
+                .unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn enrollment_permissions_replay_and_rotation_stay_scoped() {
