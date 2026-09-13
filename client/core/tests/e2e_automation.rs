@@ -85,10 +85,7 @@ fn desktop_issued_token_runs_an_isolated_verified_delivery_workflow() {
         detail["files"][0]["root"],
         delivery["grant"]["files"][0]["root"]
     );
-    assert!(!detail["files"][0]["receipt_b64"]
-        .as_str()
-        .unwrap()
-        .is_empty());
+    assert!(detail["files"][0].get("receipt_b64").is_none());
     agent.revoke(id).unwrap();
     agent.revoke(id).unwrap();
     assert_eq!(agent.delivery(id, 0, 1).unwrap()["state"], "revoked");

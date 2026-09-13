@@ -15,7 +15,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use vot_manifest::{Component, PackagePath};
-use vot_object::{ObjectBuilder, Suite};
+use vot_object::{ObjectBuilder, ObjectId, Suite};
 
 use crate::api::Client;
 use crate::entries::admit;
@@ -36,9 +36,22 @@ pub struct Received {
     pub files: Vec<PathBuf>,
 }
 
-/// The suite string the client fetches. The server reports `"blake3"` for
-/// every delivery it builds.
-const BLAKE3: &str = "blake3";
+pub(crate) fn decode_object(suite: &str, root: &str, length: u64) -> Result<ObjectId> {
+    let suite = match suite {
+        "blake3" => Suite::Blake3Bao64,
+        "sha256" => Suite::Sha256Bep52,
+        _ => {
+            return Err(Error::UnknownSuite {
+                suite: suite.to_owned(),
+            })
+        }
+    };
+    Ok(ObjectId {
+        suite: suite.identifier(),
+        root: decode_root(root)?,
+        length,
+    })
+}
 
 /// How much of a download is read at once before it is hashed and written.
 const READ_CHUNK: usize = 4 * 1024 * 1024;
@@ -207,14 +220,9 @@ fn receive_over_http_inner(
         .zip(paths)
         .map(|(file, path)| {
             let path = path?;
-            if file.suite != BLAKE3 {
-                return Err(Error::UnknownSuite {
-                    suite: file.suite.clone(),
-                });
-            }
-            let root = decode_root(&file.root)?;
-            let complete = reusable_file(&path, root, file.bytes, resume, observer)?;
-            Ok((file, path, root, complete))
+            let object = decode_object(&file.suite, &file.root, file.bytes)?;
+            let complete = reusable_file(&path, &object, resume, observer)?;
+            Ok((file, path, object, complete))
         })
         .collect::<Result<Vec<_>>>()?;
     let needed: u64 = planned
@@ -238,7 +246,7 @@ fn receive_over_http_inner(
     fs::create_dir_all(dest)?;
     let cookie = cookie.as_deref();
     let mut files = Vec::with_capacity(planned.len());
-    for (index, (file, path, root, complete)) in planned.into_iter().enumerate() {
+    for (index, (file, path, object, complete)) in planned.into_iter().enumerate() {
         if observer.cancelled() {
             return Err(Error::Cancelled);
         }
@@ -277,15 +285,7 @@ fn receive_over_http_inner(
                     start,
                 })
             };
-            write_verified(
-                &mut source,
-                &path,
-                root,
-                &file.root,
-                file.bytes,
-                index,
-                observer,
-            )?;
+            write_verified(&mut source, &path, &object, index, observer)?;
             if vot_platform_fs::same_file_handle(&lease_file, &lease_path)? {
                 fs::remove_file(&lease_path)?;
             }
@@ -361,21 +361,11 @@ pub(crate) struct Resumed {
 pub(crate) fn write_verified(
     source: &mut dyn FnMut(u64) -> Result<Resumed>,
     destination: &Path,
-    announced: [u8; 32],
-    announced_hex: &str,
-    total: u64,
+    announced: &ObjectId,
     index: usize,
     observer: &mut dyn Observer,
 ) -> Result<()> {
-    let pending = prepare_verified(
-        source,
-        destination,
-        announced,
-        announced_hex,
-        total,
-        index,
-        observer,
-    )?;
+    let pending = prepare_verified(source, destination, announced, index, observer)?;
     pending.journal.sync_all()?;
     pending.publish()
 }
@@ -392,12 +382,14 @@ pub(crate) struct PendingFile {
 pub(crate) fn prepare_verified(
     source: &mut dyn FnMut(u64) -> Result<Resumed>,
     destination: &Path,
-    announced: [u8; 32],
-    announced_hex: &str,
-    total: u64,
+    announced: &ObjectId,
     index: usize,
     observer: &mut dyn Observer,
 ) -> Result<PendingFile> {
+    let total = announced.length;
+    let suite = Suite::try_from(announced.suite).map_err(|_| Error::UnknownSuite {
+        suite: announced.suite.to_string(),
+    })?;
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -416,7 +408,7 @@ pub(crate) fn prepare_verified(
     // Resume: hash any prior partial into the builder and continue past it. A
     // partial that hashes to the wrong root fails at finish and is removed, so
     // the next run starts clean; a bad prefix cannot land silently.
-    let mut builder = ObjectBuilder::new(Suite::Blake3Bao64, Some(total))?;
+    let mut builder = ObjectBuilder::new(suite, Some(total))?;
     let mut resume_from = feed_partial(&mut journal, &mut builder, total)?;
     let resumed = source(resume_from)?;
     if resumed.start != resume_from {
@@ -427,7 +419,7 @@ pub(crate) fn prepare_verified(
             )));
         }
         // The source gave the whole file rather than the range: start over.
-        builder = ObjectBuilder::new(Suite::Blake3Bao64, Some(total))?;
+        builder = ObjectBuilder::new(suite, Some(total))?;
         resume_from = 0;
     }
     let mut reader = resumed.reader;
@@ -447,8 +439,8 @@ pub(crate) fn prepare_verified(
         journal,
         builder,
         destination: destination.to_owned(),
-        announced,
-        announced_hex: announced_hex.to_owned(),
+        announced: announced.root,
+        announced_hex: hex::encode(announced.root),
         temporary,
     })
 }
@@ -537,11 +529,14 @@ fn lock_journal(file: File, path: &Path) -> Result<File> {
 
 pub(crate) fn reusable_file(
     path: &Path,
-    root: [u8; 32],
-    total: u64,
+    object: &ObjectId,
     resume: bool,
     observer: &mut dyn Observer,
 ) -> Result<bool> {
+    let total = object.length;
+    let suite = Suite::try_from(object.suite).map_err(|_| Error::UnknownSuite {
+        suite: object.suite.to_string(),
+    })?;
     let exists = || Error::Exists {
         path: path.to_owned(),
     };
@@ -558,7 +553,7 @@ pub(crate) fn reusable_file(
     if !opened.is_file() || opened.len() != total {
         return Err(exists());
     }
-    let mut builder = ObjectBuilder::new(Suite::Blake3Bao64, Some(total))?;
+    let mut builder = ObjectBuilder::new(suite, Some(total))?;
     let mut buffer = receive_buffer(total);
     let mut reader = (&mut file).take(total);
     for _ in 0..=total {
@@ -573,7 +568,7 @@ pub(crate) fn reusable_file(
     }
     let prepared = builder.finish().map_err(|_| exists())?;
     if file.metadata()?.len() != total
-        || !root_matches(&prepared.object_id().root, &root)
+        || !root_matches(&prepared.object_id().root, &object.root)
         || !vot_platform_fs::same_file_handle(&file, path)?
     {
         return Err(exists());
@@ -848,6 +843,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn metadata_identity_admits_supported_suites_and_rejects_invalid_values() {
+        let root = hex::encode([9; 32]);
+        for (name, suite) in [("blake3", 1), ("sha256", 2)] {
+            assert_eq!(
+                decode_object(name, &root, 7).unwrap(),
+                ObjectId {
+                    suite,
+                    root: [9; 32],
+                    length: 7
+                }
+            );
+        }
+        assert!(matches!(
+            decode_object("md5", &root, 7),
+            Err(Error::UnknownSuite { .. })
+        ));
+        assert!(decode_object("sha256", "not a digest", 7).is_err());
+    }
+
+    #[test]
     fn receive_buffers_bound_memory_and_still_read_past_empty_files() {
         for (total, expected) in [
             (0, 1),
@@ -873,7 +888,7 @@ mod tests {
         let metadata = serde_json::json!({
             "has_password": true, "authorized": true,
             "files": ([0, 1].map(|index| serde_json::json!({
-                "name": format!("file{index}"), "suite": BLAKE3, "root": root,
+                "name": format!("file{index}"), "suite": "blake3", "root": root,
                 "bytes": bytes.len(), "download_url": format!("/api/s/token/files/{index}")
             })))
         })
@@ -1017,40 +1032,52 @@ mod tests {
 
     #[test]
     fn resume_reuses_only_matching_regular_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file");
-        let bytes = b"completed";
-        let mut builder = ObjectBuilder::new(Suite::Blake3Bao64, Some(bytes.len() as u64)).unwrap();
-        builder.update(bytes).unwrap();
-        let root = builder.finish().unwrap().object_id().root;
-        let mut observer = crate::progress::Silent;
-        assert!(!reusable_file(&path, root, 9, true, &mut observer).unwrap());
-        fs::write(&path, bytes).unwrap();
-        assert!(matches!(
-            reusable_file(&path, root, 9, false, &mut observer),
-            Err(Error::Exists { .. })
-        ));
-        assert!(reusable_file(&path, root, 9, true, &mut observer).unwrap());
-        for (hash, length) in [(root, 8), (root, 10), ([0; 32], 9)] {
+        for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("file");
+            let bytes = b"completed";
+            let mut builder = ObjectBuilder::new(suite, Some(bytes.len() as u64)).unwrap();
+            builder.update(bytes).unwrap();
+            let object = builder.finish().unwrap().object_id().clone();
+            let root = object.root;
+            let mut observer = crate::progress::Silent;
+            assert!(!reusable_file(&path, &object, true, &mut observer).unwrap());
+            fs::write(&path, bytes).unwrap();
             assert!(matches!(
-                reusable_file(&path, hash, length, true, &mut observer),
+                reusable_file(&path, &object, false, &mut observer),
                 Err(Error::Exists { .. })
             ));
-            assert_eq!(fs::read(&path).unwrap(), bytes);
-        }
-        assert!(matches!(
-            reusable_file(dir.path(), root, 9, true, &mut observer),
-            Err(Error::Exists { .. })
-        ));
-        #[cfg(unix)]
-        {
-            let link = dir.path().join("link");
-            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(reusable_file(&path, &object, true, &mut observer).unwrap());
+            for (hash, length) in [(root, 8), (root, 10), ([0; 32], 9)] {
+                assert!(matches!(
+                    reusable_file(
+                        &path,
+                        &ObjectId {
+                            suite: object.suite,
+                            root: hash,
+                            length
+                        },
+                        true,
+                        &mut observer
+                    ),
+                    Err(Error::Exists { .. })
+                ));
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+            }
             assert!(matches!(
-                reusable_file(&link, root, 9, true, &mut observer),
+                reusable_file(dir.path(), &object, true, &mut observer),
                 Err(Error::Exists { .. })
             ));
-            assert_eq!(fs::read(&path).unwrap(), bytes);
+            #[cfg(unix)]
+            {
+                let link = dir.path().join("link");
+                std::os::unix::fs::symlink(&path, &link).unwrap();
+                assert!(matches!(
+                    reusable_file(&link, &object, true, &mut observer),
+                    Err(Error::Exists { .. })
+                ));
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+            }
         }
     }
 
@@ -1095,8 +1122,11 @@ mod tests {
             fs::write(&path, b"same").unwrap();
             let result = reusable_file(
                 &path,
-                root,
-                4,
+                &ObjectId {
+                    suite: 1,
+                    root,
+                    length: 4,
+                },
                 true,
                 &mut Change {
                     path: &path,
@@ -1200,9 +1230,11 @@ mod tests {
         write_verified(
             source,
             destination,
-            root,
-            "expected",
-            bytes.len() as u64,
+            &ObjectId {
+                suite: 1,
+                root,
+                length: bytes.len() as u64,
+            },
             0,
             &mut crate::progress::Silent,
         )

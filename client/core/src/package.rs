@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use vot_cli::{build_manifest_from, PackageSummary, ServedSource};
 use vot_manifest::{decode_page, decode_seal, Component, EntryKind, PackagePath, StorageRef};
-use vot_object::{ObjectBuilder, PreparedObject, Suite};
+use vot_object::{ObjectBuilder, ObjectId, PreparedObject, Suite};
 
 use crate::entries::Entry;
 use crate::error::{Error, Result};
@@ -28,8 +28,7 @@ const MANIFEST_SEAL: &str = "seal.cbor";
 #[derive(Debug, Clone)]
 pub struct StoredEntry {
     pub path: PackagePath,
-    pub root: [u8; 32],
-    pub length: u64,
+    pub object: ObjectId,
 }
 
 /// A package path as the `/`-joined string a view shows; a non-UTF-8
@@ -74,8 +73,7 @@ pub fn read_manifest(manifest_root: &Path) -> Result<Vec<StoredEntry>> {
             };
             entries.push(StoredEntry {
                 path: entry.path,
-                root: object.root,
-                length: object.length,
+                object,
             });
         }
     }
@@ -91,8 +89,7 @@ fn manifest_page_path(directory: &Path, index: u64) -> PathBuf {
 pub struct PreparedEntry {
     /// The package-relative path, joined with `/`.
     pub path: String,
-    pub root: [u8; 32],
-    pub length: u64,
+    pub object: ObjectId,
     /// A file holding the object's bytes, for the one-group case and for a
     /// fallback when no leaves were kept.
     pub source: PathBuf,
@@ -107,36 +104,40 @@ impl PreparedEntry {
     /// not (a one-group object at most 64 KiB).
     ///
     /// # Errors
-    /// A read failure, or a length that no longer matches what was hashed.
+    /// A read failure, unsupported suite, or object changed since hashing.
     pub fn prover(&self) -> Result<PreparedObject> {
-        // A one-group object keeps a single leaf, which is not a tree
-        // `from_proof_leaves` can rebuild (its root is the leaf itself), so it
-        // may refuse; hashing the bytes is the fallback for that case.
-        if let Some(leaves) = &self.leaves {
-            if let Ok(prepared) =
-                PreparedObject::from_proof_leaves(Suite::Blake3Bao64, self.length, leaves.clone())
-            {
-                return Ok(prepared);
-            }
-        }
-        use std::io::Read;
-        let mut file = fs::File::open(&self.source).map_err(|source| Error::Read {
-            path: self.source.clone(),
-            source,
+        let suite = Suite::try_from(self.object.suite).map_err(|_| Error::UnknownSuite {
+            suite: self.object.suite.to_string(),
         })?;
-        let mut builder = ObjectBuilder::new(Suite::Blake3Bao64, Some(self.length))?;
-        let mut buffer = vec![0; 1024 * 1024];
-        loop {
-            let count = file.read(&mut buffer).map_err(|source| Error::Read {
+        let cached = self.leaves.as_ref().and_then(|leaves| {
+            PreparedObject::from_proof_leaves(suite, self.object.length, leaves.clone()).ok()
+        });
+        let prepared = if let Some(prepared) = cached {
+            prepared
+        } else {
+            use std::io::Read;
+            let mut file = fs::File::open(&self.source).map_err(|source| Error::Read {
                 path: self.source.clone(),
                 source,
             })?;
-            if count == 0 {
-                break;
+            let mut builder = ObjectBuilder::new(suite, Some(self.object.length))?;
+            let mut buffer = vec![0; 1024 * 1024];
+            loop {
+                let count = file.read(&mut buffer).map_err(|source| Error::Read {
+                    path: self.source.clone(),
+                    source,
+                })?;
+                if count == 0 {
+                    break;
+                }
+                builder.update(&buffer[..count])?;
             }
-            builder.update(&buffer[..count])?;
+            builder.finish()?
+        };
+        if prepared.object_id() != &self.object {
+            return Err(vot_cli::Error::SourceMutation.into());
         }
-        Ok(builder.finish()?)
+        Ok(prepared)
     }
 }
 
@@ -204,8 +205,7 @@ pub fn load_prepared(
             })?;
             objects.push(PreparedEntry {
                 path: package_path_string(&entry.path),
-                root: object.root,
-                length: object.length,
+                object,
                 source: served_source.path.clone(),
                 leaves: served_source.leaves.clone(),
             });
@@ -264,7 +264,7 @@ mod tests {
         let big_object = prepared
             .objects
             .iter()
-            .find(|object| object.length == 200_000)
+            .find(|object| object.object.length == 200_000)
             .expect("the big object");
         assert!(
             big_object.leaves.is_some(),
@@ -275,13 +275,13 @@ mod tests {
         without_cache.leaves = None;
         assert_eq!(
             without_cache.prover().unwrap().object_id().root,
-            big_object.root
+            big_object.object.root
         );
 
         let small_object = prepared
             .objects
             .iter()
-            .find(|object| object.length == 12)
+            .find(|object| object.object.length == 12)
             .expect("the small object");
         // Whether or not a one-group object kept a usable leaf, its prover
         // builds and proves the whole object.
@@ -290,5 +290,20 @@ mod tests {
             .expect("a prover for the small object");
         let cover = prover.prove(0, 12).expect("a proof of the whole object");
         assert_eq!(cover.covered_offset(), 0);
+        let mut changed = big_object.clone();
+        changed.object.root[0] ^= 1;
+        assert!(matches!(
+            changed.prover(),
+            Err(Error::Package(vot_cli::Error::SourceMutation))
+        ));
+        let mut changed = small_object.clone();
+        changed.leaves = None;
+        fs::write(&changed.source, b"edited bytes").unwrap();
+        assert!(matches!(
+            changed.prover(),
+            Err(Error::Package(vot_cli::Error::SourceMutation))
+        ));
+        changed.object.suite = u16::MAX;
+        assert!(matches!(changed.prover(), Err(Error::UnknownSuite { .. })));
     }
 }

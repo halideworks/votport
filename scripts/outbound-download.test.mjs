@@ -135,6 +135,18 @@ test('public metadata pages append only contiguous stable ranges', () => {
   assert.equal(legacy.hasMore, false);
 });
 
+test('metadata accepts absent receipts while validating receipt URLs when present', () => {
+  for (const receipt of [null, '/api/s/token/receipts/0', '/api/s/token/receipts/1', '', 7, undefined]) {
+    const page = { files_total: 1, offset: 0, limit: 1, has_more: false,
+      files: [{ download_url: '/api/s/token/files/0', receipt_url: receipt }] };
+    if (receipt === null || receipt === '/api/s/token/receipts/0') {
+      assert.equal(appendMetadataPage({ files: [], total: null }, page).files.length, 1);
+    } else {
+      assert.throws(() => appendMetadataPage({ files: [], total: null }, page), /invalid/);
+    }
+  }
+});
+
 test('public metadata starts with the bounded page and picker precedes fetch', () => {
   assert.equal(publicMetadataPageUrl('a/b', 0), '/api/s/a%2Fb?offset=0&limit=100');
   assert.match(outboundScript, /publicMetadataPageUrl\(token, offset, limit\)/);

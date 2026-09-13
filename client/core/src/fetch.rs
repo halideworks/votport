@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use vot_cli::authz::Holder;
 use vot_cli::{fetch_bundle_with_seams, parse_rendezvous, Error as VotError, FetchOptions};
+use vot_object::ObjectId;
 
 use crate::api::Client;
 use crate::error::{Error, Result};
@@ -148,18 +149,8 @@ pub(crate) fn try_fetch_with_resume(
         crate::receive::local_paths(dest, metadata.files.iter().map(|file| file.name.as_str()))?;
     for (file, path) in metadata.files.iter().zip(paths) {
         let path = path?;
-        if file.suite != "blake3" {
-            return Err(Error::UnknownSuite {
-                suite: file.suite.clone(),
-            });
-        }
-        if !reusable_file(
-            &path,
-            decode_digest(&file.root)?,
-            file.bytes,
-            resume,
-            observer,
-        )? {
+        let object = crate::receive::decode_object(&file.suite, &file.root, file.bytes)?;
+        if !reusable_file(&path, &object, resume, observer)? {
             remaining = remaining.saturating_add(file.bytes);
         }
     }
@@ -255,13 +246,16 @@ pub(crate) fn try_fetch_with_resume(
         .map(|(index, file)| {
             Ok((
                 file.name.clone(),
-                (index, decode_digest(&file.root)?, file.bytes),
+                (
+                    index,
+                    crate::receive::decode_object(&file.suite, &file.root, file.bytes)?,
+                ),
             ))
         })
         .collect::<Result<_>>()?;
     let mut references = HashMap::new();
-    for (_, root, _) in expected.values() {
-        *references.entry(*root).or_insert(0usize) += 1;
+    for (_, object) in expected.values() {
+        *references.entry(object.root).or_insert(0usize) += 1;
     }
     let cancellation = vot_cli::CancellationHandle::default();
     let received = with_events(
@@ -298,16 +292,15 @@ pub(crate) fn try_fetch_with_resume(
                     })),
                     complete: Some(Arc::new(move |_, object| {
                         for entry in &object.entries {
-                            let &(index, root, length) = expected
+                            let (index, object) = expected
                                 .get(&package_path_string(&entry.path))
                                 .ok_or(VotError::InvalidBundle)?;
                             ready
                                 .send((
-                                    index,
+                                    *index,
                                     StoredEntry {
                                         path: entry.path.clone(),
-                                        root,
-                                        length,
+                                        object: object.clone(),
                                     },
                                 ))
                                 .map_err(|_| VotError::InvalidBundle)?;
@@ -377,8 +370,8 @@ fn stage_is_stale_complete(stage: &Path) -> bool {
     };
     let objects = stage.join("objects");
     entries.iter().all(|entry| {
-        fs::metadata(objects.join(object_name(&entry.root)))
-            .map(|meta| meta.len() == entry.length)
+        fs::metadata(objects.join(object_name(&entry.object.root)))
+            .map(|meta| meta.len() == entry.object.length)
             .unwrap_or(false)
     })
 }
@@ -405,7 +398,7 @@ fn materialize(
     let references = entries
         .iter()
         .fold(std::collections::HashMap::new(), |mut counts, entry| {
-            *counts.entry(entry.root).or_insert(0usize) += 1;
+            *counts.entry(entry.object.root).or_insert(0usize) += 1;
             counts
         });
 
@@ -416,7 +409,7 @@ fn materialize(
             .map(|(index, entry)| PlannedFile {
                 index,
                 path: package_path_string(&entry.path),
-                bytes: entry.length,
+                bytes: entry.object.length,
             })
             .collect(),
     });
@@ -449,22 +442,18 @@ fn materialize_entries(
         .zip(paths)
         .map(|((index, entry), path)| {
             let path = path?;
-            let complete = reusable_file(&path, entry.root, entry.length, resume, observer)?;
-            Ok((
-                *index,
-                &entry.path,
-                path,
-                entry.root,
-                entry.length,
-                complete,
-            ))
+            let complete = reusable_file(&path, &entry.object, resume, observer)?;
+            Ok((*index, &entry.path, path, &entry.object, complete))
         })
         .collect::<Result<Vec<_>>>()?;
     fs::create_dir_all(dest)?;
     let mut files = Vec::with_capacity(planned.len());
     #[cfg(target_os = "macos")]
     let mut pending = Vec::<(usize, std::path::PathBuf, crate::receive::PendingFile)>::new();
-    for (index, package_path, path, root, length, complete) in planned {
+    for (index, package_path, path, identity, complete) in planned {
+        let root = identity.root;
+        #[cfg(target_os = "macos")]
+        let length = identity.length;
         if observer.cancelled() {
             return Err(Error::Cancelled);
         }
@@ -474,7 +463,7 @@ fn materialize_entries(
             #[cfg(windows)]
             let linked = references[&root] == 1
                 && link_verified_object_during_fetch(
-                    &object, dest, &path, root, length, observer, streaming,
+                    &object, dest, &path, identity, observer, streaming,
                 )?;
             #[cfg(not(windows))]
             let linked = false;
@@ -502,9 +491,7 @@ fn materialize_entries(
                     let file = crate::receive::prepare_verified(
                         &mut source,
                         &path,
-                        root,
-                        &hex::encode(root),
-                        length,
+                        identity,
                         index,
                         observer,
                     )?;
@@ -522,15 +509,7 @@ fn materialize_entries(
                 }
                 #[cfg(target_os = "macos")]
                 publish_batch(&mut pending, dest, observer, &mut files)?;
-                write_verified(
-                    &mut source,
-                    &path,
-                    root,
-                    &hex::encode(root),
-                    length,
-                    index,
-                    observer,
-                )?;
+                write_verified(&mut source, &path, identity, index, observer)?;
             }
         }
         #[cfg(target_os = "macos")]
@@ -580,8 +559,7 @@ fn link_verified_object_during_fetch(
     source: &Path,
     destination_root: &Path,
     destination: &Path,
-    root: [u8; 32],
-    length: u64,
+    identity: &ObjectId,
     observer: &mut dyn Observer,
     streaming: bool,
 ) -> Result<bool> {
@@ -611,7 +589,7 @@ fn link_verified_object_during_fetch(
             "the staged object changed before verification".to_owned(),
         ));
     }
-    if !reusable_file(source, root, length, true, observer)? {
+    if !reusable_file(source, identity, true, observer)? {
         return Err(Error::Other("the staged object disappeared".to_owned()));
     }
     crate::receive::validate_parent(destination_root, destination)?;
@@ -653,11 +631,10 @@ fn link_verified_object(
     source: &Path,
     dest: &Path,
     path: &Path,
-    root: [u8; 32],
-    length: u64,
+    identity: &ObjectId,
     observer: &mut dyn Observer,
 ) -> Result<bool> {
-    link_verified_object_during_fetch(source, dest, path, root, length, observer, false)
+    link_verified_object_during_fetch(source, dest, path, identity, observer, false)
 }
 
 struct StreamObserver {
@@ -736,7 +713,7 @@ impl StreamingSave {
 }
 
 fn validate_stream_manifest(
-    expected: &HashMap<String, (usize, [u8; 32], u64)>,
+    expected: &HashMap<String, (usize, ObjectId)>,
     entries: &[vot_cli::EntryRecord],
 ) -> std::result::Result<(), VotError> {
     if entries.len() != expected.len() {
@@ -746,14 +723,14 @@ fn validate_stream_manifest(
     for entry in entries {
         let name =
             crate::receive::package_name(&entry.path).map_err(|_| VotError::InvalidBundle)?;
-        let Some(&(_, root, length)) = expected.get(&name) else {
+        let Some((_, object)) = expected.get(&name) else {
             return Err(VotError::InvalidBundle);
         };
         if !seen.insert(name)
-            || entry.logical_root != root
-            || entry.logical_length != length
+            || entry.logical_root != object.root
+            || entry.logical_length != object.length
             || entry.storage != vot_cli::Storage::Direct
-            || entry.suite != vot_object::Suite::Blake3Bao64
+            || entry.suite.identifier() != object.suite
         {
             return Err(VotError::InvalidBundle);
         }
@@ -786,14 +763,14 @@ mod tests {
         for entry in &entries {
             fs::copy(
                 source.join(package_path_string(&entry.path)),
-                stage.join("objects").join(object_name(&entry.root)),
+                stage.join("objects").join(object_name(&entry.object.root)),
             )
             .unwrap();
         }
         let state = StreamingSave {
             bundle: stage,
             dest: dest.clone(),
-            references: entries.iter().map(|e| (e.root, 1)).collect(),
+            references: entries.iter().map(|e| (e.object.root, 1)).collect(),
             pending: Vec::new(),
             files: Vec::new(),
             resume: false,
@@ -838,10 +815,20 @@ mod tests {
             logical_length: 9,
             storage: vot_cli::Storage::Direct,
         };
-        let expected = HashMap::from([("a".into(), (0, [7; 32], 9))]);
+        let expected = HashMap::from([(
+            "a".into(),
+            (
+                0,
+                ObjectId {
+                    suite: 1,
+                    root: [7; 32],
+                    length: 9,
+                },
+            ),
+        )]);
         assert!(validate_stream_manifest(&expected, std::slice::from_ref(&entry)).is_ok());
         assert!(validate_stream_manifest(&expected, &[]).is_err());
-        for field in 0..4 {
+        for field in 0..5 {
             let mut changed = entry.clone();
             match field {
                 0 => {
@@ -850,6 +837,7 @@ mod tests {
                 }
                 1 => changed.logical_root[0] ^= 1,
                 2 => changed.logical_length += 1,
+                3 => changed.suite = vot_object::Suite::Sha256Bep52,
                 _ => {
                     changed.storage = vot_cli::Storage::Pack {
                         root: [8; 32],
@@ -860,8 +848,30 @@ mod tests {
             }
             assert!(validate_stream_manifest(&expected, &[changed]).is_err());
         }
-        let expected =
-            HashMap::from([("a".into(), (0, [7; 32], 9)), ("b".into(), (1, [7; 32], 9))]);
+        let expected = HashMap::from([
+            (
+                "a".into(),
+                (
+                    0,
+                    ObjectId {
+                        suite: 1,
+                        root: [7; 32],
+                        length: 9,
+                    },
+                ),
+            ),
+            (
+                "b".into(),
+                (
+                    1,
+                    ObjectId {
+                        suite: 1,
+                        root: [7; 32],
+                        length: 9,
+                    },
+                ),
+            ),
+        ]);
         assert!(validate_stream_manifest(&expected, &[entry.clone(), entry]).is_err());
     }
 
@@ -888,7 +898,7 @@ mod tests {
         let entries = read_manifest(&stage).unwrap();
         let mut references = HashMap::new();
         for entry in &entries {
-            *references.entry(entry.root).or_insert(0) += 1;
+            *references.entry(entry.object.root).or_insert(0) += 1;
         }
         let pending: Vec<_> = entries
             .iter()
@@ -899,7 +909,7 @@ mod tests {
         for (_, entry) in &pending {
             fs::copy(
                 source.join(package_path_string(&entry.path)),
-                stage.join("objects").join(object_name(&entry.root)),
+                stage.join("objects").join(object_name(&entry.object.root)),
             )
             .unwrap();
         }
@@ -939,7 +949,9 @@ mod tests {
         assert!(!dest.join("later").exists());
         fs::copy(
             source.join("later"),
-            stage.join("objects").join(object_name(&later.1.root)),
+            stage
+                .join("objects")
+                .join(object_name(&later.1.object.root)),
         )
         .unwrap();
         state.flush(&mut crate::progress::Silent).unwrap();
@@ -971,7 +983,7 @@ mod tests {
         for entry in read_manifest(&stage).unwrap() {
             if package_path_string(&entry.path) == "second" {
                 fs::write(
-                    stage.join("objects").join(object_name(&entry.root)),
+                    stage.join("objects").join(object_name(&entry.object.root)),
                     b"second",
                 )
                 .unwrap();
@@ -1015,9 +1027,11 @@ mod tests {
                     })
                 },
                 &path,
-                root,
-                &hex::encode(root),
-                8,
+                &ObjectId {
+                    suite: 1,
+                    root,
+                    length: 8,
+                },
                 0,
                 &mut crate::progress::Silent,
             )
@@ -1101,7 +1115,7 @@ mod tests {
         for entry in &entries {
             fs::copy(
                 source.join(package_path_string(&entry.path)),
-                stage.join("objects").join(object_name(&entry.root)),
+                stage.join("objects").join(object_name(&entry.object.root)),
             )
             .unwrap();
         }
@@ -1110,15 +1124,14 @@ mod tests {
             .iter()
             .find(|entry| package_path_string(&entry.path) == "unique")
             .unwrap();
-        let object = stage.join("objects").join(object_name(&unique.root));
+        let object = stage.join("objects").join(object_name(&unique.object.root));
         {
             let _writer = vot_platform_fs::guard_staging_file(&object).unwrap();
             assert!(!link_verified_object_during_fetch(
                 &object,
                 &dest,
                 &dest.join("busy"),
-                unique.root,
-                unique.length,
+                &unique.object,
                 &mut crate::progress::Silent,
                 true
             )
@@ -1136,8 +1149,7 @@ mod tests {
                 &object,
                 &dest,
                 &dest.join("unique"),
-                unique.root,
-                unique.length,
+                &unique.object,
                 &mut crate::progress::Silent
             ),
             Err(Error::Exists { .. })
@@ -1147,8 +1159,7 @@ mod tests {
             &object,
             &dest,
             &dest.join("corrupt"),
-            unique.root,
-            unique.length,
+            &unique.object,
             &mut crate::progress::Silent
         )
         .is_err());
@@ -1167,8 +1178,7 @@ mod tests {
             &object,
             &dest,
             &dest.join("guarded"),
-            unique.root,
-            unique.length,
+            &unique.object,
             &mut WritesDenied(object.clone())
         )
         .unwrap());
@@ -1197,7 +1207,7 @@ mod tests {
             build(admitted, &stage).unwrap();
             fs::create_dir(stage.join("objects")).unwrap();
             for entry in read_manifest(&stage).unwrap() {
-                let object = stage.join("objects").join(object_name(&entry.root));
+                let object = stage.join("objects").join(object_name(&entry.object.root));
                 fs::copy(source.join(package_path_string(&entry.path)), &object).unwrap();
                 fs::OpenOptions::new()
                     .write(true)
@@ -1251,8 +1261,8 @@ mod tests {
         fs::create_dir_all(&objects).unwrap();
         for entry in read_manifest(stage).unwrap() {
             fs::write(
-                objects.join(object_name(&entry.root)),
-                vec![0u8; entry.length as usize],
+                objects.join(object_name(&entry.object.root)),
+                vec![0u8; entry.object.length as usize],
             )
             .unwrap();
         }
@@ -1289,8 +1299,8 @@ mod tests {
         let objects = stage.join("objects");
         let first = &read_manifest(&stage).unwrap()[0];
         fs::write(
-            objects.join(object_name(&first.root)),
-            vec![0u8; first.length as usize - 1],
+            objects.join(object_name(&first.object.root)),
+            vec![0u8; first.object.length as usize - 1],
         )
         .unwrap();
         assert!(

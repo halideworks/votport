@@ -798,9 +798,12 @@ async fn export_destination(app: &Arc<App>, job: &Job, config: &Storage) -> ApiR
             .map_err(conflict)?;
         let key = config.key(&format!("{prefix}/files/{}", file.name))?;
         guard_folder_key(config, &key)?;
-        let path = source_info_indexed_with_file(app, &grant, index, Some(file))?.path;
-        upload_file(&*store, &key, &path, file).await?;
-        files.push(json!({"name": file.name,"suite": file.suite,"root": file.root,"bytes": file.bytes,"key": key.to_string(),"receipt": file.receipt_b64}));
+        let source = source_info_indexed_with_file(app, &grant, index, Some(file))?;
+        upload_file(&*store, &key, &source.path, &source.object).await?;
+        let receipt = source
+            .receipt
+            .map(|bytes| base64::prelude::BASE64_STANDARD.encode(bytes));
+        files.push(json!({"name": file.name,"suite": file.suite,"root": file.root,"bytes": file.bytes,"key": key.to_string(),"receipt": receipt}));
     }
     app.store
         .require_delivery_export(&job.id, job.attempts)
@@ -887,9 +890,9 @@ async fn upload_file(
     store: &dyn ObjectStore,
     key: &ObjectPath,
     path: &Path,
-    expected: &OutboundGrantFile,
+    expected: &ObjectId,
 ) -> ApiResult<()> {
-    let part_size = expected.bytes.div_ceil(10_000).max(8 * 1024 * 1024);
+    let part_size = expected.length.div_ceil(10_000).max(8 * 1024 * 1024);
     // ponytail: at most 128 MiB per part; larger than 1.25 TiB needs a streaming multipart adapter.
     if part_size > 128 * 1024 * 1024 {
         return Err(conflict(
@@ -900,9 +903,9 @@ async fn upload_file(
         .await
         .map_err(|_| conflict("open export payload failed".into()))?;
     let mut builder = InMemoryObjectBuilder::new(
-        Suite::try_from(1).map_err(|_| ApiError::internal("object suite"))?,
-        Some(expected.bytes),
-        expected.bytes,
+        Suite::try_from(expected.suite).map_err(|_| ApiError::internal("object suite"))?,
+        Some(expected.length),
+        expected.length,
     )
     .map_err(|_| conflict("build export verifier failed".into()))?;
     let mut upload = store
@@ -930,7 +933,7 @@ async fn upload_file(
             }
             total = total
                 .checked_add(used as u64)
-                .filter(|bytes| *bytes <= expected.bytes)
+                .filter(|bytes| *bytes <= expected.length)
                 .ok_or_else(|| conflict("export payload size changed".into()))?;
             builder
                 .update(&bytes)
@@ -946,7 +949,7 @@ async fn upload_file(
         let object = builder
             .finish()
             .map_err(|_| conflict("verify export payload failed".into()))?;
-        if total != expected.bytes || hex::encode(object.object_id().root) != expected.root {
+        if object.object_id() != expected {
             return Err(conflict(
                 "export payload does not match the frozen manifest".into(),
             ));

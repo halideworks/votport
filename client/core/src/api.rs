@@ -1467,7 +1467,7 @@ mod tests {
                 let result = crate::receive::write_verified(&mut |offset| {
                 let (response, start) = client.download("/file", None, &mut None, offset, 4)?;
                 Ok(crate::receive::Resumed { reader: Box::new(response), start })
-            }, &target, [0; 32], "unused", 4, 0, &mut crate::progress::Silent);
+            }, &target, &vot_object::ObjectId { suite: 1, root: [0; 32], length: 4 }, 0, &mut crate::progress::Silent);
                 let _ = sender.send(result);
             });
             let result = receiver.recv_timeout(Duration::from_secs(5)).expect("download stalled");

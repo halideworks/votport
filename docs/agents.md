@@ -196,12 +196,11 @@ operator session and write header. Creation accepts `label`, `directory`,
 
 ## Evidence and activity
 
-Delivery detail returns each file's VOT `suite`, `root`, `bytes`, base64 CBOR
-`receipt_b64`, `download_starts`, and first/last download timestamps. Receipts
-can be checked through `/api/verify` or the existing receipt library. A library
-receipt attests to the source object; it does not establish that a remote
-recipient finished downloading it. The normal Votport receive client verifies
-local bytes against their announced object identities.
+Delivery detail returns each file's VOT `suite`, `root`, `bytes`,
+`download_starts`, and first/last download timestamps. Preparing a library
+file hashes its content; it does not publish it through a VOT provider or
+produce a publication receipt. The Votport receive client verifies local
+bytes against their announced object identities.
 
 Delivery `state` is `active`, `expired`, or `revoked`; download limits and counters
 are reported separately. Counters record download starts, and the server cannot
