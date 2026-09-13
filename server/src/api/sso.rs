@@ -194,6 +194,7 @@ fn finish_sso_login(
         }
     }
     let mut grants = vec![auth::TenantGrant {
+        incarnation: None,
         tenant: String::new(),
         role: role.clone(),
     }];
@@ -207,6 +208,7 @@ fn finish_sso_login(
         };
         if groups.iter().any(|group| group == required) {
             grants.push(auth::TenantGrant {
+                incarnation: Some(tenant.incarnation.clone()),
                 tenant: tenant.key.clone(),
                 role: "admin".to_owned(),
             });
@@ -838,6 +840,103 @@ mod tests {
             .is_some());
     }
 
+    #[tokio::test]
+    async fn desktop_handoff_does_not_refresh_recreated_tenant_grants() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let application = crate::api::testing::build(directory.path());
+        let mut tenant = crate::store::tests::test_tenant("acme");
+        tenant.admin_group = Some("editors".into());
+        application.store.insert_tenant(tenant.clone()).unwrap();
+        let identity = finish_sso_login(
+            &application.store,
+            "editor",
+            "viewer".into(),
+            &["editors".into()],
+            false,
+        )
+        .unwrap();
+        let original = application
+            .store
+            .tenant("acme")
+            .unwrap()
+            .unwrap()
+            .incarnation;
+        assert_eq!(
+            identity.grants[1].incarnation.as_deref(),
+            Some(original.as_str())
+        );
+        let verifier = "ab".repeat(32);
+        let target = application
+            .desktop_sign_ins
+            .issue(
+                DesktopFlow {
+                    challenge: sha2::Sha256::digest(verifier.as_bytes()).into(),
+                    state: "cd".repeat(16),
+                },
+                identity,
+                crate::store::now_unix(),
+            )
+            .unwrap();
+        let code = target
+            .strip_prefix("votport://signin/")
+            .unwrap()
+            .split('?')
+            .next()
+            .unwrap()
+            .to_owned();
+        application.store.remove_tenant("acme").unwrap();
+        application.store.insert_tenant(tenant).unwrap();
+        assert_ne!(
+            application
+                .store
+                .tenant("acme")
+                .unwrap()
+                .unwrap()
+                .incarnation,
+            original
+        );
+        let response = sso_exchange(
+            State(application.clone()),
+            axum::Json(ExchangeParams { code, verifier }),
+        )
+        .await
+        .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let cookie = payload["cookie"].as_str().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, cookie.parse().unwrap());
+        let session = super::super::admin::require_admin(&application, &headers).unwrap();
+        assert_eq!(session.tenant, "");
+        assert_eq!(session.role, "viewer");
+        assert_eq!(session.grants.len(), 1);
+        assert_eq!(session.grants[0].tenant, "");
+        for (method, uri, body) in [
+            ("POST", "/api/admin/tenant", r#"{"tenant":"acme"}"#),
+            ("GET", "/api/admin/branding/acme", ""),
+        ] {
+            let response = crate::app::router(application.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header(header::COOKIE, cookie)
+                        .header("x-votport", "1")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+    }
+
     #[test]
     fn desktop_start_requires_a_complete_valid_binding() {
         assert!(StartParams::default().desktop().unwrap().is_none());
@@ -1071,6 +1170,7 @@ mod tests {
         let secret = [7u8; 32];
         let identity = AdminIdentity {
             grants: vec![crate::auth::TenantGrant {
+                incarnation: None,
                 tenant: "acme".to_owned(),
                 role: "viewer".to_owned(),
             }],

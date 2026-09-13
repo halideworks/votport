@@ -934,7 +934,7 @@ mod tests {
             .is_none());
         job.tenant = "cleanup".into();
         store.with(|c| {
-            c.execute("INSERT INTO tenants(key,label) VALUES ('cleanup','Restored tenant')", [])?;
+            c.execute("INSERT INTO tenants(key,label,incarnation) VALUES ('cleanup','Restored tenant','00000000000000000000000000000000')", [])?;
             c.execute("INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,document) VALUES (?1,'cleanup','sender','operation','project','suspended',0,?2)", params![job.id,serde_json::to_string(&job).unwrap()])?;
             Ok(())
         }).unwrap();

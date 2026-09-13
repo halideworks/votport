@@ -307,6 +307,7 @@ mod tests {
             tenant: tenant.into(),
             role: role.into(),
             grants: vec![TenantGrant {
+                incarnation: None,
                 tenant: tenant.into(),
                 role: role.into(),
             }],
@@ -322,6 +323,7 @@ mod tests {
     }
     fn tenant(key: &str) -> Tenant {
         Tenant {
+            incarnation: String::new(),
             key: key.into(),
             label: key.into(),
             admin_group: None,

@@ -601,7 +601,7 @@ mod tests {
                 store
                     .with(|c| {
                         c.execute(
-                            "INSERT INTO tenants(key,label) VALUES ('cleanup','Cleanup')",
+                            "INSERT INTO tenants(key,label,incarnation) VALUES ('cleanup','Cleanup','00000000000000000000000000000000')",
                             [],
                         )
                     })
