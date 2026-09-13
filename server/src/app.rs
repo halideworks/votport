@@ -4054,9 +4054,7 @@ fn expire_link_uploads_sync(app: &App, candidate: crate::store::Link, cutoff: u6
             .iter()
             .map(|file| file.stored_as.as_str())
             .collect();
-        if !app.store.tombstone_files(&link.tenant, &link.id, |file| {
-            paths.contains(file.stored_as.as_str())
-        })? {
+        if !app.store.tombstone_files(&link.tenant, &link.id, &paths)? {
             return Err("request disappeared before retention; files were retained".into());
         }
         let mut removed = 0;
@@ -4739,7 +4737,7 @@ mod retention_tests {
 
         connection
             .execute_batch(
-                "CREATE TRIGGER fail_link_update BEFORE UPDATE ON links
+                "CREATE TRIGGER fail_link_update BEFORE UPDATE ON files
                  BEGIN SELECT RAISE(FAIL, 'test update failure'); END;",
             )
             .unwrap();

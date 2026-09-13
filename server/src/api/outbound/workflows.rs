@@ -2144,10 +2144,7 @@ mod tests {
             app.store.append_upload("", &link.id, upload).unwrap();
             assert!(app.store.receive_workflow_pending("", &link.id).unwrap());
             assert!(app.store.remove_link("", &link.id).is_err());
-            assert!(app
-                .store
-                .update_link_uploads("", &link.id, |link| link.uploads.clear())
-                .is_err());
+            assert!(app.store.remove_upload("", &link.id, "complete").is_err());
             assert_eq!(
                 call(
                     &app,

@@ -1654,15 +1654,10 @@ pub async fn create_outbound_grant(
         .sessions
         .try_pin_link(&link_id)
         .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "link lifecycle update in progress"))?;
-    let link = app
+    let upload = app
         .store
-        .link(&identity.tenant, &link_id)
+        .link_upload(&identity.tenant, &link_id, &upload_id)
         .map_err(super::store_unavailable)?
-        .ok_or_else(ApiError::not_found)?;
-    let upload = link
-        .uploads
-        .iter()
-        .find(|upload| upload.id == upload_id)
         .ok_or_else(ApiError::not_found)?;
     let file = upload
         .files
@@ -5712,8 +5707,11 @@ mod tests {
     async fn download_headers_preserve_unicode_file_and_receipt_names() {
         let (_directory, app, cookie, _) = fixture().await;
         app.store
-            .update_link_uploads("", "link", |link| {
-                link.uploads[0].files[0].path = "folder/納品 café.mov".into();
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE files SET path=?1 WHERE link_id='link' AND file_index=0",
+                    ["folder/納品 café.mov"],
+                )
             })
             .unwrap();
         let response = crate::app::router(app.clone())

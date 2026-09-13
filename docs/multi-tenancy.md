@@ -31,9 +31,14 @@ sharing feature; if two teams need the same drop folder, that is one tenant.
 
 VOTPort uses bundled SQLite in `data/votport.db`, with WAL mode and
 `synchronous=FULL`. Links, audit events, tenant quotas and settings share the
-store. Completed uploads and capped session events remain embedded in each link;
-an exact-byte `files` projection is updated atomically for quota and holdings
-accounting.
+store. Each upload has an indexed header and file count keyed by request and
+upload ID. File records are stored once in typed `files` rows, with stable upload
+IDs and file indices. Full upload reads assemble those rows; tombstones update
+selected stored paths without rewriting upload headers. Capped session events
+stay on the request row. File rows also supply exact-byte quota and holdings
+accounting. Completion records, route and workflow effects, and the session
+completion marker commit together. The current schema is 39; startup
+and restore refuse earlier schemas without conversion.
 
 An empty database receives the complete current schema in one transaction.
 Existing databases must match the binary's schema version and use the reserved

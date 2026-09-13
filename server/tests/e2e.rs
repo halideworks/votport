@@ -4410,7 +4410,7 @@ async fn native_push_store_failure_preserves_published_files_for_retry() {
         .unwrap()
         .execute_batch(
             "CREATE TRIGGER fail_push_record
-             BEFORE UPDATE OF uploads_json ON links
+             BEFORE INSERT ON link_uploads
              BEGIN SELECT RAISE(FAIL, 'blocked push record'); END;",
         )
         .unwrap();
