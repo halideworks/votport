@@ -329,3 +329,34 @@ jobs:
             TRADE_PEER_ADDRESS=http://votport-browser-peer:8080 ADMIN_PASSWORD="$ADMIN_PASSWORD" \
             WORKFLOW_TEST_ROOT="$e2e_root" NOTIFY_TEST_HOST=host.docker.internal NOTIFY_TEST_BIND=0.0.0.0 \
             node scripts/trade-routes-browser-e2e.mjs
+
+      - name: Run shared and replica restart drills
+        timeout-minutes: 10
+        run: |
+          set -Eeuo pipefail
+          RESTART_TEST_ROOT="$(mktemp -d)"
+          export RESTART_TEST_ROOT PORT=18080
+          cleanup() {
+            status=$?
+            docker rm -f votport-restart-18080 votport-restart-18081 >/dev/null 2>&1 || true
+            rm -rf "$RESTART_TEST_ROOT"
+            exit "$status"
+          }
+          trap cleanup EXIT
+          cat > "$RESTART_TEST_ROOT/votport" <<'SH'
+          #!/bin/sh
+          set -eu
+          exec docker run --rm --init --name "votport-restart-${VOTPORT_BIND##*:}" \
+            --network host --user "$(id -u):$(id -g)" \
+            --mount "type=bind,src=$RESTART_TEST_ROOT,dst=$RESTART_TEST_ROOT" \
+            -e VOTPORT_BIND -e VOTPORT_PUBLIC_URL -e VOTPORT_DATA_DIR \
+            -e VOTPORT_RECEIVE_DIR -e VOTPORT_OUTBOUND_DIR \
+            -e VOTPORT_WEB_ROOT=/app/web -e VOTPORT_ADMIN_PASSWORD \
+            -e VOTPORT_MAX_UPLOAD_BYTES -e VOTPORT_REPLICA_TOKEN \
+            -e VOTPORT_STANDBY_SOURCE -e VOTPORT_STANDBY_INTERVAL_SECS \
+            -e RUST_LOG votport:ci /app/votport "$@"
+          SH
+          chmod 700 "$RESTART_TEST_ROOT/votport"
+          export VOTPORT_BIN="$RESTART_TEST_ROOT/votport" TMPDIR="$RESTART_TEST_ROOT"
+          MODE=shared node scripts/restart-e2e.mjs
+          MODE=replica node scripts/restart-e2e.mjs

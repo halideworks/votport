@@ -867,13 +867,14 @@ MODE=shared  node scripts/restart-e2e.mjs   # SIGTERM mid-upload, same directori
 MODE=replica node scripts/restart-e2e.mjs   # standby pulls, live stops, standby promoted
 ```
 
-Each run uploads a large file through the browser, stops the live process
-while the transfer is in flight, checks that the clean stop yielded the
-lease and that the next instance holds it, and requires the same upload to
-finish byte-identical with a receipt. The replica run additionally waits for
-the standby to stage a copy taken after the upload began, promotes the
-standby by starting `votport` over its data directory, and checks that the
-pending restore was consumed.
+Each run uploads a 16 MiB file through Chromium and holds later chunk
+requests until the live process has stopped. It checks the suspended payload
+and journal, the retained lease lock inode, and the next instance's ownership.
+The same session must resume verified progress, publish the retained payload
+inode byte-identical, and produce a receipt authenticated by the original key.
+Payload hashes use streaming reads. The replica run starts with an empty
+standby data directory, stages a copy after the first progress checkpoint,
+promotes the standby, and checks that the pending restore was consumed.
 
 What this does not give: two live instances. The single SQLite writer, the
 process-wide publication lock, and the in-memory session registry are the
