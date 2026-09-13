@@ -195,7 +195,11 @@ container user; blank uses `<data_dir>/backups` (normally `/data/backups`). A
 custom path must already exist with no symlink or group/other-writable ancestor.
 A dedicated host directory must be mounted at that container path. S3 uploads
 use the configured bucket and prefix. The UI reports credential and passphrase
-configured flags, never their values.
+configured flags, never their values. A pending restore or an unreadable restore
+marker pauses scheduled backups. The System page shows the current reason
+without replacing the last backup result. The scheduler checks again each
+minute and resumes when the blocker clears; applying a restore still requires
+a restart.
 
 Pruning is owned by VOTPort for snapshots it created under the configured
 local path and for generated `votport-backup-v2-*` objects under the configured

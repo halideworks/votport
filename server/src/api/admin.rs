@@ -1577,6 +1577,7 @@ pub async fn get_backups(
     let _identity = require_platform_admin(&app, &headers)?;
     let guard = app.backup_lock.try_lock().ok();
     let busy = guard.is_none();
+    let paused_reason = crate::backup::ensure_no_pending_restore(&app.config.data_dir).err();
     let config = crate::backup::decode_config(
         app.store
             .setting(crate::backup::SETTING_KEY)
@@ -1593,6 +1594,7 @@ pub async fn get_backups(
             Err(error) => (Vec::new(), Some(error)),
         };
     if !busy
+        && paused_reason.is_none()
         && matches!(
             config.destination,
             crate::backup::Destination::S3 | crate::backup::Destination::Both
@@ -1612,7 +1614,8 @@ pub async fn get_backups(
         "config": config.public(&secrets),
         "inventory": inventory,
         "inventory_error": inventory_error.map(|error| error.chars().take(512).collect::<String>()),
-        "status": status
+        "status": status,
+        "paused_reason": paused_reason
     })))
 }
 
@@ -6069,12 +6072,104 @@ mod backup_tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
 
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            crate::backup::scheduler(application),
-        )
-        .await
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(80),
+                crate::backup::scheduler(application),
+            )
+            .await
+            .is_err(),
+            "pending restore must leave the scheduler paused and alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_pause_reports_current_restore_blocker_without_replacing_history() {
+        use crate::backup::{BackupConfig, BackupSecrets, BackupStatus, Destination};
+
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = login(application.clone()).await;
+        let data_dir = &application.config.data_dir;
+        let backup_dir = crate::backup::ensure_backups_dir(data_dir).unwrap();
+        let local_inventory_error = crate::backup::inventory_local_root(&backup_dir).err();
+        let history = serde_json::to_vec(&BackupStatus {
+            last_attempt_at: Some(123),
+            last_success_at: Some(100),
+            last_error: Some("previous upload failed".into()),
+            ..BackupStatus::default()
+        })
         .unwrap();
+        let status_path = data_dir.join(crate::backup::STATUS_FILE);
+        std::fs::write(&status_path, &history).unwrap();
+        crate::backup::write_secrets(
+            data_dir,
+            &BackupSecrets {
+                access_key_id: Some("test-key".into()),
+                secret_access_key: Some("test-secret".into()),
+                ..BackupSecrets::default()
+            },
+        )
+        .unwrap();
+        let pending = data_dir.join(crate::backup::PENDING_FILE);
+        for state in ["pending", "unreadable", "cleared"] {
+            if state == "pending" {
+                std::fs::write(&pending, b"pending").unwrap();
+            } else {
+                std::fs::remove_file(&pending).unwrap();
+                if state == "unreadable" {
+                    std::os::unix::fs::symlink(&pending, &pending).unwrap();
+                }
+            }
+            let expected_pause = crate::backup::ensure_no_pending_restore(data_dir).err();
+            assert_eq!(expected_pause.is_some(), state != "cleared");
+            let config = BackupConfig {
+                destination: if state == "cleared" {
+                    Destination::Local
+                } else {
+                    Destination::S3
+                },
+                s3_endpoint: Some("http://127.0.0.1:1".into()),
+                s3_region: Some("us-east-1".into()),
+                s3_bucket: Some("backups".into()),
+                s3_path_style: true,
+                ..BackupConfig::default()
+            };
+            application
+                .store
+                .put_settings(
+                    "test",
+                    &[(
+                        crate::backup::SETTING_KEY.into(),
+                        crate::store::SettingWrite::Set(serde_json::to_string(&config).unwrap()),
+                    )],
+                )
+                .unwrap();
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                app::router(application.clone()).oneshot(
+                    Request::get("/api/admin/backups")
+                        .header("cookie", &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .expect("restore pause must not wait for remote inventory")
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(body["paused_reason"], serde_json::json!(expected_pause));
+            assert_eq!(
+                body["inventory_error"],
+                serde_json::json!(local_inventory_error)
+            );
+            assert_eq!(body["status"]["last_success_at"], 100);
+            assert_eq!(body["status"]["last_error"], "previous upload failed");
+            assert_eq!(std::fs::read(&status_path).unwrap(), history);
+        }
     }
 
     #[tokio::test]

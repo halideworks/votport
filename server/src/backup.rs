@@ -1709,8 +1709,12 @@ fn backup_lock_warning_due(
 }
 
 pub async fn scheduler(app: Arc<crate::app::App>) {
+    scheduler_with_interval(app, std::time::Duration::from_secs(60)).await;
+}
+
+async fn scheduler_with_interval(app: Arc<crate::app::App>, interval: std::time::Duration) {
     let mut busy_since = None;
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;
         let Ok(_guard) = app.backup_lock.try_lock() else {
@@ -1735,8 +1739,8 @@ pub async fn scheduler(app: Arc<crate::app::App>) {
         };
         busy_since = None;
         if let Err(error) = ensure_no_pending_restore(&app.config.data_dir) {
-            tracing::info!("backup scheduler stopped: {error}");
-            return;
+            tracing::error!("backup scheduler paused: {error}");
+            continue;
         }
         let setting = match app.store.setting(SETTING_KEY) {
             Ok(setting) => setting,
@@ -2944,6 +2948,74 @@ mod tests {
         }
         stop.send(()).unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduler_pauses_without_changing_history_and_resumes_after_restore_clears() {
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(root.path());
+        let config = BackupConfig {
+            enabled: true,
+            ..BackupConfig::default()
+        };
+        app.store
+            .put_settings(
+                "test",
+                &[(
+                    SETTING_KEY.into(),
+                    crate::store::SettingWrite::Set(serde_json::to_string(&config).unwrap()),
+                )],
+            )
+            .unwrap();
+        write_status(
+            &app.config.data_dir,
+            BackupStatus {
+                last_attempt_at: Some(1),
+                last_success_at: Some(1),
+                last_error: Some("previous attempt failed".into()),
+                ..BackupStatus::default()
+            },
+        )
+        .unwrap();
+        let status_path = app.config.data_dir.join(STATUS_FILE);
+        let history = fs::read(&status_path).unwrap();
+        let archive_root = ensure_backups_dir(&app.config.data_dir).unwrap();
+        let pending = app.config.data_dir.join(PENDING_FILE);
+        fs::write(&pending, b"pending").unwrap();
+        let mut worker = Box::pin(scheduler_with_interval(
+            Arc::clone(&app),
+            Duration::from_millis(20),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), &mut worker)
+                .await
+                .is_err(),
+            "pending restore must pause the scheduler, not terminate it"
+        );
+        assert_eq!(fs::read(&status_path).unwrap(), history);
+        assert!(local_files(&archive_root).unwrap().is_empty());
+
+        fs::remove_file(pending).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = &mut worker => panic!("scheduler terminated after the restore cleared"),
+                _ = async {
+                    loop {
+                        let status = read_status(&app.config.data_dir).unwrap();
+                        if status.last_success_at.is_some_and(|at| at > 1) {
+                            assert!(status.last_error.is_none());
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } => {}
+            }
+        })
+        .await
+        .expect("same scheduler must resume and complete a backup");
+        assert_eq!(local_files(&archive_root).unwrap().len(), 1);
     }
 
     #[test]

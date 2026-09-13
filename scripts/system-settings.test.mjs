@@ -210,3 +210,31 @@ test('filesystem notices follow detected profiles and clear stale warnings', () 
     }
   }
 });
+
+test('backup pause overrides activity and clears without replacing run history', () => {
+  const elements = new Map();
+  const context = {
+    $(id) {
+      if (!elements.has(id)) elements.set(id, { textContent: '', hidden: false, replaceChildren() {}, add() {} });
+      return elements.get(id);
+    },
+    document: { createElement() { return {}; } },
+    isFormDirty: () => true,
+    formatWhen: String,
+  };
+  runInNewContext(script.slice(script.indexOf('function fillBackups('), script.indexOf('function setBackupActions(')), context);
+  const data = { inventory: [], status: { running: true, last_success_at: 123, last_error: 'Upload failed' }, paused_reason: 'restore pending; restart required' };
+  context.fillBackups(data);
+  assert.equal(elements.get('backup-status').textContent, 'Backups paused: restore pending; restart required');
+  assert.equal(elements.get('backup-status-error').hidden, false);
+  assert.equal(elements.get('backup-status-error').textContent, 'Upload failed');
+  data.status.running = false;
+  data.status.last_error = null;
+  context.fillBackups(data);
+  assert.match(elements.get('backup-status').textContent, /^Backups paused:/);
+  assert.equal(elements.get('backup-status-error').hidden, true);
+  data.paused_reason = null;
+  context.fillBackups(data);
+  assert.equal(elements.get('backup-status').textContent, 'Last successful run 123');
+  assert.equal(elements.get('backup-status-error').hidden, true);
+});
