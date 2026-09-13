@@ -5707,7 +5707,12 @@ mod tests {
     async fn download_headers_preserve_unicode_file_and_receipt_names() {
         let (_directory, app, cookie, _) = fixture().await;
         app.store
-            .with(|connection| connection.execute("UPDATE link_uploads SET document=json_set(document,'$.files[0].path',?1) WHERE link_id='link'", ["folder/納品 café.mov"]))
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE files SET path=?1 WHERE link_id='link' AND file_index=0",
+                    ["folder/納品 café.mov"],
+                )
+            })
             .unwrap();
         let response = crate::app::router(app.clone())
             .oneshot(

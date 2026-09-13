@@ -2083,20 +2083,16 @@ mod tests {
             }
             store
                 .with(|c| {
-                    c.execute(
-                        "UPDATE link_uploads SET document=?1 WHERE link_id='incoming' AND upload_id='received'",
-                        [serde_json::to_string(&changed).unwrap()],
-                    )
+                    super::write_upload(c, "", "incoming", &changed)?;
+                    super::sync_upload_files(c, "incoming", "", &changed)
                 })
                 .unwrap();
             assert!(attempt().is_err(), "{change}");
         }
         store
             .with(|c| {
-                c.execute(
-                    "UPDATE link_uploads SET document=?1 WHERE link_id='incoming' AND upload_id='received'",
-                    [serde_json::to_string(&uploaded).unwrap()],
-                )
+                super::write_upload(c, "", "incoming", &uploaded)?;
+                super::sync_upload_files(c, "incoming", "", &uploaded)
             })
             .unwrap();
         store.with(|c| c.execute("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1000) INSERT INTO delivery_jobs(id,tenant,actor,operation_id,project_id,state,not_before,document,token) SELECT 'busy_'||i,'','sender','busy_'||i,'project','queued',0,'{}','unused' FROM n",[])).unwrap();

@@ -4737,7 +4737,7 @@ mod retention_tests {
 
         connection
             .execute_batch(
-                "CREATE TRIGGER fail_link_update BEFORE UPDATE ON link_uploads
+                "CREATE TRIGGER fail_link_update BEFORE UPDATE ON files
                  BEGIN SELECT RAISE(FAIL, 'test update failure'); END;",
             )
             .unwrap();

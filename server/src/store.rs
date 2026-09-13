@@ -1,8 +1,8 @@
 //! Persistent state: request links and their completed uploads.
 //!
 //! SQLite (WAL, synchronous FULL) in the data directory. Request metadata
-//! and each upload are stored separately. Mutations commit
-//! durably before returning; capped session events stay on the link row.
+//! and upload headers are stored separately from typed file records. Mutations
+//! commit durably before returning; capped session events stay on the link row.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,7 +27,7 @@ pub use evidence::*;
 pub use routes::{InboundRoute, OutboundControl};
 pub use webhooks::*;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FileRecord {
     /// Path as named inside the uploaded package.
     pub path: String,
@@ -70,7 +70,7 @@ pub struct SessionEvent {
     pub rejected_chunks: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UploadRecord {
     pub id: String,
     /// When the session was created; 0 on records from before this field.
@@ -519,6 +519,10 @@ CREATE TABLE IF NOT EXISTS files (
     bytes_lo INTEGER NOT NULL,
     deleted INTEGER NOT NULL DEFAULT 0,
     stored_as TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL,
+    suite TEXT NOT NULL,
+    root TEXT NOT NULL,
+    receipt INTEGER NOT NULL,
     PRIMARY KEY (link_id, upload_id, file_index)
 );
 CREATE INDEX IF NOT EXISTS files_tenant_live ON files(tenant, deleted, bytes_hi, bytes_lo);
@@ -529,6 +533,7 @@ CREATE TABLE IF NOT EXISTS link_uploads (
     tenant TEXT NOT NULL,
     upload_id TEXT NOT NULL,
     document TEXT NOT NULL,
+    file_count INTEGER NOT NULL,
     UNIQUE(link_id, upload_id)
 );
 CREATE INDEX IF NOT EXISTS link_uploads_tenant ON link_uploads(tenant);
@@ -1194,14 +1199,13 @@ impl Store {
                 .prepare_cached(
                     "SELECT links.id, links.label,
                             upload.upload_id,
-                            json_extract(file.value, '$.path'),
-                            json_extract(file.value, '$.bytes'),
+                            file.path, file.bytes_hi, file.bytes_lo,
                             json_extract(upload.document, '$.completed_at')
-                     FROM links JOIN link_uploads AS upload ON upload.link_id=links.id,
-                          json_each(upload.document, '$.files') AS file
+                     FROM links JOIN link_uploads AS upload ON upload.link_id=links.id
+                     JOIN files AS file ON file.link_id=upload.link_id AND file.upload_id=upload.upload_id
                      WHERE links.tenant = ?1
-                       AND COALESCE(json_extract(file.value, '$.deleted'), 0) = 0
-                       AND lower(json_extract(file.value, '$.path')) LIKE ?2 ESCAPE '\\'
+                       AND file.deleted = 0
+                       AND lower(file.path) LIKE ?2 ESCAPE '\\'
                      ORDER BY json_extract(upload.document, '$.completed_at') DESC LIMIT ?3",
                 )?
                 .query_map(rusqlite::params![tenant, needle, limit], |row| {
@@ -1210,11 +1214,9 @@ impl Store {
                         link_label: row.get(1)?,
                         upload_id: row.get(2)?,
                         path: row.get(3)?,
-                        bytes: row
-                            .get::<_, i64>(4)
-                            .map(|n| u64::try_from(n).unwrap_or(0))?,
+                        bytes: (u64::from(row.get::<_, u32>(4)?) << 32) | u64::from(row.get::<_, u32>(5)?),
                         completed_at: row
-                            .get::<_, i64>(5)
+                            .get::<_, i64>(6)
                             .map(|at| u64::try_from(at).unwrap_or(0))?,
                     })
                 })?
@@ -1491,7 +1493,7 @@ impl Store {
         upload: UploadRecord,
         session: Option<&str>,
     ) -> Result<Option<String>, String> {
-        let upload_json = serde_json::to_string(&upload).map_err(|e| e.to_string())?;
+        let upload_json = upload_header_json(&upload).map_err(|e| e.to_string())?;
         let mut connection = self.connection.lock().expect("store poisoned");
         let transaction = connection.transaction().map_err(|e| e.to_string())?;
         if let Some(session) = session {
@@ -1520,7 +1522,7 @@ impl Store {
             if let Some(previous) =
                 read_upload(&transaction, tenant, id, &upload.id).map_err(|e| e.to_string())?
             {
-                if serde_json::to_string(&previous).map_err(|e| e.to_string())? != upload_json {
+                if previous != upload {
                     return Err("upload identity changed".into());
                 }
                 workflows::queue_received(&transaction, &self.event_signer, tenant, id, &upload)?;
@@ -1568,8 +1570,8 @@ impl Store {
         }
         transaction
             .execute(
-                "INSERT INTO link_uploads(link_id,tenant,upload_id,document) VALUES (?1,?2,?3,?4)",
-                rusqlite::params![id, tenant, upload.id, upload_json],
+                "INSERT INTO link_uploads(link_id,tenant,upload_id,document,file_count) VALUES (?1,?2,?3,?4,?5)",
+                rusqlite::params![id, tenant, upload.id, upload_json, i64::try_from(upload.files.len()).unwrap_or(i64::MAX)],
             )
             .map_err(|e| e.to_string())?;
         if let Some(session) = session {
@@ -1608,36 +1610,15 @@ impl Store {
         if read_link_metadata(&transaction, tenant, id)?.is_none() {
             return Ok(false);
         }
-        let mut uploads = std::collections::BTreeSet::new();
         {
-            let mut statement = transaction
-                .prepare_cached(
-                    "SELECT upload_id FROM files WHERE link_id=?1 AND stored_as=?2 AND deleted=0",
-                )
-                .map_err(|e| e.to_string())?;
+            let mut statement = transaction.prepare_cached(
+                "UPDATE files SET deleted=1 WHERE tenant=?1 AND link_id=?2 AND stored_as=?3 AND deleted=0",
+            ).map_err(|e| e.to_string())?;
             for path in stored_paths {
-                for upload in statement
-                    .query_map([id, path], |row| row.get::<_, String>(0))
-                    .map_err(|e| e.to_string())?
-                {
-                    uploads.insert(upload.map_err(|e| e.to_string())?);
-                }
+                statement
+                    .execute(rusqlite::params![tenant, id, path])
+                    .map_err(|e| e.to_string())?;
             }
-        }
-        for upload_id in uploads {
-            let mut upload = read_upload(&transaction, tenant, id, &upload_id)
-                .map_err(|e| e.to_string())?
-                .ok_or("file upload record is missing")?;
-            for (index, file) in upload.files.iter_mut().enumerate() {
-                if !file.deleted && stored_paths.contains(file.stored_as.as_str()) {
-                    file.deleted = true;
-                    transaction.execute(
-                        "UPDATE files SET deleted=1 WHERE link_id=?1 AND upload_id=?2 AND file_index=?3",
-                        rusqlite::params![id, upload_id, i64::try_from(index).unwrap_or(i64::MAX)],
-                    ).map_err(|e| e.to_string())?;
-                }
-            }
-            write_upload(&transaction, tenant, id, &upload).map_err(|e| e.to_string())?;
         }
         transaction.commit().map_err(|e| e.to_string())?;
         Ok(true)
@@ -3874,13 +3855,13 @@ fn insert_link_row(connection: &Connection, link: &Link) -> rusqlite::Result<()>
     )?;
     for upload in &link.uploads {
         connection.execute(
-            "INSERT INTO link_uploads(link_id,tenant,upload_id,document) VALUES (?1,?2,?3,?4)",
+            "INSERT INTO link_uploads(link_id,tenant,upload_id,document,file_count) VALUES (?1,?2,?3,?4,?5)",
             rusqlite::params![
                 link.id,
                 link.tenant,
                 upload.id,
-                serde_json::to_string(upload)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+                upload_header_json(upload)?,
+                i64::try_from(upload.files.len()).unwrap_or(i64::MAX)
             ],
         )?;
         insert_upload_files(connection, &link.id, &link.tenant, upload)?;
@@ -3899,10 +3880,27 @@ fn write_link_row(connection: &Connection, link: &Link) -> rusqlite::Result<()> 
     Ok(())
 }
 
+fn upload_header_json(upload: &UploadRecord) -> rusqlite::Result<String> {
+    let header = UploadRecord {
+        id: upload.id.clone(),
+        started_at: upload.started_at,
+        completed_at: upload.completed_at,
+        replayed_chunks: upload.replayed_chunks,
+        rejected_chunks: upload.rejected_chunks,
+        transport: upload.transport.clone(),
+        package_root: upload.package_root.clone(),
+        total_bytes: upload.total_bytes,
+        files: Vec::new(),
+        partial: upload.partial,
+        log: upload.log.clone(),
+    };
+    serde_json::to_string(&header).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+}
+
 fn read_uploads(connection: &Connection, id: &str) -> rusqlite::Result<Vec<UploadRecord>> {
     connection
-        .prepare_cached("SELECT document FROM link_uploads WHERE link_id=?1 ORDER BY rowid")?
-        .query_map([id], |row| parse_json(&row.get::<_, String>(0)?, 0))?
+        .prepare_cached("SELECT document,file_count,upload_id,tenant FROM link_uploads WHERE link_id=?1 ORDER BY position")?
+        .query_map([id], |row| hydrate_upload(connection, id, row))?
         .collect()
 }
 
@@ -3914,13 +3912,60 @@ fn read_upload(
 ) -> rusqlite::Result<Option<UploadRecord>> {
     connection
         .prepare_cached(
-            "SELECT document FROM link_uploads WHERE tenant=?1 AND link_id=?2 AND upload_id=?3
+            "SELECT document,file_count,upload_id,tenant FROM link_uploads WHERE tenant=?1 AND link_id=?2 AND upload_id=?3
          AND EXISTS(SELECT 1 FROM links WHERE tenant=?1 AND id=?2)",
         )?
-        .query_row([tenant, link_id, upload_id], |row| {
-            parse_json(&row.get::<_, String>(0)?, 0)
-        })
+        .query_row([tenant, link_id, upload_id], |row| hydrate_upload(connection, link_id, row))
         .optional()
+}
+
+fn hydrate_upload(
+    connection: &Connection,
+    link_id: &str,
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<UploadRecord> {
+    let mut upload: UploadRecord = parse_json(&row.get::<_, String>(0)?, 0)?;
+    let count: i64 = row.get(1)?;
+    let id: String = row.get(2)?;
+    let tenant: String = row.get(3)?;
+    let invalid = || {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            "upload file records do not match their header".into(),
+        )
+    };
+    if upload.id != id || !upload.files.is_empty() {
+        return Err(invalid());
+    }
+    let mut statement = connection.prepare_cached(
+        "SELECT file_index,path,stored_as,bytes_hi,bytes_lo,suite,root,receipt,deleted
+         FROM files WHERE tenant=?1 AND link_id=?2 AND upload_id=?3 ORDER BY file_index",
+    )?;
+    let mut rows = statement.query([tenant.as_str(), link_id, id.as_str()])?;
+    while let Some(row) = rows.next()? {
+        let index: i64 = row.get(0)?;
+        if index != i64::try_from(upload.files.len()).unwrap_or(i64::MAX) || index >= count {
+            return Err(invalid());
+        }
+        upload.files.push(row_to_upload_file(row)?);
+    }
+    if i64::try_from(upload.files.len()).unwrap_or(i64::MAX) != count {
+        return Err(invalid());
+    }
+    Ok(upload)
+}
+
+fn row_to_upload_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
+    Ok(FileRecord {
+        path: row.get(1)?,
+        stored_as: row.get(2)?,
+        bytes: (u64::from(row.get::<_, u32>(3)?) << 32) | u64::from(row.get::<_, u32>(4)?),
+        suite: row.get(5)?,
+        root: row.get(6)?,
+        receipt: row.get(7)?,
+        deleted: row.get(8)?,
+    })
 }
 
 fn write_upload(
@@ -3930,14 +3975,8 @@ fn write_upload(
     upload: &UploadRecord,
 ) -> rusqlite::Result<()> {
     connection.execute(
-        "UPDATE link_uploads SET document=?4 WHERE tenant=?1 AND link_id=?2 AND upload_id=?3",
-        rusqlite::params![
-            tenant,
-            id,
-            upload.id,
-            serde_json::to_string(upload)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
-        ],
+        "UPDATE link_uploads SET document=?4,file_count=?5 WHERE tenant=?1 AND link_id=?2 AND upload_id=?3",
+        rusqlite::params![tenant, id, upload.id, upload_header_json(upload)?, i64::try_from(upload.files.len()).unwrap_or(i64::MAX)],
     )?;
     Ok(())
 }
@@ -3958,8 +3997,8 @@ fn insert_upload_files(
     upload: &UploadRecord,
 ) -> rusqlite::Result<()> {
     let mut insert = connection.prepare_cached(
-        "INSERT INTO files(link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,deleted,stored_as)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        "INSERT INTO files(link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,deleted,stored_as,path,suite,root,receipt)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
     )?;
     for (index, file) in upload.files.iter().enumerate() {
         let (hi, lo) = split_bytes(file.bytes);
@@ -3971,7 +4010,11 @@ fn insert_upload_files(
             hi,
             lo,
             file.deleted,
-            file.stored_as
+            file.stored_as,
+            file.path,
+            file.suite,
+            file.root,
+            file.receipt
         ])?;
     }
     Ok(())
@@ -3983,52 +4026,42 @@ fn sync_upload_files(
     tenant: &str,
     upload: &UploadRecord,
 ) -> rusqlite::Result<()> {
-    let mut existing = {
-        let mut statement = connection.prepare_cached(
-            "SELECT file_index,bytes_hi,bytes_lo,deleted,stored_as FROM files WHERE link_id=?1 AND upload_id=?2",
-        )?;
-        let rows = statement.query_map([link_id, &upload.id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                (
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, bool>(3)?,
-                    row.get::<_, String>(4)?,
-                ),
-            ))
-        })?;
-        rows.collect::<rusqlite::Result<HashMap<_, _>>>()?
-    };
+    // Compare in SQLite so recovery does not duplicate the full file list in a map.
     let mut upsert = connection.prepare_cached(
-        "INSERT INTO files(link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,deleted,stored_as)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+        "INSERT INTO files(link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,deleted,stored_as,path,suite,root,receipt)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
          ON CONFLICT(link_id,upload_id,file_index) DO UPDATE SET
-         tenant=excluded.tenant,bytes_hi=excluded.bytes_hi,bytes_lo=excluded.bytes_lo,deleted=excluded.deleted,stored_as=excluded.stored_as",
+         tenant=excluded.tenant,bytes_hi=excluded.bytes_hi,bytes_lo=excluded.bytes_lo,deleted=excluded.deleted,stored_as=excluded.stored_as,
+         path=excluded.path,suite=excluded.suite,root=excluded.root,receipt=excluded.receipt
+         WHERE (tenant,bytes_hi,bytes_lo,deleted,stored_as,path,suite,root,receipt)
+            IS NOT (excluded.tenant,excluded.bytes_hi,excluded.bytes_lo,excluded.deleted,excluded.stored_as,excluded.path,excluded.suite,excluded.root,excluded.receipt)",
     )?;
     for (index, file) in upload.files.iter().enumerate() {
         let index = i64::try_from(index).unwrap_or(i64::MAX);
         let (hi, lo) = split_bytes(file.bytes);
-        if existing.remove(&index).as_ref() != Some(&(hi, lo, file.deleted, file.stored_as.clone()))
-        {
-            upsert.execute(rusqlite::params![
-                link_id,
-                tenant,
-                upload.id,
-                index,
-                hi,
-                lo,
-                file.deleted,
-                file.stored_as
-            ])?;
-        }
+        upsert.execute(rusqlite::params![
+            link_id,
+            tenant,
+            upload.id,
+            index,
+            hi,
+            lo,
+            file.deleted,
+            file.stored_as,
+            file.path,
+            file.suite,
+            file.root,
+            file.receipt
+        ])?;
     }
-    for index in existing.keys() {
-        connection.execute(
-            "DELETE FROM files WHERE link_id=?1 AND upload_id=?2 AND file_index=?3",
-            rusqlite::params![link_id, upload.id, index],
-        )?;
-    }
+    connection.execute(
+        "DELETE FROM files WHERE link_id=?1 AND upload_id=?2 AND file_index>=?3",
+        rusqlite::params![
+            link_id,
+            upload.id,
+            i64::try_from(upload.files.len()).unwrap_or(i64::MAX)
+        ],
+    )?;
     Ok(())
 }
 
@@ -5177,8 +5210,8 @@ pub(crate) mod tests {
         let store = Store::open(directory.path()).unwrap();
         let residue = |tenant: &str| {
             store.with(|connection| {
-                connection.execute("INSERT INTO link_uploads(link_id,tenant,upload_id,document) VALUES (?1,?1,'retained','{}')", [tenant])?;
-                connection.execute("INSERT INTO files(link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,stored_as) VALUES (?1,?1,'retained',0,0,8,'frame')", [tenant])
+                connection.execute("INSERT INTO link_uploads(link_id,tenant,upload_id,document,file_count) VALUES (?1,?1,'retained','{}',1)", [tenant])?;
+                connection.execute("INSERT INTO files(link_id,tenant,upload_id,file_index,bytes_hi,bytes_lo,stored_as,path,suite,root,receipt) VALUES (?1,?1,'retained',0,0,8,'frame','frame','blake3','aa',0)", [tenant])
             }).unwrap();
         };
         let retained = |tenant: &str| {
@@ -6544,12 +6577,241 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tombstones_do_not_decode_upload_headers() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut link = test_link("link");
+        link.uploads.push(UploadRecord {
+            id: "upload".into(),
+            started_at: 1,
+            completed_at: 2,
+            replayed_chunks: 0,
+            rejected_chunks: 0,
+            transport: None,
+            package_root: "package".into(),
+            total_bytes: 1,
+            partial: false,
+            log: Vec::new(),
+            files: vec![FileRecord {
+                path: "display".into(),
+                stored_as: "stored".into(),
+                bytes: 1,
+                suite: "blake3".into(),
+                root: "aa".into(),
+                receipt: true,
+                deleted: false,
+            }],
+        });
+        let mut alias = link.uploads[0].clone();
+        alias.id = "alias".into();
+        link.uploads.push(alias);
+        let mut unrelated = link.uploads[0].clone();
+        unrelated.id = "unrelated".into();
+        unrelated.files[0].stored_as = "other".into();
+        link.uploads.push(unrelated);
+        store.insert_link(link).unwrap();
+        store
+            .with(|connection| {
+                connection.execute_batch(
+                    "UPDATE link_uploads SET document='{}' WHERE link_id='link';
+             CREATE TRIGGER fail_alias_tombstone BEFORE UPDATE ON files
+             WHEN old.upload_id='alias' BEGIN SELECT RAISE(FAIL,'fixture alias failure'); END;",
+                )
+            })
+            .unwrap();
+        let paths = std::collections::HashSet::from(["stored"]);
+        assert!(store
+            .tombstone_files("", "link", &paths)
+            .unwrap_err()
+            .contains("fixture alias failure"));
+        assert_eq!(store.tenant_received_bytes("").unwrap(), 2);
+        assert_eq!(
+            store
+                .with(|c| {
+                    c.query_row("SELECT count(*) FROM files WHERE deleted=0", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                })
+                .unwrap(),
+            3
+        );
+        store
+            .with(|c| c.execute_batch("DROP TRIGGER fail_alias_tombstone"))
+            .unwrap();
+        assert!(!store
+            .tombstone_files("other-tenant", "link", &paths)
+            .unwrap());
+        assert_eq!(store.tenant_received_bytes("").unwrap(), 2);
+        assert_eq!(
+            store
+                .with(|c| {
+                    c.query_row("SELECT count(*) FROM files WHERE deleted=0", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                })
+                .unwrap(),
+            3
+        );
+        assert!(store.link_upload("", "link", "upload").is_err());
+        assert!(store
+            .tombstone_files("", "link", &std::collections::HashSet::from(["stored"]))
+            .unwrap());
+        let live = store.tenant_live_files("").unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].0, "other");
+        assert!(store.link_upload("", "link", "upload").is_err());
+        assert!(store.link_upload("", "link", "unrelated").is_err());
+    }
+
+    #[test]
+    fn upload_headers_stay_small_and_typed_files_round_trip() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut link = test_link("link");
+        let upload = UploadRecord {
+            id: "upload".into(),
+            started_at: 11,
+            completed_at: 22,
+            replayed_chunks: 3,
+            rejected_chunks: 4,
+            transport: Some("native".into()),
+            package_root: "aa".repeat(32),
+            total_bytes: u64::MAX,
+            partial: true,
+            log: vec![LogEvent {
+                at: 22,
+                kind: "interrupted".into(),
+                path: None,
+                bytes: Some(u64::MAX),
+                secs: Some(5),
+                count: Some(2048),
+            }],
+            files: (0..2048)
+                .map(|index| FileRecord {
+                    path: format!("folder/納品-{index}.mov"),
+                    stored_as: format!("stored/{index}.mov"),
+                    bytes: if index == 0 { u64::MAX } else { index },
+                    suite: if index % 2 == 0 { "sha256" } else { "blake3" }.into(),
+                    root: format!("{index:064x}"),
+                    receipt: index % 2 == 0,
+                    deleted: index % 2 != 0,
+                })
+                .collect(),
+        };
+        link.uploads.push(upload.clone());
+        let mut empty = upload.clone();
+        empty.id = "empty".into();
+        empty.files.clear();
+        empty.total_bytes = 0;
+        link.uploads.push(empty.clone());
+        store.insert_link(link).unwrap();
+        let (header, count): (String, i64) = store
+            .with(|c| {
+                c.query_row(
+                    "SELECT document,file_count FROM link_uploads WHERE upload_id='upload'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert!(
+            header.len() < 1024,
+            "header includes file-sized metadata: {}",
+            header.len()
+        );
+        assert_eq!(count, 2048);
+        let header: serde_json::Value = serde_json::from_str(&header).unwrap();
+        assert_eq!(header["files"], serde_json::json!([]));
+        drop(store);
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(
+            store.link_upload("", "link", "upload").unwrap().unwrap(),
+            upload
+        );
+        assert_eq!(
+            store.link_upload("", "link", "empty").unwrap().unwrap(),
+            empty
+        );
+        assert_eq!(
+            store.uploads_by_id("link").unwrap().unwrap(),
+            vec![upload, empty]
+        );
+        let result = store.search("", "納品-0.mov", 10).unwrap();
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].bytes, u64::MAX);
+        assert_eq!(result.files[0].upload_id, "upload");
+        assert!(store.search("", "納品-1.mov", 10).unwrap().files.is_empty());
+    }
+
+    #[test]
+    fn full_upload_reads_refuse_missing_or_misindexed_file_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut link = test_link("link");
+        link.uploads.push(UploadRecord {
+            id: "upload".into(),
+            started_at: 1,
+            completed_at: 2,
+            replayed_chunks: 0,
+            rejected_chunks: 0,
+            transport: None,
+            package_root: "package".into(),
+            total_bytes: 2,
+            partial: false,
+            log: Vec::new(),
+            files: (0..2)
+                .map(|index| FileRecord {
+                    path: format!("file-{index}"),
+                    stored_as: format!("stored-{index}"),
+                    bytes: 1,
+                    suite: "blake3".into(),
+                    root: "aa".into(),
+                    receipt: true,
+                    deleted: false,
+                })
+                .collect(),
+        });
+        store.insert_link(link).unwrap();
+        store
+            .with(|c| c.execute("UPDATE files SET file_index=2 WHERE file_index=0", []))
+            .unwrap();
+        assert!(store
+            .link_upload("", "link", "upload")
+            .unwrap_err()
+            .contains("do not match"));
+        store
+            .with(|c| c.execute("UPDATE files SET file_index=0 WHERE file_index=2", []))
+            .unwrap();
+        for count in [-1, 1, 3] {
+            store
+                .with(|c| c.execute("UPDATE link_uploads SET file_count=?1", [count]))
+                .unwrap();
+            assert!(store
+                .link_upload("", "link", "upload")
+                .unwrap_err()
+                .contains("do not match"));
+        }
+        store
+            .with(|c| {
+                c.execute_batch(
+                    "UPDATE link_uploads SET file_count=2; DELETE FROM files WHERE file_index=0",
+                )
+            })
+            .unwrap();
+        assert!(store
+            .link_upload("", "link", "upload")
+            .unwrap_err()
+            .contains("do not match"));
+        assert!(store.uploads_by_id("link").is_err());
+    }
+
+    #[test]
     fn link_policy_updates_do_not_decode_upload_history() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         store.insert_link(test_link("link")).unwrap();
         store.with(|connection| connection.execute(
-            "INSERT INTO link_uploads(link_id,tenant,upload_id,document) VALUES ('link','','bad','{}')", [],
+            "INSERT INTO link_uploads(link_id,tenant,upload_id,document,file_count) VALUES ('link','','bad','{}',0)", [],
         )).unwrap();
         assert!(store
             .update_link("", "link", |link| link.active = false)
@@ -6601,6 +6863,8 @@ pub(crate) mod tests {
             .unwrap();
         store.with(|c| c.execute_batch("CREATE TABLE history_writes(upload_id TEXT, kind TEXT);
             CREATE TRIGGER history_update AFTER UPDATE ON link_uploads BEGIN INSERT INTO history_writes VALUES(new.upload_id,'update'); END;
+            CREATE TABLE file_updates(upload_id TEXT);
+            CREATE TRIGGER file_update AFTER UPDATE ON files BEGIN INSERT INTO file_updates VALUES(new.upload_id); END;
             CREATE TRIGGER history_delete AFTER DELETE ON link_uploads BEGIN INSERT INTO history_writes VALUES(old.upload_id,'delete'); END;
             CREATE TRIGGER history_insert AFTER INSERT ON link_uploads BEGIN INSERT INTO history_writes VALUES(new.upload_id,'insert'); END;
             CREATE TRIGGER fail_file_delete BEFORE DELETE ON files BEGIN SELECT RAISE(ABORT,'fixture delete failure'); END;")).unwrap();
@@ -6618,7 +6882,7 @@ pub(crate) mod tests {
         store
             .update_link("", "history", |link| link.active = false)
             .unwrap();
-        store.with(|c| c.execute_batch("CREATE TRIGGER fail_history_update BEFORE UPDATE ON link_uploads BEGIN SELECT RAISE(ABORT,'fixture update failure'); END;")).unwrap();
+        store.with(|c| c.execute_batch("CREATE TRIGGER fail_history_update BEFORE UPDATE ON files BEGIN SELECT RAISE(ABORT,'fixture update failure'); END;")).unwrap();
         let paths = std::collections::HashSet::from(["shared"]);
         assert!(store
             .tombstone_files("", "history", &paths)
@@ -6637,6 +6901,16 @@ pub(crate) mod tests {
             .with(|c| c.execute_batch("DROP TRIGGER fail_history_update"))
             .unwrap();
         store.tombstone_files("", "history", &paths).unwrap();
+        assert_eq!(
+            store
+                .with(|c| c.query_row(
+                    "SELECT count(*) FROM history_writes WHERE kind='update'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                ))
+                .unwrap(),
+            0
+        );
         let mut recovered = record("second", "shared", true);
         recovered.files[0].receipt = true;
         recovered
@@ -6645,6 +6919,24 @@ pub(crate) mod tests {
         store
             .append_upload("", "history", recovered.clone())
             .unwrap();
+        let file_updates = || {
+            store
+                .with(|c| {
+                    c.query_row("SELECT count(*) FROM file_updates", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                })
+                .unwrap()
+        };
+        assert_eq!(file_updates(), 2);
+        store
+            .append_upload("", "history", recovered.clone())
+            .unwrap();
+        assert_eq!(
+            file_updates(),
+            2,
+            "unchanged recovery must not rewrite file rows"
+        );
         let second = store.link_upload("", "history", "second").unwrap().unwrap();
         assert!(second.files[0].deleted && second.files[0].receipt);
         assert_eq!(second.files[1].stored_as, "extra");
