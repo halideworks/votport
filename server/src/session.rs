@@ -1003,9 +1003,9 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
         .iter()
         .map(|entry| (entry.path().map(str::to_owned).collect(), entry.object_id()))
         .collect::<Vec<_>>();
-    let files = prepare_files(setup, &destinations, &delivered, || true)?;
-
+    let (files, allocation) = prepare_files(setup, &destinations, &delivered, || true)?;
     persist_session(setup, &files)?;
+    drop(allocation);
     *phase = Phase::Receiving { files };
     handle_begin(setup, phase)
 }
@@ -1533,28 +1533,95 @@ fn find_delivered(
     None
 }
 
-fn prepare_files(
-    setup: &WorkerSetup,
+fn pending_upload_claims(store: &Store, tenant: &str) -> Result<HashSet<Vec<u8>>, SessionError> {
+    let mut pending = HashSet::new();
+    store
+        .visit_pending_upload_paths(tenant, |destination, components| {
+            pending
+                .insert(stored_path_key(destination, components).map_err(|error| error.message)?);
+            Ok(())
+        })
+        .map_err(SessionError::internal)?;
+    Ok(pending)
+}
+
+fn check_pending_parent(key: &[u8], pending: &HashSet<Vec<u8>>) -> Result<(), SessionError> {
+    if pending.contains(key) {
+        return Err(SessionError::conflict(
+            "destination folder is reserved by an unfinished upload",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn check_upload_directory(
+    store: &Store,
+    tenant: &str,
+    destination: &str,
+) -> Result<(), SessionError> {
+    if destination.is_empty() {
+        return Ok(());
+    }
+    let key = stored_path_key(destination, &[])?;
+    let pending = pending_upload_claims(store, tenant)?;
+    for (index, byte) in key.iter().enumerate() {
+        if *byte == 0 {
+            check_pending_parent(&key[..index], &pending)?;
+        }
+    }
+    check_pending_parent(&key, &pending)
+}
+
+fn prepare_files<'a>(
+    setup: &'a WorkerSetup,
     entries: &[(Vec<String>, ObjectId)],
     delivered: &HashMap<(&str, &str), Vec<&FileRecord>>,
     active: impl Fn() -> bool + Sync,
-) -> Result<Vec<FileState>, SessionError> {
-    // Staging creation does not reserve the final path.
-    let mut claimed = HashSet::new();
-    for (components, _) in entries {
-        for end in 1..components.len() {
-            claimed.insert(stored_path_key(&components[..end])?);
-        }
-    }
-    let claimed = Mutex::new(claimed);
-    let prepare = |(components, object): &(Vec<String>, ObjectId)| {
+) -> Result<(Vec<FileState>, std::sync::MutexGuard<'a, ()>), SessionError> {
+    let existing = prepare_parallel(entries, |_, (_, object)| {
         if !active() {
             return Err(SessionError::conflict("receive preparation cancelled"));
         }
-        if let Some(existing) = find_delivered(setup, delivered, object, &active) {
+        Ok(find_delivered(setup, delivered, object, &active))
+    })?;
+    // ponytail: large NAS manifests serialize metadata allocation; temporary claims can narrow it.
+    let allocation = setup
+        .store
+        .upload_allocation
+        .lock()
+        .map_err(|_| SessionError::internal("upload allocation poisoned"))?;
+    let pending = pending_upload_claims(&setup.store, &setup.tenant)?;
+    let mut parents = HashSet::new();
+    for ((components, _), existing) in entries.iter().zip(&existing) {
+        if existing.is_some() {
+            continue;
+        }
+        let key = stored_path_key(&setup.dest_rel, components)?;
+        for (index, byte) in key.iter().enumerate() {
+            if *byte == 0 {
+                check_pending_parent(&key[..index], &pending)?;
+                parents.insert(key[..index].to_vec());
+            }
+        }
+    }
+    for key in &pending {
+        for (index, byte) in key.iter().enumerate() {
+            if *byte == 0 {
+                parents.insert(key[..index].to_vec());
+            }
+        }
+    }
+    let mut claimed = pending;
+    claimed.extend(parents);
+    let claimed = Mutex::new(claimed);
+    let files = prepare_parallel(entries, |index, (components, object)| {
+        if !active() {
+            return Err(SessionError::conflict("receive preparation cancelled"));
+        }
+        if let Some(existing) = &existing[index] {
             return Ok(FileState {
                 display_path: components.join("/"),
-                stored_components: existing.stored_components,
+                stored_components: existing.stored_components.clone(),
                 object: object.clone(),
                 native: None,
                 published: true,
@@ -1564,28 +1631,38 @@ fn prepare_files(
                 rehash: false,
             });
         }
-        if !active() {
-            return Err(SessionError::conflict("receive preparation cancelled"));
-        }
         open_destination_for(setup, components.clone(), object.clone(), &claimed)
-    };
+    })?;
+    Ok((files, allocation))
+}
+
+fn prepare_parallel<T: Sync, U: Send>(
+    entries: &[T],
+    prepare: impl Fn(usize, &T) -> Result<U, SessionError> + Sync,
+) -> Result<Vec<U>, SessionError> {
     if entries.len() < MAX_CHUNK_BATCH * 2 {
-        return entries.iter().map(prepare).collect();
+        return entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| prepare(index, entry))
+            .collect();
     }
     let stopped = AtomicBool::new(false);
     std::thread::scope(|scope| {
+        let chunk_size = entries.len().div_ceil(MAX_CHUNK_BATCH);
         let workers = entries
-            .chunks(entries.len().div_ceil(MAX_CHUNK_BATCH))
-            .map(|chunk| {
+            .chunks(chunk_size)
+            .enumerate()
+            .map(|(chunk_index, chunk)| {
                 let prepare = &prepare;
                 let stopped = &stopped;
                 scope.spawn(move || {
                     let mut files = Vec::with_capacity(chunk.len());
-                    for entry in chunk {
+                    for (index, entry) in chunk.iter().enumerate() {
                         if stopped.load(Ordering::Acquire) {
                             break;
                         }
-                        match prepare(entry) {
+                        match prepare(chunk_index * chunk_size + index, entry) {
                             Ok(file) => files.push(file),
                             Err(error) => {
                                 stopped.store(true, Ordering::Release);
@@ -1610,11 +1687,36 @@ fn prepare_files(
     })
 }
 
-fn stored_path_key(components: &[String]) -> Result<Vec<u8>, SessionError> {
-    let path = vot_manifest::PackagePath::portable(components.iter().cloned())
-        .map_err(|error| SessionError::bad(format!("stored path rejected: {error:?}")))?;
-    vot_manifest::canonical_path_key(&path, vot_manifest::PathProfile::Portable)
-        .map_err(|error| SessionError::bad(format!("stored path key rejected: {error:?}")))
+fn stored_path_key(destination: &str, components: &[String]) -> Result<Vec<u8>, SessionError> {
+    use unicode_normalization::UnicodeNormalization as _;
+    // Destination prefixes follow server policy, not manifest depth or reserved-name limits.
+    if !components.is_empty() {
+        vot_manifest::PackagePath::portable(components.iter().cloned())
+            .map_err(|error| SessionError::bad(format!("stored path rejected: {error:?}")))?;
+    }
+    let mut key = Vec::new();
+    for component in destination
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .chain(components.iter().map(String::as_str))
+    {
+        if !key.is_empty() {
+            key.push(0);
+        }
+        let normalized: String = component
+            .nfc()
+            .map(|character| match character {
+                '\u{130}' | '\u{131}' => 'i',
+                other => other,
+            })
+            .collect();
+        let folded: String = unicase::UniCase::new(normalized.trim_end_matches(['.', ' ']))
+            .to_folded_case()
+            .nfc()
+            .collect();
+        key.extend_from_slice(folded.as_bytes());
+    }
+    Ok(key)
 }
 
 fn open_destination_for(
@@ -1638,7 +1740,7 @@ fn open_destination_for(
             .map_err(SessionError::internal)?;
         let mut stored = components.clone();
         *stored.last_mut().expect("non-empty") = paths::with_suffix(name, attempt);
-        let key = stored_path_key(&stored)?;
+        let key = stored_path_key(&setup.dest_rel, &stored)?;
         if !claimed
             .lock()
             .expect("name claims poisoned")
@@ -2456,11 +2558,15 @@ impl PushReceive {
         } else {
             None
         };
-        let files = match restored {
-            Some(files) => files,
-            None => prepare_files(&self.setup, &validated, &delivered, || {
-                self.check_active().is_ok()
-            })?,
+        let (files, allocation) = match restored {
+            Some(files) => (files, None),
+            None => {
+                let (files, allocation) =
+                    prepare_files(&self.setup, &validated, &delivered, || {
+                        self.check_active().is_ok()
+                    })?;
+                (files, Some(allocation))
+            }
         };
         let mut inner = self.inner.lock().expect("push receive poisoned");
         if inner.manifest_ready {
@@ -2495,6 +2601,7 @@ impl PushReceive {
             .store
             .insert_upload_session(&record)
             .map_err(SessionError::internal)?;
+        drop(allocation);
         for (entry, saved) in inner.entries.iter_mut().zip(&record.files) {
             let file = entry.file.as_mut().expect("admitted push file");
             *file.checkpointed.lock().expect("checkpoint poisoned") =
@@ -4689,6 +4796,514 @@ mod push_tests {
         }
     }
 
+    #[tokio::test]
+    async fn concurrent_uploads_reserve_names_across_overlapping_destinations() {
+        for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
+            for nested_destination in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let application = crate::api::testing::build(directory.path());
+                let first_object = object(suite, b"first");
+                let second_object = object(suite, b"second");
+                let first = setup_with_app(directory.path(), first_object.clone(), &application);
+                let mut second =
+                    setup_with_app(directory.path(), second_object.clone(), &application);
+                second.session_id = [8; 16];
+                second.link_id = "other".into();
+                let first_entries =
+                    [(vec!["project".into(), "frame".into()], first_object.clone())];
+                let second_name = if nested_destination {
+                    second.dest_dir.push("project");
+                    second.dest_rel = "project".into();
+                    vec!["frame".into()]
+                } else {
+                    vec!["project".into(), "frame".into()]
+                };
+                for setup in [&first, &second] {
+                    let mut link = crate::store::tests::test_link(&setup.link_id);
+                    link.dest = setup.dest_rel.clone();
+                    application.store.insert_link(link).unwrap();
+                }
+                let second_entries = [(second_name, second_object.clone())];
+                let (ready, waiting) = std::sync::mpsc::channel();
+                let (mut first_files, mut second_files) = std::thread::scope(|scope| {
+                    let (start_a, a_start) = std::sync::mpsc::channel();
+                    let (start_b, b_start) = std::sync::mpsc::channel();
+                    let prepare =
+                        |setup: &WorkerSetup,
+                         entries: &[(Vec<String>, ObjectId)],
+                         start: std::sync::mpsc::Receiver<()>| {
+                            ready.send(()).unwrap();
+                            start.recv_timeout(Duration::from_secs(5)).unwrap();
+                            let (files, allocation) =
+                                prepare_files(setup, entries, &HashMap::new(), || true).unwrap();
+                            persist_session(setup, &files).unwrap();
+                            drop(allocation);
+                            files
+                        };
+                    let a_input = (&first, &first_entries[..]);
+                    let b_input = (&second, &second_entries[..]);
+                    let a = scope.spawn(move || prepare(a_input.0, a_input.1, a_start));
+                    let b = scope.spawn(move || prepare(b_input.0, b_input.1, b_start));
+                    for _ in 0..2 {
+                        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                    start_a.send(()).unwrap();
+                    start_b.send(()).unwrap();
+                    (a.join().unwrap(), b.join().unwrap())
+                });
+                let first_path =
+                    paths::join_under(&first.dest_dir, &first_files[0].stored_components).unwrap();
+                let second_path =
+                    paths::join_under(&second.dest_dir, &second_files[0].stored_components)
+                        .unwrap();
+                assert_ne!(
+                    first_path, second_path,
+                    "admitted uploads must own distinct final names before publication"
+                );
+                for (setup, files, bytes, object) in [
+                    (&first, &mut first_files, b"first".as_slice(), &first_object),
+                    (
+                        &second,
+                        &mut second_files,
+                        b"second".as_slice(),
+                        &second_object,
+                    ),
+                ] {
+                    let source = directory.path().join("source");
+                    fs::write(&source, bytes).unwrap();
+                    reprove_staging(&source, object, vec![&mut files[0]], || true).unwrap();
+                    publish_file(setup, &mut files[0], || true).unwrap();
+                    commit_upload(setup, files, 0, 0, Some("http"), Vec::new()).unwrap();
+                }
+                assert_eq!(fs::read(first_path).unwrap(), b"first");
+                assert_eq!(fs::read(second_path).unwrap(), b"second");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_and_http_admissions_share_persisted_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = crate::api::testing::build(directory.path());
+        application
+            .store
+            .insert_link(crate::store::tests::test_link("link"))
+            .unwrap();
+        let bytes = [b"http".as_slice(), b"native-one", b"native-two"];
+        let objects = bytes.map(|bytes| object(Suite::Blake3Bao64, bytes));
+        let http = setup_with_app(directory.path(), objects[0].clone(), &application);
+        let natives = [1, 2].map(|index| {
+            let mut setup = setup_with_app(directory.path(), objects[index].clone(), &application);
+            setup.session_id = [index as u8; 16];
+            let key = hex::encode([index as u8; 16]);
+            setup.destinations.push_directory(&key).unwrap();
+            persist_push(&setup, key.clone()).unwrap();
+            let (seams, handle) = push_seams(
+                application.clone(),
+                setup,
+                PushControl::resumable(key, None),
+                tokio::runtime::Handle::current(),
+            );
+            (seams, handle.0.upgrade().unwrap())
+        });
+        let mut files = std::thread::scope(|scope| {
+            let (ready, waiting) = std::sync::mpsc::channel();
+            let mut starts = Vec::new();
+            let workers = natives
+                .iter()
+                .zip(&objects[1..])
+                .map(|((_, receive), object)| {
+                    let ready = ready.clone();
+                    let (start, waiting) = std::sync::mpsc::channel();
+                    starts.push(start);
+                    scope.spawn(move || {
+                        ready.send(()).unwrap();
+                        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+                        receive
+                            .prepare_manifest(
+                                vot_cli::PackageSummary {
+                                    root: object.root,
+                                    logical_length: object.length,
+                                    entries: 1,
+                                },
+                                &[record(
+                                    vot_manifest::PackagePath::portable(["frame"]).unwrap(),
+                                    object,
+                                )],
+                            )
+                            .unwrap();
+                    })
+                })
+                .collect::<Vec<_>>();
+            for _ in 0..2 {
+                waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            for start in starts {
+                start.send(()).unwrap();
+            }
+            let (files, allocation) = prepare_files(
+                &http,
+                &[(vec!["frame".into()], objects[0].clone())],
+                &HashMap::new(),
+                || true,
+            )
+            .unwrap();
+            persist_session(&http, &files).unwrap();
+            drop(allocation);
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            files
+        });
+        let saved = application.store.load_upload_sessions().unwrap();
+        let names = saved
+            .iter()
+            .map(|session| session.files[0].stored_components.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(names.len(), 3);
+        let source = directory.path().join("source");
+        fs::write(&source, bytes[0]).unwrap();
+        reprove_staging(&source, &objects[0], vec![&mut files[0]], || true).unwrap();
+        publish_file(&http, &mut files[0], || true).unwrap();
+        commit_upload(&http, &files, 0, 0, Some("http"), Vec::new()).unwrap();
+        for ((_, receive), (object, bytes)) in
+            natives.iter().zip(objects[1..].iter().zip(&bytes[1..]))
+        {
+            let requested = vot_cli::ReceiveObject {
+                object: vot_codec::frames::ObjectId {
+                    suite: object.suite,
+                    root: object.root,
+                    length: object.length,
+                },
+                entries: Vec::new(),
+            };
+            let sink = Arc::from(receive.choose_sink(&requested).unwrap().unwrap());
+            write_push(Arc::clone(&sink), &requested, bytes);
+            sink.flush().unwrap();
+            receive.complete_object(&requested).unwrap();
+        }
+        for session in saved {
+            let index = if session.id == hex::encode(http.session_id) {
+                0
+            } else if session.id == hex::encode([1; 16]) {
+                1
+            } else {
+                2
+            };
+            assert_eq!(
+                fs::read(
+                    paths::join_under(&http.dest_dir, &session.files[0].stored_components).unwrap()
+                )
+                .unwrap(),
+                bytes[index]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn parked_native_names_survive_restart_and_competing_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::api::testing::config(directory.path());
+        config.receive_dir = directory.path().join("receive");
+        let application = crate::app::build(config.clone()).unwrap();
+        application
+            .store
+            .insert_link(crate::store::tests::test_link("link"))
+            .unwrap();
+        let bytes = &[7_u8; 65537];
+        let expected = object(Suite::Blake3Bao64, bytes);
+        let first = setup_with_app(directory.path(), expected.clone(), &application);
+        let key = hex::encode([3; 16]);
+        let stage = first.destinations.push_directory(&key).unwrap();
+        persist_push(&first, key.clone()).unwrap();
+        let summary = vot_cli::PackageSummary {
+            root: expected.root,
+            logical_length: expected.length,
+            entries: 1,
+        };
+        let records = [record(
+            vot_manifest::PackagePath::portable(["frame"]).unwrap(),
+            &expected,
+        )];
+        let requested = vot_cli::ReceiveObject {
+            object: vot_codec::frames::ObjectId {
+                suite: expected.suite,
+                root: expected.root,
+                length: expected.length,
+            },
+            entries: Vec::new(),
+        };
+        let control = PushControl::resumable(
+            key.clone(),
+            Some(lock_push_directory(&stage, vot_sdk_file::NasContract::Unqualified).unwrap()),
+        );
+        let (seams, handle) = push_seams(
+            application.clone(),
+            first,
+            control,
+            tokio::runtime::Handle::current(),
+        );
+        let receive = handle.0.upgrade().unwrap();
+        receive.prepare_manifest(summary, &records).unwrap();
+        let sink = Arc::from(receive.choose_sink(&requested).unwrap().unwrap());
+        let accept_half = |sink: Arc<dyn vot_cli::ReceiveSink>, offset: u64| {
+            let subject = requested.object.try_into().unwrap();
+            let length = (bytes.len() as u64 - offset).min(65536);
+            let proof = vot_proof_blake3::prove(bytes, offset, length).unwrap();
+            let mut verifier =
+                vot_scheduler::ReliableReceiver::new(1 << 20, 1 << 20, 1 << 20).unwrap();
+            verifier.begin_ranges(subject, Box::new(sink)).unwrap();
+            verifier
+                .receive_range(subject, offset, &proof.data, &proof.proof)
+                .unwrap();
+        };
+        accept_half(Arc::clone(&sink), 0);
+        sink.flush().unwrap();
+        drop(sink);
+        drop(receive);
+        drop(seams);
+        let saved = application.store.load_push_sessions().unwrap().remove(0);
+        assert_eq!(saved.files[0].prefix_bytes, 65536);
+        assert!(!saved.files[0].published);
+        drop(application);
+
+        let application = crate::app::build(config).unwrap();
+        assert_eq!(
+            application.store.load_push_sessions().unwrap(),
+            std::slice::from_ref(&saved)
+        );
+        let competing_object = object(Suite::Blake3Bao64, b"competing");
+        let mut competing =
+            setup_with_app(directory.path(), competing_object.clone(), &application);
+        competing.session_id = [9; 16];
+        let (mut files, allocation) = prepare_files(
+            &competing,
+            &[(vec!["frame".into()], competing_object.clone())],
+            &HashMap::new(),
+            || true,
+        )
+        .unwrap();
+        persist_session(&competing, &files).unwrap();
+        drop(allocation);
+        assert_ne!(files[0].stored_components, saved.files[0].stored_components);
+        let mut retry = setup_with_app(directory.path(), expected.clone(), &application);
+        retry.session_id = [8; 16];
+        persist_push(&retry, key.clone()).unwrap();
+        let control = PushControl::resumable(
+            key,
+            Some(lock_push_directory(&stage, vot_sdk_file::NasContract::Unqualified).unwrap()),
+        );
+        let (seams, handle) = push_seams(
+            application.clone(),
+            retry,
+            control,
+            tokio::runtime::Handle::current(),
+        );
+        let receive = handle.0.upgrade().unwrap();
+        receive.prepare_manifest(summary, &records).unwrap();
+        let resumed = application.store.load_push_sessions().unwrap().remove(0);
+        assert_ne!(resumed.id, saved.id);
+        assert_eq!(resumed.files[0], saved.files[0]);
+        let sink: Arc<dyn vot_cli::ReceiveSink> =
+            Arc::from(receive.choose_sink(&requested).unwrap().unwrap());
+        assert_eq!(sink.resumed_prefix().unwrap(), 65536);
+        accept_half(Arc::clone(&sink), 65536);
+        sink.flush().unwrap();
+        drop(sink);
+        receive.complete_object(&requested).unwrap();
+        drop(receive);
+        drop(seams);
+        let source = directory.path().join("source");
+        fs::write(&source, b"competing").unwrap();
+        reprove_staging(&source, &competing_object, vec![&mut files[0]], || true).unwrap();
+        publish_file(&competing, &mut files[0], || true).unwrap();
+        commit_upload(&competing, &files, 0, 0, Some("http"), Vec::new()).unwrap();
+        assert_eq!(fs::read(competing.dest_dir.join("frame")).unwrap(), bytes);
+        assert!(competing.dest_dir.join("frame.vot-receipt").is_file());
+        assert_eq!(
+            fs::read(paths::join_under(&competing.dest_dir, &files[0].stored_components).unwrap())
+                .unwrap(),
+            b"competing"
+        );
+    }
+
+    #[test]
+    fn pending_names_fold_aliases_and_protect_directory_prefixes() {
+        for (first_path, second_path, outcome) in [
+            (vec!["Straße"], vec!["STRASSE"], "suffix"),
+            (vec!["İ"], vec!["ı"], "suffix"),
+            (vec!["é"], vec!["e\u{301}"], "suffix"),
+            (vec!["folder"], vec!["FOLDER", "child"], "conflict"),
+            (vec!["folder", "child"], vec!["FOLDER"], "suffix"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let expected = object(Suite::Blake3Bao64, b"");
+            let first = setup(directory.path(), expected.clone());
+            let first_path = first_path
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let second_path = second_path
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let (files, allocation) = prepare_files(
+                &first,
+                &[(first_path.clone(), expected.clone())],
+                &HashMap::new(),
+                || true,
+            )
+            .unwrap();
+            persist_session(&first, &files).unwrap();
+            drop(allocation);
+            let result = prepare_files(
+                &first,
+                &[(second_path.clone(), expected.clone())],
+                &HashMap::new(),
+                || true,
+            );
+            if outcome == "conflict" {
+                assert_eq!(result.err().unwrap().status, 409);
+            } else {
+                let (other, allocation) = result.unwrap();
+                drop(allocation);
+                assert_ne!(
+                    stored_path_key("", &other[0].stored_components).unwrap(),
+                    stored_path_key("", &first_path).unwrap()
+                );
+                assert_ne!(other[0].stored_components, second_path);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_admission_and_cancellation_release_only_new_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected = object(Suite::Blake3Bao64, b"frame");
+        let application = crate::api::testing::build(directory.path());
+        let first = setup_with_app(directory.path(), expected.clone(), &application);
+        let mut second = setup_with_app(directory.path(), expected.clone(), &application);
+        second.session_id = [8; 16];
+        let entries = [(vec!["frame".into()], expected)];
+        let (retained, allocation) =
+            prepare_files(&first, &entries, &HashMap::new(), || true).unwrap();
+        persist_session(&first, &retained).unwrap();
+        drop(allocation);
+        application.store.with(|connection| connection.execute_batch(
+            "CREATE TRIGGER fail_admission BEFORE INSERT ON upload_sessions BEGIN SELECT RAISE(ABORT, 'fixture'); END;"
+        )).unwrap();
+        let (failed, allocation) =
+            prepare_files(&second, &entries, &HashMap::new(), || true).unwrap();
+        let released_name = failed[0].stored_components.clone();
+        assert!(persist_session(&second, &failed).is_err());
+        drop(failed);
+        drop(allocation);
+        application
+            .store
+            .with(|connection| connection.execute_batch("DROP TRIGGER fail_admission;"))
+            .unwrap();
+        let active = AtomicUsize::new(0);
+        assert!(prepare_files(&second, &entries, &HashMap::new(), || active
+            .fetch_add(1, Ordering::Relaxed)
+            == 0)
+        .is_err());
+        let (retry, allocation) =
+            prepare_files(&second, &entries, &HashMap::new(), || true).unwrap();
+        drop(allocation);
+        assert_eq!(retry[0].stored_components, released_name);
+        assert_ne!(retry[0].stored_components, retained[0].stored_components);
+        assert_eq!(application.store.load_upload_sessions().unwrap().len(), 1);
+        second.tenant = "other".into();
+        second.dest_dir =
+            paths::join_under(&first.dest_dir, &paths::tenant_prefix("other")).unwrap();
+        let (independent, allocation) =
+            prepare_files(&second, &entries, &HashMap::new(), || true).unwrap();
+        drop(allocation);
+        assert_eq!(
+            independent[0].stored_components,
+            retained[0].stored_components
+        );
+    }
+
+    #[test]
+    fn pending_names_preserve_destination_policy_and_manifest_depth() {
+        for (destination, components) in [
+            ("AUX", vec!["frame".to_owned()]),
+            ("archive.", vec!["frame".to_owned()]),
+            ("project", vec!["x".to_owned(); 256]),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let expected = object(Suite::Blake3Bao64, b"frame");
+            let application = crate::api::testing::build(directory.path());
+            let mut first = setup_with_app(directory.path(), expected.clone(), &application);
+            first.dest_rel = paths::admit_dest(destination).unwrap();
+            first.dest_dir.push(destination);
+            vot_manifest::PackagePath::portable(components.clone()).unwrap();
+            let (files, allocation) = prepare_files(
+                &first,
+                &[(components, expected.clone())],
+                &HashMap::new(),
+                || true,
+            )
+            .unwrap();
+            persist_session(&first, &files).unwrap();
+            drop(allocation);
+            let mut second = setup_with_app(directory.path(), expected.clone(), &application);
+            second.session_id = [8; 16];
+            second.dest_rel = "unrelated".into();
+            second.dest_dir.push("unrelated");
+            let (other, allocation) = prepare_files(
+                &second,
+                &[(vec!["frame".into()], expected)],
+                &HashMap::new(),
+                || true,
+            )
+            .unwrap();
+            drop(allocation);
+            assert_eq!(other[0].stored_components, ["frame"]);
+        }
+    }
+
+    #[test]
+    fn pending_parent_does_not_block_verified_deduplication() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected = object(Suite::Blake3Bao64, b"original");
+        let first = setup(directory.path(), expected.clone());
+        let (pending, allocation) = prepare_files(
+            &first,
+            &[(vec!["folder".into()], expected.clone())],
+            &HashMap::new(),
+            || true,
+        )
+        .unwrap();
+        persist_session(&first, &pending).unwrap();
+        drop(allocation);
+        fs::write(first.dest_dir.join("existing.bin"), b"original").unwrap();
+        let record = FileRecord {
+            path: "existing.bin".into(),
+            stored_as: "existing.bin".into(),
+            bytes: 8,
+            suite: suite_name(expected.suite),
+            root: hex::encode(expected.root),
+            receipt: false,
+            deleted: false,
+        };
+        let delivered =
+            HashMap::from([((record.suite.as_str(), record.root.as_str()), vec![&record])]);
+        let (files, allocation) = prepare_files(
+            &first,
+            &[(vec!["folder".into(), "copy.bin".into()], expected)],
+            &delivered,
+            || true,
+        )
+        .unwrap();
+        drop(allocation);
+        assert_eq!(files[0].stored_components, ["existing.bin"]);
+        assert!(files[0].published);
+        assert!(files[0].native.is_none());
+        assert!(!first.dest_dir.join("folder").exists());
+    }
+
     #[test]
     fn preparation_reserves_distinct_names_before_publication() {
         for count in [2, 32] {
@@ -4712,8 +5327,10 @@ mod push_tests {
                     }
                     entries.push((components, object.clone()));
                 }
-                let mut files = prepare_files(&setup, &entries, &HashMap::new(), || true).unwrap();
+                let (mut files, allocation) =
+                    prepare_files(&setup, &entries, &HashMap::new(), || true).unwrap();
                 persist_session(&setup, &files).unwrap();
+                drop(allocation);
                 let mut names = HashSet::new();
                 for file in &mut files {
                     let path =
@@ -4759,21 +5376,26 @@ mod push_tests {
             let mut entries = (0..count)
                 .map(|index| (vec![format!("frame-{index}")], object.clone()))
                 .collect::<Vec<_>>();
-            let workers = Mutex::new(HashSet::new());
-            let files = prepare_files(&setup, &entries, &HashMap::new(), || {
-                workers.lock().unwrap().insert(std::thread::current().id());
+            let workers = Mutex::new([HashSet::new(), HashSet::new()]);
+            let checks = AtomicUsize::new(0);
+            let (files, allocation) = prepare_files(&setup, &entries, &HashMap::new(), || {
+                let phase = checks.fetch_add(1, Ordering::Relaxed) / count;
+                workers.lock().unwrap()[phase].insert(std::thread::current().id());
                 true
             })
             .unwrap();
+            drop(allocation);
             assert_eq!(files.len(), count);
             for (index, file) in files.iter().enumerate() {
                 assert_eq!(file.stored_components, entries[index].0);
                 assert!(!file.published);
             }
-            let workers = workers.lock().unwrap().len();
-            assert!(workers <= MAX_CHUNK_BATCH);
-            if count >= MAX_CHUNK_BATCH * 2 {
-                assert!(workers > 1);
+            assert_eq!(checks.load(Ordering::Relaxed), count * 2);
+            for phase in workers.lock().unwrap().iter() {
+                assert!(phase.len() <= MAX_CHUNK_BATCH);
+                if count >= MAX_CHUNK_BATCH * 2 {
+                    assert!(phase.len() > 1);
+                }
             }
             drop(files);
             if count == 0 {

@@ -694,20 +694,29 @@ pub async fn create_push_session(
     hash.update(prepared.expected.length.to_be_bytes());
     hash.update(holder);
     let key = hex::encode(&hash.finalize()[..16]);
-    let destinations = Arc::new(
-        prepared
-            .destinations
-            .child(
-                &prepared
-                    .dest_dir
-                    .strip_prefix(&app.config.receive_dir)
-                    .map_err(|_| ApiError::internal("destination is outside receiving storage"))?
-                    .components()
-                    .map(|part| part.as_os_str().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>(),
-            )
-            .map_err(ApiError::internal)?,
-    );
+    let components = prepared
+        .dest_dir
+        .strip_prefix(&app.config.receive_dir)
+        .map_err(|_| ApiError::internal("destination is outside receiving storage"))?
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let store = Arc::clone(&app.store);
+    let root = Arc::clone(&prepared.destinations);
+    let tenant = prepared.link.tenant.clone();
+    let destination = prepared.link.dest.clone();
+    let destinations = tokio::task::spawn_blocking(move || -> ApiResult<_> {
+        let _allocation = store
+            .upload_allocation
+            .lock()
+            .map_err(|_| ApiError::internal("upload allocation poisoned"))?;
+        session::check_upload_directory(&store, &tenant, &destination).map_err(ApiError::from)?;
+        root.child(&components)
+            .map(Arc::new)
+            .map_err(ApiError::internal)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))??;
     let directory = destinations
         .push_directory(&key)
         .map_err(ApiError::internal)?;
@@ -1461,6 +1470,57 @@ mod push_preflight_tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn native_admission_refuses_a_folder_reserved_by_an_upload() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = push_app(directory.path());
+        application.store.insert_link(open_link("root")).unwrap();
+        let mut nested = open_link("nested");
+        nested.dest = "folder/child".into();
+        application.store.insert_link(nested).unwrap();
+        let holder = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
+        assert!(
+            post_push(application.clone(), "root", request_body(&holder, 7))
+                .await
+                .status()
+                .is_success()
+        );
+        let mut saved = application.store.load_push_sessions().unwrap().remove(0);
+        saved.files.push(crate::store::PersistedUploadFile {
+            entry: 0,
+            display_path: "folder".into(),
+            stored_components: vec!["folder".into()],
+            object: saved.package.clone(),
+            staging_path: Default::default(),
+            journal_path: Default::default(),
+            incarnation: [0; 16],
+            profile: vot_sdk_file::CommitProfile::Balanced,
+            nas_contract: vot_sdk_file::NasContract::Unqualified,
+            prefix_bytes: 0,
+            published: false,
+            receipt: false,
+        });
+        application.store.insert_upload_session(&saved).unwrap();
+        let before = application.sessions.total();
+        let response = post_push(application.clone(), "nested", request_body(&holder, 7)).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(!application.config.receive_dir.join("folder").exists());
+        assert_eq!(application.sessions.total(), before);
+        assert_eq!(application.store.load_push_sessions().unwrap(), [saved]);
+        application
+            .store
+            .with(|connection| {
+                connection.execute_batch(
+                    "UPDATE upload_session_files SET stored_components='invalid json';",
+                )
+            })
+            .unwrap();
+        let response = post_push(application.clone(), "nested", request_body(&holder, 7)).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!application.config.receive_dir.join("folder").exists());
+        assert_eq!(application.sessions.total(), before);
     }
 
     #[tokio::test]
