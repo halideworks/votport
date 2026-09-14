@@ -2505,6 +2505,7 @@ struct PushReceive {
     staging: PathBuf,
     inner: Mutex<PushReceiveInner>,
     received: AtomicU64,
+    activity_origin: Instant,
     last_active: AtomicU64,
     checkpoint: Mutex<PersistTracker>,
 }
@@ -2527,12 +2528,15 @@ impl PushReceive {
     }
 
     fn mark_active(&self) {
-        let now = now_unix();
+        self.mark_active_at(self.activity_origin.elapsed().as_secs());
+    }
+
+    fn mark_active_at(&self, elapsed_secs: u64) {
         let previous = self.last_active.load(Ordering::Acquire);
-        if now > previous
+        if elapsed_secs > previous
             && self
                 .last_active
-                .compare_exchange(previous, now, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(previous, elapsed_secs, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
             if let Some(lock) = self
@@ -3211,7 +3215,8 @@ pub(crate) fn push_seams(
         runtime,
         inner: Mutex::new(PushReceiveInner::default()),
         received: AtomicU64::new(0),
-        last_active: AtomicU64::new(now_unix()),
+        activity_origin: Instant::now(),
+        last_active: AtomicU64::new(0),
         checkpoint: Mutex::new(PersistTracker::new()),
     });
     let handle = PushSeamHandle(Arc::downgrade(&receive));
@@ -4894,6 +4899,80 @@ mod push_tests {
             log: Vec::new(),
         });
         setup.store.insert_link(link).unwrap();
+    }
+
+    #[tokio::test]
+    async fn push_activity_does_not_store_wall_clock_seconds() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let setup = setup_with_app(directory.path(), object(Suite::Blake3Bao64, b""), &app);
+        let control = PushControl::new();
+        let (_seams, handle) = push_seams(
+            Arc::clone(&app),
+            setup,
+            control,
+            tokio::runtime::Handle::current(),
+        );
+        let receive = handle.0.upgrade().unwrap();
+
+        receive.mark_active();
+        assert!(
+            receive.last_active.load(Ordering::Acquire)
+                <= receive.activity_origin.elapsed().as_secs(),
+            "push activity must use process elapsed time, not Unix seconds"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_activity_refresh_keeps_progress_live_for_idle_sweep() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let setup = setup_with_app(directory.path(), object(Suite::Blake3Bao64, b""), &app);
+        let id = hex::encode(setup.session_id);
+        let control = PushControl::new();
+        assert!(control.connect());
+        let (sender, _) = mpsc::channel(1);
+        app.sessions
+            .insert_admitted(
+                SessionAdmission {
+                    id: id.clone(),
+                    link_id: setup.link_id.clone(),
+                    tenant: setup.tenant.clone(),
+                    reserved_bytes: 0,
+                    max_total_bytes: None,
+                    max_tenant_sessions: None,
+                    max_link_sessions: usize::MAX,
+                    max_sessions: usize::MAX,
+                    kind: SessionKind::Push(control.clone()),
+                },
+                sender,
+                || Ok((0, Vec::new())),
+            )
+            .unwrap();
+        let (_seams, handle) = push_seams(
+            Arc::clone(&app),
+            setup,
+            control.clone(),
+            tokio::runtime::Handle::current(),
+        );
+        let receive = handle.0.upgrade().unwrap();
+        let stale = || {
+            let activity = {
+                let inner = app.sessions.inner.lock().unwrap();
+                Arc::clone(&inner.map[&id].activity)
+            };
+            *activity.last_active.lock().unwrap() = Instant::now() - Duration::from_secs(60);
+        };
+
+        // Elapsed ticks continue after a hypothetical wall-clock rollback.
+        receive.mark_active_at(1);
+        stale();
+        receive.mark_active_at(2);
+        app.sessions.sweep(30);
+
+        assert!(!control.is_cancelled());
+        assert!(app.sessions.contains_push(&id));
+        assert_eq!(receive.last_active.load(Ordering::Acquire), 2);
     }
 
     #[tokio::test]

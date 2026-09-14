@@ -58,7 +58,7 @@ async function verifyAuthorization(value, issuer) {
   const auth = authorization(value), local = await device();
   const key = await crypto.subtle.importKey('raw', unhex(issuer), 'Ed25519', false, ['verify']);
   if (auth.issuer !== issuer || auth.challenge.origin !== window.location.origin || auth.challenge.holder !== local.holder ||
-      !Number.isSafeInteger(auth.challenge.expires_at) || auth.challenge.expires_at <= Date.now() / 1000 ||
+      !Number.isSafeInteger(auth.challenge.expires_at) ||
       !(await crypto.subtle.verify('Ed25519', key, unhex(auth.signature), message('votport-evidence-challenge-v1\0', auth.challenge)))) {
     throw new Error('Delivery authorization is invalid or expired. Reload the download page.');
   }
