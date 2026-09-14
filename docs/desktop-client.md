@@ -1,7 +1,7 @@
 # The desktop client: native apps on one Rust core
 
 Status: in progress, 2026-09-08. The VOT seams in "VOT changes" are available in
-vot-cli at the current pin `1010254b` (`build_manifest`, `build_manifest_from`,
+vot-cli at the current pin `de66d413` (`build_manifest`, `build_manifest_from`,
 `push_from`, `fetch_bundle_with`, `probe_serve`, the proof-cache accessors,
 and the wire build on the platform-native CI job); the listener session cap
 is a separate follow-on. The core and CLI now move bytes end to end: C1 send
@@ -847,7 +847,7 @@ machines on 2026-09-04, `cargo +1.97.1 build -p vot-cli --features wire
 
 | Phase | Repo | Content | Done when |
 | --- | --- | --- | --- |
-| C0 | VOT | `build_manifest`, `build_manifest_from`, `push_from`, `fetch_bundle_with`, `probe_serve`, progress observers, wire on the platform-native job (the listener session cap is a follow-on) | Loopback push from an assembled server and fetch with options pass on Linux, macOS, and Windows in CI (landed at `0a129ea`; current pin `1010254b`) |
+| C0 | VOT | `build_manifest`, `build_manifest_from`, `push_from`, `fetch_bundle_with`, `probe_serve`, progress observers, wire on the platform-native job (the listener session cap is a follow-on) | Loopback push from an assembled server and fetch with options pass on Linux, macOS, and Windows in CI (landed at `0a129ea`; current pin `de66d413`) |
 | C1 | votport | `client/core` and `client/cli`: api, identity, hash, package, transfer, send over push and HTTP, journal, e2e on loopback | `votport send` moves a 20,000-entry drop and a 4 GiB file over both paths on all three platforms; the HTTP path resumes after a kill; hash and transfer rates recorded on the two target machines |
 | C2 | votport | Receive over fetch and HTTP, publish with receipt, verify | `votport receive` publishes a grant with a verified receipt and the delivery counts on the server |
 | C3 | votport | Push resume on the receiver: staging keyed by link, package root, and holder key, kept across a disconnect and by the boot sweep, adopted by a new preflight once the old session is gone, sink factory re-proves and skips complete staged objects; the core aborts the cut session, re-preflights, and re-dials | A push killed at 90% of a 20,000-entry drop, resumed after the ticket expired and after a server restart, finishes by sending only the objects that were not complete |
@@ -887,7 +887,7 @@ Studio and erebus over the wired LAN.
 ## Upstream repin validation, 2026-09-08
 
 The validation below used VOT
-`a93f5d86a4da23744f8f8268054414b812b72c46`, before the current `1010254b` pin.
+`a93f5d86a4da23744f8f8268054414b812b72c46`, before the current `de66d413` pin.
 The desktop wrappers retain four
 QUIC rails for remote peers and select one for macOS loopback, including
 IPv4-mapped loopback addresses.

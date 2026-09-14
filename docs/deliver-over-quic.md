@@ -6,7 +6,7 @@ which adds ADR-0051, the fetch window of up to sixteen objects, the
 concurrent sink gate (#406), settled-work fetch progress (#405),
 admit-before-handout on a rail (#407), and completion syncs on a per-plan
 flusher (#408, ADR-0052). P3, the agent, and phase W remain.
-The current server, native core, and browser WASM pin is `1010254b`.
+The current server, native core, and browser WASM pin is `de66d413`.
 
 | Field | Value |
 | --- | --- |

@@ -709,7 +709,7 @@ Measured single-stream upload rose about a quarter (256 MiB baseline,
 1258 to 1580 MiB/s median on the same rig).
 
 Do not raise `CHUNK_BYTES` in votport until VOT changes its server verify
-path to support larger ranges; the `1010254b` pin does not. Any VOT re-pin
+path to support larger ranges; the `de66d413` pin does not. Any VOT re-pin
 moves the VOT dependencies and Dockerfile `ARG` together, then relocks
 Cargo.lock. Measure with:
 

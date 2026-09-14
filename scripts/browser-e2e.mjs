@@ -59,6 +59,20 @@ const page = await browser.newPage();
 page.on("dialog", (dialog) => dialog.accept());
 const errors = [];
 page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
+await page.addInitScript(() => {
+  Object.defineProperty(window, "__clipboardFailure", { value: false, writable: true });
+  Object.defineProperty(window, "__clipboardHold", { value: false, writable: true });
+  Object.defineProperty(window, "__releaseClipboard", { value: null, writable: true });
+  Object.defineProperty(window, "__copiedText", { value: "", writable: true });
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: { writeText: async (text) => {
+      if (window.__clipboardHold) await new Promise((resolve) => { window.__releaseClipboard = resolve; });
+      if (window.__clipboardFailure) throw new Error("Clipboard unavailable");
+      window.__copiedText = String(text);
+    }, readText: async () => window.__copiedText },
+  });
+});
 
 async function collectDownloads(action, count) {
   const downloads = [];
@@ -119,6 +133,25 @@ await page.fill("#login-password", adminPassword);
 await page.click("#login-form button[type=submit]");
 // Signed-in users land on /receive; the create form is the first element.
 await page.waitForSelector("#create-form:not([hidden])", { timeout: 15000 });
+await page.locator("#create-notification-options").evaluate((node) => { node.open = true; });
+await page.locator(".notification-editor > p.field-help").first().waitFor();
+if (await page.locator(".notification-editor > p.field-help").evaluateAll((nodes) => nodes.some((node) => node.getAttribute("role") === "status"))) {
+  throw new Error("embedded notification guidance must stay quiet while editors rerender");
+}
+await page.route("**/api/notifications*", (route) => route.fulfill({ status: 503, json: { error: "Notification catalog unavailable." } }), { times: 1 });
+await page.reload();
+await page.locator("#create-notification-options").evaluate((node) => { node.open = true; });
+const notificationStatus = page.locator("#create-notifications .notification-editor > p.field-help");
+await notificationStatus.waitFor();
+await page.getByRole("button", { name: "Retry loading destinations", exact: true }).waitFor();
+if (await notificationStatus.getAttribute("role") !== "alert") {
+  throw new Error("notification catalog failures must be announced");
+}
+await page.getByRole("button", { name: "Retry loading destinations", exact: true }).click();
+await page.waitForFunction(() => {
+  const node = document.querySelector("#create-notifications .notification-editor > p.field-help");
+  return node && !node.hasAttribute("role") && node.textContent === "Notifications are off for this item.";
+});
 
 const run = Date.now().toString(36);
 const dest = `e2e-${run}`;
@@ -127,9 +160,67 @@ const PROJECT = `browser-project-${run}`;
 const FOLDER_PROJECT = `browser-folder-project-${run}`;
 await page.fill("#create-label", "browser e2e");
 await page.fill("#create-dest", dest);
+let receivePostSeen = false;
+let receiveListFailed = false;
+let releaseReceiveList;
+const heldReceiveList = new Promise((resolve) => { releaseReceiveList = resolve; });
+await page.route("**/api/admin/links*", async (route) => {
+  if (route.request().method() === "POST") {
+    const response = await route.fetch();
+    receivePostSeen = true;
+    return route.fulfill({ response });
+  }
+  if (receivePostSeen && !receiveListFailed) {
+    receiveListFailed = true;
+    await heldReceiveList;
+    return route.fulfill({ status: 503, json: { error: "Created link list refresh unavailable." } });
+  }
+  return route.continue();
+});
 await page.click("#create-form button[type=submit]");
 await page.waitForSelector("#new-link:not([hidden])");
 const linkUrl = (await page.textContent("#new-link-url")).trim();
+try {
+  await page.waitForFunction(() => document.activeElement.id === "new-link-url"
+    && !document.getElementById("create-form").inert
+    && !document.querySelector("#create-form button[type=submit]").disabled);
+} finally {
+  releaseReceiveList();
+}
+await page.locator("#links-error").filter({ hasText: "Created link list refresh unavailable." }).waitFor({ state: "visible" });
+if (await page.getAttribute("#new-link-url", "role") !== "status"
+  || await page.evaluate(() => document.activeElement === document.getElementById("new-link-url"))
+  !== true
+  || await page.textContent("#links-action-status") !== "Receive link created.") {
+  throw new Error("created receive links must announce and focus their address");
+}
+if (!receiveListFailed || await page.locator("#create-error").isVisible()) {
+  throw new Error("a list refresh failure must not hide or fail a successfully created receive link");
+}
+await page.click("#new-link-copy");
+await page.waitForFunction((url) => window.__copiedText === url
+  && document.getElementById("links-action-status").textContent === "Receive link copied.", linkUrl);
+await page.evaluate(() => { window.__clipboardFailure = true; window.__clipboardHold = true; window.__releaseClipboard = null; });
+await page.click("#new-link-copy");
+await page.waitForFunction(() => typeof window.__releaseClipboard === "function");
+await page.locator("#links-query").focus();
+await page.evaluate(() => { window.__clipboardHold = false; window.__releaseClipboard(); });
+await page.waitForFunction(() => document.activeElement === document.getElementById("links-query")
+  && document.getElementById("links-action-status").textContent === "Could not copy the receive address. Use Copy address below to retry.");
+await page.evaluate(() => { window.__clipboardHold = false; });
+await page.click("#new-link-copy");
+await page.waitForFunction(() => document.activeElement === document.getElementById("new-link-url")
+  && document.getElementById("links-action-status").textContent === "Your receive address is selected below. Copy it to share.");
+await page.evaluate(() => { window.__clipboardFailure = false; });
+await page.reload();
+await page.locator("#links [data-link-id]").first().waitFor();
+const embeddedNotificationStatuses = page.locator(".notification-editor > p.field-help");
+if (await embeddedNotificationStatuses.count() < 2
+  || await embeddedNotificationStatuses.evaluateAll((nodes) => nodes.some((node) => node.getAttribute("role") === "status"))
+  || await page.getAttribute("#links-action-status", "role") !== "status") {
+  throw new Error("repeated embedded notification editors must stay quiet while action status remains live");
+}
+await page.unroute("**/api/admin/links*");
 console.log("link:", linkUrl);
 
 const senderSource = fs.readFileSync(new URL("../web/assets/upload.js", import.meta.url), "utf8");
@@ -236,7 +327,7 @@ const countPreview = await page.evaluate(() => {
   let copiedProof = "";
   Object.defineProperty(navigator, "clipboard", {
     configurable: true,
-    value: { writeText: async (text) => { copiedProof = text; } },
+    value: { writeText: async (text) => { copiedProof = text; }, readText: async () => window.__copiedText },
   });
   window.__votportPreviewTest.showDone({ files });
   document.getElementById("copy-proof").click();
@@ -1093,12 +1184,28 @@ try {
   releasePreparation();
   await page.unroute("**/api/admin/outbound-grants");
 }
+let releaseGrant;
+const heldGrant = new Promise((resolve) => { releaseGrant = resolve; });
+await page.route("**/api/admin/outbound-grants", async (route) => {
+  if (route.request().method() === "POST") {
+    await heldGrant;
+    return route.continue();
+  }
+  return route.continue();
+}, { times: 1 });
 await page.click("#deliver-submit");
+await page.locator("#deliver-progress").waitFor({ state: "visible" });
+await page.locator("#library-search").focus();
+releaseGrant();
 await page.waitForSelector("#outbound-result:not([hidden])", { timeout: 30000 });
 const outboundUrl = await page.inputValue("#outbound-url");
 if (!/^https?:\/\//.test(outboundUrl)) {
   throw new Error(`outbound URL malformed: ${outboundUrl}`);
 }
+if (await page.evaluate(() => document.activeElement.id) !== "library-search") {
+  throw new Error("a delayed download result must preserve focus moved by the operator");
+}
+await page.unroute("**/api/admin/outbound-grants");
 await page.reload();
 const savedGrant = page.locator('#outbound-grants .card').filter({ has: page.getByRole('heading', { name: 'browser outbound e2e', exact: true }) });
 await savedGrant.getByRole('button', { name: 'Copy link', exact: true }).click();
@@ -1106,10 +1213,38 @@ await page.locator('#outbound-result').waitFor({ state: 'visible' });
 if (await page.inputValue('#outbound-url') !== outboundUrl) {
   throw new Error('reopening a saved download must preserve the original address');
 }
+await page.waitForFunction((url) => window.__copiedText === url
+  && document.getElementById('outbound-grants-status').textContent === 'Download link copied.'
+  && document.activeElement === document.getElementById('outbound-url'), outboundUrl);
+await page.evaluate(() => { window.__clipboardFailure = true; window.__clipboardHold = true; window.__releaseClipboard = null; });
+await page.click('#outbound-copy');
+await page.waitForFunction(() => typeof window.__releaseClipboard === 'function');
+await page.locator('#library-search').focus();
+await page.evaluate(() => { window.__clipboardHold = false; window.__releaseClipboard(); });
+await page.waitForFunction(() => {
+  return document.activeElement === document.getElementById('library-search')
+    && document.getElementById('outbound-grants-status').textContent === 'Could not copy the download address. Use Copy address below to retry.';
+});
+await page.evaluate(() => { window.__clipboardFailure = true; window.__clipboardHold = false; });
+await page.click('#outbound-copy');
+await page.waitForFunction(() => {
+  const output = document.getElementById('outbound-url');
+  return document.activeElement === output
+    && output.selectionStart === 0
+    && output.selectionEnd === output.value.length
+    && document.getElementById('outbound-grants-status').textContent === 'Your download address is selected below. Copy it to share.';
+});
+await page.evaluate(() => { window.__clipboardFailure = false; });
 console.log("download link remains available after reload: ok");
 
 await page.goto(outboundUrl);
 await page.waitForSelector("#download-content:not([hidden])", { timeout: 30000 });
+if (await page.getAttribute("#download-content", "aria-live") !== null
+  || await page.getAttribute("#download-error", "aria-live") !== null
+  || await page.getAttribute("#download-error", "role") !== "alert"
+  || await page.getAttribute("#separate-download-status", "aria-live") !== "polite") {
+  throw new Error("download shell must stay quiet while specific download feedback remains live");
+}
 for (const file of outboundFiles) {
   await page.getByRole("button", { name: `Download file: ${PROJECT}/${file.name}`, exact: true }).waitFor();
 }

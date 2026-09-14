@@ -18,6 +18,7 @@ import {
   formatWhen,
   requireSession,
   revealHash,
+  selectText,
   showGrantResult,
   undoable,
 } from '/assets/admin-common.js';
@@ -81,7 +82,7 @@ function chunkTrouble(record) {
   return text;
 }
 
-async function issueReceivedGrant(link, upload, fileIndex, file) {
+async function issueReceivedGrant(link, upload, fileIndex, file, control) {
   const response = await api('/api/admin/outbound-grants', {
     method: 'POST',
     body: JSON.stringify({
@@ -94,7 +95,9 @@ async function issueReceivedGrant(link, upload, fileIndex, file) {
   });
   const url = response.url;
   if (!url) throw new Error('server did not return a download URL');
-  showGrantResult(url, response.grant?.has_password);
+  const focusResult = control && (document.activeElement === control || document.activeElement === document.body);
+  showGrantResult(url, response.grant?.has_password, focusResult);
+  announce('links-action-status', 'Download link ready.');
 }
 
 // The transfer timeline: summary figures and one line per log event, in
@@ -315,7 +318,7 @@ function renderFile(link, upload, file) {
       extras.push(receipt);
     }
     if (file.exists && file.receipt) {
-      extras.push(button('Send', 'tiny', () => issueReceivedGrant(link, upload, index, file)));
+      extras.push(button('Send', 'tiny', (control) => issueReceivedGrant(link, upload, index, file, control)));
     }
     if (file.exists && !held) {
       extras.push(
@@ -856,6 +859,8 @@ $('create-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const submit = event.currentTarget.querySelector('button[type="submit"]');
   if (submit.disabled) return;
+  const submittedFocus = document.activeElement;
+  let created = false;
   submit.disabled = true; $('create-form').inert = true;
   $('create-error').hidden = true;
   const maxGib = parseInt($('create-max').value, 10);
@@ -883,12 +888,30 @@ $('create-form').addEventListener('submit', async (event) => {
     $('new-link-note').textContent = link.has_password
       ? 'Send the access password by a separate channel.'
       : '';
-    $('new-link-copy').onclick = () => copyToClipboard($('new-link-copy'), link.url);
-    await refreshLinks();
+    created = true;
+    announce('links-action-status', 'Receive link created.');
+    $('new-link-copy').onclick = async () => {
+      try {
+        await copyToClipboard($('new-link-copy'), link.url);
+        announce('links-action-status', 'Receive link copied.');
+      } catch {
+        const output = $('new-link-url');
+        if ($('new-link-copy') === document.activeElement || output === document.activeElement || document.activeElement === document.body) {
+          selectText(output);
+          announce('links-action-status', 'Your receive address is selected below. Copy it to share.');
+        } else announce('links-action-status', 'Could not copy the receive address. Use Copy address below to retry.');
+      }
+    };
+    refreshLinksSafe();
   } catch (error) {
     $('create-error').textContent = error.message;
     $('create-error').hidden = false;
-  } finally { submit.disabled = false; $('create-form').inert = false; }
+  } finally {
+    submit.disabled = false; $('create-form').inert = false;
+    if (created && $('create-error').hidden && (document.activeElement === submittedFocus || document.activeElement === document.body)) {
+      $('new-link-url').focus({ preventScroll: true });
+    }
+  }
 });
 
 $('links-filter').addEventListener('submit', (event) => {

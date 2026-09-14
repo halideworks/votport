@@ -328,6 +328,20 @@ export function announce(id, text) {
   document.getElementById(id).textContent = text;
 }
 
+export function selectText(element) {
+  element.focus({ preventScroll: true });
+  if (typeof element.select === 'function') {
+    element.select();
+    return;
+  }
+  const selection = window.getSelection();
+  if (!selection) return;
+  const range = document.createRange();
+  range.selectNodeContents(element);
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
 // Undo toasts: the page changes at once, the server call waits six seconds
 // for an Undo. Interaction pauses the window; pagehide commits with keepalive.
 const undoQueue = createUndoQueue();
@@ -405,7 +419,7 @@ export function undoable({ text, commit, restore = () => {}, focus, returnFocus 
 }
 
 /// Fills the shared outbound grant URL card on receive/deliver.
-export function showGrantResult(url, protectedGrant = false) {
+export function showGrantResult(url, protectedGrant = false, focusResult = false) {
   const output = document.getElementById('outbound-url');
   document.getElementById('outbound-result').hidden = false;
   output.value = url;
@@ -414,7 +428,20 @@ export function showGrantResult(url, protectedGrant = false) {
     `You can copy this link again from Download links on the Deliver page.`
     + (protectedGrant ? ' This download is password-protected. Send the password by a separate channel.' : '');
   const copy = document.getElementById('outbound-copy');
-  copy.onclick = () => copyToClipboard(copy, url);
+  const status = document.querySelector('#outbound-grants-status, #links-action-status');
+  const report = (text) => { if (status) announce(status.id, text); };
+  if (focusResult) output.focus({ preventScroll: true });
+  copy.onclick = async () => {
+    try {
+      await copyToClipboard(copy, url);
+      report('Download link copied.');
+    } catch {
+      if (copy === document.activeElement || output === document.activeElement || document.activeElement === document.body) {
+        selectText(output);
+        report('Your download address is selected below. Copy it to share.');
+      } else report('Could not copy the download address. Use Copy address below to retry.');
+    }
+  };
 }
 
 export function formatWhen(unixSeconds) {
