@@ -97,6 +97,7 @@ pub struct App {
     pub outbound_active: Mutex<HashSet<String>>,
     /// Concurrent byte reservations for outbound staging on the data filesystem.
     pub outbound_stage_budget: Arc<crate::api::outbound::StageBudget>,
+    pub(crate) admin_status: crate::api::admin::AdminStatusCache,
     /// Bounds concurrent batch staging tasks across every download stream.
     pub staging_permits: Arc<tokio::sync::Semaphore>,
     /// Bounded locks for serializing outbound library publication paths.
@@ -846,6 +847,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         automation_read_rate: crate::api::session_rate::SessionRate::with_limit(6000),
         outbound_active: Mutex::new(HashSet::new()),
         outbound_stage_budget: Arc::new(crate::api::outbound::StageBudget::new()),
+        admin_status: crate::api::admin::AdminStatusCache::default(),
         staging_permits: Arc::new(tokio::sync::Semaphore::new(
             crate::api::outbound::STAGING_CONCURRENCY,
         )),

@@ -736,15 +736,25 @@ async function revealGrant() {
 window.addEventListener('hashchange', () => { revealGrant().catch(() => {}); });
 
 function renderStatus(status) {
-  const outbound = status.outbound;
+  const outbound = status.outbound || {};
+  const active = outbound.active ?? null;
   $('status-strip').hidden = false;
-  $('stat-active').textContent = String(outbound.active);
-  $('stat-active-detail').textContent = outbound.active
-    ? `recipient${outbound.active === 1 ? '' : 's'} downloading now`
+  $('stat-active').textContent = active === null ? '–' : String(active);
+  $('stat-active-detail').textContent = active === null
+    ? 'unavailable'
+    : active
+    ? `recipient${active === 1 ? '' : 's'} downloading now`
     : 'nothing being served';
-  $('stat-open').textContent = String(outbound.open_grants);
-  $('stat-deliveries').textContent = String(outbound.deliveries);
+  $('stat-open').textContent = String(outbound.open_grants ?? '–');
+  $('stat-deliveries').textContent = String(outbound.deliveries ?? '–');
   $('stat-disk').textContent = outbound.disk ? formatBytes(outbound.disk.free_bytes) : '–';
+  const note = $('status-cache-note');
+  note.hidden = false;
+  note.textContent = status.stale
+    ? (status.sampled_at
+      ? `Status sampled at ${new Date(status.sampled_at * 1000).toLocaleTimeString()} and may be out of date.${status.stale_error ? ` ${status.stale_error}.` : ''}`
+      : 'Totals are temporarily unavailable.')
+    : 'Totals refresh about once a minute. Transfer activity is live.';
 }
 
 // The session check and every list go out together; each is one round trip.

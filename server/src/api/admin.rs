@@ -1,6 +1,9 @@
 //! Admin management API: sign-in, request links, received-file management.
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, State};
@@ -465,6 +468,201 @@ pub struct StatusQuery {
     since: Option<u64>,
 }
 
+const ADMIN_STATUS_TTL: Duration = Duration::from_secs(60);
+const ADMIN_STATUS_WAIT: Duration = Duration::from_secs(1);
+const ADMIN_STATUS_CACHE_ENTRIES: usize = 64;
+const ADMIN_STATUS_SPOOL_LINE_MAX: usize = 2 * 1024 * 1024;
+#[cfg(test)]
+const ADMIN_STATUS_TEST_WAIT: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StatusKey {
+    tenant: String,
+    incarnation: Option<String>,
+    since: Option<u64>,
+}
+
+#[derive(Clone)]
+struct StatusSnapshot {
+    sampled_at: u64,
+    started: Instant,
+    today_uploads: u64,
+    today_bytes: u64,
+    stored: serde_json::Value,
+    receive_disk: Option<serde_json::Value>,
+    outbound: crate::store::OutboundSummary,
+    outbound_disk: Option<serde_json::Value>,
+    since: u64,
+    warning: Option<String>,
+}
+
+struct StatusEntry {
+    key: StatusKey,
+    snapshot: Option<StatusSnapshot>,
+    error: Option<String>,
+    // Completion time throttles the next scan independently of sample age.
+    last_refresh: Option<Instant>,
+}
+
+#[derive(Default)]
+struct StatusCacheState {
+    entries: Vec<StatusEntry>,
+    running: bool,
+}
+
+/// Bounded, single-flight cache for the status strip's expensive reads.
+pub(crate) struct AdminStatusCache {
+    state: std::sync::Mutex<StatusCacheState>,
+    changed: tokio::sync::Notify,
+    #[cfg(test)]
+    refreshes: AtomicU64,
+    #[cfg(test)]
+    scan_gate: std::sync::Mutex<Option<Arc<StatusScanGate>>>,
+}
+
+#[cfg(test)]
+struct StatusScanGate {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl Default for AdminStatusCache {
+    fn default() -> Self {
+        Self {
+            state: std::sync::Mutex::new(StatusCacheState::default()),
+            changed: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            refreshes: AtomicU64::new(0),
+            #[cfg(test)]
+            scan_gate: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl StatusEntry {
+    fn needs_refresh(&self, now: Instant) -> bool {
+        self.last_refresh
+            .is_none_or(|last_refresh| now.duration_since(last_refresh) >= ADMIN_STATUS_TTL)
+    }
+}
+
+impl AdminStatusCache {
+    fn fresh(snapshot: &StatusSnapshot) -> bool {
+        snapshot.started.elapsed() < ADMIN_STATUS_TTL
+    }
+
+    fn start_refresh(&self, app: &Arc<App>, key: StatusKey) -> bool {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(_) => return false,
+        };
+        if state.running {
+            return false;
+        }
+        let now = Instant::now();
+        let index = state.entries.iter().position(|entry| entry.key == key);
+        let index = index.unwrap_or_else(|| {
+            if state.entries.len() == ADMIN_STATUS_CACHE_ENTRIES {
+                state.entries.remove(0);
+            }
+            state.entries.push(StatusEntry {
+                key: key.clone(),
+                snapshot: None,
+                error: None,
+                last_refresh: None,
+            });
+            state.entries.len() - 1
+        });
+        if !state.entries[index].needs_refresh(now) {
+            return false;
+        }
+        state.entries[index].error = None;
+        state.running = true;
+        drop(state);
+
+        let app = Arc::clone(app);
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking({
+                let app = Arc::clone(&app);
+                let key = key.clone();
+                move || refresh_status_sync(&app, &key)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            app.admin_status.finish_refresh(key, result);
+        });
+        true
+    }
+
+    fn finish_refresh(&self, key: StatusKey, result: Result<StatusSnapshot, String>) {
+        let mut state = self.state.lock().expect("admin status cache poisoned");
+        if let Some(entry) = state.entries.iter_mut().find(|entry| entry.key == key) {
+            entry.last_refresh = Some(Instant::now());
+            match result {
+                Ok(snapshot) => {
+                    entry.snapshot = Some(snapshot);
+                    entry.error = None;
+                }
+                Err(error) => entry.error = Some(error),
+            }
+        }
+        state.running = false;
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    async fn snapshot(
+        &self,
+        app: &Arc<App>,
+        key: StatusKey,
+    ) -> (
+        Option<(StatusSnapshot, bool, Option<String>)>,
+        Option<String>,
+    ) {
+        let deadline = Instant::now() + ADMIN_STATUS_WAIT;
+        loop {
+            let notified = self.changed.notified();
+            let (snapshot, error, running, needs_refresh) = {
+                let Some(state) = self.state.try_lock().ok() else {
+                    return (None, Some("status cache is busy".to_owned()));
+                };
+                match state.entries.iter().find(|entry| entry.key == key) {
+                    Some(entry) => (
+                        entry.snapshot.clone(),
+                        entry.error.clone(),
+                        state.running,
+                        entry.needs_refresh(Instant::now()),
+                    ),
+                    None => (None, None, state.running, true),
+                }
+            };
+            let started = needs_refresh && !running && self.start_refresh(app, key.clone());
+            if let Some(snapshot) = snapshot {
+                let warning = snapshot.warning.clone();
+                let sample_error = if snapshot.started.elapsed() >= ADMIN_STATUS_TTL {
+                    Some("cached status is older than its refresh window".to_owned())
+                } else {
+                    None
+                };
+                let error = error.or(warning).or(sample_error);
+                let stale = !Self::fresh(&snapshot) || error.is_some();
+                return (Some((snapshot, stale, error)), None);
+            }
+            if !running && !started {
+                return (None, error);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
+                return (
+                    None,
+                    Some("status refresh did not finish in time".to_owned()),
+                );
+            }
+        }
+    }
+}
+
 /// Free and total bytes on the volume holding `root`.
 pub(crate) fn disk_of(root: &std::path::Path) -> Option<(u64, u64)> {
     rustix::fs::statvfs(root).ok().map(|stat| {
@@ -475,28 +673,108 @@ pub(crate) fn disk_of(root: &std::path::Path) -> Option<(u64, u64)> {
     })
 }
 
-/// Splits a tenant's live file records into what is on disk and what is not.
-/// A record with no stored path (from before it was tracked) cannot be
-/// checked and counts as present.
-fn stored_on_disk(app: &App, tenant: &str, live: &[(String, u64)]) -> serde_json::Value {
-    let (mut files, mut bytes, mut missing_files, mut missing_bytes) = (0u64, 0u64, 0u64, 0u64);
-    for (stored_as, size) in live {
-        let present = stored_as.is_empty()
-            || stored_path(app, tenant, stored_as).is_some_and(|path| path.is_file());
-        if present {
-            files += 1;
-            bytes = bytes.saturating_add(*size);
-        } else {
-            missing_files += 1;
-            missing_bytes = missing_bytes.saturating_add(*size);
+#[derive(Default)]
+struct StoredCounts {
+    files: u64,
+    bytes: u64,
+    missing_files: u64,
+    missing_bytes: u64,
+}
+
+/// Adds one live file record to the on-disk or missing bucket. A record with
+/// no stored path cannot be checked and counts as present.
+fn add_stored_count(
+    app: &App,
+    tenant: &str,
+    stored_as: &str,
+    size: u64,
+    counts: &mut StoredCounts,
+) {
+    let present = stored_as.is_empty()
+        || stored_path(app, tenant, stored_as).is_some_and(|path| path.is_file());
+    if present {
+        counts.files += 1;
+        counts.bytes = counts.bytes.saturating_add(size);
+    } else {
+        counts.missing_files += 1;
+        counts.missing_bytes = counts.missing_bytes.saturating_add(size);
+    }
+}
+
+fn read_spool_line<R: std::io::BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+) -> Result<bool, String> {
+    line.clear();
+    loop {
+        let available = reader.fill_buf().map_err(|error| error.to_string())?;
+        if available.is_empty() {
+            return Ok(!line.is_empty());
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(take) > ADMIN_STATUS_SPOOL_LINE_MAX {
+            return Err("admin status metadata row is too large".to_owned());
+        }
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            return Ok(true);
         }
     }
-    json!({
-        "files": files,
-        "bytes": bytes,
-        "missing_files": missing_files,
-        "missing_bytes": missing_bytes,
-    })
+}
+
+/// Runs the one grouped Store scan into a private metadata spool, then reads
+/// it back while checking paths. The Store lock is released before any NAS
+/// metadata calls, and only one JSON line is held in memory at a time.
+fn stored_counts_from_spool(app: &App, tenant: &str) -> Result<StoredCounts, String> {
+    use std::io::{BufReader, BufWriter, Seek as _, Write as _};
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let path = app
+        .config
+        .data_dir
+        .join(format!(".admin-status-{}.tmp", auth::random_token()));
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(&path).map_err(|error| error.to_string())?;
+    // Keep the descriptor private and unlink the name immediately so a
+    // cancelled or panicking worker cannot leave a spool behind.
+    std::fs::remove_file(&path).map_err(|error| error.to_string())?;
+    let mut writer = BufWriter::new(file);
+    // ponytail: SQLite may keep this GROUP BY temp B-tree in MEMORY; this
+    // focused task bounds the Rust side and leaves index/schema work separate.
+    app.store.write_tenant_live_files(tenant, &mut writer)?;
+    writer.flush().map_err(|error| error.to_string())?;
+    let mut file = writer
+        .into_inner()
+        .map_err(|error| error.into_error().to_string())?;
+    file.rewind().map_err(|error| error.to_string())?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut counts = StoredCounts::default();
+    while read_spool_line(&mut reader, &mut line)? {
+        let line = line.strip_suffix(b"\n").unwrap_or(&line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let (stored_as, size) =
+            serde_json::from_slice::<(String, u64)>(line).map_err(|error| error.to_string())?;
+        add_stored_count(app, tenant, &stored_as, size, &mut counts);
+    }
+    Ok(counts)
+}
+
+impl StoredCounts {
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "files": self.files,
+            "bytes": self.bytes,
+            "missing_files": self.missing_files,
+            "missing_bytes": self.missing_bytes,
+        })
+    }
 }
 
 /// Downloads in flight are keyed by the grant's hex token hash, a colon, and
@@ -511,6 +789,86 @@ fn active_grant_hashes<'a>(keys: impl Iterator<Item = &'a str>) -> Vec<String> {
     hashes
 }
 
+fn status_key(identity: &auth::AdminIdentity, since: Option<u64>) -> StatusKey {
+    StatusKey {
+        tenant: identity.tenant.clone(),
+        incarnation: identity
+            .grants
+            .iter()
+            .find(|grant| grant.tenant == identity.tenant)
+            .and_then(|grant| grant.incarnation.clone()),
+        since,
+    }
+}
+
+fn status_key_is_current(app: &App, key: &StatusKey) -> Result<bool, String> {
+    if key.tenant.is_empty() {
+        return Ok(true);
+    }
+    Ok(app
+        .store
+        .tenant(&key.tenant)?
+        .is_some_and(|tenant| key.incarnation.as_deref() == Some(tenant.incarnation.as_str())))
+}
+
+fn disk_json(root: &std::path::Path) -> Option<serde_json::Value> {
+    disk_of(root).map(|(free, total)| json!({ "free_bytes": free, "total_bytes": total }))
+}
+
+fn refresh_status_sync(app: &Arc<App>, key: &StatusKey) -> Result<StatusSnapshot, String> {
+    #[cfg(test)]
+    app.admin_status.refreshes.fetch_add(1, Ordering::Relaxed);
+    let _operation = app
+        .sessions
+        .try_begin_outbound_owned(&key.tenant)
+        .ok_or_else(|| "tenant operation unavailable".to_owned())?;
+    #[cfg(test)]
+    if let Some(gate) = app.admin_status.scan_gate.lock().unwrap().clone() {
+        gate.entered
+            .send(())
+            .map_err(|_| "status scan gate closed".to_owned())?;
+        gate.release
+            .lock()
+            .map_err(|_| "status scan gate poisoned".to_owned())?
+            .recv_timeout(ADMIN_STATUS_TEST_WAIT)
+            .map_err(|_| "status scan gate release timed out".to_owned())?;
+    }
+    if !status_key_is_current(app, key)? {
+        return Err("status changed while refreshing".to_owned());
+    }
+    let sample_started = Instant::now();
+    let sample_time = now_unix();
+    let since = key
+        .since
+        .unwrap_or_else(|| sample_time.saturating_sub(86_400));
+    let (today_uploads, today_bytes) = app.store.uploads_since(&key.tenant, since)?;
+    let stored_counts = stored_counts_from_spool(app, &key.tenant)?;
+    let outbound = app.store.outbound_summary(&key.tenant, sample_time, &[])?;
+    let receive_disk = disk_json(&app.config.receive_dir);
+    let outbound_disk = disk_json(&app.config.outbound_dir);
+    if !status_key_is_current(app, key)? {
+        return Err("status changed while refreshing".to_owned());
+    }
+    let warning = match (receive_disk.is_none(), outbound_disk.is_none()) {
+        (true, true) => Some("receive and outbound disk statistics unavailable".to_owned()),
+        (true, false) => Some("receive disk statistics unavailable".to_owned()),
+        (false, true) => Some("outbound disk statistics unavailable".to_owned()),
+        (false, false) => None,
+    };
+    Ok(StatusSnapshot {
+        sampled_at: sample_time,
+        started: sample_started,
+        today_uploads,
+        today_bytes,
+        stored: stored_counts.json(),
+        receive_disk,
+        outbound,
+        outbound_disk,
+        since,
+        warning,
+    })
+}
+
 /// The Receive and Deliver status strips: what is arriving now, what landed
 /// today, what is stored, what is being served, and room on both volumes.
 pub async fn admin_status(
@@ -521,36 +879,10 @@ pub async fn admin_status(
     let identity = require_operator(&app, &headers)?;
     let receiving = app.sessions.active_transfers(&identity.tenant);
     let bytes_in_flight: u64 = receiving.iter().map(|transfer| transfer.received).sum();
-    let since = query
-        .since
-        .unwrap_or_else(|| now_unix().saturating_sub(86_400));
-    let (today_uploads, today_bytes) = app
-        .store
-        .uploads_since(&identity.tenant, since)
-        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    let disk_of = |root: &std::path::Path| {
-        disk_of(root).map(|(free, total)| json!({ "free_bytes": free, "total_bytes": total }))
-    };
-    // Stored means on disk: a record whose file was moved or deleted outside
-    // votport is reported apart, so the strip never claims bytes that are
-    // not there. One stat per live file, off the runtime thread.
-    // ponytail: every poll stats every live file; cache the sweep once a
-    // tenant holds tens of thousands of records.
-    let stored = {
-        let app = Arc::clone(&app);
-        let tenant = identity.tenant.clone();
-        tokio::task::spawn_blocking(move || {
-            let live = app.store.tenant_live_files(&tenant)?;
-            Ok::<_, String>(stored_on_disk(&app, &tenant, &live))
-        })
-        .await
-        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
-    };
+    let since = query.since;
     let now = now_unix();
-    // Downloads in flight are keyed by the grant's hex token hash, a colon,
-    // and one or two stream segments; the tenant's share is counted by
-    // grant, so one recipient with several streams open is one download.
+    // Downloads in flight are kept in a bounded process registry. Query only
+    // those current hashes here, so a slow status sweep cannot hide them.
     let active_hashes = {
         let active = app
             .outbound_active
@@ -558,25 +890,380 @@ pub async fn admin_status(
             .expect("outbound active poisoned");
         active_grant_hashes(active.iter().map(String::as_str))
     };
-    let outbound = app
-        .store
-        .outbound_summary(&identity.tenant, now, &active_hashes)
-        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let current_active = if active_hashes.is_empty() {
+        Some(0)
+    } else {
+        let app_for_query = Arc::clone(&app);
+        let tenant = identity.tenant.clone();
+        tokio::task::spawn_blocking(move || {
+            app_for_query
+                .store
+                .outbound_active_count(&tenant, &active_hashes)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+    };
+    let key = status_key(&identity, since);
+    let (cached, cache_error) = app.admin_status.snapshot(&app, key).await;
+    let (today, stored, disk, outbound, sampled_at, stale, mut stale_error) =
+        if let Some((snapshot, snapshot_stale, error)) = cached {
+            let active = current_active;
+            let stale_error = error.or_else(|| {
+                active
+                    .is_none()
+                    .then(|| "active download count unavailable".to_owned())
+            });
+            (
+                Some(json!({
+                    "uploads": snapshot.today_uploads,
+                    "bytes": snapshot.today_bytes,
+                    "since": snapshot.since,
+                })),
+                Some(snapshot.stored),
+                snapshot.receive_disk,
+                json!({
+                    "active": active,
+                    "open_grants": snapshot.outbound.open_grants,
+                    "deliveries": snapshot.outbound.deliveries,
+                    "disk": snapshot.outbound_disk,
+                }),
+                Some(snapshot.sampled_at),
+                snapshot_stale || active.is_none(),
+                stale_error,
+            )
+        } else {
+            (
+                None,
+                None,
+                None,
+                json!({
+                    "active": current_active,
+                    "open_grants": null,
+                    "deliveries": null,
+                    "disk": null,
+                }),
+                None,
+                true,
+                cache_error.or_else(|| Some("status refresh unavailable".to_owned())),
+            )
+        };
+    if stale_error.is_none() && stale {
+        stale_error = Some("cached status is older than its refresh window".to_owned());
+    }
     Ok(Json(json!({
         "now": now,
         "sessions_active": receiving.len(),
         "bytes_in_flight": bytes_in_flight,
         "receiving": receiving,
-        "today": { "uploads": today_uploads, "bytes": today_bytes, "since": since },
+        "today": today,
         "stored": stored,
-        "disk": disk_of(&app.config.receive_dir),
-        "outbound": {
-            "active": outbound.active,
-            "open_grants": outbound.open_grants,
-            "deliveries": outbound.deliveries,
-            "disk": disk_of(&app.config.outbound_dir),
-        },
+        "disk": disk,
+        "outbound": outbound,
+        "sampled_at": sampled_at,
+        "stale": stale,
+        "stale_error": stale_error,
     })))
+}
+
+#[cfg(test)]
+mod status_cache_tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn concurrent_polls_share_one_refresh_and_publish_stale_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = crate::api::testing::build(directory.path());
+        let cookie = test_admin_cookie(&application, &auth::AdminIdentity::local_admin());
+        let router = crate::app::router(Arc::clone(&application));
+        let request = |uri| {
+            Request::get(uri)
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let (first, second) = tokio::join!(
+            router.clone().oneshot(request("/api/admin/status")),
+            router.oneshot(request("/api/admin/status")),
+        );
+        assert_eq!(first.unwrap().status(), StatusCode::OK);
+        assert_eq!(second.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            application.admin_status.refreshes.load(Ordering::Relaxed),
+            1
+        );
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let response = crate::app::router(Arc::clone(&application))
+            .oneshot(request("/api/admin/status"))
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["stale"], false);
+        assert!(body["sampled_at"].as_u64().is_some());
+        assert!(body["today"]["uploads"].as_u64().is_some());
+        let rolling_since = body["today"]["since"].as_u64().unwrap();
+
+        let response = crate::app::router(Arc::clone(&application))
+            .oneshot(request("/api/admin/status?since=1704067200"))
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["today"]["since"], 1_704_067_200u64);
+        assert_ne!(body["today"]["since"].as_u64().unwrap(), rolling_since);
+        assert!(application.admin_status.refreshes.load(Ordering::Relaxed) >= 2);
+
+        application
+            .admin_status
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key.since == Some(1_704_067_200))
+            .and_then(|entry| entry.snapshot.as_mut())
+            .unwrap()
+            .started -= ADMIN_STATUS_TTL;
+        let response = crate::app::router(application)
+            .oneshot(request("/api/admin/status?since=1704067200"))
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["stale"], true);
+        assert!(body["sampled_at"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn stuck_refresh_keeps_live_status_response_available() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = crate::api::testing::build(directory.path());
+        let cookie = test_admin_cookie(&application, &auth::AdminIdentity::local_admin());
+        application.admin_status.state.lock().unwrap().running = true;
+        let router = crate::app::router(Arc::clone(&application));
+        let status_request = Request::get("/api/admin/status")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let status = tokio::spawn(router.clone().oneshot(status_request));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let started = Instant::now();
+        let asset = router
+            .oneshot(
+                Request::get("/assets/status-strip.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(asset.status(), StatusCode::OK);
+        assert!(started.elapsed() < Duration::from_millis(250));
+
+        let response = status.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["today"].is_null());
+        assert!(body["stored"].is_null());
+        assert!(body["outbound"]["open_grants"].is_null());
+        assert_eq!(body["sampled_at"], serde_json::Value::Null);
+        assert_eq!(body["stale"], true);
+        assert!(body["stale_error"].as_str().is_some());
+    }
+
+    #[test]
+    fn status_worker_rejects_a_recreated_tenant() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = crate::api::testing::build(directory.path());
+        let tenant = || crate::store::Tenant {
+            incarnation: String::new(),
+            key: "team".to_owned(),
+            label: "team".to_owned(),
+            admin_group: None,
+            max_total_bytes: None,
+            max_links: None,
+            max_sessions: None,
+            created_at: 0,
+        };
+        application.store.insert_tenant(tenant()).unwrap();
+        let incarnation = application
+            .store
+            .tenant("team")
+            .unwrap()
+            .unwrap()
+            .incarnation;
+        let key = StatusKey {
+            tenant: "team".to_owned(),
+            incarnation: Some(incarnation),
+            since: None,
+        };
+        assert!(status_key_is_current(&application, &key).unwrap());
+        assert!(matches!(
+            application.store.remove_tenant("team").unwrap(),
+            crate::store::TenantRemoval::Deleted
+        ));
+        application.store.insert_tenant(tenant()).unwrap();
+        assert!(!status_key_is_current(&application, &key).unwrap());
+    }
+
+    #[tokio::test]
+    async fn status_worker_holds_tenant_guard_until_done_and_drops_on_early_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = crate::api::testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(crate::store::Tenant {
+                incarnation: String::new(),
+                key: "team".to_owned(),
+                label: "team".to_owned(),
+                admin_group: None,
+                max_total_bytes: None,
+                max_links: None,
+                max_sessions: None,
+                created_at: 0,
+            })
+            .unwrap();
+        let key = StatusKey {
+            tenant: "team".to_owned(),
+            incarnation: Some(
+                application
+                    .store
+                    .tenant("team")
+                    .unwrap()
+                    .unwrap()
+                    .incarnation,
+            ),
+            since: Some(0),
+        };
+
+        // Admission refusal must complete without ever reaching the scan
+        // gate. The result channel makes that assertion bounded too.
+        let held_pin = application.sessions.try_pin_tenant("team").unwrap();
+        let (no_entry_tx, no_entry_rx) = std::sync::mpsc::sync_channel(1);
+        let no_entry_app = Arc::clone(&application);
+        let no_entry_key = key.clone();
+        let no_entry_worker = std::thread::spawn(move || {
+            let result = refresh_status_sync(&no_entry_app, &no_entry_key);
+            no_entry_tx.send(result).unwrap();
+        });
+        let no_entry_result = no_entry_rx
+            .recv_timeout(ADMIN_STATUS_TEST_WAIT)
+            .expect("refused status worker did not finish");
+        assert!(matches!(
+            no_entry_result,
+            Err(error) if error == "tenant operation unavailable"
+        ));
+        assert!(no_entry_worker.join().is_ok());
+        drop(held_pin);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let gate = Arc::new(StatusScanGate {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        *application.admin_status.scan_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        let worker_app = Arc::clone(&application);
+        let worker_key = key.clone();
+        let (worker_done_tx, worker_done_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = refresh_status_sync(&worker_app, &worker_key);
+            worker_done_tx.send(result).unwrap();
+        });
+        entered_rx
+            .recv_timeout(ADMIN_STATUS_TEST_WAIT)
+            .expect("status worker did not enter the scan gate");
+        let cookie = test_admin_cookie(&application, &auth::AdminIdentity::local_admin());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, cookie.parse().unwrap());
+        headers.insert("x-votport", "1".parse().unwrap());
+        let response = delete_tenant(
+            State(Arc::clone(&application)),
+            axum::extract::Path("team".to_owned()),
+            headers,
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        release_tx.send(()).unwrap();
+        assert!(worker_done_rx
+            .recv_timeout(ADMIN_STATUS_TEST_WAIT)
+            .expect("released status worker did not finish")
+            .is_ok());
+        assert!(worker.join().is_ok());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, cookie.parse().unwrap());
+        headers.insert("x-votport", "1".parse().unwrap());
+        let _ = delete_tenant(
+            State(Arc::clone(&application)),
+            axum::extract::Path("team".to_owned()),
+            headers,
+        )
+        .await
+        .unwrap();
+
+        *application.admin_status.scan_gate.lock().unwrap() = None;
+        application
+            .store
+            .insert_tenant(crate::store::Tenant {
+                incarnation: String::new(),
+                key: "team".to_owned(),
+                label: "team".to_owned(),
+                admin_group: None,
+                max_total_bytes: None,
+                max_links: None,
+                max_sessions: None,
+                created_at: 0,
+            })
+            .unwrap();
+        assert!(refresh_status_sync(&application, &key).is_err());
+        assert!(application.sessions.try_pin_tenant("team").is_some());
+    }
+
+    #[test]
+    fn stale_observation_waits_for_completion_throttle() {
+        let now = Instant::now();
+        let entry = StatusEntry {
+            key: StatusKey {
+                tenant: String::new(),
+                incarnation: None,
+                since: None,
+            },
+            snapshot: Some(StatusSnapshot {
+                sampled_at: 0,
+                started: now - ADMIN_STATUS_TTL,
+                today_uploads: 0,
+                today_bytes: 0,
+                stored: json!({}),
+                receive_disk: None,
+                outbound: crate::store::OutboundSummary {
+                    open_grants: 0,
+                    deliveries: 0,
+                    active: 0,
+                },
+                outbound_disk: None,
+                since: 0,
+                warning: None,
+            }),
+            error: None,
+            last_refresh: Some(now),
+        };
+        assert!(!entry.needs_refresh(now + ADMIN_STATUS_TTL - Duration::from_nanos(1)));
+        assert!(entry.needs_refresh(now + ADMIN_STATUS_TTL));
+        let cold = StatusEntry {
+            last_refresh: None,
+            ..entry
+        };
+        assert!(cold.needs_refresh(now));
+    }
 }
 
 #[derive(Deserialize)]

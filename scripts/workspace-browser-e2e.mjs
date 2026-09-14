@@ -635,6 +635,7 @@ try {
   await page.waitForFunction(() => !document.querySelector('.reception-workflow > [role=status]').textContent);
   assert.equal(listReads, 2, 'The deferred refresh runs after editing finishes');
   await page.unroute('**/api/admin/status?*'); await page.unroute('**/api/admin/links?*'); await page.unroute(`**/api/admin/links/${incoming.id}`);
+
   await editor.evaluate((node) => { node.open = true; });
   await editor.locator('input[data-metadata]').fill('Preserved by manual refresh');
   await page.click('#links-refresh'); await page.waitForLoadState('networkidle');
@@ -653,6 +654,127 @@ try {
   await page.locator('#confirm-ok').click(); await card.waitFor({ state: 'detached' }); await page.waitForLoadState('networkidle');
   page.off('dialog', onExtra); assert.deepEqual(extraDialogs, [], 'Confirmed deletion removes the request draft without another discard prompt');
   assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'Deleting the request keeps a keyboard focus target');
+
+  // The status cache may return a fresh sample, an older sample, or no
+  // expensive totals while the live activity count is still available. Keep
+  // each response controlled so both pages exercise the real renderer and
+  // poll error path without waiting on a wall-clock refresh interval.
+  const statusTime = Math.floor(Date.now() / 1000);
+  const statusFixture = (overrides = {}) => ({
+    now: statusTime,
+    sessions_active: 2,
+    bytes_in_flight: 4096,
+    receiving: [],
+    today: { uploads: 12, bytes: 12 * 1024 },
+    stored: { files: 3, bytes: 3 * 1024, missing_files: 0, missing_bytes: 0 },
+    disk: { free_bytes: 8 * 1024 * 1024, total_bytes: 16 * 1024 * 1024 },
+    outbound: {
+      active: 8,
+      open_grants: 6,
+      deliveries: 11,
+      disk: { free_bytes: 7 * 1024 * 1024, total_bytes: 16 * 1024 * 1024 },
+    },
+    sampled_at: statusTime,
+    stale: false,
+    stale_error: null,
+    ...overrides,
+  });
+  let controlledStatus = statusFixture();
+  let failControlledStatus = false;
+  await page.route('**/api/admin/status?*', (route) => failControlledStatus
+    ? route.fulfill({ status: 503, json: { error: 'Status fixture unavailable' } })
+    : route.fulfill({ json: controlledStatus }));
+  async function pollControlledStatus(next) {
+    controlledStatus = next;
+    failControlledStatus = false;
+    const response = page.waitForResponse((candidate) => candidate.url().includes('/api/admin/status?'));
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    assert.equal((await response).status(), 200);
+  }
+  async function failStatusPoll() {
+    failControlledStatus = true;
+    const response = page.waitForResponse((candidate) => candidate.url().includes('/api/admin/status?'));
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    assert.equal((await response).status(), 503);
+  }
+
+  await page.goto(`${base}/receive`);
+  await page.locator('#status-strip').waitFor({ state: 'visible' });
+  assert.equal(await page.locator('#stat-active').textContent(), '2', 'Receive renders the live active count for a fresh sample');
+  assert.equal(await page.locator('#stat-today').textContent(), '12');
+  assert.equal(await page.locator('#status-cache-note').textContent(), 'Totals refresh about once a minute. Transfer activity is live.');
+  assert.doesNotMatch(await page.locator('#status-strip').textContent(), /warming up/i);
+  await pollControlledStatus(statusFixture({
+    sessions_active: 3,
+    bytes_in_flight: 8192,
+    today: { uploads: 13, bytes: 13 * 1024 },
+    stored: { files: 4, bytes: 4 * 1024, missing_files: 0, missing_bytes: 0 },
+    sampled_at: statusTime - 120,
+    stale: true,
+    stale_error: 'cached status is older than its refresh window',
+  }));
+  await page.waitForFunction(() => document.querySelector('#stat-active').textContent === '3' && document.querySelector('#status-cache-note').textContent.includes('may be out of date'));
+  assert.equal(await page.locator('#stat-today').textContent(), '13', 'Receive keeps sampled totals visible when the sample is stale');
+  assert.doesNotMatch(await page.locator('#status-strip').textContent(), /warming up/i);
+  await pollControlledStatus(statusFixture({
+    sessions_active: 4,
+    bytes_in_flight: 16384,
+    today: null,
+    stored: null,
+    disk: null,
+    outbound: { active: 10, open_grants: null, deliveries: null, disk: null },
+    sampled_at: null,
+    stale: true,
+    stale_error: 'status refresh unavailable',
+  }));
+  await page.waitForFunction(() => document.querySelector('#stat-active').textContent === '4' && document.querySelector('#stat-today').textContent === '–');
+  assert.equal(await page.locator('#stat-stored').textContent(), '–');
+  assert.equal(await page.locator('#status-cache-note').textContent(), 'Totals are temporarily unavailable.');
+  assert.doesNotMatch(await page.locator('#status-strip').textContent(), /warming up/i);
+  assert.notEqual(await page.locator('#stat-today').textContent(), '0');
+  assert.notEqual(await page.locator('#stat-stored').textContent(), '0');
+  await failStatusPoll();
+  assert.equal(await page.locator('#stat-active').textContent(), '4', 'A failed poll preserves the last live Receive count');
+  assert.doesNotMatch(await page.locator('#status-strip').textContent(), /warming up/i);
+
+  controlledStatus = statusFixture();
+  failControlledStatus = false;
+  await page.goto(`${base}/deliver`);
+  await page.locator('#status-strip').waitFor({ state: 'visible' });
+  assert.equal(await page.locator('#stat-active').textContent(), '8', 'Deliver renders the live active count for a fresh sample');
+  assert.equal(await page.locator('#stat-open').textContent(), '6');
+  assert.equal(await page.locator('#stat-deliveries').textContent(), '11');
+  assert.equal(await page.locator('#status-cache-note').textContent(), 'Totals refresh about once a minute. Transfer activity is live.');
+  assert.doesNotMatch(await page.locator('#status-strip').textContent(), /warming up/i);
+  await pollControlledStatus(statusFixture({
+    outbound: { active: 9, open_grants: 7, deliveries: 12, disk: { free_bytes: 7 * 1024 * 1024, total_bytes: 16 * 1024 * 1024 } },
+    sampled_at: statusTime - 120,
+    stale: true,
+    stale_error: 'cached status is older than its refresh window',
+  }));
+  await page.waitForFunction(() => document.querySelector('#stat-active').textContent === '9' && document.querySelector('#status-cache-note').textContent.includes('may be out of date'));
+  assert.equal(await page.locator('#stat-open').textContent(), '7', 'Deliver keeps sampled totals visible when the sample is stale');
+  assert.doesNotMatch(await page.locator('#status-strip').textContent(), /warming up/i);
+  await pollControlledStatus(statusFixture({
+    sessions_active: 5,
+    outbound: { active: 10, open_grants: null, deliveries: null, disk: null },
+    today: null,
+    stored: null,
+    disk: null,
+    sampled_at: null,
+    stale: true,
+    stale_error: 'status refresh unavailable',
+  }));
+  await page.waitForFunction(() => document.querySelector('#stat-active').textContent === '10' && document.querySelector('#stat-open').textContent === '–');
+  assert.equal(await page.locator('#stat-deliveries').textContent(), '–');
+  assert.equal(await page.locator('#status-cache-note').textContent(), 'Totals are temporarily unavailable.');
+  assert.doesNotMatch(await page.locator('#status-strip').textContent(), /warming up/i);
+  assert.notEqual(await page.locator('#stat-open').textContent(), '0');
+  assert.notEqual(await page.locator('#stat-deliveries').textContent(), '0');
+  await failStatusPoll();
+  assert.equal(await page.locator('#stat-active').textContent(), '10', 'A failed poll preserves the last live Deliver count');
+  assert.doesNotMatch(await page.locator('#status-strip').textContent(), /warming up/i);
+  await page.unroute('**/api/admin/status?*');
 
   await page.goto(`${base}/storage`);
   let releaseInitial, initialStarted, initialReads = 0;
