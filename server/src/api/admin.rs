@@ -2614,7 +2614,8 @@ struct LinkView {
 
     notifications: Option<crate::store::NotificationPolicy>,
     usable: bool,
-    uploads: Vec<UploadView>,
+    upload_count: u64,
+    upload_bytes: u64,
     events: Vec<crate::store::SessionEvent>,
     /// Sessions receiving into this link right now.
     receiving: Vec<crate::session::ActiveTransfer>,
@@ -2623,6 +2624,8 @@ struct LinkView {
 
 #[derive(Serialize)]
 struct UploadView {
+    position: i64,
+    file_count: usize,
     route: Option<serde_json::Value>,
     id: String,
     started_at: u64,
@@ -2632,13 +2635,14 @@ struct UploadView {
     rejected_chunks: u64,
     package_root: String,
     total_bytes: u64,
-    files: Vec<FileView>,
     partial: bool,
-    log: Vec<crate::store::LogEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log: Option<Vec<crate::store::LogEvent>>,
 }
 
 #[derive(Serialize)]
 struct FileView {
+    file_index: usize,
     path: String,
     stored_as: String,
     bytes: u64,
@@ -2656,6 +2660,8 @@ pub struct LinkQuery {
     status: Option<String>,
     before_created_at: Option<u64>,
     before_id: Option<String>,
+    #[serde(default)]
+    route_eligible: bool,
 }
 
 pub(crate) fn base_url(app: &App, headers: &HeaderMap) -> String {
@@ -2697,52 +2703,12 @@ fn link_view(
     link: Link,
     base: &str,
     transfers: &[crate::session::ActiveTransfer],
+    totals: (u64, u64),
 ) -> ApiResult<LinkView> {
     let workflow = app
         .store
         .receive_workflow(&link.tenant, &link.id)
         .map_err(super::store_unavailable)?;
-    let mut routes = app
-        .store
-        .received_route_statuses(&link.tenant, &link.id)
-        .map_err(super::store_unavailable)?;
-    let usable = link.usable_now();
-    let tenant = link.tenant.clone();
-    let uploads = link
-        .uploads
-        .into_iter()
-        .map(|upload| UploadView {
-            route: routes.remove(&upload.id),
-            files: upload
-                .files
-                .into_iter()
-                .map(|file| FileView {
-                    exists: !file.deleted
-                        && stored_path(app, &tenant, &file.stored_as)
-                            .and_then(|path| std::fs::symlink_metadata(path).ok())
-                            .is_some_and(|metadata| {
-                                metadata.is_file() && metadata.len() == file.bytes
-                            }),
-                    path: file.path,
-                    stored_as: file.stored_as,
-                    bytes: file.bytes,
-                    suite: file.suite,
-                    root: file.root,
-                    receipt: file.receipt,
-                })
-                .collect(),
-            id: upload.id,
-            started_at: upload.started_at,
-            completed_at: upload.completed_at,
-            transport: upload.transport.unwrap_or_else(|| "http".to_owned()),
-            replayed_chunks: upload.replayed_chunks,
-            rejected_chunks: upload.rejected_chunks,
-            package_root: upload.package_root,
-            total_bytes: upload.total_bytes,
-            partial: upload.partial,
-            log: upload.log,
-        })
-        .collect();
     let receiving = transfers
         .iter()
         .filter(|transfer| transfer.link_id == link.id)
@@ -2751,7 +2717,7 @@ fn link_view(
     Ok(LinkView {
         workflow,
         url: format!("{base}/r/{}", link.id),
-        usable,
+        usable: link.usable_now(),
         receiving,
         id: link.id,
         label: link.label,
@@ -2762,11 +2728,46 @@ fn link_view(
         max_bytes: link.max_bytes,
         active: link.active,
         legal_hold: link.legal_hold,
-
-        notifications: link.notifications.clone(),
-        uploads,
+        notifications: link.notifications,
+        upload_count: totals.0,
+        upload_bytes: totals.1,
         events: link.events,
     })
+}
+
+fn upload_view(header: crate::store::UploadHeader, include_log: bool) -> UploadView {
+    let upload = header.upload;
+    UploadView {
+        position: header.position,
+        file_count: header.file_count,
+        route: header.route,
+        id: upload.id,
+        started_at: upload.started_at,
+        completed_at: upload.completed_at,
+        transport: upload.transport.unwrap_or_else(|| "http".to_owned()),
+        replayed_chunks: upload.replayed_chunks,
+        rejected_chunks: upload.rejected_chunks,
+        package_root: upload.package_root,
+        total_bytes: upload.total_bytes,
+        partial: upload.partial,
+        log: include_log.then_some(upload.log),
+    }
+}
+
+fn file_view(app: &App, tenant: &str, index: usize, file: crate::store::FileRecord) -> FileView {
+    FileView {
+        file_index: index,
+        exists: !file.deleted
+            && stored_path(app, tenant, &file.stored_as)
+                .and_then(|path| std::fs::symlink_metadata(path).ok())
+                .is_some_and(|metadata| metadata.is_file() && metadata.len() == file.bytes),
+        path: file.path,
+        stored_as: file.stored_as,
+        bytes: file.bytes,
+        suite: file.suite,
+        root: file.root,
+        receipt: file.receipt,
+    }
 }
 
 pub async fn list_links(
@@ -2776,77 +2777,273 @@ pub async fn list_links(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_operator(&app, &headers)?;
     let base = base_url(&app, &headers);
-    let paged = query.limit.is_some()
-        || query.search.is_some()
-        || query.status.is_some()
-        || query.before_created_at.is_some()
-        || query.before_id.is_some();
-    if paged {
-        let limit = query.limit.unwrap_or(100);
-        if !(1..=100).contains(&limit) {
+    let limit = query.limit.unwrap_or(50);
+    validate_page_limit(limit)?;
+    let status = query
+        .status
+        .as_deref()
+        .unwrap_or("all")
+        .to_ascii_lowercase();
+    if !matches!(status.as_str(), "all" | "open" | "closed") {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "status must be all, open, or closed",
+        ));
+    }
+    let cursor = match (query.before_created_at, query.before_id) {
+        (Some(created_at), Some(id)) if created_at <= i64::MAX as u64 && id.len() <= 128 => {
+            Some(LinkCursor { created_at, id })
+        }
+        (None, None) => None,
+        _ => {
             return Err(ApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "limit must be between 1 and 100",
-            ));
+                "before_created_at and before_id must be supplied together and be valid",
+            ))
         }
-        let status = query
-            .status
-            .as_deref()
-            .unwrap_or("all")
-            .to_ascii_lowercase();
-        if !matches!(status.as_str(), "all" | "open" | "closed") {
-            return Err(ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "status must be all, open, or closed",
-            ));
-        }
-        let cursor = match (query.before_created_at, query.before_id) {
-            (Some(created_at), Some(id)) => Some(LinkCursor { created_at, id }),
-            (None, None) => None,
-            _ => {
-                return Err(ApiError::new(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "before_created_at and before_id must be supplied together",
-                ));
-            }
-        };
+    };
+    let search = validate_audit_filter(query.search, "search")?.unwrap_or_default();
+    tokio::task::spawn_blocking(move || {
         let page = app
             .store
             .links_page(
                 &identity.tenant,
                 limit,
                 cursor.as_ref(),
-                query.search.as_deref().unwrap_or(""),
+                &search,
                 &status,
                 now_unix(),
+                query.route_eligible,
+            )
+            .map_err(super::store_unavailable)?;
+        let mut totals = app
+            .store
+            .link_upload_totals(
+                &identity.tenant,
+                &page
+                    .links
+                    .iter()
+                    .map(|link| link.id.clone())
+                    .collect::<Vec<_>>(),
             )
             .map_err(super::store_unavailable)?;
         let transfers = app.sessions.active_transfers(&identity.tenant);
-        let links: Vec<LinkView> = page
+        let links = page
             .links
             .into_iter()
-            .map(|link| link_view(&app, link, &base, &transfers))
-            .collect::<ApiResult<_>>()?;
-        return Ok(Json(json!({
-            "links": links,
-            "receive_dir": app.config.receive_dir,
-            "receipt_key": app.signer.public_hex,
-            "next_cursor": page.next_cursor,
-        })));
+            .map(|link| {
+                let counts = totals.remove(&link.id).unwrap_or_default();
+                link_view(&app, link, &base, &transfers, counts)
+            })
+            .collect::<ApiResult<Vec<_>>>()?;
+        Ok(Json(
+            json!({"links":links,"receive_dir":app.config.receive_dir,
+            "receipt_key":app.signer.public_hex,"next_cursor":page.next_cursor}),
+        ))
+    })
+    .await
+    .map_err(|_| ApiError::internal("request query worker failed"))?
+}
+
+pub async fn get_link(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_operator(&app, &headers)?;
+    let base = base_url(&app, &headers);
+    tokio::task::spawn_blocking(move || {
+        let link = app
+            .store
+            .link_metadata(&identity.tenant, &id)
+            .map_err(super::store_unavailable)?
+            .ok_or_else(ApiError::not_found)?;
+        let totals = app
+            .store
+            .link_upload_totals(&identity.tenant, std::slice::from_ref(&id))
+            .map_err(super::store_unavailable)?
+            .remove(&id)
+            .unwrap_or_default();
+        let transfers = app.sessions.active_transfers(&identity.tenant);
+        Ok(Json(
+            json!({"link":link_view(&app, link, &base, &transfers, totals)?}),
+        ))
+    })
+    .await
+    .map_err(|_| ApiError::internal("request query worker failed"))?
+}
+
+fn validate_page_limit(limit: u64) -> ApiResult<()> {
+    if !(1..=100).contains(&limit) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "limit must be between 1 and 100",
+        ));
     }
-    let transfers = app.sessions.active_transfers(&identity.tenant);
-    let links: Vec<LinkView> = app
-        .store
-        .links(&identity.tenant)
-        .map_err(super::store_unavailable)?
-        .into_iter()
-        .map(|link| link_view(&app, link, &base, &transfers))
-        .collect::<ApiResult<_>>()?;
-    Ok(Json(json!({
-        "links": links,
-        "receive_dir": app.config.receive_dir,
-        "receipt_key": app.signer.public_hex,
-    })))
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct UploadQuery {
+    limit: Option<u64>,
+    before_position: Option<i64>,
+}
+
+pub async fn list_link_uploads(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<UploadQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_operator(&app, &headers)?;
+    let limit = query.limit.unwrap_or(20);
+    validate_page_limit(limit)?;
+    if query.before_position.is_some_and(|position| position <= 0) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "before_position must be positive",
+        ));
+    }
+    tokio::task::spawn_blocking(move || {
+        let page = app.store.upload_headers_page(&identity.tenant, &id, query.before_position, limit as usize)
+            .map_err(super::store_unavailable)?.ok_or_else(ApiError::not_found)?;
+        Ok(Json(json!({"uploads":page.uploads.into_iter().map(|header| upload_view(header, false)).collect::<Vec<_>>(),
+            "next_position":page.next_position})))
+    }).await.map_err(|_| ApiError::internal("upload query worker failed"))?
+}
+
+pub async fn get_link_upload(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path((id, upload)): Path<(String, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_operator(&app, &headers)?;
+    tokio::task::spawn_blocking(move || {
+        let header = app
+            .store
+            .upload_header(&identity.tenant, &id, &upload)
+            .map_err(super::store_unavailable)?
+            .ok_or_else(ApiError::not_found)?;
+        Ok(Json(json!({"upload":upload_view(header, true)})))
+    })
+    .await
+    .map_err(|_| ApiError::internal("upload query worker failed"))?
+}
+
+#[derive(Deserialize)]
+pub struct UploadFilesQuery {
+    limit: Option<u64>,
+    offset: Option<u64>,
+}
+
+pub async fn list_upload_files(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path((id, upload)): Path<(String, String)>,
+    Query(query): Query<UploadFilesQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let identity = require_operator(&app, &headers)?;
+    let limit = query.limit.unwrap_or(100);
+    validate_page_limit(limit)?;
+    let offset = query.offset.unwrap_or(0);
+    if offset > i64::MAX as u64 {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "offset is too large",
+        ));
+    }
+    tokio::task::spawn_blocking(move || {
+        let crate::store::UploadFilesPage { header, files } = app
+            .store
+            .upload_files_page(
+                &identity.tenant,
+                &id,
+                &upload,
+                offset as usize,
+                limit as usize,
+            )
+            .map_err(super::store_unavailable)?
+            .ok_or_else(ApiError::not_found)?;
+        let next = offset.saturating_add(files.len() as u64);
+        let next_offset = (next < header.file_count as u64).then_some(next);
+        let files = files
+            .into_iter()
+            .map(|(index, file)| file_view(&app, &identity.tenant, index, file))
+            .collect::<Vec<_>>();
+        Ok(Json(
+            json!({"files":files,"file_count":header.file_count,"next_offset":next_offset}),
+        ))
+    })
+    .await
+    .map_err(|_| ApiError::internal("file query worker failed"))?
+}
+
+pub async fn export_upload_timeline(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path((id, upload)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    use futures_util::StreamExt as _;
+    use std::io::{Seek as _, Write as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let identity = require_operator(&app, &headers)?;
+    let disposition =
+        super::outbound::attachment_filename(&format!("votport-transfer-{upload}.json"))?;
+    let operation = Arc::clone(&identity.operation);
+    let (file, length) = tokio::task::spawn_blocking(move || {
+        let path = app
+            .config
+            .data_dir
+            .join(format!(".timeline-{}.tmp", auth::random_token()));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        // An unlinked spool is removed when its last descriptor closes, including cancelled requests.
+        std::fs::remove_file(&path).map_err(|error| ApiError::internal(error.to_string()))?;
+        let mut writer = std::io::BufWriter::new(file);
+        if !app
+            .store
+            .write_upload_timeline(&identity.tenant, &id, &upload, &mut writer)
+            .map_err(super::store_unavailable)?
+        {
+            return Err(ApiError::not_found());
+        }
+        writer
+            .flush()
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        let mut file = writer
+            .into_inner()
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        file.rewind()
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        let length = file
+            .metadata()
+            .map_err(|error| ApiError::internal(error.to_string()))?
+            .len();
+        Ok::<_, ApiError>((file, length))
+    })
+    .await
+    .map_err(|_| ApiError::internal("timeline export worker failed"))??;
+    let stream = ReaderStream::new(tokio::fs::File::from_std(file)).map(move |chunk| {
+        let _guard = &operation;
+        chunk
+    });
+    let mut response = (
+        [
+            (header::CONTENT_TYPE, "application/json".to_owned()),
+            (header::CONTENT_LENGTH, length.to_string()),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_DISPOSITION, disposition);
+    Ok(response)
 }
 
 #[derive(Deserialize)]
@@ -2924,13 +3121,10 @@ pub async fn create_link(
         .quotas_for(&tenant, &app.config)
         .map_err(super::store_unavailable)?;
     if let Some(max_links) = max_links {
-        let count = u64::try_from(
-            app.store
-                .links(&tenant)
-                .map_err(super::store_unavailable)?
-                .len(),
-        )
-        .unwrap_or(u64::MAX);
+        let count = app
+            .store
+            .tenant_link_count(&tenant)
+            .map_err(super::store_unavailable)?;
         if count >= max_links {
             return Err(ApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -2975,7 +3169,7 @@ pub async fn create_link(
         events: Vec::new(),
     };
     let base = base_url(&app, &headers);
-    let mut view = link_view(&app, link.clone(), &base, &[])?;
+    let mut view = link_view(&app, link.clone(), &base, &[], (0, 0))?;
     view.workflow = request.workflow.clone();
     app.store
         .insert_link_with_workflow(link, request.workflow.as_ref())
@@ -3847,44 +4041,29 @@ mod handler_tests {
     }
 
     #[test]
-    fn link_view_maps_legacy_upload_transport_to_http() {
-        let directory = tempfile::tempdir().unwrap();
-        let application = testing::build(directory.path());
-        let view = link_view(
-            &application,
-            Link {
-                id: "link".to_owned(),
-                label: "link".to_owned(),
-                tenant: String::new(),
-                dest: String::new(),
-                password_hash: None,
-                created_at: 0,
-                expires_at: None,
-                max_bytes: None,
-                active: true,
-                legal_hold: false,
-
-                notifications: None,
-                uploads: vec![UploadRecord {
+    fn upload_view_maps_legacy_upload_transport_to_http() {
+        let view = upload_view(
+            crate::store::UploadHeader {
+                position: 1,
+                file_count: 0,
+                route: None,
+                upload: UploadRecord {
                     partial: false,
                     log: Vec::new(),
-                    id: "upload".to_owned(),
+                    id: "upload".into(),
                     started_at: 0,
                     completed_at: 1,
                     replayed_chunks: 0,
                     rejected_chunks: 0,
                     transport: None,
-                    package_root: "root".to_owned(),
+                    package_root: "root".into(),
                     total_bytes: 0,
                     files: Vec::new(),
-                }],
-                events: Vec::new(),
+                },
             },
-            "http://localhost",
-            &[],
+            true,
         );
-        let json = serde_json::to_value(view.unwrap()).unwrap();
-        assert_eq!(json["uploads"][0]["transport"], "http");
+        assert_eq!(serde_json::to_value(view).unwrap()["transport"], "http");
     }
 
     #[test]
@@ -8618,5 +8797,295 @@ mod status_tests {
             active_grant_hashes(keys.iter().copied()),
             vec!["abc".to_owned(), "def".to_owned()]
         );
+    }
+}
+
+#[cfg(test)]
+mod received_page_tests {
+    use super::*;
+    use crate::{
+        api::testing,
+        app,
+        store::tests::{link_in, test_tenant},
+    };
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+
+    fn cookie(app: &App, tenant: &str, role: &str) -> String {
+        test_admin_cookie(
+            app,
+            &auth::AdminIdentity {
+                subject: format!("sso:{tenant}:{role}"),
+                tenant: tenant.into(),
+                role: role.into(),
+                grants: vec![auth::TenantGrant {
+                    incarnation: None,
+                    tenant: tenant.into(),
+                    role: role.into(),
+                }],
+                credential_version: 1,
+            },
+        )
+    }
+
+    async fn get(app: &Arc<App>, cookie: &str, route: &str) -> Response {
+        app::router(Arc::clone(app))
+            .oneshot(
+                Request::get(route)
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn json(response: Response) -> serde_json::Value {
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    fn seed(app: &App) {
+        app.store.insert_tenant(test_tenant("team")).unwrap();
+        for index in 0..101 {
+            app.store
+                .insert_link(link_in("team", &format!("request-{index:03}")))
+                .unwrap();
+        }
+        let record = serde_json::from_value(json!({
+            "id":"upload", "started_at":10, "completed_at":20, "total_bytes":201,
+            "package_root":"package", "replayed_chunks":2, "rejected_chunks":3,
+            "files":(0..201).map(|index|json!({"path":format!("file-{index}"),"stored_as":format!("file-{index}"),
+                "bytes":1,"suite":"blake3","root":"aa","receipt":true,"deleted":index == 1})).collect::<Vec<_>>(),
+            "log":[{"at":10,"kind":"opened"},{"at":12,"kind":"published","path":"file-0","bytes":5,"secs":2},
+                {"at":15,"kind":"quiet","secs":2},{"at":18,"kind":"reattached"},{"at":20,"kind":"finished"}],
+        })).unwrap();
+        app.store
+            .append_upload("team", "request-000", record)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn received_pages_are_bounded_scoped_and_lazy() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        seed(&application);
+        let cookie = cookie(&application, "team", "operator");
+        let listing = json(get(&application, &cookie, "/api/admin/links").await).await;
+        assert_eq!(listing["links"].as_array().unwrap().len(), 50);
+        assert!(listing["next_cursor"].is_object());
+        assert!(listing["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|link| link.get("uploads").is_none()));
+        let exact = json(get(&application, &cookie, "/api/admin/links/request-000").await).await;
+        assert_eq!(exact["link"]["id"], "request-000");
+        assert_eq!(exact["link"]["upload_count"], 1);
+        assert!(exact["link"].get("uploads").is_none());
+        assert_eq!(
+            get(&application, &cookie, "/api/admin/links/missing")
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let selected =
+            json(get(&application, &cookie, "/api/admin/links?search=request-000").await).await;
+        assert_eq!(selected["links"][0]["upload_count"], 1);
+        assert_eq!(selected["links"][0]["upload_bytes"], 201);
+        let headers = json(
+            get(
+                &application,
+                &cookie,
+                "/api/admin/links/request-000/uploads",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(headers["uploads"][0]["file_count"], 201);
+        assert!(headers["uploads"][0].get("files").is_none());
+        assert!(headers["uploads"][0].get("log").is_none());
+        let header = json(
+            get(
+                &application,
+                &cookie,
+                "/api/admin/links/request-000/uploads/upload",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(header["upload"]["log"].as_array().unwrap().len(), 5);
+        let mut files = Vec::new();
+        for (offset, count, next) in [(0, 100, Some(100)), (100, 100, Some(200)), (200, 1, None)] {
+            let page = json(
+                get(
+                    &application,
+                    &cookie,
+                    &format!("/api/admin/links/request-000/uploads/upload/files?offset={offset}"),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(page["file_count"], 201);
+            assert_eq!(page["files"].as_array().unwrap().len(), count);
+            assert_eq!(page["next_offset"], json!(next));
+            files.extend(page["files"].as_array().unwrap().clone());
+        }
+        assert_eq!(files.len(), 201);
+        for (index, file) in files.iter().enumerate() {
+            assert_eq!(file["file_index"], index);
+        }
+        assert_eq!(files[1]["exists"], false);
+        for suffix in ["?limit=0", "?limit=101", "?offset=18446744073709551615"] {
+            assert_eq!(
+                get(
+                    &application,
+                    &cookie,
+                    &format!("/api/admin/links/request-000/uploads/upload/files{suffix}")
+                )
+                .await
+                .status(),
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
+        for route in [
+            "/api/admin/links?limit=101",
+            "/api/admin/links?before_id=x",
+            "/api/admin/links/request-000/uploads?before_position=0",
+        ] {
+            assert_eq!(
+                get(&application, &cookie, route).await.status(),
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
+        for route in [
+            "/api/admin/links/request-000",
+            "/api/admin/links/request-000/uploads",
+            "/api/admin/links/request-000/uploads/upload",
+            "/api/admin/links/request-000/uploads/upload/files",
+            "/api/admin/links/request-000/uploads/upload/timeline",
+        ] {
+            assert_eq!(
+                get(&application, "", route).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                get(
+                    &application,
+                    &self::cookie(&application, "", "admin"),
+                    route
+                )
+                .await
+                .status(),
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                get(
+                    &application,
+                    &self::cookie(&application, "team", "viewer"),
+                    route
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn received_export_is_complete_and_releases_spool_on_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        seed(&application);
+        let cookie = cookie(&application, "team", "operator");
+        let route = "/api/admin/links/request-000/uploads/upload/timeline";
+        let response = get(&application, &cookie, route).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"votport-transfer-upload.json\"; filename*=UTF-8''votport-transfer-upload.json"
+        );
+        assert_eq!(application.sessions.active_outbound_for_tenant("team"), 1);
+        // A slow reader holds only its operation guard and private spool, not the Store lock.
+        let store = Arc::clone(&application.store);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || {
+                store
+                    .insert_link(link_in("team", "while-exporting"))
+                    .unwrap();
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let scratch = || {
+            std::fs::read_dir(&application.config.data_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".timeline-")
+                })
+                .count()
+        };
+        assert_eq!(scratch(), 0);
+        drop(response);
+        assert_eq!(application.sessions.active_outbound_for_tenant("team"), 0);
+        assert_eq!(scratch(), 0);
+        let response = get(&application, &cookie, route).await;
+        let length: usize = response.headers()[header::CONTENT_LENGTH]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.len(), length);
+        assert_eq!(application.sessions.active_outbound_for_tenant("team"), 0);
+        let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(document["upload"]["files"].as_array().unwrap().len(), 201);
+        assert_eq!(document["upload"]["files"][200]["path"], "file-200");
+        assert!(document["upload"]["files"][0].get("file_index").is_none());
+        assert_eq!(
+            document["summary"],
+            json!({"files":201,"bytes":201,"duration":10,"average":20.0,"peak":3.0,
+            "pauses":2,"restarts":1,"resent":2,"rejected":3,"outcome":"finished","transport":"http"})
+        );
+        let link = application
+            .store
+            .link("team", "request-000")
+            .unwrap()
+            .unwrap();
+        let upload = &link.uploads[0];
+        assert_eq!(
+            document,
+            json!({
+                "request":{"id":link.id,"label":link.label,"dest":link.dest},
+                "upload":{"id":upload.id,"started_at":upload.started_at,"completed_at":upload.completed_at,
+                    "transport":"http","package_root":upload.package_root,"total_bytes":upload.total_bytes,
+                    "partial":upload.partial,"replayed_chunks":upload.replayed_chunks,"rejected_chunks":upload.rejected_chunks,
+                    "files":upload.files.iter().map(|file|json!({"path":file.path,"bytes":file.bytes,"suite":file.suite,
+                        "root":file.root,"receipt":file.receipt})).collect::<Vec<_>>()},
+                "summary":{"files":201,"bytes":201,"duration":10,"average":20.0,"peak":3.0,
+                    "pauses":2,"restarts":1,"resent":2,"rejected":3,"outcome":"finished","transport":"http"},
+                "events":upload.log,
+            })
+        );
+        assert!(serde_json::from_slice::<serde_json::Value>(&bytes[..bytes.len() - 1]).is_err());
+        assert_eq!(
+            get(
+                &application,
+                &cookie,
+                "/api/admin/links/request-000/uploads/missing/timeline"
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(scratch(), 0);
+        assert_eq!(application.sessions.active_outbound_for_tenant("team"), 0);
     }
 }

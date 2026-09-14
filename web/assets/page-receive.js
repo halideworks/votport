@@ -4,7 +4,7 @@ import { notificationEditor, notificationDetails, uploadEvents, workflowEvents }
 // VOTPORT PROPRIETARY LICENSE.
 
 import { appendObjectCard } from '/assets/object-card.js';
-import { narrate, summarize, timelineJson } from '/assets/timeline.js';
+import { narrate, summarize } from '/assets/timeline.js';
 import { startStatusPoll } from '/assets/status-strip.js';
 import {
   alertModal,
@@ -99,7 +99,16 @@ async function issueReceivedGrant(link, upload, fileIndex, file) {
 
 // The transfer timeline: summary figures and one line per log event, in
 // the shared dialog. Everything shown is read from the record.
-function openTimeline(link, upload) {
+async function openTimeline(link, upload, trigger) {
+  const ticket = ++timelineTicket;
+  const response = await api('/api/admin/links/' + link.id + '/uploads/' + upload.id);
+  if (ticket !== timelineTicket || !trigger.isConnected) return;
+  upload = response.upload;
+  timelineSelection = { link, upload, trigger, offset: 0 };
+  timelineTicket++;
+  $('timeline-files').replaceChildren();
+  $('timeline-range').textContent = 'Loading files…';
+  for (const id of ['timeline-error', 'timeline-retry', 'timeline-previous', 'timeline-next']) $(id).hidden = true;
   const dialog = $('timeline');
   const summary = summarize(upload);
   $('timeline-kicker').textContent = link.label;
@@ -164,23 +173,17 @@ function openTimeline(link, upload) {
     events.append(row);
   }
   const download = $('timeline-download');
-  download.onclick = () => {
-    const blob = new window.Blob([timelineJson(link, upload)], { type: 'application/json' });
-    const url = window.URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = `votport-transfer-${upload.id}.json`;
-    anchor.click();
-    setTimeout(() => window.URL.revokeObjectURL(url), 1000);
-  };
+  download.href = '/api/admin/links/' + link.id + '/uploads/' + upload.id + '/timeline';
+  download.download = 'votport-transfer-' + upload.id + '.json';
   $('timeline-audit').href = `/audit?q=${encodeURIComponent(link.id)}`;
   dialog.showModal();
+  await refreshTimelineFiles(0);
 }
 
 // Actions inside an undo window, keyed by what they change. The renderer
 // reads these so any refresh (the status poll, another action) shows the
 // pending state; the server hears about it when the window closes.
-const pendingClears = new Set();
+const pendingClears = new Map();
 const pendingLinks = new Map();
 // Cards whose transfer list is open, so a re-render does not collapse them.
 const openLinks = new Set();
@@ -229,7 +232,7 @@ function renderUpload(link, upload) {
   transport.className = 'badge';
   transport.textContent = upload.transport === 'push' ? 'native push' : 'http';
   head.append(when, transport);
-  head.append(button('Timeline', 'tiny ghost', () => openTimeline(link, upload)));
+  head.append(button('Files and timeline', 'tiny ghost', (control) => openTimeline(link, upload, control)));
   if (upload.route) {
     head.append(button(upload.route.revoked_at ? 'Revoked trade route · evidence' : 'Trade route · evidence', 'tiny ghost', async () => {
       try {
@@ -252,7 +255,7 @@ function renderUpload(link, upload) {
       // Files on disk stay, so this needs an undo window, not a modal.
       button('Clear record', 'tiny ghost', (control) => deferred(control, {
         text: 'Transfer record cleared.',
-        mark: () => pendingClears.add(upload.id),
+        mark: () => pendingClears.set(upload.id, link.id),
         unmark: () => pendingClears.delete(upload.id),
         commit: async () => {
           await api(`/api/admin/links/${link.id}/uploads/${upload.id}`, {
@@ -263,37 +266,41 @@ function renderUpload(link, upload) {
       })),
     );
   }
-  const existingFiles = upload.files.filter((file) => file.exists);
-  if (!held && existingFiles.length) {
-    head.append(
-      button('Delete stored files', 'tiny danger', async () => {
-        if (
-          !(await confirmModal(
-            'Delete stored files',
-            `Delete ${existingFiles.length} stored file${existingFiles.length === 1 ? '' : 's'} from disk? This cannot be undone.`,
-            'Delete',
-          ))
-        )
-          return;
-        try {
-          for (const [index, file] of upload.files.entries()) {
+  if (!held && upload.file_count) {
+    head.append(button('Delete stored files', 'tiny danger', async () => {
+      if (!(await confirmModal('Delete stored files', 'Delete the stored files from this transfer? This cannot be undone.', 'Delete'))) return;
+      let offset = 0;
+      try {
+        do {
+          const page = await api('/api/admin/links/' + link.id + '/uploads/' + upload.id + '/files?offset=' + offset + '&limit=100');
+          if (page.file_count !== upload.file_count) throw new Error('Transfer history changed. Review the files before deleting them.');
+          for (const file of page.files) {
             if (!file.exists) continue;
-            await api(
-              `/api/admin/links/${link.id}/uploads/${upload.id}/files/${index}`,
-              { method: 'DELETE' },
-            );
+            await api('/api/admin/links/' + link.id + '/uploads/' + upload.id + '/files/' + file.file_index, { method: 'DELETE' });
           }
-        } catch (error) {
-          try { await refreshLinks(); } catch { /* keep the deletion error visible */ }
-          throw error;
-        }
-        await refreshLinks();
-        announce('links-action-status', `Deleted ${existingFiles.length} stored file${existingFiles.length === 1 ? '' : 's'}.`);
-      }),
-    );
+          offset = page.next_offset;
+        } while (offset !== null);
+      } catch (error) {
+        try { await refreshLinks(); } catch { /* keep the deletion error visible */ }
+        throw error;
+      }
+      await refreshLinks();
+      announce('links-action-status', 'Stored-file deletion completed.');
+    }));
   }
   item.append(head);
-  upload.files.forEach((file, index) => {
+
+  const root = document.createElement('div');
+  root.className = 'mono muted file-id';
+  root.textContent = `package ${upload.package_root}`;
+  item.append(root);
+  return item;
+}
+
+function renderFile(link, upload, file) {
+  const item = document.createElement('div');
+  const index = file.file_index;
+  const held = link.legal_hold || pendingLinks.get(link.id)?.legal_hold === false;
     const extras = [];
     if (!file.exists) {
       const missing = document.createElement('span');
@@ -325,6 +332,7 @@ function renderUpload(link, upload) {
             `/api/admin/links/${link.id}/uploads/${upload.id}/files/${index}`,
             { method: 'DELETE' },
           );
+          if (timelineSelection?.upload.id === upload.id) await refreshTimelineFiles(timelineSelection.offset);
           await refreshLinks();
           announce('links-action-status', `Deleted "${file.stored_as}".`);
         }),
@@ -335,17 +343,94 @@ function renderUpload(link, upload) {
       { name: file.stored_as, suite: file.suite, root: file.root },
       { tag: 'div', rowClass: 'upload-file', status: formatBytes(file.bytes), extras },
     );
-  });
+  return item.firstElementChild;
+}
+let timelineSelection = null, timelineTicket = 0;
+async function refreshTimelineFiles(offset) {
+  const selection = timelineSelection, ticket = ++timelineTicket;
+  if (!selection) return;
+  const previous = $('timeline-previous'), next = $('timeline-next'), retry = $('timeline-retry');
+  const focusedControl = [previous, next, retry].includes(document.activeElement) ? document.activeElement : null;
+  previous.disabled = next.disabled = retry.disabled = true;
+  try {
+    const page = await api('/api/admin/links/' + selection.link.id + '/uploads/' + selection.upload.id + '/files?offset=' + offset + '&limit=100');
+    if (ticket !== timelineTicket || selection !== timelineSelection || !$('timeline').open) return;
+    const focus = $('timeline-files').contains(document.activeElement) ? document.activeElement : null;
+    $('timeline-files').replaceChildren(...page.files.map((file) => renderFile(selection.link, selection.upload, file)));
+    selection.offset = offset;
+    selection.next = page.next_offset;
+    $('timeline-range').textContent = page.files.length ? 'Showing files ' + (offset + 1) + ' to ' + (offset + page.files.length) + ' of ' + page.file_count + '.' : 'No files.';
+    $('timeline-error').hidden = retry.hidden = true;
+    previous.hidden = offset === 0; next.hidden = page.next_offset === null;
+    if (focus) $('timeline-range').focus({ preventScroll: true });
+  } catch (error) {
+    if (ticket !== timelineTicket || selection !== timelineSelection) return;
+    selection.retry = offset;
+    $('timeline-error').textContent = error.message; $('timeline-error').hidden = retry.hidden = false;
+  } finally {
+    if (ticket === timelineTicket) {
+      previous.disabled = next.disabled = retry.disabled = false;
+      if (focusedControl && document.activeElement === document.body) (focusedControl.hidden ? $('timeline-range') : focusedControl).focus({ preventScroll: true });
+    }
+  }
+}
+$('timeline-retry').addEventListener('click', () => refreshTimelineFiles(timelineSelection.retry));
+$('timeline-previous').addEventListener('click', () => refreshTimelineFiles(Math.max(0, timelineSelection.offset - 100)));
+$('timeline-next').addEventListener('click', () => refreshTimelineFiles(timelineSelection.next));
+$('timeline').addEventListener('close', () => {
+  const trigger = timelineSelection?.trigger;
+  timelineSelection = null; timelineTicket++;
+  $('timeline-files').replaceChildren();
+  (trigger?.isConnected ? trigger : $('links-action-status')).focus({ preventScroll: true });
+});
 
-  const root = document.createElement('div');
-  root.className = 'mono muted file-id';
-  root.textContent = `package ${upload.package_root}`;
-  item.append(root);
-  return item;
+const historyPositions = new Map();
+function uploadHistory(link) {
+  const details = document.createElement('details'), summary = document.createElement('summary');
+  details.className = 'upload-history';
+  details.open = openLinks.has(link.id);
+  summary.textContent = link.upload_count + ' transfer' + (link.upload_count === 1 ? '' : 's') + ' · ' + formatBytes(link.upload_bytes);
+  if ([...pendingClears.values()].includes(link.id)) summary.textContent += ' · clearing record';
+  const list = document.createElement('ul'); list.className = 'uploads';
+  const status = document.createElement('p'); status.className = 'muted'; status.setAttribute('role', 'status'); status.tabIndex = -1;
+  const latest = button('Latest transfers', 'tiny ghost', () => load(null, 0));
+  const older = button('Older transfers', 'tiny ghost', () => load(next, seen));
+  const actions = document.createElement('div'); actions.className = 'actions'; actions.append(latest, older);
+  let loaded = false, busy = false, next = null, seen = 0;
+  async function load(before, offset = 0) {
+    if (busy) return;
+    busy = true;
+    const focusedControl = [latest, older].includes(document.activeElement) ? document.activeElement : null;
+    latest.disabled = older.disabled = true;
+    try {
+      const page = await api('/api/admin/links/' + link.id + '/uploads?limit=20' + (before === null ? '' : '&before_position=' + before));
+      if (!details.isConnected) return;
+      const focus = list.contains(document.activeElement);
+      list.replaceChildren(...page.uploads.filter((upload) => !pendingClears.has(upload.id)).map((upload) => renderUpload(link, upload)));
+      seen = offset + page.uploads.length;
+      historyPositions.set(link.id, { before, offset });
+      loaded = true; next = page.next_position;
+      latest.hidden = before === null; older.hidden = next === null;
+      status.textContent = page.uploads.length ? 'Showing transfers ' + (offset + 1) + ' to ' + seen + ', newest first.' : 'No transfers on this page.';
+      if (focus) status.focus({ preventScroll: true });
+    } catch (error) { status.textContent = error.message; latest.hidden = false; }
+    finally {
+      busy = false; latest.disabled = older.disabled = false;
+      if (focusedControl && document.activeElement === document.body) (focusedControl.hidden ? status : focusedControl).focus({ preventScroll: true });
+    }
+  }
+  details.addEventListener('toggle', () => {
+    if (details.open) { openLinks.add(link.id); if (!loaded) { const position = historyPositions.get(link.id); load(position?.before ?? null, position?.offset ?? 0); } }
+    else openLinks.delete(link.id);
+  });
+  details.append(summary, status, list, actions);
+  latest.hidden = older.hidden = true;
+  return details;
 }
 
 const LINKS_PAGE_SIZE = 50;
 let linksCursor = null;
+let linksSeen = 0;
 let linksBusy = false;
 // Load more was used: a background refresh would collapse the list.
 let linksExpanded = false;
@@ -447,10 +532,6 @@ function renderLink(link) {
     const expired = link.expires_at && Date.now() / 1000 >= link.expires_at;
     link = { ...link, ...pending };
     if (pending.active !== undefined) link.usable = pending.active && !expired;
-  }
-  // A record being cleared is gone from the count and total as well.
-  if (pendingClears.size) {
-    link = { ...link, uploads: link.uploads.filter((upload) => !pendingClears.has(upload.id)) };
   }
   const card = document.createElement('div');
   card.className = 'card link-item';
@@ -619,27 +700,7 @@ function renderLink(link) {
   }
   card.append(actions, qr);
 
-  if (link.uploads.length) {
-    const details = document.createElement('details');
-    details.open = openLinks.has(link.id);
-    details.addEventListener('toggle', () => {
-      if (details.open) openLinks.add(link.id);
-      else openLinks.delete(link.id);
-    });
-    const summary = document.createElement('summary');
-    const total = link.uploads.reduce((sum, up) => sum + up.total_bytes, 0);
-    summary.textContent =
-      `${link.uploads.length} transfer${link.uploads.length === 1 ? '' : 's'}` +
-      ` · ${formatBytes(total)}`;
-    details.append(summary);
-    const list = document.createElement('ul');
-    list.className = 'uploads';
-    for (const upload of [...link.uploads].reverse()) {
-      list.append(renderUpload(link, upload));
-    }
-    details.append(list);
-    card.append(details);
-  }
+  if (link.upload_count) card.append(uploadHistory(link));
 
   if (link.events?.length) {
     const details = document.createElement('details');
@@ -653,6 +714,10 @@ function renderLink(link) {
     details.append(summary);
     const list = document.createElement('ul');
     list.className = 'uploads';
+    let built = false;
+    details.addEventListener('toggle', () => {
+      if (!details.open || built) return;
+      built = true;
     for (const event of [...link.events].reverse()) {
       const item = document.createElement('li');
       const eventHead = document.createElement('div');
@@ -671,6 +736,7 @@ function renderLink(link) {
       item.append(detail);
       list.append(item);
     }
+    });
     details.append(list);
     card.append(details);
   }
@@ -709,15 +775,19 @@ async function refreshLinksInner({ append, fromPoll }) {
   const { links, receive_dir } = response;
   $('receive-dir').textContent = `Receive root ${receive_dir}`;
   const container = $('links');
+  const previousCards = [...container.querySelectorAll('[data-link-id]')];
+  const evicted = append ? previousCards.slice(0, Math.max(0, previousCards.length + links.length - 100)) : [];
   const edits = new Map([...container.querySelectorAll('[data-link-id]')].map((card) => [card.dataset.linkId, [...card.querySelectorAll('[data-unsaved]')].filter(isFormDirty)]).filter(([, editors]) => editors.length));
-  if (!append) {
-    const omitted = [...edits].filter(([id]) => !links.some((link) => link.id === id)).flatMap(([, editors]) => editors);
+  {
+    const omitted = [...edits].filter(([id]) => append ? evicted.some((card) => card.dataset.linkId === id) : !links.some((link) => link.id === id)).flatMap(([, editors]) => editors);
     if (omitted.length && !window.confirm('Discard unsaved edits on requests outside these results?')) return;
     for (const editor of omitted) markFormSaved(editor);
   }
   linksFilter = filter; linksExpanded = append;
   linksRefreshPending = false;
-  const focus = !append && container.contains(document.activeElement) ? document.activeElement : null;
+  const focus = container.contains(document.activeElement) ? document.activeElement : null;
+  for (const card of evicted) card.remove();
+  linksSeen = append ? linksSeen + links.length : links.length;
   if (!append) container.replaceChildren();
   if (!append && !links.length) {
     if (linksFilter.search || linksFilter.status) {
@@ -739,6 +809,10 @@ async function refreshLinksInner({ append, fromPoll }) {
       container.append(card);
     }
   }
+  const retained = new Set([...container.querySelectorAll('[data-link-id]')].map((card) => card.dataset.linkId));
+  for (const id of historyPositions.keys()) if (!retained.has(id)) historyPositions.delete(id);
+  for (const id of openLinks) if (!retained.has(id.replace(/:events$/, ''))) openLinks.delete(id);
+  $('links-range').textContent = retained.size ? 'Showing requests ' + (linksSeen - retained.size + 1) + ' to ' + linksSeen + '.' : 'No requests.';
   const nextCursor = response.next_cursor;
   linksCursor = nextCursor?.created_at !== undefined
     && nextCursor.created_at !== null
@@ -811,9 +885,11 @@ $('links-filter').addEventListener('submit', (event) => {
 $('links-refresh').addEventListener('click', () => refreshLinksSafe());
 $('links-load-more').addEventListener('click', async () => {
   const loadMore = $('links-load-more');
+  const focused = document.activeElement === loadMore;
   loadMore.disabled = true;
   await refreshLinksSafe({ append: true });
   loadMore.disabled = false;
+  if (focused && document.activeElement === document.body) (loadMore.hidden ? $('links-range') : loadMore).focus({ preventScroll: true });
 });
 
 // The session check, the list, and the strip go out together; each is one

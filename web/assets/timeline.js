@@ -29,7 +29,7 @@ export function summarize(upload) {
   const outcome = log.map((event) => event.kind).find((kind) =>
     ['finished', 'cancelled', 'interrupted', 'dropped'].includes(kind)) || (upload.partial ? 'partial' : 'finished');
   return {
-    files: upload.files?.length || 0,
+    files: upload.file_count,
     bytes,
     duration,
     average,
@@ -71,27 +71,4 @@ export function narrate(event) {
     case 'elided': return { text: `${plural(count, 'more event')} not kept` };
     default: return { text: event.kind };
   }
-}
-
-/// The record as a document someone can keep: summary, then events.
-export function timelineJson(link, upload) {
-  return JSON.stringify({
-    request: { id: link.id, label: link.label, dest: link.dest },
-    upload: {
-      id: upload.id,
-      started_at: upload.started_at,
-      completed_at: upload.completed_at,
-      transport: upload.transport || 'http',
-      package_root: upload.package_root,
-      total_bytes: upload.total_bytes,
-      partial: Boolean(upload.partial),
-      replayed_chunks: upload.replayed_chunks || 0,
-      rejected_chunks: upload.rejected_chunks || 0,
-      files: (upload.files || []).map((file) => ({
-        path: file.path, bytes: file.bytes, suite: file.suite, root: file.root, receipt: file.receipt,
-      })),
-    },
-    summary: summarize(upload),
-    events: upload.log || [],
-  }, null, 2);
 }

@@ -4200,7 +4200,7 @@ fn receipt_path(path: &Path) -> PathBuf {
 fn valid_token(token: &str) -> bool {
     token.len() == 32 && token.as_bytes().iter().all(u8::is_ascii_hexdigit)
 }
-fn attachment_filename(name: &str) -> ApiResult<HeaderValue> {
+pub(super) fn attachment_filename(name: &str) -> ApiResult<HeaderValue> {
     use std::fmt::Write as _;
 
     let name = name

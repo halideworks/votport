@@ -866,6 +866,10 @@ textarea { resize: vertical; }
 .timeline-stats .stat strong {
  font-size: 1.15rem;
 }
+#timeline-files {
+ max-height: 40vh;
+ overflow-y: auto;
+}
 .timeline-events {
  list-style: none;
  margin: 0 0 1rem;

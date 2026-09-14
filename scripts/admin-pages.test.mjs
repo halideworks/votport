@@ -165,7 +165,7 @@ test('each transfer opens a timeline dialog built from the record', () => {
   for (const id of ['timeline', 'timeline-stats', 'timeline-events', 'timeline-download', 'timeline-audit']) {
     assert.match(receive, new RegExp(`id="${id}"`), `${id} present`);
   }
-  assert.match(receiveScript, /button\('Timeline'/);
+  assert.match(receiveScript, /button\('Files and timeline'/);
   assert.match(receiveScript, /from '\/assets\/timeline\.js'/);
   assert.doesNotMatch(receiveScript, /transfer-log/);
 });

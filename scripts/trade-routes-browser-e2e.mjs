@@ -47,6 +47,13 @@ try {
   const senderNotice = await source('notifications', { id: '', revision: 0, label: `Sent ${id}`, channel: 'webhook', target: 'Sender only', url: `${sinkUrl}/sender`, enabled: true });
   await destination('trade-routes/port', { name: 'Receiver studio', address: process.env.TRADE_PEER_ADDRESS || peer }, 'PUT');
   await destination('workflows/projects', { id, label: 'Receiver approvals', directory: id, receive: true, require_approval: true }, 'PUT');
+  const eligibleRequests = [];
+  for (let index = 0; index < 52; index++) eligibleRequests.push((await destination('admin/links', { label: `${id}-page-${index}`, dest: `${id}/page-${index}` })).link);
+  const excluded = (await destination('admin/links', { label: `${id}-excluded`, password: 'private request fixture' })).link;
+  const firstRequests = await destination('admin/links?limit=50&route_eligible=true');
+  assert.equal(firstRequests.links.length, 50);
+  assert.ok(!firstRequests.links.some((request) => request.id === excluded.id));
+  const olderRequest = eligibleRequests.find((request) => !firstRequests.links.some((entry) => entry.id === request.id));
   await receiving.goto(`${peer}/trade-routes`);
   const receiverPort = (await destination('trade-routes')).port;
   await receiving.waitForFunction(() => !!document.querySelector('#port-key').textContent);
@@ -55,6 +62,47 @@ try {
   assert.ok(await receiving.locator('#trade-accept-form').isHidden());
   assert.ok(await receiving.locator('#trade-receive-setup').isHidden());
   await receiving.click('#trade-start-receive');
+  assert.equal(await receiving.locator('#trade-request option').count(), 51);
+  const selectedRequest = firstRequests.links[0].id;
+  await receiving.selectOption('#trade-request', selectedRequest); await receiving.fill('#trade-endpoint-name', 'Keep route permission draft');
+  let releaseSearch, searchStarted = false;
+  const heldSearch = new Promise((resolve) => releaseSearch = resolve);
+  const holdSearch = async (route) => { const response = await route.fetch(); searchStarted = true; await heldSearch; await route.fulfill({ response }); };
+  await receiving.route('**/api/admin/links?*', holdSearch);
+  try {
+    await receiving.click('#trade-request-search'); await until(() => searchStarted, Boolean);
+    const changedSelection = firstRequests.links[1].id;
+    await receiving.selectOption('#trade-request', changedSelection);
+    releaseSearch(); await receiving.waitForFunction(() => !document.querySelector('#trade-request-search').disabled);
+    assert.equal(await receiving.locator('#trade-request').inputValue(), changedSelection, 'A delayed search must preserve a newer request selection');
+  } finally { releaseSearch(); await receiving.unroute('**/api/admin/links?*', holdSearch); }
+  await receiving.selectOption('#trade-request', selectedRequest);
+  for (const width of [1440, 390]) {
+    await receiving.setViewportSize({ width, height: 1000 });
+    await receiving.locator('#trade-request-query').scrollIntoViewIfNeeded();
+    assert.ok(await receiving.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `Trade receive setup fits at ${width}px`);
+    await receiving.screenshot({ path: path.join(root, `trade-receive-setup-${width}.png`) });
+  }
+  await receiving.setViewportSize({ width: 1440, height: 1000 });
+  await receiving.locator('#trade-request-more').focus(); await receiving.keyboard.press('Enter');
+  await receiving.waitForFunction(() => document.querySelector('#trade-request-more').hidden);
+  assert.equal(await receiving.locator('#trade-request').inputValue(), selectedRequest, 'Paging keeps the selected request');
+  assert.equal(await receiving.locator('#trade-endpoint-name').inputValue(), 'Keep route permission draft');
+  assert.ok(await receiving.locator('#trade-request-help').evaluate((node) => node === document.activeElement));
+  assert.ok(await receiving.locator('#trade-request option').count() <= 4);
+  await receiving.fill('#trade-request-query', olderRequest.id); await receiving.click('#trade-request-search');
+  await receiving.waitForFunction((id) => [...document.querySelector('#trade-request').options].some((option) => option.value === id), olderRequest.id);
+  await receiving.selectOption('#trade-request', olderRequest.id);
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  const idAlias = (await destination('admin/links', { label: `Alias for ${olderRequest.id}` })).link;
+  assert.equal((await destination(`admin/links?limit=1&route_eligible=true&search=${olderRequest.id}`)).links[0].id, idAlias.id, 'General search is not an exact-ID lookup');
+  await receiving.fill('#trade-request-query', 'No matching request fixture'); await receiving.locator('#trade-request-query').press('Enter');
+  await receiving.waitForFunction(() => !document.querySelector('#trade-request-search').disabled && document.querySelector('#trade-request').options.length === 2);
+  assert.equal(await receiving.locator('#trade-request').inputValue(), olderRequest.id, 'Search keeps the chosen request even outside its results');
+  assert.equal(await receiving.locator('#trade-endpoint-name').inputValue(), 'Keep route permission draft');
+  await receiving.goto(`${peer}/trade-routes?receive=${olderRequest.id}#receive`);
+  await receiving.waitForFunction((id) => document.querySelector('#trade-request').value === id, olderRequest.id);
+  assert.equal(await receiving.locator('#trade-request').inputValue(), olderRequest.id, 'Returning to an older request uses its exact tenant-scoped ID');
   await receiving.getByRole('link', { name: 'Create a receive request and return here →', exact: true }).click();
   await receiving.locator('#trade-return-guide').waitFor();
   assert.ok(await receiving.locator('#create-password').isHidden());
@@ -138,5 +186,18 @@ try {
   await source(`trade-routes/${route.id}/test`, {}); assert.equal((await source('trade-routes')).routes.find((r) => r.id === route.id).remote_state, 'revoked');
   await until(async () => notices, (v) => v.includes('/receiver') && v.includes('/sender'));
   assert.deepEqual(notices.sort(), ['/receiver', '/sender']);
+  await receiving.route(`**/api/admin/links/${olderRequest.id}`, (route) => route.fulfill({ status: 503, json: { error: 'Returned request unavailable fixture' } }), { times: 1 });
+  await receiving.goto(`${peer}/trade-routes?receive=${olderRequest.id}#receive`);
+  await receiving.locator('#trade-request-help').getByText(/Returned request unavailable fixture/).waitFor();
+  await receiving.locator(`#endpoint-${receiveId}`).waitFor();
+  assert.equal(await receiving.locator('#trade-connections .trade-route').count(), 1, 'A failed returned-request lookup keeps the route catalog visible');
+  await destination(`admin/links/${olderRequest.id}`, undefined, 'DELETE');
+  for (let retry = 0; retry < 2; retry++) {
+    await receiving.click('#trade-refresh');
+    await receiving.locator('#trade-request-help').getByText(/Could not select the returned request/).waitFor();
+    await receiving.waitForLoadState('networkidle');
+    assert.equal(await receiving.locator('#trade-connections .trade-route').count(), 1);
+    assert.equal(await receiving.locator(`#endpoint-${receiveId}`).count(), 1, 'A deleted return request does not erase existing receiving endpoints');
+  }
   assert.deepEqual(errors, []); console.log('Trade route browser acceptance passed: five clipboard actions, preview, independent keys, approval, rotation, transfer, metadata filtering, downstream hold, revocation, responsive UI.');
 } finally { await browser.close(); await new Promise((resolve) => sink.close(resolve)); }

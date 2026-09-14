@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { narrate, summarize, timelineJson } from '../web/assets/timeline.js';
+import { narrate, summarize } from '../web/assets/timeline.js';
 
 const upload = {
   id: 'up1',
@@ -11,7 +11,7 @@ const upload = {
   replayed_chunks: 17,
   rejected_chunks: 0,
   transport: 'http',
-  files: [{ path: 'a.mov', bytes: 1, suite: 'blake3', root: 'r', receipt: true }, { path: 'b.mov', bytes: 2, suite: 'blake3', root: 's', receipt: true }],
+  file_count: 2,
   log: [
     { at: 1000, kind: 'opened' },
     { at: 1003, kind: 'published', path: 'a.mov', bytes: 412 * 1024 * 1024, secs: 3 },
@@ -35,7 +35,7 @@ test('summarize reads duration, rates, pauses, restarts, and outcome from the re
 });
 
 test('a record without a log or timing has null rates and a partial outcome', () => {
-  const summary = summarize({ id: 'x', completed_at: 5, total_bytes: 10, partial: true, files: [] });
+  const summary = summarize({ id: 'x', completed_at: 5, total_bytes: 10, partial: true, file_count: 0 });
   assert.equal(summary.duration, null);
   assert.equal(summary.average, null);
   assert.equal(summary.peak, null);
@@ -55,10 +55,8 @@ test('narrate turns each event kind into a sentence with its facts', () => {
   assert.equal(narrate({ kind: 'weird' }).text, 'weird');
 });
 
-test('timelineJson carries the request, the record, the summary, and every event', () => {
-  const doc = JSON.parse(timelineJson({ id: 'l', label: 'L', dest: 'd' }, upload));
-  assert.equal(doc.request.label, 'L');
-  assert.equal(doc.upload.files.length, 2);
-  assert.equal(doc.summary.resent, 17);
-  assert.equal(doc.events.length, 6);
+test('summary uses the transfer header count without file rows', () => {
+  const header = { ...upload, file_count: 201 };
+  assert.equal(summarize(header).files, 201);
+  assert.equal(summarize({ ...header, file_count: 0 }).files, 0);
 });

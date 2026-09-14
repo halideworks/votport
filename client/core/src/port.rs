@@ -383,15 +383,14 @@ struct LinkView {
     max_bytes: Option<u64>,
     usable: bool,
     active: bool,
-    #[serde(default)]
-    uploads: Vec<serde_json::Value>,
+    upload_count: u64,
     #[serde(default)]
     receiving: Vec<serde_json::Value>,
 }
 
 impl From<LinkView> for RequestLink {
     fn from(view: LinkView) -> Self {
-        let drops = view.uploads.len() as u64;
+        let drops = view.upload_count;
         let receiving = view.receiving.len() as u64;
         let mut parts = vec![count(drops, "drop", "drops")];
         if receiving > 0 {
@@ -1292,7 +1291,7 @@ mod tests {
         let view: LinkView = serde_json::from_value(serde_json::json!({
             "id": "l", "label": "Dailies", "url": "https://d/r/l", "has_password": false,
             "created_at": 1, "expires_at": null, "max_bytes": 5, "usable": true, "active": true,
-            "uploads": [{}, {}], "receiving": [{}]
+            "upload_count": 2, "receiving": [{}]
         }))
         .unwrap();
         let link = RequestLink::from(view);

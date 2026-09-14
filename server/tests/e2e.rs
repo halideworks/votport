@@ -30,6 +30,109 @@ struct TestServer {
     _received: tempfile::TempDir,
 }
 
+// Small protocol fixtures collect explicit pages so their existing full-history assertions stay complete.
+async fn admin_links(client: &reqwest::Client, base: &str) -> reqwest::Result<Value> {
+    let mut result = json!({"links":[]});
+    let mut cursor = Value::Null;
+    loop {
+        let mut request = client
+            .get(format!("{base}/api/admin/links"))
+            .query(&[("limit", "100")]);
+        if let (Some(created), Some(id)) = (cursor["created_at"].as_u64(), cursor["id"].as_str()) {
+            request = request.query(&[
+                ("before_created_at", created.to_string()),
+                ("before_id", id.to_owned()),
+            ]);
+        }
+        let mut page = request
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        assert!(page["links"].as_array().unwrap().len() <= 100);
+        for link in page["links"].as_array_mut().unwrap() {
+            let id = link["id"].as_str().unwrap().to_owned();
+            let mut uploads = Vec::new();
+            let mut before = None;
+            loop {
+                let mut request = client
+                    .get(format!("{base}/api/admin/links/{id}/uploads"))
+                    .query(&[("limit", 100)]);
+                if let Some(position) = before {
+                    request = request.query(&[("before_position", position)]);
+                }
+                let headers: Value = request.send().await?.error_for_status()?.json().await?;
+                assert!(headers["uploads"].as_array().unwrap().len() <= 100);
+                for header in headers["uploads"].as_array().unwrap() {
+                    let upload_id = header["id"].as_str().unwrap();
+                    let mut upload = client
+                        .get(format!("{base}/api/admin/links/{id}/uploads/{upload_id}"))
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json::<Value>()
+                        .await?["upload"]
+                        .take();
+                    let mut files = Vec::new();
+                    let mut offset = 0;
+                    loop {
+                        let page: Value = client
+                            .get(format!(
+                                "{base}/api/admin/links/{id}/uploads/{upload_id}/files"
+                            ))
+                            .query(&[("offset", offset), ("limit", 100)])
+                            .send()
+                            .await?
+                            .error_for_status()?
+                            .json()
+                            .await?;
+                        assert!(page["files"].as_array().unwrap().len() <= 100);
+                        files.extend(page["files"].as_array().unwrap().clone());
+                        let Some(next) = page["next_offset"].as_u64() else {
+                            break;
+                        };
+                        assert!(next > offset);
+                        offset = next;
+                    }
+                    upload["files"] = json!(files);
+                    uploads.push(upload);
+                }
+                let Some(next) = headers["next_position"].as_i64() else {
+                    break;
+                };
+                assert!(before.is_none_or(|before| next < before));
+                before = Some(next);
+            }
+            uploads.reverse();
+            link["uploads"] = json!(uploads);
+        }
+        result["links"]
+            .as_array_mut()
+            .unwrap()
+            .extend(page["links"].as_array().unwrap().clone());
+        result["receipt_key"] = page["receipt_key"].take();
+        result["receive_dir"] = page["receive_dir"].take();
+        let next = page["next_cursor"].take();
+        if next.is_null() {
+            break;
+        }
+        if !cursor.is_null() {
+            assert!(
+                (
+                    next["created_at"].as_u64().unwrap(),
+                    next["id"].as_str().unwrap()
+                ) < (
+                    cursor["created_at"].as_u64().unwrap(),
+                    cursor["id"].as_str().unwrap()
+                )
+            );
+        }
+        cursor = next;
+    }
+    Ok(result)
+}
+
 async fn start_server() -> TestServer {
     start_server_with_cap(64 * 1024 * 1024).await
 }
@@ -710,14 +813,7 @@ async fn full_protocol_end_to_end() {
     );
 
     // --- upload records are visible to the admin ----------------------------
-    let links = client
-        .get(format!("{base}/api/admin/links"))
-        .send()
-        .await
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap();
+    let links = admin_links(&client, &base).await.unwrap();
     let uploads = links["links"]
         .as_array()
         .unwrap()
@@ -1477,14 +1573,7 @@ async fn receipts_are_written_and_files_are_manageable() {
     );
 
     let sidecar = server.receive_dir.join("receipted.bin.vot-receipt");
-    let listing = client
-        .get(format!("{base}/api/admin/links"))
-        .send()
-        .await
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap();
+    let listing = admin_links(&client, &base).await.unwrap();
     let key_hex = listing["receipt_key"].as_str().unwrap();
     let bytes = std::fs::read(&sidecar).expect("sidecar exists");
     let decoded = vot_receipt::decode_authenticated(&bytes).expect("sidecar decodes");
@@ -1528,14 +1617,7 @@ async fn receipts_are_written_and_files_are_manageable() {
         assert_eq!(std::fs::read(&payload).unwrap(), changed);
         assert!(sidecar.exists());
         if changed.len() != 300_000 {
-            let listing = client
-                .get(format!("{base}/api/admin/links"))
-                .send()
-                .await
-                .unwrap()
-                .json::<Value>()
-                .await
-                .unwrap();
+            let listing = admin_links(&client, &base).await.unwrap();
             let current = listing["links"]
                 .as_array()
                 .unwrap()
@@ -1578,14 +1660,7 @@ async fn receipts_are_written_and_files_are_manageable() {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
-    let listing = client
-        .get(format!("{base}/api/admin/links"))
-        .send()
-        .await
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap();
+    let listing = admin_links(&client, &base).await.unwrap();
     let link = listing["links"]
         .as_array()
         .unwrap()
@@ -1696,14 +1771,7 @@ async fn aborted_sessions_record_a_cancelled_event() {
         .unwrap();
     assert_eq!(response.status(), 200);
 
-    let links = client
-        .get(format!("{base}/api/admin/links"))
-        .send()
-        .await
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap();
+    let links = admin_links(&client, &base).await.unwrap();
     let events = links["links"]
         .as_array()
         .unwrap()
@@ -2105,14 +2173,7 @@ async fn begin_rejection_records_an_event() {
         .unwrap();
     assert_eq!(response.status(), 422, "{}", response.text().await.unwrap());
 
-    let links = client
-        .get(format!("{base}/api/admin/links"))
-        .send()
-        .await
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap();
+    let links = admin_links(&client, &base).await.unwrap();
     let events = links["links"]
         .as_array()
         .unwrap()
@@ -2269,14 +2330,7 @@ async fn identical_resend_is_deduped_not_suffixed() {
 
     // --- admin deletes the file, different same-length content reuses the
     // name: the old root must not dedupe onto the impostor ------------------
-    let links = client
-        .get(format!("{base}/api/admin/links"))
-        .send()
-        .await
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap();
+    let links = admin_links(&client, &base).await.unwrap();
     let uploads = links["links"]
         .as_array()
         .unwrap()
@@ -2914,14 +2968,7 @@ async fn transfer_log_records_publishes_and_quiet_gaps() {
     assert!(log[3].path.is_some(), "{log:?}");
     assert_eq!(log[4].count, Some(0));
     // The admin view carries the log for the Receive page.
-    let links = client
-        .get(format!("{base}/api/admin/links"))
-        .send()
-        .await
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap();
+    let links = admin_links(&client, &base).await.unwrap();
     let link = links["links"]
         .as_array()
         .unwrap()
@@ -2980,14 +3027,7 @@ async fn abandoned_session_records_its_published_files_as_partial() {
     );
 
     // The operator listing carries the flag.
-    let links = client
-        .get(format!("{base}/api/admin/links"))
-        .send()
-        .await
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap();
+    let links = admin_links(&client, &base).await.unwrap();
     let link = links["links"]
         .as_array()
         .unwrap()
@@ -3230,14 +3270,7 @@ async fn backup_restores_through_a_restart() {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
-    let links = client
-        .get(format!("{base}/api/admin/links"))
-        .send()
-        .await
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap();
+    let links = admin_links(&client, &base).await.unwrap();
     let ids: Vec<&str> = links["links"]
         .as_array()
         .unwrap()
@@ -3329,14 +3362,7 @@ async fn standby_pull_stages_the_live_copy_and_a_boot_promotes_it() {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
-    let links = promoted_client
-        .get(format!("{}/api/admin/links", promoted.base))
-        .send()
-        .await
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap();
+    let links = admin_links(&promoted_client, &promoted.base).await.unwrap();
     let ids: Vec<&str> = links["links"]
         .as_array()
         .unwrap()
@@ -4854,15 +4880,7 @@ async fn load_cleanup(admin: &reqwest::Client, base: &str, artifacts: &LoadArtif
     }
     if !artifacts.links.is_empty() {
         // Received copies first, then the link records.
-        let listing = match admin
-            .get(format!("{base}/api/admin/links"))
-            .send()
-            .await
-            .and_then(|response| response.error_for_status())
-        {
-            Ok(response) => response.json::<Value>().await.unwrap_or(Value::Null),
-            Err(_) => Value::Null,
-        };
+        let listing = admin_links(admin, base).await.unwrap_or(Value::Null);
         for link in &artifacts.links {
             let uploads = listing["links"]
                 .as_array()
@@ -5332,14 +5350,7 @@ async fn status_reports_receiving_sessions_and_the_days_uploads() {
     assert_eq!(status["outbound"]["open_grants"], json!(0));
     assert!(status["outbound"]["disk"]["free_bytes"].as_u64().unwrap() > 0);
 
-    let links: Value = client
-        .get(format!("{base}/api/admin/links"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let links: Value = admin_links(&client, &base).await.unwrap();
     let link = links["links"]
         .as_array()
         .unwrap()
@@ -5681,14 +5692,7 @@ async fn search_finds_requests_files_downloads_and_audit_rows() {
     );
 
     // A deleted file drops out of the results.
-    let links: Value = client
-        .get(format!("{base}/api/admin/links"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let links: Value = admin_links(&client, &base).await.unwrap();
     let link = links["links"]
         .as_array()
         .unwrap()

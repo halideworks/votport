@@ -17,7 +17,9 @@ use crate::config::Config;
 
 mod evidence;
 mod notifications;
+mod received;
 pub use notifications::*;
+pub use received::{UploadFilesPage, UploadHeader, UploadPage};
 mod routes;
 mod trade;
 pub use trade::*;
@@ -463,7 +465,7 @@ pub struct SettingsOverlay {
     pub draining_source: &'static str,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 40;
+pub(crate) const SCHEMA_VERSION: u64 = 41;
 pub(crate) const DELIVERED_CANDIDATE_PAGE: usize = 128;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
@@ -540,6 +542,7 @@ CREATE TABLE IF NOT EXISTS link_uploads (
     UNIQUE(link_id, upload_id)
 );
 CREATE INDEX IF NOT EXISTS link_uploads_tenant ON link_uploads(tenant);
+CREATE INDEX IF NOT EXISTS link_uploads_link_position ON link_uploads(link_id, position);
 ";
 
 /// A grant's VOT package root, and the capabilities minted for it. A root
@@ -1234,6 +1237,7 @@ impl Store {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn links_page(
         &self,
         tenant: &str,
@@ -1242,6 +1246,7 @@ impl Store {
         search: &str,
         status: &str,
         now: u64,
+        route_eligible: bool,
     ) -> Result<LinkPage, String> {
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         let sql_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
@@ -1270,6 +1275,12 @@ impl Store {
                             AND (expires_at IS NULL OR expires_at > ?4))
                         OR (?3 = 'closed' AND (active = 0
                             OR (expires_at IS NOT NULL AND expires_at <= ?4))))
+                   AND (?9 = 0 OR (
+                        password_hash IS NULL AND active != 0
+                        AND (expires_at IS NULL OR expires_at > ?4)
+                        AND NOT EXISTS(SELECT 1 FROM link_uploads WHERE link_id=links.id)
+                        AND NOT EXISTS(SELECT 1 FROM trade_endpoints WHERE id=links.id)
+                        AND NOT EXISTS(SELECT 1 FROM inbound_routes WHERE link_id=links.id)))
                    AND (?5 = 0 OR created_at < ?6
                         OR (created_at = ?6 AND id < ?7))
                  ORDER BY created_at DESC, id DESC
@@ -1285,8 +1296,9 @@ impl Store {
                     before_created_at,
                     before_id,
                     sql_limit,
+                    route_eligible,
                 ],
-                |row| row_to_link_with_uploads(connection, row),
+                row_to_link,
             )?;
             rows.collect::<Result<Vec<_>, _>>()
         })
@@ -7982,7 +7994,7 @@ mod phase4_review_tests {
         store.insert_link(link_in("acme", "foreign")).unwrap();
 
         let first = store
-            .links_page("", 2, None, "HUNDRED%", "all", 1000)
+            .links_page("", 2, None, "HUNDRED%", "all", 1000, false)
             .unwrap();
         assert_eq!(
             first
@@ -7993,7 +8005,9 @@ mod phase4_review_tests {
             vec!["z-link"]
         );
 
-        let first = store.links_page("", 2, None, "", "all", 1000).unwrap();
+        let first = store
+            .links_page("", 2, None, "", "all", 1000, false)
+            .unwrap();
         assert_eq!(
             first
                 .links
@@ -8004,19 +8018,19 @@ mod phase4_review_tests {
         );
         let cursor = first.next_cursor.unwrap();
         let second = store
-            .links_page("", 2, Some(&cursor), "", "all", 1000)
+            .links_page("", 2, Some(&cursor), "", "all", 1000, false)
             .unwrap();
         assert_eq!(second.links[0].id, "a-link");
         assert!(second.next_cursor.is_none());
         assert!(store
-            .links_page("", 2, None, "", "all", 1000)
+            .links_page("", 2, None, "", "all", 1000, false)
             .unwrap()
             .links
             .iter()
             .all(|link| link.tenant.is_empty()));
         assert_eq!(
             store
-                .links_page("", 10, None, "", "open", 1000)
+                .links_page("", 10, None, "", "open", 1000, false)
                 .unwrap()
                 .links
                 .len(),
@@ -8024,7 +8038,7 @@ mod phase4_review_tests {
         );
         assert_eq!(
             store
-                .links_page("", 10, None, "", "closed", 1000)
+                .links_page("", 10, None, "", "closed", 1000, false)
                 .unwrap()
                 .links
                 .len(),

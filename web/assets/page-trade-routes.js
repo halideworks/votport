@@ -40,10 +40,74 @@ const acceptNotifications = notificationEditor({ events: tradeEvents, policy: { 
 const endpointNotifications = notificationEditor({ events: tradeEvents, policy: { mode: 'default', rules: [] } });
 $('trade-accept-notifications').append(acceptNotifications.element); $('trade-endpoint-notifications').append(endpointNotifications.element);
 
+let requestCursor = null, requestTicket = 0;
+function requestQuery(cursor = null) {
+  const query = new URLSearchParams({ limit: '50', route_eligible: 'true' });
+  const search = $('trade-request-query').value.trim();
+  if (search) query.set('search', search);
+  if (cursor) { query.set('before_created_at', cursor.created_at); query.set('before_id', cursor.id); }
+  return query;
+}
+function showRequests(requests, preferred = '') {
+  const select = $('trade-request'), retained = select.selectedOptions[0];
+  const chosen = retained?.value || preferred;
+  select.replaceChildren();
+  const placeholder = node('option', 'Choose a receive request'); placeholder.value = ''; select.append(placeholder);
+  for (const request of requests.links) {
+    const option = node('option', request.label + ' · ' + (request.dest || 'Receive root'));
+    option.value = request.id; option.dataset.label = request.label; select.append(option);
+  }
+  if (retained?.value && !requests.links.some((request) => request.id === retained.value)) select.append(retained);
+  select.value = chosen || '';
+  requestCursor = requests.next_cursor;
+  $('trade-request-more').hidden = !requestCursor;
+  $('trade-request-help').textContent = requests.links.length
+    ? 'Only active requests with no password or previous uploads can be used. Search by name or destination to find another request.'
+    : 'No eligible requests match. Try another search or create a request below.';
+  requestSelected();
+}
+async function loadRequests(older = false) {
+  const ticket = ++requestTicket;
+  const search = $('trade-request-search'), more = $('trade-request-more');
+  const focused = document.activeElement === more;
+  search.disabled = more.disabled = true;
+  try {
+    const requests = await api('/api/admin/links?' + requestQuery(older ? requestCursor : null));
+    if (ticket === requestTicket) showRequests(requests);
+  } catch (error) {
+    if (ticket === requestTicket) $('trade-request-help').textContent = error.message;
+  } finally {
+    if (ticket === requestTicket) {
+      search.disabled = more.disabled = false;
+      if (focused && document.activeElement === document.body) (more.hidden ? $('trade-request-help') : more).focus({ preventScroll: true });
+    }
+  }
+}
+$('trade-request-search').addEventListener('click', () => loadRequests());
+$('trade-request-more').addEventListener('click', () => loadRequests(true));
+$('trade-request-query').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') { event.preventDefault(); loadRequests(); }
+});
+
 async function refresh() {
   const ticket = ++refreshTicket;
-  const [data, requests] = await Promise.all([api('/api/trade-routes'), api('/api/admin/links')]);
+  const requestRevision = ++requestTicket;
+  $('trade-request-search').disabled = $('trade-request-more').disabled = false;
+  const [data, requests] = await Promise.all([api('/api/trade-routes'), api('/api/admin/links?' + requestQuery())]);
   if (ticket !== refreshTicket) return;
+  const chosen = $('trade-request').value || (!data.endpoints.some((e) => e.id === returnRequest) ? returnRequest : '');
+  let selectionError = '';
+  if (chosen && !$('trade-request').value && !requests.links.some((request) => request.id === chosen)) {
+    try {
+      const selected = await api('/api/admin/links/' + encodeURIComponent(chosen));
+      requests.links.push(selected.link);
+    } catch (error) { selectionError = 'Could not select the returned request: ' + error.message; }
+  }
+  if (ticket !== refreshTicket) return;
+  if (requestRevision === requestTicket) {
+    showRequests(requests, chosen);
+    if (selectionError) $('trade-request-help').textContent = selectionError;
+  }
   catalog = data;
   if (!isFormDirty($('port-form'))) { $('port-name').value = catalog.port.name; $('port-address').value = catalog.port.address; }
   $('port-display-name').textContent = catalog.port.name; $('port-display-address').textContent = catalog.port.address; $('port-key').textContent = catalog.port.key;
@@ -51,16 +115,6 @@ async function refresh() {
   const peerEdits = new Map([...$('trade-connections').querySelectorAll('details[data-peer]')].filter((details) => isFormDirty(details.querySelector('form'))).map((details) => [details.dataset.peer, details]));
   const invitationEdits = new Map([...$('trade-endpoints').querySelectorAll('form')].filter(isFormDirty).map((form) => [form.parentElement.id, form]));
   $('trade-endpoints').replaceChildren(); $('trade-connections').replaceChildren();
-  const chosen = $('trade-request').value || (!catalog.endpoints.some((e) => e.id === returnRequest) ? returnRequest : '');
-  $('trade-request').replaceChildren();
-  const placeholder = node('option', 'Choose a receive request'); placeholder.value = ''; $('trade-request').append(placeholder);
-  for (const request of requests.links || []) {
-    if (request.has_password || !request.active || (request.expires_at && request.expires_at <= Date.now() / 1000) || request.uploads?.length || catalog.endpoints.some((e) => e.id === request.id)) continue;
-    const option = node('option', `${request.label} · ${request.dest || 'Receive root'}`); option.value = request.id; option.dataset.label = request.label; $('trade-request').append(option);
-  }
-  $('trade-request').value = chosen || '';
-  $('trade-request-help').textContent = $('trade-request').options.length === 1 ? 'No eligible requests yet. Create one below, then we will bring you back to set permissions.' : 'Only active requests with no password or previous uploads can be used.';
-  requestSelected();
   $('trade-endpoints-section').hidden = !catalog.endpoints.length && setup !== 'receive';
   for (const endpoint of catalog.endpoints) {
     const row = node('div', '', 'card'); row.id = `endpoint-${endpoint.id}`; row.tabIndex = -1;
