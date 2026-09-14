@@ -496,18 +496,28 @@ function renderStatus(status) {
   $('stat-active-detail').textContent = status.sessions_active
     ? `${formatBytes(status.bytes_in_flight)} in flight`
     : 'nothing in flight';
-  $('stat-today').textContent = String(status.today.uploads);
-  $('stat-today-detail').textContent = status.today.uploads
-    ? `received · ${formatBytes(status.today.bytes)}`
-    : 'received';
-  $('stat-stored').textContent = formatBytes(status.stored.bytes);
   const stored = status.stored;
-  let detail = `${stored.files} received file${stored.files === 1 ? '' : 's'} on disk`;
-  if (stored.missing_files) {
+  const today = status.today;
+  $('stat-today').textContent = today ? String(today.uploads) : '–';
+  $('stat-today-detail').textContent = today
+    ? (today.uploads ? `received · ${formatBytes(today.bytes)}` : 'received')
+    : 'unavailable';
+  $('stat-stored').textContent = stored ? formatBytes(stored.bytes) : '–';
+  let detail = stored
+    ? `${stored.files} received file${stored.files === 1 ? '' : 's'} on disk`
+    : 'unavailable';
+  if (stored?.missing_files) {
     detail += ` · ${stored.missing_files} record${stored.missing_files === 1 ? '' : 's'} (${formatBytes(stored.missing_bytes)}) not on disk`;
   }
   $('stat-stored-detail').textContent = detail;
   $('stat-disk').textContent = status.disk ? formatBytes(status.disk.free_bytes) : '–';
+  const note = $('status-cache-note');
+  note.hidden = false;
+  note.textContent = status.stale
+    ? (status.sampled_at
+      ? `Status sampled at ${new Date(status.sampled_at * 1000).toLocaleTimeString()} and may be out of date.${status.stale_error ? ` ${status.stale_error}.` : ''}`
+      : 'Totals are temporarily unavailable.')
+    : 'Totals refresh about once a minute. Transfer activity is live.';
 
   const byLink = new Map();
   for (const transfer of status.receiving) {

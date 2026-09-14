@@ -5367,8 +5367,24 @@ async fn status_reports_receiving_sessions_and_the_days_uploads() {
         .await
         .unwrap();
     assert_eq!(finish.status().as_u16(), 200);
-    let status: Value = client
+    // The same key returns the completed sample from while the transfer was
+    // active while the live session state reflects completion. Sampling is
+    // disclosed, so a new boundary requests a fresh observation below.
+    let cached: Value = client
         .get(format!("{base}/api/admin/status?since=0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cached["sessions_active"], json!(0), "{cached:?}");
+    assert_eq!(cached["today"]["uploads"], json!(0), "{cached:?}");
+    assert_eq!(cached["stored"]["files"], json!(0), "{cached:?}");
+    assert_eq!(cached["stale"], json!(false), "{cached:?}");
+
+    let status: Value = client
+        .get(format!("{base}/api/admin/status?since=1"))
         .send()
         .await
         .unwrap()
@@ -5392,7 +5408,7 @@ async fn status_reports_receiving_sessions_and_the_days_uploads() {
     // A file moved out from under votport is a record, not stored bytes.
     std::fs::remove_file(server.receive_dir.join("status.bin")).unwrap();
     let status: Value = client
-        .get(format!("{base}/api/admin/status?since=0"))
+        .get(format!("{base}/api/admin/status?since=2"))
         .send()
         .await
         .unwrap()
@@ -5428,7 +5444,7 @@ async fn status_reports_receiving_sessions_and_the_days_uploads() {
         .await
         .unwrap();
     let status: Value = client
-        .get(format!("{base}/api/admin/status?since=0"))
+        .get(format!("{base}/api/admin/status?since=3"))
         .send()
         .await
         .unwrap()
@@ -5451,7 +5467,7 @@ async fn status_reports_receiving_sessions_and_the_days_uploads() {
         .unwrap();
     assert_eq!(fetched.status().as_u16(), 200);
     let status: Value = client
-        .get(format!("{base}/api/admin/status?since=0"))
+        .get(format!("{base}/api/admin/status?since=4"))
         .send()
         .await
         .unwrap()

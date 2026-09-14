@@ -1036,26 +1036,40 @@ impl Store {
         })
     }
 
-    /// Every live received file in one tenant namespace as (stored_as, bytes),
-    /// a physical file listed once however many records reference it. A
-    /// record from before stored_as was tracked comes back with an empty path.
-    pub fn tenant_live_files(&self, tenant: &str) -> Result<Vec<(String, u64)>, String> {
+    /// Spools one grouped pass of live received-file metadata. The caller can
+    /// release the Store lock before checking each path on the storage volume.
+    pub(crate) fn write_tenant_live_files<W: std::io::Write>(
+        &self,
+        tenant: &str,
+        output: &mut W,
+    ) -> Result<(), String> {
         self.with(|connection| {
-            connection
-                .prepare_cached(
-                    "SELECT stored_as, MAX(bytes_hi) AS bytes_hi, bytes_lo
-                     FROM files WHERE tenant = ?1 AND deleted = 0
-                     GROUP BY CASE WHEN stored_as = ''
-                         THEN link_id || '/' || upload_id || '/' || file_index
-                         ELSE stored_as END",
-                )?
-                .query_map(rusqlite::params![tenant], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        combine_byte_sums(row.get(1)?, row.get(2)?),
-                    ))
-                })?
-                .collect()
+            let mut statement = connection.prepare_cached(
+                "SELECT CASE WHEN stored_as = ''
+                            THEN link_id || '/' || upload_id || '/' || file_index
+                            ELSE stored_as END AS group_key,
+                        CASE WHEN stored_as = '' THEN '' ELSE stored_as END AS stored_as,
+                        MAX(bytes_hi) AS bytes_hi, bytes_lo
+                 FROM files
+                 WHERE tenant = ?1 AND deleted = 0
+                 GROUP BY group_key
+                 ORDER BY group_key",
+            )?;
+            let rows = statement.query_map([tenant], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    combine_byte_sums(row.get(2)?, row.get(3)?),
+                ))
+            })?;
+            for row in rows {
+                let row = row?;
+                serde_json::to_writer(&mut *output, &row)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                output
+                    .write_all(b"\n")
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            }
+            Ok(())
         })
     }
 
@@ -1121,30 +1135,66 @@ impl Store {
         })
     }
 
+    /// Counts the current in-flight grants using only their bounded token-hash
+    /// set. The status cache owns the full grant scan; this keeps active state
+    /// current without repeating it.
+    pub(crate) fn outbound_active_count(
+        &self,
+        tenant: &str,
+        active_hashes: &[String],
+    ) -> Result<u64, String> {
+        let hashes = serde_json::to_string(active_hashes).unwrap_or_else(|_| "[]".to_owned());
+        self.with(|connection| {
+            connection
+                .prepare_cached(
+                    "SELECT COUNT(DISTINCT active.value)
+                     FROM json_each(?2) AS active
+                     WHERE EXISTS(
+                         SELECT 1 FROM outbound_grants
+                         WHERE token_hash = active.value AND tenant = ?1
+                     )",
+                )?
+                .query_row(rusqlite::params![tenant, hashes], |row| {
+                    let count: i64 = row.get(0)?;
+                    Ok(u64::try_from(count).unwrap_or(0))
+                })
+        })
+    }
+
     /// Uploads completed at or after `since` in one tenant namespace (count,
     /// bytes), partial records excluded. Polled, so the statement is cached
     /// and the tenant filter keeps links_tenant_created in play.
     pub fn uploads_since(&self, tenant: &str, since: u64) -> Result<(u64, u64), String> {
         self.with(|connection| {
-            connection
-                .prepare_cached(
-                    "SELECT COUNT(*), COALESCE(SUM(json_extract(upload.document, '$.total_bytes')), 0)
+            let mut statement = connection.prepare_cached(
+                "SELECT upload.document -> '$.total_bytes'
                  FROM links JOIN link_uploads AS upload ON upload.link_id=links.id
                  WHERE links.tenant = ?1
                    AND json_extract(upload.document, '$.completed_at') >= ?2
                    AND COALESCE(json_extract(upload.document, '$.partial'), 0) = 0",
-                )?
-                .query_row(
-                    rusqlite::params![tenant, i64::try_from(since).unwrap_or(i64::MAX)],
-                    |row| {
-                        let count: i64 = row.get(0)?;
-                        let bytes: i64 = row.get(1)?;
-                        Ok((
-                            u64::try_from(count).unwrap_or(0),
-                            u64::try_from(bytes).unwrap_or(0),
-                        ))
-                    },
-                )
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![tenant, i64::try_from(since).unwrap_or(i64::MAX)],
+                |row| {
+                    let token = row.get::<_, Option<String>>(0)?;
+                    token
+                        .map(|token| {
+                            serde_json::from_str::<u64>(&token).map_err(|error| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                            })
+                        })
+                        .transpose()
+                        .map(|total| total.unwrap_or(0))
+                },
+            )?;
+            let mut count = 0u64;
+            let mut bytes = 0u64;
+            for row in rows {
+                let total = row?;
+                count = count.saturating_add(1);
+                bytes = bytes.saturating_add(total);
+            }
+            Ok((count, bytes))
         })
     }
 
@@ -5590,9 +5640,38 @@ pub(crate) mod tests {
         assert_eq!(summary.open_grants, 1, "used and revoked are not open");
         assert_eq!(summary.deliveries, 2);
         assert_eq!(summary.active, 1, "the other tenant's download is not ours");
+        assert_eq!(store.outbound_active_count("acme", &active).unwrap(), 1);
         let expired = store.outbound_summary("acme", 25, &[]).unwrap();
         assert_eq!(expired.open_grants, 0);
         assert_eq!(expired.active, 0);
+    }
+
+    #[test]
+    fn uploads_since_preserves_u64_max_and_saturates_sum_overflow() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let upload = |id: &str, total_bytes| UploadRecord {
+            id: id.to_owned(),
+            started_at: 1,
+            completed_at: 10,
+            replayed_chunks: 0,
+            rejected_chunks: 0,
+            transport: None,
+            package_root: String::new(),
+            total_bytes,
+            files: Vec::new(),
+            partial: false,
+            log: Vec::new(),
+        };
+        let mut first = test_link("first");
+        first.uploads = vec![upload("max", u64::MAX)];
+        store.insert_link(first).unwrap();
+        assert_eq!(store.uploads_since("", 0).unwrap(), (1, u64::MAX));
+
+        let mut second = test_link("second");
+        second.uploads = vec![upload("one", 1)];
+        store.insert_link(second).unwrap();
+        assert_eq!(store.uploads_since("", 0).unwrap(), (2, u64::MAX));
     }
 
     #[test]
@@ -6807,9 +6886,14 @@ pub(crate) mod tests {
         assert!(store
             .tombstone_files("", "link", &std::collections::HashSet::from(["stored"]))
             .unwrap());
-        let live = store.tenant_live_files("").unwrap();
-        assert_eq!(live.len(), 1);
-        assert_eq!(live[0].0, "other");
+        let mut spool = Vec::new();
+        store.write_tenant_live_files("", &mut spool).unwrap();
+        let live: Vec<(String, u64)> = spool
+            .split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .map(|row| serde_json::from_slice(row).unwrap())
+            .collect();
+        assert_eq!(live, vec![("other".to_owned(), 1)]);
         assert!(store.link_upload("", "link", "upload").is_err());
         assert!(store.link_upload("", "link", "unrelated").is_err());
     }
