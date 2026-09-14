@@ -133,6 +133,25 @@ await page.fill("#login-password", adminPassword);
 await page.click("#login-form button[type=submit]");
 // Signed-in users land on /receive; the create form is the first element.
 await page.waitForSelector("#create-form:not([hidden])", { timeout: 15000 });
+await page.locator("#create-notification-options").evaluate((node) => { node.open = true; });
+await page.locator(".notification-editor > p.field-help").first().waitFor();
+if (await page.locator(".notification-editor > p.field-help").evaluateAll((nodes) => nodes.some((node) => node.getAttribute("role") === "status"))) {
+  throw new Error("embedded notification guidance must stay quiet while editors rerender");
+}
+await page.route("**/api/notifications*", (route) => route.fulfill({ status: 503, json: { error: "Notification catalog unavailable." } }), { times: 1 });
+await page.reload();
+await page.locator("#create-notification-options").evaluate((node) => { node.open = true; });
+const notificationStatus = page.locator("#create-notifications .notification-editor > p.field-help");
+await notificationStatus.waitFor();
+await page.getByRole("button", { name: "Retry loading destinations", exact: true }).waitFor();
+if (await notificationStatus.getAttribute("role") !== "alert") {
+  throw new Error("notification catalog failures must be announced");
+}
+await page.getByRole("button", { name: "Retry loading destinations", exact: true }).click();
+await page.waitForFunction(() => {
+  const node = document.querySelector("#create-notifications .notification-editor > p.field-help");
+  return node && !node.hasAttribute("role") && node.textContent === "Notifications are off for this item.";
+});
 
 const run = Date.now().toString(36);
 const dest = `e2e-${run}`;
@@ -193,6 +212,14 @@ await page.click("#new-link-copy");
 await page.waitForFunction(() => document.activeElement === document.getElementById("new-link-url")
   && document.getElementById("links-action-status").textContent === "Your receive address is selected below. Copy it to share.");
 await page.evaluate(() => { window.__clipboardFailure = false; });
+await page.reload();
+await page.locator("#links [data-link-id]").first().waitFor();
+const embeddedNotificationStatuses = page.locator(".notification-editor > p.field-help");
+if (await embeddedNotificationStatuses.count() < 2
+  || await embeddedNotificationStatuses.evaluateAll((nodes) => nodes.some((node) => node.getAttribute("role") === "status"))
+  || await page.getAttribute("#links-action-status", "role") !== "status") {
+  throw new Error("repeated embedded notification editors must stay quiet while action status remains live");
+}
 await page.unroute("**/api/admin/links*");
 console.log("link:", linkUrl);
 
@@ -1212,6 +1239,12 @@ console.log("download link remains available after reload: ok");
 
 await page.goto(outboundUrl);
 await page.waitForSelector("#download-content:not([hidden])", { timeout: 30000 });
+if (await page.getAttribute("#download-content", "aria-live") !== null
+  || await page.getAttribute("#download-error", "aria-live") !== null
+  || await page.getAttribute("#download-error", "role") !== "alert"
+  || await page.getAttribute("#separate-download-status", "aria-live") !== "polite") {
+  throw new Error("download shell must stay quiet while specific download feedback remains live");
+}
 for (const file of outboundFiles) {
   await page.getByRole("button", { name: `Download file: ${PROJECT}/${file.name}`, exact: true }).waitFor();
 }

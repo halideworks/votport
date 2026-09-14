@@ -8,7 +8,7 @@ intermediate object payload, re-proof pass, or rollback of shared published file
 
 Status: Native push and its operator surface are implemented, 2026-08-29. VOT ADR-0045 (push, the holder dials)
 landed upstream in PR #391 at `0a129ea8b7ef47578b956f3c70a8274bf623cb79`.
-The current server, native core, and browser WASM pin is `1010254b`.
+The current server, native core, and browser WASM pin is `de66d413`.
 
 ## Overview
 
@@ -411,7 +411,7 @@ want one public port, and changes nothing in votport.
 
 - Cloudflare in front of VOTDock: raw QUIC needs Spectrum UDP or a direct
   address. Decide before VOTDock's topology is fixed.
-- VOT `1010254b` parses the CLI push address as a numeric `SocketAddr`. DNS
+- VOT `de66d413` parses the CLI push address as a numeric `SocketAddr`. DNS
   resolution remains the library caller's responsibility until upstream adds
   hostname resolution to the CLI.
 

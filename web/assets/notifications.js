@@ -25,7 +25,6 @@ export function notificationEditor({ policy = null, events = Object.keys(notific
   for (const [value, label] of [['off', 'Off'], ...(!defaults ? [['default', 'Use tenant defaults']] : []), ['custom', 'Choose destinations and events'], ...(inherit !== undefined ? [['inherit', inheritLabel]] : [])]) mode.add(new window.Option(label, value));
   mode.className = 'notification-mode'; modeLabel.append(mode);
   const summary = node('div', '', 'field-help'), rules = node('div', '', 'notification-rules'), status = node('p', 'Loading notification destinations…', 'field-help');
-  status.setAttribute('role', 'status');
   const manage = node('a', 'Add or manage destinations ↗', 'text-link'); manage.href = '/notifications'; manage.target = '_blank'; manage.rel = 'noopener noreferrer'; manage.hidden = defaults;
   const picker = document.createElement('select'); picker.setAttribute('aria-label', 'Destination to add');
   const add = button('Add destination', 'ghost', () => {
@@ -85,6 +84,7 @@ export function notificationEditor({ policy = null, events = Object.keys(notific
   async function load(refresh = false) {
     const ticket = ++loadTicket;
     if (refresh && catalog) selected = { mode: mode.value, rules: readRules() };
+    status.removeAttribute('role');
     element.disabled = true; status.textContent = 'Loading notification destinations…';
     try {
       const loaded = settings || await loadNotificationSettings(refresh);
@@ -99,6 +99,7 @@ export function notificationEditor({ policy = null, events = Object.keys(notific
       updatePicker();
       element.disabled = readOnly; mode.disabled = false; status.textContent = ''; renderMode();
     } catch (error) {
+      status.setAttribute('role', 'alert');
       status.textContent = error.message; status.append(button('Retry loading destinations', 'link', () => load(true)));
       element.disabled = false; mode.disabled = true;
     }
