@@ -22,7 +22,14 @@ for (const context of [sender, receiver]) await context.addInitScript(() => {
 });
 const page = await sender.newPage(), receiving = await receiver.newPage();
 for (const tab of [page, receiving]) tab.on('dialog', (dialog) => dialog.accept());
-for (const tab of [page, receiving]) tab.on('pageerror', (error) => errors.push(error.message));
+const failedResponses = [];
+for (const tab of [page, receiving]) {
+  tab.on('pageerror', (error) => errors.push(error.message));
+  tab.on('response', (response) => {
+    if (!response.ok()) failedResponses.push({ url: response.url(), status: response.status() });
+  });
+  tab.on('requestfailed', (request) => failedResponses.push({ url: request.url(), requestFailure: request.failure()?.errorText || 'unknown' }));
+}
 async function api(context, origin, route, data, method = data ? 'POST' : 'GET') {
   const response = await context.request.fetch(`${origin}/api/${route}`, { method, data, headers: { 'X-Votport': '1' } });
   assert.ok(response.ok(), `${route}: ${response.status()} ${await response.text()}`); return response.json();
@@ -56,7 +63,19 @@ try {
   const olderRequest = eligibleRequests.find((request) => !firstRequests.links.some((entry) => entry.id === request.id));
   await receiving.goto(`${peer}/trade-routes`);
   const receiverPort = (await destination('trade-routes')).port;
-  await receiving.waitForFunction(() => !!document.querySelector('#port-key').textContent);
+  try {
+    await receiving.waitForFunction(() => !!document.querySelector('#port-key')?.textContent);
+  } catch (cause) {
+    const state = await receiving.evaluate(() => ({
+      url: location.href,
+      readyState: document.readyState,
+      tradeError: document.querySelector('#trade-error')?.textContent || '',
+      tradeErrorHidden: document.querySelector('#trade-error')?.hidden ?? null,
+      keyCount: document.querySelectorAll('#port-key').length,
+      keyText: document.querySelector('#port-key')?.textContent || '',
+    }));
+    throw new Error(`Peer trade-routes bootstrap did not render port key: ${JSON.stringify({ state, pageErrors: errors, failedResponses })}; ${cause.message}`, { cause });
+  }
   await copyValue(receiving, receiving.locator('#port-copy-address'), receiverPort.address);
   await copyValue(receiving, receiving.locator('#port-copy-key'), receiverPort.key);
   assert.ok(await receiving.locator('#trade-accept-form').isHidden());
