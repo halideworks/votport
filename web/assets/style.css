@@ -1620,9 +1620,18 @@ details summary:focus-visible {
  font-size: 0.72rem;
 }
 .search-row:hover,
-.search-row:focus-visible {
+.search-row[aria-selected="true"] {
  background: var(--panel-hover);
- outline: none;
+}
+.search-row:focus-visible,
+.search-row[aria-selected="true"] {
+ outline: 2px solid var(--progress);
+ outline-offset: -2px;
+}
+.link-item:focus,
+.job-card:focus {
+ outline: 2px solid var(--progress);
+ outline-offset: 3px;
 }
 
 @media (max-width: 640px) {

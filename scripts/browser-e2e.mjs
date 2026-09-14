@@ -177,7 +177,10 @@ await page.route("**/api/admin/links*", async (route) => {
   }
   return route.continue();
 });
+const createdResponse = page.waitForResponse((response) => response.url().includes("/api/admin/links")
+  && response.request().method() === "POST");
 await page.click("#create-form button[type=submit]");
+const createdLinkId = (await (await createdResponse).json()).link.id;
 await page.waitForSelector("#new-link:not([hidden])");
 const linkUrl = (await page.textContent("#new-link-url")).trim();
 try {
@@ -220,6 +223,157 @@ if (await embeddedNotificationStatuses.count() < 2
   || await page.getAttribute("#links-action-status", "role") !== "status") {
   throw new Error("repeated embedded notification editors must stay quiet while action status remains live");
 }
+
+const mastheadSearchRoute = "**/api/admin/search?*";
+let searchUnavailable = false;
+const searchNow = Math.floor(Date.now() / 1000);
+await page.route(mastheadSearchRoute, (route) => searchUnavailable
+  ? route.fulfill({ status: 503, json: { error: "Search fixture unavailable." } })
+  : route.fulfill({ json: {
+    requests: [
+      { id: "unselected-request", label: "unselected request", active: true, dest, created_at: searchNow },
+      { id: createdLinkId, label: "browser search request", active: true, dest, created_at: searchNow },
+    ],
+    files: [{ link_id: createdLinkId, path: "search.txt", bytes: 42, link_label: "browser search request", completed_at: searchNow }],
+    downloads: [{ id: "search-grant", label: "browser search download", name: "search.txt", revoked: false, created_at: searchNow }],
+    audit: [{ event: "created", subject: "search request", actor: "operator", at: searchNow }],
+  } }));
+const searchInput = page.locator("#global-search-input");
+const searchResults = page.locator("#global-search-results");
+const searchStatus = page.locator("#global-search-status");
+await searchInput.focus();
+if (await searchInput.getAttribute("autocomplete") !== "off"
+  || await searchInput.getAttribute("role") !== "combobox"
+  || await searchInput.getAttribute("aria-controls") !== "global-search-results"
+  || await searchInput.getAttribute("aria-expanded") !== "false"
+  || await searchInput.getAttribute("aria-autocomplete") !== "list"
+  || await searchInput.getAttribute("aria-haspopup") !== "listbox"
+  || await searchResults.getAttribute("role") !== "listbox"
+  || await searchStatus.getAttribute("role") !== "status") {
+  throw new Error("masthead search must expose its combobox and listbox semantics");
+}
+await searchInput.fill("ac");
+const options = searchResults.locator('[role="option"]');
+await options.first().waitFor();
+await page.waitForFunction(() => document.getElementById("global-search-status").textContent === "5 search results.");
+if (await options.count() !== 5 || await searchResults.locator('[role="option"][aria-selected="false"]').count() !== 5
+  || await options.evaluateAll((rows) => rows.some((row) => row.tabIndex !== -1))) {
+  throw new Error("masthead search must expose every result as an unselected option");
+}
+await searchInput.focus();
+await searchInput.press("Tab");
+if (await page.evaluate(() => document.activeElement?.getAttribute("role") === "option")
+  || !(await searchResults.isHidden())
+  || await searchInput.getAttribute("aria-expanded") !== "false") {
+  throw new Error("Tab must skip input-owned search options");
+}
+await searchInput.focus();
+await searchInput.fill("ac");
+await page.waitForFunction(() => document.getElementById("global-search-status").textContent === "5 search results.");
+await options.first().waitFor();
+await searchInput.press("ArrowDown");
+const firstOptionId = await options.nth(0).getAttribute("id");
+if (await searchInput.getAttribute("aria-activedescendant") !== firstOptionId
+  || await options.nth(0).getAttribute("aria-selected") !== "true"
+  || !(await options.nth(0).evaluate((node) => getComputedStyle(node).outlineStyle !== "none"))) {
+  throw new Error("ArrowDown must select and visibly mark the first search result");
+}
+await searchInput.fill("new");
+if (await searchInput.getAttribute("aria-activedescendant") !== null) {
+  throw new Error("new search input must clear the old active result");
+}
+const refreshedSearch = page.waitForResponse((response) => response.url().includes("/api/admin/search")
+  && response.status() === 200);
+await searchInput.fill("ac");
+await refreshedSearch;
+await page.waitForFunction(() => document.getElementById("global-search-status").textContent === "5 search results.");
+await options.first().waitFor();
+await searchInput.press("ArrowDown");
+await searchInput.press("ArrowDown");
+const secondOptionId = await options.nth(1).getAttribute("id");
+if (await searchInput.getAttribute("aria-activedescendant") !== secondOptionId
+  || await options.nth(0).getAttribute("aria-selected") !== "false"
+  || await options.nth(1).getAttribute("aria-selected") !== "true") {
+  throw new Error("ArrowDown must advance the active search result");
+}
+await searchInput.press("ArrowUp");
+if (await searchInput.getAttribute("aria-activedescendant") !== firstOptionId) {
+  throw new Error("ArrowUp must return to the previous search result");
+}
+await searchInput.press("Home");
+if (!(await searchInput.evaluate((node) => node.selectionStart === 0 && node.selectionEnd === 0))
+  || await searchInput.getAttribute("aria-activedescendant") !== firstOptionId) {
+  throw new Error("Home must move the input cursor without clearing the active result");
+}
+await searchInput.press("End");
+if (!(await searchInput.evaluate((node) => node.selectionStart === node.value.length && node.selectionEnd === node.value.length))
+  || await searchInput.getAttribute("aria-activedescendant") !== firstOptionId) {
+  throw new Error("End must move the input cursor without clearing the active result");
+}
+await searchInput.press("Escape");
+if (!(await searchResults.isHidden())
+  || await searchInput.getAttribute("aria-expanded") !== "false"
+  || await searchInput.getAttribute("aria-activedescendant") !== null
+  || !(await searchInput.evaluate((node) => node === document.activeElement))) {
+  throw new Error("Escape must close and reset masthead search state");
+}
+searchUnavailable = true;
+await searchInput.fill("zz");
+await page.waitForFunction(() => document.getElementById("global-search-status").textContent === "Search failed: Search fixture unavailable.");
+if (await searchResults.isHidden() || !(await searchResults.textContent()).includes("Search failed: Search fixture unavailable.")) {
+  throw new Error("masthead search failures must remain visible and announced");
+}
+searchUnavailable = false;
+await searchInput.fill("ac");
+await options.first().waitFor();
+await searchInput.press("ArrowDown");
+await searchInput.press("ArrowDown");
+await searchInput.press("Enter");
+await page.waitForURL((url) => url.pathname === "/receive"
+  && url.searchParams.get("search") === createdLinkId
+  && url.hash === `#link-${createdLinkId}`);
+const searchedCard = page.locator(`#link-${createdLinkId}`);
+await searchedCard.locator("details[open]").waitFor();
+await page.waitForFunction((id) => document.activeElement?.id === id, `link-${createdLinkId}`);
+if (!(await searchedCard.evaluate((node) => getComputedStyle(node).outlineStyle !== "none"))) {
+  throw new Error("hash navigation must leave a visibly focused destination card");
+}
+await page.unroute(mastheadSearchRoute);
+
+const workflowJobId = "a".repeat(32);
+const workflowJob = {
+  id: workflowJobId,
+  state: "ready",
+  created_at: searchNow,
+  request: { label: "Search workflow", notifications: null, not_before: null, deadline: null },
+  project: { id: "search-project", label: "Search project", recipients: [], notifications: null, destinations: [] },
+  received: null,
+  checks: {},
+  manifest: null,
+  error: null,
+};
+await page.route("**/api/workflows/projects", (route) => route.fulfill({ json: { projects: [] } }));
+await page.route("**/api/workflows/storage", (route) => route.fulfill({ json: { storage: [] } }));
+const workflowJobsRoute = (route) => {
+  const url = new URL(route.request().url());
+  return url.pathname.endsWith(`/jobs/${workflowJobId}`)
+    ? route.fulfill({ json: { job: workflowJob } })
+    : route.fulfill({ json: { jobs: [], next: null } });
+};
+await page.route("**/api/workflows/jobs?*", workflowJobsRoute);
+await page.route("**/api/workflows/jobs/*", workflowJobsRoute);
+await page.goto(`${base}/workflows#job-${workflowJobId}`);
+const workflowCard = page.locator(`#job-${workflowJobId}`);
+await workflowCard.waitFor();
+await workflowCard.locator("details[open]").waitFor();
+await page.waitForFunction((id) => document.activeElement?.id === id, `job-${workflowJobId}`);
+if (!(await workflowCard.evaluate((node) => getComputedStyle(node).outlineStyle !== "none"))) {
+  throw new Error("workflow hash navigation must leave a visibly focused job card");
+}
+await page.unroute("**/api/workflows/projects");
+await page.unroute("**/api/workflows/storage");
+await page.unroute("**/api/workflows/jobs?*");
+await page.unroute("**/api/workflows/jobs/*");
 await page.unroute("**/api/admin/links*");
 console.log("link:", linkUrl);
 
