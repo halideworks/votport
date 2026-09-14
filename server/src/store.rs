@@ -825,6 +825,11 @@ impl Store {
         } else {
             initialize_schema(&mut connection)?;
         }
+        let transaction = connection.transaction().map_err(|e| e.to_string())?;
+        transaction
+            .execute_batch(workflows::INDEXES)
+            .map_err(|e| e.to_string())?;
+        transaction.commit().map_err(|e| e.to_string())?;
         connection
             .set_db_config(
                 rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
@@ -4895,6 +4900,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
         OUTBOUND_GRANT_MANIFESTS_SCHEMA,
         evidence::SCHEMA,
         workflows::SCHEMA,
+        workflows::INDEXES,
         webhooks::SCHEMA,
         routes::SCHEMA,
         notifications::SCHEMA,
@@ -6475,6 +6481,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn current_schema_installs_workflow_indexes_on_reopen_and_promotion() {
+        for promotion in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            store.with(|connection| connection.execute_batch(
+                "DROP INDEX delivery_jobs_deadline_pending; DROP INDEX delivery_jobs_retirement_due;",
+            )).unwrap();
+            drop(store);
+            if promotion {
+                std::fs::write(directory.path().join(crate::standby::STATUS_FILE), b"{}").unwrap();
+            }
+            let store = Store::open(directory.path()).unwrap();
+            assert!(store.claim_snapshot_retirement(1).unwrap().is_none());
+            store.escalate_delivery_jobs(1).unwrap();
+            let indexes = store.with(|connection| connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name IN ('delivery_jobs_deadline_pending','delivery_jobs_retirement_due')",
+                [], |row| row.get::<_, i64>(0),
+            )).unwrap();
+            assert_eq!(indexes, 2, "promotion {promotion}");
+        }
+    }
+
+    #[test]
     fn schema41_upgrade_preserves_existing_grants_and_can_store_new_addresses() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -6483,7 +6512,9 @@ pub(crate) mod tests {
         store
             .with(|connection| {
                 connection.execute_batch(
-                    "ALTER TABLE outbound_grants DROP COLUMN share_token;
+                    "DROP INDEX delivery_jobs_retirement_due;
+             DROP INDEX delivery_jobs_deadline_pending;
+             ALTER TABLE outbound_grants DROP COLUMN share_token;
              UPDATE meta SET value='41' WHERE key='schema_version';",
                 )
             })
@@ -6516,6 +6547,19 @@ pub(crate) mod tests {
                     |row| row.get(0),
                 )?;
                 assert_eq!(version, "42");
+                let indexes: Vec<String> = connection
+                    .prepare(
+                        "SELECT name FROM sqlite_schema WHERE type='index' AND name IN ('delivery_jobs_deadline_pending','delivery_jobs_retirement_due') ORDER BY name",
+                    )?
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                assert_eq!(
+                    indexes,
+                    [
+                        "delivery_jobs_deadline_pending".to_owned(),
+                        "delivery_jobs_retirement_due".to_owned()
+                    ]
+                );
                 Ok(())
             })
             .unwrap();
@@ -8807,7 +8851,7 @@ mod settings_tests {
             drop(store);
             let path = directory.path().join("votport.db");
             let connection = Connection::open(&path).unwrap();
-            connection.execute_batch("PRAGMA journal_mode=DELETE; DROP INDEX links_tenant; DROP INDEX links_tenant_created; DELETE FROM meta WHERE key='schema_version';").unwrap();
+            connection.execute_batch("PRAGMA journal_mode=DELETE; DROP INDEX links_tenant; DROP INDEX links_tenant_created; DROP INDEX delivery_jobs_deadline_pending; DROP INDEX delivery_jobs_retirement_due; DELETE FROM meta WHERE key='schema_version';").unwrap();
             if let Some(version) = version {
                 connection
                     .execute(
@@ -8823,6 +8867,15 @@ mod settings_tests {
                 "version {version:?}"
             );
             assert_eq!(std::fs::read(&path).unwrap(), before, "version {version:?}");
+            let connection = Connection::open(&path).unwrap();
+            let indexes: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name IN ('delivery_jobs_deadline_pending','delivery_jobs_retirement_due')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(indexes, 0, "version {version:?}");
             assert!(!directory.path().join("votport.db-wal").exists());
         }
         let directory = tempfile::tempdir().unwrap();

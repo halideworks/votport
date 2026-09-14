@@ -1379,6 +1379,8 @@ pub async fn replay_webhook(
 }
 
 pub async fn event_worker(app: Arc<App>) {
+    const DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+    const RETIREMENT_EMPTY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     let client = match reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(5))
@@ -1390,6 +1392,7 @@ pub async fn event_worker(app: Arc<App>) {
             return;
         }
     };
+    let mut next_retirement = tokio::time::Instant::now();
     loop {
         if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) {
             return;
@@ -1397,10 +1400,19 @@ pub async fn event_worker(app: Arc<App>) {
         if let Err(error) = dispatch_events(&app, &client).await {
             tracing::error!(%error,"dispatch delivery events");
         }
-        if let Err(error) = retire_snapshot(&app).await {
-            tracing::error!(%error,"retire delivery snapshot");
+        if tokio::time::Instant::now() >= next_retirement {
+            match retire_snapshot(&app).await {
+                Ok(true) => next_retirement = tokio::time::Instant::now() + DISPATCH_INTERVAL,
+                Ok(false) => {
+                    next_retirement = tokio::time::Instant::now() + RETIREMENT_EMPTY_INTERVAL;
+                }
+                Err(error) => {
+                    tracing::error!(%error,"retire delivery snapshot");
+                    next_retirement = tokio::time::Instant::now() + RETIREMENT_EMPTY_INTERVAL;
+                }
+            }
         }
-        tokio::select! { _ = app.shutdown.notified() => return, _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {} }
+        tokio::select! { _ = app.shutdown.notified() => return, _ = tokio::time::sleep(DISPATCH_INTERVAL) => {} }
     }
 }
 
@@ -1465,13 +1477,16 @@ async fn dispatch_events(app: &App, client: &reqwest::Client) -> Result<(), Stri
     Ok(())
 }
 
-async fn retire_snapshot(app: &Arc<App>) -> Result<(), String> {
+async fn retire_snapshot(app: &Arc<App>) -> Result<bool, String> {
     let Some(job) = app.store.claim_snapshot_retirement(now_unix())? else {
-        return Ok(());
+        return Ok(false);
     };
     let _operation = begin_outbound_operation(app, &job.tenant).map_err(|error| error.message)?;
     if job.received.is_some() {
-        return app.store.complete_snapshot_retirement(&job.id, now_unix());
+        return app
+            .store
+            .complete_snapshot_retirement(&job.id, now_unix())
+            .map(|()| true);
     }
     let root = payload_root(app, &job.tenant, &job.id);
     let path = root.parent().ok_or("invalid snapshot path")?.to_owned();
@@ -1485,7 +1500,9 @@ async fn retire_snapshot(app: &Arc<App>) -> Result<(), String> {
     })
     .await
     .map_err(|_| "retire snapshot task failed")??;
-    app.store.complete_snapshot_retirement(&job.id, now_unix())
+    app.store
+        .complete_snapshot_retirement(&job.id, now_unix())
+        .map(|()| true)
 }
 
 pub async fn update_notifications(
@@ -3087,7 +3104,7 @@ mod tests {
                 .unwrap();
             assert_eq!(retiring.id, received_job.id);
             assert!(!library_root(&receiver, "nyc").exists());
-            retire_snapshot(&receiver).await.unwrap();
+            assert!(retire_snapshot(&receiver).await.unwrap());
             for incoming in receiver.store.trade_routes(Some("nyc")).unwrap() {
                 assert!(receiver.store.remove_link("nyc", &token).is_err());
                 receiver
@@ -4396,9 +4413,10 @@ mod tests {
                 events
             );
             if state == "retiring" {
-                retire_snapshot(&app).await.unwrap();
+                assert!(retire_snapshot(&app).await.unwrap());
             }
         }
+        assert!(!retire_snapshot(&app).await.unwrap());
         assert!(!root.exists());
         let retired = app.store.delivery_job(&job.id).unwrap().unwrap();
         assert_eq!(retired.state, "retired");
