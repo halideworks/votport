@@ -4684,6 +4684,7 @@ fn parse_json<T: DeserializeOwned>(text: &str, column: usize) -> rusqlite::Resul
 
 fn insert_audit_row(
     connection: &Connection,
+    at: u64,
     tenant: &str,
     actor: &str,
     event: &str,
@@ -4696,7 +4697,7 @@ fn insert_audit_row(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?
         .execute(rusqlite::params![
-            i64::try_from(now_unix()).unwrap_or(0),
+            i64::try_from(at).unwrap_or(0),
             tenant,
             actor,
             event,
@@ -4716,9 +4717,17 @@ impl Store {
         subject: &str,
         detail: &serde_json::Value,
     ) {
-        if let Err(error) = self
-            .with(|connection| insert_audit_row(connection, tenant, actor, event, subject, detail))
-        {
+        if let Err(error) = self.with(|connection| {
+            insert_audit_row(
+                connection,
+                now_unix(),
+                tenant,
+                actor,
+                event,
+                subject,
+                detail,
+            )
+        }) {
             // Best-effort by design: the tracing event above each call site
             // still records the action. The counter lets operators alert on
             // the divergence between the log and the exportable trail.
@@ -4750,6 +4759,7 @@ impl Store {
         }
         insert_audit_row(
             &transaction,
+            now_unix(),
             tenant,
             actor,
             "link_legal_hold_changed",

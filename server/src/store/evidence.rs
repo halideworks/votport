@@ -234,6 +234,8 @@ pub(crate) fn delivery_event(
     now: u64,
 ) -> rusqlite::Result<()> {
     use sha2::{Digest, Sha256};
+    // Keep copied audit text small; an oversized actor is represented by a digest.
+    const MAX_AUDIT_TEXT_BYTES: usize = 256;
     let previous: Option<String> = connection
         .query_row(
             "SELECT hash FROM delivery_events WHERE tenant=?1 ORDER BY id DESC LIMIT 1",
@@ -254,6 +256,63 @@ pub(crate) fn delivery_event(
         "UPDATE delivery_events SET hash=?2,signature=?3 WHERE id=?1",
         params![id, hash, signature],
     )?;
+    let (actor, actor_encoding) = match payload.get("actor").and_then(serde_json::Value::as_str) {
+        Some(value) if value.len() <= MAX_AUDIT_TEXT_BYTES => (value.to_owned(), "plain"),
+        Some(value) => (
+            format!("sha256:{}", hex::encode(Sha256::digest(value.as_bytes()))),
+            "sha256",
+        ),
+        None => (String::new(), "none"),
+    };
+    let mut summary = serde_json::Map::new();
+    for key in [
+        "job_id",
+        "project_id",
+        "route",
+        "storage_id",
+        "evidence_id",
+        "destination",
+        "replacement_id",
+        "reprocessed_from",
+        "link_id",
+        "upload_id",
+        "operation_id",
+        "direction",
+        "peer_id",
+        "state",
+        "status",
+        "revision",
+        "policy_revision",
+        "original_revision",
+        "generation",
+        "attempt",
+        "enabled",
+        "cancel_active",
+    ] {
+        let Some(value) = payload.get(key) else {
+            continue;
+        };
+        let keep = match value {
+            serde_json::Value::String(value) => value.len() <= MAX_AUDIT_TEXT_BYTES,
+            serde_json::Value::Number(_) => true,
+            serde_json::Value::Bool(_) => true,
+            serde_json::Value::Null
+            | serde_json::Value::Array(_)
+            | serde_json::Value::Object(_) => false,
+        };
+        if keep {
+            summary.insert(key.to_owned(), value.clone());
+        }
+    }
+    let detail = serde_json::json!({
+        "delivery_event_id": id,
+        "delivery_event_hash": hash,
+        "delivery_event_issuer": signer.public_hex,
+        "delivery_event_kind": kind,
+        "delivery_event_actor": actor_encoding,
+        "summary": summary,
+    });
+    super::insert_audit_row(connection, now, tenant, &actor, kind, grant_id, &detail)?;
     Ok(())
 }
 
@@ -483,6 +542,113 @@ mod tests {
             .with(|c| c.execute("UPDATE delivery_events SET payload='{}'", []))
             .unwrap();
         assert!(store.delivery_events("", 0, 100).is_err());
+    }
+
+    #[test]
+    fn delivery_event_mirrors_bounded_audit_summary() {
+        use sha2::{Digest, Sha256};
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.audit("tenant", "seed", "seed", "seed", &serde_json::json!({}));
+        let payload = serde_json::json!({
+            "actor": "alice@example.com",
+            "project_id": "project",
+            "revision": 3,
+            "state": "queued",
+            "enabled": true,
+            "manifest": {"secret": "do not copy"},
+            "password": "do not copy",
+            "destination": "x".repeat(257),
+        });
+        let oversized_actor = "a".repeat(257);
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let tx = connection.transaction().unwrap();
+            delivery_event(
+                &tx,
+                &store.event_signer,
+                "tenant",
+                "grant",
+                "delivery_queued",
+                &payload,
+                42,
+            )
+            .unwrap();
+            delivery_event(
+                &tx,
+                &store.event_signer,
+                "tenant",
+                "grant-hashed",
+                "delivery_retrying",
+                &serde_json::json!({"actor": oversized_actor.clone(), "status": "retrying"}),
+                43,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let events = store.delivery_events("tenant", 0, 100).unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.grant_id == "grant")
+            .unwrap();
+        assert!(event.verify_for(&store.event_signer.public_hex, "tenant"));
+        let audit = store
+            .audit_export(Some("tenant"), 0, 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.event == "delivery_queued")
+            .expect("delivery event mirror");
+        assert_eq!(audit.at, 42);
+        assert_eq!(audit.tenant, "tenant");
+        assert_eq!(audit.actor, "alice@example.com");
+        assert_eq!(audit.subject, "grant");
+        assert_eq!(
+            audit.detail["delivery_event_id"],
+            serde_json::json!(event.id)
+        );
+        assert_eq!(audit.detail["delivery_event_hash"], event.hash);
+        assert_eq!(audit.detail["delivery_event_issuer"], event.issuer);
+        assert_eq!(audit.detail["delivery_event_kind"], event.kind);
+        assert_eq!(audit.detail["delivery_event_actor"], "plain");
+        assert_eq!(audit.detail["summary"]["project_id"], "project");
+        assert_eq!(audit.detail["summary"]["revision"], 3);
+        assert_eq!(audit.detail["summary"]["state"], "queued");
+        assert_eq!(audit.detail["summary"]["enabled"], true);
+        assert!(audit.detail["summary"].get("destination").is_none());
+        let detail = audit.detail.to_string();
+        for secret in ["do not copy", "password", "manifest"] {
+            assert!(!detail.contains(secret), "secret leaked into audit detail");
+        }
+        assert_eq!(event.payload, payload);
+        let hashed_event = events
+            .iter()
+            .find(|event| event.grant_id == "grant-hashed")
+            .unwrap();
+        let hashed_audit = store
+            .audit_export(Some("tenant"), 0, 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.subject == "grant-hashed")
+            .unwrap();
+        assert_eq!(
+            hashed_audit.actor,
+            format!(
+                "sha256:{}",
+                hex::encode(Sha256::digest(oversized_actor.as_bytes()))
+            )
+        );
+        assert_eq!(hashed_audit.detail["delivery_event_actor"], "sha256");
+        assert!(!hashed_audit.actor.contains(&oversized_actor));
+        assert_eq!(hashed_audit.detail["delivery_event_id"], hashed_event.id);
+        assert_eq!(
+            store
+                .delivery_event_export("tenant", EventCheckpoint::default(), None, 100)
+                .unwrap()
+                .events
+                .len(),
+            2
+        );
     }
 
     #[test]

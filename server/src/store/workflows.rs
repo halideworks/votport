@@ -2670,11 +2670,14 @@ mod tests {
             .unwrap();
         let before_events =
             serde_json::to_value(store.delivery_events("", 0, 100).unwrap()).unwrap();
+        let before_audit =
+            serde_json::to_value(store.audit_export(Some(""), 0, 0, 100).unwrap()).unwrap();
         for trigger in [
             "BEFORE UPDATE OF token_hash ON outbound_grants",
             "BEFORE UPDATE OF token ON delivery_jobs",
             "BEFORE UPDATE OF document ON delivery_jobs",
             "BEFORE INSERT ON delivery_events",
+            "BEFORE INSERT ON audit_log",
         ] {
             store.with(|connection| connection.execute_batch(&format!(
                 "CREATE TEMP TRIGGER fail_rotation {trigger} BEGIN SELECT RAISE(FAIL,'rotation fixture'); END;"
@@ -2702,6 +2705,10 @@ mod tests {
             assert_eq!(
                 serde_json::to_value(store.delivery_events("", 0, 100).unwrap()).unwrap(),
                 before_events
+            );
+            assert_eq!(
+                serde_json::to_value(store.audit_export(Some(""), 0, 0, 100).unwrap()).unwrap(),
+                before_audit
             );
             store
                 .with(|connection| connection.execute_batch("DROP TRIGGER fail_rotation"))
@@ -2767,6 +2774,18 @@ mod tests {
                 .count(),
             1
         );
+        let rotated = events
+            .iter()
+            .find(|event| event.kind == "delivery_link_rotated")
+            .unwrap();
+        let mirrored = store
+            .audit_export(Some(""), 0, 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.event == "delivery_link_rotated")
+            .collect::<Vec<_>>();
+        assert_eq!(mirrored.len(), 1);
+        assert_eq!(mirrored[0].detail["delivery_event_id"], rotated.id);
         assert!(!serde_json::to_string(&events).unwrap().contains(&current));
         let snapshot = Store::open(snapshot_directory.path()).unwrap();
         assert_eq!(

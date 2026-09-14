@@ -3472,47 +3472,68 @@ async fn restart_preserves_a_truncated_staging_session() {
 /// the restart, not only the bytes this boot saw.
 #[tokio::test(flavor = "multi_thread")]
 async fn resumed_session_end_counts_bytes_from_before_the_restart() {
-    let server = start_server().await;
-    let client = reqwest::Client::builder()
-        .cookie_store(true)
-        .build()
-        .unwrap();
-    let files = [twenty_mib()];
-    let (_token, session) = open_session(&client, &server.base, "resumed-end", &files).await;
-    let base = server.base.clone();
-    assert_eq!(begin(&client, &base, &session).await.0, 200);
-    assert_eq!(
-        post_chunk(&client, &base, &session, &files[0], 0).await.0,
-        200
-    );
+    for outcome in ["cancelled", "interrupted"] {
+        let server = start_server().await;
+        let client = reqwest::Client::builder()
+            .cookie_store(true)
+            .build()
+            .unwrap();
+        let files = [twenty_mib()];
+        let (_token, session) = open_session(&client, &server.base, "resumed-end", &files).await;
+        let base = server.base.clone();
+        assert_eq!(begin(&client, &base, &session).await.0, 200);
+        assert_eq!(
+            post_chunk(&client, &base, &session, &files[0], 0).await.0,
+            200
+        );
 
-    let server = server.restart().await;
-    let base = server.base.clone();
-    let link_id = server.application.sessions.link_id(&session).unwrap();
-    let abort = client
-        .post(format!("{base}/api/session/{session}/abort"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(abort.status(), 200);
+        let server = server.restart().await;
+        let base = server.base.clone();
+        let link_id = server.application.sessions.link_id(&session).unwrap();
+        if outcome == "cancelled" {
+            let abort = client
+                .post(format!("{base}/api/session/{session}/abort"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(abort.status(), 200);
+        } else {
+            server.application.sessions.sweep(0);
+        }
 
-    let mut ended_rx = server
-        .application
-        .session_ended_rx
-        .lock()
-        .unwrap()
-        .take()
-        .unwrap();
-    let ended = ended_rx.recv().await.unwrap();
-    assert_eq!(ended.event.outcome, "cancelled");
-    assert_eq!(ended.event.received_bytes, CHUNK);
-    let link = server
-        .application
-        .store
-        .link_by_id(&link_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(link.events.last().unwrap().received_bytes, CHUNK);
+        let mut ended_rx = server
+            .application
+            .session_ended_rx
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(5), ended_rx.recv())
+            .await
+            .expect("resumed session did not end")
+            .unwrap();
+        assert_eq!(ended.event.outcome, outcome);
+        assert_eq!(ended.event.received_bytes, CHUNK);
+        let link = server
+            .application
+            .store
+            .link_by_id(&link_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(link.events.last().unwrap().received_bytes, CHUNK);
+        let audit = server
+            .application
+            .store
+            .audit_recent(Some(&link.tenant), 0, 100)
+            .unwrap();
+        let events: Vec<_> = audit
+            .iter()
+            .filter(|row| row.event == "upload_session_ended" && row.subject == link_id)
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].detail["outcome"], outcome);
+        assert_eq!(events[0].detail["received_bytes"], CHUNK);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -14,6 +14,25 @@ use crate::package::Prepared;
 use crate::progress::{Event, Observer, Transport};
 
 const MAX_REBEGINS: usize = 100;
+const MAX_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+
+pub(crate) fn valid_session_id(session: &str) -> bool {
+    session.len() == 32 && session.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub(crate) fn valid_chunk_bytes(chunk_bytes: u64) -> bool {
+    (1..=MAX_CHUNK_BYTES).contains(&chunk_bytes)
+}
+
+pub(crate) fn valid_resume_metadata(session: &str, chunk_bytes: u64) -> bool {
+    valid_session_id(session) && valid_chunk_bytes(chunk_bytes)
+}
+
+struct JournalBoundary<'a, F> {
+    journalled: bool,
+    reconnectable: bool,
+    on_begin: &'a mut F,
+}
 
 /// Sends a prepared drop to `token` over the HTTP session protocol.
 ///
@@ -27,32 +46,83 @@ pub fn send(
     prepared: &Prepared,
     observer: &mut dyn Observer,
 ) -> Result<FinishReport> {
-    let created = client.create_session(
+    send_with_session(
+        client,
         token,
         password,
-        PackageAnnouncement {
-            suite: "blake3".to_owned(),
-            root: hex::encode(prepared.summary.root),
-            length: prepared.summary.logical_length,
-        },
-    )?;
-    let session = created.session;
+        prepared,
+        observer,
+        None,
+        |_, _, _| Ok(false),
+    )
+}
+
+/// Sends a prepared drop, optionally reconnecting to a known HTTP session.
+/// `on_begin` runs after the first successful begin, before any payload is
+/// accepted, so a caller can durably associate the session with its journal.
+pub fn send_with_session(
+    client: &Client,
+    token: &str,
+    password: Option<&str>,
+    prepared: &Prepared,
+    observer: &mut dyn Observer,
+    existing: Option<(&str, u64)>,
+    mut on_begin: impl FnMut(&str, u64, &Prepared) -> Result<bool>,
+) -> Result<FinishReport> {
+    if let Some((session, chunk_bytes)) = existing {
+        if !valid_resume_metadata(session, chunk_bytes) {
+            return Err(Error::ResumeSessionInvalid);
+        }
+    }
+    let (session, chunk_bytes, resume) = match existing {
+        Some((session, chunk_bytes)) => (session.to_owned(), chunk_bytes, true),
+        None => {
+            let created = client.create_session(
+                token,
+                password,
+                PackageAnnouncement {
+                    suite: "blake3".to_owned(),
+                    root: hex::encode(prepared.summary.root),
+                    length: prepared.summary.logical_length,
+                },
+            )?;
+            (created.session, created.chunk_bytes, created.resume)
+        }
+    };
+    if !valid_resume_metadata(&session, chunk_bytes) {
+        if existing.is_none() && valid_session_id(&session) && !client.is_route() {
+            client.abort(&session);
+        }
+        return Err(Error::Other(
+            "the server returned invalid HTTP session metadata".to_owned(),
+        ));
+    }
     observer.event(Event::SessionCreated {
         session: session.clone(),
     });
     observer.event(Event::Transport(Transport::Http));
 
+    let mut journal = JournalBoundary {
+        journalled: existing.is_some(),
+        reconnectable: existing.is_some(),
+        on_begin: &mut on_begin,
+    };
     let result = drive(
         client,
         &session,
-        created.chunk_bytes,
+        chunk_bytes,
         prepared,
         observer,
-        created.resume,
+        resume,
+        &mut journal,
     );
-    if result.is_err() && !client.is_route() {
-        // Abort is best effort and safe on any failure path; it lets the
-        // server record the session as cancelled rather than idle out.
+    let preserve = result.as_ref().err().is_some_and(|error| {
+        journal.reconnectable
+            && ((matches!(error, Error::Cancelled) && observer.paused()) || error.worth_retrying())
+    });
+    if result.is_err() && existing.is_none() && !preserve && !client.is_route() {
+        // Abort only terminal cancellation/failure. Pause and retryable
+        // errors retain the session for the journalled resume path.
         client.abort(&session);
     }
     result
@@ -66,6 +136,7 @@ fn drive(
     prepared: &Prepared,
     observer: &mut dyn Observer,
     resume: bool,
+    journal: &mut JournalBoundary<'_, impl FnMut(&str, u64, &Prepared) -> Result<bool>>,
 ) -> Result<FinishReport> {
     if !resume {
         let expected_pages = client.seal(session, prepared.seal_bytes.clone())?;
@@ -82,7 +153,7 @@ fn drive(
 
     // Accepted chunks do not reset recovery: finish can still refuse forever.
     for _ in 0..=MAX_REBEGINS {
-        if observer.cancelled() {
+        if journal.journalled && observer.cancelled() {
             return Err(Error::Cancelled);
         }
         let entries = client.begin(session)?;
@@ -92,6 +163,13 @@ fn drive(
                 entries.len(),
                 prepared.objects.len()
             )));
+        }
+        if !journal.journalled {
+            journal.reconnectable = (journal.on_begin)(session, chunk_bytes, prepared)?;
+            journal.journalled = true;
+        }
+        if observer.cancelled() {
+            return Err(Error::Cancelled);
         }
         match send_entries(client, session, chunk_bytes, prepared, &entries, observer)? {
             Outcome::Rebegin => {
@@ -318,7 +396,11 @@ mod tests {
         use std::io::{BufRead as _, Write as _};
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("frame");
-        let length = if mode == "resume" { 65537 } else { 7 };
+        let length = if mode == "resume" || mode == "existing" {
+            65537
+        } else {
+            7
+        };
         std::fs::write(&source, vec![7; length]).unwrap();
         let prepared = crate::package::build(
             vec![crate::entries::Entry {
@@ -372,12 +454,14 @@ mod tests {
                 let (status, body, done) = if path == "/api/r/token/session" {
                     (
                         200,
-                        json!({"session":"upload", "chunk_bytes":65536, "resume":true}),
+                        json!({"session":"0123456789abcdef0123456789abcdef", "chunk_bytes":65536, "resume":true}),
                         false,
                     )
                 } else if path.ends_with("/begin") {
                     begins += 1;
-                    if begins > 101 {
+                    if mode == "prebegin" {
+                        (422, json!({"error":"fixture refused begin"}), false)
+                    } else if begins > 101 {
                         (
                             400,
                             json!({"error":"fixture observed an excess begin"}),
@@ -387,7 +471,7 @@ mod tests {
                         (
                             200,
                             json!({"entries":[{"index":0, "path":"frame", "stored_as":"frame", "bytes":length,
-                            "complete":false, "covered_bytes":if mode == "resume" && begins > 1 { 65536 } else { 0 }}]}),
+                            "complete":false, "covered_bytes":if (mode == "resume" || mode == "existing") && begins > 1 { 65536 } else { 0 }}]}),
                             false,
                         )
                     }
@@ -405,7 +489,7 @@ mod tests {
                     let rebegin = mode == "chunk"
                         || mode == "cancel"
                         || (mode == "mixed" && begins % 2 == 1)
-                        || (mode == "resume" && begins == 1);
+                        || ((mode == "resume" || mode == "existing") && begins == 1);
                     (
                         200,
                         json!({"accepted":true, "replay":false, "covered_bytes":length,
@@ -413,7 +497,7 @@ mod tests {
                         false,
                     )
                 } else if path.ends_with("/finish") {
-                    if mode == "resume" {
+                    if mode == "resume" || mode == "existing" {
                         (
                             200,
                             json!({"upload_id":"finished", "files":[{"path":"frame"}]}),
@@ -449,19 +533,41 @@ mod tests {
             }
         }
         let client = Client::with_timeout(&url, Some(Duration::from_secs(2))).unwrap();
-        let result = send(
-            &client,
-            "token",
-            None,
-            &prepared,
-            &mut CancelOnRebegin {
-                enabled: mode == "cancel",
-                cancelled: false,
-            },
-        );
+        let result = if mode == "journal" {
+            send_with_session(
+                &client,
+                "token",
+                None,
+                &prepared,
+                &mut crate::progress::Silent,
+                None,
+                |_, _, _| Err(Error::Other("journal write failed".into())),
+            )
+        } else if mode == "existing" {
+            send_with_session(
+                &client,
+                "token",
+                None,
+                &prepared,
+                &mut crate::progress::Silent,
+                Some(("0123456789abcdef0123456789abcdef", 65536)),
+                |_, _, _| panic!("existing-session resume rewrote its journal"),
+            )
+        } else {
+            send(
+                &client,
+                "token",
+                None,
+                &prepared,
+                &mut CancelOnRebegin {
+                    enabled: mode == "cancel",
+                    cancelled: false,
+                },
+            )
+        };
         let (begins, offsets) = server.join().unwrap();
         match mode {
-            "resume" => {
+            "resume" | "existing" => {
                 assert_eq!(result.unwrap().upload_id, "finished");
                 assert_eq!(begins, 2);
                 assert_eq!(offsets, [0, 65536]);
@@ -469,6 +575,18 @@ mod tests {
             "cancel" => {
                 assert!(matches!(result, Err(Error::Cancelled)));
                 assert_eq!(begins, 1);
+            }
+            "prebegin" => {
+                assert!(matches!(result, Err(Error::Server { status: 422, .. })));
+                assert_eq!(begins, 1);
+                assert!(offsets.is_empty());
+            }
+            "journal" => {
+                assert!(
+                    matches!(result, Err(Error::Other(ref message)) if message == "journal write failed")
+                );
+                assert_eq!(begins, 1);
+                assert!(offsets.is_empty());
             }
             _ => {
                 assert!(
@@ -501,8 +619,23 @@ mod tests {
     }
 
     #[test]
+    fn an_existing_resume_skips_the_journal_callback() {
+        exercise_rebegin("existing");
+    }
+
+    #[test]
     fn cancellation_after_rebegin_prevents_another_begin() {
         exercise_rebegin("cancel");
+    }
+
+    #[test]
+    fn a_pre_begin_failure_still_aborts_an_unjournalled_session() {
+        exercise_rebegin("prebegin");
+    }
+
+    #[test]
+    fn a_journal_write_failure_aborts_the_new_session() {
+        exercise_rebegin("journal");
     }
 
     #[test]

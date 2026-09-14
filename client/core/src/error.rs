@@ -124,6 +124,21 @@ pub enum Error {
     #[error("no journalled transfer {id}")]
     UnknownTransfer { id: String },
 
+    /// The persisted HTTP upload no longer exists; the journal can be retried
+    /// as a fresh send after its stale session association is cleared.
+    #[error("the saved upload session expired; start a new send")]
+    ResumeSessionExpired,
+
+    /// The files selected for a persisted HTTP upload no longer make the same
+    /// package, so the saved session must not receive them.
+    #[error("the selected files changed; start a new send")]
+    ResumeSourceChanged,
+
+    /// The persisted HTTP session metadata is damaged and cannot be used to
+    /// address a server session safely.
+    #[error("the saved upload session metadata is invalid; start a new send")]
+    ResumeSessionInvalid,
+
     /// The destination's filesystem cannot hold the delivery.
     #[error("{path} has {available} bytes free; the delivery needs {needed}")]
     NoSpace {
@@ -220,6 +235,13 @@ impl Error {
             ),
             Self::Cancelled => "Cancelled.".to_owned(),
             Self::UnknownTransfer { .. } => "That transfer is no longer on record.".to_owned(),
+            Self::ResumeSessionExpired => {
+                "That paused upload expired. Start a new send.".to_owned()
+            }
+            Self::ResumeSourceChanged => "The selected files changed. Send them again.".to_owned(),
+            Self::ResumeSessionInvalid => {
+                "That paused upload cannot be resumed. Start a new send.".to_owned()
+            }
             Self::NoSpace {
                 needed, available, ..
             } => format!(

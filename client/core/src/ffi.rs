@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::api::{split_link, split_link_as, LinkKind};
+use crate::api::{split_link, split_link_as, Client, LinkKind};
 use crate::error::{human_bytes, human_seconds, Error};
 use crate::identity::Device;
 use crate::journal;
@@ -266,7 +266,49 @@ pub fn pending() -> Vec<journal::Entry> {
 /// person removed rather than resumed.
 #[uniffi::export]
 pub fn forget(id: String) {
+    let entry = journal::get(&id).ok();
     journal::forget(&id);
+    if let Some(entry) = entry {
+        if entry.http.is_some() {
+            let _ = std::thread::Builder::new()
+                .name("votport-http-cleanup".to_owned())
+                .spawn(move || abort_saved_http(&entry));
+        }
+    }
+}
+
+/// Releases a retained ordinary HTTP upload after its journal entry is being
+/// discarded. This runs on a worker for UI-triggered forgets; ship already
+/// runs off the UI thread and calls it inline before removing a replacement.
+fn abort_saved_http(entry: &journal::Entry) {
+    let Some(http) = entry.http.as_ref() else {
+        return;
+    };
+    if !crate::send_http::valid_session_id(&http.session) {
+        return;
+    }
+    let Ok(link) = split_link(&entry.link) else {
+        return;
+    };
+    let Ok(client) = Client::with_timeout(&link.base, Some(Duration::from_secs(5))) else {
+        return;
+    };
+    client.abort(&http.session);
+}
+
+fn resume_error_needs_abort(error: &Error, paused: bool) -> bool {
+    match error {
+        Error::Cancelled => !paused,
+        Error::ResumeSourceChanged => true,
+        Error::ResumeSessionInvalid => true,
+        Error::ResumeSessionExpired => false,
+        Error::Server {
+            status: 404 | 410,
+            what,
+            ..
+        } if what != "link info" => false,
+        _ => !error.worth_retrying(),
+    }
 }
 
 /// What a resumed transfer did: a send's report or a receive's.
@@ -305,7 +347,7 @@ pub fn resume(
     };
     match entry.kind {
         journal::Kind::Send => {
-            run_send(entry, password, transfer, listener).map(ResumeReport::Sent)
+            run_send(entry, password, transfer, listener, false).map(ResumeReport::Sent)
         }
         journal::Kind::Receive => {
             run_receive(entry, password, transfer, listener, true).map(ResumeReport::Received)
@@ -689,7 +731,7 @@ pub fn ship(
     // holding the path makes this fail now, before the forget below.
     {
         let _flight = watch::single_flight(&path)?;
-        journal::forget_send_of(&path);
+        journal::forget_send_of(&path, abort_saved_http);
     }
     let report = send(link, password, vec![path.clone()], transfer, listener)?;
     let parked = watch::park(Path::new(&path));
@@ -721,28 +763,50 @@ pub fn send(
     listener: Arc<dyn TransferListener>,
 ) -> std::result::Result<SendReport, Error> {
     let entry = journal::record(journal::Kind::Send, &link, paths, None, password.is_some());
-    run_send(entry, password, transfer, listener)
+    run_send(entry, password, transfer, listener, true)
 }
 
 /// Runs a journalled send. The entry is dropped from the journal when the
-/// send ends well or is cancelled, and kept when it fails, so the next
-/// launch can offer it again.
+/// send ends well or a terminal cancel occurs, and kept for Pause or a
+/// retryable failure so the next launch can offer the same session again.
 fn run_send(
     entry: journal::Entry,
     password: Option<String>,
     transfer: Arc<Transfer>,
     listener: Arc<dyn TransferListener>,
+    new_journal: bool,
 ) -> std::result::Result<SendReport, Error> {
-    transfer.set_journal_id(&entry.id);
+    let existing_http = entry.http.clone();
+    let resume = existing_http.as_ref().map(|http| transfer::HttpResume {
+        session: &http.session,
+        chunk_bytes: http.chunk_bytes,
+        root: &http.root,
+        length: http.length,
+    });
+    let journal_id = entry.id.clone();
     let handle = Arc::clone(&transfer);
     let mut forward = Forward::new(journal::Kind::Send, transfer, listener);
+    if new_journal {
+        handle.set_journal_id(&entry.id);
+    }
+    let _flight = match entry.paths.as_slice() {
+        [only] => match watch::single_flight(only) {
+            Ok(flight) => Some(flight),
+            Err(error) => {
+                let result = Err(error);
+                if new_journal {
+                    handle.settle(&entry, result.as_ref().err());
+                }
+                forward.finish(result.as_ref().err());
+                return result;
+            }
+        },
+        _ => None,
+    };
+    if !new_journal {
+        handle.set_journal_id(&entry.id);
+    }
     let result = (|| {
-        // A one-path send holds its path while it runs, so a watch ship and
-        // a Resume of the same drop never upload it side by side.
-        let _flight = match entry.paths.as_slice() {
-            [only] => Some(watch::single_flight(only)?),
-            _ => None,
-        };
         let link = split_link_as(&entry.link, LinkKind::Request)?;
         let mut files: Vec<Selected> = Vec::new();
         for path in &entry.paths {
@@ -758,7 +822,25 @@ fn run_send(
         };
         let device = Device::load_or_create()?;
         Ok(
-            match transfer::send(&link.base, drop, &device, &mut forward)? {
+            match transfer::send_with_session(
+                &link.base,
+                drop,
+                &device,
+                &mut forward,
+                resume,
+                |session, chunk_bytes, prepared| {
+                    journal::mark_http(
+                        &journal_id,
+                        journal::HttpResume {
+                            session: session.to_owned(),
+                            chunk_bytes,
+                            root: hex::encode(prepared.summary.root),
+                            length: prepared.summary.logical_length,
+                        },
+                    )
+                    .map(|()| true)
+                },
+            )? {
                 transfer::Sent::Push { files } => SendReport {
                     transport: Transport::Push,
                     files: files as u64,
@@ -772,9 +854,41 @@ fn run_send(
             },
         )
     })();
+    if existing_http.is_some() {
+        if let Some(error) = result.as_ref().err() {
+            if resume_error_needs_abort(error, handle.is_paused()) {
+                abort_saved_http(&entry);
+            }
+        }
+    }
+    let result = match result {
+        Err(Error::Server {
+            status: 404 | 410,
+            ref what,
+            ..
+        }) if existing_http.is_some() && what != "link info" => {
+            Err(clear_resume_error(&entry.id, Error::ResumeSessionExpired))
+        }
+        Err(Error::ResumeSourceChanged) if existing_http.is_some() => {
+            Err(clear_resume_error(&entry.id, Error::ResumeSourceChanged))
+        }
+        Err(Error::ResumeSessionInvalid) if existing_http.is_some() => {
+            Err(clear_resume_error(&entry.id, Error::ResumeSessionInvalid))
+        }
+        result => result,
+    };
     handle.settle(&entry, result.as_ref().err());
     forward.finish(result.as_ref().err());
     result
+}
+
+fn clear_resume_error(id: &str, error: Error) -> Error {
+    match journal::clear_http(id) {
+        Ok(()) => error,
+        Err(clear) => Error::Other(format!(
+            "{error}; could not clear the saved session for a fresh retry: {clear}"
+        )),
+    }
 }
 
 /// Receives the delivery at `link` into the directory `dest`, over a QUIC
@@ -1371,6 +1485,10 @@ impl Observer for Forward {
 
     fn cancelled(&self) -> bool {
         self.transfer.is_cancelled()
+    }
+
+    fn paused(&self) -> bool {
+        self.transfer.is_paused()
     }
 }
 
