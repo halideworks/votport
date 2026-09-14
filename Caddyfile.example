@@ -1,7 +1,7 @@
 # Example Caddy site for votport.
 #
 # Add this to your existing Caddyfile (adjust the hostname and port to match
-# docker-compose.yml). Caddy terminates TLS; votport speaks plain HTTP on
+# the selected Compose file). Caddy terminates TLS; votport speaks plain HTTP on
 # localhost.
 
 drop.example.com {

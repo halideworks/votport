@@ -67,13 +67,16 @@ Requirements: Docker with the compose plugin, and Caddy on the host.
 ```sh
 git clone https://github.com/halideworks/votport
 cd votport
-# edit docker-compose.yml:
-#   - set VOTPORT_ADMIN_PASSWORD
-#   - set VOTPORT_PUBLIC_URL to the https URL Caddy will serve
-#   - point the /received volume at the folder that should receive files
-#   - point the /outbound volume at the folder for outbound library files
-docker compose up -d --build
+install -m 600 .env.example .env
+# edit .env: set VOTPORT_ADMIN_PASSWORD and the https URL Caddy will serve
+sudo install -d -o 1000 -g 1000 -m 0700 data received outbound
+docker compose --env-file .env -f docker-compose.example.yml up -d --build
 ```
+
+The three bind roots must be writable by uid/gid 1000, the user inside the
+container. If they already exist, grant that uid/gid access without
+recursively changing unrelated content. The tracked `docker-compose.yml` is a
+deployment-specific template; the example file is the portable quick start.
 
 The first build takes a while: it compiles the VOT SDK to WebAssembly for the
 browser and builds the server. Then add the site to your Caddyfile (see
@@ -113,8 +116,10 @@ content volumes still need operator-owned file backups.
 
 ## Configuration
 
-Environment variables are the boot defaults (see `docker-compose.yml`). A
-platform admin can configure the SMTP relay, retention, and default quotas
+Environment variables are the boot defaults. The portable Docker quick start
+uses `.env` with `docker-compose.example.yml`; deployment-specific Compose
+files may use different values. A platform admin can configure the SMTP relay,
+retention, and default quotas
 from **System** without SSH (`GET`/`PUT /api/admin/settings`). Configure named
 notification destinations and tenant defaults on **Notifications**.
 The System page configures automatic local and S3-compatible backups, reports
@@ -138,6 +143,12 @@ The table covers common settings. See the configuration references for
 [SSO roles and session lifetime](docs/deployment.md#single-sign-on),
 [JSON logs](docs/deployment.md#logs), and
 [workflow snapshot budgets](docs/delivery-workflows.md#storage-templates-and-quarantine).
+
+`VOTPORT_SESSION_IDLE_SECS` defaults to 1800 seconds. Choose a value longer
+than the longest sender or network pause when preserving interrupted transfers;
+the portable Compose example uses 172800 seconds (48 hours). Keep this
+environment setting the same on a promoted failover host. Active requests
+remain retained while in flight.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
