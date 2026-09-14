@@ -182,7 +182,9 @@ try {
     await grantCard.getByRole('button', { name: action, exact: true }).focus();
     await page.keyboard.press('Enter'); await page.locator('#confirm-ok').press('Enter');
     await page.waitForFunction((text) => document.querySelector('#outbound-grants-status').textContent.startsWith(text), message);
-    assert.ok(await page.locator('#outbound-grants-status').evaluate((node) => node === document.activeElement), `${action} retains keyboard position`);
+    const resultFocus = action === 'New address' ? '#outbound-url' : '#outbound-grants-status';
+    assert.ok(await page.locator(resultFocus).evaluate((node) => node === document.activeElement), `${action} focuses its result`);
+    if (action === 'New address') assert.match(await page.inputValue('#outbound-url'), /^https?:\/\//);
   }
   await page.getByText('Issued downloads could not be loaded.', { exact: true }).waitFor();
   assert.deepEqual(errors, []);

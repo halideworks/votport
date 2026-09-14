@@ -21,6 +21,7 @@ import {
   formatWhen,
   requireSession,
   revealHash,
+  selectText,
   showGrantResult,
 } from '/assets/admin-common.js';
 import { startStatusPoll } from '/assets/status-strip.js';
@@ -159,26 +160,31 @@ function renderGrants() {
       const actions = document.createElement('div');
       actions.className = 'actions';
       if (status === 'active') {
-        const copyLink = button('Copy link', 'tiny', async () => {
-          copyLink.disabled = true;
+        const copyLink = button('Copy link', 'tiny', async (control) => {
+          control.disabled = true;
           try {
             const { url } = await api(`/api/admin/outbound-grants/${grant.id}/url`);
-            showGrantResult(url, grant.has_password);
+            const focusResult = control === document.activeElement || document.activeElement === document.body;
+            showGrantResult(url, grant.has_password, focusResult);
             try {
-              await copyToClipboard(copyLink, url);
+              await copyToClipboard(control, url);
               announce('outbound-grants-status', 'Download link copied.');
             } catch {
-              $('outbound-url').focus();
-              $('outbound-url').select();
-              announce('outbound-grants-status', 'Your download address is selected below. Copy it to share.');
+              const ownsResultFocus = control === document.activeElement
+                || $('outbound-url') === document.activeElement
+                || document.activeElement === document.body;
+              if (ownsResultFocus) {
+                selectText($('outbound-url'));
+                announce('outbound-grants-status', 'Your download address is selected below. Copy it to share.');
+              } else announce('outbound-grants-status', 'Could not copy the download address. Use Copy address below to retry.');
             }
           } finally {
-            copyLink.disabled = false;
+            control.disabled = false;
           }
         });
         actions.append(copyLink);
         actions.append(
-          button('New address', 'tiny', async () => {
+          button('New address', 'tiny', async (control) => {
             if (
               !(await confirmModal(
                 'Rotate download address',
@@ -192,7 +198,8 @@ function renderGrants() {
               body: JSON.stringify({ rotate: true }),
             });
             if (!response.url) throw new Error('server did not return a download URL');
-            showGrantResult(response.url, grant.has_password);
+            const focusResult = control === document.activeElement || document.activeElement === document.body;
+            showGrantResult(response.url, grant.has_password, focusResult);
             await refreshGrants();
             announce('outbound-grants-status', 'Download address rotated.');
           }),
@@ -705,6 +712,7 @@ async function submitDeliverGrant() {
     return;
   }
   deliverGrantBusy = true;
+  const submittedFocus = document.activeElement;
   const form = $('deliver-form');
   const submit = $('deliver-submit');
   const progress = $('deliver-progress');
@@ -723,21 +731,25 @@ async function submitDeliverGrant() {
     });
     if (!response.url) throw new Error('server did not return a download URL');
     markFormSaved($('deliver-form'));
-    showGrantResult(response.url, response.grant?.has_password);
+    const focusResult = document.activeElement === submittedFocus
+      || document.activeElement === progress
+      || document.activeElement === document.body;
+    showGrantResult(response.url, response.grant?.has_password, focusResult);
+    announce('outbound-grants-status', 'Download link ready.');
     $('deliver-password').value = '';
-    $('outbound-url').focus();
     refreshGrants();
   } catch (requestError) {
     $('deliver-error').textContent = requestError.message;
     $('deliver-error').hidden = false;
   } finally {
+    const focusError = !error.hidden && (document.activeElement === progress || document.activeElement === document.body);
     deliverGrantBusy = false;
     form.removeAttribute('aria-busy');
     $('deliver-fields').disabled = false;
     $('library-files').disabled = false;
     submit.textContent = 'Create download link';
     progress.hidden = true;
-    if (!error.hidden) error.focus();
+    if (focusError) error.focus();
   }
 }
 
