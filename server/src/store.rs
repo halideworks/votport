@@ -571,6 +571,12 @@ const OUTBOUND_GRANT_MANIFESTS_SCHEMA: &str = "
     CREATE INDEX IF NOT EXISTS outbound_fetch_tickets_grant ON outbound_fetch_tickets(grant_id, expires_at);
 ";
 
+const OUTBOUND_INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS outbound_fetch_tickets_expires ON outbound_fetch_tickets(expires_at);
+CREATE INDEX IF NOT EXISTS outbound_grants_open_expires
+    ON outbound_grants(expires_at) WHERE revoked_at IS NULL;
+";
+
 const OUTBOUND_GRANTS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS outbound_grants (
     id TEXT PRIMARY KEY,
@@ -828,6 +834,9 @@ impl Store {
         let transaction = connection.transaction().map_err(|e| e.to_string())?;
         transaction
             .execute_batch(workflows::INDEXES)
+            .map_err(|e| e.to_string())?;
+        transaction
+            .execute_batch(OUTBOUND_INDEXES)
             .map_err(|e| e.to_string())?;
         transaction.commit().map_err(|e| e.to_string())?;
         connection
@@ -4898,6 +4907,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
         BRANDING_SCHEMA,
         UPLOAD_SESSIONS_SCHEMA,
         OUTBOUND_GRANT_MANIFESTS_SCHEMA,
+        OUTBOUND_INDEXES,
         evidence::SCHEMA,
         workflows::SCHEMA,
         workflows::INDEXES,
@@ -6250,6 +6260,63 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn serve_prune_queries_preserve_expiry_revoke_and_ticket_retention() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut open = test_outbound_grant("open", "acme", 0);
+        open.expires_at = 200;
+        let mut expired = test_outbound_grant("expired", "acme", 0);
+        expired.expires_at = 10;
+        let mut revoked = test_outbound_grant("revoked", "acme", 0);
+        revoked.expires_at = 200;
+        revoked.revoked_at = Some(3);
+        let mut exhausted = test_outbound_grant("exhausted", "acme", 0);
+        exhausted.expires_at = 200;
+        exhausted.max_downloads = Some(1);
+        exhausted.downloads = 1;
+        for grant in [open, expired, revoked, exhausted] {
+            store.insert_outbound_grant(grant).unwrap();
+        }
+        store
+            .with(|connection| {
+                for (grant_id, root) in [
+                    ("open", "root-open"),
+                    ("expired", "root-expired"),
+                    ("revoked", "root-revoked"),
+                    ("exhausted", "root-exhausted"),
+                ] {
+                    connection.execute(
+                        "INSERT INTO outbound_grant_manifests(grant_id,manifest_root,created_at) VALUES (?1,?2,0)",
+                        rusqlite::params![grant_id, root],
+                    )?;
+                }
+                for (token_id, expires_at) in [("old", 10), ("boundary", 20), ("live", 30)] {
+                    connection.execute(
+                        "INSERT INTO outbound_fetch_tickets(token_id,grant_id,manifest_root,expires_at) VALUES (?1,'open','root-open',?2)",
+                        rusqlite::params![token_id, expires_at],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            store.servable_manifest_roots(20).unwrap(),
+            vec!["root-open".to_owned()]
+        );
+        assert_eq!(store.prune_fetch_tickets(20).unwrap(), 1);
+        let remaining: Vec<String> = store
+            .with(|connection| {
+                connection
+                    .prepare("SELECT token_id FROM outbound_fetch_tickets ORDER BY token_id")?
+                    .query_map([], |row| row.get(0))?
+                    .collect()
+            })
+            .unwrap();
+        assert_eq!(remaining, ["boundary".to_owned(), "live".to_owned()]);
+    }
+
+    #[test]
     fn fetch_delivery_and_ticket_commit_atomically() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -6481,13 +6548,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn current_schema_installs_workflow_indexes_on_reopen_and_promotion() {
+    fn current_schema_installs_maintenance_indexes_on_reopen_and_promotion() {
         for promotion in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let store = Store::open(directory.path()).unwrap();
-            store.with(|connection| connection.execute_batch(
-                "DROP INDEX delivery_jobs_deadline_pending; DROP INDEX delivery_jobs_retirement_due;",
-            )).unwrap();
+            store
+                .with(|connection| {
+                    connection.execute_batch(
+                        "DROP INDEX delivery_jobs_deadline_pending;
+                         DROP INDEX delivery_jobs_retirement_due;
+                         DROP INDEX outbound_fetch_tickets_expires;
+                         DROP INDEX outbound_grants_open_expires;",
+                    )
+                })
+                .unwrap();
             drop(store);
             if promotion {
                 std::fs::write(directory.path().join(crate::standby::STATUS_FILE), b"{}").unwrap();
@@ -6495,11 +6569,31 @@ pub(crate) mod tests {
             let store = Store::open(directory.path()).unwrap();
             assert!(store.claim_snapshot_retirement(1).unwrap().is_none());
             store.escalate_delivery_jobs(1).unwrap();
-            let indexes = store.with(|connection| connection.query_row(
-                "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name IN ('delivery_jobs_deadline_pending','delivery_jobs_retirement_due')",
-                [], |row| row.get::<_, i64>(0),
-            )).unwrap();
-            assert_eq!(indexes, 2, "promotion {promotion}");
+            let indexes = store
+                .with(|connection| {
+                    connection
+                        .prepare(
+                            "SELECT name FROM sqlite_schema WHERE type='index' AND name IN (
+                                'delivery_jobs_deadline_pending',
+                                'delivery_jobs_retirement_due',
+                                'outbound_fetch_tickets_expires',
+                                'outbound_grants_open_expires'
+                            ) ORDER BY name",
+                        )?
+                        .query_map([], |row| row.get(0))?
+                        .collect::<rusqlite::Result<Vec<String>>>()
+                })
+                .unwrap();
+            assert_eq!(
+                indexes,
+                [
+                    "delivery_jobs_deadline_pending".to_owned(),
+                    "delivery_jobs_retirement_due".to_owned(),
+                    "outbound_fetch_tickets_expires".to_owned(),
+                    "outbound_grants_open_expires".to_owned()
+                ],
+                "promotion {promotion}"
+            );
         }
     }
 
@@ -6514,6 +6608,8 @@ pub(crate) mod tests {
                 connection.execute_batch(
                     "DROP INDEX delivery_jobs_retirement_due;
              DROP INDEX delivery_jobs_deadline_pending;
+             DROP INDEX outbound_fetch_tickets_expires;
+             DROP INDEX outbound_grants_open_expires;
              ALTER TABLE outbound_grants DROP COLUMN share_token;
              UPDATE meta SET value='41' WHERE key='schema_version';",
                 )
@@ -6549,7 +6645,12 @@ pub(crate) mod tests {
                 assert_eq!(version, "42");
                 let indexes: Vec<String> = connection
                     .prepare(
-                        "SELECT name FROM sqlite_schema WHERE type='index' AND name IN ('delivery_jobs_deadline_pending','delivery_jobs_retirement_due') ORDER BY name",
+                        "SELECT name FROM sqlite_schema WHERE type='index' AND name IN (
+                            'delivery_jobs_deadline_pending',
+                            'delivery_jobs_retirement_due',
+                            'outbound_fetch_tickets_expires',
+                            'outbound_grants_open_expires'
+                        ) ORDER BY name",
                     )?
                     .query_map([], |row| row.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
@@ -6557,7 +6658,9 @@ pub(crate) mod tests {
                     indexes,
                     [
                         "delivery_jobs_deadline_pending".to_owned(),
-                        "delivery_jobs_retirement_due".to_owned()
+                        "delivery_jobs_retirement_due".to_owned(),
+                        "outbound_fetch_tickets_expires".to_owned(),
+                        "outbound_grants_open_expires".to_owned()
                     ]
                 );
                 Ok(())
@@ -8851,7 +8954,7 @@ mod settings_tests {
             drop(store);
             let path = directory.path().join("votport.db");
             let connection = Connection::open(&path).unwrap();
-            connection.execute_batch("PRAGMA journal_mode=DELETE; DROP INDEX links_tenant; DROP INDEX links_tenant_created; DROP INDEX delivery_jobs_deadline_pending; DROP INDEX delivery_jobs_retirement_due; DELETE FROM meta WHERE key='schema_version';").unwrap();
+            connection.execute_batch("PRAGMA journal_mode=DELETE; DROP INDEX links_tenant; DROP INDEX links_tenant_created; DROP INDEX delivery_jobs_deadline_pending; DROP INDEX delivery_jobs_retirement_due; DROP INDEX outbound_fetch_tickets_expires; DROP INDEX outbound_grants_open_expires; DELETE FROM meta WHERE key='schema_version';").unwrap();
             if let Some(version) = version {
                 connection
                     .execute(
@@ -8870,7 +8973,12 @@ mod settings_tests {
             let connection = Connection::open(&path).unwrap();
             let indexes: i64 = connection
                 .query_row(
-                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name IN ('delivery_jobs_deadline_pending','delivery_jobs_retirement_due')",
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name IN (
+                        'delivery_jobs_deadline_pending',
+                        'delivery_jobs_retirement_due',
+                        'outbound_fetch_tickets_expires',
+                        'outbound_grants_open_expires'
+                    )",
                     [],
                     |row| row.get(0),
                 )
