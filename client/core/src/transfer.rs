@@ -113,6 +113,14 @@ pub enum Sent {
     Push { files: usize },
 }
 
+/// A journalled HTTP session to reconnect after a paused or retryable send.
+pub struct HttpResume<'a> {
+    pub session: &'a str,
+    pub chunk_bytes: u64,
+    pub root: &'a str,
+    pub length: u64,
+}
+
 /// The link, the built manifest, and the staging directory that holds it, ready
 /// to send. The token and password ride along for the send calls.
 struct Ready {
@@ -227,8 +235,43 @@ fn announce(prepared: &Prepared, observer: &mut dyn Observer) {
 /// An unusable or password-protected link, a refused file, an empty or
 /// oversized drop, a build failure, or a transport error.
 pub fn send(base: &str, drop: Drop, device: &Device, observer: &mut dyn Observer) -> Result<Sent> {
+    send_with_session(base, drop, device, observer, None, |_, _, _| Ok(false))
+}
+
+/// Sends a drop, reconnecting to `resume` when it names a previous HTTP
+/// session. The callback durably records the session after its first begin.
+pub fn send_with_session(
+    base: &str,
+    drop: Drop,
+    device: &Device,
+    observer: &mut dyn Observer,
+    resume: Option<HttpResume<'_>>,
+    mut on_http_begin: impl FnMut(&str, u64, &Prepared) -> Result<bool>,
+) -> Result<Sent> {
+    if let Some(resume) = resume.as_ref() {
+        if !send_http::valid_resume_metadata(resume.session, resume.chunk_bytes) {
+            return Err(Error::ResumeSessionInvalid);
+        }
+    }
     let ready = prepare(base, drop, observer)?;
     announce(&ready.prepared, observer);
+    if let Some(resume) = resume {
+        if resume.root != hex::encode(ready.prepared.summary.root)
+            || resume.length != ready.prepared.summary.logical_length
+        {
+            return Err(Error::ResumeSourceChanged);
+        }
+        let report = send_http::send_with_session(
+            &ready.client,
+            &ready.token,
+            ready.password.as_deref(),
+            &ready.prepared,
+            observer,
+            Some((resume.session, resume.chunk_bytes)),
+            &mut on_http_begin,
+        )?;
+        return Ok(Sent::Http(report));
+    }
     if ready.info.push {
         match send_push::try_push(
             &ready.client,
@@ -246,12 +289,14 @@ pub fn send(base: &str, drop: Drop, device: &Device, observer: &mut dyn Observer
             Outcome::Unreachable => {}
         }
     }
-    let report = send_http::send(
+    let report = send_http::send_with_session(
         &ready.client,
         &ready.token,
         ready.password.as_deref(),
         &ready.prepared,
         observer,
+        None,
+        &mut on_http_begin,
     )?;
     Ok(Sent::Http(report))
 }
@@ -271,4 +316,40 @@ pub fn send_http(base: &str, drop: Drop, observer: &mut dyn Observer) -> Result<
         &ready.prepared,
         observer,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_saved_http_metadata_is_rejected_before_prepare() {
+        let device_dir = tempfile::tempdir().unwrap();
+        let device = Device::load_or_create_in(device_dir.path()).unwrap();
+        let mut observer = crate::progress::Silent;
+        for (session, chunk_bytes) in [
+            ("not-a-session", 65536),
+            ("0123456789abcdef0123456789abcdef", 0),
+            ("0123456789abcdef0123456789abcdef", 8 * 1024 * 1024 + 1),
+        ] {
+            let result = send_with_session(
+                "http://127.0.0.1:1",
+                Drop {
+                    token: "token".to_owned(),
+                    password: None,
+                    files: Vec::new(),
+                },
+                &device,
+                &mut observer,
+                Some(HttpResume {
+                    session,
+                    chunk_bytes,
+                    root: "root",
+                    length: 1,
+                }),
+                |_, _, _| Ok(true),
+            );
+            assert!(matches!(result, Err(Error::ResumeSessionInvalid)));
+        }
+    }
 }

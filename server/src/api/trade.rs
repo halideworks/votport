@@ -636,8 +636,9 @@ pub async fn rotate_remote(
         .as_str()
         .unwrap_or_default();
     let next = request.document.body["next"].as_str().unwrap_or_default();
+    let actor = format!("peer:{}", route.peer_key);
     app.store
-        .rotate_trade_credential(&route.id, old, next, true)
+        .rotate_trade_credential(&route.id, old, next, &actor)
         .map_err(invalid)?;
     Ok(private(app.signer.port_message(
         "rotated",
@@ -681,18 +682,11 @@ pub async fn rotate(
     let response = remote_json(&app, &route.address, "/api/port/rotate", Some(&request)).await?;
     verify_response(&app, &route, &request, &response, "rotated")?;
     app.store
-        .rotate_trade_credential(&id, &old, &next, false)
+        .rotate_trade_credential(&id, &old, &next, &actor.subject)
         .map_err(invalid)?;
     app.store
         .clear_trade_rotation(&id, &next)
         .map_err(store_unavailable)?;
-    app.store.audit(
-        &actor.tenant,
-        &actor.subject,
-        "trade_credential_rotated",
-        &id,
-        &json!({"peer":route.peer_key}),
-    );
     Ok(private(json!({"ok":true})))
 }
 
@@ -932,5 +926,97 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), status);
         }
+    }
+
+    #[tokio::test]
+    async fn remote_rotation_replay_mirrors_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = crate::api::testing::build(directory.path());
+        let sender_directory = tempfile::tempdir().unwrap();
+        let sender =
+            crate::receipt::ReceiptSigner::load_or_create(sender_directory.path()).unwrap();
+        let route = TradeRoute {
+            id: crate::auth::random_token(),
+            revision: 1,
+            tenant: String::new(),
+            direction: "incoming".into(),
+            name: "Sender".into(),
+            peer_name: "Sender".into(),
+            peer_key: sender.public_hex.clone(),
+            address: String::new(),
+            endpoint: "endpoint".into(),
+            endpoint_name: "Endpoint".into(),
+            category: "external".into(),
+            forwarding: false,
+            metadata_keys: vec![],
+            state: "active".into(),
+            notifications: crate::store::NotificationPolicy::default(),
+            last_contact: Some(crate::store::now_unix()),
+            error: None,
+            remote_grant: String::new(),
+            remote_state: String::new(),
+            cancel_active: false,
+        };
+        let old = crate::auth::random_token();
+        let next = crate::auth::random_token();
+        application
+            .store
+            .with(|connection| {
+                connection.execute(
+                    "INSERT INTO trade_routes(id,tenant,direction,peer_key,endpoint,document,credential) VALUES (?1,'','incoming',?2,?3,?4,?5)",
+                    rusqlite::params![
+                        route.id,
+                        route.peer_key,
+                        route.endpoint,
+                        serde_json::to_string(&route).unwrap(),
+                        crate::store::trade_secret_hash(&old),
+                    ],
+                )
+            })
+            .unwrap();
+        let request = sender.port_message(
+            "rotate",
+            &application.signer.public_hex,
+            crate::auth::random_token(),
+            now() + 300,
+            json!({"grant":route.id,"credential":old,"next":next}),
+        );
+        let router = crate::app::router(application.clone());
+        for _ in 0..2 {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::post("/api/port/rotate")
+                        .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
+                        .header("x-votport", "1")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let events = application.store.delivery_events("", 0, 100).unwrap();
+        let rotated = events
+            .iter()
+            .filter(|event| event.kind == "trade_credential_rotated")
+            .collect::<Vec<_>>();
+        assert_eq!(rotated.len(), 1);
+        assert!(rotated[0].verify());
+        let audits = application.store.audit_export(Some(""), 0, 0, 100).unwrap();
+        let mirrored = audits
+            .iter()
+            .filter(|row| row.event == "trade_credential_rotated")
+            .collect::<Vec<_>>();
+        assert_eq!(mirrored.len(), 1);
+        assert_eq!(mirrored[0].actor, format!("peer:{}", sender.public_hex));
+        assert_eq!(mirrored[0].detail["delivery_event_id"], rotated[0].id);
+        assert_eq!(mirrored[0].detail["summary"]["route"], route.id);
+        assert_eq!(mirrored[0].detail["summary"]["direction"], "incoming");
+        assert_eq!(mirrored[0].detail["summary"]["peer_id"], sender.public_hex);
+        let text = serde_json::to_string(&mirrored[0]).unwrap();
+        assert!(!text.contains(&old));
+        assert!(!text.contains(&next));
     }
 }

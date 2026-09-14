@@ -5269,6 +5269,19 @@ mod tenant_authz_tests {
                 "{denied} must refuse the auditor role"
             );
         }
+        for denied in ["/api/workflows/events", "/api/workflows/events/export"] {
+            let response = app::router(application.clone())
+                .oneshot(
+                    Request::get(denied)
+                        .header("cookie", cookie.clone())
+                        .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{denied}");
+        }
         // Platform routes already demand the admin role.
         assert_eq!(
             get("/api/admin/holdings").await.status(),
@@ -5287,6 +5300,65 @@ mod tenant_authz_tests {
             .await
             .unwrap();
         assert_eq!(write.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn workflow_project_mutation_is_mirrored_for_platform_auditor() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let project = crate::workflow::tests::project();
+        let admin_cookie =
+            super::test_admin_cookie(&application, &auth::AdminIdentity::local_admin());
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::put("/api/workflows/projects")
+                    .header("cookie", admin_cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&project).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let signed = application
+            .store
+            .delivery_events("", 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "project_policy_changed")
+            .expect("project mutation must append its signed control event");
+        assert!(signed.verify());
+
+        let cookie = cookie_for(&application, "", "auditor");
+        let response = app::router(application)
+            .oneshot(
+                Request::get("/api/admin/audit?event=project_policy_changed")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.lines().any(|line| {
+                let row: serde_json::Value = serde_json::from_str(line).unwrap();
+                row["event"] == "project_policy_changed"
+                    && row["tenant"] == ""
+                    && row["subject"] == ""
+                    && row["detail"]["delivery_event_id"] == signed.id
+                    && row["detail"]["delivery_event_hash"] == signed.hash
+                    && row["detail"]["delivery_event_issuer"] == signed.issuer
+                    && row["detail"]["summary"]["project_id"] == project.id
+            }),
+            "signed project event was not mirrored into the auditor JSONL export: {text:?}"
+        );
     }
 
     #[tokio::test]

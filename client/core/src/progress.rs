@@ -77,6 +77,12 @@ pub trait Observer {
     fn cancelled(&self) -> bool {
         false
     }
+
+    /// Whether cancellation is a user pause whose resumable session should be
+    /// retained. Other cancellation is terminal and may be aborted.
+    fn paused(&self) -> bool {
+        false
+    }
 }
 
 /// Runs `work` with a vot-cli progress callback and forwards every report to

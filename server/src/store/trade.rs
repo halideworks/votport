@@ -515,17 +515,65 @@ impl Store {
         id: &str,
         previous: &str,
         next: &str,
-        incoming: bool,
+        actor: &str,
     ) -> Result<(), String> {
         if next.len() != 32 || !next.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("invalid credential".into());
         }
-        let (previous, next) = if incoming {
-            (trade_secret_hash(previous), trade_secret_hash(next))
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+        let (tenant, direction, peer_key, current): (String, String, String, String) = tx
+            .query_row(
+                "SELECT tenant,direction,peer_key,credential FROM trade_routes WHERE id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        let incoming = direction == "incoming";
+        let previous = if incoming {
+            trade_secret_hash(previous)
         } else {
-            (previous.into(), next.into())
+            previous.to_owned()
         };
-        self.with(|c|c.execute("UPDATE trade_routes SET credential=?3 WHERE id=?1 AND (credential=?2 OR credential=?3)",params![id,previous,next])).and_then(|n|if n==1 {Ok(())}else{Err("credential changed; retry with current credentials".into())})
+        let next = if incoming {
+            trade_secret_hash(next)
+        } else {
+            next.to_owned()
+        };
+        if current == next {
+            return Ok(());
+        }
+        if current != previous {
+            return Err("credential changed; retry with current credentials".into());
+        }
+        let updated = tx
+            .execute(
+                "UPDATE trade_routes SET credential=?2 WHERE id=?1 AND credential=?3",
+                params![id, next, previous],
+            )
+            .map_err(|e| e.to_string())?;
+        if updated != 1 {
+            return Err("credential changed; retry with current credentials".into());
+        }
+        let mut payload = serde_json::json!({
+            "actor": actor,
+            "route": id,
+            "direction": direction,
+        });
+        if valid_peer_key(&peer_key) {
+            payload["peer_id"] = serde_json::Value::String(peer_key);
+        }
+        evidence::delivery_event(
+            &tx,
+            &self.event_signer,
+            &tenant,
+            "",
+            "trade_credential_rotated",
+            &payload,
+            now_unix(),
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
     }
 }
 
@@ -1158,12 +1206,88 @@ mod tests {
             )
             .is_err());
         let next = crate::auth::random_token();
+        let actor = format!("peer:{}", sender.public_hex);
+        let before_rotation_events = store.delivery_events("", 0, 100).unwrap();
+        let before_rotation_audit = store.audit_export(Some(""), 0, 0, 100).unwrap();
         store
-            .rotate_trade_credential(&active.id, &credential, &next, true)
+            .rotate_trade_credential(&active.id, &credential, &next, &actor)
             .unwrap();
+        let after_rotation_events = store.delivery_events("", 0, 100).unwrap();
+        assert_eq!(
+            after_rotation_events
+                .iter()
+                .filter(|event| event.kind == "trade_credential_rotated")
+                .count(),
+            before_rotation_events
+                .iter()
+                .filter(|event| event.kind == "trade_credential_rotated")
+                .count()
+                + 1
+        );
+        let after_rotation_audit = store.audit_export(Some(""), 0, 0, 100).unwrap();
+        assert_eq!(
+            after_rotation_audit
+                .iter()
+                .filter(|row| row.event == "trade_credential_rotated")
+                .count(),
+            before_rotation_audit
+                .iter()
+                .filter(|row| row.event == "trade_credential_rotated")
+                .count()
+                + 1
+        );
+        let rotated = after_rotation_events
+            .iter()
+            .find(|event| event.kind == "trade_credential_rotated")
+            .unwrap();
+        let rotated_audit = after_rotation_audit
+            .iter()
+            .find(|row| row.event == "trade_credential_rotated")
+            .unwrap();
+        assert_eq!(rotated_audit.actor, actor);
+        assert_eq!(rotated_audit.detail["summary"]["route"], active.id);
+        assert_eq!(rotated_audit.detail["summary"]["direction"], "incoming");
+        assert_eq!(
+            rotated_audit.detail["summary"]["peer_id"],
+            sender.public_hex
+        );
+        assert_eq!(rotated_audit.detail["delivery_event_id"], rotated.id);
+        let rotation_text = serde_json::to_string(&rotated).unwrap();
+        assert!(!rotation_text.contains(&credential));
+        assert!(!rotation_text.contains(&next));
+        let audit_text = serde_json::to_string(&rotated_audit).unwrap();
+        assert!(!audit_text.contains(&credential));
+        assert!(!audit_text.contains(&next));
         store
-            .rotate_trade_credential(&active.id, &credential, &next, true)
+            .rotate_trade_credential(&active.id, &credential, &next, &actor)
             .unwrap();
+        assert_eq!(
+            store
+                .delivery_events("", 0, 100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "trade_credential_rotated")
+                .count(),
+            after_rotation_events
+                .iter()
+                .filter(|event| event.kind == "trade_credential_rotated")
+                .count()
+        );
+        store
+            .rotate_trade_credential(&active.id, &next, &next, &actor)
+            .unwrap();
+        assert_eq!(
+            store
+                .audit_export(Some(""), 0, 0, 100)
+                .unwrap()
+                .iter()
+                .filter(|row| row.event == "trade_credential_rotated")
+                .count(),
+            after_rotation_audit
+                .iter()
+                .filter(|row| row.event == "trade_credential_rotated")
+                .count()
+        );
         assert!(store.authenticate_trade(&status, "status").is_err());
         let rotation = sender.port_message(
             "rotate",
@@ -1173,6 +1297,73 @@ mod tests {
             serde_json::json!({"grant":active.id,"credential":credential,"next":next}),
         );
         assert!(store.authenticate_trade(&rotation, "rotate").is_ok());
+        let next_rotation = crate::auth::random_token();
+        store
+            .with(|connection| connection.execute_batch(
+                "CREATE TEMP TRIGGER reject_trade_rotation_audit BEFORE INSERT ON audit_log BEGIN SELECT RAISE(FAIL,'trade rotation audit fixture'); END;",
+            ))
+            .unwrap();
+        assert!(store
+            .rotate_trade_credential(&active.id, &next, &next_rotation, &actor)
+            .is_err());
+        assert_eq!(
+            store
+                .with(|connection| connection.query_row(
+                    "SELECT credential FROM trade_routes WHERE id=?1",
+                    [&active.id],
+                    |row| row.get::<_, String>(0),
+                ))
+                .unwrap(),
+            trade_secret_hash(&next)
+        );
+        store
+            .with(|connection| connection.execute_batch("DROP TRIGGER reject_trade_rotation_audit"))
+            .unwrap();
+        store
+            .rotate_trade_credential(&active.id, &next, &next_rotation, &actor)
+            .unwrap();
+        let final_events = store.delivery_events("", 0, 100).unwrap();
+        assert_eq!(
+            final_events
+                .iter()
+                .filter(|event| event.kind == "trade_credential_rotated")
+                .count(),
+            before_rotation_events
+                .iter()
+                .filter(|event| event.kind == "trade_credential_rotated")
+                .count()
+                + 2
+        );
+        let final_audits = store.audit_export(Some(""), 0, 0, 100).unwrap();
+        assert_eq!(
+            final_audits
+                .iter()
+                .filter(|row| row.event == "trade_credential_rotated")
+                .count(),
+            before_rotation_audit
+                .iter()
+                .filter(|row| row.event == "trade_credential_rotated")
+                .count()
+                + 2
+        );
+        let latest_event = final_events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "trade_credential_rotated")
+            .unwrap();
+        let latest_audit = final_audits
+            .iter()
+            .rev()
+            .find(|row| row.event == "trade_credential_rotated")
+            .unwrap();
+        assert!(latest_event.verify());
+        assert_eq!(latest_audit.detail["delivery_event_id"], latest_event.id);
+        assert!(!serde_json::to_string(latest_event)
+            .unwrap()
+            .contains(&next_rotation));
+        assert!(!serde_json::to_string(latest_audit)
+            .unwrap()
+            .contains(&next_rotation));
         let (expired, secret) = store
             .create_trade_invitation("", &endpoint.id, &sender.public_hex, now_unix() + 100)
             .unwrap();

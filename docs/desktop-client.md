@@ -119,6 +119,12 @@ Chunk and finish restarts share that budget, even when chunks are accepted.
 Exhaustion returns an error through the existing retry flow; cancellation stops
 before another begin request. Normal recovery still uses the verified prefix.
 
+Journalled HTTP sends save the session ID and package identity after the first
+successful begin. Pause and retryable failures keep that session; Resume rehashes
+the selected files and reconnects to its verified prefix. An expired session or
+changed package requires an explicit fresh retry. Direct CLI `send` remains
+unjournalled; app sends and watch-folder sends use the journal.
+
 Native push retries retain complete receiver objects until the configured session
 idle timeout (30 minutes by default). The same device, request link, and package
 can reuse them after reconnecting or restarting the server, including after the

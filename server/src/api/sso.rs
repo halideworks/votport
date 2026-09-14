@@ -1981,7 +1981,19 @@ mod tests {
     fn blocked_sign_in_is_not_audited_as_sso_login() {
         let (_directory, store) = test_store();
         store
-            .upsert_sso_principal("user@example.com", &[], &json!([]))
+            .upsert_sso_principal(
+                "user@example.com",
+                &["before".to_owned()],
+                &json!([{"tenant":"before","role":"viewer"}]),
+            )
+            .unwrap();
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE principals SET last_login_at = 123 WHERE subject = ?1",
+                    ["user@example.com"],
+                )
+            })
             .unwrap();
         store.revoke_principal("user@example.com").unwrap();
         let error = finish_sso_login(&store, "user@example.com", "admin".to_owned(), &[], false)
@@ -1989,6 +2001,13 @@ mod tests {
         assert_eq!(error, "this account is blocked");
         assert_eq!(sso_error_code(error), "account_blocked");
         assert!(sso_login_events(&store).is_empty());
+        let blocked = store.principal("user@example.com").unwrap().unwrap();
+        assert_eq!(blocked.last_login_at, 123);
+        assert_eq!(blocked.last_groups, vec!["before"]);
+        assert_eq!(
+            blocked.last_grants,
+            json!([{"tenant":"before","role":"viewer"}])
+        );
         let issued =
             finish_sso_login(&store, "ok@example.com", "viewer".to_owned(), &[], false).unwrap();
         assert_eq!(issued.subject, "ok@example.com");

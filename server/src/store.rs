@@ -2430,6 +2430,7 @@ impl Store {
     }
 
     /// Inserts or refreshes last-login fields without resetting version or block.
+    /// Blocked principals retain their previous login fields and are returned.
     pub fn upsert_sso_principal(
         &self,
         subject: &str,
@@ -2444,9 +2445,12 @@ impl Store {
                 "INSERT INTO principals (subject, last_login_at, last_groups, last_grants, source, created_at)
                  VALUES (?1, ?2, ?3, ?4, 'sso', ?2)
                  ON CONFLICT(subject) DO UPDATE SET
-                    last_login_at = excluded.last_login_at,
-                    last_groups = excluded.last_groups,
-                    last_grants = excluded.last_grants
+                    last_login_at = CASE WHEN blocked = 0
+                                         THEN excluded.last_login_at ELSE last_login_at END,
+                    last_groups = CASE WHEN blocked = 0
+                                       THEN excluded.last_groups ELSE last_groups END,
+                    last_grants = CASE WHEN blocked = 0
+                                       THEN excluded.last_grants ELSE last_grants END
                  RETURNING subject, credential_version, blocked, last_login_at,
                            last_groups, last_grants, source, external_id, created_at",
                 rusqlite::params![subject, at, groups_json, grants_json],
@@ -4680,6 +4684,7 @@ fn parse_json<T: DeserializeOwned>(text: &str, column: usize) -> rusqlite::Resul
 
 fn insert_audit_row(
     connection: &Connection,
+    at: u64,
     tenant: &str,
     actor: &str,
     event: &str,
@@ -4692,7 +4697,7 @@ fn insert_audit_row(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?
         .execute(rusqlite::params![
-            i64::try_from(now_unix()).unwrap_or(0),
+            i64::try_from(at).unwrap_or(0),
             tenant,
             actor,
             event,
@@ -4712,9 +4717,17 @@ impl Store {
         subject: &str,
         detail: &serde_json::Value,
     ) {
-        if let Err(error) = self
-            .with(|connection| insert_audit_row(connection, tenant, actor, event, subject, detail))
-        {
+        if let Err(error) = self.with(|connection| {
+            insert_audit_row(
+                connection,
+                now_unix(),
+                tenant,
+                actor,
+                event,
+                subject,
+                detail,
+            )
+        }) {
             // Best-effort by design: the tracing event above each call site
             // still records the action. The counter lets operators alert on
             // the divergence between the log and the exportable trail.
@@ -4746,6 +4759,7 @@ impl Store {
         }
         insert_audit_row(
             &transaction,
+            now_unix(),
             tenant,
             actor,
             "link_legal_hold_changed",
@@ -9393,12 +9407,37 @@ mod principals_store_tests {
         assert!(store.principal_allows("missing", 1));
         assert!(!store.principal_allows("missing", 2));
 
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE principals SET last_login_at = 123 WHERE subject = ?1",
+                    ["user@example.com"],
+                )
+            })
+            .unwrap();
+
         assert!(store.revoke_principal("user@example.com").unwrap());
         let revoked = store.principal("user@example.com").unwrap().unwrap();
         assert_eq!(revoked.credential_version, 2);
         assert!(revoked.blocked);
+        assert_eq!(revoked.last_login_at, 123);
+        assert_eq!(revoked.last_groups, vec!["employees".to_owned()]);
+        assert_eq!(revoked.last_grants, grants);
         assert!(!store.principal_allows("user@example.com", 1));
         assert!(!store.principal_allows("user@example.com", 2));
+
+        let blocked_upsert = store
+            .upsert_sso_principal(
+                "user@example.com",
+                &["after".to_owned()],
+                &serde_json::json!([{"tenant":"after","role":"viewer"}]),
+            )
+            .unwrap();
+        assert_eq!(blocked_upsert.credential_version, 2);
+        assert!(blocked_upsert.blocked);
+        assert_eq!(blocked_upsert.last_login_at, 123);
+        assert_eq!(blocked_upsert.last_groups, vec!["employees".to_owned()]);
+        assert_eq!(blocked_upsert.last_grants, grants);
 
         assert!(store.unblock_principal("user@example.com").unwrap());
         let unblocked = store.principal("user@example.com").unwrap().unwrap();
@@ -9408,6 +9447,25 @@ mod principals_store_tests {
         assert!(!store.principal_allows("user@example.com", 1));
         assert!(!store.revoke_principal("missing").unwrap());
         assert!(!store.unblock_principal("missing").unwrap());
+
+        let refreshed = store
+            .upsert_sso_principal(
+                "user@example.com",
+                &["after-unblock".to_owned()],
+                &serde_json::json!([{"tenant":"after-unblock","role":"editor"}]),
+            )
+            .unwrap();
+        assert_eq!(refreshed.credential_version, unblocked.credential_version);
+        assert!(!refreshed.blocked);
+        assert!(refreshed.last_login_at > 123);
+        assert_eq!(refreshed.last_groups, vec!["after-unblock".to_owned()]);
+        assert_eq!(
+            refreshed.last_grants,
+            serde_json::json!([{"tenant":"after-unblock","role":"editor"}])
+        );
+        assert_eq!(refreshed.source, unblocked.source);
+        assert_eq!(refreshed.external_id, unblocked.external_id);
+        assert_eq!(refreshed.created_at, unblocked.created_at);
 
         store
             .with(|connection| {

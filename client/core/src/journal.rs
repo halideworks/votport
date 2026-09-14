@@ -2,8 +2,9 @@
 //! directory, written when a transfer starts and removed when it ends well,
 //! so a transfer that was cut by a quit, a crash, or a failure is still there
 //! at the next launch for a shell to offer again. It holds what is needed to
-//! start the transfer over (the link, the paths or the destination) and never
-//! the password.
+//! start the transfer over (the link, the paths or the destination), plus a
+//! resumable HTTP session when one has reached its manifest boundary, and
+//! never the password.
 //!
 //! ponytail: a directory of JSON files, not SQLite; one file per transfer is
 //! the whole schema, and a pre-release app has no migrations to carry.
@@ -34,8 +35,21 @@ pub struct Entry {
     /// does not keep, so a resume must ask for it again.
     #[serde(default)]
     pub needs_password: bool,
+    /// The HTTP upload session that a paused or retryable send can resume.
+    /// Older journal entries have no session and start a fresh send.
+    #[serde(default)]
+    pub http: Option<HttpResume>,
     /// Seconds since the Unix epoch when the transfer started.
     pub started_unix: u64,
+}
+
+/// The server identity and package authority for a resumable HTTP send.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct HttpResume {
+    pub session: String,
+    pub chunk_bytes: u64,
+    pub root: String,
+    pub length: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
@@ -85,6 +99,7 @@ pub fn record(
         paths: paths.into_iter().map(|path| absolute(&path)).collect(),
         dest: dest.map(|dest| absolute(&dest)),
         needs_password,
+        http: None,
         started_unix,
     };
     let _ = write_in(&dir(), &entry);
@@ -109,6 +124,25 @@ pub fn mark_needs_password(id: &str) {
     }
 }
 
+/// Records the server session after its first successful `begin`. Unlike the
+/// initial journal write, this boundary is required for a resumable send, so
+/// a write failure is returned to the caller.
+pub fn mark_http(id: &str, http: HttpResume) -> Result<()> {
+    let dir = dir();
+    let mut entry = get_in(&dir, id)?;
+    entry.http = Some(http);
+    write_in(&dir, &entry)
+}
+
+/// Removes a stale HTTP session association while retaining the journalled
+/// paths for an explicit retry from a fresh session.
+pub fn clear_http(id: &str) -> Result<()> {
+    let dir = dir();
+    let mut entry = get_in(&dir, id)?;
+    entry.http = None;
+    write_in(&dir, &entry)
+}
+
 fn protect_directory(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -129,11 +163,14 @@ fn write_in(dir: &std::path::Path, entry: &Entry) -> Result<()> {
 }
 
 /// Forgets the pending send entries that name exactly `path`: a watch drop
-/// shipping afresh after a cut send has nothing to resume.
-pub(crate) fn forget_send_of(path: &str) {
+/// shipping afresh after a cut send has nothing to resume. The callback runs
+/// before each entry is removed, so an owner can release any server session
+/// without racing the journal deletion.
+pub(crate) fn forget_send_of(path: &str, mut before_forget: impl FnMut(&Entry)) {
     let path = absolute(path);
     for entry in pending() {
         if entry.kind == Kind::Send && entry.paths == [path.clone()] {
+            before_forget(&entry);
             forget(&entry.id);
         }
     }
@@ -199,6 +236,7 @@ mod tests {
             paths: Vec::new(),
             dest: Some("/tmp/landed".into()),
             needs_password: true,
+            http: None,
             started_unix: 1,
         };
         let second = Entry {
@@ -208,6 +246,7 @@ mod tests {
             paths: vec!["/shots".into()],
             dest: None,
             needs_password: false,
+            http: None,
             started_unix: 2,
         };
         fs::create_dir_all(&dir).unwrap();
