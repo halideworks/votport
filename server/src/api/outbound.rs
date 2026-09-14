@@ -65,12 +65,17 @@ const OUTBOUND_UPLOAD_ID: &str = "x-votport-upload-id";
 const MAX_OUTBOUND_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_LIBRARY_DIRECTORY_INPUT_BYTES: usize = 1024;
 const MAX_LIBRARY_DIRECTORY_ENTRIES: usize = 1000;
-const MAX_LIBRARY_SELECTION_FILES: usize = 1_000_000;
 const MAX_LIBRARY_PROJECT_FILES: usize = 1_000_000;
+const MAX_LIBRARY_SELECTION_FILES: usize = 100_000;
+const MAX_LIBRARY_PATHS_FILES: usize = 1_000_000;
 const OUTBOUND_GRANT_PREVIEW_FILES: usize = 64;
 pub const MAX_GRANT_REQUEST_BYTES: usize = 256 * 1024 * 1024;
 const MAX_LIBRARY_SEARCH_CHARS: usize = 100;
 const MAX_LIBRARY_SEARCH_RESULTS: usize = 200;
+// ponytail: bounded at 100,000 entries and 128 levels per query; add a search
+// cursor if larger libraries need full coverage.
+const MAX_LIBRARY_SEARCH_NODES: usize = 100_000;
+const MAX_LIBRARY_SEARCH_DEPTH: usize = 128;
 const RETAINED_LIBRARY_SEARCH_RESULTS: usize = MAX_LIBRARY_SEARCH_RESULTS + 1;
 const LIBRARY_HASH_CONCURRENCY: usize = 4;
 pub(crate) const LIBRARY_GRANT_CONCURRENCY: usize = 4;
@@ -79,6 +84,21 @@ const ZIP_LOCAL_HEADER_BYTES: u64 = 30;
 const ZIP_CENTRAL_HEADER_BYTES: u64 = 46;
 const ZIP_ENTRY_EXTRA_BYTES: u64 = 64;
 const ZIP_END_BYTES: u64 = 98;
+
+// ponytail: one JSON response; reuse the search budget and refuse over-limit
+// folders instead of returning partial data. Add a cursor for full coverage.
+#[derive(Clone, Copy)]
+struct LibraryEnumerationBudget {
+    max_entries: usize,
+    max_depth: usize,
+    max_path_bytes: usize,
+}
+
+const LIBRARY_SELECTION_BUDGET: LibraryEnumerationBudget = LibraryEnumerationBudget {
+    max_entries: MAX_LIBRARY_SEARCH_NODES,
+    max_depth: MAX_LIBRARY_SEARCH_DEPTH,
+    max_path_bytes: 16 * 1024 * 1024,
+};
 
 // ponytail: one tiny global critical section; use per-tenant locks only if contention is measured.
 static LIBRARY_MUTATION_LOCK: Mutex<()> = Mutex::new(());
@@ -1128,11 +1148,21 @@ fn search_library_dir(
     directory: &Path,
     query: &str,
     matches: &mut BinaryHeap<(String, String, u64)>,
-) {
+    visited: &mut usize,
+    max_nodes: usize,
+    depth: usize,
+) -> bool {
     let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
+        return true;
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        if *visited >= max_nodes {
+            return true;
+        }
+        *visited += 1;
+        let Ok(entry) = entry else {
+            continue;
+        };
         let name = entry.file_name();
         if is_private_library_name(&name) {
             continue;
@@ -1152,7 +1182,11 @@ fn search_library_dir(
             continue;
         }
         if meta.file_type().is_dir() {
-            search_library_dir(root, &path, query, matches);
+            if depth >= MAX_LIBRARY_SEARCH_DEPTH
+                || search_library_dir(root, &path, query, matches, visited, max_nodes, depth + 1)
+            {
+                return true;
+            }
         } else if meta.file_type().is_file() {
             let Some(relative) = path.strip_prefix(root).ok() else {
                 continue;
@@ -1168,15 +1202,26 @@ fn search_library_dir(
             }
         }
     }
+    false
 }
 
 fn list_library_search(root: &Path, query: &str) -> (Vec<serde_json::Value>, bool) {
+    list_library_search_with_budget(root, query, MAX_LIBRARY_SEARCH_NODES)
+}
+
+fn list_library_search_with_budget(
+    root: &Path,
+    query: &str,
+    max_nodes: usize,
+) -> (Vec<serde_json::Value>, bool) {
     if !library_root_safe(root) {
         return (Vec::new(), false);
     }
     let mut matches = BinaryHeap::new();
-    search_library_dir(root, root, query, &mut matches);
-    let truncated = matches.len() > MAX_LIBRARY_SEARCH_RESULTS;
+    let mut visited = 0;
+    let budget_exhausted =
+        search_library_dir(root, root, query, &mut matches, &mut visited, max_nodes, 0);
+    let truncated = budget_exhausted || matches.len() > MAX_LIBRARY_SEARCH_RESULTS;
     let mut matches = matches.into_sorted_vec();
     matches.truncate(MAX_LIBRARY_SEARCH_RESULTS);
     (
@@ -1189,14 +1234,26 @@ fn list_library_search(root: &Path, query: &str) -> (Vec<serde_json::Value>, boo
 }
 
 fn enumerate_library_selection(root: &Path, directory: &Path) -> ApiResult<Vec<serde_json::Value>> {
-    enumerate_automation_files(root, directory, MAX_LIBRARY_SELECTION_FILES)?
-        .into_iter()
-        .map(|relative| {
-            let path = root.join(&relative);
-            let metadata = std::fs::symlink_metadata(path).map_err(|_| ApiError::not_found())?;
-            Ok(json!({ "path": relative, "bytes": metadata.len() }))
-        })
-        .collect()
+    enumerate_automation_files_with_budget(
+        root,
+        directory,
+        MAX_LIBRARY_SELECTION_FILES,
+        Some(LIBRARY_SELECTION_BUDGET),
+    )?
+    .into_iter()
+    .map(|relative| {
+        let path = root.join(&relative);
+        let metadata = std::fs::symlink_metadata(path).map_err(|_| ApiError::not_found())?;
+        Ok(json!({ "path": relative, "bytes": metadata.len() }))
+    })
+    .collect()
+}
+
+fn library_selection_limit_error() -> ApiError {
+    ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "library selection is too large; choose a narrower folder or select individual files",
+    )
 }
 
 fn library_components_safe(root: &Path, path: &Path) -> bool {
@@ -1620,7 +1677,7 @@ pub async fn create_outbound_grant(
             &headers,
             &identity,
             paths,
-            MAX_LIBRARY_SELECTION_FILES,
+            MAX_LIBRARY_PATHS_FILES,
             GrantOptions {
                 workflow: None,
                 automation: None,
@@ -1814,14 +1871,43 @@ fn enumerate_automation_files(
     directory: &Path,
     max_files: usize,
 ) -> ApiResult<Vec<String>> {
+    enumerate_automation_files_with_budget(root, directory, max_files, None)
+}
+
+fn enumerate_automation_files_with_budget(
+    root: &Path,
+    directory: &Path,
+    max_files: usize,
+    budget: Option<LibraryEnumerationBudget>,
+) -> ApiResult<Vec<String>> {
+    struct TraversalState {
+        entries_seen: usize,
+        path_bytes: usize,
+    }
+
     fn visit(
         root: &Path,
         directory: &Path,
         paths: &mut Vec<String>,
         max_files: usize,
+        budget: Option<LibraryEnumerationBudget>,
+        state: &mut TraversalState,
+        depth: usize,
     ) -> ApiResult<()> {
+        if budget.is_some_and(|budget| depth > budget.max_depth) {
+            return Err(library_selection_limit_error());
+        }
         let entries = std::fs::read_dir(directory).map_err(|_| ApiError::not_found())?;
         for entry in entries {
+            if let Some(budget) = budget {
+                state.entries_seen = state
+                    .entries_seen
+                    .checked_add(1)
+                    .ok_or_else(library_selection_limit_error)?;
+                if state.entries_seen > budget.max_entries {
+                    return Err(library_selection_limit_error());
+                }
+            }
             let entry = entry.map_err(|_| ApiError::not_found())?;
             if is_private_library_name(&entry.file_name()) {
                 continue;
@@ -1835,28 +1921,47 @@ fn enumerate_automation_files(
                 ));
             }
             if metadata.file_type().is_dir() {
-                visit(root, &path, paths, max_files)?;
+                visit(root, &path, paths, max_files, budget, state, depth + 1)?;
             } else if metadata.file_type().is_file() {
+                if paths.len() >= max_files {
+                    return Err(if budget.is_some() {
+                        library_selection_limit_error()
+                    } else {
+                        ApiError::new(
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            format!("directory contains too many files (maximum {max_files})"),
+                        )
+                    });
+                }
                 let relative = path
                     .strip_prefix(root)
                     .map_err(|_| ApiError::not_found())?
                     .to_str()
                     .ok_or_else(ApiError::not_found)?
                     .replace('\\', "/");
-                paths.push(relative);
-                if paths.len() > max_files {
-                    return Err(ApiError::new(
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        format!("directory contains too many files (maximum {max_files})"),
-                    ));
+                if let Some(budget) = budget {
+                    state.path_bytes = state
+                        .path_bytes
+                        .checked_add(relative.len())
+                        .ok_or_else(library_selection_limit_error)?;
+                    if state.path_bytes > budget.max_path_bytes {
+                        return Err(library_selection_limit_error());
+                    }
                 }
+                paths.push(relative);
             }
         }
         Ok(())
     }
 
     let mut paths = Vec::new();
-    visit(root, directory, &mut paths, max_files)?;
+    let mut state = TraversalState {
+        entries_seen: 0,
+        path_bytes: 0,
+    };
+    visit(
+        root, directory, &mut paths, max_files, budget, &mut state, 0,
+    )?;
     paths.sort();
     if paths.is_empty() {
         return Err(ApiError::new(
@@ -7796,6 +7901,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn library_search_stops_at_node_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("missed-match.bin"), b"x").unwrap();
+        let (matches, truncated) = list_library_search_with_budget(directory.path(), "match", 1);
+        assert!(matches.is_empty());
+        assert!(truncated);
+    }
+
+    #[test]
+    fn library_search_stops_at_depth_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut nested = directory.path().to_owned();
+        for index in 0..=MAX_LIBRARY_SEARCH_DEPTH {
+            nested.push(format!("nested-{index:03}"));
+            std::fs::create_dir(&nested).unwrap();
+        }
+        std::fs::write(nested.join("missed-match.bin"), b"x").unwrap();
+
+        let (matches, truncated) = list_library_search(directory.path(), "match");
+
+        assert!(matches.is_empty());
+        assert!(truncated);
+    }
+
+    #[test]
+    fn library_search_reports_missing_directory_as_truncated() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut matches = BinaryHeap::new();
+        let mut visited = 0;
+
+        assert!(search_library_dir(
+            directory.path(),
+            &directory.path().join("missing"),
+            "match",
+            &mut matches,
+            &mut visited,
+            1,
+            0,
+        ));
+    }
+
     #[tokio::test]
     async fn admin_directory_grant_supports_large_projects_and_public_metadata() {
         let (_directory, app, cookie, _bytes) = fixture().await;
@@ -8024,6 +8173,104 @@ mod tests {
             enumerate_automation_files(directory.path(), directory.path(), limit).unwrap_err();
         assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(error.message.contains(&format!("maximum {limit}")));
+    }
+
+    #[test]
+    fn library_selection_refuses_file_entry_depth_and_path_budgets() {
+        let boundary_root = tempfile::tempdir().unwrap();
+        std::fs::write(boundary_root.path().join("x"), b"x").unwrap();
+        let paths = enumerate_automation_files_with_budget(
+            boundary_root.path(),
+            boundary_root.path(),
+            1,
+            Some(LibraryEnumerationBudget {
+                max_entries: 1,
+                max_depth: 0,
+                max_path_bytes: 1,
+            }),
+        )
+        .unwrap();
+        assert_eq!(paths, vec!["x"]);
+
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..=3 {
+            std::fs::write(directory.path().join(format!("file-{index}.bin")), b"x").unwrap();
+        }
+        let error = enumerate_automation_files_with_budget(
+            directory.path(),
+            directory.path(),
+            3,
+            Some(LibraryEnumerationBudget {
+                max_entries: 10,
+                max_depth: 10,
+                max_path_bytes: 1000,
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.message,
+            "library selection is too large; choose a narrower folder or select individual files"
+        );
+
+        let nested = directory.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("nested.bin"), b"x").unwrap();
+        let error = enumerate_automation_files_with_budget(
+            directory.path(),
+            directory.path(),
+            10,
+            Some(LibraryEnumerationBudget {
+                max_entries: 1,
+                max_depth: 10,
+                max_path_bytes: 1000,
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.message,
+            "library selection is too large; choose a narrower folder or select individual files"
+        );
+
+        let depth_root = tempfile::tempdir().unwrap();
+        let mut deep = depth_root.path().to_owned();
+        for index in 0..=2 {
+            deep.push(format!("nested-{index}"));
+            std::fs::create_dir(&deep).unwrap();
+        }
+        std::fs::write(deep.join("deep.bin"), b"x").unwrap();
+        let error = enumerate_automation_files_with_budget(
+            depth_root.path(),
+            depth_root.path(),
+            10,
+            Some(LibraryEnumerationBudget {
+                max_entries: 10,
+                max_depth: 1,
+                max_path_bytes: 1000,
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.message,
+            "library selection is too large; choose a narrower folder or select individual files"
+        );
+
+        let path_root = tempfile::tempdir().unwrap();
+        std::fs::write(path_root.path().join("long-name.bin"), b"x").unwrap();
+        let error = enumerate_automation_files_with_budget(
+            path_root.path(),
+            path_root.path(),
+            10,
+            Some(LibraryEnumerationBudget {
+                max_entries: 10,
+                max_depth: 10,
+                max_path_bytes: 4,
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.message,
+            "library selection is too large; choose a narrower folder or select individual files"
+        );
     }
 
     #[tokio::test]

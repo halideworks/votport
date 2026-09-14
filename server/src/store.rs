@@ -2670,8 +2670,8 @@ impl Store {
         crate::paths::tighten_private_file(destination).map(|_| ())
     }
 
-    /// Every link across every tenant. Internal use only (retention sweeps,
-    /// metrics); administrative API reads stay tenant-scoped.
+    /// Every link across every tenant. Internal use only for complete scans;
+    /// administrative API reads stay tenant-scoped.
     pub fn all_links(&self) -> Result<Vec<Link>, String> {
         self.with(|connection| {
             let mut statement = connection.prepare(
@@ -2681,6 +2681,37 @@ impl Store {
             )?;
             let rows = statement.query_map([], |row| row_to_link_with_uploads(connection, row))?;
             rows.collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    /// Link identities for the retention sweep. The caller hydrates each link
+    /// separately so one pass never keeps every tenant's upload history alive.
+    pub(crate) fn retention_link_ids(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with(|connection| {
+            if let Some(after) = after {
+                let mut statement = connection.prepare_cached(
+                    "SELECT tenant, id FROM links
+                     WHERE id > ?1
+                     ORDER BY id LIMIT ?2",
+                )?;
+                let rows = statement.query_map(rusqlite::params![after, limit], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?;
+                rows.collect()
+            } else {
+                let mut statement = connection
+                    .prepare_cached("SELECT tenant, id FROM links ORDER BY id LIMIT ?1")?;
+                let rows = statement.query_map([limit], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                rows.collect()
+            }
         })
     }
 
@@ -7800,7 +7831,7 @@ mod tenant_tests {
 
 #[cfg(test)]
 mod ops_tests {
-    use super::tests::{test_link, test_tenant};
+    use super::tests::{link_in, test_link, test_tenant};
     use super::*;
 
     #[test]
@@ -7913,6 +7944,41 @@ mod ops_tests {
         scoped.tenant = "acme".to_owned();
         store.insert_link(scoped).unwrap();
         assert_eq!(store.all_links().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn retention_link_ids_page_is_bounded_and_spans_tenants() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.insert_link(test_link("a-link")).unwrap();
+        store.insert_link(test_link("b-link")).unwrap();
+        store.insert_tenant(test_tenant("acme")).unwrap();
+        store.insert_link(link_in("acme", "c-link")).unwrap();
+        store
+            .with(|connection| {
+                connection.execute("UPDATE links SET events_json = '{' WHERE id = 'a-link'", [])
+            })
+            .unwrap();
+
+        // The page reads identities only, so an unrelated malformed history
+        // does not make the bounded scan allocate or parse that history.
+        let first = store.retention_link_ids(None, 2).unwrap();
+        assert_eq!(
+            first,
+            vec![
+                (String::new(), "a-link".into()),
+                (String::new(), "b-link".into())
+            ]
+        );
+        let second = store
+            .retention_link_ids(Some(&first.last().unwrap().1), 2)
+            .unwrap();
+        assert_eq!(second, vec![("acme".into(), "c-link".into())]);
+        assert!(store
+            .retention_link_ids(Some(&second.last().unwrap().1), 2)
+            .unwrap()
+            .is_empty());
+        assert!(store.retention_link_ids(None, 0).unwrap().is_empty());
     }
 }
 

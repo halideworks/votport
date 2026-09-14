@@ -932,6 +932,40 @@ if (!(await selectedFolder.isChecked())) {
 if (!(await page.textContent("#library-selection-status")).startsWith(`${outboundFiles.length} files selected`)) {
   throw new Error("scoped library root selection status changed");
 }
+await selectedFolder.click();
+await page.getByRole("button", { name: `Open folder ${PROJECT}` }).click();
+await page.waitForFunction(
+  () => document.querySelectorAll("#library-files input[type=checkbox]").length === 12 &&
+    ![...document.querySelectorAll("#library-files input[type=checkbox]")].some((checkbox) => checkbox.checked) &&
+    document.getElementById("library-selection-status").textContent.startsWith("0 files selected"),
+  undefined,
+  { timeout: 15000 },
+);
+await page.locator("#library-files input[type=checkbox]").first().check();
+await page.getByRole("button", { name: "Library", exact: true }).click();
+await page.waitForSelector(`#library-files input[aria-label="Select folder ${PROJECT}"]`);
+const selectionError = "library selection is too large; choose a narrower folder or select individual files";
+await page.route("**/api/admin/outbound-files?selection=*", (route) => route.fulfill({
+  status: 422,
+  contentType: "application/json",
+  body: JSON.stringify({ error: selectionError }),
+}), { times: 1 });
+await selectedFolder.click();
+await page.locator("#library-selection-error").waitFor({ state: "visible" });
+if (await selectedFolder.isChecked() ||
+    !(await page.textContent("#library-selection-status")).startsWith("1 file selected") ||
+    await page.textContent("#library-selection-error") !== selectionError) {
+  throw new Error("an oversized folder refusal changed the existing selection");
+}
+await page.unroute("**/api/admin/outbound-files?selection=*");
+await selectedFolder.click();
+await page.waitForFunction(
+  () => document.getElementById("library-selection-status").textContent.startsWith("12 files selected") &&
+    document.querySelector('#library-files input[aria-label^="Select folder "]').checked,
+  undefined,
+  { timeout: 15000 },
+);
+console.log("oversized library selection refusal keeps existing files and remains retryable: ok");
 
 await page.fill("#deliver-project", FOLDER_PROJECT);
 await page.setInputFiles("#library-folder-input", folder);
@@ -954,6 +988,55 @@ await page.fill("#library-search", "");
 await page.waitForFunction(
   () => document.querySelector('#library-breadcrumbs [aria-current="page"]')?.textContent === "Library",
   { timeout: 15000 },
+);
+
+const incompleteSearchText = "Search incomplete. Refine your search or browse folders.";
+const noMatchSearchText = "No matching library files.";
+const searchFixturePath = `${FOLDER_PROJECT}/folder-pick/nested/folder-nested.txt`;
+const searchResponses = [
+  { files: [], truncated: true },
+  { files: [{ path: searchFixturePath, bytes: 25 }], truncated: true },
+  { files: [], truncated: false },
+];
+const searchRoute = "**/api/admin/outbound-files?q=*";
+await page.route(searchRoute, async (route) => {
+  const response = searchResponses.shift();
+  if (!response) throw new Error("unexpected extra library search request");
+  await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(response) });
+});
+try {
+  await page.fill("#library-search", "budget-zero");
+  await page.waitForFunction(
+    (text) => document.querySelector("#library-files")?.innerText === text,
+    incompleteSearchText,
+  );
+  if (await page.locator("#library-files").getByText(noMatchSearchText, { exact: true }).count()) {
+    throw new Error("truncated empty search claimed no matching files");
+  }
+
+  await page.fill("#library-search", "budget-one");
+  await page.waitForFunction(
+    ([expected, incomplete]) => document.querySelector("#library-files")?.innerText.includes(expected)
+      && document.querySelector("#library-files")?.innerText.includes(incomplete),
+    [searchFixturePath, incompleteSearchText],
+  );
+  const oneMatchText = await page.locator("#library-files").innerText();
+  if (oneMatchText.includes(noMatchSearchText)) throw new Error("truncated partial search claimed no matching files");
+
+  await page.fill("#library-search", "budget-done");
+  await page.getByText(noMatchSearchText, { exact: true }).waitFor();
+  if (await page.getByText(incompleteSearchText, { exact: true }).count()) {
+    throw new Error("completed empty search reported incomplete");
+  }
+} finally {
+  await page.unroute(searchRoute);
+}
+if (searchResponses.length) throw new Error(`library search fixtures unused: ${searchResponses.length}`);
+console.log("library search reports incomplete zero and partial results and completed no-match results: ok");
+await page.fill("#library-search", "");
+await page.waitForSelector(
+  `#library-files button[aria-label="Share folder ${FOLDER_PROJECT}"]`,
+  { state: "visible", timeout: 15000 },
 );
 
 await page.fill("#deliver-label", "browser outbound e2e");
