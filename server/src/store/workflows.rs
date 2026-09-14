@@ -8,8 +8,13 @@ CREATE TABLE IF NOT EXISTS delivery_policy_cache(grant_id TEXT PRIMARY KEY,prote
 CREATE TABLE IF NOT EXISTS delivery_storage(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,document TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS delivery_projects(tenant TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL, document TEXT NOT NULL, PRIMARY KEY(tenant,id));
 CREATE TABLE IF NOT EXISTS delivery_jobs(id TEXT PRIMARY KEY, tenant TEXT NOT NULL, actor TEXT NOT NULL, operation_id TEXT NOT NULL, project_id TEXT NOT NULL, state TEXT NOT NULL, owner TEXT NOT NULL DEFAULT '', not_before INTEGER NOT NULL, deadline INTEGER, escalated INTEGER NOT NULL DEFAULT 0, token TEXT NOT NULL, document TEXT NOT NULL, UNIQUE(tenant,actor,operation_id));
+";
+
+pub(super) const INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS delivery_jobs_ready ON delivery_jobs(state,not_before);
 CREATE INDEX IF NOT EXISTS delivery_jobs_tenant ON delivery_jobs(tenant,id);
+CREATE INDEX IF NOT EXISTS delivery_jobs_deadline_pending ON delivery_jobs(deadline) WHERE deadline IS NOT NULL AND escalated=0;
+CREATE INDEX IF NOT EXISTS delivery_jobs_retirement_due ON delivery_jobs(COALESCE(json_extract(document,'$.checks.retirement_attempt_at'),0),id) WHERE state IN ('retiring','failed','cancelled','ready','awaiting_approval');
 ";
 
 pub(super) fn ensure_tenant(connection: &Connection, tenant: &str) -> Result<(), String> {
@@ -408,7 +413,9 @@ impl Store {
         let mut connection = self.connection.lock().expect("store poisoned");
         let tx = connection.transaction().map_err(|e| e.to_string())?;
         let cutoff = now.saturating_sub(7 * 86400);
-        let job: Option<Job> = tx.query_row("SELECT j.document FROM delivery_jobs j LEFT JOIN outbound_grants g ON g.id=j.id WHERE j.state='retiring' OR (j.state IN ('failed','cancelled') AND CAST(json_extract(j.document,'$.updated_at') AS INTEGER)<=?1 AND (json_extract(j.document,'$.checks.released_at') IS NULL OR g.expires_at<=?1 OR g.revoked_at<=?1)) OR (j.state IN ('ready','awaiting_approval') AND (g.expires_at<=?1 OR g.revoked_at<=?1)) ORDER BY COALESCE(json_extract(j.document,'$.checks.retirement_attempt_at'),0),j.id LIMIT 1",[cutoff as i64],|row| decode(row.get(0)?)).optional().map_err(|e| e.to_string())?;
+        // ponytail: the partial index bounds this ordered scan to live
+        // candidates; split the eligibility OR only if measured rows need it.
+        let job: Option<Job> = tx.query_row("SELECT j.document FROM delivery_jobs j INDEXED BY delivery_jobs_retirement_due LEFT JOIN outbound_grants g ON g.id=j.id WHERE j.state IN ('retiring','failed','cancelled','ready','awaiting_approval') AND (j.state='retiring' OR (j.state IN ('failed','cancelled') AND CAST(json_extract(j.document,'$.updated_at') AS INTEGER)<=?1 AND (json_extract(j.document,'$.checks.released_at') IS NULL OR g.expires_at<=?1 OR g.revoked_at<=?1)) OR (j.state IN ('ready','awaiting_approval') AND (g.expires_at<=?1 OR g.revoked_at<=?1))) ORDER BY COALESCE(json_extract(j.document,'$.checks.retirement_attempt_at'),0),j.id LIMIT 1",[cutoff as i64],|row| decode(row.get(0)?)).optional().map_err(|e| e.to_string())?;
         let Some(mut job) = job else {
             return Ok(None);
         };
