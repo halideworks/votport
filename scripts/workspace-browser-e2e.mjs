@@ -461,15 +461,39 @@ try {
   await page.keyboard.press('Enter'); await undo.waitFor({ state: 'detached' });
   assert.ok(await clearRecord.isEnabled(), 'Undo re-enables a retained button when list refreshes fail');
   await fileCard.getByRole('button', { name: 'Files and timeline', exact: true }).click();
+  await page.locator('#timeline[open]').waitFor();
+  await page.locator('#timeline-files .upload-file').first().waitFor();
+  await page.evaluate(() => {
+    const timeline = document.querySelector('#timeline');
+    timeline.addEventListener('close', () => {
+      timeline.showModal();
+      window.__timelineStaleCloseReopened = true;
+    }, { capture: true, once: true });
+    timeline.addEventListener('close', () => { window.__timelineStaleCloseSeen = true; }, { once: true });
+  });
+  const timelineFilesBeforeStaleClose = await page.locator('#timeline-files .upload-file').count();
+  await page.click('#timeline-close');
+  await page.waitForFunction(() => window.__timelineStaleCloseSeen);
+  assert.ok(await page.locator('#timeline').evaluate((node) => node.open && window.__timelineStaleCloseReopened), 'A stale close must leave a reopened timeline open');
+  assert.equal(await page.locator('#timeline-files .upload-file').count(), timelineFilesBeforeStaleClose, 'A stale close must preserve loaded timeline files');
   const deleteFile = page.locator('#timeline-files').getByRole('button', { name: 'Delete file', exact: true }).first();
   await openAncestors(deleteFile); await deleteFile.focus(); await page.keyboard.press('Enter');
   await page.getByRole('dialog', { name: 'Delete file', exact: true }).waitFor();
   await page.locator('#confirm-ok').press('Enter');
   await page.waitForFunction(() => document.querySelector('#links-action-status').textContent.startsWith('Deleted "'));
   assert.ok(await page.locator('#timeline-range').evaluate((node) => node === document.activeElement), 'File deletion keeps focus inside the dialog');
-  await page.click('#timeline-close');
   const deleteFiles = fileCard.getByRole('button', { name: 'Delete stored files', exact: true });
-  await openAncestors(deleteFiles); await deleteFiles.focus(); await page.keyboard.press('Enter');
+  await openAncestors(deleteFiles);
+  const bulkHandle = await deleteFiles.elementHandle();
+  await page.evaluate((bulk) => {
+    const timeline = document.querySelector('#timeline');
+    timeline.addEventListener('close', () => bulk.focus(), { capture: true, once: true });
+    timeline.addEventListener('close', () => { window.__timelineCloseSeen = true; }, { once: true });
+  }, bulkHandle);
+  await page.click('#timeline-close');
+  await page.waitForFunction(() => window.__timelineCloseSeen);
+  assert.ok(await deleteFiles.evaluate((node) => node === document.activeElement), 'Native close preserves moved bulk focus');
+  await page.keyboard.press('Enter');
   await page.getByRole('dialog', { name: 'Delete stored files', exact: true }).waitFor();
   await page.locator('#confirm-ok').press('Enter');
   await page.getByText('Stored-file deletion completed.', { exact: true }).waitFor();

@@ -15,6 +15,7 @@ use vot_sdk::object::ObjectId;
 
 use crate::config::Config;
 
+pub mod conversion;
 mod evidence;
 mod notifications;
 mod received;

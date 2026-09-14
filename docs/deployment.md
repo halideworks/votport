@@ -535,6 +535,10 @@ derive these values from `receipt.key` or retain the old deterministic links.
 Use a matching binary for older archives, take fresh backups after conversion,
 and upgrade replicas together.
 
+The explicit `votport convert-schema35` command converts a disposable schema-35
+copy to schema 41 without starting the application. Follow the
+[offline conversion procedure](schema35-conversion.md); startup never runs it.
+
 The local platform password is break-glass for every namespace; named
 tenants have no separate password.
 

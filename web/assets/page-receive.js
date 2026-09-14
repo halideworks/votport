@@ -378,10 +378,13 @@ $('timeline-retry').addEventListener('click', () => refreshTimelineFiles(timelin
 $('timeline-previous').addEventListener('click', () => refreshTimelineFiles(Math.max(0, timelineSelection.offset - 100)));
 $('timeline-next').addEventListener('click', () => refreshTimelineFiles(timelineSelection.next));
 $('timeline').addEventListener('close', () => {
+  const dialog = $('timeline');
+  if (dialog.open) return;
+  const restoreFocus = dialog.contains(document.activeElement) || document.activeElement === document.body;
   const trigger = timelineSelection?.trigger;
   timelineSelection = null; timelineTicket++;
   $('timeline-files').replaceChildren();
-  (trigger?.isConnected ? trigger : $('links-action-status')).focus({ preventScroll: true });
+  if (restoreFocus) (trigger?.isConnected ? trigger : $('links-action-status')).focus({ preventScroll: true });
 });
 
 const historyPositions = new Map();
