@@ -609,7 +609,7 @@ pub async fn list_users(
         }
         None => app
             .store
-            .principals_page(count, start_index - 1, None)
+            .scim_principals_page(count, start_index - 1)
             .map_err(ScimError::store)?,
     };
     let resources: Vec<_> = rows.iter().map(|row| resource(&app, row)).collect();
@@ -710,7 +710,11 @@ fn patched_active(operation: &Value) -> ScimResult<Option<bool>> {
     if !(op.eq_ignore_ascii_case("replace") || op.eq_ignore_ascii_case("add")) {
         return Ok(None);
     }
-    let path = operation.get("path").and_then(Value::as_str);
+    let path = operation.get("path").and_then(Value::as_str).map(|path| {
+        path.strip_prefix(USER_SCHEMA)
+            .and_then(|path| path.strip_prefix(':'))
+            .unwrap_or(path)
+    });
     if path.is_some_and(|path| path.eq_ignore_ascii_case("userName")) {
         return Err(ScimError::mutability("userName cannot change"));
     }
@@ -1407,6 +1411,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_pages_remain_stable_when_login_changes_between_pages() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = build(directory.path());
+        for subject in ["a", "b", "c"] {
+            assert!(application
+                .store
+                .provision_principal(subject, None)
+                .unwrap());
+        }
+        application
+            .store
+            .with(|connection| connection.execute("UPDATE principals SET last_login_at = 0", []))
+            .unwrap();
+
+        let (status, first) = scim(
+            &application,
+            "GET",
+            "/scim/v2/Users?startIndex=1&count=2",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(first["Resources"][0]["userName"], "a");
+        assert_eq!(first["Resources"][1]["userName"], "b");
+
+        // A successful SSO update moves the later row ahead of the old page
+        // boundary when admin recency ordering is used.
+        application
+            .store
+            .upsert_sso_principal("c", &[], &json!([]))
+            .unwrap();
+        let (admin_page, _) = application.store.principals_page(2, 2, None).unwrap();
+        assert_eq!(
+            admin_page
+                .iter()
+                .map(|principal| principal.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["b"],
+            "the mutable recency order duplicates page-one data"
+        );
+
+        let (status, second) = scim(
+            &application,
+            "GET",
+            "/scim/v2/Users?startIndex=3&count=2",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(second["totalResults"], 3);
+        assert_eq!(second["Resources"].as_array().unwrap().len(), 1);
+        assert_eq!(second["Resources"][0]["userName"], "c");
+    }
+
+    #[tokio::test]
     async fn refuses_local_blank_and_renames() {
         let directory = tempfile::tempdir().unwrap();
         let application = build(directory.path());
@@ -1441,6 +1500,14 @@ mod tests {
             "PATCH",
             "/scim/v2/Users/ok",
             Some(r#"{"Operations":[{"op":"replace","path":"userName","value":"renamed"}]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = scim(
+            &application,
+            "PATCH",
+            "/scim/v2/Users/ok",
+            Some(r#"{"Operations":[{"op":"replace","path":"urn:ietf:params:scim:schemas:core:2.0:User:userName","value":"renamed"}]}"#),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1493,6 +1560,50 @@ mod tests {
         assert_eq!(json["active"], true);
         assert!(application.store.principal_allows("u@example.com", 2));
 
+        // RFC 7643 shape: the core User schema qualifies the attribute path.
+        let (status, json) = scim(
+            &application,
+            "PATCH",
+            "/scim/v2/Users/u@example.com",
+            Some(r#"{"Operations":[{"op":"replace","path":"urn:ietf:params:scim:schemas:core:2.0:User:active","value":false}]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["active"], false);
+        let row = application
+            .store
+            .principal("u@example.com")
+            .unwrap()
+            .unwrap();
+        assert!(row.blocked);
+        assert_eq!(row.credential_version, 3);
+        assert!(!application.store.principal_allows("u@example.com", 1));
+        assert!(!application.store.principal_allows("u@example.com", 2));
+
+        let (status, json) = scim(
+            &application,
+            "PATCH",
+            "/scim/v2/Users/u@example.com",
+            Some(r#"{"Operations":[{"op":"replace","path":"urn:ietf:params:scim:schemas:core:2.0:User:active","value":true}]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["active"], true);
+        assert!(application.store.principal_allows("u@example.com", 3));
+        assert!(!application.store.principal_allows("u@example.com", 2));
+
+        // A different URN is an unknown attribute and remains a no-op.
+        let (status, json) = scim(
+            &application,
+            "PATCH",
+            "/scim/v2/Users/u@example.com",
+            Some(r#"{"Operations":[{"op":"replace","path":"urn:example:active","value":false}]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["active"], true);
+        assert!(application.store.principal_allows("u@example.com", 3));
+
         // An operation on an attribute this server does not store is a no-op.
         let (status, json) = scim(
             &application,
@@ -1522,7 +1633,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["active"], false);
-        assert!(!application.store.principal_allows("u@example.com", 2));
+        assert!(!application.store.principal_allows("u@example.com", 3));
 
         let (status, _) = scim(
             &application,

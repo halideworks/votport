@@ -375,6 +375,12 @@ pub struct Principal {
     pub created_at: u64,
 }
 
+#[derive(Clone, Copy)]
+enum PrincipalPageOrder {
+    LastLogin,
+    Subject,
+}
+
 /// A SCIM group: a name the sign-in role mapping can match, plus members.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScimGroup {
@@ -2372,9 +2378,33 @@ impl Store {
         offset: usize,
         query: Option<&str>,
     ) -> Result<(Vec<Principal>, u64), String> {
+        self.principals_page_ordered(limit, offset, query, PrincipalPageOrder::LastLogin)
+    }
+
+    /// SCIM clients use offset pagination without a sort parameter. Subject is
+    /// immutable, so it keeps a page walk stable while login timestamps move.
+    pub fn scim_principals_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Principal>, u64), String> {
+        self.principals_page_ordered(limit, offset, None, PrincipalPageOrder::Subject)
+    }
+
+    fn principals_page_ordered(
+        &self,
+        limit: usize,
+        offset: usize,
+        query: Option<&str>,
+        order: PrincipalPageOrder,
+    ) -> Result<(Vec<Principal>, u64), String> {
         let limit = i64::try_from(limit).map_err(|_| "principal limit overflow".to_owned())?;
         let offset = i64::try_from(offset).map_err(|_| "principal offset overflow".to_owned())?;
         let query = query.map(|value| format!("%{}%", escape_like(value)));
+        let order = match order {
+            PrincipalPageOrder::LastLogin => "last_login_at DESC, subject ASC",
+            PrincipalPageOrder::Subject => "subject ASC",
+        };
         self.with(|connection| {
             let total = connection.query_row(
                 "SELECT COUNT(*) FROM principals
@@ -2382,14 +2412,14 @@ impl Store {
                 rusqlite::params![query.as_deref()],
                 |row| row.get::<_, i64>(0),
             )?;
-            let mut statement = connection.prepare(
+            let mut statement = connection.prepare(&format!(
                 "SELECT subject, credential_version, blocked, last_login_at,
                         last_groups, last_grants, source, external_id, created_at
                  FROM principals
                  WHERE (?1 IS NULL OR subject LIKE ?1 ESCAPE '\\' COLLATE NOCASE)
-                 ORDER BY last_login_at DESC, subject ASC
+                 ORDER BY {order}
                  LIMIT ?2 OFFSET ?3",
-            )?;
+            ))?;
             let rows =
                 statement.query_map(rusqlite::params![query, limit, offset], map_principal)?;
             Ok((
