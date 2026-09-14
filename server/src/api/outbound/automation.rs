@@ -776,6 +776,18 @@ mod tests {
         assert_eq!(app.store.outbound_grants("").unwrap().len(), 1);
         let created = first.1;
         let id = created["grant"]["id"].as_str().unwrap();
+        let saved = app.store.outbound_share_token("", id).unwrap().unwrap();
+        assert_ne!(saved, raw);
+        assert_eq!(
+            created["url"].as_str().unwrap().rsplit('/').next(),
+            Some(saved.as_str())
+        );
+        assert_eq!(
+            request(&app, "GET", "/api/automation/session", &saved, json!({}))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
         let path = format!("/api/automation/deliveries/{id}");
         let (_, detail) = request(&app, "GET", &format!("{path}?limit=1"), &raw, json!({})).await;
         assert_eq!(detail["total_bytes"], 9);

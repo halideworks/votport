@@ -1763,7 +1763,7 @@ mod tests {
         grant.upload_id.clear();
         grant.files[0].source = "received:file.bin".into();
         store
-            .insert_workflow_grant(grant, None, Some(&job))
+            .insert_workflow_grant(grant, None, Some(&job), None)
             .unwrap();
         (store.delivery_job(&job.id).unwrap().unwrap(), workflow)
     }
@@ -1957,7 +1957,7 @@ mod tests {
         let mut stale = original.clone();
         stale.state = "preparing".into();
         assert!(store
-            .insert_workflow_grant(grant(&stale), None, Some(&stale))
+            .insert_workflow_grant(grant(&stale), None, Some(&stale), None)
             .is_err());
         assert_eq!(
             store.delivery_job(&original.id).unwrap().unwrap().state,
@@ -2002,7 +2002,7 @@ mod tests {
         blocked_grant.upload_id.clear();
         blocked_grant.files[0].source = "received:file.bin".into();
         assert!(store
-            .insert_workflow_grant(blocked_grant, None, Some(&blocked))
+            .insert_workflow_grant(blocked_grant, None, Some(&blocked), None)
             .unwrap_err()
             .contains("identity"));
         assert!(store
@@ -2193,7 +2193,7 @@ mod tests {
         first_grant.upload_id.clear();
         first_grant.files[0].source = "received:file.bin".into();
         store
-            .insert_workflow_grant(first_grant, None, Some(&preparing))
+            .insert_workflow_grant(first_grant, None, Some(&preparing), None)
             .unwrap();
         let exporting = store
             .claim_delivery_job("worker", now_unix())
@@ -2330,7 +2330,7 @@ mod tests {
             .rotate_outbound_grant_token("", &grant.id, "rotated")
             .unwrap();
         assert!(!store.admit_fetch_ticket(&ticket, now).unwrap());
-        next.grant_token_hash = "rotated".into();
+        next.grant_token_hash = crate::auth::hash_token("rotated");
         assert!(store.put_fetch_ticket(&next, now).unwrap());
         assert!(store.admit_fetch_ticket(&next, now).unwrap());
         store
@@ -2338,7 +2338,7 @@ mod tests {
             .unwrap();
         let mut third = next.clone();
         third.token_id = "third".into();
-        third.grant_token_hash = "again".into();
+        third.grant_token_hash = crate::auth::hash_token("again");
         assert!(!store.put_fetch_ticket(&third, now).unwrap());
         assert!(!store.admit_fetch_ticket(&next, now).unwrap());
         assert!(!store.admit_fetch_ticket(&third, now).unwrap());
@@ -2396,7 +2396,7 @@ mod tests {
         job.checks["destination_revisions"] =
             serde_json::json!({"s3":config.revision,"remaining":remaining.revision});
         store
-            .insert_workflow_grant(grant(&job), None, Some(&job))
+            .insert_workflow_grant(grant(&job), None, Some(&job), None)
             .unwrap();
         let pending = store.delivery_job(&job.id).unwrap().unwrap();
         for change in ["disabled", "tenant", "revision"] {
@@ -2650,6 +2650,13 @@ mod tests {
         grant.token_hash = hash_token(&token);
         grant.expires_at = now_unix() + 3600;
         store.insert_outbound_grant(grant).unwrap();
+        assert_eq!(
+            store.outbound_share_token("", &original.id).unwrap(),
+            Some(token.clone())
+        );
+        assert!(!store
+            .rotate_outbound_grant_token("", &original.id, &random_token())
+            .unwrap());
         let snapshot_directory = tempfile::tempdir().unwrap();
         store
             .backup_into(&snapshot_directory.path().join("votport.db"))
@@ -2733,6 +2740,10 @@ mod tests {
             .unwrap()]
         .clone();
         assert_eq!(store.delivery_job_token("", &original.id).unwrap(), current);
+        assert_eq!(
+            store.outbound_share_token("", &original.id).unwrap(),
+            Some(current.clone())
+        );
         assert_ne!(current, token);
         assert!(store
             .delivery_token_active(&original.id, &hash_token(&current))
@@ -2836,13 +2847,13 @@ mod tests {
             "preparing"
         );
         assert!(store
-            .insert_workflow_grant(grant(&stale), None, Some(&stale))
+            .insert_workflow_grant(grant(&stale), None, Some(&stale), None)
             .is_err());
         assert!(store
-            .insert_workflow_grant(grant(&first), None, Some(&first))
+            .insert_workflow_grant(grant(&first), None, Some(&first), None)
             .is_err());
         store
-            .insert_workflow_grant(grant(&job), None, Some(&job))
+            .insert_workflow_grant(grant(&job), None, Some(&job), None)
             .unwrap();
         let pending = store.delivery_job(&job.id).unwrap().unwrap();
         assert_eq!(pending.state, "awaiting_approval");
@@ -2917,7 +2928,7 @@ mod tests {
             .change_delivery_job("", &job.id, "sender", false, "cancel", None)
             .unwrap();
         assert!(store
-            .insert_workflow_grant(grant(&running), None, Some(&running))
+            .insert_workflow_grant(grant(&running), None, Some(&running), None)
             .is_err());
         assert!(store.outbound_grant_by_id(&job.id).unwrap().is_none());
         for path in [
@@ -2945,7 +2956,7 @@ mod tests {
             .unwrap();
         store.save_delivery_project("", "admin", project).unwrap();
         assert!(store
-            .insert_workflow_grant(grant(&running), None, Some(&running))
+            .insert_workflow_grant(grant(&running), None, Some(&running), None)
             .is_err());
         store
             .fail_delivery_job(&running.id, running.attempts, "changed")

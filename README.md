@@ -31,7 +31,7 @@ Received files use **Send** beside a file on **Receive**. For the outbound
 library, use **Deliver** to choose one or more files. Server-rendered projects
 may populate nested project subdirectories under the outbound directory, and
 admin uploads land there too. VOTPort issues one expiring bearer URL for the
-selection, shown once and revocable by an admin.
+selection, available to copy again from Deliver and revocable by an admin.
 Before an individual file download starts, the server verifies the source's
 VOT object identity and signed receipt against a cached proof catalog (built
 once per object), then streams verified ranges directly from the source. ZIP

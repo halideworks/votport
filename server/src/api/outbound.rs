@@ -1461,6 +1461,30 @@ pub async fn list_outbound_grants(
     })))
 }
 
+pub async fn outbound_grant_url(
+    State(app): State<Arc<App>>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let identity = admin::require_operator(&app, &headers)?;
+    let _operation = begin_outbound_operation(&app, &identity.tenant)?;
+    let token = app.store.outbound_share_token(&identity.tenant, &id)
+        .map_err(super::store_unavailable)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND,
+            "This saved address is unavailable. For a link created before saved addresses were supported, use your original copy or choose New address to replace it."))?;
+    app.store
+        .delivery_access(&id, &hash_token(&token))
+        .map_err(|error| {
+            ApiError::new(StatusCode::FORBIDDEN, error).with_code("delivery_pending")
+        })?;
+    let base = admin::base_url(&app, &headers);
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({"url": format!("{base}/s/{token}")})),
+    )
+        .into_response())
+}
+
 #[derive(Deserialize)]
 pub struct AutomationTokenRequest {
     label: String,
@@ -1795,7 +1819,7 @@ pub async fn create_outbound_grant(
         files: Vec::new(),
     };
     app.store
-        .insert_outbound_grant(grant.clone())
+        .insert_workflow_grant(grant.clone(), None, None, Some(&token))
         .map_err(ApiError::internal)?;
     app.store.audit(
         &identity.tenant,
@@ -2257,6 +2281,7 @@ async fn create_library_grant(
                 grant.clone(),
                 options.automation.as_ref().map(|(op, _)| op),
                 options.workflow.as_ref(),
+                Some(&token),
             )
             .map_err(ApiError::internal)?;
     }
@@ -2573,7 +2598,7 @@ pub async fn update_outbound_grant(
                 .rotate_delivery_job_token(&identity.tenant, &id, job.token_generation, &token)
         } else {
             app.store
-                .rotate_outbound_grant_token(&identity.tenant, &id, &hash_token(&token))
+                .rotate_outbound_grant_token(&identity.tenant, &id, &token)
         }
         .map_err(ApiError::internal)?;
         if !changed {
@@ -5990,6 +6015,39 @@ mod tests {
         let token = url.rsplit('/').next().unwrap();
         assert_eq!(url, format!("https://drop.example.com/s/{token}"));
         let id = created["grant"]["id"].as_str().unwrap().to_owned();
+        for _ in 0..2 {
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::get(format!("/api/admin/outbound-grants/{id}/url"))
+                        .header("cookie", &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert_eq!(body(response).await["url"], url);
+        }
+        let refused = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/admin/outbound-grants/{id}/url"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        let listing = crate::app::router(app.clone())
+            .oneshot(
+                Request::get("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!body(listing).await.to_string().contains(token));
 
         let metadata = crate::app::router(app.clone())
             .oneshot(
@@ -6129,6 +6187,16 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
+        let refused = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/admin/outbound-grants/{id}/url"))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
         for suffix in ["", "/receipt", "/file"] {
             let mut request = Request::get(format!("/api/s/{token}{suffix}"));
             if suffix == "/file" {

@@ -500,8 +500,8 @@ pub fn close_request(id: &str) -> Result<()> {
     })
 }
 
-/// A delivery the port issued: files a recipient can pull. The link itself
-/// is shown once, when it is issued; the server keeps only its hash.
+/// A delivery the port issued: files a recipient can pull. Its address can
+/// be reopened and copied from the web Deliver page.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record, Deserialize)]
 pub struct Delivery {
     pub id: String,

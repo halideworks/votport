@@ -889,7 +889,24 @@ if (await page.evaluate(() => document.activeElement.id) !== "library-search") {
 await page.getByRole("button", { name: "Library", exact: true }).click();
 await page.waitForSelector(`#library-files input[aria-label="Select folder ${PROJECT}"]`);
 console.log("library navigation preserves keyboard focus on success and failure: ok");
-await page.locator(`#library-files input[aria-label="Select folder ${PROJECT}"]`).click();
+let releaseFolderSelection;
+const heldFolderSelection = new Promise((resolve) => { releaseFolderSelection = resolve; });
+await page.route("**/api/admin/outbound-files?selection=*", async (route) => {
+  await heldFolderSelection;
+  await route.continue();
+}, { times: 1 });
+try {
+  await page.locator(`#library-files input[aria-label="Select folder ${PROJECT}"]`).click();
+  await page.fill("#deliver-label", "Pending folder selection");
+  await page.click("#deliver-submit");
+  await page.locator("#deliver-error").waitFor({ state: "visible" });
+  if (await page.textContent("#deliver-error") !== "Wait for the folder selection to finish before creating a link.") {
+    throw new Error("link creation must wait for the full folder selection");
+  }
+} finally {
+  releaseFolderSelection();
+}
+
 await page.waitForFunction(
   () => document.getElementById("library-selection-status").textContent.startsWith("12 files selected"),
   { timeout: 15000 },
@@ -975,7 +992,7 @@ await page.waitForFunction(
 );
 await page.getByRole("button", { name: "Library", exact: true }).click();
 await page.waitForSelector(
-  `#library-files button[aria-label="Share folder ${FOLDER_PROJECT}"]`,
+  `#library-files input[aria-label="Select folder ${FOLDER_PROJECT}"]`,
   { state: "visible", timeout: 15000 },
 );
 await page.fill("#library-search", "folder-nested.txt");
@@ -1035,18 +1052,61 @@ if (searchResponses.length) throw new Error(`library search fixtures unused: ${s
 console.log("library search reports incomplete zero and partial results and completed no-match results: ok");
 await page.fill("#library-search", "");
 await page.waitForSelector(
-  `#library-files button[aria-label="Share folder ${FOLDER_PROJECT}"]`,
+  `#library-files input[aria-label="Select folder ${FOLDER_PROJECT}"]`,
   { state: "visible", timeout: 15000 },
 );
 
+if (await page.getByRole("button", { name: /^Share folder / }).count()) {
+  throw new Error("folder sharing must use the selection checkboxes and access form");
+}
 await page.fill("#deliver-label", "browser outbound e2e");
+let releasePreparation;
+const heldPreparation = new Promise((resolve) => { releasePreparation = resolve; });
+let preparationRequests = 0;
+await page.route("**/api/admin/outbound-grants", async (route) => {
+  if (route.request().method() !== "POST") return route.continue();
+  preparationRequests += 1;
+  await heldPreparation;
+  await route.fulfill({ status: 503, json: { error: "Preparation failed; try again." } });
+});
+try {
+  await page.click("#deliver-submit");
+  await page.locator("#deliver-progress").waitFor({ state: "visible" });
+  if (!(await page.textContent("#deliver-progress")).includes("Verifying selected files") ||
+      await page.textContent("#deliver-submit") !== "Preparing link…" ||
+      !(await page.locator("#deliver-label").isDisabled()) ||
+      !(await page.locator("#library-files input[type=checkbox]").first().isDisabled()) ||
+      !(await page.locator("#library-search").isEnabled())) {
+    throw new Error("preparation must show progress, protect submitted settings and leave the library usable");
+  }
+  await page.locator("#deliver-form").evaluate((form) => form.dispatchEvent(new Event("submit", { cancelable: true })));
+  releasePreparation();
+  await page.locator("#deliver-error").waitFor({ state: "visible" });
+  if (preparationRequests !== 1 ||
+      await page.inputValue("#deliver-label") !== "browser outbound e2e" ||
+      !(await page.locator("#deliver-submit").isEnabled()) ||
+      !(await page.locator("#library-files input[type=checkbox]").first().isEnabled()) ||
+      !(await page.locator("#deliver-progress").isHidden())) {
+    throw new Error("failed preparation must preserve settings and selection and allow retry without a duplicate request");
+  }
+} finally {
+  releasePreparation();
+  await page.unroute("**/api/admin/outbound-grants");
+}
 await page.click("#deliver-submit");
 await page.waitForSelector("#outbound-result:not([hidden])", { timeout: 30000 });
 const outboundUrl = await page.inputValue("#outbound-url");
 if (!/^https?:\/\//.test(outboundUrl)) {
   throw new Error(`outbound URL malformed: ${outboundUrl}`);
 }
-console.log("outbound link:", outboundUrl);
+await page.reload();
+const savedGrant = page.locator('#outbound-grants .card').filter({ has: page.getByRole('heading', { name: 'browser outbound e2e', exact: true }) });
+await savedGrant.getByRole('button', { name: 'Copy link', exact: true }).click();
+await page.locator('#outbound-result').waitFor({ state: 'visible' });
+if (await page.inputValue('#outbound-url') !== outboundUrl) {
+  throw new Error('reopening a saved download must preserve the original address');
+}
+console.log("download link remains available after reload: ok");
 
 await page.goto(outboundUrl);
 await page.waitForSelector("#download-content:not([hidden])", { timeout: 30000 });

@@ -202,7 +202,7 @@ links with their URLs, drop counts, and senders shipping now
 (`GET /api/admin/links?status=open`), issues one (`POST /api/admin/links`
 with a label, an optional password, expiry, and cap) and closes one,
 lists the deliveries (`GET /api/admin/outbound-grants`; a delivery's link
-is shown once, at issue, since the server keeps only its hash), revokes
+can be reopened and copied from the web Deliver page), revokes
 one, browses the library one directory at a time
 (`GET /api/admin/outbound-files?directory=`), and issues a delivery of
 library files (`POST /api/admin/outbound-grants` with `paths`), whose
@@ -269,8 +269,8 @@ as already on the port, which it is)
 `Transfer` handle, `votport upload` in the CLI); what lands comes back
 ticked with its folder open. Below it, "On the port" browses what is
 already there one directory at a time for ticking, and the delivery is
-issued with its link shown once and copied. A path the port already
-holds, or that a delivery is serving, is refused as "already on the
+issued with its link copied. The address can be copied again from the web
+Deliver page. A path the port already holds, or that a delivery is serving, is refused as "already on the
 port"; a file over the port's upload limit as "larger than the port
 accepts". The day, count,
 and gigabyte fields are number entries (a spin box under a caption on

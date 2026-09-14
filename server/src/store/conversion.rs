@@ -153,7 +153,7 @@ fn convert(data: &Path, public_url: &str) -> Result<Conversion> {
     verify_events(&transaction, &signer)?;
     let mut target = Connection::open_in_memory()?;
     initialize_schema(&mut target)?;
-    validate_schema(&target, 41)?;
+    validate_schema(&target, SCHEMA_VERSION)?;
     let mut result = Conversion {
         id: auth::random_token(),
         source: 35,
@@ -165,8 +165,10 @@ fn convert(data: &Path, public_url: &str) -> Result<Conversion> {
         sha256: String::new(),
         replacements: 0,
     };
-    transaction
-        .execute_batch("ALTER TABLE upload_sessions ADD COLUMN committed_upload_id TEXT;")?;
+    transaction.execute_batch(
+        "ALTER TABLE upload_sessions ADD COLUMN committed_upload_id TEXT;
+             ALTER TABLE outbound_grants ADD COLUMN share_token TEXT;",
+    )?;
     rebuild(
         &transaction,
         &target,

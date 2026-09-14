@@ -94,12 +94,13 @@
         </label>
         <p id="library-selection-status" class="muted" aria-live="polite">0 files selected · 0 B</p>
         <p id="library-selection-error" class="error" role="alert" hidden></p>
-        <div id="library-files" class="library-list" aria-live="polite"></div>
+        <fieldset id="library-files" class="library-list" aria-label="Library files" aria-live="polite"></fieldset>
       </section>
       <section class="card delivery-options" aria-labelledby="delivery-options-title">
         <h2 id="delivery-options-title" class="section-title"><span class="step-number">2</span> Set access and share</h2>
         <p class="muted">Only the files you select will be included.</p>
         <form data-unsaved data-draft id="deliver-form">
+          <fieldset id="deliver-fields" aria-label="Download link settings">
           <div class="grid">
             <label>Name
               <input data-draft-field id="deliver-label" required maxlength="200" placeholder="Project files" />
@@ -118,8 +119,10 @@
           </details>
           <details class="form-advanced"><summary>Notifications <button type="button" class="hint-button" aria-label="Help about download notifications" data-hint="First download started means a recipient began fetching files. Delivery completed is a separate event; neither is the recipient’s explicit acceptance.">?</button></summary><div id="deliver-notifications"></div></details>
           <button type="submit" id="deliver-submit">Create download link</button>
-          <p id="deliver-error" class="error" role="alert" hidden></p>
+          </fieldset>
         </form>
+        <p id="deliver-progress" class="muted" role="status" tabindex="-1" hidden></p>
+        <p id="deliver-error" class="error" role="alert" tabindex="-1" hidden></p>
       </section>
 
       </div>
@@ -129,7 +132,7 @@
           <input id="outbound-url" class="mono" type="text" readonly aria-describedby="outbound-note" />
         </label>
         <button id="outbound-copy" type="button">Copy address</button>
-        <p id="outbound-note" class="muted">Shown once. Copy it now; this URL cannot be retrieved later.</p>
+        <p id="outbound-note" class="muted">You can copy this link again from Download links on the Deliver page.</p>
       </div>
 
       <h2>Download links</h2>
