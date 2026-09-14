@@ -1,0 +1,18 @@
+services:
+  votport:
+    build: .
+    restart: unless-stopped
+    # Allow streaming requests to finish during a normal stop.
+    stop_grace_period: 5m
+    # The bind roots must be writable by this container user.
+    user: "1000:1000"
+    ports:
+      - "127.0.0.1:8103:8080"
+    environment:
+      VOTPORT_ADMIN_PASSWORD: "${VOTPORT_ADMIN_PASSWORD:?set VOTPORT_ADMIN_PASSWORD in .env}"
+      VOTPORT_PUBLIC_URL: "${VOTPORT_PUBLIC_URL:?set VOTPORT_PUBLIC_URL in .env}"
+      VOTPORT_SESSION_IDLE_SECS: "${VOTPORT_SESSION_IDLE_SECS:-172800}"
+    volumes:
+      - ./data:/data
+      - ./received:/received
+      - ./outbound:/outbound

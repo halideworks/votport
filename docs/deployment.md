@@ -7,7 +7,10 @@ backups, metrics, and content lifecycle.
 ## Layout
 
 ```text
-docker-compose.yml          service definition (ports, env, volumes)
+docker-compose.yml          deployment-specific service definition
+docker-compose.example.yml  portable Docker quick-start service definition
+.env.example                tracked quick-start environment template
+.env                        local environment file (0600, ignored)
 data/                       votport state (directory 0700, keep private)
   votport.db                SQLite store (links, tenants, audit log) (0600)
   votport.db-wal / -shm     SQLite write-ahead log and shared-memory files (0600)
@@ -87,14 +90,28 @@ Received files retain their original publication receipts when shared.
 
 ```sh
 cp Caddyfile.example /etc/caddy/sites/votport   # adjust host + port
-# edit docker-compose.yml: VOTPORT_ADMIN_PASSWORD, VOTPORT_PUBLIC_URL, volumes
-docker compose up -d --build
-curl -o /dev/null -w '%{http_code}\n' http://127.0.0.1:<debug-port>/r/x   # expect 200
+install -m 600 .env.example .env
+# edit .env: VOTPORT_ADMIN_PASSWORD and VOTPORT_PUBLIC_URL
+sudo install -d -o 1000 -g 1000 -m 0700 data received outbound
+docker compose --env-file .env -f docker-compose.example.yml up -d --build
+curl -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8103/r/x   # expect 200
 ```
+
+The three bind roots must be writable by uid/gid 1000, the user inside the
+container. If they already exist, grant that uid/gid access without
+recursively changing unrelated content. The tracked `docker-compose.yml` is
+deployment-specific; use `docker-compose.example.yml` for this portable quick
+start.
 
 `VOTPORT_PUBLIC_URL` must be an `https://` URL for a deployed site. Plain
 `http://` is accepted only when its host is loopback (`localhost`, `127.0.0.1`,
 or `::1`), and invalid values stop startup.
+
+`VOTPORT_SESSION_IDLE_SECS` defaults to 1800 seconds. Choose a value longer
+than the longest sender or network pause when preserving interrupted
+transfers; the portable Compose example uses 172800 seconds (48 hours). Keep
+this environment setting the same on a promoted failover host. Active requests
+remain retained while in flight.
 
 For a customer release, use the GHCR image reference and digest recorded in the
 GitHub release notes and workflow summary instead of rebuilding from source:

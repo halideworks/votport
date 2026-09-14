@@ -4,6 +4,8 @@ client/target/
 client/target-*/
 web/assets/vendor
 data/
+/received/
+/outbound/
 node_modules/
 .env
 HANDOFF.md
