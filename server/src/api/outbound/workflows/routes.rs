@@ -39,6 +39,11 @@ pub async fn receive(
     let ip = crate::api::client_ip(&headers, &peer, &app.config.trusted_proxies);
     crate::api::upload::check_password(
         &app,
+        crate::api::upload::PasswordResource {
+            tenant: &link.tenant,
+            id: &link.id,
+            kind: crate::api::upload::PasswordResourceKind::Receive,
+        },
         link.password_hash.as_deref(),
         request.password.as_deref(),
         &ip,

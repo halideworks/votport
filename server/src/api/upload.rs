@@ -186,12 +186,35 @@ fn parse_push_object(package: &PushPackageAnnouncement) -> ApiResult<ObjectId> {
     })
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum PasswordResourceKind {
+    Receive,
+    Delivery,
+}
+
+impl PasswordResourceKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Receive => "receive",
+            Self::Delivery => "delivery",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PasswordResource<'a> {
+    pub(crate) tenant: &'a str,
+    pub(crate) id: &'a str,
+    pub(crate) kind: PasswordResourceKind,
+}
+
 /// Verifies a public-resource password, throttled per client IP. These are
 /// unauthenticated password checks, so without a throttle they would be an
 /// oracle, and with a global one anyone holding a URL could lock the admin
 /// out. A resource with no password accepts anything.
 pub(crate) async fn check_password(
     app: &Arc<App>,
+    resource: PasswordResource<'_>,
     password_hash: Option<&str>,
     password: Option<&str>,
     ip: &str,
@@ -220,15 +243,52 @@ pub(crate) async fn check_password(
         .acquire_owned()
         .await
         .map_err(|_| ApiError::internal("verify semaphore closed"))?;
+    let app = Arc::clone(app);
+    let store = Arc::clone(&app.store);
+    let tenant = resource.tenant.to_owned();
+    let subject = resource.id.to_owned();
+    let kind = resource.kind.label();
+    let client_ip = ip.to_owned();
     let ok = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        auth::verify_password(&password, &hash)
+        let ok = auth::verify_password(&password, &hash);
+        drop(permit);
+        if ok {
+            app.link_throttle.succeeded(&bucket);
+        }
+        let event = if ok {
+            tracing::info!(
+                target: "audit",
+                event = "link_unlocked",
+                tenant = %tenant,
+                subject = %subject,
+                kind,
+                client_ip = %client_ip,
+                "public link password accepted"
+            );
+            "link_unlocked"
+        } else {
+            tracing::warn!(
+                target: "audit",
+                event = "link_password_failed",
+                tenant = %tenant,
+                subject = %subject,
+                kind,
+                client_ip = %client_ip,
+                "public link password rejected"
+            );
+            "link_password_failed"
+        };
+        store.audit(
+            &tenant,
+            "",
+            event,
+            &subject,
+            &json!({"kind": kind, "client_ip": client_ip}),
+        );
+        ok
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?;
-    if ok {
-        app.link_throttle.succeeded(&bucket);
-    }
     if !ok {
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, error_message));
     }
@@ -260,6 +320,11 @@ pub async fn verify_link_password(
     let ip = client_ip(&headers, &peer, &app.config.trusted_proxies);
     check_password(
         &app,
+        PasswordResource {
+            tenant: &link.tenant,
+            id: &link.id,
+            kind: PasswordResourceKind::Receive,
+        },
         link.password_hash.as_deref(),
         request.password.as_deref(),
         &ip,
@@ -347,6 +412,11 @@ async fn prepare_session(
     if !link_authorized(app, &link, headers) {
         check_password(
             app,
+            PasswordResource {
+                tenant: &link.tenant,
+                id: &link.id,
+                kind: PasswordResourceKind::Receive,
+            },
             link.password_hash.as_deref(),
             password,
             &ip,
@@ -1522,6 +1592,293 @@ mod push_preflight_tests {
             uploads: Vec::new(),
             events: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn protected_link_password_failure_is_audited() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_tenant(crate::store::tests::test_tenant("acme"))
+            .unwrap();
+        let mut link = open_link("password-audit");
+        link.tenant = "acme".to_owned();
+        link.password_hash = Some(auth::hash_password("correct password").unwrap());
+        application.store.insert_link(link).unwrap();
+
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::post("/api/r/password-audit/session")
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [192, 0, 2, 8],
+                        4444,
+                    ))))
+                    .body(Body::from(
+                        r#"{"password":"wrong password","package":{"suite":"blake3","root":"0000000000000000000000000000000000000000000000000000000000000000","length":1}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::post("/api/r/password-audit/verify")
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [192, 0, 2, 9],
+                        4444,
+                    ))))
+                    .body(Body::from(r#"{"password":"wrong password"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let audits = application
+            .store
+            .audit_export(Some("acme"), 0, 0, 100)
+            .unwrap();
+        assert!(audits.iter().any(|row| {
+            row.event == "link_password_failed"
+                && row.subject == "password-audit"
+                && row.detail["kind"] == "receive"
+                && row.detail["client_ip"] == "192.0.2.9"
+        }));
+
+        let verified = app::router(application.clone())
+            .oneshot(
+                Request::post("/api/r/password-audit/verify")
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [192, 0, 2, 10],
+                        4444,
+                    ))))
+                    .body(Body::from(r#"{"password":"correct password"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(verified.status(), StatusCode::OK);
+        let cookie = verified
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let session = app::router(application.clone())
+            .oneshot(
+                Request::post("/api/r/password-audit/session")
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [192, 0, 2, 10],
+                        4444,
+                    ))))
+                    .body(Body::from(
+                        r#"{"package":{"suite":"blake3","root":"0000000000000000000000000000000000000000000000000000000000000000","length":1}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.status(), StatusCode::OK);
+        app::suspend_sessions(&application).await;
+
+        let audits = application
+            .store
+            .audit_export(Some("acme"), 0, 0, 100)
+            .unwrap();
+        let verdicts: Vec<_> = audits
+            .iter()
+            .filter(|row| {
+                row.subject == "password-audit"
+                    && matches!(row.event.as_str(), "link_password_failed" | "link_unlocked")
+            })
+            .collect();
+        assert_eq!(
+            verdicts.len(),
+            3,
+            "cookie authorization must not audit again"
+        );
+        assert!(verdicts.iter().any(|row| {
+            row.event == "link_unlocked"
+                && row.detail["kind"] == "receive"
+                && row.detail["client_ip"] == "192.0.2.10"
+        }));
+        assert!(verdicts.iter().all(
+            |row| row.actor.is_empty() && !row.detail.to_string().contains("correct password")
+        ));
+
+        application
+            .store
+            .insert_link(open_link("unprotected"))
+            .unwrap();
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::post("/api/r/unprotected/verify")
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [192, 0, 2, 11],
+                        4444,
+                    ))))
+                    .body(Body::from(r#"{"password":"anything"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!application
+            .store
+            .audit_export(None, 0, 0, 100)
+            .unwrap()
+            .iter()
+            .any(|row| row.subject == "unprotected"));
+    }
+
+    #[tokio::test]
+    async fn password_throttle_refusal_is_not_a_verdict() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let hash = auth::hash_password("correct password").unwrap();
+        let resource = PasswordResource {
+            tenant: "acme",
+            id: "password-throttle",
+            kind: PasswordResourceKind::Receive,
+        };
+        for _ in 0..5 {
+            assert!(check_password(
+                &application,
+                resource,
+                Some(&hash),
+                Some("wrong password"),
+                "192.0.2.12",
+                "wrong link password",
+            )
+            .await
+            .is_err());
+        }
+        let before = application.store.audit_export(None, 0, 0, 100).unwrap();
+        assert_eq!(before.len(), 5);
+        assert!(check_password(
+            &application,
+            resource,
+            Some(&hash),
+            Some("wrong password"),
+            "192.0.2.12",
+            "wrong link password",
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            application
+                .store
+                .audit_export(None, 0, 0, 100)
+                .unwrap()
+                .len(),
+            before.len(),
+            "a throttle refusal did not run password verification"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_password_clears_throttle_before_blocking_audit() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let hash = auth::hash_password("correct password").unwrap();
+        let ip = "192.0.2.13";
+        let permits = Arc::clone(&application.link_verify_permits)
+            .acquire_many_owned(2)
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            assert!(application.link_throttle.claim(ip));
+        }
+        assert!(!application.link_throttle.locked(ip));
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let store = Arc::clone(&application.store);
+        let holder = std::thread::spawn(move || {
+            store
+                .with(|_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+        if entered_rx.recv_timeout(Duration::from_secs(1)).is_err() {
+            let _ = release_tx.send(());
+            let _ = holder.join();
+            panic!("store contention fixture did not acquire the store");
+        }
+
+        let app_for_check = Arc::clone(&application);
+        let hash_for_check = hash.clone();
+        let check = tokio::spawn(async move {
+            check_password(
+                &app_for_check,
+                PasswordResource {
+                    tenant: "acme",
+                    id: "password-order",
+                    kind: PasswordResourceKind::Receive,
+                },
+                Some(&hash_for_check),
+                Some("correct password"),
+                ip,
+                "wrong link password",
+            )
+            .await
+        });
+        let locked = tokio::time::timeout(Duration::from_secs(5), async {
+            while !application.link_throttle.locked(ip) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        if !locked {
+            drop(permits);
+            let _ = release_tx.send(());
+            let _ = holder.join();
+            let _ = tokio::time::timeout(Duration::from_secs(5), check).await;
+            panic!("password check did not claim the locked bucket");
+        }
+        drop(permits);
+        let cleared = tokio::time::timeout(Duration::from_secs(5), async {
+            while application.link_throttle.locked(ip) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        if !cleared {
+            let _ = release_tx.send(());
+            let _ = holder.join();
+            let _ = tokio::time::timeout(Duration::from_secs(5), check).await;
+            panic!("successful verification stayed throttled");
+        }
+        let audit_blocked = !check.is_finished();
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), check)
+            .await
+            .expect("password check did not finish after audit release")
+            .unwrap();
+        assert!(audit_blocked, "audit was not held by store contention");
+        assert!(result.is_ok());
     }
 
     fn request_body(holder: &ed25519_dalek::SigningKey, length: u64) -> serde_json::Value {

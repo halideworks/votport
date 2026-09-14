@@ -2905,6 +2905,11 @@ pub async fn verify_outbound_password(
     let ip = super::client_ip(&headers, &peer, &app.config.trusted_proxies);
     super::upload::check_password(
         &app,
+        super::upload::PasswordResource {
+            tenant: &grant.tenant,
+            id: &grant.id,
+            kind: super::upload::PasswordResourceKind::Delivery,
+        },
         grant.password_hash.as_deref(),
         request.password.as_deref(),
         &ip,
@@ -6616,6 +6621,7 @@ mod tests {
         let created = body(response).await;
         assert_eq!(created["grant"]["has_password"], true);
         assert!(created["grant"].get("password_hash").is_none());
+        let grant_id = created["grant"]["id"].as_str().unwrap().to_owned();
         let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
 
         let metadata = crate::app::router(app.clone())
@@ -6692,6 +6698,33 @@ mod tests {
         assert!(set_cookie.starts_with("votport_s_"));
         assert!(set_cookie.contains(&format!("; Path=/api/s/{token}; HttpOnly; SameSite=Lax;")));
         let grant_cookie = set_cookie.split(';').next().unwrap().to_owned();
+
+        let verdicts: Vec<_> = app
+            .store
+            .audit_export(Some(""), 0, 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|row| {
+                row.subject == grant_id
+                    && matches!(row.event.as_str(), "link_password_failed" | "link_unlocked")
+            })
+            .collect();
+        assert_eq!(
+            verdicts
+                .iter()
+                .map(|row| row.event.as_str())
+                .collect::<Vec<_>>(),
+            ["link_password_failed", "link_unlocked"]
+        );
+        assert!(verdicts.iter().all(|row| {
+            row.actor.is_empty()
+                && row.detail["kind"] == "delivery"
+                && row.detail["client_ip"] == "127.0.0.1"
+                && !row.detail.to_string().contains("correct horse")
+                && !row.detail.to_string().contains(token)
+                && !row.detail.to_string().contains("$argon2")
+        }));
+        assert_ne!(grant_id, token);
 
         let metadata = crate::app::router(app.clone())
             .oneshot(
