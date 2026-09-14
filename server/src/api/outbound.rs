@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, FromRequest, Path as AxumPath, Query, Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine as _;
@@ -2963,8 +2963,9 @@ pub async fn outbound_file(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     AxumPath(token): AxumPath<String>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
 ) -> ApiResult<Response> {
-    outbound_file_inner(app, headers, token, 0).await
+    outbound_file_inner(app, headers, token, 0, peer).await
 }
 
 pub async fn outbound_file_head(
@@ -2979,8 +2980,9 @@ pub async fn outbound_file_indexed(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     AxumPath((token, index)): AxumPath<(String, usize)>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
 ) -> ApiResult<Response> {
-    outbound_file_inner(app, headers, token, index).await
+    outbound_file_inner(app, headers, token, index, peer).await
 }
 
 pub async fn outbound_file_indexed_head(
@@ -2995,7 +2997,10 @@ pub async fn outbound_batch(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     AxumPath(token): AxumPath<String>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    request: Request,
 ) -> ApiResult<Response> {
+    let is_head = request.method() == Method::HEAD;
     let grant = Arc::new(active_grant(&app, &token)?);
     let operation = begin_outbound_operation_owned(&app, &grant.tenant)?;
     require_grant_access(&app, &grant, &headers)?;
@@ -3036,7 +3041,6 @@ pub async fn outbound_batch(
     )?)
     .await?;
     let file = first_file;
-    require_grant_access(&app, &grant, &headers)?;
     // Downloads are recorded per file as its last byte is handed to the
     // transport, not all up front: an interrupted batch must leave the
     // files it never sent still downloadable individually. The stale-copy
@@ -3058,7 +3062,7 @@ pub async fn outbound_batch(
         })
         .collect();
     let mut state = BatchStream {
-        app,
+        app: Arc::clone(&app),
         grant,
         _operation: operation,
         _active: active,
@@ -3071,6 +3075,11 @@ pub async fn outbound_batch(
         recorded: 0,
     };
     state.fill_lookahead();
+    if is_head {
+        require_grant_access(&app, &state.grant, &headers)?;
+    } else {
+        audit_download_request(&app, &state.grant, &headers, peer, "batch", None).await?;
+    }
     let stream = futures_util::stream::try_unfold(state, |mut state| async move {
         // Recording trails delivery: only files whose bytes a previous
         // poll already handed to the transport are recorded, so a record
@@ -3350,6 +3359,7 @@ async fn outbound_file_inner(
     headers: HeaderMap,
     token: String,
     index: usize,
+    peer: std::net::SocketAddr,
 ) -> ApiResult<Response> {
     let (grant, leased, file) = active_download_grant(&app, &token, index, &headers)?;
     let grant = Arc::new(grant);
@@ -3408,7 +3418,6 @@ async fn outbound_file_inner(
         if !leased {
             record_download(&app, &grant, &[index]).await?;
         }
-        require_grant_access(&app, &grant, &headers)?;
         let length = range.map_or(source.object.length, |(start, end)| end - start + 1);
         let mut response = Body::from_stream(stream).into_response();
         add_file_headers(&mut response, &source, length, range)?;
@@ -3418,6 +3427,7 @@ async fn outbound_file_inner(
         if !leased {
             issue_download_lease(&app, &grant, &token, index, &mut response);
         }
+        audit_download_request(&app, &grant, &headers, peer, "file", Some(index)).await?;
         Ok(response)
     }
 }
@@ -3581,7 +3591,10 @@ pub async fn outbound_bundle(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     AxumPath(token): AxumPath<String>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    request: Request,
 ) -> ApiResult<Response> {
+    let is_head = request.method() == Method::HEAD;
     let grant = active_grant(&app, &token)?;
     let operation = begin_outbound_operation_owned(&app, &grant.tenant)?;
     require_grant_access(&app, &grant, &headers)?;
@@ -3642,7 +3655,6 @@ pub async fn outbound_bundle(
     // endpoint records per delivered file instead.
     let indexes: Vec<usize> = (0..count).collect();
     record_download(&app, &grant, &indexes).await?;
-    require_grant_access(&app, &grant, &headers)?;
     let stream = ReaderStream::with_capacity(
         BundleReader {
             file,
@@ -3666,6 +3678,11 @@ pub async fn outbound_bundle(
         header::CONTENT_DISPOSITION,
         HeaderValue::from_static("attachment; filename=\"deliverables.zip\""),
     );
+    if is_head {
+        require_grant_access(&app, &grant, &headers)?;
+    } else {
+        audit_download_request(&app, &grant, &headers, peer, "bundle", None).await?;
+    }
     Ok(response)
 }
 
@@ -3733,6 +3750,80 @@ fn grant_is_exhausted(
         .map_or(grant.files.is_empty() && grant.downloads >= max, |file| {
             file.downloads >= max
         })
+}
+
+async fn audit_download_request(
+    app: &Arc<App>,
+    grant: &OutboundGrant,
+    headers: &HeaderMap,
+    peer: std::net::SocketAddr,
+    mode: &'static str,
+    index: Option<usize>,
+) -> ApiResult<()> {
+    let client_ip = super::client_ip(headers, &peer, &app.config.trusted_proxies);
+    let tenant = grant.tenant.clone();
+    let subject = grant.id.clone();
+    let token_hash = grant.token_hash.clone();
+    let password_hash = grant.password_hash.clone();
+    let secret = app.secret;
+    let headers = headers.clone();
+    let detail = match index {
+        Some(index) => json!({
+            "client_ip": client_ip,
+            "mode": mode,
+            "file_index": index,
+        }),
+        None => json!({
+            "client_ip": client_ip,
+            "mode": mode,
+        }),
+    };
+    let store = Arc::clone(&app.store);
+    let app = Arc::clone(app);
+    tokio::task::spawn_blocking(move || {
+        store.delivery_access_with_audit(&subject, &token_hash, &tenant, &detail, |access| {
+            let job = access.map_err(|error| {
+                if error == "delivery link is inactive" {
+                    ApiError::not_found()
+                } else {
+                    ApiError::new(StatusCode::FORBIDDEN, error).with_code("delivery_pending")
+                }
+            })?;
+            if password_hash.is_some()
+                && !super::upload::cookie_authorized(
+                    &app,
+                    &subject,
+                    password_hash.as_deref(),
+                    &grant_cookie_name(&subject),
+                    &headers,
+                )
+            {
+                return Err(ApiError::new(
+                    StatusCode::UNAUTHORIZED,
+                    "outbound grant password required",
+                ));
+            }
+            workflows::require_recipient_for_job(
+                &secret,
+                &subject,
+                &token_hash,
+                &headers,
+                job.as_ref(),
+            )?;
+            tracing::info!(
+                target: "audit",
+                event = "outbound_downloaded",
+                grant_id = %subject,
+                %client_ip,
+                mode,
+                file_index = ?index,
+                "outbound HTTP payload request started"
+            );
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|_| ApiError::internal("download authorization failed"))?
 }
 
 async fn record_download(
@@ -5230,6 +5321,201 @@ mod tests {
         (directory, app.clone(), admin_cookie(&app), bytes)
     }
 
+    #[tokio::test]
+    async fn payload_gets_write_one_audit_row_per_request() {
+        let (_directory, app, cookie, first) = fixture().await;
+        for (path, bytes) in [
+            ("audit/one.bin", first.as_slice()),
+            ("audit/two.bin", b"second file".as_slice()),
+        ] {
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::post(format!("/api/admin/outbound-files?path={path}"))
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .body(Body::from(bytes.to_vec()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let created = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"paths":["audit/one.bin","audit/two.bin"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let created = body(created).await;
+        let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
+        let grant_id = created["grant"]["id"].as_str().unwrap().to_owned();
+        let audit_rows = || {
+            app.store
+                .audit_export(None, 0, 0, 100)
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.event == "outbound_downloaded" && row.subject == grant_id)
+                .collect::<Vec<_>>()
+        };
+
+        // Metadata, HEAD and receipts do not represent a payload request.
+        let metadata = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metadata.status(), StatusCode::OK);
+        let head = crate::app::router(app.clone())
+            .oneshot(
+                Request::head(format!("/api/s/{token}/files/0"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        let receipt = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/receipts/0"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.status(), StatusCode::NOT_FOUND);
+        for (path, port) in [("batch", 6), ("bundle", 7)] {
+            let head = crate::app::router(app.clone())
+                .oneshot(
+                    Request::head(format!("/api/s/{token}/{path}"))
+                        .extension(ConnectInfo(std::net::SocketAddr::from((
+                            [127, 0, 0, 1],
+                            port,
+                        ))))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(head.status(), StatusCode::OK, "{path}");
+            head.into_body().collect().await.unwrap();
+        }
+        assert!(audit_rows().is_empty());
+
+        let file = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/files/0"))
+                    .header("x-forwarded-for", "198.51.100.7")
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(file.status(), StatusCode::OK);
+        let lease = file
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        assert_eq!(file.into_body().collect().await.unwrap().to_bytes(), first);
+
+        let range = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/files/0"))
+                    .header(header::RANGE, "bytes=0-1")
+                    .header("cookie", &lease)
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 2))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(range.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            range.into_body().collect().await.unwrap().to_bytes(),
+            &first[..2]
+        );
+
+        let batch = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/batch"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 3))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch.status(), StatusCode::OK);
+        assert_eq!(
+            batch.into_body().collect().await.unwrap().to_bytes(),
+            [first.clone(), b"second file".to_vec()].concat()
+        );
+
+        let bundle = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/bundle"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 4))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bundle.status(), StatusCode::OK);
+        bundle.into_body().collect().await.unwrap();
+
+        // A source failure happens before the request-start boundary.
+        std::fs::write(app.config.outbound_dir.join("audit/two.bin"), b"tampered").unwrap();
+        let failed = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/files/1"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.status(), StatusCode::NOT_FOUND);
+
+        let rows = audit_rows();
+        assert_eq!(rows.len(), 4);
+        let mut modes = rows
+            .iter()
+            .map(|row| row.detail["mode"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        modes.sort_unstable();
+        assert_eq!(modes, ["batch", "bundle", "file", "file"]);
+        assert!(rows.iter().all(|row| {
+            row.actor.is_empty() && row.tenant.is_empty() && row.detail.get("token").is_none()
+        }));
+        let file_rows = rows
+            .iter()
+            .filter(|row| row.detail["mode"] == "file")
+            .collect::<Vec<_>>();
+        assert_eq!(file_rows.len(), 2);
+        assert!(file_rows.iter().all(|row| row.detail["file_index"] == 0));
+        assert!(file_rows
+            .iter()
+            .any(|row| row.detail["client_ip"] == "198.51.100.7"));
+        assert!(rows
+            .iter()
+            .filter(|row| row.detail["mode"] != "file")
+            .all(|row| row.detail.get("file_index").is_none()));
+    }
+
     #[test]
     fn tokens_are_strict() {
         assert!(valid_token(&"a".repeat(32)));
@@ -5980,6 +6266,7 @@ mod tests {
                         Request::builder()
                             .method(method)
                             .uri(format!("/api/s/{token}/{path}"))
+                            .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
                             .body(Body::empty())
                             .unwrap(),
                     )
@@ -6261,6 +6548,7 @@ mod tests {
             .oneshot(
                 Request::get(format!("/api/s/{token}/file"))
                     .header(header::RANGE, "bytes=0-6")
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -6301,6 +6589,7 @@ mod tests {
                     .header(header::RANGE, "bytes=7-")
                     .header(header::IF_RANGE, etag)
                     .header(header::COOKIE, &lease)
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -6317,6 +6606,7 @@ mod tests {
             .oneshot(
                 Request::get(format!("/api/s/{token}/file"))
                     .header(header::RANGE, "bytes=7-15")
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -6327,6 +6617,7 @@ mod tests {
             .oneshot(
                 Request::get(format!("/api/s/{token}/file"))
                     .header(header::COOKIE, "votport_d_invalid=forged")
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -6351,6 +6642,7 @@ mod tests {
             .oneshot(
                 Request::get(format!("/api/s/{token}/file"))
                     .header(header::COOKIE, &lease)
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -6378,6 +6670,7 @@ mod tests {
         let first = crate::app::router(app.clone())
             .oneshot(
                 Request::get(format!("/api/s/{revoke_token}/file"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -6406,6 +6699,7 @@ mod tests {
             .oneshot(
                 Request::get(format!("/api/s/{revoke_token}/file"))
                     .header(header::COOKIE, revoke_lease)
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -6439,6 +6733,7 @@ mod tests {
                 .oneshot(
                     Request::get(format!("/api/s/{token}/file"))
                         .header(header::RANGE, value)
+                        .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
                         .body(Body::empty())
                         .unwrap(),
                 )
@@ -6448,6 +6743,7 @@ mod tests {
             assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes */16");
         }
         let mut multiple = Request::get(format!("/api/s/{token}/file"))
+            .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
             .body(Body::empty())
             .unwrap();
         multiple
@@ -6467,6 +6763,7 @@ mod tests {
                 Request::get(format!("/api/s/{token}/file"))
                     .header(header::RANGE, "bytes=0-1")
                     .header(header::IF_RANGE, "\"wrong\"")
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
                     .body(Body::empty())
                     .unwrap(),
             )

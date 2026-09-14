@@ -1195,22 +1195,32 @@ impl Store {
 
     pub fn delivery_access(&self, grant_id: &str, token_hash: &str) -> Result<Option<Job>, String> {
         let connection = self.connection.lock().expect("store poisoned");
-        let row: Option<(Option<String>,Option<i64>,Option<bool>)> = connection.prepare_cached("SELECT j.document,p.revision,c.protected FROM outbound_grants g LEFT JOIN delivery_jobs j ON j.id=g.id LEFT JOIN delivery_projects p ON p.tenant=j.tenant AND p.id=j.project_id LEFT JOIN delivery_policy_cache c ON c.grant_id=g.id WHERE g.id=?1 AND g.token_hash=?2 AND g.revoked_at IS NULL AND g.expires_at>?3").and_then(|mut statement| statement.query_row(params![grant_id,token_hash,now_unix() as i64],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()).map_err(|error| error.to_string())?;
-        let Some((document, revision, protected)) = row else {
-            return Err("delivery link is inactive".into());
-        };
-        if let Some(document) = document {
-            let job: Job = serde_json::from_str(&document).map_err(|error| error.to_string())?;
-            if !job.released() || revision != Some(job.project.revision as i64) {
-                return Err("delivery is awaiting release under the current project policy".into());
-            }
-            return Ok(Some(job));
+        delivery_access_in(&connection, grant_id, token_hash)
+    }
+
+    pub(crate) fn delivery_access_with_audit<E>(
+        &self,
+        grant_id: &str,
+        token_hash: &str,
+        tenant: &str,
+        detail: &serde_json::Value,
+        check: impl FnOnce(Result<Option<Job>, String>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let connection = self.connection.lock().expect("store poisoned");
+        check(delivery_access_in(&connection, grant_id, token_hash))?;
+        if let Err(error) = insert_audit_row(
+            &connection,
+            now_unix(),
+            tenant,
+            "",
+            "outbound_downloaded",
+            grant_id,
+            detail,
+        ) {
+            AUDIT_INSERT_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(%error, event = "outbound_downloaded", "audit row insert failed");
         }
-        match protected {
-            Some(false) => Ok(None),
-            Some(true) => Err("delivery requires a project workflow".into()),
-            None => release_in(&connection, grant_id),
-        }
+        Ok(())
     }
 
     pub fn delivery_release(&self, grant_id: &str) -> Result<Option<Job>, String> {
@@ -1276,6 +1286,38 @@ impl Store {
 
     pub fn delivery_token_active(&self, id: &str, token_hash: &str) -> Result<bool, String> {
         self.with(|connection| connection.query_row("SELECT EXISTS(SELECT 1 FROM outbound_grants WHERE id=?1 AND token_hash=?2 AND revoked_at IS NULL AND expires_at>?3)", params![id,token_hash,now_unix() as i64], |row| row.get(0)))
+    }
+}
+
+fn delivery_access_in(
+    connection: &Connection,
+    grant_id: &str,
+    token_hash: &str,
+) -> Result<Option<Job>, String> {
+    let row: Option<(Option<String>, Option<i64>, Option<bool>)> = connection
+        .prepare_cached("SELECT j.document,p.revision,c.protected FROM outbound_grants g LEFT JOIN delivery_jobs j ON j.id=g.id LEFT JOIN delivery_projects p ON p.tenant=j.tenant AND p.id=j.project_id LEFT JOIN delivery_policy_cache c ON c.grant_id=g.id WHERE g.id=?1 AND g.token_hash=?2 AND g.revoked_at IS NULL AND g.expires_at>?3")
+        .and_then(|mut statement| {
+            statement.query_row(
+                params![grant_id, token_hash, now_unix() as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+        })
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((document, revision, protected)) = row else {
+        return Err("delivery link is inactive".into());
+    };
+    if let Some(document) = document {
+        let job: Job = serde_json::from_str(&document).map_err(|error| error.to_string())?;
+        if !job.released() || revision != Some(job.project.revision as i64) {
+            return Err("delivery is awaiting release under the current project policy".into());
+        }
+        return Ok(Some(job));
+    }
+    match protected {
+        Some(false) => Ok(None),
+        Some(true) => Err("delivery requires a project workflow".into()),
+        None => release_in(connection, grant_id),
     }
 }
 
@@ -2592,6 +2634,58 @@ mod tests {
             visits.load(Ordering::Relaxed) > 0,
             "new policies must invalidate admitted legacy links"
         );
+    }
+
+    #[test]
+    fn delivery_audit_decision_precedes_a_concurrent_revocation() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(Store::open(directory.path()).unwrap());
+        let mut grant = crate::store::tests::test_outbound_grant("audited", "", 0);
+        grant.expires_at = now_unix() + 3600;
+        store.insert_outbound_grant(grant.clone()).unwrap();
+        let grant_id = grant.id.clone();
+        let detail = serde_json::json!({"mode": "file", "client_ip": "127.0.0.1"});
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let revoker = std::thread::spawn({
+            let store = std::sync::Arc::clone(&store);
+            let grant_id = grant_id.clone();
+            move || {
+                started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                store
+                    .revoke_outbound_grant("", &grant_id, now_unix())
+                    .unwrap();
+                finished_tx.send(()).unwrap();
+            }
+        });
+
+        store
+            .delivery_access_with_audit(&grant.id, &grant.token_hash, "", &detail, |access| {
+                assert!(access.is_ok());
+                assert!(
+                    store.connection.try_lock().is_err(),
+                    "the access callback must hold the Store connection"
+                );
+                started_tx.send(()).unwrap();
+                assert!(finished_rx.recv_timeout(Duration::from_millis(50)).is_err());
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .audit_export(None, 0, 0, 100)
+                .unwrap()
+                .iter()
+                .filter(|row| row.event == "outbound_downloaded")
+                .count(),
+            1
+        );
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        revoker.join().unwrap();
+        assert!(store.delivery_access(&grant.id, &grant.token_hash).is_err());
     }
 
     #[test]

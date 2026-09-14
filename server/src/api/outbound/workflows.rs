@@ -1111,7 +1111,24 @@ pub(crate) fn require_recipient(
     grant: &OutboundGrant,
     headers: &HeaderMap,
 ) -> ApiResult<Option<String>> {
-    let Some(job) = release(app, grant)? else {
+    let job = release(app, grant)?;
+    require_recipient_for_job(
+        &app.secret,
+        &grant.id,
+        &grant.token_hash,
+        headers,
+        job.as_ref(),
+    )
+}
+
+pub(crate) fn require_recipient_for_job(
+    secret: &[u8; 32],
+    grant_id: &str,
+    token_hash: &str,
+    headers: &HeaderMap,
+    job: Option<&Job>,
+) -> ApiResult<Option<String>> {
+    let Some(job) = job else {
         return Ok(None);
     };
     if job.request.recipients.is_empty() {
@@ -1120,14 +1137,14 @@ pub(crate) fn require_recipient(
     let holder = headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
-        .and_then(|cookies| auth::cookie_value(cookies, &recipient_cookie_name(&grant.id)))
+        .and_then(|cookies| auth::cookie_value(cookies, &recipient_cookie_name(grant_id)))
         .and_then(|cookie| cookie.split_once('.'))
         .filter(|(holder, token)| {
             job.request.recipients.iter().any(|key| key == holder)
                 && auth::verify_recipient(
-                    &app.secret,
-                    &grant.id,
-                    &grant.token_hash,
+                    secret,
+                    grant_id,
+                    token_hash,
                     job.project.revision,
                     holder,
                     token,
