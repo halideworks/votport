@@ -416,7 +416,7 @@ async fn prepare_session(
     );
     let dest_dir =
         paths::join_under(&app.config.receive_dir, &dest_components).map_err(ApiError::internal)?;
-    let destinations = app.receiving_destinations().map_err(|error| {
+    let destinations = app.receiving_destinations_async().await.map_err(|error| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             format!("receiving storage is unavailable: {error}"),
@@ -1401,6 +1401,108 @@ mod push_preflight_tests {
         config.push_bind = Some("127.0.0.1:0".parse().unwrap());
         config.push_advertise = Some("push.example.test:8322".to_owned());
         app::build(config).unwrap()
+    }
+
+    #[tokio::test]
+    async fn receiving_checks_do_not_block_session_creation_runtime() {
+        use std::time::{Duration, Instant};
+        let mut timings = Vec::new();
+        for native in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let app = push_app(directory.path());
+            app.store.insert_link(open_link("paused")).unwrap();
+            let destinations = app.receiving_destinations().unwrap();
+            let pause = crate::receiving::CheckPause::new(&destinations, 1);
+            let holder = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+            let body = if native {
+                request_body(&holder, 1)
+            } else {
+                json!({"package":{"suite":"blake3","root":hex::encode([7;32]),"length":1}})
+            };
+            let path = if native { "push" } else { "session" };
+            let request = Request::post(format!("/api/r/paused/{path}"))
+                .header("content-type", "application/json")
+                .extension(ConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    1234,
+                ))))
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let started = Instant::now();
+            let (response, timer) =
+                tokio::join!(app::router(app.clone()).oneshot(request), async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let elapsed = started.elapsed();
+                    pause.release();
+                    elapsed
+                });
+            app::suspend_sessions(&app).await;
+            assert_eq!(response.unwrap().status(), StatusCode::OK);
+            timings.push((path, timer));
+        }
+        assert!(
+            timings
+                .iter()
+                .all(|(_, timer)| *timer < Duration::from_millis(500)),
+            "admission blocked async timers: {timings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn receiving_checks_allow_concurrent_http_and_native_admissions() {
+        use std::time::Duration;
+        let directory = tempfile::tempdir().unwrap();
+        let app = push_app(directory.path());
+        let destinations = app.receiving_destinations().unwrap();
+        let pause = crate::receiving::CheckPause::new(&destinations, 8);
+        let mut requests = Vec::new();
+        for index in 0..24_u8 {
+            let link = format!("concurrent-{index}");
+            app.store.insert_link(open_link(&link)).unwrap();
+            let native = index % 2 == 0;
+            let holder = ed25519_dalek::SigningKey::from_bytes(&[index; 32]);
+            let body = if native {
+                request_body(&holder, 1)
+            } else {
+                json!({"package":{"suite":"blake3","root":hex::encode([index;32]),"length":1}})
+            };
+            let path = if native { "push" } else { "session" };
+            let request = Request::post(format!("/api/r/{link}/{path}"))
+                .header("content-type", "application/json")
+                .extension(ConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, index + 1],
+                    1234,
+                ))))
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            requests.push(tokio::spawn(app::router(app.clone()).oneshot(request)));
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pause.entered() < 8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(pause.entered(), 8);
+        pause.release();
+        let mut statuses = Vec::new();
+        for request in requests {
+            statuses.push(
+                tokio::time::timeout(Duration::from_secs(3), request)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .status(),
+            );
+        }
+        app::suspend_sessions(&app).await;
+        assert!(
+            statuses.iter().all(|status| *status == StatusCode::OK),
+            "{statuses:?}"
+        );
+        assert_eq!(pause.entered(), 24);
     }
 
     fn open_link(id: &str) -> Link {

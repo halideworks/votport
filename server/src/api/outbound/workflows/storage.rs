@@ -781,11 +781,12 @@ pub(super) async fn export(app: &Arc<App>, job: &Job) -> ApiResult<()> {
 }
 
 async fn export_destination(app: &Arc<App>, job: &Job, config: &Storage) -> ApiResult<()> {
-    let grant = app
-        .store
-        .outbound_grant_by_id(&job.id)
-        .map_err(crate::api::store_unavailable)?
-        .ok_or_else(ApiError::not_found)?;
+    let grant = Arc::new(
+        app.store
+            .outbound_grant_by_id(&job.id)
+            .map_err(crate::api::store_unavailable)?
+            .ok_or_else(ApiError::not_found)?,
+    );
     grant.validate_names().map_err(conflict)?;
     if config.kind == StorageKind::Votport {
         return super::routes::export(app, job, config).await;
@@ -797,13 +798,22 @@ async fn export_destination(app: &Arc<App>, job: &Job, config: &Storage) -> ApiR
         .ok_or_else(|| conflict("frozen manifest missing".into()))?;
     let prefix = format!("deliveries/{}/{manifest}", job.id);
     let mut files = vec![];
+    let mut operation = begin_outbound_operation_owned(app, &job.tenant)?;
     for (index, file) in grant.files.iter().enumerate() {
         app.store
             .require_delivery_destination(&job.id, job.attempts, &config.id)
             .map_err(conflict)?;
         let key = config.key(&format!("{prefix}/files/{}", file.name))?;
         guard_folder_key(config, &key)?;
-        let source = source_info_indexed_with_file(app, &grant, index, Some(file))?;
+        let (source, retained) = source_info_async(
+            app,
+            Arc::clone(&grant),
+            index,
+            Some(file.clone()),
+            operation,
+        )
+        .await?;
+        operation = retained;
         upload_file(&*store, &key, &source.path, &source.object).await?;
         let receipt = source
             .receipt

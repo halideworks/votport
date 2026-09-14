@@ -3626,14 +3626,18 @@ impl Drop for TenantPin {
     }
 }
 
-pub struct LinkPin<'a> {
-    sessions: &'a Sessions,
+pub struct LinkPin {
+    inner: Arc<Mutex<SessionsInner>>,
     link_id: String,
 }
 
-impl Drop for LinkPin<'_> {
+impl Drop for LinkPin {
     fn drop(&mut self) {
-        self.sessions.unpin_link(&self.link_id);
+        self.inner
+            .lock()
+            .expect("sessions poisoned")
+            .pinned_links
+            .remove(&self.link_id);
     }
 }
 
@@ -3892,9 +3896,9 @@ impl Sessions {
     }
 
     /// Blocks new sessions until the returned guard is dropped.
-    pub fn try_pin_link(&self, link_id: &str) -> Option<LinkPin<'_>> {
+    pub fn try_pin_link(&self, link_id: &str) -> Option<LinkPin> {
         self.pin_link_for_delete(link_id).then(|| LinkPin {
-            sessions: self,
+            inner: Arc::clone(&self.inner),
             link_id: link_id.to_owned(),
         })
     }

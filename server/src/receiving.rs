@@ -138,7 +138,7 @@ fn validate_nfs_lock_recovery(value: &str) -> Result<(), String> {
 
 pub struct Active {
     pub destinations: std::sync::Arc<Destinations>,
-    pub lease: crate::lease::Guard,
+    lease: Mutex<crate::lease::Guard>,
 }
 
 impl Active {
@@ -148,15 +148,21 @@ impl Active {
         destinations.probe()?;
         Ok(Self {
             destinations: std::sync::Arc::new(destinations),
-            lease,
+            lease: Mutex::new(lease),
         })
     }
 
-    pub fn renew(&mut self, now: u64) -> Result<(), String> {
+    pub fn renew(&self, now: u64) -> Result<(), String> {
         let result = self
             .destinations
             .check_current()
-            .and_then(|()| self.lease.renew(now));
+            .and_then(|()| {
+                self.lease
+                    .lock()
+                    .map_err(|_| "receiving lease poisoned".to_owned())?
+                    .renew(now)
+            })
+            .and_then(|()| self.destinations.check_live());
         if result.is_err() {
             self.destinations.stop();
         }
@@ -164,7 +170,7 @@ impl Active {
     }
 
     pub fn during_recovery<T>(
-        &mut self,
+        &self,
         recover: impl FnOnce(&std::sync::Arc<Destinations>) -> Result<T, String>,
     ) -> Result<T, String> {
         self.renew(crate::store::now_unix())?;
@@ -201,6 +207,65 @@ pub struct Destinations {
     root: Directory,
     path: PathBuf,
     directories: Mutex<Vec<(PathBuf, ReceiveDirectory)>>,
+    #[cfg(test)]
+    check_pause: Mutex<Option<Arc<CheckGate>>>,
+}
+
+#[cfg(test)]
+struct CheckGate {
+    limit: usize,
+    entered: std::sync::atomic::AtomicUsize,
+    released: Mutex<bool>,
+    wake: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl CheckGate {
+    fn wait(&self) {
+        if self.entered.fetch_add(1, Ordering::Relaxed) < self.limit {
+            let _ = self
+                .wake
+                .wait_timeout_while(
+                    self.released.lock().unwrap(),
+                    std::time::Duration::from_secs(3),
+                    |released| !*released,
+                )
+                .unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct CheckPause(Arc<CheckGate>);
+
+#[cfg(test)]
+impl CheckPause {
+    pub(crate) fn new(destinations: &Destinations, limit: usize) -> Self {
+        let gate = Arc::new(CheckGate {
+            limit,
+            entered: std::sync::atomic::AtomicUsize::new(0),
+            released: Mutex::new(false),
+            wake: std::sync::Condvar::new(),
+        });
+        *destinations.check_pause.lock().unwrap() = Some(gate.clone());
+        Self(gate)
+    }
+
+    pub(crate) fn entered(&self) -> usize {
+        self.0.entered.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn release(&self) {
+        *self.0.released.lock().unwrap() = true;
+        self.0.wake.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl Drop for CheckPause {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 pub struct PreparedRemoval {
@@ -280,6 +345,8 @@ impl Destinations {
             root,
             path: path.to_owned(),
             directories: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            check_pause: Mutex::new(None),
         }
     }
 
@@ -301,6 +368,13 @@ impl Destinations {
 
     pub fn check_current(&self) -> Result<(), String> {
         self.check_live()?;
+        #[cfg(test)]
+        {
+            let gate = self.check_pause.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.wait();
+            }
+        }
         if storage_identity(&self.path)? != self.identity()? {
             return Err("receiving folder or mount changed; reopen storage in Storage".to_owned());
         }
@@ -309,7 +383,7 @@ impl Destinations {
         if self.contract() == NasContract::ServerAcknowledged {
             vot_platform_fs::validate_nas_mount(self.root.file()).map_err(|e| e.to_string())?;
         }
-        Ok(())
+        self.check_live()
     }
 
     pub fn is_nas(&self) -> bool {
@@ -829,7 +903,7 @@ pub(crate) mod tests {
             .tempdir()
             .unwrap();
         let destinations = Destinations::open(root.path(), NasContract::Unqualified).unwrap();
-        let mut active = Active::open(destinations, "first").unwrap();
+        let active = Active::open(destinations, "first").unwrap();
         assert_eq!(active.during_recovery(|_| Ok(7)).unwrap(), 7);
         let record = crate::lease::path(root.path());
         assert!(active

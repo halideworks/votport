@@ -90,8 +90,8 @@ impl TestServer {
     /// sessions, and hands back its directories for [`boot`].
     async fn suspend(self) -> (tempfile::TempDir, tempfile::TempDir) {
         app::suspend_sessions(&self.application).await;
-        // The old App outlives this in-process restart; a real clean exit
-        // makes this same call as its last step.
+        // This quiescent in-process fixture outlives its old App; production
+        // keeps both kernel locks until process exit.
         app::release_data_lock(&self.application);
         (self._data, self._received)
     }
