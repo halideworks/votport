@@ -536,8 +536,16 @@ Use a matching binary for older archives, take fresh backups after conversion,
 and upgrade replicas together.
 
 The explicit `votport convert-schema35` command converts a disposable schema-35
-copy to schema 41 without starting the application. Follow the
+copy to schema 42 without starting the application. Follow the
 [offline conversion procedure](schema35-conversion.md); startup never runs it.
+
+Schema 41 upgrades to 42 during startup under the data-directory ownership lock,
+before workers start. This adds private storage for ordinary download addresses;
+existing files, grants, passwords, expiry and download counts are unchanged.
+Older ordinary addresses remain valid but cannot be reconstructed if no copy was
+saved. New addresses can be reopened from Deliver. Workflow addresses retain their
+existing private token storage. The database and its backups contain credentials
+and must remain private. Upgrade replicas to the same release.
 
 The local platform password is break-glass for every namespace; named
 tenants have no separate password.

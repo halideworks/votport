@@ -1,6 +1,6 @@
 # Offline schema 35 conversion
 
-`votport convert-schema35` converts schema 35 to schema 41. It does not start
+`votport convert-schema35` converts schema 35 to schema 42. It does not start
 HTTP listeners, process jobs, send notifications or copy payload files. Normal
 startup still refuses an incompatible database. Other source and target schema
 versions are refused.

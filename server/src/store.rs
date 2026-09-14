@@ -466,7 +466,7 @@ pub struct SettingsOverlay {
     pub draining_source: &'static str,
 }
 
-pub(crate) const SCHEMA_VERSION: u64 = 41;
+pub(crate) const SCHEMA_VERSION: u64 = 42;
 pub(crate) const DELIVERED_CANDIDATE_PAGE: usize = 128;
 
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
@@ -596,7 +596,8 @@ CREATE TABLE IF NOT EXISTS outbound_grants (
     last_download_at INTEGER,
     files_json TEXT NOT NULL DEFAULT '[]',
     file_count INTEGER NOT NULL DEFAULT 1,
-    notifications_json TEXT
+    notifications_json TEXT,
+    share_token TEXT
 );
 CREATE INDEX IF NOT EXISTS outbound_grants_tenant_created ON outbound_grants(tenant, created_at);
 CREATE INDEX IF NOT EXISTS outbound_grants_file
@@ -2953,7 +2954,7 @@ impl Store {
         grant: OutboundGrant,
         operation: Option<&AutomationOperation>,
     ) -> Result<(), String> {
-        self.insert_workflow_grant(grant, operation, None)
+        self.insert_workflow_grant(grant, operation, None, None)
     }
 
     pub fn insert_workflow_grant(
@@ -2961,7 +2962,11 @@ impl Store {
         mut grant: OutboundGrant,
         operation: Option<&AutomationOperation>,
         job: Option<&crate::workflow::Job>,
+        share_token: Option<&str>,
     ) -> Result<(), String> {
+        if share_token.is_some_and(|token| crate::auth::hash_token(token) != grant.token_hash) {
+            return Err("download token does not match grant".into());
+        }
         grant.validate_names()?;
         let delivery_digest = evidence::grant_digest(&grant);
         let (bytes_hi, bytes_lo) = split_bytes(grant.bytes);
@@ -2993,8 +2998,8 @@ impl Store {
                  (id, token_hash, password_hash, tenant, link_id, upload_id, package_root, name, suite,
                   root, file_index, bytes_hi, bytes_lo, label, created_at, expires_at, revoked_at,
                   downloads, max_downloads, first_download_at, last_download_at,
-                  files_json, file_count, notifications_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                  files_json, file_count, notifications_json, share_token)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
                 rusqlite::params![
                     &grant_id,
                     grant.token_hash,
@@ -3026,6 +3031,7 @@ impl Store {
                     files_json,
                     file_count,
                     serde_json::to_string(&grant.notifications).map_err(|e| e.to_string())?,
+                    share_token.filter(|_| job.is_none()),
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -3506,18 +3512,39 @@ impl Store {
         })
     }
 
+    /// Private bearer storage follows the workflow token model. Never include
+    /// it in grant listings, audits, or public metadata.
+    pub(crate) fn outbound_share_token(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<Option<String>, String> {
+        self.with(|connection| {
+            connection.query_row(
+                "SELECT CASE WHEN j.id IS NULL THEN g.share_token ELSE j.token END, g.token_hash
+                 FROM outbound_grants AS g
+                 LEFT JOIN delivery_jobs AS j ON j.id=g.id AND j.tenant=g.tenant
+                 WHERE g.tenant=?1 AND g.id=?2 AND g.revoked_at IS NULL",
+                rusqlite::params![tenant, id],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+            ).optional().map(|row| row.and_then(|(token, hash)|
+                token.filter(|token| crate::auth::hash_token(token) == hash)))
+        })
+    }
+
     pub fn rotate_outbound_grant_token(
         &self,
         tenant: &str,
         id: &str,
-        token_hash: &str,
+        token: &str,
     ) -> Result<bool, String> {
         self.with(|connection| {
             connection
                 .execute(
-                    "UPDATE outbound_grants SET token_hash = ?3
-                     WHERE tenant = ?1 AND id = ?2 AND revoked_at IS NULL",
-                    rusqlite::params![tenant, id, token_hash],
+                    "UPDATE outbound_grants SET token_hash=?3, share_token=?4
+                     WHERE tenant=?1 AND id=?2 AND revoked_at IS NULL
+                     AND NOT EXISTS(SELECT 1 FROM delivery_jobs WHERE id=?2)",
+                    rusqlite::params![tenant, id, crate::auth::hash_token(token), token],
                 )
                 .map(|changed| changed > 0)
         })
@@ -4840,6 +4867,16 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
     if !empty {
+        if validate_schema(connection, 41).is_ok() {
+            let transaction = connection.transaction().map_err(|e| e.to_string())?;
+            transaction
+                .execute_batch(
+                    "ALTER TABLE outbound_grants ADD COLUMN share_token TEXT;
+                UPDATE meta SET value='42' WHERE key='schema_version';",
+                )
+                .map_err(|e| e.to_string())?;
+            transaction.commit().map_err(|e| e.to_string())?;
+        }
         return validate_schema(connection, SCHEMA_VERSION);
     }
     let transaction = connection.transaction().map_err(|e| e.to_string())?;
@@ -6354,6 +6391,137 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn saved_download_address_survives_restart_and_rotates_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let token = crate::auth::random_token();
+        let mut grant = test_outbound_grant("saved", "acme", 0);
+        grant.token_hash = crate::auth::hash_token(&token);
+        assert!(store
+            .insert_workflow_grant(grant.clone(), None, None, Some("wrong"))
+            .is_err());
+        assert!(store.outbound_grant_by_id("saved").unwrap().is_none());
+        store
+            .insert_workflow_grant(grant.clone(), None, None, Some(&token))
+            .unwrap();
+        assert_eq!(store.outbound_share_token("other", "saved").unwrap(), None);
+        assert_eq!(store.outbound_share_token("acme", "missing").unwrap(), None);
+        store
+            .with(|connection| {
+                connection
+                    .execute(
+                        "UPDATE outbound_grants SET share_token='mismatched' WHERE id='saved'",
+                        [],
+                    )
+                    .map(|_| ())
+            })
+            .unwrap();
+        assert_eq!(store.outbound_share_token("acme", "saved").unwrap(), None);
+        store
+            .with(|connection| {
+                connection
+                    .execute(
+                        "UPDATE outbound_grants SET share_token=?1 WHERE id='saved'",
+                        [&token],
+                    )
+                    .map(|_| ())
+            })
+            .unwrap();
+        drop(store);
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(
+            store
+                .outbound_share_token("acme", "saved")
+                .unwrap()
+                .as_deref(),
+            Some(token.as_str())
+        );
+        let next = crate::auth::random_token();
+        store
+            .with(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER refuse_token BEFORE UPDATE OF share_token ON outbound_grants
+             BEGIN SELECT RAISE(ABORT, 'fixture refusal'); END;",
+                )
+            })
+            .unwrap();
+        assert!(store
+            .rotate_outbound_grant_token("acme", "saved", &next)
+            .is_err());
+        assert_eq!(
+            store
+                .outbound_share_token("acme", "saved")
+                .unwrap()
+                .as_deref(),
+            Some(token.as_str())
+        );
+        assert_eq!(store.outbound_grant_by_id("saved").unwrap().unwrap(), grant);
+        store
+            .with(|connection| connection.execute_batch("DROP TRIGGER refuse_token"))
+            .unwrap();
+        assert!(store
+            .rotate_outbound_grant_token("acme", "saved", &next)
+            .unwrap());
+        assert_eq!(
+            store.outbound_share_token("acme", "saved").unwrap(),
+            Some(next)
+        );
+        assert!(store
+            .outbound_grant_by_token_hash(&crate::auth::hash_token(&token))
+            .unwrap()
+            .is_none());
+        store.revoke_outbound_grant("acme", "saved", 12).unwrap();
+        assert_eq!(store.outbound_share_token("acme", "saved").unwrap(), None);
+    }
+
+    #[test]
+    fn schema41_upgrade_preserves_existing_grants_and_can_store_new_addresses() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let grant = test_outbound_grant("preserved", "acme", 0);
+        store.insert_outbound_grant(grant.clone()).unwrap();
+        store
+            .with(|connection| {
+                connection.execute_batch(
+                    "ALTER TABLE outbound_grants DROP COLUMN share_token;
+             UPDATE meta SET value='41' WHERE key='schema_version';",
+                )
+            })
+            .unwrap();
+        drop(store);
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(
+            store.outbound_grant_by_id("preserved").unwrap().unwrap(),
+            grant
+        );
+        assert_eq!(
+            store.outbound_share_token("acme", "preserved").unwrap(),
+            None
+        );
+        let token = crate::auth::random_token();
+        assert!(store
+            .rotate_outbound_grant_token("acme", "preserved", &token)
+            .unwrap());
+        assert_eq!(
+            store.outbound_share_token("acme", "preserved").unwrap(),
+            Some(token)
+        );
+        drop(store);
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .with(|connection| {
+                let version: String = connection.query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(version, "42");
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn outbound_grant_token_rotation_is_tenant_scoped() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -6373,7 +6541,7 @@ pub(crate) mod tests {
             .is_none());
         assert_eq!(
             store
-                .outbound_grant_by_token_hash("new-hash")
+                .outbound_grant_by_token_hash(&crate::auth::hash_token("new-hash"))
                 .unwrap()
                 .unwrap()
                 .id,
@@ -8620,7 +8788,7 @@ mod settings_tests {
 
     #[test]
     fn unsupported_schema_is_refused_without_rewriting_data() {
-        let previous = (SCHEMA_VERSION - 1).to_string();
+        let previous = "40".to_owned();
         let future = (SCHEMA_VERSION + 1).to_string();
         for version in [
             None,

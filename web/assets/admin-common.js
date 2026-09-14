@@ -404,14 +404,14 @@ export function undoable({ text, commit, restore = () => {}, focus, returnFocus 
   });
 }
 
-/// Fills the shared show-once outbound grant URL card on receive/deliver.
+/// Fills the shared outbound grant URL card on receive/deliver.
 export function showGrantResult(url, protectedGrant = false) {
   const output = document.getElementById('outbound-url');
   document.getElementById('outbound-result').hidden = false;
   output.value = url;
   output.onclick = () => output.select();
   document.getElementById('outbound-note').textContent =
-    `Shown once. Copy it now; this URL cannot be retrieved later.`
+    `You can copy this link again from Download links on the Deliver page.`
     + (protectedGrant ? ' This download is password-protected. Send the password by a separate channel.' : '');
   const copy = document.getElementById('outbound-copy');
   copy.onclick = () => copyToClipboard(copy, url);

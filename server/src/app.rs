@@ -3309,6 +3309,10 @@ pub fn router(app: Arc<App>) -> Router {
             axum::routing::patch(api::update_outbound_grant).delete(api::delete_outbound_grant),
         )
         .route(
+            "/api/admin/outbound-grants/{id}/url",
+            get(api::outbound::outbound_grant_url),
+        )
+        .route(
             "/api/admin/automation-tokens",
             get(api::list_automation_tokens).post(api::create_automation_token),
         )

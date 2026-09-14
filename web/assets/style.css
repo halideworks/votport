@@ -2088,6 +2088,8 @@ body:has(#nav) fieldset {
  border: 0;
  border-top: 1px solid var(--border);
 }
+body:has(#nav) #deliver-fields,
+body:has(#nav) #library-files { margin: 0; padding: 0; border: 0; }
 body:has(#nav) legend {
  padding: 0 0.75rem 0 0;
  color: var(--text);

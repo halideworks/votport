@@ -16,6 +16,7 @@ import {
   api,
   button,
   confirmModal,
+  copyToClipboard,
   formatBytes,
   formatWhen,
   requireSession,
@@ -158,6 +159,24 @@ function renderGrants() {
       const actions = document.createElement('div');
       actions.className = 'actions';
       if (status === 'active') {
+        const copyLink = button('Copy link', 'tiny', async () => {
+          copyLink.disabled = true;
+          try {
+            const { url } = await api(`/api/admin/outbound-grants/${grant.id}/url`);
+            showGrantResult(url, grant.has_password);
+            try {
+              await copyToClipboard(copyLink, url);
+              announce('outbound-grants-status', 'Download link copied.');
+            } catch {
+              $('outbound-url').focus();
+              $('outbound-url').select();
+              announce('outbound-grants-status', 'Your download address is selected below. Copy it to share.');
+            }
+          } finally {
+            copyLink.disabled = false;
+          }
+        });
+        actions.append(copyLink);
         actions.append(
           button('New address', 'tiny', async () => {
             if (
@@ -251,6 +270,7 @@ const MAX_LIBRARY_SELECTION = 100_000;
 const MAX_LIBRARY_PROJECT_SUGGESTIONS = 200;
 const selectedLibraryPaths = new Map();
 let deliverGrantBusy = false;
+let librarySelectionsPending = 0;
 let libraryFiles = [];
 let libraryDirectories = [];
 let libraryDirectory = '';
@@ -406,6 +426,7 @@ async function toggleLibraryFolder(directory, checkbox) {
     return;
   }
   checkbox.disabled = true;
+  librarySelectionsPending += 1;
   try {
     const response = await api(`/api/admin/outbound-files?selection=${encodeURIComponent(directory)}`);
     const files = (response.files || []).filter((file) => parseLibraryPath(file.path));
@@ -426,6 +447,7 @@ async function toggleLibraryFolder(directory, checkbox) {
     $('library-selection-error').hidden = false;
     updateLibrarySelectionStatus();
   } finally {
+    librarySelectionsPending -= 1;
     checkbox.disabled = false;
   }
 }
@@ -505,14 +527,9 @@ function renderLibraryDirectory(directory, container) {
   });
   open.setAttribute('aria-label', `Open folder ${name}`);
   open.title = name;
-  const share = button('Share folder', 'tiny', async () => {
-    await submitDeliverGrant({ directory }, share);
-  });
-  share.dataset.libraryFolderShare = 'true';
-  share.setAttribute('aria-label', `Share folder ${directory}`);
   const row = document.createElement('div');
   row.className = 'library-file library-folder';
-  row.append(select, open, share);
+  row.append(select, open);
   container.append(row);
 }
 
@@ -645,18 +662,17 @@ document.addEventListener('drop', async (event) => {
   }
 });
 
-function deliverFormValues(selection) {
+function deliverFormValues() {
   $('deliver-error').hidden = true;
-  const paths = selection.directory === undefined
-    ? [...selectedLibraryPaths.keys()]
-    : [];
-  if (selection.directory === undefined && paths.length > MAX_LIBRARY_SELECTION) {
+  if (librarySelectionsPending) throw new Error('Wait for the folder selection to finish before creating a link.');
+  const paths = [...selectedLibraryPaths.keys()];
+  if (paths.length > MAX_LIBRARY_SELECTION) {
     throw new Error(`Select at most ${MAX_LIBRARY_SELECTION} files.`);
   }
   const expires = Number($('deliver-expires').value);
   const maxDownloadsValue = $('deliver-max-downloads').value.trim();
   const maxDownloads = maxDownloadsValue ? Number(maxDownloadsValue) : null;
-  if (selection.directory === undefined && !paths.length) {
+  if (!paths.length) {
     throw new Error('Select at least one file.');
   }
   if (!Number.isInteger(expires) || expires < 1 || expires > 30) {
@@ -666,10 +682,9 @@ function deliverFormValues(selection) {
     throw new Error('Max downloads must be between 1 and 10000.');
   }
   const label = $('deliver-label').value;
-  const directoryLabel = selection.directory?.split('/').filter(Boolean).pop();
   return {
-    ...(selection.directory === undefined ? { paths } : { directory: selection.directory }),
-    label: selection.directory !== undefined && !label.trim() ? directoryLabel : label,
+    paths,
+    label,
     expires_days: expires,
     password: $('deliver-password').value || null,
     max_downloads: maxDownloads,
@@ -677,25 +692,30 @@ function deliverFormValues(selection) {
   };
 }
 
-async function submitDeliverGrant(selection, control) {
+async function submitDeliverGrant() {
   if (deliverGrantBusy) return;
   const error = $('deliver-error');
   error.hidden = true;
   let request;
   try {
-    request = deliverFormValues(selection);
+    request = deliverFormValues();
   } catch (validationError) {
     error.textContent = validationError.message;
     error.hidden = false;
     return;
   }
-  deliverGrantBusy = true; $('deliver-form').inert = true;
+  deliverGrantBusy = true;
+  const form = $('deliver-form');
   const submit = $('deliver-submit');
-  submit.disabled = true;
-  document.querySelectorAll('[data-library-folder-share]').forEach((button) => {
-    button.disabled = true;
-  });
-  control.disabled = true;
+  const progress = $('deliver-progress');
+  form.setAttribute('aria-busy', 'true');
+  $('deliver-fields').disabled = true;
+  $('library-files').disabled = true;
+  submit.textContent = 'Preparing link…';
+  progress.textContent = 'Verifying selected files and preparing your download link. Large files can take a few minutes. Keep this page open.';
+  progress.hidden = false;
+  progress.focus({ preventScroll: true });
+  $('outbound-result').hidden = true;
   try {
     const response = await api('/api/admin/outbound-grants', {
       method: 'POST',
@@ -705,23 +725,25 @@ async function submitDeliverGrant(selection, control) {
     markFormSaved($('deliver-form'));
     showGrantResult(response.url, response.grant?.has_password);
     $('deliver-password').value = '';
-    await refreshGrants();
+    $('outbound-url').focus();
+    refreshGrants();
   } catch (requestError) {
     $('deliver-error').textContent = requestError.message;
     $('deliver-error').hidden = false;
   } finally {
-    deliverGrantBusy = false; $('deliver-form').inert = false;
-    submit.disabled = false;
-    document.querySelectorAll('[data-library-folder-share]').forEach((button) => {
-      button.disabled = false;
-    });
-    control.disabled = false;
+    deliverGrantBusy = false;
+    form.removeAttribute('aria-busy');
+    $('deliver-fields').disabled = false;
+    $('library-files').disabled = false;
+    submit.textContent = 'Create download link';
+    progress.hidden = true;
+    if (!error.hidden) error.focus();
   }
 }
 
 $('deliver-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  await submitDeliverGrant({}, $('deliver-submit'));
+  await submitDeliverGrant();
 });
 
 // A search result may name a grant past the first page: page forward until
