@@ -578,7 +578,7 @@ fn validate_admin_password_hash(phc: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_public_url(url: &str) -> Result<(), String> {
+pub(crate) fn validate_public_url(url: &str) -> Result<(), String> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|error| format!("VOTPORT_PUBLIC_URL is not a valid URL: {error}"))?;
     if !matches!(parsed.scheme(), "https" | "http") {

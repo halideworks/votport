@@ -65,9 +65,13 @@ impl ReceiptSigner {
             }
             Err(error) => return Err(format!("read {}: {error}", path.display())),
         };
+        Ok(Self::from_seed(seed))
+    }
+
+    pub(crate) fn from_seed(seed: [u8; 32]) -> Self {
         let key = SigningKey::from_bytes(&seed);
         let public_hex = hex::encode(key.verifying_key().to_bytes());
-        Ok(Self { key, public_hex })
+        Self { key, public_hex }
     }
 
     pub(crate) fn sign_route(

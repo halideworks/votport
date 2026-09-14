@@ -120,7 +120,7 @@ pub struct EventExport {
     pub events: Vec<DeliveryEvent>,
 }
 
-const EVENT_COLUMNS: &str =
+pub(super) const EVENT_COLUMNS: &str =
     "id,tenant,grant_id,kind,created_at,payload,previous_hash,hash,issuer,signature";
 pub const MAX_EVENT_PAGE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -128,7 +128,7 @@ fn invalid_chain() -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure("invalid or incomplete delivery event chain".into())
 }
 
-fn event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryEvent> {
+pub(super) fn event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryEvent> {
     for column in [1, 2, 3, 5, 6, 7, 8, 9] {
         if matches!(row.get_ref(column)?, rusqlite::types::ValueRef::Text(bytes) if bytes.len() > MAX_EVENT_PAGE_BYTES)
         {

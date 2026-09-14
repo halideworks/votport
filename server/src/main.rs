@@ -11,6 +11,13 @@ use votport::{app, config};
 async fn main() {
     let mut arguments = std::env::args().skip(1);
     let command = arguments.next();
+    if command.as_deref() == Some("convert-schema35") {
+        if let Err(error) = votport::store::conversion::command(arguments.collect()) {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if command.as_deref() == Some("share") {
         let arguments: Vec<String> = arguments.collect();
         let json = arguments.iter().any(|arg| arg == "--json");
