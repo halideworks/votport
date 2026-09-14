@@ -956,6 +956,55 @@ await page.waitForFunction(
   { timeout: 15000 },
 );
 
+const incompleteSearchText = "Search incomplete. Refine your search or browse folders.";
+const noMatchSearchText = "No matching library files.";
+const searchFixturePath = `${FOLDER_PROJECT}/folder-pick/nested/folder-nested.txt`;
+const searchResponses = [
+  { files: [], truncated: true },
+  { files: [{ path: searchFixturePath, bytes: 25 }], truncated: true },
+  { files: [], truncated: false },
+];
+const searchRoute = "**/api/admin/outbound-files?q=*";
+await page.route(searchRoute, async (route) => {
+  const response = searchResponses.shift();
+  if (!response) throw new Error("unexpected extra library search request");
+  await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(response) });
+});
+try {
+  await page.fill("#library-search", "budget-zero");
+  await page.waitForFunction(
+    (text) => document.querySelector("#library-files")?.innerText === text,
+    incompleteSearchText,
+  );
+  if (await page.locator("#library-files").getByText(noMatchSearchText, { exact: true }).count()) {
+    throw new Error("truncated empty search claimed no matching files");
+  }
+
+  await page.fill("#library-search", "budget-one");
+  await page.waitForFunction(
+    ([expected, incomplete]) => document.querySelector("#library-files")?.innerText.includes(expected)
+      && document.querySelector("#library-files")?.innerText.includes(incomplete),
+    [searchFixturePath, incompleteSearchText],
+  );
+  const oneMatchText = await page.locator("#library-files").innerText();
+  if (oneMatchText.includes(noMatchSearchText)) throw new Error("truncated partial search claimed no matching files");
+
+  await page.fill("#library-search", "budget-done");
+  await page.getByText(noMatchSearchText, { exact: true }).waitFor();
+  if (await page.getByText(incompleteSearchText, { exact: true }).count()) {
+    throw new Error("completed empty search reported incomplete");
+  }
+} finally {
+  await page.unroute(searchRoute);
+}
+if (searchResponses.length) throw new Error(`library search fixtures unused: ${searchResponses.length}`);
+console.log("library search reports incomplete zero and partial results and completed no-match results: ok");
+await page.fill("#library-search", "");
+await page.waitForSelector(
+  `#library-files button[aria-label="Share folder ${FOLDER_PROJECT}"]`,
+  { state: "visible", timeout: 15000 },
+);
+
 await page.fill("#deliver-label", "browser outbound e2e");
 await page.click("#deliver-submit");
 await page.waitForSelector("#outbound-result:not([hidden])", { timeout: 30000 });

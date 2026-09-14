@@ -71,6 +71,10 @@ const OUTBOUND_GRANT_PREVIEW_FILES: usize = 64;
 pub const MAX_GRANT_REQUEST_BYTES: usize = 256 * 1024 * 1024;
 const MAX_LIBRARY_SEARCH_CHARS: usize = 100;
 const MAX_LIBRARY_SEARCH_RESULTS: usize = 200;
+// ponytail: bounded at 100,000 entries and 128 levels per query; add a search
+// cursor if larger libraries need full coverage.
+const MAX_LIBRARY_SEARCH_NODES: usize = 100_000;
+const MAX_LIBRARY_SEARCH_DEPTH: usize = 128;
 const RETAINED_LIBRARY_SEARCH_RESULTS: usize = MAX_LIBRARY_SEARCH_RESULTS + 1;
 const LIBRARY_HASH_CONCURRENCY: usize = 4;
 pub(crate) const LIBRARY_GRANT_CONCURRENCY: usize = 4;
@@ -1128,11 +1132,21 @@ fn search_library_dir(
     directory: &Path,
     query: &str,
     matches: &mut BinaryHeap<(String, String, u64)>,
-) {
+    visited: &mut usize,
+    max_nodes: usize,
+    depth: usize,
+) -> bool {
     let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
+        return true;
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        if *visited >= max_nodes {
+            return true;
+        }
+        *visited += 1;
+        let Ok(entry) = entry else {
+            continue;
+        };
         let name = entry.file_name();
         if is_private_library_name(&name) {
             continue;
@@ -1152,7 +1166,11 @@ fn search_library_dir(
             continue;
         }
         if meta.file_type().is_dir() {
-            search_library_dir(root, &path, query, matches);
+            if depth >= MAX_LIBRARY_SEARCH_DEPTH
+                || search_library_dir(root, &path, query, matches, visited, max_nodes, depth + 1)
+            {
+                return true;
+            }
         } else if meta.file_type().is_file() {
             let Some(relative) = path.strip_prefix(root).ok() else {
                 continue;
@@ -1168,15 +1186,26 @@ fn search_library_dir(
             }
         }
     }
+    false
 }
 
 fn list_library_search(root: &Path, query: &str) -> (Vec<serde_json::Value>, bool) {
+    list_library_search_with_budget(root, query, MAX_LIBRARY_SEARCH_NODES)
+}
+
+fn list_library_search_with_budget(
+    root: &Path,
+    query: &str,
+    max_nodes: usize,
+) -> (Vec<serde_json::Value>, bool) {
     if !library_root_safe(root) {
         return (Vec::new(), false);
     }
     let mut matches = BinaryHeap::new();
-    search_library_dir(root, root, query, &mut matches);
-    let truncated = matches.len() > MAX_LIBRARY_SEARCH_RESULTS;
+    let mut visited = 0;
+    let budget_exhausted =
+        search_library_dir(root, root, query, &mut matches, &mut visited, max_nodes, 0);
+    let truncated = budget_exhausted || matches.len() > MAX_LIBRARY_SEARCH_RESULTS;
     let mut matches = matches.into_sorted_vec();
     matches.truncate(MAX_LIBRARY_SEARCH_RESULTS);
     (
@@ -7794,6 +7823,50 @@ mod tests {
             files[MAX_LIBRARY_DIRECTORY_ENTRIES - 1]["path"],
             "file-0999.bin"
         );
+    }
+
+    #[test]
+    fn library_search_stops_at_node_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("missed-match.bin"), b"x").unwrap();
+        let (matches, truncated) = list_library_search_with_budget(directory.path(), "match", 1);
+        assert!(matches.is_empty());
+        assert!(truncated);
+    }
+
+    #[test]
+    fn library_search_stops_at_depth_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut nested = directory.path().to_owned();
+        for index in 0..=MAX_LIBRARY_SEARCH_DEPTH {
+            nested.push(format!("nested-{index:03}"));
+            std::fs::create_dir(&nested).unwrap();
+        }
+        std::fs::write(nested.join("missed-match.bin"), b"x").unwrap();
+
+        let (matches, truncated) = list_library_search(directory.path(), "match");
+
+        assert!(matches.is_empty());
+        assert!(truncated);
+    }
+
+    #[test]
+    fn library_search_reports_missing_directory_as_truncated() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut matches = BinaryHeap::new();
+        let mut visited = 0;
+
+        assert!(search_library_dir(
+            directory.path(),
+            &directory.path().join("missing"),
+            "match",
+            &mut matches,
+            &mut visited,
+            1,
+            0,
+        ));
     }
 
     #[tokio::test]

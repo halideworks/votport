@@ -248,7 +248,6 @@ async function refreshGrants(reset = true) {
 $('outbound-grants-load-more').addEventListener('click', () => refreshGrants(false));
 
 const MAX_LIBRARY_SELECTION = 1_000_000;
-const MAX_LIBRARY_SEARCH_RESULTS = 200;
 const MAX_LIBRARY_PROJECT_SUGGESTIONS = 200;
 const selectedLibraryPaths = new Map();
 let deliverGrantBusy = false;
@@ -527,10 +526,9 @@ function renderLibraryView() {
     if (libraryTruncated) {
       const note = document.createElement('p');
       note.className = 'muted';
-      note.textContent = `Showing first ${MAX_LIBRARY_SEARCH_RESULTS}; refine search.`;
+      note.textContent = 'Search incomplete. Refine your search or browse folders.';
       container.append(note);
-    }
-    if (!libraryFiles.length) {
+    } else if (!libraryFiles.length) {
       const empty = document.createElement('p');
       empty.className = 'muted';
       empty.textContent = 'No matching library files.';

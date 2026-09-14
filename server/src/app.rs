@@ -5015,6 +5015,8 @@ async fn sweep_task<T: Send + 'static>(
         .ok()
 }
 
+const RETENTION_LINK_PAGE_SIZE: usize = 128;
+
 async fn sweep_short(app: &Arc<App>) {
     sweep_task(app, "idle sessions", |app| {
         app.sessions.sweep(app.config.session_idle_secs)
@@ -5070,16 +5072,45 @@ async fn sweep_daily(app: &Arc<App>) {
     if settings.upload_retention_days > 0 {
         let cutoff = crate::store::now_unix()
             .saturating_sub(settings.upload_retention_days.saturating_mul(86_400));
-        let links = match sweep_task(app, "retention links", |app| app.store.all_links()).await {
-            Some(Ok(links)) => links,
-            Some(Err(error)) => {
-                tracing::error!(%error, "link read failed; skipping the retention sweep");
-                return;
+        let mut after = None;
+        loop {
+            let page_after = after.clone();
+            let link_ids = match sweep_task(app, "retention link ids", move |app| {
+                app.store
+                    .retention_link_ids(page_after.as_deref(), RETENTION_LINK_PAGE_SIZE)
+            })
+            .await
+            {
+                Some(Ok(link_ids)) => link_ids,
+                Some(Err(error)) => {
+                    tracing::error!(%error, "link read failed; skipping the retention sweep");
+                    return;
+                }
+                None => return,
+            };
+            let page_len = link_ids.len();
+            for (tenant, id) in link_ids {
+                after = Some(id.clone());
+                // ponytail: one link's complete history remains the memory ceiling;
+                // page link_uploads/files if a single link grows beyond memory.
+                let link = match sweep_task(app, "retention link", move |app| {
+                    app.store.link(&tenant, &id)
+                })
+                .await
+                {
+                    Some(Ok(Some(link))) => link,
+                    Some(Ok(None)) => continue,
+                    Some(Err(error)) => {
+                        tracing::error!(%error, "link read failed; skipping retention for link");
+                        continue;
+                    }
+                    None => return,
+                };
+                expire_link_uploads(app, link, cutoff).await;
             }
-            None => return,
-        };
-        for link in links {
-            expire_link_uploads(app, link, cutoff).await;
+            if page_len < RETENTION_LINK_PAGE_SIZE {
+                break;
+            }
         }
     }
 }
