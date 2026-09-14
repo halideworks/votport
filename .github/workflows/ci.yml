@@ -263,6 +263,7 @@ jobs:
             status=$?
             if [ "$status" -ne 0 ]; then
               docker logs votport-browser-e2e || true
+              docker logs votport-browser-peer || true
             fi
             docker rm -f votport-browser-e2e votport-browser-peer >/dev/null 2>&1 || true
             docker network rm votport-browser-trade >/dev/null 2>&1 || true

@@ -46,8 +46,8 @@ export async function requireSession() {
 }
 
 // Masthead search: one request, results grouped by what they are, each row
-// a link into the page that owns it. Opens on typing, closes on Escape or a
-// click elsewhere; Enter follows the first row.
+// a link into the page that owns it. The input keeps focus while arrows move
+// through the result options; Escape or a click elsewhere closes the panel.
 function mountSearch(session) {
   const form = document.getElementById('global-search');
   const input = document.getElementById('global-search-input');
@@ -59,27 +59,71 @@ function mountSearch(session) {
     form.hidden = true;
     return;
   }
+  input.setAttribute('role', 'combobox');
+  input.setAttribute('autocomplete', 'off');
+  input.setAttribute('aria-controls', results.id);
+  input.setAttribute('aria-expanded', 'false');
+  input.setAttribute('aria-autocomplete', 'list');
+  input.setAttribute('aria-haspopup', 'listbox');
+  results.setAttribute('role', 'listbox');
+  results.setAttribute('aria-label', 'Search results');
+  let status = document.getElementById('global-search-status');
+  if (!status) {
+    status = document.createElement('p');
+    status.id = 'global-search-status';
+    status.className = 'visually-hidden';
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+    form.append(status);
+  }
   let timer = null;
   let latest = 0;
+  let activeIndex = -1;
+  const options = () => [...results.querySelectorAll('[role="option"]')];
+  const setActive = (index) => {
+    const rows = options();
+    activeIndex = index < 0 || !rows.length ? -1 : index % rows.length;
+    rows.forEach((row, rowIndex) => row.setAttribute('aria-selected', String(rowIndex === activeIndex)));
+    if (activeIndex < 0) {
+      input.removeAttribute('aria-activedescendant');
+      return;
+    }
+    input.setAttribute('aria-activedescendant', rows[activeIndex].id);
+    rows[activeIndex].scrollIntoView({ block: 'nearest' });
+  };
+  const setExpanded = (expanded) => {
+    results.hidden = !expanded;
+    input.setAttribute('aria-expanded', String(expanded));
+  };
   // Closing also retires any request still in flight so it cannot reopen
   // the panel with stale rows.
   const close = () => {
     clearTimeout(timer);
     latest += 1;
-    results.hidden = true;
+    setActive(-1);
+    setExpanded(false);
     results.replaceChildren();
+    status.textContent = '';
   };
   // A row on the page already open is a fragment change, not a load.
   window.addEventListener('hashchange', () => { close(); revealHash(); });
+  let optionNumber = 0;
+  let resultCount = 0;
   const group = (title, rows, render) => {
     if (!rows.length) return;
     const heading = document.createElement('div');
     heading.className = 'search-group';
+    heading.setAttribute('role', 'presentation');
     heading.textContent = title;
     results.append(heading);
     for (const row of rows) {
       const link = document.createElement('a');
       link.className = 'search-row';
+      link.id = `global-search-option-${optionNumber}`;
+      optionNumber += 1;
+      link.tabIndex = -1;
+      link.setAttribute('role', 'option');
+      link.setAttribute('aria-selected', 'false');
       const { href, primary, secondary } = render(row);
       link.href = href;
       const main = document.createElement('span');
@@ -88,8 +132,10 @@ function mountSearch(session) {
       meta.className = 'muted';
       meta.textContent = secondary;
       link.append(main, meta);
+      link.addEventListener('click', close);
       results.append(link);
     }
+    resultCount += rows.length;
   };
   const run = async () => {
     const phrase = input.value.trim();
@@ -100,16 +146,21 @@ function mountSearch(session) {
       hit = await api(`/api/admin/search?q=${encodeURIComponent(phrase)}`);
     } catch (error) {
       if (ticket !== latest) return;
+      setActive(-1);
       results.replaceChildren();
       const failed = document.createElement('div');
       failed.className = 'search-group';
       failed.textContent = `Search failed: ${error.message}`;
       results.append(failed);
-      results.hidden = false;
+      setExpanded(true);
+      status.textContent = `Search failed: ${error.message}`;
       return;
     }
     if (ticket !== latest) return;
+    setActive(-1);
     results.replaceChildren();
+    optionNumber = 0;
+    resultCount = 0;
     if (pages.includes('receive')) {
       // The id rides along as the list filter so the card is the one row on
       // the page that opens, however far down the list it would be.
@@ -141,22 +192,42 @@ function mountSearch(session) {
     if (!results.firstChild) {
       const none = document.createElement('div');
       none.className = 'search-group';
+      none.setAttribute('role', 'presentation');
       none.textContent = 'Nothing matches';
       results.append(none);
     }
-    results.hidden = false;
+    setExpanded(true);
+    status.textContent = resultCount
+      ? `${resultCount} search result${resultCount === 1 ? '' : 's'}.`
+      : 'No search results.';
   };
   input.addEventListener('input', () => {
     clearTimeout(timer);
+    latest += 1;
+    setActive(-1);
+    status.textContent = input.value.trim().length >= 2 ? 'Searching…' : '';
     timer = setTimeout(run, 180);
   });
-  input.addEventListener('focus', () => { if (results.firstChild) results.hidden = false; });
+  input.addEventListener('focus', () => { if (results.firstChild) setExpanded(true); });
   input.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') { close(); input.blur(); }
+    if (event.key === 'Escape' || event.key === 'Tab') close();
+    if (results.hidden) return;
+    const rows = options();
+    if (!rows.length) return;
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      setActive(activeIndex + 1);
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      setActive(activeIndex < 0 ? rows.length - 1 : activeIndex - 1);
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      rows[activeIndex < 0 ? 0 : activeIndex].click();
+    }
   });
   form.addEventListener('submit', (event) => {
     event.preventDefault();
-    const first = results.querySelector('a');
+    const first = options()[activeIndex < 0 ? 0 : activeIndex];
     if (first && !results.hidden) first.click();
     else run();
   });
@@ -168,7 +239,7 @@ function mountSearch(session) {
 /// Scrolls to the card named by the location hash and opens its details,
 /// once the list that holds it has rendered. Search results deep-link this
 /// way; the card is not marked, arriving at it is the signal.
-export function revealHash({ scroll = true } = {}) {
+export function revealHash({ scroll = true, focus = scroll } = {}) {
   const id = window.location.hash.slice(1);
   // Only list cards are revealed; a settings section fragment on System is
   // plain navigation.
@@ -178,6 +249,11 @@ export function revealHash({ scroll = true } = {}) {
   if (!target) return false;
   if (scroll) target.scrollIntoView({ block: 'center' });
   target.querySelector('details')?.setAttribute('open', '');
+  if (focus && (document.activeElement === document.body
+    || document.activeElement === document.getElementById('global-search-input'))) {
+    target.tabIndex = -1;
+    target.focus({ preventScroll: true });
+  }
   return true;
 }
 

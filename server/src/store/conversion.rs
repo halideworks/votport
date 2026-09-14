@@ -169,6 +169,7 @@ fn convert(data: &Path, public_url: &str) -> Result<Conversion> {
         "ALTER TABLE upload_sessions ADD COLUMN committed_upload_id TEXT;
              ALTER TABLE outbound_grants ADD COLUMN share_token TEXT;",
     )?;
+    transaction.execute_batch(OUTBOUND_INDEXES)?;
     rebuild(
         &transaction,
         &target,
@@ -1251,6 +1252,28 @@ mod tests {
             .contains("schema version 35"));
         let result = convert(directory.path(), "https://DROP.EXAMPLE.com:443/").unwrap();
         assert_eq!(result.replacements, 2);
+        let converted = Connection::open(&path).unwrap();
+        let indexes: Vec<String> = converted
+            .prepare(
+                "SELECT name FROM sqlite_schema WHERE type='index' AND name IN (
+                    'outbound_fetch_tickets_expires',
+                    'outbound_grants_open_expires'
+                ) ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+
+        assert_eq!(
+            indexes,
+            [
+                "outbound_fetch_tickets_expires".to_owned(),
+                "outbound_grants_open_expires".to_owned()
+            ]
+        );
+        drop(converted);
         let store = Store::open(directory.path()).unwrap();
         let connection = store.connection.lock().unwrap();
         assert_eq!(read_uploads(&connection, "link").unwrap(), vec![upload]);
