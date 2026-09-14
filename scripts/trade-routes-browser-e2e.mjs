@@ -199,5 +199,11 @@ try {
     assert.equal(await receiving.locator('#trade-connections .trade-route').count(), 1);
     assert.equal(await receiving.locator(`#endpoint-${receiveId}`).count(), 1, 'A deleted return request does not erase existing receiving endpoints');
   }
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  for (let index = 0; index < 50; index++) await destination('admin/links', { label: `${id}-newer-${index}` });
+  assert.ok(!(await destination('admin/links')).links.some((request) => request.id === receiveId), 'The endpoint request is outside the first Receive page');
+  await receiving.locator(`#endpoint-${receiveId}`).getByRole('link', { name: 'Receiving folder, limits and workflow →', exact: true }).click();
+  await receiving.locator(`#link-${receiveId}`).waitFor({ timeout: 5000 });
+  assert.equal(new URL(receiving.url()).searchParams.get('search'), receiveId);
   assert.deepEqual(errors, []); console.log('Trade route browser acceptance passed: five clipboard actions, preview, independent keys, approval, rotation, transfer, metadata filtering, downstream hold, revocation, responsive UI.');
 } finally { await browser.close(); await new Promise((resolve) => sink.close(resolve)); }

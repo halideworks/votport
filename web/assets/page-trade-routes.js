@@ -118,7 +118,7 @@ async function refresh() {
   $('trade-endpoints-section').hidden = !catalog.endpoints.length && setup !== 'receive';
   for (const endpoint of catalog.endpoints) {
     const row = node('div', '', 'card'); row.id = `endpoint-${endpoint.id}`; row.tabIndex = -1;
-    row.append(node('h3', endpoint.name), node('p', `${endpoint.category === 'internal' ? 'Internal site' : 'External partner'} · ${endpoint.forwarding ? 'Forwarding allowed' : 'Forwarding prohibited'}`, 'field-help'), link('Receiving folder, limits and workflow →', `/receive#link-${endpoint.id}`));
+    row.append(node('h3', endpoint.name), node('p', `${endpoint.category === 'internal' ? 'Internal site' : 'External partner'} · ${endpoint.forwarding ? 'Forwarding allowed' : 'Forwarding prohibited'}`, 'field-help'), link('Receiving folder, limits and workflow →', `/receive?search=${endpoint.id}#link-${endpoint.id}`));
     if (admin) {
       const form = node('form'), key = input('text'); form.setAttribute('data-unsaved', ''); key.maxLength = 64; key.placeholder = 'Optional: exact sending port fingerprint';
       const expiry = select([['3600', '1 hour'], ['86400', '24 hours'], ['604800', '7 days']], '86400');
