@@ -932,6 +932,40 @@ if (!(await selectedFolder.isChecked())) {
 if (!(await page.textContent("#library-selection-status")).startsWith(`${outboundFiles.length} files selected`)) {
   throw new Error("scoped library root selection status changed");
 }
+await selectedFolder.click();
+await page.getByRole("button", { name: `Open folder ${PROJECT}` }).click();
+await page.waitForFunction(
+  () => document.querySelectorAll("#library-files input[type=checkbox]").length === 12 &&
+    ![...document.querySelectorAll("#library-files input[type=checkbox]")].some((checkbox) => checkbox.checked) &&
+    document.getElementById("library-selection-status").textContent.startsWith("0 files selected"),
+  undefined,
+  { timeout: 15000 },
+);
+await page.locator("#library-files input[type=checkbox]").first().check();
+await page.getByRole("button", { name: "Library", exact: true }).click();
+await page.waitForSelector(`#library-files input[aria-label="Select folder ${PROJECT}"]`);
+const selectionError = "library selection is too large; choose a narrower folder or select individual files";
+await page.route("**/api/admin/outbound-files?selection=*", (route) => route.fulfill({
+  status: 422,
+  contentType: "application/json",
+  body: JSON.stringify({ error: selectionError }),
+}), { times: 1 });
+await selectedFolder.click();
+await page.locator("#library-selection-error").waitFor({ state: "visible" });
+if (await selectedFolder.isChecked() ||
+    !(await page.textContent("#library-selection-status")).startsWith("1 file selected") ||
+    await page.textContent("#library-selection-error") !== selectionError) {
+  throw new Error("an oversized folder refusal changed the existing selection");
+}
+await page.unroute("**/api/admin/outbound-files?selection=*");
+await selectedFolder.click();
+await page.waitForFunction(
+  () => document.getElementById("library-selection-status").textContent.startsWith("12 files selected") &&
+    document.querySelector('#library-files input[aria-label^="Select folder "]').checked,
+  undefined,
+  { timeout: 15000 },
+);
+console.log("oversized library selection refusal keeps existing files and remains retryable: ok");
 
 await page.fill("#deliver-project", FOLDER_PROJECT);
 await page.setInputFiles("#library-folder-input", folder);

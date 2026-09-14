@@ -247,7 +247,7 @@ async function refreshGrants(reset = true) {
 
 $('outbound-grants-load-more').addEventListener('click', () => refreshGrants(false));
 
-const MAX_LIBRARY_SELECTION = 1_000_000;
+const MAX_LIBRARY_SELECTION = 100_000;
 const MAX_LIBRARY_PROJECT_SUGGESTIONS = 200;
 const selectedLibraryPaths = new Map();
 let deliverGrantBusy = false;
