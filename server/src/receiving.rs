@@ -209,6 +209,8 @@ pub struct Destinations {
     directories: Mutex<Vec<(PathBuf, ReceiveDirectory)>>,
     #[cfg(test)]
     check_pause: Mutex<Option<Arc<CheckGate>>>,
+    #[cfg(test)]
+    directory_pause: Mutex<Option<Arc<CheckGate>>>,
 }
 
 #[cfg(test)]
@@ -241,13 +243,17 @@ pub(crate) struct CheckPause(Arc<CheckGate>);
 #[cfg(test)]
 impl CheckPause {
     pub(crate) fn new(destinations: &Destinations, limit: usize) -> Self {
+        Self::arm(&destinations.check_pause, limit)
+    }
+
+    fn arm(slot: &Mutex<Option<Arc<CheckGate>>>, limit: usize) -> Self {
         let gate = Arc::new(CheckGate {
             limit,
             entered: std::sync::atomic::AtomicUsize::new(0),
             released: Mutex::new(false),
             wake: std::sync::Condvar::new(),
         });
-        *destinations.check_pause.lock().unwrap() = Some(gate.clone());
+        *slot.lock().unwrap() = Some(gate.clone());
         Self(gate)
     }
 
@@ -347,6 +353,8 @@ impl Destinations {
             directories: Mutex::new(Vec::new()),
             #[cfg(test)]
             check_pause: Mutex::new(None),
+            #[cfg(test)]
+            directory_pause: Mutex::new(None),
         }
     }
 
@@ -732,15 +740,19 @@ impl Destinations {
         {
             return Err("invalid receive folder".to_owned());
         }
-        let mut cache = self
-            .directories
-            .lock()
-            .expect("receive directories poisoned");
-        if let Some(index) = cache.iter().position(|(key, _)| key == relative) {
-            let entry = cache.remove(index);
-            let directory = entry.1.clone();
-            cache.push(entry);
-            return Ok(directory);
+        {
+            let mut cache = self
+                .directories
+                .lock()
+                .expect("receive directories poisoned");
+            if let Some(index) = cache.iter().position(|(key, _)| key == relative) {
+                let entry = cache.remove(index);
+                let directory = entry.1.clone();
+                cache.push(entry);
+                drop(cache);
+                self.check_live()?;
+                return Ok(directory);
+            }
         }
         let mut directory = self.root.clone();
         for name in relative.components() {
@@ -754,10 +766,34 @@ impl Destinations {
             .map_err(|e| format!("open receive folder: {e}"))?;
         }
         let directory = ReceiveDirectory::from_directory(directory).map_err(|e| e.to_string())?;
-        if cache.len() == DIRECTORY_CACHE_SIZE {
-            cache.remove(0);
+        #[cfg(test)]
+        {
+            let gate = self.directory_pause.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.wait();
+            }
         }
-        cache.push((relative.to_owned(), directory.clone()));
+        let evicted = {
+            let mut cache = self
+                .directories
+                .lock()
+                .expect("receive directories poisoned");
+            self.check_live()?;
+            if let Some(index) = cache.iter().position(|(key, _)| key == relative) {
+                let entry = cache.remove(index);
+                let cached = entry.1.clone();
+                cache.push(entry);
+                drop(cache);
+                drop(directory);
+                self.check_live()?;
+                return Ok(cached);
+            }
+            let evicted = (cache.len() == DIRECTORY_CACHE_SIZE).then(|| cache.remove(0));
+            cache.push((relative.to_owned(), directory.clone()));
+            evicted
+        };
+        drop(evicted);
+        self.check_live()?;
         Ok(directory)
     }
 }
@@ -1017,6 +1053,110 @@ pub(crate) mod tests {
         assert!(crate::session::lock_push_directory(&path, NasContract::Unqualified).is_err());
         drop(lock);
         assert!(crate::session::lock_push_directory(&path, NasContract::Unqualified).is_ok());
+    }
+
+    #[test]
+    fn directory_miss_does_not_block_a_hit_or_another_miss() {
+        use std::time::{Duration, Instant};
+        let root = tempfile::tempdir().unwrap();
+        let destinations = Destinations::open(root.path(), NasContract::Unqualified).unwrap();
+        let warm = root.path().join("warm");
+        destinations.directory(&warm, true).unwrap();
+        let pause = CheckPause::arm(&destinations.directory_pause, 1);
+        std::thread::scope(|threads| {
+            let stalled = threads.spawn(|| destinations.directory(&root.path().join("slow"), true));
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while pause.entered() == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(pause.entered(), 1);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let other_destinations = &destinations;
+            let other_path = root.path().join("other");
+            let other = threads.spawn(move || {
+                let result = other_destinations
+                    .directory(&warm, false)
+                    .and_then(|_| other_destinations.directory(&other_path, true));
+                sender.send(result).unwrap();
+            });
+            let completed = receiver.recv_timeout(Duration::from_millis(500)).ok();
+            pause.release();
+            stalled.join().unwrap().unwrap();
+            other.join().unwrap();
+            assert!(
+                matches!(completed, Some(Ok(_))),
+                "an opened miss held the directory cache mutex"
+            );
+        });
+    }
+
+    #[test]
+    fn directory_misses_reuse_the_raced_cache_entry() {
+        use std::os::fd::AsRawFd as _;
+        use std::time::{Duration, Instant};
+        for create in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let destinations = Destinations::open(root.path(), NasContract::Unqualified).unwrap();
+            let path = root.path().join("same");
+            if !create {
+                std::fs::create_dir(&path).unwrap();
+            }
+            let pause = CheckPause::arm(&destinations.directory_pause, 1);
+            std::thread::scope(|threads| {
+                let first = threads.spawn(|| destinations.directory(&path, create));
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while pause.entered() == 0 && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(pause.entered(), 1);
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let other_destinations = &destinations;
+                let other_path = &path;
+                let second = threads.spawn(move || {
+                    sender
+                        .send(other_destinations.directory(other_path, create))
+                        .unwrap()
+                });
+                let completed = receiver.recv_timeout(Duration::from_millis(500)).ok();
+                pause.release();
+                let first = first.join().unwrap().unwrap();
+                second.join().unwrap();
+                let second = completed.expect("another miss could not finish").unwrap();
+                let first = first.destination(OsStr::new("payload")).unwrap();
+                let second = second.destination(OsStr::new("payload")).unwrap();
+                assert_eq!(
+                    first.directory().file().as_raw_fd(),
+                    second.directory().file().as_raw_fd()
+                );
+                assert_eq!(destinations.directories.lock().unwrap().len(), 1);
+                assert_eq!(
+                    pause.entered(),
+                    2,
+                    "both callers must open the missing entry"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn directory_miss_cannot_install_after_ownership_stops() {
+        use std::time::{Duration, Instant};
+        let root = tempfile::tempdir().unwrap();
+        let destinations = Destinations::open(root.path(), NasContract::Unqualified).unwrap();
+        let pause = CheckPause::arm(&destinations.directory_pause, 1);
+        std::thread::scope(|threads| {
+            let opening =
+                threads.spawn(|| destinations.directory(&root.path().join("stopped"), true));
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while pause.entered() == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(pause.entered(), 1);
+            destinations.stop();
+            pause.release();
+            assert!(opening.join().unwrap().is_err());
+            assert!(destinations.directories.lock().unwrap().is_empty());
+        });
     }
 
     #[test]
