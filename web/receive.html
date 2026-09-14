@@ -108,7 +108,7 @@
       <form id="links-filter" class="card">
         <div class="grid">
           <label>Search requests
-            <input id="links-query" type="search" autocomplete="off" placeholder="name or destination" />
+            <input id="links-query" type="search" maxlength="100" autocomplete="off" placeholder="name or destination" />
           </label>
           <label>Status
             <select id="links-status">
@@ -123,6 +123,8 @@
       </form>
       <p id="links-action-status" class="muted" role="status" tabindex="-1"></p>
       <div id="links"></div>
+      <p id="links-range" class="muted" role="status" tabindex="-1"></p>
+      <p class="field-help">Shows up to 100 requests. Refresh returns to the beginning.</p>
       <button id="links-load-more" type="button" class="ghost" hidden>Load more</button>
       <p id="links-error" class="error" role="alert" hidden></p>
     <div id="outbound-result" class="card ok" hidden aria-live="polite">
@@ -147,9 +149,15 @@
           <button value="close" class="ghost tiny" id="timeline-close">Close</button>
         </div>
         <div id="timeline-stats" class="timeline-stats"></div>
+        <h3>Files</h3>
+        <p id="timeline-range" class="muted" role="status" tabindex="-1"></p>
+        <p id="timeline-error" class="error" role="alert" hidden></p>
+        <div id="timeline-files" role="region" aria-label="Received files" tabindex="0"></div>
+        <div class="actions"><button type="button" id="timeline-retry" class="ghost" hidden>Try again</button><button type="button" id="timeline-previous" class="ghost" hidden>Previous files</button><button type="button" id="timeline-next" class="ghost" hidden>Next files</button></div>
+        <h3>Timeline</h3>
         <ol id="timeline-events" class="timeline-events" tabindex="0"></ol>
         <div class="modal-actions timeline-actions">
-          <button type="button" class="ghost tiny" id="timeline-download">Download timeline JSON</button>
+          <a class="button ghost tiny" id="timeline-download">Download timeline JSON</a>
           <a id="timeline-audit" class="button tiny ghost" href="/audit">Open audit rows</a>
         </div>
       </form>

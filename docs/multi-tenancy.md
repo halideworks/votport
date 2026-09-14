@@ -41,7 +41,7 @@ completion marker commit together. Admission looks up live file candidates by
 request, tenant, suite, root and exact byte length in pages of 128 rows. It skips
 repeated stored paths and verifies the candidate bytes outside the Store lock
 before reusing a copy; saved sessions keep their recorded destinations. The
-current schema is 40; startup and restore refuse earlier schemas without
+current schema is 41; startup and restore refuse earlier schemas without
 conversion.
 
 An empty database receives the complete current schema in one transaction.

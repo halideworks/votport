@@ -71,6 +71,40 @@ and peer exports read and verify these files directly; no reception snapshot is
 required. Source changes fail verification. Ordinary local receiving does not
 add an unconditional second payload read.
 
+## Browse requests and transfer history
+
+Receive keeps at most 100 request cards, with 20 transfer headers per history
+page. **Files and timeline** opens one transfer and loads at most 100 files at a
+time. **Refresh** returns to the first request page. Trade route setup searches
+and pages eligible requests while preserving the selected request and draft
+permissions.
+
+`GET /api/admin/links` returns summaries with `upload_count` and `upload_bytes`,
+not nested uploads. Its default limit is 50 and maximum is 100; continue with
+both `before_created_at` and `before_id` from `next_cursor`. Search and status
+filters apply before the limit. `GET /api/admin/links/{id}` returns one exact
+request summary. `route_eligible=true` restricts results to fresh
+requests that can become a receiving endpoint.
+
+For a selected request, `GET /api/admin/links/{id}/uploads` returns transfer
+headers, newest first, with default limit 20 and maximum 100. Continue using
+`before_position=next_position`. `GET /api/admin/links/{id}/uploads/{upload}`
+adds the selected transfer's log. Its `/files` endpoint returns at most 100 file
+rows, their original `file_index`, and `next_offset`; continue with that offset.
+Deleted and missing files keep their indices. These reads retain the existing
+operator and tenant access checks. Request totals scan the selected requests'
+headers without loading file rows; they are not constant-time aggregates.
+
+**Download timeline JSON** uses the selected transfer's `/timeline` endpoint.
+It exports the complete `request`, `upload`, `summary` and `events` document,
+including every file. The server validates rows and completes a private metadata
+spool before responding with its byte length. Failed serialization produces an
+error response; an interrupted download is incomplete JSON or shorter than its
+announced length. The export holds the Store lock while writing the spool, so
+large exports can delay other Store work. Streaming to a slow reader happens
+after that lock is released. Dropping the response removes its private spool;
+source payloads are never copied for export.
+
 ## Ownership and recovery
 
 `.vot-stage/writer.lock` is a permanent inode with an exclusive kernel lock.

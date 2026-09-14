@@ -23,11 +23,11 @@ async function layout(name) {
   for (const width of [1440, 900, 640, 390, 320]) {
     await page.setViewportSize({ width, height: 1000 });
     const theme = width < 640 ? 'light' : 'dark';
-    if (await page.evaluate(() => document.documentElement.dataset.theme || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')) !== theme) await page.click('#theme-toggle');
+    if (!await page.locator('dialog[open]').count() && await page.evaluate(() => document.documentElement.dataset.theme || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')) !== theme) await page.click('#theme-toggle');
     const defects = await page.evaluate(() => {
       const result = [];
       if (document.documentElement.scrollWidth > innerWidth) result.push(`Page overflows by ${document.documentElement.scrollWidth - innerWidth}px`);
-      const controls = [...document.querySelectorAll('input:not([type=hidden]),select,textarea,button')].filter((node) => node.checkVisibility()).map((node) => {
+      const controls = [...(document.querySelector('dialog[open]') || document).querySelectorAll('input:not([type=hidden]),select,textarea,button')].filter((node) => node.checkVisibility()).map((node) => {
         const box = node.getBoundingClientRect(), rect = { left: box.left, right: box.right, top: box.top, bottom: box.bottom };
         for (let parent = node.parentElement; parent; parent = parent.parentElement) {
           const style = getComputedStyle(parent), clip = parent.getBoundingClientRect();
@@ -44,7 +44,8 @@ async function layout(name) {
     });
     if (defects.length) await page.screenshot({ path: path.join(root, `${name}-${width}-failure.png`), fullPage: true });
     assert.deepEqual(defects, [], `${name} at ${width}px`);
-    if (width === 1440 || width === 390) await page.screenshot({ path: path.join(root, `${name}-${width}.png`), fullPage: true });
+    if (name === 'receive-request-page') await page.locator('#links-range').scrollIntoViewIfNeeded();
+    if (width === 1440 || width === 390) await page.screenshot({ path: path.join(root, `${name}-${width}.png`), fullPage: name !== 'receive-request-page' && !await page.locator('dialog[open]').count() });
   }
   await page.setViewportSize({ width: 1440, height: 1000 });
 }
@@ -448,7 +449,8 @@ try {
   await page.click('#send'); await page.locator('#done-card:not([hidden])').waitFor({ timeout: 30000 });
   await page.goto(`${base}/receive?search=${fileRequest.id}#link-${fileRequest.id}`);
   const fileCard = page.locator(`#link-${fileRequest.id}`), clearRecord = fileCard.getByRole('button', { name: 'Clear record', exact: true, includeHidden: true });
-  await clearRecord.waitFor({ state: 'attached' }); await openAncestors(clearRecord);
+  await fileCard.locator('.upload-history > summary').click();
+  await clearRecord.waitFor();
   await clearRecord.focus(); await page.keyboard.press('Enter'); await undo.waitFor();
   assert.ok(await undo.evaluate((node) => node === document.activeElement), 'Clearing a transfer record focuses Undo');
   await page.keyboard.press('Enter'); await undo.waitFor({ state: 'detached' });
@@ -458,16 +460,110 @@ try {
   await clearRecord.focus(); await page.keyboard.press('Enter'); await undo.waitFor();
   await page.keyboard.press('Enter'); await undo.waitFor({ state: 'detached' });
   assert.ok(await clearRecord.isEnabled(), 'Undo re-enables a retained button when list refreshes fail');
-  const deleteFile = fileCard.getByRole('button', { name: 'Delete file', exact: true }).first();
+  await fileCard.getByRole('button', { name: 'Files and timeline', exact: true }).click();
+  const deleteFile = page.locator('#timeline-files').getByRole('button', { name: 'Delete file', exact: true }).first();
   await openAncestors(deleteFile); await deleteFile.focus(); await page.keyboard.press('Enter');
+  await page.getByRole('dialog', { name: 'Delete file', exact: true }).waitFor();
   await page.locator('#confirm-ok').press('Enter');
   await page.waitForFunction(() => document.querySelector('#links-action-status').textContent.startsWith('Deleted "'));
-  assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'File deletion retains keyboard position');
+  assert.ok(await page.locator('#timeline-range').evaluate((node) => node === document.activeElement), 'File deletion keeps focus inside the dialog');
+  await page.click('#timeline-close');
   const deleteFiles = fileCard.getByRole('button', { name: 'Delete stored files', exact: true });
   await openAncestors(deleteFiles); await deleteFiles.focus(); await page.keyboard.press('Enter');
+  await page.getByRole('dialog', { name: 'Delete stored files', exact: true }).waitFor();
   await page.locator('#confirm-ok').press('Enter');
-  await page.getByText('Deleted 1 stored file.', { exact: true }).waitFor();
+  await page.getByText('Stored-file deletion completed.', { exact: true }).waitFor();
   assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'Batch file deletion retains keyboard position');
+
+  const completeTimeline = await api(`admin/links/${fileRequest.id}/uploads`);
+  const actualUpload = (await api(`admin/links/${fileRequest.id}/uploads/${completeTimeline.uploads[0].id}`)).upload;
+  const actualFiles = (await api(`admin/links/${fileRequest.id}/uploads/${actualUpload.id}/files`)).files;
+  const headers = Array.from({ length: 25 }, (_, index) => ({ ...actualUpload, id: `page-upload-${index}`, position: 25 - index, file_count: 201, total_bytes: 201 * actualFiles[0].bytes }));
+  const names = Array.from({ length: 201 }, (_, index) => ({ ...actualFiles[0], file_index: index, exists: false,
+    path: `file-${index}.txt`, stored_as: `folder/${index}-` + 'A long international production filename é '.repeat(4) + '.txt' }));
+  let failFilePage = true, fileOffsets = [];
+  const uploadPages = `**/api/admin/links/${fileRequest.id}/uploads**`;
+  await page.route(uploadPages, (route) => {
+    const url = new URL(route.request().url()), parts = url.pathname.split('/'), position = Number(url.searchParams.get('before_position') || 26);
+    if (parts.at(-1) === 'uploads') {
+      const remaining = headers.filter((upload) => upload.position < position), uploads = remaining.slice(0, 20);
+      return route.fulfill({ json: { uploads, next_position: remaining.length > 20 ? uploads.at(-1).position : null } });
+    }
+    const upload = headers.find((upload) => parts.includes(upload.id));
+    if (!upload) return route.continue();
+    if (parts.at(-1) !== 'files') return route.fulfill({ json: { upload } });
+    const offset = Number(url.searchParams.get('offset') || 0); fileOffsets.push(offset);
+    if (offset === 100 && failFilePage) { failFilePage = false; return route.fulfill({ status: 503, json: { error: 'File page unavailable fixture' } }); }
+    return route.fulfill({ json: { files: names.slice(offset, offset + 100), file_count: 201, next_offset: offset < 200 ? offset + 100 : null } });
+  });
+  await page.reload();
+  assert.equal(await page.locator('#links .upload-file').count(), 0);
+  await fileCard.locator('.upload-history > summary').click();
+  await fileCard.getByText('Showing transfers 1 to 20, newest first.', { exact: true }).waitFor();
+  assert.equal(await fileCard.locator('.uploads > li').count(), 20);
+  await fileCard.getByRole('button', { name: 'Older transfers', exact: true }).focus(); await page.keyboard.press('Enter');
+  await fileCard.getByText('Showing transfers 21 to 25, newest first.', { exact: true }).waitFor();
+  assert.equal(await fileCard.locator('.uploads > li').count(), 5);
+  assert.ok(await fileCard.locator('.upload-history [role=status]').evaluate((node) => node === document.activeElement));
+  await fileCard.getByRole('button', { name: 'Files and timeline', exact: true }).first().click();
+  await page.getByText('Showing files 1 to 100 of 201.', { exact: true }).waitFor();
+  assert.equal(await page.locator('.upload-file').count(), 100);
+  await layout('received-files-page');
+  await page.locator('#timeline-next').focus(); await page.keyboard.press('Enter');
+  await page.getByText('File page unavailable fixture', { exact: true }).waitFor();
+  assert.equal(await page.locator('.upload-file').count(), 100);
+  assert.equal(await page.locator('#timeline-range').textContent(), 'Showing files 1 to 100 of 201.');
+  await page.click('#timeline-retry');
+  await page.getByText('Showing files 101 to 200 of 201.', { exact: true }).waitFor();
+  assert.deepEqual(fileOffsets, [0, 100, 100]);
+  assert.equal(await page.locator('.upload-file').count(), 100);
+  await page.locator('#timeline-next').focus(); await page.keyboard.press('Enter');
+  await page.getByText('Showing files 201 to 201 of 201.', { exact: true }).waitFor();
+  assert.equal(await page.locator('.upload-file').count(), 1);
+  assert.ok(await page.locator('#timeline-range').evaluate((node) => node === document.activeElement));
+  await page.locator('#timeline-previous').click();
+  await page.getByText('Showing files 101 to 200 of 201.', { exact: true }).waitFor();
+  await page.click('#timeline-close');
+  await page.waitForFunction(() => document.querySelectorAll('.upload-file').length === 0);
+  assert.equal(await page.locator('.upload-file').count(), 0, 'Closing the dialog releases its file nodes');
+  await page.unroute(uploadPages);
+
+  const summaries = Array.from({ length: 151 }, (_, index) => ({ ...incoming, id: `page-request-${index}`, label: `Page request ${index}`, upload_count: 0, upload_bytes: 0, url: `${base}/r/page-request-${index}`, created_at: Math.floor(Date.now() / 1000) - index }));
+  let pageCursors = [], failThirdPage = true;
+  await page.route('**/api/admin/links?*', (route) => {
+    const query = new URL(route.request().url()).searchParams, before = query.get('before_id');
+    const start = before ? Number(before.split('-').at(-1)) + 1 : 0; pageCursors.push(start);
+    if (start === 100 && failThirdPage) { failThirdPage = false; return route.fulfill({ status: 503, json: { error: 'Request page unavailable fixture' } }); }
+    const links = query.get('search') ? summaries.slice(0, 3) : summaries.slice(start, start + 50);
+    return route.fulfill({ json: { links, receive_dir: root, next_cursor: !query.get('search') && start + 50 < summaries.length ? { id: links.at(-1).id, created_at: links.at(-1).created_at } : null } });
+  });
+  await page.goto(`${base}/receive`);
+  await page.getByText('Showing requests 1 to 50.', { exact: true }).waitFor();
+  const retainedEditor = page.locator('#link-page-request-0 .reception-workflow');
+  await retainedEditor.locator('summary').click(); await retainedEditor.locator('input[data-metadata]').fill('Keep this request draft');
+  await page.locator('#links-load-more').focus(); await page.keyboard.press('Enter');
+  await page.getByText('Showing requests 1 to 100.', { exact: true }).waitFor();
+  assert.equal(await retainedEditor.locator('input[data-metadata]').inputValue(), 'Keep this request draft');
+  assert.ok(await page.locator('#links-load-more').evaluate((node) => node === document.activeElement));
+  await page.click('#links-load-more'); await page.getByText('Request page unavailable fixture', { exact: true }).waitFor();
+  assert.equal(await page.locator('#links-range').textContent(), 'Showing requests 1 to 100.');
+  page.removeAllListeners('dialog'); page.once('dialog', (dialog) => dialog.dismiss());
+  await page.click('#links-load-more'); await page.waitForFunction(() => !document.querySelector('#links-load-more').disabled);
+  assert.equal(await retainedEditor.locator('input[data-metadata]').inputValue(), 'Keep this request draft');
+  page.on('dialog', (dialog) => dialog.accept());
+  await page.click('#links-load-more'); await page.getByText('Showing requests 51 to 150.', { exact: true }).waitFor();
+  assert.equal(await page.locator('#links [data-link-id]').count(), 100);
+  assert.deepEqual(pageCursors.slice(-3), [100, 100, 100], 'Errors and declined eviction preserve the cursor');
+  await layout('receive-request-page');
+  await page.locator('#links-load-more').focus(); await page.keyboard.press('Enter');
+  await page.getByText('Showing requests 52 to 151.', { exact: true }).waitFor();
+  assert.equal(await page.locator('#links [data-link-id]').count(), 100);
+  assert.ok(await page.locator('#links-range').evaluate((node) => node === document.activeElement));
+  await page.click('#links-refresh'); await page.getByText('Showing requests 1 to 50.', { exact: true }).waitFor();
+  await page.fill('#links-query', 'matching request'); await page.locator('#links-filter button[type=submit]').click();
+  await page.getByText('Showing requests 1 to 3.', { exact: true }).waitFor();
+  assert.equal(await page.locator('#links [data-link-id]').count(), 3);
+  await page.unroute('**/api/admin/links?*');
 
   const status = await api('admin/status'); status.receiving = [];
   await page.route('**/api/admin/status?*', (route) => route.fulfill({ json: status }));

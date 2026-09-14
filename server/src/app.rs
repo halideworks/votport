@@ -3327,14 +3327,24 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route(
             "/api/admin/links/{id}",
-            post(api::update_link)
+            get(api::get_link)
+                .post(api::update_link)
                 .patch(api::update_link)
                 .delete(api::delete_link),
         )
         .route("/api/admin/links/{id}/qr", get(api::link_qr))
+        .route("/api/admin/links/{id}/uploads", get(api::list_link_uploads))
+        .route(
+            "/api/admin/links/{id}/uploads/{upload}/files",
+            get(api::list_upload_files),
+        )
+        .route(
+            "/api/admin/links/{id}/uploads/{upload}/timeline",
+            get(api::export_upload_timeline),
+        )
         .route(
             "/api/admin/links/{id}/uploads/{upload}",
-            axum::routing::delete(api::delete_upload_record),
+            get(api::get_link_upload).delete(api::delete_upload_record),
         )
         .route(
             "/api/admin/links/{id}/uploads/{upload}/files/{index}",

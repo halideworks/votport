@@ -376,6 +376,10 @@ const statuses = await page.$$eval("#done-list .status", (els) =>
 if (!statuses.every((s) => s.includes("receipt ✓"))) {
   throw new Error(`receipt mark missing: ${JSON.stringify(statuses)}`);
 }
+const links = await (await page.request.get(`${base}/api/admin/links`)).json();
+const receivedLink = links.links.find((link) => link.url === linkUrl);
+const receivedHeaders = await (await page.request.get(`${base}/api/admin/links/${receivedLink.id}/uploads`)).json();
+const receivedUpload = receivedHeaders.uploads[0];
 if (browserEngine === "chromium") {
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
 }
@@ -700,12 +704,12 @@ if (!pdfId || `${verdict.suite}:${verdict.root}` !== pdfId) {
 }
 console.log("verified:", pdfId);
 
-const links = await (await page.request.get(`${base}/api/admin/links`)).json();
-const receivedLink = links.links.find((link) => link.url === linkUrl);
-const receivedUpload = receivedLink.uploads.find((upload) => upload.files.some((file) => file.path === "Résumé Draft.pdf"));
+const receivedFiles = await (await page.request.get(`${base}/api/admin/links/${receivedLink.id}/uploads/${receivedUpload.id}/files`)).json();
+const receivedFile = receivedFiles.files.find((file) => file.path === "Résumé Draft.pdf");
+if (!receivedFile) throw new Error("received-file page omitted the published PDF");
 const receiptShare = await page.request.post(`${base}/api/admin/outbound-grants`, {
   headers: { "X-Votport": "1" },
-  data: { link_id: receivedLink.id, upload_id: receivedUpload.id, file_index: receivedUpload.files.findIndex((file) => file.path === "Résumé Draft.pdf") },
+  data: { link_id: receivedLink.id, upload_id: receivedUpload.id, file_index: receivedFile.file_index },
 });
 if (!receiptShare.ok()) throw new Error(`received-file share: ${receiptShare.status()} ${await receiptShare.text()}`);
 await page.goto((await receiptShare.json()).url);

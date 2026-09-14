@@ -19,10 +19,11 @@ pub use admin::{
     admin_audit_export, admin_change_password, admin_login, admin_logout, admin_search,
     admin_session, admin_status, backup_database, create_backup, create_link, create_tenant,
     delete_branding, delete_branding_logo, delete_link, delete_received_file, delete_tenant,
-    delete_upload_record, get_backups, get_branding, get_settings, holdings, link_qr, list_links,
-    list_principals, list_tenants, put_backups_config, put_branding, put_branding_logo,
-    put_settings, restore_backup, revoke_principal, switch_tenant, unblock_principal, update_link,
-    update_tenant,
+    delete_upload_record, export_upload_timeline, get_backups, get_branding, get_link,
+    get_link_upload, get_settings, holdings, link_qr, list_link_uploads, list_links,
+    list_principals, list_tenants, list_upload_files, put_backups_config, put_branding,
+    put_branding_logo, put_settings, restore_backup, revoke_principal, switch_tenant,
+    unblock_principal, update_link, update_tenant,
 };
 pub use outbound::{
     automation_share, create_automation_token, create_outbound_grant, delete_automation_token,
