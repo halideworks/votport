@@ -463,12 +463,14 @@ try {
   await fileCard.getByRole('button', { name: 'Files and timeline', exact: true }).click();
   const deleteFile = page.locator('#timeline-files').getByRole('button', { name: 'Delete file', exact: true }).first();
   await openAncestors(deleteFile); await deleteFile.focus(); await page.keyboard.press('Enter');
+  await page.getByRole('dialog', { name: 'Delete file', exact: true }).waitFor();
   await page.locator('#confirm-ok').press('Enter');
   await page.waitForFunction(() => document.querySelector('#links-action-status').textContent.startsWith('Deleted "'));
   assert.ok(await page.locator('#timeline-range').evaluate((node) => node === document.activeElement), 'File deletion keeps focus inside the dialog');
   await page.click('#timeline-close');
   const deleteFiles = fileCard.getByRole('button', { name: 'Delete stored files', exact: true });
   await openAncestors(deleteFiles); await deleteFiles.focus(); await page.keyboard.press('Enter');
+  await page.getByRole('dialog', { name: 'Delete stored files', exact: true }).waitFor();
   await page.locator('#confirm-ok').press('Enter');
   await page.getByText('Stored-file deletion completed.', { exact: true }).waitFor();
   assert.ok(await page.locator('#links-action-status').evaluate((node) => node === document.activeElement), 'Batch file deletion retains keyboard position');
