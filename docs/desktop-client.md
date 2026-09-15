@@ -275,10 +275,12 @@ LINKS as the way back). It opens with a drop zone: files or folders
 dropped, chosen, or pasted there go up to the port first, into the folder named
 beside it (today's date unless changed), in 8 MiB chunks under one upload
 id per file through `POST /api/admin/outbound-files?path=` with
-`Content-Range`, so a second attempt resumes from the server's offset
-(a stage that already holds the whole file is published on the next
-attempt; a file that was published before its reply was lost is refused
-as already on the port, which it is)
+`Content-Range`. Each acknowledged chunk is synced before its resume offset
+is returned. Retries overwrite any unacknowledged tail, including a complete
+but unpublished stage; file length alone cannot prove that tail survived a
+crash. Stages created before durable acknowledgements restart from zero and
+age out through the existing idle cleanup. A file published before its reply was lost is still refused as already
+on the port
 (`port::upload`, `UploadListener` with a core-computed line such as
 "Uploading reel.mov, 1.2 GB of 4.0 GB (2 of 5 files)", cancel through a
 `Transfer` handle, `votport upload` in the CLI); what lands comes back

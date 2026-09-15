@@ -670,30 +670,20 @@ async fn prepare_outbound_chunk<'a>(
         .await
         .map_err(|_| Err(ApiError::internal("inspect outbound staging file failed")))?
         .len();
-    if stage_len == total {
-        // The client's last chunk landed but the connection went before the
-        // publish (or its reply) did. The bytes may still sit in the page
-        // cache, since only the final request syncs; sync, then publish,
-        // whatever range this request named.
-        file.sync_all()
-            .await
-            .map_err(|_| Err(ApiError::internal("sync outbound file failed")))?;
-        drop(file);
-        return Err(publish_outbound_stage(
-            app,
-            identity,
-            &stage,
-            &path,
-            requested_path,
-            total,
-        ));
-    }
-    if stage_len != start {
+    if stage_len < start {
+        sync_outbound_chunk(&mut file).await.map_err(Err)?;
         return Err(Ok(outbound_upload_conflict(
             requested_path,
             stage_len,
             total,
         )));
+    }
+    if stage_len > start {
+        // Only the caller's acknowledged offset proves a safe prefix. A
+        // longer stage may contain unsynced bytes from an interrupted request.
+        file.set_len(start)
+            .await
+            .map_err(|_| Err(ApiError::internal("truncate outbound staging file failed")))?;
     }
     file.seek(SeekFrom::Start(start))
         .await
@@ -781,9 +771,9 @@ async fn upload_outbound_chunk(
     }
     let offset = end + 1;
     if offset < total {
-        if file.flush().await.is_err() {
+        if let Err(error) = sync_outbound_chunk(&mut file).await {
             let _ = file.set_len(start).await;
-            return Err(ApiError::internal("write outbound staging file failed"));
+            return Err(error);
         }
         return Ok(Json(json!({
             "complete": false,
@@ -803,6 +793,15 @@ async fn upload_outbound_chunk(
     }
     drop(file);
     publish_outbound_stage(&app, &identity, &stage, &path, &requested_path, total)
+}
+
+async fn sync_outbound_chunk(file: &mut tokio::fs::File) -> ApiResult<()> {
+    file.flush()
+        .await
+        .map_err(|_| ApiError::internal("write outbound staging file failed"))?;
+    file.sync_data()
+        .await
+        .map_err(|_| ApiError::internal("sync outbound staging file failed"))
 }
 
 /// Links a complete stage into the library under `path`, drops the stage,
@@ -848,6 +847,8 @@ fn outbound_upload_stripe(path: &Path) -> usize {
 
 fn outbound_stage_name(path: &Path, upload_id: &str) -> String {
     let mut hasher = Sha256::new();
+    // Older stages acknowledged bytes before syncing and cannot prove a prefix.
+    hasher.update(b"durable-chunks-v1\0");
     hasher.update(path.to_string_lossy().as_bytes());
     hasher.update([0]);
     hasher.update(upload_id.as_bytes());
@@ -8918,6 +8919,22 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn chunk_checkpoint_refuses_a_file_that_cannot_sync() {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .await
+            .unwrap();
+        file.write_all(b"chunk").await.unwrap();
+        let response = sync_outbound_chunk(&mut file)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     #[tokio::test]
     async fn resumable_library_upload_keeps_partial_files_unpublished() {
         let (_directory, app, cookie, _bytes) = fixture().await;
@@ -8981,7 +8998,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(mismatch.status(), StatusCode::CONFLICT);
+        assert_eq!(mismatch.status(), StatusCode::OK);
         assert_eq!(body(mismatch).await["offset"], 3);
 
         let complete = crate::app::router(app.clone())
@@ -9087,33 +9104,121 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_complete_stage_left_unpublished_is_published_on_the_next_request() {
-        // The last chunk landed but the connection went before the publish:
-        // the stage holds the whole file, and the client's next attempt,
-        // which starts the file over from its first chunk, publishes it and
-        // learns the file is complete.
+    async fn an_unacknowledged_stage_tail_is_replayed_instead_of_trusted() {
+        for stale in [b"wrong".as_slice(), b"wrong data"] {
+            let (_directory, app, cookie, _bytes) = fixture().await;
+            let upload_id = "e".repeat(64);
+            let path = app.config.outbound_dir.join("late.bin");
+            let stage = app
+                .config
+                .outbound_dir
+                .join(outbound_stage_name(&path, &upload_id));
+            std::fs::write(&stage, stale).unwrap();
+            let response = crate::app::router(app.clone())
+                .oneshot(chunk_request(
+                    &cookie, "late.bin", &upload_id, 0, 4, 10, b"whole",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let progress = body(response).await;
+            assert_eq!(progress["complete"], false);
+            assert_eq!(progress["offset"], 5);
+            assert!(!path.exists());
+            assert_eq!(std::fs::read(&stage).unwrap(), b"whole");
+            let response = crate::app::router(app.clone())
+                .oneshot(chunk_request(
+                    &cookie, "late.bin", &upload_id, 5, 9, 10, b" file",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body(response).await["complete"], true);
+            assert_eq!(std::fs::read(&path).unwrap(), b"whole file");
+            assert!(!stage.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn chunk_replay_preserves_the_acknowledged_prefix_and_rewinds_missing_bytes() {
+        for (stale, expected_status, expected_offset) in [
+            (b"wholewrong".as_slice(), StatusCode::OK, 10),
+            (b"who".as_slice(), StatusCode::CONFLICT, 3),
+        ] {
+            let (_directory, app, cookie, _bytes) = fixture().await;
+            let upload_id = "e".repeat(64);
+            let path = app.config.outbound_dir.join("prefix.bin");
+            let stage = path
+                .parent()
+                .unwrap()
+                .join(outbound_stage_name(&path, &upload_id));
+            std::fs::write(&stage, stale).unwrap();
+            let response = crate::app::router(app.clone())
+                .oneshot(chunk_request(
+                    &cookie,
+                    "prefix.bin",
+                    &upload_id,
+                    5,
+                    9,
+                    10,
+                    b" file",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(body(response).await["offset"], expected_offset);
+            if expected_status == StatusCode::CONFLICT {
+                assert_eq!(std::fs::read(&stage).unwrap(), b"who");
+                let response = crate::app::router(app.clone())
+                    .oneshot(chunk_request(
+                        &cookie,
+                        "prefix.bin",
+                        &upload_id,
+                        3,
+                        9,
+                        10,
+                        b"le file",
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(body(response).await["complete"], true);
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), b"whole file");
+        }
+    }
+
+    #[tokio::test]
+    async fn stages_from_before_durable_acknowledgements_are_not_resumed() {
         let (_directory, app, cookie, _bytes) = fixture().await;
         let upload_id = "e".repeat(64);
-        let path = app.config.outbound_dir.join("late.bin");
-        let stage = app
-            .config
-            .outbound_dir
-            .join(outbound_stage_name(&path, &upload_id));
-        std::fs::write(&stage, b"whole file").unwrap();
+        let path = app.config.outbound_dir.join("older.bin");
+        let mut old_hash = Sha256::new();
+        old_hash.update(path.to_string_lossy().as_bytes());
+        old_hash.update([0]);
+        old_hash.update(upload_id.as_bytes());
+        let old_stage = path.parent().unwrap().join(format!(
+            ".vot-outbound-{:02x}-{}.stage",
+            outbound_upload_stripe(&path),
+            hex::encode(old_hash.finalize()),
+        ));
+        std::fs::write(&old_stage, b"wrong").unwrap();
         let response = crate::app::router(app.clone())
             .oneshot(chunk_request(
-                &cookie, "late.bin", &upload_id, 0, 4, 10, b"whole",
+                &cookie,
+                "older.bin",
+                &upload_id,
+                5,
+                9,
+                10,
+                b" file",
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: serde_json::Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert_eq!(body["complete"], true);
-        assert_eq!(body["offset"], 10);
-        assert_eq!(std::fs::read(&path).unwrap(), b"whole file");
-        assert!(!stage.exists());
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(body(response).await["offset"], 0);
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&old_stage).unwrap(), b"wrong");
     }
 
     #[tokio::test]
@@ -9198,8 +9303,7 @@ mod tests {
             crate::app::router(app.clone()).oneshot(second),
         );
         let statuses = [first.unwrap().status(), second.unwrap().status()];
-        assert!(statuses.contains(&StatusCode::OK));
-        assert!(statuses.contains(&StatusCode::CONFLICT));
+        assert_eq!(statuses, [StatusCode::OK, StatusCode::OK]);
         assert_eq!(
             std::fs::metadata(app.config.outbound_dir.join(outbound_stage_name(
                 &app.config.outbound_dir.join("concurrent.bin"),
