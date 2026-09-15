@@ -28,6 +28,33 @@ Caddyfile.example           reverse-proxy template
 The container runs as uid 1000; all three mounted volumes must be writable by
 it.
 
+### Build identity
+
+`votport --version` prints the version and source revision compiled into the
+server without loading configuration or opening data files. Primary and standby
+processes also log those fields at startup. Release images carry the same values
+in their OCI labels.
+
+For a local build from a clean checkout, stamp the revision explicitly:
+
+```sh
+VOTPORT_REVISION="$(git rev-parse HEAD)" cargo build --release --locked --manifest-path server/Cargo.toml
+```
+
+The portable Compose file accepts `VOTPORT_VERSION` and `VOTPORT_REVISION` as build
+arguments. Export the revision before building; the version defaults to `dev`:
+
+```sh
+export VOTPORT_REVISION="$(git rev-parse HEAD)"
+docker compose -f docker-compose.example.yml build
+```
+
+For a deployment-specific Compose file, pass `--build-arg
+VOTPORT_REVISION="$VOTPORT_REVISION"` and `--build-arg VOTPORT_VERSION=dev` to its
+build command. Unstamped local binaries report the package version and an
+`unknown` revision. Build identity is diagnostic metadata; verify the image digest
+and provenance when checking authenticity.
+
 ### Network filesystems
 
 Linux NFS and SMB/CIFS can receive directly with Balanced publication after a

@@ -2542,8 +2542,21 @@ impl Store {
             )?;
             for session in &mut sessions {
                 let files = file_statement.query_map([&session.id], |row| {
-                    let components: Vec<String> =
-                        serde_json::from_str(&row.get::<_, String>(2)?).unwrap_or_default();
+                    let encoded: String = row.get(2)?;
+                    let components: Vec<String> = serde_json::from_str(&encoded).map_err(|_| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            "stored_components is invalid JSON or has an invalid type".into(),
+                        )
+                    })?;
+                    if components.is_empty() {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            "stored_components is empty".into(),
+                        ));
+                    }
                     let incarnation_hex: String = row.get(8)?;
                     let incarnation: [u8; 16] = hex::decode(&incarnation_hex)
                         .ok()
@@ -11376,6 +11389,46 @@ mod settings_tests {
         // Re-inserting the same id replaces its file rows, no duplication.
         store.insert_upload_session(&session).unwrap();
         assert_eq!(store.load_upload_sessions().unwrap()[0].files.len(), 2);
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE upload_session_files SET stored_components=?1 WHERE session_id=?2 AND entry=0",
+                    rusqlite::params!["not json", session.id],
+                )
+            })
+            .unwrap();
+        let error = store.load_upload_sessions().unwrap_err();
+        assert!(error.contains("stored_components"), "{error}");
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE upload_session_files SET stored_components=?1 WHERE session_id=?2 AND entry=0",
+                    rusqlite::params![r#""private-path-sentinel""#, session.id],
+                )
+            })
+            .unwrap();
+        let error = store.load_upload_sessions().unwrap_err();
+        assert!(error.contains("stored_components"), "{error}");
+        assert!(!error.contains("private-path-sentinel"), "{error}");
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE upload_session_files SET stored_components=?1 WHERE session_id=?2 AND entry=0",
+                    rusqlite::params!["[]", session.id],
+                )
+            })
+            .unwrap();
+        let error = store.load_upload_sessions().unwrap_err();
+        assert!(error.contains("stored_components"), "{error}");
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE upload_session_files SET stored_components=?1 WHERE session_id=?2 AND entry=0",
+                    rusqlite::params![r#"["a.bin"]"#, session.id],
+                )
+            })
+            .unwrap();
+        assert!(store.load_upload_sessions().is_ok());
         store
             .with(|connection| {
                 connection.execute_batch(

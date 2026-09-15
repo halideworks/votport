@@ -9,12 +9,25 @@ use std::future::IntoFuture;
 
 use votport::{app, config};
 
+const BUILD_VERSION: &str = match option_env!("VOTPORT_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+const BUILD_REVISION: &str = match option_env!("VOTPORT_REVISION") {
+    Some(revision) => revision,
+    None => "unknown",
+};
+
 const HTTP_NATIVE_DRAIN: std::time::Duration = std::time::Duration::from_secs(240);
 
 #[tokio::main]
 async fn main() {
     let mut arguments = std::env::args().skip(1);
     let command = arguments.next();
+    if command.as_deref() == Some("--version") {
+        println!("votport {BUILD_VERSION} ({BUILD_REVISION})");
+        return;
+    }
     if command.as_deref() == Some("convert-schema35") {
         if let Err(error) = votport::store::conversion::command(arguments.collect()) {
             eprintln!("{error}");
@@ -53,6 +66,11 @@ async fn main() {
     } else {
         tracing_subscriber::fmt().with_env_filter(filter()).init();
     }
+    tracing::info!(
+        version = BUILD_VERSION,
+        revision = BUILD_REVISION,
+        "votport starting"
+    );
     config::warn_unknown_environment();
     if command.as_deref() == Some("standby") {
         let result = match votport::standby::config_from_env() {

@@ -1062,12 +1062,13 @@ pub(crate) fn admit_fetch(
         registry: Arc::clone(&serve.registry),
         token,
     };
-    if !app
-        .store
-        .admit_fetch_ticket(&ticket, presentation.now)
-        .unwrap_or(false)
-    {
-        return refuse_closed_fetch(app, token, peer);
+    match app.store.admit_fetch_ticket(&ticket, presentation.now) {
+        Ok(true) => {}
+        Ok(false) => return refuse_closed_fetch(app, token, peer),
+        Err(error) => {
+            tracing::error!(%error, %peer, "fetch ticket admission failed");
+            return refuse(app, ServeRefusalReason::Unknown, peer);
+        }
     }
     drop(admission);
     tracing::info!(
@@ -1661,5 +1662,120 @@ mod tests {
         assert_eq!(registry.active_sessions(), 1);
         registry.release_slot([2; 16]);
         assert_eq!(registry.active_sessions(), 0);
+    }
+
+    #[tokio::test]
+    async fn ticket_admission_store_error_is_unknown_not_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::api::testing::config(directory.path());
+        config.serve_bind = Some("127.0.0.1:0".parse().unwrap());
+        let app = crate::app::build(config).unwrap();
+        let bytes = b"ticket admission";
+        let source = app.config.outbound_dir.join("file.bin");
+        std::fs::write(&source, bytes).unwrap();
+        let mut builder = vot_sdk::object::InMemoryObjectBuilder::new(
+            Suite::Blake3Bao64,
+            Some(bytes.len() as u64),
+            bytes.len() as u64,
+        )
+        .unwrap();
+        builder.update(bytes).unwrap();
+        let object = builder.finish().unwrap().object_id().clone();
+        let now = now_unix();
+        let holder = ed25519_dalek::SigningKey::from_bytes(&[74; 32]);
+        let token = "admission-error";
+        let mut grant = crate::store::tests::test_outbound_grant("admission", "", 0);
+        grant.token_hash = crate::auth::hash_token(token);
+        grant.package_root = hex::encode(object.root);
+        grant.root = hex::encode(object.root);
+        grant.bytes = bytes.len() as u64;
+        grant.expires_at = now + 600;
+        grant.files = vec![crate::store::OutboundGrantFile {
+            source: "file.bin".into(),
+            name: "file.bin".into(),
+            suite: "blake3".into(),
+            root: hex::encode(object.root),
+            bytes: bytes.len() as u64,
+            receipt_b64: String::new(),
+            downloads: 0,
+            first_download_at: None,
+            last_download_at: None,
+        }];
+        app.store.insert_outbound_grant(grant.clone()).unwrap();
+        let serve = app.serve.as_ref().unwrap();
+        let (root, _) = ensure_server(&app, serve, &grant).unwrap();
+        let capability = vot_cli::authz::issue(
+            "votport",
+            &serve.audience,
+            &serve.issuer,
+            holder.verifying_key().to_bytes(),
+            root,
+            now,
+            300,
+        )
+        .unwrap();
+        let signed = vot_capability::decode(&capability).unwrap();
+        let claims = vot_capability::Capability::from_canonical_bytes(&signed.capability).unwrap();
+        let ticket = FetchTicket {
+            holder: hex::encode(holder.verifying_key().to_bytes()),
+            grant_token_hash: grant.token_hash.clone(),
+            policy_revision: 0,
+            token_id: hex::encode(claims.token_id),
+            grant_id: grant.id,
+            manifest_root: hex::encode(root),
+            expires_at: now + 300,
+            delivered_at: None,
+        };
+        assert!(app.store.put_fetch_ticket(&ticket, now).unwrap());
+        let requirement = vot_cli::authz::Requirement::new(
+            "votport",
+            vot_cli::authz::key_id_of(&serve.issuer.verifying_key()),
+            serve.issuer.verifying_key(),
+            &serve.audience,
+            root,
+        );
+        let challenge = requirement.challenge([75; 32]);
+        let binding = vot_transport_api::ChannelBinding::from_bytes([76; 32]);
+        let open = vot_cli::authz::Holder::new(capability, holder)
+            .unwrap()
+            .answer(&challenge, binding)
+            .unwrap();
+        app.store
+            .with(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER fail_fetch_admission BEFORE UPDATE OF admitted_at ON outbound_fetch_tickets
+                     BEGIN SELECT RAISE(ABORT, 'admission fixture'); END;",
+                )
+            })
+            .unwrap();
+
+        let peer = "127.0.0.1:1".parse().unwrap();
+        let unknown_before = app.serve_metrics.refusals(ServeRefusalReason::Unknown);
+        let closed_before = app.serve_metrics.refusals(ServeRefusalReason::Closed);
+        let runtime = tokio::runtime::Handle::current();
+        let admission = admit_fetch(
+            &app,
+            vot_cli::ServePresentation {
+                peer,
+                challenge: &challenge,
+                open: &open,
+                channel_binding: binding,
+                now,
+            },
+            &runtime,
+        );
+        assert!(admission.is_none());
+        assert_eq!(
+            app.serve_metrics.refusals(ServeRefusalReason::Unknown),
+            unknown_before + 1
+        );
+        assert_eq!(
+            app.serve_metrics.refusals(ServeRefusalReason::Closed),
+            closed_before
+        );
+        assert_eq!(serve.registry.active_sessions(), 0);
+        let _ = app
+            .store
+            .with(|connection| connection.execute_batch("DROP TRIGGER fail_fetch_admission"));
     }
 }

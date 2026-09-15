@@ -2424,7 +2424,7 @@ pub fn commit_persisted_interruption(
         replayed_chunks: 0,
         rejected_chunks: 0,
     };
-    record_session_event(store, ended, &session.tenant, &session.link_id, event);
+    let _ = record_session_event(store, ended, &session.tenant, &session.link_id, event);
 }
 
 fn commit_upload(
@@ -3575,7 +3575,7 @@ fn record_event(
         replayed_chunks: replays,
         rejected_chunks: rejected,
     };
-    record_session_event(
+    let _ = record_session_event(
         &setup.store,
         &setup.ended,
         &setup.tenant,
@@ -3590,7 +3590,7 @@ fn record_session_event(
     tenant: &str,
     link_id: &str,
     event: crate::store::SessionEvent,
-) {
+) -> Result<bool, String> {
     tracing::warn!(
         target: "audit", event = "upload_session_ended", link = %link_id,
         outcome = %event.outcome, detail = %event.detail,
@@ -3616,7 +3616,7 @@ fn record_session_event(
         label: String::new(),
         event: event.clone(),
     };
-    let _ = store.update_link(tenant, link_id, |link| {
+    let stored = store.update_link(tenant, link_id, |link| {
         ended.label = link.label.clone();
         ended.notifications = link.notifications.clone();
         link.events.push(event);
@@ -3625,7 +3625,16 @@ fn record_session_event(
             link.events.drain(..excess);
         }
     });
+    match &stored {
+        Ok(true) | Ok(false) => {}
+        Err(error) => tracing::warn!(
+            target: "audit", event = "upload_session_event_store_failed", link = %link_id,
+            outcome = %ended.event.outcome, %error,
+            "could not record upload session event"
+        ),
+    }
     let _ = ended_sender.send(ended);
+    stored
 }
 
 /// Records a native-push ticket that ended before it opened a VOT session.
@@ -5077,6 +5086,38 @@ mod push_tests {
             quiet_after_secs: 5,
             ended: mpsc::unbounded_channel().0,
         }
+    }
+
+    #[test]
+    fn session_event_writer_reports_store_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::Store::open(directory.path()).unwrap());
+        store
+            .with(|connection| connection.execute_batch("DROP TABLE links"))
+            .unwrap();
+        let (ended_sender, mut ended_receiver) = mpsc::unbounded_channel();
+        let error = record_session_event(
+            &store,
+            &ended_sender,
+            "",
+            "deleted-link",
+            crate::store::SessionEvent {
+                at: 2,
+                started_at: 1,
+                outcome: "cancelled".to_owned(),
+                detail: "test cancellation".to_owned(),
+                received_bytes: 0,
+                expected_bytes: 10,
+                replayed_chunks: 0,
+                rejected_chunks: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("no such table: links"), "{error}");
+        let ended = ended_receiver.try_recv().unwrap();
+        assert_eq!(ended.link_id, "deleted-link");
+        assert!(ended.label.is_empty());
+        assert!(ended.notifications.is_none());
     }
 
     #[tokio::test]

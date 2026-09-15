@@ -51,7 +51,7 @@ fn startup_warns_once_for_unknown_names_without_values() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_votport"));
     clear_votport_environment(&mut command);
     command
-        .env("RUST_LOG", "warn")
+        .env("RUST_LOG", "info")
         .env("VOTPORT_LOG_FORMAT", "json")
         .env("VOTPORT_ADMIN_PASSWORD", "correct-horse-battery")
         .env("VOTPORT_BIND", address.to_string())
@@ -96,6 +96,7 @@ fn startup_warns_once_for_unknown_names_without_values() {
         1,
         "{logs}"
     );
+    check_build_identity(&logs);
     assert!(logs.contains("VOTPORT_NOTIFY_SMTP_TO"), "{logs}");
     assert!(!logs.contains(SENTINEL), "unknown value leaked into logs");
 }
@@ -114,7 +115,7 @@ fn standby_startup_warns_for_unknown_names_before_pulling() {
     clear_votport_environment(&mut command);
     command
         .arg("standby")
-        .env("RUST_LOG", "warn")
+        .env("RUST_LOG", "info")
         .env("VOTPORT_LOG_FORMAT", "json")
         .env("VOTPORT_STANDBY_SOURCE", "http://127.0.0.1:9")
         .env("VOTPORT_REPLICA_TOKEN", "standby-fixture-token")
@@ -154,8 +155,53 @@ fn standby_startup_warns_for_unknown_names_before_pulling() {
         1,
         "{logs}"
     );
+    check_build_identity(&logs);
     assert!(logs.contains("VOTPORT_NOTIFY_SMTP_TO"), "{logs}");
     assert!(!logs.contains(SENTINEL), "unknown value leaked into logs");
+}
+
+fn check_build_identity(logs: &str) {
+    let entries: Vec<serde_json::Value> = logs
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|entry: &serde_json::Value| entry["fields"]["message"] == "votport starting")
+        .collect();
+    assert_eq!(entries.len(), 1, "{logs}");
+    assert_eq!(
+        entries[0]["fields"]["version"],
+        option_env!("VOTPORT_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(
+        entries[0]["fields"]["revision"],
+        option_env!("VOTPORT_REVISION").unwrap_or("unknown")
+    );
+}
+
+#[test]
+fn version_uses_compiled_identity_without_loading_configuration() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("must-not-exist");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_votport"));
+    clear_votport_environment(&mut command);
+    let output = command
+        .arg("--version")
+        .env("VOTPORT_BIND", "invalid-address")
+        .env("VOTPORT_DATA_DIR", &data)
+        .env("VOTPORT_VERSION", "runtime-version-must-not-win")
+        .env("VOTPORT_REVISION", "runtime-revision-must-not-win")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "votport {} ({})\n",
+            option_env!("VOTPORT_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
+            option_env!("VOTPORT_REVISION").unwrap_or("unknown")
+        )
+    );
+    assert!(output.stderr.is_empty());
+    assert!(!data.exists());
 }
 
 #[cfg(unix)]

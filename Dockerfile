@@ -42,6 +42,8 @@ RUN mkdir -p /src/server/src \
     && cd /src/server \
     && cargo build --release --locked
 COPY server/src /src/server/src
+ARG VOTPORT_VERSION=dev
+ARG VOTPORT_REVISION=unknown
 RUN touch /src/server/src/main.rs /src/server/src/lib.rs \
     && cd /src/server \
     && cargo auditable build --release --locked
