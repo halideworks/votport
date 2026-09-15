@@ -5,7 +5,8 @@ import { loadNotificationSettings, notificationEditor, notificationServices } fr
 const $ = (id) => document.getElementById(id);
 const node = (tag, text, className = '') => { const element = document.createElement(tag); element.textContent = text; element.className = className; return element; };
 const session = await requireSession(), admin = session.role === 'admin';
-let editing = null, defaultsEditor;
+let editing = null, defaultsEditor, testAttempt = 0;
+const testingDestinations = new Set();
 for (const [key, label] of Object.entries(notificationServices)) $('nd-channel').add(new window.Option(label, key));
 $('notification-new').hidden = $('notification-defaults-save').hidden = !admin;
 const guides = {
@@ -51,6 +52,7 @@ async function refresh() {
   $('notification-destinations').replaceChildren();
   for (const destination of data.destinations) {
     const card = node('div', '', 'card'), head = node('div', '', 'section-heading');
+    card.dataset.destination = destination.id;
     head.append(node('h3', destination.label), node('span', destination.enabled ? 'Enabled' : 'Disabled', 'badge')); card.append(head);
     card.append(node('p', `${notificationServices[destination.channel]} · ${destination.target}`, 'connection-meta'));
     const outcome = data.outcomes[destination.id];
@@ -60,10 +62,24 @@ async function refresh() {
       const actions = node('div', '', 'actions');
       actions.append(button('Edit', 'ghost', () => edit(destination)));
       const test = button('Send test', 'ghost', () => guard(async () => {
+        const attempt = ++testAttempt;
+        testingDestinations.add(destination.id);
         test.disabled = true;
-        try { await api(`/api/notifications/${destination.id}/test`, { method: 'POST' }); $('notification-notice').textContent = `Test accepted for ${destination.label}. Check that it appeared in ${destination.target}.`; }
-        finally { test.disabled = false; await refresh(); }
-      })); test.disabled = !destination.enabled; actions.append(test);
+        $('notification-notice').textContent = `Testing ${destination.label}…`;
+        try {
+          await api(`/api/notifications/${destination.id}/test`, { method: 'POST' });
+          if (attempt === testAttempt) $('notification-notice').textContent = `Test accepted for ${destination.label}. Check that it appeared in ${destination.target}.`;
+        } catch (error) {
+          if (attempt === testAttempt) $('notification-notice').textContent = `Test failed for ${destination.label}: ${error.message}`;
+        }
+        finally {
+          testingDestinations.delete(destination.id); test.disabled = false;
+          if (attempt === testAttempt) await refresh();
+          const current = [...document.querySelectorAll('#notification-destinations .card')]
+            .find((card) => card.dataset.destination === destination.id)?.querySelector('[data-notification-test]');
+          if (current) current.disabled = current.closest('.card')?.querySelector('.badge')?.textContent !== 'Enabled';
+        }
+      })); test.dataset.notificationTest = ''; test.disabled = !destination.enabled || testingDestinations.has(destination.id); actions.append(test);
       actions.append(button(destination.enabled ? 'Disable' : 'Enable', 'ghost', () => guard(async () => {
         await api('/api/notifications', { method: 'POST', body: JSON.stringify(write(destination, { enabled: !destination.enabled })) }); await refresh();
       })));

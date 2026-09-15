@@ -48,6 +48,7 @@ function workflowEditor(current = null) {
   const manage = document.createElement('a'); manage.href = '/workflows#projects'; manage.className = 'text-link'; manage.textContent = 'Manage reception projects →';
   element.append(help, fields, notificationHost, manage);
   function render() {
+    workflowNotifications?.destroy();
     fields.replaceChildren(); const project = receiveProjects.find((project) => project.id === select.value);
     notificationHost.replaceChildren(); workflowNotifications = null;
     if (project) { workflowNotifications = notificationEditor({ policy: current?.project_id === project.id ? current.notifications : null, inherit: project.notifications || null, events: workflowEvents }); notificationHost.append(workflowNotifications.element); }
@@ -71,7 +72,7 @@ function workflowEditor(current = null) {
     const recipients = [...fields.querySelectorAll('[data-recipient]:checked')].map((input) => input.dataset.recipient);
     if (project.recipients.length && !recipients.length) throw new Error('Choose at least one enrolled recipient.');
     return { project_id: select.value, metadata, recipients, notifications: workflowNotifications?.read() || null };
-  } };
+  }, destroy() { workflowNotifications?.destroy(); } };
 }
 
 // Connection-quality proxy: chunks the sender re-sent or the server refused.
@@ -605,7 +606,9 @@ function renderLink(link) {
       catch (error) { result.textContent = error.message; }
       finally { save.disabled = false; editor.element.disabled = false; }
     });
-    details.append(summary, editor.element, save, result); card.append(details);
+    details.append(summary, editor.element, save, result);
+    details.destroy = () => editor.destroy();
+    card.append(details);
   }
   // Filled in by the status poll while a sender is shipping into this link.
   const receiving = document.createElement('p');
@@ -795,13 +798,17 @@ async function refreshLinksInner({ append, fromPoll }) {
   const evicted = append ? previousCards.slice(0, Math.max(0, previousCards.length + links.length - 100)) : [];
   const edits = new Map([...container.querySelectorAll('[data-link-id]')].map((card) => [card.dataset.linkId, [...card.querySelectorAll('[data-unsaved]')].filter(isFormDirty)]).filter(([, editors]) => editors.length));
   {
-    const omitted = [...edits].filter(([id]) => append ? evicted.some((card) => card.dataset.linkId === id) : !links.some((link) => link.id === id)).flatMap(([, editors]) => editors);
+    const omittedEntries = [...edits].filter(([id]) => append ? evicted.some((card) => card.dataset.linkId === id) : !links.some((link) => link.id === id));
+    const omitted = omittedEntries.flatMap(([, editors]) => editors);
     if (omitted.length && !window.confirm('Discard unsaved edits on requests outside these results?')) return;
-    for (const editor of omitted) markFormSaved(editor);
+    for (const [id, editors] of omittedEntries) { for (const editor of editors) markFormSaved(editor); edits.delete(id); }
   }
   linksFilter = filter; linksExpanded = append;
   linksRefreshPending = false;
   const focus = container.contains(document.activeElement) ? document.activeElement : null;
+  const retainedEditors = new Set([...edits.values()].flat());
+  for (const card of evicted) card.querySelectorAll('.notification-details, .reception-workflow').forEach((editor) => editor.destroy?.());
+  if (!append) for (const editor of container.querySelectorAll('.notification-details, .reception-workflow')) if (!retainedEditors.has(editor)) editor.destroy?.();
   for (const card of evicted) card.remove();
   linksSeen = append ? linksSeen + links.length : links.length;
   if (!append) container.replaceChildren();
@@ -881,6 +888,7 @@ $('create-form').addEventListener('submit', async (event) => {
     markFormSaved($('create-form'));
     if (creatingRoute) { window.location.assign(`/trade-routes?receive=${encodeURIComponent(link.id)}#receive`); return; }
     $('create-form').reset();
+    createNotifications.destroy(); createWorkflow?.destroy();
     createNotifications = notificationEditor({ events: uploadEvents }); $('create-notifications').replaceChildren(createNotifications.element);
     createWorkflow = workflowEditor(); $('create-workflow').replaceChildren(createWorkflow.element);
     $('new-link').hidden = false;
@@ -934,6 +942,7 @@ const sessionReady = requireSession();
 $('create-form').inert = true;
 const projectsReady = Promise.all([sessionReady, api('/api/workflows/projects')]).then(([session, response]) => {
   receiveAdministrator = session.role === 'admin'; receiveProjects = response.projects.filter((project) => project.receive);
+  createWorkflow?.destroy();
   createWorkflow = workflowEditor(); $('create-workflow').replaceChildren(createWorkflow.element);
 }).catch((error) => { $('create-error').textContent = `Could not load reception projects: ${error.message}`; $('create-error').hidden = false; })
   .finally(() => { $('create-form').inert = false; });

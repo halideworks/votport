@@ -2,9 +2,6 @@ use super::*;
 use crate::store::{NotificationDestination, NotificationMode, NotificationPolicy};
 use futures_util::{stream, StreamExt};
 
-const DESTINATION_FAILURE: &str =
-    "The destination did not accept the test. Check its connection settings and try again.";
-
 pub(super) struct Route<'a> {
     pub tenant: &'a str,
     pub policy: Option<&'a NotificationPolicy>,
@@ -137,8 +134,6 @@ async fn send_destination(
         request.send().await,
     )
     .await
-    .then_some(())
-    .ok_or(DESTINATION_FAILURE)
 }
 
 fn destination_request(

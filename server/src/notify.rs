@@ -22,9 +22,11 @@ use crate::session::FinishReport;
 use crate::store::{OutboundDownloadResult, OutboundGrant, ResolvedSmtp};
 
 const MAX_NOTIFICATION_FILES: usize = 100;
+const DESTINATION_FAILURE: &str =
+    "The destination did not accept the test. Check its connection settings and try again.";
 
 /// Product name for notification titles: the tenant's brand name when one is
-/// set, else the tenant label, else "votport".
+/// set, else the tenant label, else "VOTPort".
 fn title_brand(app: &App, tenant: &str) -> String {
     app.store
         .branding(tenant)
@@ -40,7 +42,7 @@ fn title_brand(app: &App, tenant: &str) -> String {
                 .map(|tenant| tenant.label)
                 .filter(|label| !label.is_empty())
         })
-        .unwrap_or_else(|| "votport".to_owned())
+        .unwrap_or_else(|| "VOTPort".to_owned())
 }
 
 pub async fn trade_uploaded(app: &App, tenant: &str, upload: &str) {
@@ -334,12 +336,20 @@ fn chat_payload(channel: &str, title: &str, body: &str) -> serde_json::Value {
     }
 }
 
+fn notification_connection_failure(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "The destination timed out. Try again or check the service status."
+    } else {
+        "The destination connection failed. Check its URL, network access and TLS settings."
+    }
+}
+
 async fn log_failure(
     channel: &str,
     event: &str,
     transfer_id: Option<&str>,
     result: Result<reqwest::Response, reqwest::Error>,
-) -> bool {
+) -> Result<(), &'static str> {
     match result {
         Ok(response) if !response.status().is_success() => {
             tracing::warn!(
@@ -350,9 +360,10 @@ async fn log_failure(
                 outcome = "failed",
                 "notification failed"
             );
-            false
+            Err(DESTINATION_FAILURE)
         }
         Err(error) => {
+            let reason = notification_connection_failure(&error);
             let error = error.without_url();
             tracing::warn!(
                 channel,
@@ -361,7 +372,7 @@ async fn log_failure(
                 outcome = "failed",
                 "notification failed: {error}"
             );
-            false
+            Err(reason)
         }
         Ok(mut response) if channel == "teams" => {
             let mut body = Vec::new();
@@ -371,13 +382,19 @@ async fn log_failure(
                         body.extend_from_slice(&chunk)
                     }
                     Ok(None) => {
-                        break !String::from_utf8_lossy(&body)
+                        break if String::from_utf8_lossy(&body)
                             .contains("Microsoft Teams endpoint returned HTTP error")
+                        {
+                            Err(DESTINATION_FAILURE)
+                        } else {
+                            Ok(())
+                        };
                     }
-                    _ => break false,
+                    Err(error) => break Err(notification_connection_failure(&error)),
+                    _ => break Err(DESTINATION_FAILURE),
                 }
             };
-            if !accepted {
+            if accepted.is_err() {
                 tracing::warn!(
                     channel,
                     event,
@@ -387,7 +404,7 @@ async fn log_failure(
             }
             accepted
         }
-        Ok(_) => true,
+        Ok(_) => Ok(()),
     }
 }
 
@@ -802,7 +819,7 @@ pub(crate) mod tests {
         for ((uri, headers, body), brand) in
             messages[1..]
                 .iter()
-                .zip(["Müller 撮影", "votport", "Atelier été"])
+                .zip(["Müller 撮影", "VOTPort", "Atelier été"])
         {
             let url = reqwest::Url::parse(&format!("http://localhost{uri}")).unwrap();
             assert!(
@@ -1199,6 +1216,65 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn notification_tests_distinguish_connection_and_response_timeouts() {
+        use tokio::io::AsyncWriteExt;
+        for phase in ["connect", "headers", "body"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = if phase == "connect" {
+                drop(listener);
+                None
+            } else {
+                Some(tokio::spawn(async move {
+                    let (mut stream, _) =
+                        tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    if phase == "body" {
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n")
+                            .await.unwrap();
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    drop(stream);
+                }))
+            };
+            let directory = tempfile::tempdir().unwrap();
+            let mut application = testing::build(directory.path());
+            Arc::get_mut(&mut application).unwrap().http = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_millis(100))
+                .build()
+                .unwrap();
+            let destination = test_destination_config(
+                &application,
+                if phase == "body" { "teams" } else { "webhook" },
+                format!("http://{address}/test?secret=fixture-secret"),
+            );
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                test_destination(&application, "", &destination),
+            )
+            .await;
+            if let Some(server) = server {
+                server.abort();
+                let joined = server.await;
+                assert!(joined.is_ok() || joined.unwrap_err().is_cancelled());
+            }
+            let expected = if phase == "connect" {
+                "The destination connection failed. Check its URL, network access and TLS settings."
+            } else {
+                "The destination timed out. Try again or check the service status."
+            };
+            assert_eq!(result.unwrap(), Err(expected), "{phase}");
+            assert_eq!(
+                application.store.notification_outcomes("").unwrap()[&destination.id]["delivered"],
+                false
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn outbound_downloaded_sends_complete_webhook() {
         let (application, _directory, rx, thread) = webhook_app();
         let mut grant = test_grant(Vec::new());
@@ -1360,7 +1436,7 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            transcript.contains("Subject: votport: notification test\r\n"),
+            transcript.contains("Subject: VOTPort: notification test\r\n"),
             "{transcript}"
         );
         assert!(transcript.contains("MIME-Version: 1.0\r\n"), "{transcript}");
