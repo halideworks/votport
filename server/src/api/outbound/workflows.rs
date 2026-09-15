@@ -2335,7 +2335,7 @@ mod tests {
                     .unwrap(),
             );
             assert_eq!(
-                source_info_indexed(&app, &cached_grant, 0)
+                source_info_indexed_with_file(&app, &cached_grant, 0, None)
                     .unwrap()
                     .receipt
                     .as_ref(),
@@ -2343,18 +2343,20 @@ mod tests {
             );
             let sidecar = receipt_path(&app.config.receive_dir.join("file.bin"));
             std::fs::write(&sidecar, b"invalid").unwrap();
-            assert!(source_info_indexed(&app, &cached_grant, 0).is_err());
+            assert!(source_info_indexed_with_file(&app, &cached_grant, 0, None).is_err());
             std::fs::remove_file(&sidecar).unwrap();
-            assert!(source_info_indexed(&app, &cached_grant, 0).is_err());
+            assert!(source_info_indexed_with_file(&app, &cached_grant, 0, None).is_err());
             std::fs::write(&sidecar, &original_receipt).unwrap();
-            let source = source_info_indexed(&app, &grant, 0).unwrap();
+            let source = source_info_indexed_with_file(&app, &grant, 0, None).unwrap();
             assert_eq!(source.path, app.config.receive_dir.join("file.bin"));
             assert_eq!(source.receipt.as_ref(), Some(&original_receipt));
+            let integrity = IntegrityContext::for_source(&app, &grant, 0, "workflow", &source);
             assert!(write_verified_source(
                 &mut Vec::new(),
                 source,
                 &app.signer.verifying_key(),
-                &mut [0; 64]
+                &mut [0; 64],
+                &integrity
             )
             .is_err());
             std::fs::write(app.config.receive_dir.join("file.bin"), bytes).unwrap();

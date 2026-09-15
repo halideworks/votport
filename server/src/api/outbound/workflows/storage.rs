@@ -811,6 +811,7 @@ async fn export_destination(app: &Arc<App>, job: &Job, config: &Storage) -> ApiR
             index,
             Some(file.clone()),
             operation,
+            Some("storage"),
         )
         .await?;
         operation = retained;
