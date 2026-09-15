@@ -3558,8 +3558,11 @@ impl Store {
 
     /// Records a minted fetch capability against its grant, only if the
     /// deliveries recorded plus the tickets still live and undelivered leave
-    /// room under `max_downloads`. One statement, so two mints racing for
-    /// the last delivery cannot both reserve it. Returns whether it did.
+    /// room under `max_downloads`. An unadmitted ticket from this same
+    /// holder is replaced by the new capability in the same transaction;
+    /// admitted tickets and other holders still consume the reservation.
+    /// The insert and replacement are atomic, so two mints racing for the
+    /// last delivery cannot both reserve it.
     pub fn put_fetch_ticket(&self, ticket: &FetchTicket, now: u64) -> Result<bool, String> {
         let mut connection = self.connection.lock().expect("store poisoned");
         let tx = connection.transaction().map_err(|e| e.to_string())?;
@@ -3575,8 +3578,17 @@ impl Store {
         let changed = tx.execute(
             "INSERT INTO outbound_fetch_tickets(token_id,grant_id,manifest_root,expires_at,delivered_at,holder,grant_token_hash,policy_revision)
              SELECT ?1,?2,?3,?4,NULL,?5,?6,?7 FROM outbound_grants g WHERE g.id=?2 AND g.token_hash=?6 AND g.revoked_at IS NULL AND g.expires_at>?8
-             AND (g.max_downloads IS NULL OR g.downloads+(SELECT COUNT(*) FROM outbound_fetch_tickets WHERE grant_id=?2 AND (admitted_at IS NOT NULL OR (grant_token_hash=?6 AND policy_revision=?7)) AND expires_at>?8 AND delivered_at IS NULL)<g.max_downloads)",
+             AND (g.max_downloads IS NULL OR g.downloads+(SELECT COUNT(*) FROM outbound_fetch_tickets WHERE grant_id=?2 AND (admitted_at IS NOT NULL OR (grant_token_hash=?6 AND policy_revision=?7 AND holder<>?5)) AND expires_at>?8 AND delivered_at IS NULL)<g.max_downloads)",
             rusqlite::params![ticket.token_id,ticket.grant_id,ticket.manifest_root,ticket.expires_at as i64,ticket.holder,ticket.grant_token_hash,ticket.policy_revision as i64,now as i64]).map_err(|e| e.to_string())?;
+        if changed == 1 {
+            tx.execute(
+                "DELETE FROM outbound_fetch_tickets
+                 WHERE grant_id = ?1 AND holder = ?2 AND token_id <> ?3
+                   AND expires_at > ?4 AND delivered_at IS NULL AND admitted_at IS NULL",
+                rusqlite::params![ticket.grant_id, ticket.holder, ticket.token_id, now as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(changed == 1)
     }

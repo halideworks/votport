@@ -5900,15 +5900,16 @@ async fn a_library_grant_is_fetched_over_vot_quic_and_counted_once() {
         .json::<Value>()
         .await
         .unwrap();
-    // The one capability reserves the one allowed delivery: a second mint
-    // is refused before anything is fetched.
+    // The capability reserves the one allowed delivery for its holder;
+    // another holder cannot reserve it before the first fetch finishes.
+    let other_holder = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
     let reserved = recipient
         .post(format!("{}/api/s/{token}/fetch", server.base))
-        .json(&json!({ "holder_key": hex::encode(holder.verifying_key().to_bytes()) }))
+        .json(&json!({ "holder_key": hex::encode(other_holder.verifying_key().to_bytes()) }))
         .send()
         .await
         .unwrap();
-    assert_eq!(reserved.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(reserved.status(), reqwest::StatusCode::CONFLICT);
     let root: [u8; 32] = hex::decode(minted["package_root"].as_str().unwrap())
         .unwrap()
         .try_into()

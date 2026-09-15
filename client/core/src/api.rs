@@ -185,6 +185,8 @@ pub struct OutboundMetadata {
     #[serde(default)]
     pub grant_id: Option<String>,
     #[serde(default)]
+    pub package_root: Option<String>,
+    #[serde(default)]
     pub delivery_manifest: Option<String>,
     #[serde(default)]
     pub evidence_authorization: Option<crate::delivery_protocol::SignedChallenge>,
@@ -220,7 +222,6 @@ pub struct FetchMint {
     pub address: String,
     pub certificate_digest: String,
     pub package_root: String,
-    pub expires_at: u64,
 }
 
 impl Client {
@@ -751,7 +752,7 @@ impl Client {
     ///
     /// # Errors
     /// A network failure or a non-success status (404 when the server does not
-    /// serve).
+    /// serve, or 409 when its download reservation is unavailable).
     pub fn mint_fetch(
         &self,
         token: &str,

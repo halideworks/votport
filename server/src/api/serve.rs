@@ -813,7 +813,10 @@ pub async fn mint_fetch(
         )
         .map_err(super::store_unavailable)?;
     if !reserved {
-        return Err(ApiError::not_found());
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "this delivery has no fetch reservation available; try again later",
+        ));
     }
     tracing::info!(
         target: "audit", event = "outbound_fetch_minted", grant_id = %grant.id,
@@ -1352,6 +1355,84 @@ mod tests {
                 std::fs::remove_file(&manifest).unwrap();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn mint_fetch_replaces_same_holder_ticket_but_rejects_another_holder() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::api::testing::config(directory.path());
+        config.serve_bind = Some("127.0.0.1:0".parse().unwrap());
+        let app = crate::app::build(config).unwrap();
+        let bytes = b"fetch retry";
+        let source = app.config.outbound_dir.join("file.bin");
+        std::fs::write(&source, bytes).unwrap();
+        let mut builder = vot_sdk::object::InMemoryObjectBuilder::new(
+            Suite::Blake3Bao64,
+            Some(bytes.len() as u64),
+            bytes.len() as u64,
+        )
+        .unwrap();
+        builder.update(bytes).unwrap();
+        let object = builder.finish().unwrap().object_id().clone();
+        let token = "a".repeat(32);
+        let now = now_unix();
+        let mut grant = crate::store::tests::test_outbound_grant("fetch-retry", "", 0);
+        grant.token_hash = crate::auth::hash_token(&token);
+        grant.expires_at = now + 600;
+        grant.max_downloads = Some(1);
+        grant.bytes = bytes.len() as u64;
+        grant.root = hex::encode(object.root);
+        grant.files = vec![crate::store::OutboundGrantFile {
+            source: "file.bin".into(),
+            name: "file.bin".into(),
+            suite: "blake3".into(),
+            root: hex::encode(object.root),
+            bytes: bytes.len() as u64,
+            receipt_b64: String::new(),
+            downloads: 0,
+            first_download_at: None,
+            last_download_at: None,
+        }];
+        app.store.insert_outbound_grant(grant.clone()).unwrap();
+
+        let holder_a = ed25519_dalek::SigningKey::from_bytes(&[7; 32])
+            .verifying_key()
+            .to_bytes();
+        assert!(app
+            .store
+            .put_fetch_ticket(
+                &FetchTicket {
+                    holder: hex::encode(holder_a),
+                    grant_token_hash: grant.token_hash.clone(),
+                    policy_revision: 0,
+                    token_id: "interrupted".into(),
+                    grant_id: grant.id.clone(),
+                    manifest_root: "old".into(),
+                    expires_at: now + 300,
+                    delivered_at: None,
+                },
+                now,
+            )
+            .unwrap());
+
+        let mint = |holder_key: [u8; 32]| {
+            mint_fetch(
+                axum::extract::State(Arc::clone(&app)),
+                axum::extract::Path(token.clone()),
+                axum::http::HeaderMap::new(),
+                axum::Json(FetchRequest {
+                    holder_key: hex::encode(holder_key),
+                }),
+            )
+        };
+        assert_eq!(mint(holder_a).await.unwrap().status(), StatusCode::OK);
+        let holder_b = ed25519_dalek::SigningKey::from_bytes(&[8; 32])
+            .verifying_key()
+            .to_bytes();
+        assert_eq!(
+            mint(holder_b).await.unwrap_err().status,
+            StatusCode::CONFLICT
+        );
     }
 
     #[test]
