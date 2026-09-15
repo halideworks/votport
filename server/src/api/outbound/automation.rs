@@ -427,7 +427,7 @@ fn delivery_page(
     };
     let files = page.files.iter().map(|(index, file)| json!({"index": index, "name": file.name, "suite": file.suite, "root": file.root, "bytes": file.bytes, "download_starts": file.downloads, "first_download_at": file.first_download_at, "last_download_at": file.last_download_at})).collect::<Vec<_>>();
     Ok(
-        json!({"grant": public_grant_with_file_count(page.grant, page.file_count), "state": state, "total_bytes": page.total_bytes, "files": files, "offset": offset, "has_more": has_more, "next_offset": has_more.then_some(offset + files.len())}),
+        json!({"grant": public_grant_with_file_count(&page.grant, page.file_count), "state": state, "total_bytes": page.total_bytes, "files": files, "offset": offset, "has_more": has_more, "next_offset": has_more.then_some(offset + files.len())}),
     )
 }
 

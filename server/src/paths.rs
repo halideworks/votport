@@ -766,13 +766,13 @@ mod tests {
     fn portable_payload_names_leave_space_for_receipts() {
         let parent = "p".repeat(255);
         assert!(admit_component(&parent, false).is_ok());
-        for name in ["a".repeat(243), "ア".repeat(81)] {
+        for name in ["a".repeat(242), format!("{}ab", "ア".repeat(80))] {
             admit_portable_paths([format!("{parent}/{name}").as_str()]).unwrap();
         }
-        for name in ["a".repeat(244), format!("{}a", "ア".repeat(81))] {
+        for name in ["a".repeat(243), "ア".repeat(81)] {
             assert!(admit_portable_paths([format!("{parent}/{name}").as_str()])
                 .unwrap_err()
-                .contains("243 UTF-8 bytes; shorten"));
+                .contains("242 UTF-8 bytes; shorten"));
         }
     }
 

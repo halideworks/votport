@@ -109,6 +109,37 @@ const LIBRARY_SELECTION_BUDGET: LibraryEnumerationBudget = LibraryEnumerationBud
 static LIBRARY_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static LIBRARY_HASH_PERMITS: Semaphore = Semaphore::const_new(LIBRARY_HASH_CONCURRENCY);
 
+#[cfg(test)]
+struct LibraryMutationStall {
+    root: PathBuf,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static LIBRARY_MUTATION_STALL: Mutex<Option<LibraryMutationStall>> = Mutex::new(None);
+
+#[cfg(test)]
+fn wait_library_mutation_stall(root: &Path) {
+    let stall = {
+        let mut pending = LIBRARY_MUTATION_STALL
+            .lock()
+            .expect("library mutation stall poisoned");
+        if pending.as_ref().is_some_and(|stall| stall.root == root) {
+            pending.take()
+        } else {
+            None
+        }
+    };
+    if let Some(stall) = stall {
+        let _ = stall.entered.send(());
+        stall
+            .release
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("library mutation stall was not released");
+    }
+}
+
 pub(crate) static OUTBOUND_INTEGRITY_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
@@ -670,30 +701,20 @@ async fn prepare_outbound_chunk<'a>(
         .await
         .map_err(|_| Err(ApiError::internal("inspect outbound staging file failed")))?
         .len();
-    if stage_len == total {
-        // The client's last chunk landed but the connection went before the
-        // publish (or its reply) did. The bytes may still sit in the page
-        // cache, since only the final request syncs; sync, then publish,
-        // whatever range this request named.
-        file.sync_all()
-            .await
-            .map_err(|_| Err(ApiError::internal("sync outbound file failed")))?;
-        drop(file);
-        return Err(publish_outbound_stage(
-            app,
-            identity,
-            &stage,
-            &path,
-            requested_path,
-            total,
-        ));
-    }
-    if stage_len != start {
+    if stage_len < start {
+        sync_outbound_chunk(&mut file).await.map_err(Err)?;
         return Err(Ok(outbound_upload_conflict(
             requested_path,
             stage_len,
             total,
         )));
+    }
+    if stage_len > start {
+        // Only the caller's acknowledged offset proves a safe prefix. A
+        // longer stage may contain unsynced bytes from an interrupted request.
+        file.set_len(start)
+            .await
+            .map_err(|_| Err(ApiError::internal("truncate outbound staging file failed")))?;
     }
     file.seek(SeekFrom::Start(start))
         .await
@@ -781,9 +802,9 @@ async fn upload_outbound_chunk(
     }
     let offset = end + 1;
     if offset < total {
-        if file.flush().await.is_err() {
+        if let Err(error) = sync_outbound_chunk(&mut file).await {
             let _ = file.set_len(start).await;
-            return Err(ApiError::internal("write outbound staging file failed"));
+            return Err(error);
         }
         return Ok(Json(json!({
             "complete": false,
@@ -803,6 +824,15 @@ async fn upload_outbound_chunk(
     }
     drop(file);
     publish_outbound_stage(&app, &identity, &stage, &path, &requested_path, total)
+}
+
+async fn sync_outbound_chunk(file: &mut tokio::fs::File) -> ApiResult<()> {
+    file.flush()
+        .await
+        .map_err(|_| ApiError::internal("write outbound staging file failed"))?;
+    file.sync_data()
+        .await
+        .map_err(|_| ApiError::internal("sync outbound staging file failed"))
 }
 
 /// Links a complete stage into the library under `path`, drops the stage,
@@ -848,6 +878,8 @@ fn outbound_upload_stripe(path: &Path) -> usize {
 
 fn outbound_stage_name(path: &Path, upload_id: &str) -> String {
     let mut hasher = Sha256::new();
+    // Older stages acknowledged bytes before syncing and cannot prove a prefix.
+    hasher.update(b"durable-chunks-v1\0");
     hasher.update(path.to_string_lossy().as_bytes());
     hasher.update([0]);
     hasher.update(upload_id.as_bytes());
@@ -982,14 +1014,21 @@ pub async fn delete_outbound_file(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = admin::require_operator(&app, &headers)?;
     admin::require_admin_write(&headers, &identity)?;
-    let _operation = begin_outbound_operation(&app, &identity.tenant)?;
+    let operation = begin_outbound_operation_owned(&app, &identity.tenant)?;
     let relative_path = query.path.trim_matches('/').to_owned();
     let path = safe_library_path(&app, &identity.tenant, &relative_path)?;
-    let bytes = {
+    let worker = Arc::clone(&app);
+    let tenant = identity.tenant.clone();
+    let subject = identity.subject.clone();
+    let relative_path_for_worker = relative_path.clone();
+    let bytes = tokio::task::spawn_blocking(move || {
+        let _operation = operation;
         let _lock = LIBRARY_MUTATION_LOCK
             .lock()
             .expect("library mutation lock poisoned");
-        let root = library_root(&app, &identity.tenant);
+        let root = library_root(&worker, &tenant);
+        #[cfg(test)]
+        wait_library_mutation_stall(&root);
         if !library_components_safe(&root, &path) {
             return Err(ApiError::not_found());
         }
@@ -997,9 +1036,9 @@ pub async fn delete_outbound_file(
         if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
             return Err(ApiError::not_found());
         }
-        if app
+        if worker
             .store
-            .has_active_library_grant(&identity.tenant, &relative_path, now_unix())
+            .has_active_library_grant(&tenant, &relative_path_for_worker, now_unix())
             .map_err(super::store_unavailable)?
         {
             return Err(ApiError::new(
@@ -1009,15 +1048,18 @@ pub async fn delete_outbound_file(
         }
         std::fs::remove_file(&path)
             .map_err(|_| ApiError::internal("delete outbound file failed"))?;
-        metadata.len()
-    };
-    app.store.audit(
-        &identity.tenant,
-        &identity.subject,
-        "outbound_file_deleted",
-        &relative_path,
-        &json!({ "path": relative_path, "bytes": bytes }),
-    );
+        drop(_lock);
+        worker.store.audit(
+            &tenant,
+            &subject,
+            "outbound_file_deleted",
+            &relative_path_for_worker,
+            &json!({ "path": relative_path_for_worker, "bytes": metadata.len() }),
+        );
+        Ok::<_, ApiError>(metadata.len())
+    })
+    .await
+    .map_err(|_| ApiError::internal("delete outbound file failed"))??;
     Ok(Json(json!({ "path": query.path, "bytes": bytes })))
 }
 
@@ -1557,7 +1599,7 @@ pub async fn list_outbound_grants(
     Ok(Json(json!({
         "grants": grants
             .into_iter()
-            .map(|(grant, file_count)| public_grant_with_file_count(grant, file_count))
+            .map(|(grant, file_count)| public_grant_with_file_count(&grant, file_count))
             .collect::<Vec<_>>(),
         "total": total,
         "offset": offset,
@@ -1937,7 +1979,7 @@ pub async fn create_outbound_grant(
     let base = admin::base_url(&app, &headers);
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({ "grant": public_grant(grant), "url": format!("{base}/s/{token}") })),
+        Json(json!({ "grant": public_grant(&grant), "url": format!("{base}/s/{token}") })),
     )
         .into_response())
 }
@@ -2121,7 +2163,7 @@ async fn create_library_grant(
     max_files: usize,
     options: GrantOptions,
 ) -> ApiResult<Response> {
-    let _operation = begin_outbound_operation(app, &identity.tenant)?;
+    let operation = begin_outbound_operation_owned(app, &identity.tenant)?;
     if requested.is_empty() || requested.len() > max_files {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2375,33 +2417,55 @@ async fn create_library_grant(
             "label must be 1..=200 characters",
         ));
     }
-    {
+    let public = public_grant(&grant);
+    let grant_id = grant.id.clone();
+    let grant_file_count = grant.files.len();
+    let operation_id = options
+        .automation
+        .as_ref()
+        .map(|(operation, _)| operation.operation_id.clone());
+    let automation = options.automation;
+    let workflow = options.workflow;
+    let worker = Arc::clone(app);
+    let token_for_worker = token.clone();
+    let tenant = identity.tenant.clone();
+    let subject = identity.subject.clone();
+    let audit_detail = json!({ "files": grant_file_count, "operation_id": operation_id });
+    tokio::task::spawn_blocking(move || {
+        let _operation = operation;
         let _lock = LIBRARY_MUTATION_LOCK
             .lock()
             .expect("library mutation lock poisoned");
+        #[cfg(test)]
+        wait_library_mutation_stall(&root);
         if !library_sources_match(&root, &revalidation, &grant.files) {
             return Err(ApiError::not_found());
         }
-        app.store
+        worker
+            .store
             .insert_workflow_grant(
-                grant.clone(),
-                options.automation.as_ref().map(|(op, _)| op),
-                options.workflow.as_ref(),
-                Some(&token),
+                grant,
+                automation.as_ref().map(|(operation, _)| operation),
+                workflow.as_ref(),
+                Some(&token_for_worker),
             )
             .map_err(super::store_unavailable)?;
-    }
-    app.store.audit(
-        &identity.tenant,
-        &identity.subject,
-        "outbound_grant_created",
-        &grant.id,
-        &json!({ "files": grant.files.len(), "operation_id": options.automation.as_ref().map(|(op, _)| &op.operation_id) }),
-    );
+        drop(_lock);
+        worker.store.audit(
+            &tenant,
+            &subject,
+            "outbound_grant_created",
+            &grant_id,
+            &audit_detail,
+        );
+        Ok::<_, ApiError>(())
+    })
+    .await
+    .map_err(|_| ApiError::internal("create outbound grant failed"))??;
     let base = admin::base_url(app, headers);
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({ "grant": public_grant(grant), "url": format!("{base}/s/{token}"), "operation_id": options.automation.as_ref().map(|(op, _)| &op.operation_id) })),
+        Json(json!({ "grant": public, "url": format!("{base}/s/{token}"), "operation_id": operation_id })),
     )
         .into_response())
 }
@@ -4761,7 +4825,7 @@ pub(super) fn attachment_filename(name: &str) -> ApiResult<HeaderValue> {
     }
     HeaderValue::try_from(value).map_err(|_| ApiError::internal("download filename invalid"))
 }
-fn public_grant(grant: OutboundGrant) -> serde_json::Value {
+fn public_grant(grant: &OutboundGrant) -> serde_json::Value {
     let file_count = if grant.files.is_empty() {
         1
     } else {
@@ -4770,7 +4834,7 @@ fn public_grant(grant: OutboundGrant) -> serde_json::Value {
     public_grant_with_file_count(grant, file_count)
 }
 
-fn public_grant_with_file_count(grant: OutboundGrant, file_count: usize) -> serde_json::Value {
+fn public_grant_with_file_count(grant: &OutboundGrant, file_count: usize) -> serde_json::Value {
     let files_truncated = file_count > OUTBOUND_GRANT_PREVIEW_FILES
         || (file_count > 1 && grant.files.len() < file_count);
     let files = if files_truncated {
@@ -5053,6 +5117,39 @@ mod tests {
         format!("votport_admin={token}")
     }
 
+    fn named_admin_cookie(app: &App, tenant: &str) -> String {
+        let identity = auth::AdminIdentity {
+            subject: "local".to_owned(),
+            tenant: tenant.to_owned(),
+            role: "admin".to_owned(),
+            grants: vec![auth::TenantGrant {
+                incarnation: None,
+                tenant: tenant.to_owned(),
+                role: "admin".to_owned(),
+            }],
+            credential_version: 1,
+        };
+        let token = auth::issue_admin_token(&app.secret, &identity, &app.config.admin_token_tag);
+        format!("votport_admin={token}")
+    }
+
+    fn arm_library_mutation_stall(
+        root: &Path,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        assert!(LIBRARY_MUTATION_STALL
+            .lock()
+            .expect("library mutation stall poisoned")
+            .replace(LibraryMutationStall {
+                root: root.to_owned(),
+                entered: entered_tx,
+                release: release_rx,
+            })
+            .is_none());
+        (entered_rx, release_tx)
+    }
+
     #[test]
     fn outbound_operation_refusal_is_retryable_during_tenant_purge() {
         let directory = tempfile::tempdir().unwrap();
@@ -5067,6 +5164,99 @@ mod tests {
         assert_eq!(error.retry_after_seconds, Some(1));
         assert_eq!(error.code, "unavailable");
         drop(operation);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_library_mutation_keeps_admission_until_worker_finishes() {
+        use std::time::{Duration, Instant};
+
+        for deleting in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let app = crate::api::testing::build(directory.path());
+            app.store
+                .insert_tenant(crate::store::tests::test_tenant("acme"))
+                .unwrap();
+            let root = library_root(&app, "acme");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("held.bin"), b"library fixture").unwrap();
+            let cookie = named_admin_cookie(&app, "acme");
+
+            let (entered, release) = arm_library_mutation_stall(&root);
+            let (cancel_watchdog, watchdog_wait) = std::sync::mpsc::channel();
+            let watchdog_release = release.clone();
+            let watchdog = std::thread::spawn(move || {
+                if watchdog_wait.recv_timeout(Duration::from_secs(5)).is_err() {
+                    let _ = watchdog_release.send(());
+                }
+            });
+            let request = if deleting {
+                Request::delete("/api/admin/outbound-files?path=held.bin")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .body(Body::empty())
+                    .unwrap()
+            } else {
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"paths":["held.bin"],"expires_days":1}"#))
+                    .unwrap()
+            };
+            let serving = tokio::spawn(crate::app::router(app.clone()).oneshot(request));
+
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if entered.try_recv().is_ok() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("library mutation worker did not enter its critical section");
+            let heartbeat_started = Instant::now();
+            let heartbeat = tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Instant::now()
+            });
+            let heartbeat_at = heartbeat.await.unwrap();
+            assert!(
+                !serving.is_finished(),
+                "mutation must still be held by the barrier"
+            );
+            assert!(
+                heartbeat_at.duration_since(heartbeat_started) < Duration::from_secs(1),
+                "the runtime stalled in the library mutation critical section"
+            );
+            serving.abort();
+            assert!(matches!(
+                serving.await,
+                Err(error) if error.is_cancelled()
+            ));
+            assert_eq!(app.sessions.active_outbound_for_tenant("acme"), 1);
+
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while app.sessions.active_outbound_for_tenant("acme") != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled mutation did not release admission after worker completion");
+            let _ = cancel_watchdog.send(());
+            watchdog.join().unwrap();
+            let grants = app.store.outbound_grants("acme").unwrap();
+            assert_eq!(grants.len(), usize::from(!deleting));
+            assert_eq!(root.join("held.bin").exists(), !deleting);
+            let audit = app.store.audit_recent(Some("acme"), 0, 10).unwrap();
+            let event = if deleting {
+                "outbound_file_deleted"
+            } else {
+                "outbound_grant_created"
+            };
+            assert_eq!(audit.iter().filter(|row| row.event == event).count(), 1);
+        }
     }
 
     async fn body(response: Response) -> serde_json::Value {
@@ -8918,6 +9108,22 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn chunk_checkpoint_refuses_a_file_that_cannot_sync() {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .await
+            .unwrap();
+        file.write_all(b"chunk").await.unwrap();
+        let response = sync_outbound_chunk(&mut file)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     #[tokio::test]
     async fn resumable_library_upload_keeps_partial_files_unpublished() {
         let (_directory, app, cookie, _bytes) = fixture().await;
@@ -8981,7 +9187,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(mismatch.status(), StatusCode::CONFLICT);
+        assert_eq!(mismatch.status(), StatusCode::OK);
         assert_eq!(body(mismatch).await["offset"], 3);
 
         let complete = crate::app::router(app.clone())
@@ -9087,33 +9293,121 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_complete_stage_left_unpublished_is_published_on_the_next_request() {
-        // The last chunk landed but the connection went before the publish:
-        // the stage holds the whole file, and the client's next attempt,
-        // which starts the file over from its first chunk, publishes it and
-        // learns the file is complete.
+    async fn an_unacknowledged_stage_tail_is_replayed_instead_of_trusted() {
+        for stale in [b"wrong".as_slice(), b"wrong data"] {
+            let (_directory, app, cookie, _bytes) = fixture().await;
+            let upload_id = "e".repeat(64);
+            let path = app.config.outbound_dir.join("late.bin");
+            let stage = app
+                .config
+                .outbound_dir
+                .join(outbound_stage_name(&path, &upload_id));
+            std::fs::write(&stage, stale).unwrap();
+            let response = crate::app::router(app.clone())
+                .oneshot(chunk_request(
+                    &cookie, "late.bin", &upload_id, 0, 4, 10, b"whole",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let progress = body(response).await;
+            assert_eq!(progress["complete"], false);
+            assert_eq!(progress["offset"], 5);
+            assert!(!path.exists());
+            assert_eq!(std::fs::read(&stage).unwrap(), b"whole");
+            let response = crate::app::router(app.clone())
+                .oneshot(chunk_request(
+                    &cookie, "late.bin", &upload_id, 5, 9, 10, b" file",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body(response).await["complete"], true);
+            assert_eq!(std::fs::read(&path).unwrap(), b"whole file");
+            assert!(!stage.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn chunk_replay_preserves_the_acknowledged_prefix_and_rewinds_missing_bytes() {
+        for (stale, expected_status, expected_offset) in [
+            (b"wholewrong".as_slice(), StatusCode::OK, 10),
+            (b"who".as_slice(), StatusCode::CONFLICT, 3),
+        ] {
+            let (_directory, app, cookie, _bytes) = fixture().await;
+            let upload_id = "e".repeat(64);
+            let path = app.config.outbound_dir.join("prefix.bin");
+            let stage = path
+                .parent()
+                .unwrap()
+                .join(outbound_stage_name(&path, &upload_id));
+            std::fs::write(&stage, stale).unwrap();
+            let response = crate::app::router(app.clone())
+                .oneshot(chunk_request(
+                    &cookie,
+                    "prefix.bin",
+                    &upload_id,
+                    5,
+                    9,
+                    10,
+                    b" file",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(body(response).await["offset"], expected_offset);
+            if expected_status == StatusCode::CONFLICT {
+                assert_eq!(std::fs::read(&stage).unwrap(), b"who");
+                let response = crate::app::router(app.clone())
+                    .oneshot(chunk_request(
+                        &cookie,
+                        "prefix.bin",
+                        &upload_id,
+                        3,
+                        9,
+                        10,
+                        b"le file",
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(body(response).await["complete"], true);
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), b"whole file");
+        }
+    }
+
+    #[tokio::test]
+    async fn stages_from_before_durable_acknowledgements_are_not_resumed() {
         let (_directory, app, cookie, _bytes) = fixture().await;
         let upload_id = "e".repeat(64);
-        let path = app.config.outbound_dir.join("late.bin");
-        let stage = app
-            .config
-            .outbound_dir
-            .join(outbound_stage_name(&path, &upload_id));
-        std::fs::write(&stage, b"whole file").unwrap();
+        let path = app.config.outbound_dir.join("older.bin");
+        let mut old_hash = Sha256::new();
+        old_hash.update(path.to_string_lossy().as_bytes());
+        old_hash.update([0]);
+        old_hash.update(upload_id.as_bytes());
+        let old_stage = path.parent().unwrap().join(format!(
+            ".vot-outbound-{:02x}-{}.stage",
+            outbound_upload_stripe(&path),
+            hex::encode(old_hash.finalize()),
+        ));
+        std::fs::write(&old_stage, b"wrong").unwrap();
         let response = crate::app::router(app.clone())
             .oneshot(chunk_request(
-                &cookie, "late.bin", &upload_id, 0, 4, 10, b"whole",
+                &cookie,
+                "older.bin",
+                &upload_id,
+                5,
+                9,
+                10,
+                b" file",
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: serde_json::Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert_eq!(body["complete"], true);
-        assert_eq!(body["offset"], 10);
-        assert_eq!(std::fs::read(&path).unwrap(), b"whole file");
-        assert!(!stage.exists());
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(body(response).await["offset"], 0);
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&old_stage).unwrap(), b"wrong");
     }
 
     #[tokio::test]
@@ -9198,8 +9492,7 @@ mod tests {
             crate::app::router(app.clone()).oneshot(second),
         );
         let statuses = [first.unwrap().status(), second.unwrap().status()];
-        assert!(statuses.contains(&StatusCode::OK));
-        assert!(statuses.contains(&StatusCode::CONFLICT));
+        assert_eq!(statuses, [StatusCode::OK, StatusCode::OK]);
         assert_eq!(
             std::fs::metadata(app.config.outbound_dir.join(outbound_stage_name(
                 &app.config.outbound_dir.join("concurrent.bin"),

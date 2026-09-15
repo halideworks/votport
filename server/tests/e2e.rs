@@ -1524,7 +1524,7 @@ async fn oversized_payload_names_are_refused_before_staging() {
         .build()
         .unwrap();
     let parent = "p".repeat(255);
-    for name in ["a".repeat(244), format!("{}a", "ア".repeat(81))] {
+    for name in ["a".repeat(243), "ア".repeat(81)] {
         let files = [prepare(vec![&parent, &name], b"payload".to_vec())];
         let (_, session) = open_session(&client, &server.base, "filename budget", &files).await;
         let (status, body) = begin(&client, &server.base, &session).await;
@@ -1532,7 +1532,7 @@ async fn oversized_payload_names_are_refused_before_staging() {
         assert!(body["error"]
             .as_str()
             .unwrap()
-            .contains("243 UTF-8 bytes; shorten"));
+            .contains("242 UTF-8 bytes; shorten"));
         assert!(!server.receive_dir.join(&parent).exists());
     }
 }

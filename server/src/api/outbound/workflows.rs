@@ -1659,6 +1659,190 @@ mod tests {
         )
     }
 
+    fn standalone_storage(id: &str, revision: u64) -> serde_json::Value {
+        json!({
+            "storage": {
+                "id": id,
+                "revision": revision,
+                "label": id,
+                "kind": "s3",
+                "endpoint": "http://127.0.0.1:1",
+                "bucket": "delivery",
+                "region": "us-east-1",
+                "path_style": true,
+                "kms_key_id": null,
+                "tenants": [""],
+                "enabled": true
+            },
+            "credentials": {
+                "mode": "access_key",
+                "access_key_id": "test-access",
+                "secret_access_key": "test-secret",
+                "session_token": null
+            }
+        })
+    }
+
+    fn paired_route(app: &App, index: usize) {
+        let route = crate::store::TradeRoute {
+            id: format!("paired_{index:03}"),
+            revision: 1,
+            tenant: String::new(),
+            direction: "outgoing".into(),
+            name: format!("Partner {index}"),
+            peer_name: format!("Partner {index}"),
+            peer_key: format!("{index:064x}"),
+            address: format!("http://peer-{index}.example"),
+            endpoint: "delivery".into(),
+            endpoint_name: "Delivery".into(),
+            category: "external".into(),
+            forwarding: false,
+            metadata_keys: vec![],
+            state: "pending_approval".into(),
+            notifications: Default::default(),
+            last_contact: None,
+            error: None,
+            remote_grant: String::new(),
+            remote_state: "enrolling".into(),
+            cancel_active: false,
+        };
+        let invitation = app.store.event_signer.port_message(
+            "invitation",
+            "",
+            format!("invitation-{index}"),
+            now_unix() + 300,
+            json!({}),
+        );
+        app.store
+            .save_outgoing_trade(&route, &auth::random_token(), &invitation)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn paired_trade_storage_does_not_consume_standalone_storage_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        for index in 0..100 {
+            paired_route(&app, index);
+        }
+        assert_eq!(app.store.trade_routes(None).unwrap().len(), 100);
+
+        let cookie = admin_cookie(&app);
+        let put = |id: &str, revision: u64| standalone_storage(id, revision);
+        assert_eq!(
+            call(
+                &app,
+                Method::PUT,
+                "/api/workflows/storage",
+                Some(&cookie),
+                Some(put("paired_000", 1)),
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let (status, _, body) = call(
+            &app,
+            Method::PUT,
+            "/api/workflows/storage",
+            Some(&cookie),
+            Some(put("standalone_000", 0)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        for index in 1..100 {
+            let (status, _, body) = call(
+                &app,
+                Method::PUT,
+                "/api/workflows/storage",
+                Some(&cookie),
+                Some(put(&format!("standalone_{index:03}"), 0)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        }
+        assert_eq!(
+            app.store
+                .delivery_storages()
+                .unwrap()
+                .into_iter()
+                .filter(|storage| !storage.id.starts_with("paired_"))
+                .count(),
+            100
+        );
+
+        let saved = app
+            .store
+            .delivery_storages()
+            .unwrap()
+            .into_iter()
+            .find(|storage| storage.id == "standalone_099")
+            .unwrap();
+        let mut update = serde_json::to_value(saved).unwrap();
+        update["label"] = json!("renamed at the cap");
+        let (status, _, body) = call(
+            &app,
+            Method::PUT,
+            "/api/workflows/storage",
+            Some(&cookie),
+            Some(json!({
+                "storage": update,
+                "credentials": {
+                    "mode": "access_key",
+                    "access_key_id": "test-access",
+                    "secret_access_key": "test-secret",
+                    "session_token": null
+                }
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let (status, _, body) = call(
+            &app,
+            Method::PUT,
+            "/api/workflows/storage",
+            Some(&cookie),
+            Some(put("standalone_100", 0)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(String::from_utf8_lossy(&body).contains("storage connection limit"));
+
+        app.store
+            .insert_tenant(crate::store::tests::test_tenant("acme"))
+            .unwrap();
+        let incarnation = app.store.tenant("acme").unwrap().unwrap().incarnation;
+        let identity = auth::AdminIdentity {
+            subject: "sso:acme-admin".into(),
+            tenant: "acme".into(),
+            role: "admin".into(),
+            grants: vec![auth::TenantGrant {
+                incarnation: Some(incarnation),
+                tenant: "acme".into(),
+                role: "admin".into(),
+            }],
+            credential_version: 1,
+        };
+        let named_cookie = format!(
+            "votport_admin={}",
+            auth::issue_admin_token(&app.secret, &identity, &app.config.admin_token_tag)
+        );
+        assert_eq!(
+            call(
+                &app,
+                Method::PUT,
+                "/api/workflows/storage",
+                Some(&named_cookie),
+                Some(put("named_admin_storage", 0)),
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+
     #[test]
     fn workflow_store_errors_keep_domain_statuses_and_hide_unknown_failures() {
         let operation =

@@ -5425,7 +5425,7 @@ mod push_tests {
 
     #[test]
     fn publication_reserves_receipt_filename_bytes() {
-        for name in ["a".repeat(243), "ア".repeat(81)] {
+        for name in ["a".repeat(242), format!("{}ab", "ア".repeat(80))] {
             let directory = tempfile::tempdir().unwrap();
             let bytes = b"frame";
             let object = object(Suite::Blake3Bao64, bytes);
@@ -5456,7 +5456,7 @@ mod push_tests {
             let error = prepare_files(&setup, &[(entries[0].0.clone(), other)], || true)
                 .err()
                 .expect("oversized collision candidate admitted");
-            assert!(error.message.contains("243 UTF-8 bytes; shorten"));
+            assert!(error.message.contains("242 UTF-8 bytes; shorten"));
             assert_eq!(fs::read(destination.join(&name)).unwrap(), bytes);
             assert_eq!(fs::read(&sidecar).unwrap(), receipt);
             assert!(!destination.join(paths::with_suffix(&name, 1)).exists());
@@ -5466,7 +5466,7 @@ mod push_tests {
 
     #[test]
     fn oversized_payload_names_refuse_preparation_before_staging() {
-        for name in ["a".repeat(244), format!("{}a", "ア".repeat(81))] {
+        for name in ["a".repeat(243), "ア".repeat(81)] {
             let directory = tempfile::tempdir().unwrap();
             let object = object(Suite::Blake3Bao64, b"frame");
             let setup = setup(directory.path(), object.clone());
@@ -5477,7 +5477,7 @@ mod push_tests {
             let error = prepare_files(&setup, &entries, || true)
                 .err()
                 .expect("oversized payload admitted");
-            assert!(error.message.contains("243 UTF-8 bytes; shorten"));
+            assert!(error.message.contains("242 UTF-8 bytes; shorten"));
             assert!(!setup.dest_dir.join("new").exists());
         }
     }
@@ -5520,7 +5520,7 @@ mod push_tests {
                     scope.spawn(move || {
                         ready.send(()).unwrap();
                         waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-                        for name in ["a".repeat(244), format!("{}a", "ア".repeat(81))] {
+                        for name in ["a".repeat(243), "ア".repeat(81)] {
                             let error = receive
                                 .prepare_manifest(
                                     vot_cli::PackageSummary {
@@ -5534,7 +5534,7 @@ mod push_tests {
                                     )],
                                 )
                                 .unwrap_err();
-                            assert!(error.message.contains("243 UTF-8 bytes; shorten"));
+                            assert!(error.message.contains("242 UTF-8 bytes; shorten"));
                             assert!(!receive.setup.dest_dir.join(name).exists());
                         }
                         receive
@@ -6989,12 +6989,8 @@ mod push_tests {
                 vec!["frame".into()],
                 "reserved for signed receipts",
             ),
-            ("", vec!["a".repeat(244)], "243 UTF-8 bytes; shorten"),
-            (
-                "",
-                vec![format!("{}a", "ア".repeat(81))],
-                "243 UTF-8 bytes; shorten",
-            ),
+            ("", vec!["a".repeat(243)], "242 UTF-8 bytes; shorten"),
+            ("", vec!["ア".repeat(81)], "242 UTF-8 bytes; shorten"),
         ] {
             let directory = tempfile::tempdir().unwrap();
             let bytes = b"frame";
@@ -7613,8 +7609,8 @@ mod push_tests {
             for name in [
                 "old.vot-receipt".into(),
                 "old.vot-receI\u{307}pt/frame".into(),
-                "a".repeat(244),
-                format!("{}a", "ア".repeat(81)),
+                "a".repeat(243),
+                "ア".repeat(81),
             ] {
                 let reserved = setup.dest_dir.join(&name);
                 fs::create_dir_all(reserved.parent().unwrap()).unwrap();

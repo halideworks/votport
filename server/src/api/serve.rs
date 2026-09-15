@@ -34,7 +34,7 @@ use super::outbound::{
 use super::{ApiError, ApiResult};
 use crate::app::App;
 use crate::session::AdmissionGuard;
-use crate::store::{now_unix, FetchTicket, OutboundGrant};
+use crate::store::{now_unix, FetchTicket, OutboundGrant, Store};
 
 /// vot-cli's bundle layout, which `BundleServer::assemble` reads and which
 /// upstream keeps crate-private: the manifest directory, its seal, and its
@@ -385,6 +385,76 @@ fn write_stage(stage: &Path, pages: &[Vec<u8>], seal: &[u8]) -> Result<(), Strin
 /// Where a grant's manifest lives.
 pub(crate) fn manifest_directory(app: &App, grant_id: &str) -> PathBuf {
     app.config.data_dir.join(MANIFESTS_DIRECTORY).join(grant_id)
+}
+
+fn owned_grant_id(name: &str) -> bool {
+    name.len() == 32
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Removes only manifest directories whose grant was revoked or deleted.
+/// Query errors retain every directory so boot cannot erase data from an incomplete view.
+pub(crate) fn sweep_manifests(store: &Store, data_dir: &Path) {
+    let root = data_dir.join(MANIFESTS_DIRECTORY);
+    let metadata = match std::fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(%error, path = %root.display(), "grant manifest directory unavailable; skipping sweep");
+            return;
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        tracing::warn!(path = %root.display(), "grant manifest root is not a directory; skipping sweep");
+        return;
+    }
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(%error, path = %root.display(), "grant manifest directory unreadable; skipping sweep");
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, path = %root.display(), "grant manifest entry unreadable");
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !owned_grant_id(name) {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "grant manifest entry type unavailable");
+                continue;
+            }
+        };
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        match store.outbound_grant_is_non_revoked(name) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, grant_id = name, "grant manifest ownership unavailable; preserving entry");
+                continue;
+            }
+        }
+        if let Err(error) = std::fs::remove_dir_all(&path) {
+            tracing::warn!(%error, grant_id = name, "grant manifest cleanup failed");
+        }
+    }
 }
 
 /// The proof directory a grant's leaves are cached in, beside its catalogs.
@@ -1097,6 +1167,86 @@ pub(crate) fn admit_fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_boot_sweeps_revoked_and_deleted_grant_manifests() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::api::testing::config(directory.path());
+        let store = Store::open(&config.data_dir).unwrap();
+        let now = now_unix();
+        let open_id = "a".repeat(32);
+        let expired_id = "b".repeat(32);
+        let revoked_id = "c".repeat(32);
+        for mut grant in [
+            crate::store::tests::test_outbound_grant(&open_id, "", 0),
+            crate::store::tests::test_outbound_grant(&expired_id, "", 0),
+            crate::store::tests::test_outbound_grant(&revoked_id, "", 0),
+        ] {
+            grant.expires_at = now.saturating_add(600);
+            store.insert_outbound_grant(grant).unwrap();
+        }
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE outbound_grants SET expires_at = ?1 WHERE id = ?2",
+                    rusqlite::params![now.saturating_sub(1) as i64, expired_id],
+                )?;
+                connection.execute(
+                    "UPDATE outbound_grants SET revoked_at = ?1 WHERE id = ?2",
+                    rusqlite::params![now as i64, revoked_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+
+        let root = config.data_dir.join(MANIFESTS_DIRECTORY);
+        std::fs::create_dir_all(&root).unwrap();
+        let missing_id = "d".repeat(32);
+        for id in [&open_id, &expired_id, &revoked_id, &missing_id] {
+            std::fs::create_dir(root.join(id)).unwrap();
+        }
+        for name in ["package", "foreign", &"e".repeat(31), &"F".repeat(32)] {
+            std::fs::create_dir(root.join(name)).unwrap();
+        }
+        #[cfg(unix)]
+        let symlink_id = "1".repeat(32);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join(&open_id), root.join(&symlink_id)).unwrap();
+
+        let app = crate::app::build(config).unwrap();
+
+        assert!(root.join(&open_id).is_dir());
+        assert!(root.join(&expired_id).is_dir());
+        assert!(!root.join(&revoked_id).exists());
+        assert!(!root.join(&missing_id).exists());
+        for name in ["package", "foreign", &"e".repeat(31), &"F".repeat(32)] {
+            assert!(root.join(name).is_dir());
+        }
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(root.join(symlink_id))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        drop(app);
+    }
+
+    #[test]
+    fn manifest_sweep_fails_closed_when_grant_query_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let root = directory.path().join(MANIFESTS_DIRECTORY);
+        std::fs::create_dir_all(&root).unwrap();
+        let stale_id = "f".repeat(32);
+        std::fs::create_dir(root.join(&stale_id)).unwrap();
+        store
+            .with(|connection| connection.execute_batch("DROP TABLE outbound_grants"))
+            .unwrap();
+
+        sweep_manifests(&store, directory.path());
+
+        assert!(root.join(stale_id).is_dir());
+    }
 
     #[test]
     #[ignore = "timing, run with --ignored --nocapture"]

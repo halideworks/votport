@@ -1,11 +1,11 @@
-pub(crate) const MAX_PAYLOAD_NAME_BYTES: usize = 255 - ".vot-receipt".len();
+pub(crate) const MAX_PAYLOAD_NAME_BYTES: usize = 255 - ".vot-".len() - ".journal".len();
 
 pub(crate) fn check_payload_name_length(name: &str) -> Result<(), String> {
     if name.len() <= MAX_PAYLOAD_NAME_BYTES {
         Ok(())
     } else {
         Err(format!(
-            "filename {name:?} exceeds {MAX_PAYLOAD_NAME_BYTES} UTF-8 bytes; shorten it to leave room for its signed receipt"
+            "filename {name:?} exceeds {MAX_PAYLOAD_NAME_BYTES} UTF-8 bytes; shorten it to leave room for its signed receipt and receive journal"
         ))
     }
 }
@@ -31,16 +31,12 @@ mod tests {
 
     #[test]
     fn payload_name_length_counts_utf8_bytes() {
-        for name in ["a".repeat(242), "a".repeat(243), "ア".repeat(81)] {
+        for name in ["a".repeat(242), format!("{}ab", "ア".repeat(80))] {
             assert!(check_payload_name_length(&name).is_ok(), "{name:?}");
         }
-        for name in [
-            "a".repeat(244),
-            format!("{}a", "ア".repeat(81)),
-            "ア".repeat(82),
-        ] {
+        for name in ["a".repeat(243), "ア".repeat(81)] {
             let error = check_payload_name_length(&name).unwrap_err();
-            assert!(error.contains("243 UTF-8 bytes; shorten"));
+            assert!(error.contains("242 UTF-8 bytes; shorten"));
             assert!(error.contains(&format!("{name:?}")));
         }
     }
