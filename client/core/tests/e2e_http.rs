@@ -1,7 +1,6 @@
 //! End-to-end HTTP send against a real votport server.
 //!
-//! Without `VOTPORT_BIN` the test returns early, so it is inert where no server
-//! binary exists and real where the client CI job builds one.
+//! Local runs may skip without `VOTPORT_BIN`; CI requires the server binary.
 
 mod common;
 
@@ -13,8 +12,7 @@ use votport_client_core::{send_over_http, Drop, Selected};
 
 #[test]
 fn a_drop_sends_over_http_and_lands_in_the_receive_directory() {
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
-        eprintln!("VOTPORT_BIN unset; skipping the HTTP e2e");
+    let Some(bin) = common::server_binary() else {
         return;
     };
     let server = common::start_server(&bin, &[]);
@@ -81,5 +79,49 @@ fn a_drop_sends_over_http_and_lands_in_the_receive_directory() {
             .read_to_end(&mut received_bytes)
             .unwrap();
         assert_eq!(&received_bytes, expected, "{relative} bytes differ");
+    }
+}
+
+#[test]
+fn server_fixture_is_required_in_ci() {
+    const PROBE: &str = "VOTPORT_TEST_SERVER_FIXTURE_PROBE";
+    if let Ok(expected) = std::env::var(PROBE) {
+        assert_eq!(
+            common::server_binary().as_deref(),
+            (!expected.is_empty()).then_some(expected.as_str())
+        );
+        return;
+    }
+    for (ci, binary, succeeds) in [
+        (None, None, true),
+        (Some("true"), None, false),
+        (Some(""), None, false),
+        (Some("true"), Some("fixture-server"), true),
+        (None, Some("fixture-server"), true),
+    ] {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args(["--exact", "server_fixture_is_required_in_ci", "--nocapture"])
+            .env(PROBE, binary.unwrap_or_default())
+            .env_remove("CI")
+            .env_remove("VOTPORT_BIN");
+        if let Some(ci) = ci {
+            child.env("CI", ci);
+        }
+        if let Some(binary) = binary {
+            child.env("VOTPORT_BIN", binary);
+        }
+        let output = child.output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            succeeds,
+            "CI={ci:?}, VOTPORT_BIN={binary:?}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !succeeds {
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .contains("VOTPORT_BIN must name the integration-test server"));
+        }
     }
 }

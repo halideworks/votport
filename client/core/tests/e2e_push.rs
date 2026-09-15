@@ -1,7 +1,7 @@
 //! End-to-end push send against a real votport server with push enabled.
 //!
-//! Push receive is Unix-only, so this runs on Unix. Without `VOTPORT_BIN` it
-//! returns early. The server is started with a push listener and a loopback
+//! Push receive is Unix-only. Local runs may skip without `VOTPORT_BIN`; CI
+//! requires it. The server is started with a push listener and a loopback
 //! advertise address; it generates its own push certificate.
 
 #![cfg(unix)]
@@ -15,8 +15,7 @@ use votport_client_core::{send, Device, Drop, Selected, Sent};
 
 #[test]
 fn a_drop_pushes_over_quic_and_lands_in_the_receive_directory() {
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
-        eprintln!("VOTPORT_BIN unset; skipping the push e2e");
+    let Some(bin) = common::server_binary() else {
         return;
     };
     let push_port = common::free_port();

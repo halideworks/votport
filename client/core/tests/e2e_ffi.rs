@@ -1,7 +1,7 @@
 //! End-to-end over the UniFFI surface: the same functions a shell calls, with
 //! a Rust listener standing in for the shell's, against a real votport.
 //!
-//! Without `VOTPORT_BIN` the test returns early. The state directory (the
+//! Local runs may skip without `VOTPORT_BIN`; CI requires it. The state directory (the
 //! device key and the journal) is pointed at a temporary directory through
 //! `XDG_DATA_HOME`, so the test neither reads this machine's key nor leaves
 //! journal entries behind; the e2e runs on Linux only.
@@ -30,8 +30,7 @@ fn isolate_state() -> tempfile::TempDir {
 
 #[test]
 fn the_ffi_end_to_end() {
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
-        eprintln!("VOTPORT_BIN unset; skipping the FFI e2e");
+    let Some(bin) = common::server_binary() else {
         return;
     };
     let _state = isolate_state();

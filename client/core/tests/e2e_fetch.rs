@@ -1,8 +1,8 @@
 //! End-to-end QUIC fetch against a real votport server with a serve listener.
 //!
 //! The server serves fetches only when `VOTPORT_SERVE_BIND` is set; it
-//! generates its own certificate, the twin of the push one. Without
-//! `VOTPORT_BIN` this returns early. Unix-only, matching the push e2e.
+//! generates its own certificate, the twin of the push one. Local runs may skip
+//! without `VOTPORT_BIN`; CI requires it. Unix-only, matching the push e2e.
 
 #![cfg(unix)]
 
@@ -13,8 +13,7 @@ use votport_client_core::{receive_over_fetch, Delivery, Device, Error};
 
 #[test]
 fn a_delivery_is_fetched_over_quic_and_materialized() {
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
-        eprintln!("VOTPORT_BIN unset; skipping the QUIC fetch e2e");
+    let Some(bin) = common::server_binary() else {
         return;
     };
     let serve_port = common::free_port();
@@ -103,8 +102,7 @@ fn a_delivery_is_fetched_over_quic_and_materialized() {
 
 #[test]
 fn a_refused_fetch_does_not_burn_a_download_ticket() {
-    let Ok(bin) = std::env::var("VOTPORT_BIN") else {
-        eprintln!("VOTPORT_BIN unset; skipping the fetch ticket-burn e2e");
+    let Some(bin) = common::server_binary() else {
         return;
     };
     let serve_port = common::free_port();

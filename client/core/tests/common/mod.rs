@@ -11,6 +11,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+/// Only local runs may omit the server fixture.
+pub fn server_binary() -> Option<String> {
+    match std::env::var("VOTPORT_BIN") {
+        Ok(binary) => Some(binary),
+        Err(std::env::VarError::NotPresent) if std::env::var_os("CI").is_none() => {
+            eprintln!("VOTPORT_BIN unset; skipping local server integration test");
+            None
+        }
+        Err(error) => panic!("VOTPORT_BIN must name the integration-test server: {error}"),
+    }
+}
+
 pub const ADMIN_PASSWORD: &str = "e2e-password";
 
 /// A running server, killed on drop.
