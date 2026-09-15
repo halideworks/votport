@@ -26,3 +26,5 @@ client/windows/*/bin/
 client/windows/*/obj/
 
 /client/macos/VotportCore/votport-cli
+
+__pycache__/

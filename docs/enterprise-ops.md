@@ -281,7 +281,7 @@ Resolution per key:
 
 Pushover stays all-or-nothing: token and user must both resolve to Some, else the channel is off (same as `from_env` today).
 
-`Store::setting(key)`, `Store::put_settings(actor, &[(key, SettingWrite)])`, `Store::delete_setting(key)`, `Store::resolved_settings(&Config)`.
+`Store::setting(key)`, `Store::put_settings(actor, &[(key, SettingWrite)])`, `Store::resolved_settings(&Config)`.
 
 ```rust
 enum SettingWrite {
