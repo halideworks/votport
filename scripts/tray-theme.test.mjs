@@ -5,7 +5,10 @@ import { test } from 'node:test';
 const tray = await readFile(new URL('../client/windows/Votport/Tray.cs', import.meta.url), 'utf8');
 
 test('tray clicks keep the transfer panel separate from the context menu', () => {
-  const routing = tray.slice(tray.indexOf('if (mouse == WmLButtonUp)'), tray.indexOf('return IntPtr.Zero;'));
+  const start = tray.indexOf('if (mouse == WmLButtonUp)');
+  const end = tray.indexOf('return IntPtr.Zero;', start);
+  assert.ok(start >= 0 && end > start, 'tray click routing must be present');
+  const routing = tray.slice(start, end);
   const dispatch = new Function('mouse', 'panel', 'menu',
     'const WmLButtonUp = 0x0202, WmRButtonUp = 0x0205;\n' + routing);
   for (const mouse of [0x0202, 0x0205, 0]) {

@@ -318,7 +318,7 @@ final class PortStore: ObservableObject {
             deliveries = []
             automationTokens = []
         }
-        log.notice("port call failed: \(detail, privacy: .public)")
+        log.notice("port call failed: \(detail, privacy: .private)")
     }
 
     /// Runs `work` on its own thread (a core call blocks for its round trips

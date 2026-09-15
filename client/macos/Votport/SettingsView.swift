@@ -23,6 +23,12 @@ struct SettingsView: View {
                     .tracking(1.5)
                     .foregroundStyle(Tokens.muted)
 
+                if #available(macOS 15, *) {
+                    Text("If a port on your local network cannot connect, allow Local Network access for votport in System Settings.")
+                        .font(Type.caption)
+                        .foregroundStyle(Tokens.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 HomePortSection()
                 if port.signedIn { AgentAccessSection() }
 
