@@ -424,8 +424,7 @@ pub async fn upload_outbound_file(
 ) -> ApiResult<Response> {
     // Every refusal of a chunk before its body is read drains it first, so
     // a client still writing reads the status (a session that ended
-    // mid-upload must arrive as the 401 it is, not a reset connection). The
-    // whole-file branch below is only reached with empty bodies.
+    // mid-upload must arrive as the 401 it is, not a reset connection).
     let admitted = admin::require_operator(&app, &headers).and_then(|identity| {
         admin::require_admin_write(&headers, &identity)?;
         let operation = begin_outbound_operation(&app, &identity.tenant)?;
@@ -463,11 +462,14 @@ pub async fn upload_outbound_file(
         return upload_outbound_chunk(Arc::clone(&app), identity, headers, query.path, body).await;
     }
     let path = safe_library_path(&app, &identity.tenant, &query.path)?;
+    let stripe = outbound_upload_stripe(&path);
+    let _lock = app.outbound_upload_locks[stripe].lock().await;
     let parent = path
         .parent()
         .ok_or_else(|| ApiError::internal("outbound path has no parent"))?;
     create_library_dirs(parent)?;
-    let temporary = parent.join(format!(".vot-outbound-{}.stage", auth::random_token()));
+    let upload_id = auth::random_token();
+    let temporary = parent.join(outbound_stage_name(&path, &upload_id));
     let temporary_guard = UploadTemporary(temporary.clone());
     let mut options = tokio::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -8531,6 +8533,94 @@ mod tests {
                 .flatten()
                 .all(|entry| !entry.file_name().to_string_lossy().ends_with(".stage")))
             .unwrap_or(true));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn whole_file_upload_stage_is_owned_while_a_slow_body_is_active() {
+        use std::time::{Duration, SystemTime};
+
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let cookie = admin_cookie(&app);
+        let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+        let stream = futures_util::stream::unfold(receiver, |mut receiver| async {
+            receiver.recv().await.map(|chunk| (chunk, receiver))
+        });
+        let request = Request::post("/api/admin/outbound-files?path=slow.bin")
+            .header("cookie", cookie)
+            .header("x-votport", "1")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let upload = tokio::spawn(crate::app::router(app.clone()).oneshot(request));
+
+        sender.send(Ok(Bytes::from_static(b"first"))).await.unwrap();
+        let stage = tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..200 {
+                if let Some(stage) = std::fs::read_dir(&app.config.outbound_dir)
+                    .unwrap()
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .find(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                name.starts_with(".vot-outbound-") && name.ends_with(".stage")
+                            })
+                    })
+                    .filter(|stage| {
+                        std::fs::read(stage).is_ok_and(|contents| contents.as_slice() == b"first")
+                    })
+                {
+                    return stage;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("whole-file upload did not write its first chunk");
+        })
+        .await
+        .expect("whole-file upload did not create its stage");
+        let name = stage.file_name().unwrap().to_str().unwrap();
+        let (stripe, digest) = name
+            .strip_prefix(".vot-outbound-")
+            .and_then(|name| name.strip_suffix(".stage"))
+            .and_then(|name| name.split_once('-'))
+            .expect("whole-file upload used an unowned stage name");
+        assert_eq!(
+            stripe,
+            format!(
+                "{:02x}",
+                outbound_upload_stripe(&app.config.outbound_dir.join("slow.bin"))
+            )
+        );
+        assert!(stripe.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(valid_outbound_upload_id(digest));
+
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let now = old + Duration::from_secs(app.config.session_idle_secs);
+        std::fs::File::open(&stage)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        sweep_upload_stages(&app, now);
+        assert!(stage.exists(), "sweeper removed an active upload stage");
+
+        sender
+            .send(Ok(Bytes::from_static(b"second")))
+            .await
+            .unwrap();
+        drop(sender);
+        let response = tokio::time::timeout(Duration::from_secs(2), upload)
+            .await
+            .expect("whole-file upload did not finish")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read(app.config.outbound_dir.join("slow.bin")).unwrap(),
+            b"firstsecond"
+        );
+        assert!(!stage.exists());
     }
 
     #[tokio::test]

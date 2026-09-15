@@ -145,9 +145,13 @@ try {
   await page.fill('#audit-retention-days', '40'); await page.locator('#retention-form button[type=submit]').click();
   await page.locator('#retention-note').getByText('Saved.', { exact: true }).waitFor();
   assert.equal(await page.inputValue('#smtp-host'), 'unsaved.example'); assert.equal(await page.inputValue('#smtp-password'), 'unsaved-smtp-secret');
+  assert.equal(await page.locator('#audit-retention-source').textContent(), 'saved');
+  assert.equal(await page.locator('[data-reset=audit_retention_days]').isVisible(), true);
   await page.fill('#audit-retention-days', '41'); await page.locator('[data-reset=audit_retention_days]').click();
   await page.locator('#retention-note').getByText('Using environment.', { exact: true }).waitFor();
   assert.notEqual(await page.inputValue('#audit-retention-days'), '41'); assert.equal(await page.inputValue('#smtp-host'), 'unsaved.example');
+  assert.equal(await page.locator('#audit-retention-source').textContent(), 'from environment');
+  assert.equal(await page.locator('[data-reset=audit_retention_days]').isVisible(), false);
 
   const clockPage = await context.newPage();
   const clockSettings = structuredClone(await api('admin/settings'));

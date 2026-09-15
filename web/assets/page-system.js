@@ -7,12 +7,12 @@ import { applyFooter } from '/assets/branding.js';
 
 const $ = (id) => document.getElementById(id);
 
-function sourceLabel(source) {
-  return source === 'db' ? 'saved' : 'from environment';
+function sourceLabel(key, overriddenKeys) {
+  return overriddenKeys.includes(key) ? 'saved' : 'from environment';
 }
 
-function setSource(id, source) {
-  $(id).textContent = sourceLabel(source);
+function setSource(id, key, overriddenKeys) {
+  $(id).textContent = sourceLabel(key, overriddenKeys);
 }
 
 function setSecret(id, isSet) {
@@ -157,73 +157,74 @@ function preserveSettingsEdits(exclude) {
 }
 function fillSettings(data, exclude = null) {
   const restore = preserveSettingsEdits(exclude);
+  const overriddenKeys = data.overridden_keys || [];
   fillDeployment(data);
   fillRetentionClock(data);
   $('smtp-host').value = data.smtp_host || '';
-  setSource('smtp-host-source', data.smtp_host_source);
+  setSource('smtp-host-source', 'smtp_host', overriddenKeys);
   $('smtp-port').value = data.smtp_port;
-  setSource('smtp-port-source', data.smtp_port_source);
+  setSource('smtp-port-source', 'smtp_port', overriddenKeys);
   $('smtp-starttls').checked = data.smtp_starttls !== false;
-  setSource('smtp-starttls-source', data.smtp_starttls_source);
+  setSource('smtp-starttls-source', 'smtp_starttls', overriddenKeys);
   $('smtp-username').value = data.smtp_username || '';
-  setSource('smtp-username-source', data.smtp_username_source);
+  setSource('smtp-username-source', 'smtp_username', overriddenKeys);
   setSecret('smtp-password', data.smtp_password_set);
-  setSource('smtp-password-source', data.smtp_password_source);
+  setSource('smtp-password-source', 'smtp_password', overriddenKeys);
   $('smtp-from').value = data.smtp_from || '';
-  setSource('smtp-from-source', data.smtp_from_source);
+  setSource('smtp-from-source', 'smtp_from', overriddenKeys);
 
   $('audit-retention-days').value = data.audit_retention_days;
-  setSource('audit-retention-source', data.audit_retention_days_source);
+  setSource('audit-retention-source', 'audit_retention_days', overriddenKeys);
   $('upload-retention-days').value = data.upload_retention_days;
-  setSource('upload-retention-source', data.upload_retention_days_source);
+  setSource('upload-retention-source', 'upload_retention_days', overriddenKeys);
 
   $('default-max-total').value = gibValue(data.default_max_total_bytes);
-  setSource('default-max-total-source', data.default_max_total_bytes_source);
+  setSource('default-max-total-source', 'default_max_total_bytes', overriddenKeys);
   $('default-max-links').value =
     data.default_max_links === null || data.default_max_links === undefined
       ? ''
       : data.default_max_links;
-  setSource('default-max-links-source', data.default_max_links_source);
+  setSource('default-max-links-source', 'default_max_links', overriddenKeys);
   $('default-max-sessions').value =
     data.default_max_sessions === null || data.default_max_sessions === undefined
       ? ''
       : data.default_max_sessions;
-  setSource('default-max-sessions-source', data.default_max_sessions_source);
+  setSource('default-max-sessions-source', 'default_max_sessions', overriddenKeys);
 
   const collapse = $('signin-collapse');
   collapse.checked = data.public_password_login === false;
   collapse.disabled = !data.sso_configured;
-  setSource('signin-source', data.public_password_login_source);
+  setSource('signin-source', 'public_password_login', overriddenKeys);
   // Lossy round-trip: the UI works in whole hours; an API-written value
   // under an hour must not display as 0, which would fail the min="1"
   // constraint and block saving the unrelated collapse toggle too.
   $('sso-session-hours').value = Math.max(1, Math.round(data.sso_session_secs / 3600));
   $('sso-session-hours').disabled = !data.sso_configured;
-  setSource('sso-session-source', data.sso_session_secs_source);
+  setSource('sso-session-source', 'sso_session_secs', overriddenKeys);
   // SCIM keys on the OIDC subject, so it is only useful with SSO configured.
   setSecret('scim-token', data.scim_token_set);
-  setSource('scim-token-source', data.scim_token_source);
+  setSource('scim-token-source', 'scim_token', overriddenKeys);
   $('scim-token').disabled = !data.sso_configured;
   $('scim-token-previous-state').textContent = data.scim_token_previous_set
     ? 'A previous token is still accepted.'
     : '';
   $('require-provisioning').checked = data.require_provisioning === true;
   $('require-provisioning').disabled = !data.sso_configured;
-  setSource('require-provisioning-source', data.require_provisioning_source);
+  setSource('require-provisioning-source', 'require_provisioning', overriddenKeys);
   $('signin-save').disabled = !data.sso_configured;
   for (const button of $('signin-form').querySelectorAll('[data-clear]')) {
     button.disabled = !data.sso_configured;
   }
 
   $('drain-toggle').checked = data.draining === true;
-  setSource('drain-source', data.draining_source);
+  setSource('drain-source', 'draining', overriddenKeys);
   setSecret('replica-token', data.replica_token_set);
-  setSource('replica-token-source', data.replica_token_source);
+  setSource('replica-token-source', 'replica_token', overriddenKeys);
 
   // Reset and clear links only where they do something: a saved override
   // to drop, or a stored secret to wipe.
   for (const button of document.querySelectorAll('[data-reset]')) {
-    button.hidden = data[`${button.dataset.reset}_source`] !== 'db';
+    button.hidden = !overriddenKeys.includes(button.dataset.reset);
   }
   for (const button of document.querySelectorAll('[data-clear]')) {
     button.hidden = !data[`${button.dataset.clear}_set`];

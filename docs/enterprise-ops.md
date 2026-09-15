@@ -308,23 +308,20 @@ Storage is always TEXT. Numbers as decimal strings. Bools as `"1"` / `"0"`.
 
 ```json
 {
+  "overridden_keys": [],
   "audit_retention_days": 400,
-  "audit_retention_days_source": "env",
   "upload_retention_days": 0,
-  "upload_retention_days_source": "env",
   "default_max_total_bytes": null,
-  "default_max_total_bytes_source": "env",
   "default_max_links": null,
   "default_max_sessions": null,
   "public_password_login": true,
-  "public_password_login_source": "env",
   "sso_configured": true
 }
 ```
 
-Secrets never leave the process: GET returns `*_set: bool` and `*_source`, not the token. `sso_healthy` lives on `GET /api/admin/sso`, not on settings (login page already calls SSO). System can GET both.
+Secrets never leave the process: GET returns `*_set: bool` and the accepted key list, not the token. `sso_healthy` lives on `GET /api/admin/sso`, not on settings (login page already calls SSO). System can GET both.
 
-`*_source` is `"env"` when the row is absent (or invalid-skipped), `"db"` when a row exists, including a stored empty disable.
+`overridden_keys` contains the settings rows whose values were accepted by the overlay parser. Absent and invalid rows are omitted, while accepted empty string rows remain in the list and disable that string setting.
 
 Audit: `settings_updated` with `actor = identity.subject`, `detail = { "keys": ["smtp_host"], "reset": ["audit_retention_days"] }`.
 
@@ -365,10 +362,10 @@ Do not add a settings form in the API-only PR. Do not add SMTP fields until the 
 
 #### Tests (API PR)
 
-- GET with empty table returns env defaults (`testing::build` has retention 400 / 0) and `*_source: "env"`.
-- PUT then GET shows `source: "db"` and the new values.
+- GET with empty table returns env defaults (`testing::build` has retention 400 / 0) and an empty `overridden_keys` list.
+- PUT then GET shows the accepted keys in `overridden_keys` and the new values.
 - PUT omitting a secret leaves the previous DB value.
-- PUT `null` on that key deletes the row; GET follows env again (`source: "env"`).
+- PUT `null` on that key deletes the row; GET follows env again and omits that key from `overridden_keys`.
 - PUT `0` on `default_max_total_bytes` is 422; PUT `0` on `audit_retention_days` is 200 (off).
 - PUT a non-http URL is 422.
 - Invalid TEXT in the table (hand-inserted `"nope"` for days) resolves to env and does not panic.
