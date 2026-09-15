@@ -6,7 +6,7 @@
     <WindowsPackageType Condition="'$(WindowsPackageType)' == ''">None</WindowsPackageType>
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
     <!-- Console model checks do not consume XAML resources. -->
-    <AppxGeneratePriEnabled>false</AppxGeneratePriEnabled>
+    <EnableCoreMrtTooling>false</EnableCoreMrtTooling>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <Platforms>x64</Platforms>
