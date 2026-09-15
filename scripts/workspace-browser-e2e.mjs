@@ -397,7 +397,7 @@ try {
   const actionCard = page.locator(`#link-${incoming.id}`);
   await actionCard.getByRole('button', { name: 'Deactivate', exact: true }).focus();
   await page.keyboard.press('Enter');
-  const undo = page.locator('#toast-stack').getByRole('button', { name: 'Undo', exact: true });
+  const undo = page.locator('#toast-stack').getByRole('button', { name: /^Undo / });
   await undo.waitFor();
   assert.ok(await undo.evaluate((node) => node === document.activeElement), 'Keyboard row action must focus its Undo');
   await undo.hover(); await page.mouse.move(0, 0);

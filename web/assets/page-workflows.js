@@ -49,8 +49,8 @@ function canReprocess(job, project) {
   return Boolean(job.received && job.manifest && !job.reprocessed_as && project?.receive && project.revision !== job.project.revision
     && ['failed', 'retrying', 'awaiting_approval', 'ready'].includes(job.state));
 }
-function reprocessAction(job, project) {
-  if (!canReprocess(job, project) || (!admin && project.members[session.subject] !== 'sender')) return null;
+function reprocessAction(job, project, canSend) {
+  if (!canReprocess(job, project) || !canSend) return null;
   return button('Reprocess with current rules', 'ghost', () => guard(async () => {
     await refreshProjects();
     const current = projects.find((item) => item.id === job.project.id);
@@ -230,6 +230,7 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
   }
   if (revision !== jobsRevision) return false;
   if (background && editingJob()) { schedulePoll(); return false; }
+  const wasAppended = appendedJobs;
   if (!more) appendedJobs = false;
   else if (page.jobs.length) appendedJobs = true;
   jobs = [...new Map((more ? jobs.concat(page.jobs) : page.jobs).map((entry) => [entry.job.id, entry])).values()]; cursor = page.next; $('workflow-more').hidden = !cursor;
@@ -241,16 +242,25 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
   const retainedEditors = new Set(editingNotifications.values());
   for (const editor of list.querySelectorAll('.notification-details')) if (!retainedEditors.has(editor)) editor.destroy?.();
   list.replaceChildren();
-  $('workflow-filter-status').textContent = `${jobs.length}${cursor ? '+' : ''} ${jobs.length === 1 ? 'delivery' : 'deliveries'}${Object.values(jobFilter).some(Boolean) ? ' matching these filters' : ''}`;
+  const pagingNote = appendedJobs
+    ? ' Updates paused while older deliveries are shown. Refresh to resume.'
+    : wasAppended ? ' Updates resumed.' : '';
+  $('workflow-filter-status').textContent = `${jobs.length}${cursor ? '+' : ''} ${jobs.length === 1 ? 'delivery' : 'deliveries'}${Object.values(jobFilter).some(Boolean) ? ' matching these filters' : ''}${pagingNote}`;
   if (!jobs.length && Object.values(jobFilter).some(Boolean)) list.append(empty('No deliveries match', 'Try another name, project or status.', button('Clear filters', 'ghost', () => clearFilters())));
   else if (!jobs.length) list.append(empty('Every delivery, in one place', 'Create a delivery to follow preparation, approvals, storage exports, and recipient acceptance.', button('Create delivery', '', () => guard(() => newDelivery()))));
   for (const entry of jobs) {
     const { job, url, notifications_override } = entry;
+    const currentProject = projects.find((project) => project.id === job.project.id);
+    const currentRole = currentProject?.members?.[session.subject];
+    const canSend = admin || currentRole === 'sender';
+    const canApprove = (admin || currentRole === 'approver') && session.subject !== job.actor;
+    const policyChanged = job.state === 'ready' && !url && Boolean(currentProject && currentProject.revision !== job.project.revision);
     const card = node('article', '', 'card job-card'); card.id = `job-${job.id}`;
-    const head = node('div', '', 'head'); head.append(node('h3', job.request.label), node('span', stateNames[job.state] || job.state, 'badge'));
+    const label = job.state === 'ready' && !url ? 'Link unavailable' : stateNames[job.state] || job.state;
+    const head = node('div', '', 'head'); head.append(node('h3', job.request.label), node('span', label, 'badge'));
     card.append(head, node('p', `${job.project.label} · ${formatWhen(job.created_at)}`, 'connection-meta'));
     const inheritedNotifications = job.request.notifications || job.project.notifications || null;
-    card.append(editingNotifications.get(card.id) || notificationDetails({ policy: notifications_override, inherit: inheritedNotifications, inheritLabel: 'Use original settings', events: workflowEvents, readOnly: !admin && !projects.some((project) => project.id === job.project.id && project.members[session.subject] === 'sender'),
+    card.append(editingNotifications.get(card.id) || notificationDetails({ policy: notifications_override, inherit: inheritedNotifications, inheritLabel: 'Use original settings', events: workflowEvents, readOnly: !canSend,
       save: async (notifications) => { await api(`/api/workflows/jobs/${job.id}/notifications`, { method: 'PATCH', body: JSON.stringify(notifications) }); const current = jobs.find((entry) => entry.job.id === job.id); if (current) current.notifications_override = notifications; },
     }));
     if (job.request.not_before) card.append(node('p', `Scheduled ${formatWhen(job.request.not_before)}`, 'muted'));
@@ -259,8 +269,7 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
     if (job.received) {
       const source = node('a', 'View incoming request →', 'text-link'); source.href = `/receive?search=${encodeURIComponent(job.received.link_id)}#link-${job.received.link_id}`; card.append(source);
       if (!['retired', 'suspended'].includes(job.state)) card.append(node('p', 'This delivery uses the original received files. Keep them unchanged until the delivery is archived. Automatic archival occurs seven days after cancellation, failure, or link expiry or revocation.', 'field-help'));
-      const current = projects.find((project) => project.id === job.project.id);
-      if (canReprocess(job, current)) card.append(node('p', 'Project rules changed. This prepared delivery remains held under its recorded rules. Reprocessing requires a new delivery and valid Receive workflow settings.', 'info-banner'));
+      if (canReprocess(job, currentProject)) card.append(node('p', 'Project rules changed. This prepared delivery remains held under its recorded rules. Reprocessing requires a new delivery and valid Receive workflow settings.', 'info-banner'));
       for (const [label, id] of [['Previous delivery', job.reprocessed_from], ['Replacement delivery', job.reprocessed_as]]) {
         if (id) { const link = node('a', label, 'text-link'); link.href = `/workflows#job-${encodeURIComponent(id)}`; card.append(link); }
       }
@@ -280,7 +289,7 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
       card.append(leg);
     }
     if (job.state === 'retrying') card.append(node('p', `Next attempt ${formatWhen(job.checks.retry_at)}`, 'muted'));
-    const nextStep = { awaiting_approval: 'Waiting for an authorized approver who did not create this delivery.', failed: 'Delivery stopped. Review the error below, correct the cause, then retry.', retrying: 'Another attempt is scheduled. Review the error below if this keeps happening.', preparing: 'Checking and preparing files before release.', exporting: 'Sending copies to the selected destinations. Each destination reports its progress below.', ready: 'Ready to share. Copy the download link below.' }[job.state];
+    const nextStep = { awaiting_approval: 'Waiting for an authorized approver who did not create this delivery.', failed: 'Delivery stopped. Review the error below, correct the cause, then retry.', retrying: 'Another attempt is scheduled. Review the error below if this keeps happening.', preparing: 'Checking and preparing files before release.', exporting: 'Sending copies to the selected destinations. Each destination reports its progress below.', ready: url ? 'Ready to share. Copy the download link below.' : policyChanged ? 'The project rules changed before this delivery could be shared. Create a new delivery to get a current download link.' : 'The delivery is ready, but its download link is unavailable. Refresh and check the delivery details before creating a new delivery.' }[job.state];
     if (nextStep) card.append(node('p', nextStep, 'workflow-next'));
     if (job.error) card.append(node('p', job.error, 'error'));
     const detail = document.createElement('details'); detail.append(node('summary', 'Package and recipient verification'));
@@ -303,15 +312,15 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
     detail.append(load, evidence); card.append(detail);
     const actions = node('div', '', 'actions');
     if (url) actions.append(button('Copy download link', '', (element) => copyToClipboard(element, url)));
-    if (job.state === 'awaiting_approval') actions.append(button('Approve delivery', '', () => guard(async () => {
+    if (job.state === 'awaiting_approval' && canApprove) actions.append(button('Approve delivery', '', () => guard(async () => {
       if (await confirmModal('Approve delivery', `Release “${job.request.label}” with manifest ${job.manifest}?`, 'Approve delivery')) {
         await api(`/api/workflows/jobs/${job.id}`, { method: 'POST', body: JSON.stringify({ action: 'approve', manifest: job.manifest }) }); await refreshJobs();
       }
     })));
-    if (['failed', 'retrying'].includes(job.state)) actions.append(button('Retry', 'ghost', () => guard(async () => { await api(`/api/workflows/jobs/${job.id}`, { method: 'POST', body: JSON.stringify({ action: 'retry' }) }); await refreshJobs(); })));
-    const reprocess = reprocessAction(job, projects.find((project) => project.id === job.project.id));
+    if (canSend && ['failed', 'retrying'].includes(job.state)) actions.append(button('Retry', 'ghost', () => guard(async () => { await api(`/api/workflows/jobs/${job.id}`, { method: 'POST', body: JSON.stringify({ action: 'retry' }) }); await refreshJobs(); })));
+    const reprocess = reprocessAction(job, currentProject, canSend);
     if (reprocess) actions.append(reprocess);
-    if (!['cancelled', 'retired', 'retiring', 'suspended'].includes(job.state)) actions.append(button('Cancel delivery', 'danger', () => guard(async () => {
+    if (canSend && !['cancelled', 'retired', 'retiring', 'suspended'].includes(job.state)) actions.append(button('Cancel delivery', 'danger', () => guard(async () => {
       if (await confirmModal('Cancel delivery', 'Stop downloads here and request revocation at connected ports? Each port will stop route-managed sharing and forwarding. Downloaded files and independent copies remain.', 'Cancel delivery')) {
         await api(`/api/workflows/jobs/${job.id}`, { method: 'POST', body: JSON.stringify({ action: 'cancel' }) }); await refreshJobs();
       }
@@ -321,7 +330,7 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
   revealHash({ scroll: false });
   schedulePoll();
   return true;
-  } catch (error) { if (revision === jobsRevision) $('workflow-filter-status').textContent = 'Could not refresh deliveries. Previous results remain; retry these filters.'; throw error; }
+  } catch (error) { if (revision === jobsRevision) $('workflow-filter-status').textContent = `Could not refresh deliveries. Previous results remain; retry these filters.${appendedJobs ? ' Updates remain paused while older deliveries are shown. Refresh to resume.' : ''}`; throw error; }
   finally { if (revision === jobsRevision) { jobsLoading = false; $('workflow-jobs').inert = false; $('workflow-more').disabled = JSON.stringify(jobFilter) !== committedFilters; } }
 }
 function schedulePoll() {

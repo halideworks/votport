@@ -501,8 +501,10 @@ function renderLibraryBreadcrumbs() {
 }
 
 function renderLibraryFile(file, container, showPath = false) {
+  const row = document.createElement('div');
+  row.className = 'library-file';
   const label = document.createElement('label');
-  label.className = 'library-file';
+  label.className = 'library-file-name';
   const checkbox = selectionCheckbox(file);
   checkbox.value = file.path;
   const name = document.createElement('span');
@@ -513,8 +515,9 @@ function renderLibraryFile(file, container, showPath = false) {
   size.textContent = formatBytes(file.bytes);
   if (!deliverAdministrator) {
     checkbox.disabled = true;
-    label.append(checkbox, name, size);
-    container.append(label);
+    label.append(checkbox, name);
+    row.append(label, size);
+    container.append(row);
     return;
   }
   const remove = button('Delete', 'tiny danger', async () => {
@@ -537,12 +540,9 @@ function renderLibraryFile(file, container, showPath = false) {
     }
   });
   remove.setAttribute('aria-label', `Delete ${file.path}`);
-  remove.addEventListener('click', (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-  }, { capture: true });
-  label.append(checkbox, name, size, remove);
-  container.append(label);
+  label.append(checkbox, name);
+  row.append(label, size, remove);
+  container.append(row);
 }
 
 function renderLibraryDirectory(directory, container) {

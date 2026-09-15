@@ -346,24 +346,56 @@ if (!(await searchedCard.evaluate((node) => getComputedStyle(node).outlineStyle 
 await page.unroute(mastheadSearchRoute);
 
 const workflowJobId = "a".repeat(32);
+const workflowProject = {
+  id: "search-project",
+  label: "Search project",
+  directory: "search",
+  revision: 2,
+  members: { "approver@example.test": "approver" },
+  recipients: [],
+  required_metadata: [],
+  destinations: [],
+  receive: false,
+  require_approval: true,
+  scan_required: false,
+  sequence: false,
+  media: false,
+  notifications: null,
+};
 const workflowJob = {
   id: workflowJobId,
   state: "ready",
+  actor: "workflow-admin",
   created_at: searchNow,
   request: { label: "Search workflow", notifications: null, not_before: null, deadline: null },
-  project: { id: "search-project", label: "Search project", recipients: [], notifications: null, destinations: [] },
+  project: { ...workflowProject },
   received: null,
   checks: {},
   manifest: null,
   error: null,
 };
-await page.route("**/api/workflows/projects", (route) => route.fulfill({ json: { projects: [] } }));
+const workflowAdminSession = await page.evaluate(async () => (await fetch("/api/admin/session", { headers: { "X-Votport": "1" } })).json());
+workflowJob.actor = workflowAdminSession.subject;
+let workflowListed = false;
+let workflowPaging = false;
+let workflowRefreshFailure = false;
+let workflowJobUrl = null;
+await page.route("**/api/workflows/projects", (route) => route.fulfill({ json: { projects: [workflowProject] } }));
 await page.route("**/api/workflows/storage", (route) => route.fulfill({ json: { storage: [] } }));
 const workflowJobsRoute = (route) => {
   const url = new URL(route.request().url());
-  return url.pathname.endsWith(`/jobs/${workflowJobId}`)
-    ? route.fulfill({ json: { job: workflowJob } })
-    : route.fulfill({ json: { jobs: [], next: null } });
+  if (url.pathname.endsWith(`/jobs/${workflowJobId}`)) return route.fulfill({ json: { job: workflowJob } });
+  if (workflowRefreshFailure && !url.searchParams.get("after")) {
+    workflowRefreshFailure = false;
+    return route.fulfill({ status: 503, json: { error: "workflow refresh fixture failed" } });
+  }
+  if (!workflowListed) return route.fulfill({ json: { jobs: [], next: null } });
+  const entry = { job: workflowJob, url: workflowJobUrl, notifications_override: null };
+  if (!workflowPaging) return route.fulfill({ json: { jobs: [entry], next: null } });
+  if (url.searchParams.get("after") === "older") {
+    return route.fulfill({ json: { jobs: [{ ...entry, job: { ...workflowJob, id: "b".repeat(32) } }], next: "older-again" } });
+  }
+  return route.fulfill({ json: { jobs: [entry], next: "older" } });
 };
 await page.route("**/api/workflows/jobs?*", workflowJobsRoute);
 await page.route("**/api/workflows/jobs/*", workflowJobsRoute);
@@ -375,6 +407,50 @@ await page.waitForFunction((id) => document.activeElement?.id === id, `job-${wor
 if (!(await workflowCard.evaluate((node) => getComputedStyle(node).outlineStyle !== "none"))) {
   throw new Error("workflow hash navigation must leave a visibly focused job card");
 }
+if ((await workflowCard.locator(".badge").textContent()) !== "Link unavailable") {
+  throw new Error("ready deliveries without a released URL must explain that the link is unavailable");
+}
+if (!/link is unavailable.*refresh.*check.*details/i.test(await workflowCard.locator(".workflow-next").textContent())) {
+  throw new Error("same-revision missing links need generic recovery guidance");
+}
+workflowListed = true;
+workflowJob.project.revision = 1;
+await page.click("#workflow-refresh");
+await page.waitForFunction(() => /project rules changed.*new delivery/i.test(document.querySelector(".workflow-next")?.textContent || ""));
+workflowJob.project.revision = 2;
+workflowJob.state = "awaiting_approval";
+workflowJob.actor = workflowAdminSession.subject;
+workflowJobUrl = null;
+await page.click("#workflow-refresh");
+await page.waitForFunction((id) => document.querySelector(`#job-${id} .badge`)?.textContent === "Needs approval", workflowJobId);
+if (await workflowCard.getByRole("button", { name: "Approve delivery", exact: true }).count() !== 0) {
+  throw new Error("the delivery actor must not see self-approval");
+}
+workflowJob.state = "failed";
+workflowJob.actor = "different-user";
+workflowJobUrl = "https://fixture.invalid/download";
+await page.click("#workflow-refresh");
+await workflowCard.getByRole("button", { name: "Retry", exact: true }).waitFor();
+if (await workflowCard.getByRole("button", { name: "Cancel delivery", exact: true }).count() !== 1
+  || await workflowCard.getByRole("button", { name: "Copy download link", exact: true }).count() !== 1) {
+  throw new Error("sender actions and valid links must remain available");
+}
+workflowPaging = true;
+workflowJob.state = "preparing";
+await page.click("#workflow-refresh");
+await page.locator("#workflow-more").waitFor({ state: "visible" });
+await page.click("#workflow-more");
+await page.waitForFunction(() => /Updates paused while older deliveries are shown\. Refresh to resume\./.test(document.querySelector("#workflow-filter-status")?.textContent || ""));
+workflowRefreshFailure = true;
+await page.click("#workflow-refresh");
+await page.getByText("workflow refresh fixture failed", { exact: true }).waitFor();
+if (!/Could not refresh deliveries.*Updates remain paused while older deliveries are shown\. Refresh to resume\./s.test(await page.locator("#workflow-filter-status").textContent())) {
+  throw new Error("a failed refresh must retain the paging pause cue");
+}
+workflowPaging = false;
+await page.click("#workflow-refresh");
+await page.waitForFunction(() => /Updates resumed\./.test(document.querySelector("#workflow-filter-status")?.textContent || ""));
+if (!await page.locator("#workflow-more").isHidden()) throw new Error("successful refresh must return to the first page");
 await page.unroute("**/api/workflows/projects");
 await page.unroute("**/api/workflows/storage");
 await page.unroute("**/api/workflows/jobs?*");
@@ -633,13 +709,44 @@ const receivedUpload = receivedHeaders.uploads[0];
 if (browserEngine === "chromium") {
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
 }
-await page.locator("#done-list").getByRole("button", { name: `Copy file hash: ${cards[0].name}`, exact: true }).press("Enter");
+const copyControl = page.locator("#done-list .file-id").first();
+if (await copyControl.getAttribute("aria-label") !== `Copy file hash: ${cards[0].name}`) {
+  throw new Error("file identity copy control must name its file");
+}
+await copyControl.press("Enter");
+await page.waitForFunction(() => document.querySelector("#done-list .file-id")?.textContent === "Copied");
 if (browserEngine === "chromium") {
   const copied = await page.evaluate(() => navigator.clipboard.readText());
   if (copied !== ids[0]) {
     throw new Error(`copy mismatch: ${copied}`);
   }
 }
+await page.waitForFunction(() => document.querySelector("#done-list .file-id")?.getAttribute("aria-label")?.startsWith("Copied file hash: "));
+await page.evaluate(() => { window.__copySuccessAt = performance.now(); });
+await page.waitForFunction(() => performance.now() - window.__copySuccessAt >= 750, null, { timeout: 3000 });
+await page.evaluate(() => { window.__clipboardFailure = true; });
+await copyControl.press("Enter");
+await page.waitForFunction(() => document.querySelector("#done-list .file-id")?.textContent === "Copy failed");
+if (await copyControl.getAttribute("aria-label") !== `Copy failed: ${cards[0].name}`) {
+  throw new Error("denied clipboard copy must expose an accessible failure status");
+}
+await page.waitForFunction(() => performance.now() - window.__copySuccessAt >= 1600, null, { timeout: 3000 });
+if (await copyControl.textContent() !== "Copy failed"
+  || await copyControl.getAttribute("aria-label") !== `Copy failed: ${cards[0].name}`) {
+  throw new Error("latest copy failure must outlive an earlier success deadline");
+}
+await page.evaluate(() => { window.__clipboardFailure = false; });
+await page.waitForFunction((expected) => document.querySelector("#done-list .file-id")?.textContent === expected, ids[0], { timeout: 3000 });
+await page.waitForFunction((expected) => document.querySelector("#done-list .file-id")?.getAttribute("aria-label") === expected, `Copy file hash: ${cards[0].name}`, { timeout: 3000 });
+await page.setViewportSize({ width: 360, height: 1000 });
+if (!await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth
+  && [...document.querySelectorAll("#done-list .file-id")].every((node) => {
+    const style = getComputedStyle(node);
+    return style.overflowWrap === "anywhere" && node.scrollWidth <= node.clientWidth;
+  }))) {
+  throw new Error("file identities must remain readable without horizontal overflow at 360px");
+}
+await page.setViewportSize({ width: 1440, height: 1000 });
 
 for (const focus of ["send", "cancel", "pick", "external-focus"]) {
   await page.goto(linkUrl);
@@ -986,6 +1093,15 @@ const payloadPath = path.join(stored, "Résumé Draft.pdf");
 const sidecarPath = path.join(stored, sidecarName);
 await page.goto(`${base}/verify`);
 await page.waitForSelector("#verify-drop", { timeout: 15000 });
+for (const [selector, name, describedBy] of [
+  ["#pick-payload", "Browse for file", "payload-name"],
+  ["#pick-sidecar", "Browse for receipt", "sidecar-name"],
+]) {
+  const control = page.locator(selector);
+  if (await control.getAttribute("aria-label") !== name || await control.getAttribute("aria-describedby") !== describedBy) {
+    throw new Error(`${selector} must identify its file slot to assistive technology`);
+  }
+}
 const shownKey = await page.textContent("#receipt-key");
 if (shownKey.trim() !== key) {
   throw new Error("verify page shows a different receipt key");
@@ -1065,6 +1181,24 @@ const currentDirectory = await page.textContent('#library-breadcrumbs [aria-curr
 if (currentDirectory !== PROJECT) {
   throw new Error(`scoped library breadcrumb: ${currentDirectory}`);
 }
+await page.locator("#status-strip").waitFor({ state: "visible", timeout: 15000 });
+if (await page.locator("#status-strip").evaluate((node) => node.tagName) !== "DL"
+  || await page.locator("#status-strip .stat dt").count() !== 4
+  || await page.locator("#status-strip .stat dd").count() !== 4) {
+  throw new Error("status strip must associate each live value with its label");
+}
+const firstLibraryFile = page.locator("#library-files .library-file:not(.library-folder)").first();
+const firstLibraryCheckbox = firstLibraryFile.getByRole("checkbox");
+if (await firstLibraryFile.locator("label button").count() !== 0
+  || await firstLibraryFile.getByRole("button", { name: /^Delete / }).count() !== 1) {
+  throw new Error("library file actions must not be nested inside the checkbox label");
+}
+await firstLibraryCheckbox.check();
+await firstLibraryFile.getByRole("button", { name: /^Delete / }).click();
+await page.locator("#confirm-ok").waitFor();
+await page.locator("#confirm-cancel").click();
+if (!await firstLibraryCheckbox.isChecked()) throw new Error("canceling delete must preserve file selection");
+await firstLibraryCheckbox.uncheck();
 
 await page.locator("#nav .nav-more > summary").click();
 await page.getByRole("link", { name: "Automation", exact: true }).click();
@@ -1074,6 +1208,7 @@ await page.uncheck('#automation-token-permissions input[value="deliveries:create
 await page.uncheck('#automation-token-permissions input[value="deliveries:read"]');
 await page.click("#automation-token-submit");
 await page.waitForSelector("#automation-token-result:not([hidden])");
+await page.waitForFunction(() => /^\d+ automation tokens? issued\.$/.test(document.getElementById("automation-token-status").textContent));
 const agentToken = await page.inputValue("#automation-token-value");
 const agentConfig = JSON.parse(await page.textContent("#automation-mcp-config"));
 if (agentConfig.mcpServers.votport.env.VOTPORT_AUTOMATION_TOKEN !== agentToken ||
@@ -1097,6 +1232,9 @@ const agentCard = page.locator("#automation-tokens .card").filter({ has: page.ge
 await agentCard.getByRole("button", { name: "Revoke", exact: true }).click();
 await page.click("#confirm-ok");
 await agentCard.locator(".badge").filter({ hasText: "revoked" }).waitFor();
+const issuedTokenCards = await page.locator("#automation-tokens .card").count();
+await page.waitForFunction((count) => document.getElementById("automation-token-status").textContent
+  === `${count} automation token${count === 1 ? "" : "s"} issued.`, issuedTokenCards);
 const revokedAccess = await page.request.get(`${base}/api/automation/session`, { headers: agentHeaders });
 if (revokedAccess.status() !== 401) throw new Error("revoked agent token still authenticates");
 await page.getByRole("link", { name: "Deliver", exact: true }).click();
@@ -1340,7 +1478,16 @@ await page.waitForFunction((paths) => {
 if (!await page.evaluate(() => document.activeElement.matches('#library-breadcrumbs [aria-current="page"]'))) {
   throw new Error("failed folder navigation lost keyboard focus");
 }
+const keyboardRootResponse = page.waitForResponse((response) => {
+  const url = new URL(response.url());
+  return response.request().method() === "GET" && response.status() === 200
+    && url.pathname === "/api/admin/outbound-files"
+    && url.searchParams.get("directory") === ""
+    && !url.searchParams.has("q");
+});
 await page.keyboard.press("Enter");
+await keyboardRootResponse;
+await page.locator("#library-files [role=alert]").waitFor({ state: "hidden" });
 await page.waitForSelector(`#library-files input[aria-label="Select folder ${PROJECT}"]`);
 const failedSearch = `browser-search-failed-${run}`;
 await page.route("**/api/admin/outbound-files?q=*", (route) => route.fulfill({ status: 503 }), { times: 1 });

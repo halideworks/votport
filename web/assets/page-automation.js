@@ -19,6 +19,9 @@ function automationTokenStatus(token) {
 
 function renderAutomationTokens(tokens) {
   const container = $('automation-tokens');
+  $('automation-token-status').textContent = tokens.length
+    ? `${tokens.length} automation token${tokens.length === 1 ? '' : 's'} issued.`
+    : 'No automation tokens issued.';
   container.replaceChildren();
   if (!tokens.length) {
     const empty = document.createElement('p');
@@ -82,6 +85,7 @@ async function refreshAutomationTokens() {
     const { tokens } = await api('/api/admin/automation-tokens');
     renderAutomationTokens(tokens || []);
   } catch (error) {
+    $('automation-token-status').textContent = 'Automation tokens could not be loaded.';
     const message = document.createElement('p');
     message.className = 'error';
     message.setAttribute('role', 'alert');

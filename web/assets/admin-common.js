@@ -457,6 +457,7 @@ export function undoable({ text, commit, restore = () => {}, focus, returnFocus 
   undo.type = 'button';
   undo.className = 'link';
   undo.textContent = 'Undo';
+  undo.setAttribute('aria-label', `Undo ${text}`);
   toast.append(label, undo);
   stack.append(toast);
   return new Promise((resolve, reject) => {

@@ -52,10 +52,34 @@ export function appendObjectCard(parent, file, options = {}) {
   id.className = "mono muted file-id";
   id.title = "Copy identity";
   id.setAttribute("role", "button");
-  id.setAttribute("aria-label", `Copy file hash: ${file.name}`);
+  const copyLabel = `Copy file hash: ${file.name}`;
+  id.setAttribute("aria-label", copyLabel);
+  id.setAttribute("aria-live", "polite");
+  id.setAttribute("aria-atomic", "true");
   id.tabIndex = 0;
-  id.textContent = identityLine(file);
-  const copy = () => navigator.clipboard.writeText(identityLine(file));
+  const identity = identityLine(file);
+  id.textContent = identity;
+  let copyStatusTimer;
+  let copyPending = false;
+  const copy = async () => {
+    if (copyPending) return;
+    copyPending = true;
+    clearTimeout(copyStatusTimer);
+    try {
+      await navigator.clipboard.writeText(identity);
+      id.textContent = "Copied";
+      id.setAttribute("aria-label", `Copied file hash: ${file.name}`);
+    } catch {
+      id.textContent = "Copy failed";
+      id.setAttribute("aria-label", `Copy failed: ${file.name}`);
+    } finally {
+      copyPending = false;
+      copyStatusTimer = setTimeout(() => {
+        id.textContent = identity;
+        id.setAttribute("aria-label", copyLabel);
+      }, 1500);
+    }
+  };
   id.addEventListener("click", copy);
   id.addEventListener("keydown", (event) => {
     if (event.key === "Enter" || event.key === " ") {
