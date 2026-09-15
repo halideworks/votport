@@ -8,9 +8,40 @@
 
 use std::path::PathBuf;
 
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard};
+
 use ed25519_dalek::SigningKey;
 
 use crate::error::Result;
+
+#[cfg(test)]
+static TEST_STATE_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(test)]
+static TEST_STATE_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) struct TestState {
+    previous: Option<PathBuf>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+pub(crate) fn test_state_dir(path: &std::path::Path) -> TestState {
+    let lock = TEST_STATE_LOCK.lock().unwrap();
+    let previous = TEST_STATE_DIR.lock().unwrap().replace(path.to_owned());
+    TestState {
+        previous,
+        _lock: lock,
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestState {
+    fn drop(&mut self) {
+        *TEST_STATE_DIR.lock().unwrap() = self.previous.take();
+    }
+}
 
 /// The per-user state directory for votport client data, without creating it.
 ///
@@ -18,6 +49,10 @@ use crate::error::Result;
 /// Support` on macOS, `%APPDATA%` on Windows, each under a `votport` subdir.
 #[must_use]
 pub fn state_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_STATE_DIR.lock().unwrap().clone() {
+        return path;
+    }
     let base = platform_data_home();
     base.join("votport")
 }

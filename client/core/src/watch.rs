@@ -17,10 +17,10 @@
 //! file, since an unattended send has to hold it; the keychain is the
 //! upgrade with the signed apps.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,11 @@ pub const SHIPPED: &str = "shipped";
 pub const SETTLE: Duration = Duration::from_secs(10);
 /// How often a watched folder is scanned.
 pub const POLL: Duration = Duration::from_secs(2);
+
+/// One native watch send at a time. The permit covers the platform callback
+/// queue as well as the blocking send, so a fast poll cannot strand a burst
+/// of callbacks as native sessions.
+const WATCH_CAPACITY: usize = 1;
 
 /// One watched folder, as a shell lists it. Never the password.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -111,6 +116,11 @@ pub fn add_watch(dir: &str, link: &str, password: Option<String>) -> Result<Watc
     split_link_as(link, LinkKind::Request)?;
     let dir = dir.to_string_lossy().into_owned();
     let mut list = load();
+    let removed = list
+        .iter()
+        .filter(|stored| stored.dir == dir)
+        .map(|stored| stored.id.clone())
+        .collect::<Vec<_>>();
     list.retain(|stored| stored.dir != dir);
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -124,6 +134,9 @@ pub fn add_watch(dir: &str, link: &str, password: Option<String>) -> Result<Watc
     };
     list.push(stored.clone());
     store(&list)?;
+    for id in removed {
+        release_watch(&id);
+    }
     Ok(Watch::from(&stored))
 }
 
@@ -134,14 +147,66 @@ pub fn add_watch(dir: &str, link: &str, password: Option<String>) -> Result<Watc
 pub fn remove_watch(id: &str) -> Result<()> {
     let mut list = load();
     list.retain(|stored| stored.id != id);
-    store(&list)
+    let result = store(&list);
+    if result.is_ok() {
+        release_watch(id);
+    }
+    result
 }
 
 /// A shell's sink for drops that settled. Called from the watcher thread,
 /// once per drop; the shell then runs [`ship`] as it would a send.
 #[uniffi::export(with_foreign)]
 pub trait WatchListener: Send + Sync {
-    fn ready(&self, watch_id: String, path: String);
+    fn ready(&self, watch_id: String, path: String, admission: Arc<WatchAdmission>);
+}
+
+/// A watch drop's native send permit. Shells keep this opaque object while
+/// handing a callback to their UI thread; dropping it releases the permit.
+#[derive(uniffi::Object)]
+pub struct WatchAdmission {
+    flight: Mutex<Option<Flight>>,
+    key: (String, String),
+}
+
+impl WatchAdmission {
+    pub(crate) fn take(&self, watch_id: &str, path: &str) -> Result<Flight> {
+        let flight = self
+            .flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .ok_or_else(|| Error::AlreadyShipping {
+                path: path.to_owned(),
+            })?;
+        if self.key.0 != watch_id || self.key.1 != path || flight.0 != path {
+            pending_remove(&self.key);
+            drop(flight);
+            return Err(Error::Other("watch admission path changed".to_owned()));
+        }
+        pending_remove(&self.key);
+        Ok(flight)
+    }
+
+    fn release(&self) {
+        let flight = self
+            .flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if flight.is_some() {
+            pending_remove(&self.key);
+            #[cfg(test)]
+            wait_before_admission_flight_drop();
+            drop(flight);
+        }
+    }
+}
+
+impl Drop for WatchAdmission {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// The running watcher. `stop` ends the scan at its next poll, and so does
@@ -247,8 +312,12 @@ fn scan(
             continue;
         }
         if !state.handed && now.duration_since(state.since) >= settle {
+            let path = path.to_string_lossy().into_owned();
+            let Some(admission) = try_admit(&watch.id, &path) else {
+                continue;
+            };
             state.handed = true;
-            listener.ready(watch.id.clone(), path.to_string_lossy().into_owned());
+            listener.ready(watch.id.clone(), path, admission);
         }
     }
     seen.retain(|(id, path), _| id != &watch.id || present.contains(path));
@@ -309,11 +378,27 @@ fn fingerprint(path: &Path) -> Option<(u64, u64, Option<SystemTime>)> {
 
 /// The paths being shipped right now, so a drop that changes while its
 /// send runs is not shipped twice at once.
-static IN_FLIGHT: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
-    std::sync::Mutex::new(None);
+static IN_FLIGHT: Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
+static WATCH_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+type PendingAdmissions = HashMap<(String, String), Weak<WatchAdmission>>;
+static WATCH_PENDING: Mutex<Option<PendingAdmissions>> = Mutex::new(None);
+
+#[cfg(test)]
+struct AdmissionGate {
+    arrived: std::sync::mpsc::Sender<()>,
+    proceed: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+const ADMISSION_TEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+static ADMISSION_RECHECK_GATE: Mutex<Option<AdmissionGate>> = Mutex::new(None);
+#[cfg(test)]
+static ADMISSION_RELEASE_GATE: Mutex<Option<AdmissionGate>> = Mutex::new(None);
 
 /// Holds a path in flight; dropping it releases the path.
-pub(crate) struct Flight(String);
+pub(crate) struct Flight(String, bool);
 
 impl Drop for Flight {
     fn drop(&mut self) {
@@ -323,6 +408,9 @@ impl Drop for Flight {
             .as_mut()
         {
             set.remove(&self.0);
+        }
+        if self.1 {
+            WATCH_IN_FLIGHT.fetch_sub(1, Ordering::Release);
         }
     }
 }
@@ -342,7 +430,111 @@ pub(crate) fn single_flight(path: &str) -> Result<Flight> {
             path: path.to_owned(),
         });
     }
-    Ok(Flight(path.to_owned()))
+    Ok(Flight(path.to_owned(), false))
+}
+
+fn try_admit(watch_id: &str, path: &str) -> Option<Arc<WatchAdmission>> {
+    let admission = {
+        let mut guard = IN_FLIGHT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let set = guard.get_or_insert_with(HashSet::new);
+        if WATCH_IN_FLIGHT.load(Ordering::Acquire) >= WATCH_CAPACITY || !set.insert(path.to_owned())
+        {
+            return None;
+        }
+        let admission = Arc::new(WatchAdmission {
+            flight: Mutex::new(Some(Flight(path.to_owned(), true))),
+            key: (watch_id.to_owned(), path.to_owned()),
+        });
+        WATCH_IN_FLIGHT.fetch_add(1, Ordering::Release);
+        pending_insert(&admission);
+        admission
+    };
+    #[cfg(test)]
+    wait_before_admission_recheck();
+    if load().iter().any(|stored| stored.id == watch_id) {
+        Some(admission)
+    } else {
+        admission.release();
+        None
+    }
+}
+
+#[cfg(test)]
+fn wait_before_admission_recheck() {
+    let gate = ADMISSION_RECHECK_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(gate) = gate {
+        gate.arrived
+            .send(())
+            .expect("admission recheck test is alive");
+        gate.proceed
+            .recv_timeout(ADMISSION_TEST_TIMEOUT)
+            .expect("admission recheck test released the hook");
+    }
+}
+
+#[cfg(test)]
+fn wait_before_admission_flight_drop() {
+    let gate = ADMISSION_RELEASE_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(gate) = gate {
+        gate.arrived
+            .send(())
+            .expect("admission release test is alive");
+        gate.proceed
+            .recv_timeout(ADMISSION_TEST_TIMEOUT)
+            .expect("admission release test released the hook");
+    }
+}
+
+fn pending_insert(admission: &Arc<WatchAdmission>) {
+    WATCH_PENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(admission.key.clone(), Arc::downgrade(admission));
+}
+
+fn pending_remove(key: &(String, String)) {
+    if let Some(pending) = WATCH_PENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_mut()
+    {
+        pending.remove(key);
+    }
+}
+
+fn release_watch(watch_id: &str) {
+    let admissions = {
+        let mut guard = WATCH_PENDING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(pending) = guard.as_mut() else {
+            return;
+        };
+        let mut admissions = Vec::new();
+        pending.retain(|(id, _), weak| {
+            if id == watch_id {
+                if let Some(admission) = weak.upgrade() {
+                    admissions.push(admission);
+                }
+                false
+            } else {
+                weak.strong_count() != 0
+            }
+        });
+        admissions
+    };
+    for admission in admissions {
+        admission.release();
+    }
 }
 
 /// The link and password of a watch, for the send.
@@ -394,18 +586,208 @@ pub(crate) fn park(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{mpsc, Mutex};
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_state() -> (tempfile::TempDir, crate::identity::TestState) {
+        let state = tempfile::tempdir().unwrap();
+        let scope = crate::identity::test_state_dir(state.path());
+        (state, scope)
+    }
 
     struct Collect(Mutex<Vec<(String, String)>>);
 
     impl WatchListener for Collect {
-        fn ready(&self, watch_id: String, path: String) {
+        fn ready(&self, watch_id: String, path: String, _admission: Arc<WatchAdmission>) {
             self.0.lock().unwrap().push((watch_id, path));
         }
     }
 
+    struct Holding {
+        calls: Mutex<Vec<String>>,
+        admissions: Mutex<Vec<Arc<WatchAdmission>>>,
+    }
+
+    impl WatchListener for Holding {
+        fn ready(&self, _watch_id: String, path: String, admission: Arc<WatchAdmission>) {
+            self.calls.lock().unwrap().push(path);
+            self.admissions.lock().unwrap().push(admission);
+        }
+    }
+
+    #[test]
+    fn watch_admission_stays_bounded_until_each_callback_releases_it() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let watch = watch_in(dir.path());
+        let (_state, _state_scope) = test_state();
+        store(std::slice::from_ref(&watch)).unwrap();
+        let listener = Arc::new(Holding {
+            calls: Mutex::new(Vec::new()),
+            admissions: Mutex::new(Vec::new()),
+        });
+        let mut seen = HashMap::new();
+        let settle = Duration::from_millis(10);
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.path().join(name), name).unwrap();
+        }
+        let t0 = Instant::now();
+        scan(&watch, settle, t0, &mut seen, listener.as_ref());
+        scan(&watch, settle, t0 + settle, &mut seen, listener.as_ref());
+        assert_eq!(listener.calls.lock().unwrap().len(), WATCH_CAPACITY);
+        assert_eq!(listener.admissions.lock().unwrap().len(), WATCH_CAPACITY);
+
+        // Additional polls leave the other settled drops unhanded while the
+        // callback's queued send still owns the only native slot.
+        scan(
+            &watch,
+            settle,
+            t0 + Duration::from_secs(1),
+            &mut seen,
+            listener.as_ref(),
+        );
+        assert_eq!(listener.calls.lock().unwrap().len(), WATCH_CAPACITY);
+
+        listener.admissions.lock().unwrap().clear();
+        scan(
+            &watch,
+            settle,
+            t0 + Duration::from_secs(2),
+            &mut seen,
+            listener.as_ref(),
+        );
+        assert_eq!(listener.calls.lock().unwrap().len(), 2);
+        listener.admissions.lock().unwrap().clear();
+        scan(
+            &watch,
+            settle,
+            t0 + Duration::from_secs(3),
+            &mut seen,
+            listener.as_ref(),
+        );
+        let calls = listener.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.iter().collect::<HashSet<_>>().len(), calls.len());
+        listener.admissions.lock().unwrap().clear();
+        scan(
+            &watch,
+            settle,
+            t0 + Duration::from_secs(4),
+            &mut seen,
+            listener.as_ref(),
+        );
+        assert_eq!(listener.calls.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn removing_a_watch_releases_queued_admission() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
+        let (_state, _state_scope) = test_state();
+        let folder = tempfile::tempdir().unwrap();
+        let watch = watch_in(folder.path());
+        store(std::slice::from_ref(&watch)).unwrap();
+        let admission = try_admit(&watch.id, "/tmp/watch-admission").unwrap();
+        release_watch(&watch.id);
+        assert!(admission.take(&watch.id, "/tmp/watch-admission").is_err());
+        drop(admission);
+    }
+
+    #[test]
+    fn an_old_consumed_admission_cannot_remove_a_new_registration() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
+        let (_state, _state_scope) = test_state();
+        let folder = tempfile::tempdir().unwrap();
+        let watch = watch_in(folder.path());
+        store(std::slice::from_ref(&watch)).unwrap();
+        let path = "/tmp/watch-admission-same-key";
+        let old = try_admit(&watch.id, path).unwrap();
+        drop(old.take(&watch.id, path).unwrap());
+        let current = try_admit(&watch.id, path).unwrap();
+        drop(old);
+        release_watch(&watch.id);
+        assert!(current.take(&watch.id, path).is_err());
+        assert_eq!(WATCH_IN_FLIGHT.load(Ordering::Acquire), 0);
+        drop(current);
+    }
+
+    #[test]
+    fn an_owned_release_unregisters_before_freeing_capacity() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
+        let (_state, _state_scope) = test_state();
+        let folder = tempfile::tempdir().unwrap();
+        let watch = watch_in(folder.path());
+        store(std::slice::from_ref(&watch)).unwrap();
+        let path = "/tmp/watch-admission-release-order";
+        let current = try_admit(&watch.id, path).unwrap();
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        *ADMISSION_RELEASE_GATE.lock().unwrap() = Some(AdmissionGate {
+            arrived: arrived_tx,
+            proceed: proceed_rx,
+        });
+        let release = current.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            release.release();
+            done_tx.send(()).unwrap();
+        });
+        arrived_rx
+            .recv_timeout(ADMISSION_TEST_TIMEOUT)
+            .expect("admission release hook arrived");
+        let successor = try_admit(&watch.id, path);
+        proceed_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(ADMISSION_TEST_TIMEOUT)
+            .expect("admission release completed");
+        thread.join().unwrap();
+        assert!(successor.is_none());
+        let next = try_admit(&watch.id, path).unwrap();
+        release_watch(&watch.id);
+        assert!(next.take(&watch.id, path).is_err());
+        assert_eq!(WATCH_IN_FLIGHT.load(Ordering::Acquire), 0);
+        drop(current);
+    }
+
+    #[test]
+    fn an_admission_rechecks_a_watch_after_registration() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
+        let (_state, _state_scope) = test_state();
+        let folder = tempfile::tempdir().unwrap();
+        let watch = watch_in(folder.path());
+        store(std::slice::from_ref(&watch)).unwrap();
+
+        let (registered_tx, registered_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        *ADMISSION_RECHECK_GATE.lock().unwrap() = Some(AdmissionGate {
+            arrived: registered_tx,
+            proceed: proceed_rx,
+        });
+        let id = watch.id.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let result = try_admit(&id, "/tmp/watch-admission-race");
+            done_tx.send(result.is_none()).unwrap();
+            result
+        });
+        registered_rx
+            .recv_timeout(ADMISSION_TEST_TIMEOUT)
+            .expect("admission recheck hook arrived");
+        remove_watch(&watch.id).unwrap();
+        proceed_tx.send(()).unwrap();
+        assert!(done_rx.recv_timeout(ADMISSION_TEST_TIMEOUT).unwrap());
+        assert!(thread.join().unwrap().is_none());
+        assert_eq!(WATCH_IN_FLIGHT.load(Ordering::Acquire), 0);
+        assert!(IN_FLIGHT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(HashSet::is_empty));
+    }
+
     #[test]
     fn a_drop_is_handed_over_once_it_holds_still_and_again_if_it_changes() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let watch = Stored {
             id: "w".to_owned(),
@@ -413,6 +795,8 @@ mod tests {
             link: "https://d/r/t".to_owned(),
             password: None,
         };
+        let (_state, _state_scope) = test_state();
+        store(std::slice::from_ref(&watch)).unwrap();
         let seen_list = Arc::new(Collect(Mutex::new(Vec::new())));
         let mut seen = HashMap::new();
         let settle = Duration::from_millis(50);
@@ -511,8 +895,11 @@ mod tests {
 
     #[test]
     fn a_folder_with_only_hidden_metadata_is_handed_for_an_empty_send() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let watch = watch_in(dir.path());
+        let (_state, _state_scope) = test_state();
+        store(std::slice::from_ref(&watch)).unwrap();
         let handed = Arc::new(Collect(Mutex::new(Vec::new())));
         let mut seen = HashMap::new();
         let settle = Duration::from_millis(10);
@@ -561,9 +948,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_subfolder_still_settles_and_is_handed_over() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let watch = watch_in(dir.path());
+        let (_state, _state_scope) = test_state();
+        store(std::slice::from_ref(&watch)).unwrap();
         let handed = Arc::new(Collect(Mutex::new(Vec::new())));
         let mut seen = HashMap::new();
         let settle = Duration::from_millis(10);
@@ -611,6 +1001,7 @@ mod tests {
 
     #[test]
     fn a_folder_fingerprint_covers_its_files() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let drop = dir.path().join("seq");
         std::fs::create_dir_all(drop.join("sub")).unwrap();
@@ -625,6 +1016,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_fingerprint_covers_hidden_and_skips_symlinked_descendants() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();

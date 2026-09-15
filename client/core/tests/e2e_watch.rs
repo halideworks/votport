@@ -34,9 +34,15 @@ type Shipped = (String, Result<ShipReport, Error>, TransferView);
 struct Shipper(Mutex<Vec<Shipped>>);
 
 impl WatchListener for Shipper {
-    fn ready(&self, watch_id: String, path: String) {
+    fn ready(&self, watch_id: String, path: String, admission: Arc<watch::WatchAdmission>) {
         let recorder = Arc::new(Recorder::default());
-        let result = ffi::ship(watch_id, path.clone(), Transfer::new(), recorder.clone());
+        let result = ffi::ship(
+            watch_id,
+            path.clone(),
+            admission,
+            Transfer::new(),
+            recorder.clone(),
+        );
         let last = recorder.0.lock().unwrap().last().cloned().unwrap();
         self.0.lock().unwrap().push((path, result, last));
     }

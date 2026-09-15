@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use votport_client_core::ffi::{self, Phase, Transfer, TransferListener, TransferView};
 use votport_client_core::journal;
+use votport_client_core::watch::{self, WatchListener};
 use votport_client_core::{api, Error, LinkKind};
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -108,6 +109,21 @@ struct PausedHttp {
     token: String,
     journal_id: String,
     http: journal::HttpResume,
+}
+
+struct ShipOnWatch(Mutex<Option<Result<ffi::ShipReport, Error>>>);
+
+impl WatchListener for ShipOnWatch {
+    fn ready(&self, watch_id: String, path: String, admission: Arc<watch::WatchAdmission>) {
+        let result = ffi::ship(
+            watch_id,
+            path,
+            admission,
+            Transfer::new(),
+            Arc::new(Recorder::default()),
+        );
+        *self.0.lock().unwrap() = Some(result);
+    }
 }
 
 fn pause_http_send(bin: &str) -> PausedHttp {
@@ -266,13 +282,20 @@ fn watch_ship_replacement_aborts_the_old_http_session() {
     )
     .unwrap();
 
-    let result = ffi::ship(
-        watch.id.clone(),
-        paused.path.display().to_string(),
-        Transfer::new(),
-        Arc::new(Recorder::default()),
-    )
-    .expect("the watch replacement ships");
+    let shipper = Arc::new(ShipOnWatch(Mutex::new(None)));
+    let watcher = watch::watch_with(Duration::ZERO, Duration::from_millis(10), shipper.clone());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let result = loop {
+        if let Some(result) = shipper.0.lock().unwrap().take() {
+            watcher.stop();
+            break result.expect("the watch replacement ships");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the watch replacement did not ship"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
     assert_eq!((result.files, result.parked), (1, true));
     assert!(journal::get(&paused.journal_id).is_err());
     assert!(paused._source.path().join("shipped/pause.bin").is_file());

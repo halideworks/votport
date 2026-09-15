@@ -82,11 +82,12 @@ final class TransferStore: ObservableObject {
 
     /// Ships a settled drop of a watched folder, as a send of that one path;
     /// the core moves it into the folder's `shipped` subfolder afterwards.
-    func ship(watchId: String, path: String) {
+    func ship(watchId: String, path: String, admission: WatchAdmission) {
         let item = start(kind: .send, subject: Self.subject(for: [path]), link: "")
         run(item.id) { transfer, listener in
             _ = try? VotportCore.ship(
-                watchId: watchId, path: path, transfer: transfer, listener: listener)
+                watchId: watchId, path: path, admission: admission,
+                transfer: transfer, listener: listener)
             return []
         }
     }
@@ -239,9 +240,11 @@ final class WatchHandoff: WatchListener, @unchecked Sendable {
         self.store = store
     }
 
-    func ready(watchId: String, path: String) {
+    func ready(watchId: String, path: String, admission: WatchAdmission) {
         DispatchQueue.main.async {
-            MainActor.assumeIsolated { self.store.ship(watchId: watchId, path: path) }
+            MainActor.assumeIsolated {
+                self.store.ship(watchId: watchId, path: path, admission: admission)
+            }
         }
     }
 }

@@ -347,7 +347,7 @@ pub fn resume(
     };
     match entry.kind {
         journal::Kind::Send => {
-            run_send(entry, password, transfer, listener, false).map(ResumeReport::Sent)
+            run_send(entry, password, transfer, listener, false, None).map(ResumeReport::Sent)
         }
         journal::Kind::Receive => {
             run_receive(entry, password, transfer, listener, true).map(ResumeReport::Received)
@@ -723,17 +723,21 @@ pub struct ShipReport {
 pub fn ship(
     watch_id: String,
     path: String,
+    admission: Arc<watch::WatchAdmission>,
     transfer: Arc<Transfer>,
     listener: Arc<dyn TransferListener>,
 ) -> std::result::Result<ShipReport, Error> {
+    let flight = admission.take(&watch_id, &path)?;
     let (link, password) = watch::credentials(&watch_id)?;
-    // Claimed here and released before the send claims it again: a Resume
-    // holding the path makes this fail now, before the forget below.
-    {
-        let _flight = watch::single_flight(&path)?;
-        journal::forget_send_of(&path, abort_saved_http);
-    }
-    let report = send(link, password, vec![path.clone()], transfer, listener)?;
+    journal::forget_send_of(&path, abort_saved_http);
+    let entry = journal::record(
+        journal::Kind::Send,
+        &link,
+        vec![path.clone()],
+        None,
+        password.is_some(),
+    );
+    let report = run_send(entry, password, transfer, listener, true, Some(flight))?;
     let parked = watch::park(Path::new(&path));
     Ok(ShipReport {
         files: report.files,
@@ -763,7 +767,7 @@ pub fn send(
     listener: Arc<dyn TransferListener>,
 ) -> std::result::Result<SendReport, Error> {
     let entry = journal::record(journal::Kind::Send, &link, paths, None, password.is_some());
-    run_send(entry, password, transfer, listener, true)
+    run_send(entry, password, transfer, listener, true, None)
 }
 
 /// Runs a journalled send. The entry is dropped from the journal when the
@@ -775,6 +779,7 @@ fn run_send(
     transfer: Arc<Transfer>,
     listener: Arc<dyn TransferListener>,
     new_journal: bool,
+    claimed_flight: Option<watch::Flight>,
 ) -> std::result::Result<SendReport, Error> {
     let existing_http = entry.http.clone();
     let resume = existing_http.as_ref().map(|http| transfer::HttpResume {
@@ -789,19 +794,23 @@ fn run_send(
     if new_journal {
         handle.set_journal_id(&entry.id);
     }
-    let _flight = match entry.paths.as_slice() {
-        [only] => match watch::single_flight(only) {
-            Ok(flight) => Some(flight),
-            Err(error) => {
-                let result = Err(error);
-                if new_journal {
-                    handle.settle(&entry, result.as_ref().err());
+    let _flight = if let Some(flight) = claimed_flight {
+        Some(flight)
+    } else {
+        match entry.paths.as_slice() {
+            [only] => match watch::single_flight(only) {
+                Ok(flight) => Some(flight),
+                Err(error) => {
+                    let result = Err(error);
+                    if new_journal {
+                        handle.settle(&entry, result.as_ref().err());
+                    }
+                    forward.finish(result.as_ref().err());
+                    return result;
                 }
-                forward.finish(result.as_ref().err());
-                return result;
-            }
-        },
-        _ => None,
+            },
+            _ => None,
+        }
     };
     if !new_journal {
         handle.set_journal_id(&entry.id);
@@ -1993,13 +2002,12 @@ mod tests {
         assert_eq!(empty.with_line().line, None);
     }
 
-    /// The journal is process-wide; this test points it at a temporary
-    /// directory, which only the Linux arm of `state_dir` reads.
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_paused_transfer_keeps_its_journal_entry_and_a_cancelled_one_does_not() {
         let state = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_DATA_HOME", state.path());
+        // The journal is process-wide; scope it to this temporary directory
+        // so the test is isolated on every supported platform.
+        let _state_scope = crate::identity::test_state_dir(state.path());
         let entry = journal::record(
             journal::Kind::Send,
             "https://d/r/t",
