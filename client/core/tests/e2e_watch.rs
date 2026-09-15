@@ -112,24 +112,26 @@ fn a_watched_folder_ships_what_settles_in_it() {
     std::fs::create_dir(&drop).unwrap();
     std::fs::write(drop.join("plate.bin"), vec![3u8; 200_000]).unwrap();
     std::fs::write(drop.join("note.txt"), b"hello").unwrap();
+    std::fs::write(drop.join(".DS_Store"), b"nested metadata").unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(20);
     while shipper.0.lock().unwrap().is_empty() {
         assert!(Instant::now() < deadline, "the drop never shipped");
         std::thread::sleep(Duration::from_millis(100));
     }
-    watcher.stop();
-    let shipped = shipper.0.lock().unwrap();
-    assert_eq!(shipped.len(), 1, "{shipped:?}");
-    let (path, result, last) = &shipped[0];
-    assert_eq!(path, &drop.to_string_lossy());
-    let report = result.as_ref().unwrap();
-    assert_eq!(
-        (report.files, report.parked, report.park_problem.as_deref()),
-        (2, true, None)
-    );
-    assert_eq!(last.phase, Phase::Done);
-    assert!(last.status.starts_with("Shipped and verified, 2 files, "));
+    {
+        let shipped = shipper.0.lock().unwrap();
+        assert_eq!(shipped.len(), 1, "{shipped:?}");
+        let (path, result, last) = &shipped[0];
+        assert_eq!(path, &drop.to_string_lossy());
+        let report = result.as_ref().unwrap();
+        assert_eq!(
+            (report.files, report.parked, report.park_problem.as_deref()),
+            (2, true, None)
+        );
+        assert_eq!(last.phase, Phase::Done);
+        assert!(last.status.starts_with("Shipped and verified, 2 files, "));
+    }
     // Moved into shipped/, and on the server.
     assert!(!drop.exists());
     assert!(folder
@@ -151,6 +153,34 @@ fn a_watched_folder_ships_what_settles_in_it() {
         .join(".DS_Store")
         .exists());
 
+    let empty_drop = folder.path().join("metadata-only");
+    std::fs::create_dir(&empty_drop).unwrap();
+    std::fs::write(empty_drop.join(".DS_Store"), b"metadata").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while shipper.0.lock().unwrap().len() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the metadata-only drop was not handed"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    {
+        let shipped = shipper.0.lock().unwrap();
+        assert!(shipped[1]
+            .1
+            .as_ref()
+            .err()
+            .is_some_and(|error| matches!(error, Error::Empty)));
+        assert_eq!(shipped[1].2.phase, Phase::Failed);
+    }
+    assert!(empty_drop.join(".DS_Store").is_file());
+    assert!(!folder
+        .path()
+        .join(watch::SHIPPED)
+        .join("metadata-only")
+        .exists());
+
+    watcher.stop();
     ffi::remove_watch(shipped_id(&ffi::watches())).unwrap();
     assert!(ffi::watches().is_empty());
 }

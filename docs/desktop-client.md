@@ -231,7 +231,12 @@ the state directory (a folder, a request link, and the link's password
 when it has one, since an unattended send must hold it); a watcher thread
 scans every watched folder every two seconds and hands the listener each
 top-level file or folder whose fingerprint (entry count, total bytes,
-newest change) has held still for ten seconds, once; the caller ships it
+newest change) has held still for ten seconds, once. When a folder is chosen
+for a normal send, hidden descendants are included only when the request link
+allows hidden names; otherwise they are skipped. Watch folders skip dotfiles
+at their root and fingerprint nested hidden descendants so the same link
+policy applies when they ship. A folder containing only skipped metadata
+stays in place after an empty-send notice. The caller ships it
 with `ship`, which runs the ordinary journalled send and then moves the
 drop into the folder's `shipped` subfolder, so the folder is its own
 ledger. Dotfiles, `shipped`, and a folder with nothing in it yet are

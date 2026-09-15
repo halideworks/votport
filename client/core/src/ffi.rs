@@ -808,12 +808,15 @@ fn run_send(
     }
     let result = (|| {
         let link = split_link_as(&entry.link, LinkKind::Request)?;
+        let info = Client::new(&link.base)?.link_info(&link.token)?;
         let mut files: Vec<Selected> = Vec::new();
         for path in &entry.paths {
-            transfer::collect(Path::new(path), &mut files).map_err(|source| Error::Read {
-                path: path.into(),
-                source,
-            })?;
+            transfer::collect_for_link(Path::new(path), &mut files, info.allow_hidden).map_err(
+                |source| Error::Read {
+                    path: path.into(),
+                    source,
+                },
+            )?;
         }
         let drop = Drop {
             token: link.token,

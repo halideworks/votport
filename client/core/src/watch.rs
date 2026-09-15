@@ -257,7 +257,8 @@ fn scan(
 /// Entry count, total bytes, and newest modification under `path`, or
 /// `None` when `path` itself is gone. A file or subfolder inside that
 /// cannot be read counts as one entry, so the drop still settles and the
-/// send says what is wrong rather than the watcher staying silent.
+/// send says what is wrong rather than the watcher staying silent. Symlinks
+/// are skipped before metadata traversal.
 fn fingerprint(path: &Path) -> Option<(u64, u64, Option<SystemTime>)> {
     let meta = std::fs::symlink_metadata(path).ok()?;
     let mut count = 0;
@@ -275,6 +276,13 @@ fn fingerprint(path: &Path) -> Option<(u64, u64, Option<SystemTime>)> {
                     count += 1;
                     continue;
                 };
+                let Ok(file_type) = entry.file_type() else {
+                    count += 1;
+                    continue;
+                };
+                if file_type.is_symlink() {
+                    continue;
+                }
                 let Ok(meta) = entry.metadata() else {
                     count += 1;
                     continue;
@@ -502,13 +510,24 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_folder_never_ships() {
+    fn a_folder_with_only_hidden_metadata_is_handed_for_an_empty_send() {
         let dir = tempfile::tempdir().unwrap();
         let watch = watch_in(dir.path());
         let handed = Arc::new(Collect(Mutex::new(Vec::new())));
         let mut seen = HashMap::new();
         let settle = Duration::from_millis(10);
         std::fs::create_dir(dir.path().join("seq")).unwrap();
+        let empty_at = Instant::now();
+        scan(&watch, settle, empty_at, &mut seen, handed.as_ref());
+        scan(
+            &watch,
+            settle,
+            empty_at + settle,
+            &mut seen,
+            handed.as_ref(),
+        );
+        assert!(handed.0.lock().unwrap().is_empty());
+        std::fs::write(dir.path().join("seq/.DS_Store"), b"metadata").unwrap();
         let t0 = Instant::now();
         scan(&watch, settle, t0, &mut seen, handed.as_ref());
         scan(
@@ -518,10 +537,7 @@ mod tests {
             &mut seen,
             handed.as_ref(),
         );
-        assert!(
-            handed.0.lock().unwrap().is_empty(),
-            "an empty folder is not a drop"
-        );
+        assert_eq!(handed.0.lock().unwrap().len(), 1);
         std::fs::write(dir.path().join("seq/a"), b"1").unwrap();
         scan(
             &watch,
@@ -537,7 +553,7 @@ mod tests {
             &mut seen,
             handed.as_ref(),
         );
-        assert_eq!(handed.0.lock().unwrap().len(), 1);
+        assert_eq!(handed.0.lock().unwrap().len(), 2);
     }
 
     /// An unreadable subfolder counts as one entry, so the drop changes,
@@ -604,5 +620,28 @@ mod tests {
         assert_eq!((count, bytes), (2, 5));
         assert!(newest.is_some());
         assert_eq!(fingerprint(&dir.path().join("missing")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fingerprint_covers_hidden_and_skips_symlinked_descendants() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let drop = root.path().join("drop");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(drop.join("nested")).unwrap();
+        std::fs::write(drop.join("visible"), b"12").unwrap();
+        std::fs::write(drop.join("nested/file"), b"345").unwrap();
+        std::fs::write(drop.join(".DS_Store"), b"ignored").unwrap();
+        std::fs::create_dir(drop.join(".cache")).unwrap();
+        std::fs::write(drop.join(".cache/file"), b"ignored").unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, drop.join("outside")).unwrap();
+        symlink(&drop, drop.join("cycle")).unwrap();
+
+        let (count, bytes, newest) = fingerprint(&drop).unwrap();
+        assert_eq!((count, bytes), (4, 19));
+        assert!(newest.is_some());
     }
 }
