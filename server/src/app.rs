@@ -3945,7 +3945,21 @@ pub fn router(app: Arc<App>) -> Router {
                             let session = api::admin::admin_session_view(session);
                             footer_tenant = session["tenant"].as_str().map(str::to_owned);
                             let mut nav = String::new();
-                            for (page, label) in [
+                            let self_branding = session["tenant"]
+                                .as_str()
+                                .is_some_and(|tenant| !tenant.is_empty());
+                            if self_branding {
+                                contents = contents
+                                    .replace(
+                                        "<title>VOTPort &middot; Tenants</title>",
+                                        "<title>VOTPort &middot; Branding</title>",
+                                    )
+                                    .replace(
+                                        "<h1 id=\"page-title\">Tenant namespaces</h1>",
+                                        "<h1 id=\"page-title\">Branding</h1>",
+                                    );
+                            }
+                            for (page, default_label) in [
                                 ("receive", "Receive"),
                                 ("deliver", "Deliver"),
                                 ("workflows", "Workflows"),
@@ -3968,8 +3982,23 @@ pub fn router(app: Arc<App>) -> Router {
                                     } else {
                                         ""
                                     };
+                                    let (label, hint): (&str, Option<&str>) = if page == "tenants" {
+                                        if self_branding {
+                                            (
+                                                "Branding",
+                                                Some("Set how recipients see this tenant."),
+                                            )
+                                        } else {
+                                            (default_label, Some("Manage separate workspaces, each with its own users and files."))
+                                        }
+                                    } else {
+                                        (default_label, None)
+                                    };
+                                    let hint = hint.map_or(String::new(), |hint| {
+                                        format!(" data-hint=\"{hint}\"")
+                                    });
                                     nav.push_str(&format!(
-                                        "<a href=\"/{page}\"{active}>{label}</a>"
+                                        "<a href=\"/{page}\"{active}{hint}>{label}</a>"
                                     ));
                                 }
                             }

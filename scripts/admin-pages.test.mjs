@@ -73,6 +73,15 @@ test('admin pages expose the branding forms', () => {
   assert.match(tenantsScript, /logoInput\.type = 'file'/);
 });
 
+test('tenant admins get a self-branding page without platform controls', () => {
+  assert.match(tenants, /id="self-branding" class="card" hidden/);
+  assert.match(tenants, /id="platform-tenant-management" hidden/);
+  assert.match(tenantsScript, /const session = await requireSession\(\);/);
+  assert.match(tenantsScript, /session\.tenant/);
+  assert.doesNotMatch(tenantsScript, /Promise\.all\(\[requireSession\(\), refreshTenants/);
+  assert.match(commonScript, /selfBranding \? 'Branding'/);
+});
+
 test('tenant principals use a bounded searchable page', () => {
   assert.match(tenants, /id="principal-search"[^>]+maxlength="100"/);
   assert.match(tenants, /id="principal-load-more"[^>]+hidden/);

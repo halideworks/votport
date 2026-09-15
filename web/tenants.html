@@ -45,8 +45,14 @@
         </form>
       </div>
 
-      <h1>Tenant namespaces</h1>
+      <h1 id="page-title">Tenant namespaces</h1>
 
+      <section id="self-branding" class="card" hidden>
+        <p class="muted">Customize how recipients see this tenant on request and download pages.</p>
+        <div id="self-branding-form"></div>
+      </section>
+
+      <div id="platform-tenant-management" hidden>
       <form data-unsaved id="tenant-form" class="card">
         <h2>New tenant <button type="button" class="hint-button" aria-label="Help about tenants" data-hint="A tenant is a separate workspace on this port with its own files, users, branding and limits. Create one when teams need separate access.">?</button></h2>
         <div class="grid">
@@ -96,6 +102,7 @@
       </div>
       <div id="principals"></div>
       <button id="principal-load-more" type="button" hidden>Load more</button>
+      </div>
       <p class="sheet-foot"><span class="footer-custom"></span><span>Powered by Verified Object Transport (VOT) · <a href="https://votport.com" target="_blank" rel="noopener noreferrer">VOTPort</a></span></p>
     </div>
 

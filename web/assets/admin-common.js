@@ -304,8 +304,11 @@ function buildNav(session) {
   const panel = document.createElement('div'); panel.className = 'nav-panel';
   more.append(summary, panel);
   const canManageStorage = session.role === 'admin' && !session.tenant;
-  for (const [page, href, label, hint] of NAV_ITEMS) {
+  for (const [page, href, defaultLabel, defaultHint] of NAV_ITEMS) {
     if (!session.pages.includes(page)) continue;
+    const selfBranding = page === 'tenants' && session.tenant;
+    const label = selfBranding ? 'Branding' : defaultLabel;
+    const hint = selfBranding ? 'Set how recipients see this tenant.' : defaultHint;
     const link = document.createElement('a'); link.href = href; link.textContent = label;
     link.dataset.hint = page === 'storage' && !canManageStorage ? 'View available storage connections.' : hint;
     const active = window.location.pathname === href || (href === '/receive' && window.location.pathname === '/links');
