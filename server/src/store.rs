@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension as _};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use vot_sdk::object::ObjectId;
 
-use crate::config::Config;
+use crate::config::{valid_sso_session_secs, Config};
 
 pub mod conversion;
 mod evidence;
@@ -5942,8 +5942,7 @@ fn validate_settings(rows: &HashMap<String, String>) -> ValidatedSettings {
         validated_positive(rows, "default_max_sessions", &mut settings.overridden_keys);
     settings.public_password_login =
         validated_bool(rows, "public_password_login", &mut settings.overridden_keys);
-    settings.sso_session_secs =
-        validated_positive(rows, "sso_session_secs", &mut settings.overridden_keys);
+    settings.sso_session_secs = validated_sso_session_secs(rows, &mut settings.overridden_keys);
     settings.scim_token = validated_text(rows, "scim_token", &mut settings.overridden_keys);
     settings.scim_token_previous =
         validated_text(rows, "scim_token_previous", &mut settings.overridden_keys);
@@ -6001,6 +6000,23 @@ fn validated_positive(
         }
         _ => {
             invalid_setting(key);
+            None
+        }
+    }
+}
+
+fn validated_sso_session_secs(
+    rows: &HashMap<String, String>,
+    overridden_keys: &mut Vec<String>,
+) -> Option<u64> {
+    let value = rows.get("sso_session_secs")?;
+    match value.parse::<u64>() {
+        Ok(parsed) if valid_sso_session_secs(parsed) => {
+            overridden_keys.push("sso_session_secs".to_owned());
+            Some(parsed)
+        }
+        _ => {
+            invalid_setting("sso_session_secs");
             None
         }
     }
@@ -10769,6 +10785,44 @@ mod settings_tests {
         let overlay = store.overlay(&test_config()).unwrap();
         assert_eq!(overlay.resolved.audit_retention_days, 400);
         assert!(!overridden(&overlay, "audit_retention_days"));
+    }
+
+    #[test]
+    fn sso_session_override_has_a_bounded_cached_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        for (value, accepted) in [
+            (crate::config::MAX_SSO_SESSION_SECS.to_string(), true),
+            ((crate::config::MAX_SSO_SESSION_SECS + 1).to_string(), false),
+            ("0".to_owned(), false),
+            (u64::MAX.to_string(), false),
+        ] {
+            store
+                .put_settings(
+                    "local",
+                    &[("sso_session_secs".to_owned(), SettingWrite::Set(value))],
+                )
+                .unwrap();
+            let overlay = store.overlay(&test_config()).unwrap();
+            assert_eq!(
+                overlay.resolved.sso_session_secs,
+                if accepted {
+                    crate::config::MAX_SSO_SESSION_SECS
+                } else {
+                    7 * 24 * 3600
+                }
+            );
+            assert_eq!(overridden(&overlay, "sso_session_secs"), accepted);
+        }
+        store
+            .put_settings(
+                "local",
+                &[("sso_session_secs".to_owned(), SettingWrite::Reset)],
+            )
+            .unwrap();
+        let overlay = store.overlay(&test_config()).unwrap();
+        assert_eq!(overlay.resolved.sso_session_secs, 7 * 24 * 3600);
+        assert!(!overridden(&overlay, "sso_session_secs"));
     }
 
     #[test]

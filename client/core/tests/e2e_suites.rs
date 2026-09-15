@@ -77,11 +77,13 @@ fn sha256_partial_proofs_and_both_receive_transports_preserve_identity() {
                 &mut Silent,
             )
         } else {
+            let destination_file = destination.path().join("source.bin");
             std::fs::write(
                 destination.path().join(".vot-source.bin.journal"),
                 &bytes[..12345],
             )
             .unwrap();
+            common::write_receive_identity_for_bytes(&destination_file, Suite::Sha256Bep52, &bytes);
             receive_over_http(&server.base, delivery, destination.path(), &mut Silent)
         }
         .expect("both receive transports must verify the advertised SHA256 identity");

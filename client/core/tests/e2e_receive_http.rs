@@ -126,7 +126,9 @@ fn an_interrupted_download_resumes_from_the_partial() {
 
     let dest = tempfile::tempdir().unwrap();
     // The temporary a receive resumes is a hidden `.vot-<name>.journal`.
+    let destination = dest.path().join("movie.bin");
     std::fs::write(dest.path().join(".vot-movie.bin.journal"), &movie[..PREFIX]).unwrap();
+    common::write_receive_identity_for_bytes(&destination, vot_object::Suite::Blake3Bao64, &movie);
 
     // Record progress so the test can prove the download resumed rather than
     // restarting from zero.

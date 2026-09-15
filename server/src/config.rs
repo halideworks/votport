@@ -107,6 +107,11 @@ impl Config {
         if self.session_idle_secs == 0 {
             return Err("VOTPORT_SESSION_IDLE_SECS must be greater than zero".to_owned());
         }
+        if !valid_sso_session_secs(self.sso_session_secs) {
+            return Err(format!(
+                "VOTPORT_SSO_SESSION_SECS must be between 1 and {MAX_SSO_SESSION_SECS}"
+            ));
+        }
         validate_admin_password_hash(&self.admin_password_hash)
     }
 
@@ -355,6 +360,11 @@ const DEFAULT_MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024 * 1024; // 50 GiB
 const DEFAULT_MAX_TOTAL_SESSIONS: usize = 32;
 const DEFAULT_MAX_LINK_SESSIONS: usize = 8;
 const DEFAULT_SSO_SESSION_SECS: u64 = 7 * 24 * 3600;
+pub(crate) const MAX_SSO_SESSION_SECS: u64 = 365 * 24 * 3600;
+
+pub(crate) fn valid_sso_session_secs(value: u64) -> bool {
+    (1..=MAX_SSO_SESSION_SECS).contains(&value)
+}
 
 /// Shortest admin password this build accepts. Enforced on anything set
 /// through the UI and on `VOTPORT_ADMIN_PASSWORD`, which refuses to start
@@ -683,9 +693,6 @@ pub fn from_env() -> Result<Config, String> {
             let parsed: u64 = value
                 .parse()
                 .map_err(|error| format!("VOTPORT_SSO_SESSION_SECS: {error}"))?;
-            if parsed == 0 {
-                return Err("VOTPORT_SSO_SESSION_SECS must be at least 1".to_owned());
-            }
             parsed
         }
         Err(_) => DEFAULT_SSO_SESSION_SECS,
@@ -1226,6 +1233,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sso_session_bounds_are_explicit() {
+        assert_eq!(MAX_SSO_SESSION_SECS, 31_536_000);
+        assert!(valid_sso_session_secs(1));
+        assert!(valid_sso_session_secs(31_536_000));
+        assert!(!valid_sso_session_secs(0));
+        assert!(!valid_sso_session_secs(31_536_001));
+        assert!(!valid_sso_session_secs(u64::MAX));
+    }
+
+    #[test]
     fn known_environment_names_are_explicit() {
         for name in KNOWN_ENVIRONMENT_NAMES {
             assert!(is_known_environment_name(name), "{name}");
@@ -1309,6 +1326,18 @@ mod tests {
             ),
             ("VOTPORT_SESSION_IDLE_SECS", "0".to_owned(), false),
             ("VOTPORT_SESSION_IDLE_SECS", "1".to_owned(), true),
+            (
+                "VOTPORT_SSO_SESSION_SECS",
+                MAX_SSO_SESSION_SECS.to_string(),
+                true,
+            ),
+            (
+                "VOTPORT_SSO_SESSION_SECS",
+                (MAX_SSO_SESSION_SECS + 1).to_string(),
+                false,
+            ),
+            ("VOTPORT_SSO_SESSION_SECS", "0".to_owned(), false),
+            ("VOTPORT_SSO_SESSION_SECS", u64::MAX.to_string(), false),
             (
                 "VOTPORT_ADMIN_PASSWORD_HASH",
                 "not-a-password-hash".to_owned(),
