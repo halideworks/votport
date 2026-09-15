@@ -2220,6 +2220,8 @@ impl Store {
                 "delivery_manifests",
                 "delivery_evidence",
                 "delivery_policy_cache",
+                "outbound_grant_manifests",
+                "outbound_fetch_tickets",
             ] {
                 transaction.execute(&format!("DELETE FROM {table} WHERE grant_id IN (SELECT id FROM outbound_grants WHERE tenant=?1)"), [key]).map_err(|e| e.to_string())?;
             }
@@ -3703,6 +3705,16 @@ impl Store {
                     |row| row.get(0),
                 )
                 .optional()
+        })
+    }
+
+    pub(crate) fn outbound_grant_is_non_revoked(&self, grant_id: &str) -> Result<bool, String> {
+        self.with(|connection| {
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM outbound_grants WHERE id = ?1 AND revoked_at IS NULL)",
+                [grant_id],
+                |row| row.get(0),
+            )
         })
     }
 
@@ -7175,6 +7187,19 @@ pub(crate) mod tests {
         store
             .insert_automation_token(test_automation_token("token", "acme"))
             .unwrap();
+        store
+            .with(|connection| {
+                connection.execute(
+                    "INSERT INTO outbound_grant_manifests(grant_id,manifest_root,created_at) VALUES ('grant','root',1)",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO outbound_fetch_tickets(token_id,grant_id,manifest_root,expires_at) VALUES ('ticket','grant','root',2)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
 
         assert_eq!(store.remove_tenant("acme").unwrap(), TenantRemoval::Deleted);
         assert!(store.outbound_grants("acme").unwrap().is_empty());
@@ -7186,6 +7211,26 @@ pub(crate) mod tests {
             store
                 .with(|connection| connection.query_row(
                     "SELECT COUNT(*) FROM outbound_grant_files",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                ))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .with(|connection| connection.query_row(
+                    "SELECT COUNT(*) FROM outbound_grant_manifests",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                ))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .with(|connection| connection.query_row(
+                    "SELECT COUNT(*) FROM outbound_fetch_tickets",
                     [],
                     |row| row.get::<_, i64>(0),
                 ))

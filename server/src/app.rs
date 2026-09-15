@@ -939,6 +939,7 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     let data_lock = lock_data_dir(&config.data_dir)?;
     crate::backup::apply_pending_restore(&config.data_dir, crate::store::SCHEMA_VERSION)?;
     let store = Arc::new(Store::open(&config.data_dir)?);
+    crate::api::serve::sweep_manifests(&store, &config.data_dir);
     // A saved NAS root is never created on a missing mount's local backing directory.
     if crate::receiving::saved_qualification(&store)?.is_none() {
         use std::os::unix::fs::DirBuilderExt as _;
