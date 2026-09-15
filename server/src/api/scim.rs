@@ -241,15 +241,12 @@ fn parse_active(value: &Value) -> ScimResult<bool> {
 
 /// Percent-encodes one path segment (RFC 3986 unreserved characters pass).
 fn encode_segment(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
+    const ENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    percent_encoding::utf8_percent_encode(value, ENCODE_SET).to_string()
 }
 
 /// The absolute base for meta.location; the request path when no public
@@ -2506,6 +2503,8 @@ mod tests {
         assert_eq!(encode_segment("a-b_c.d~E9"), "a-b_c.d~E9");
         assert_eq!(encode_segment("a/b@x y"), "a%2Fb%40x%20y");
         assert_eq!(encode_segment("é"), "%C3%A9");
+        assert_eq!(encode_segment("?#+%&\0"), "%3F%23%2B%25%26%00");
+        assert_eq!(encode_segment(""), "");
     }
 
     #[test]

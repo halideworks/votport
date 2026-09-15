@@ -996,28 +996,20 @@ fn civil_date(days: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-/// Percent-encodes a query value: everything outside the unreserved set,
-/// keeping the slashes a library directory is made of.
+const SEGMENT_ENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'~');
+
+/// Percent-encodes a library query value while preserving directory slashes.
 fn url_query(value: &str) -> String {
-    encode(value, true)
+    const QUERY_ENCODE_SET: &percent_encoding::AsciiSet = &SEGMENT_ENCODE_SET.remove(b'/');
+    percent_encoding::utf8_percent_encode(value, QUERY_ENCODE_SET).to_string()
 }
 
-/// Percent-encodes one path segment (an id from a shell): a slash or a dot
-/// pair cannot reach another route.
+/// Percent-encodes a shell-provided path segment, including dots and slashes.
 fn url_segment(value: &str) -> String {
-    encode(value, false)
-}
-
-fn encode(value: &str, keep_slash: bool) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'~' => out.push(byte as char),
-            b'/' if keep_slash => out.push('/'),
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
+    percent_encoding::utf8_percent_encode(value, SEGMENT_ENCODE_SET).to_string()
 }
 
 #[cfg(test)]
@@ -1301,6 +1293,10 @@ mod tests {
         assert_eq!(url_query("a b&c"), "a%20b%26c");
         assert_eq!(url_segment("abc-1_2"), "abc-1_2");
         assert_eq!(url_segment("../links"), "%2E%2E%2Flinks");
+        assert_eq!(url_query("-_.~/é?#+%&"), "-_%2E~/%C3%A9%3F%23%2B%25%26");
+        assert_eq!(url_segment("-_.~/é?#+%&"), "-_%2E~%2F%C3%A9%3F%23%2B%25%26");
+        assert_eq!(url_query("\0"), "%00");
+        assert_eq!(url_segment(""), "");
     }
 
     #[test]
