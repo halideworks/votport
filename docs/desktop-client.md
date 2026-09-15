@@ -118,6 +118,12 @@ minimized options. `--snapshot <png>` belongs to the `--receive` in that launch;
 other transfers do not inherit it. The Windows CI job runs headless activation
 checks and builds both unpackaged and MSIX shells.
 
+Managed crash hooks are best-effort and append only exception type, HRESULT,
+and stack frames to `%LOCALAPPDATA%\Votport\votport-crash.log`. This location
+uses the current user's normal private application-data permissions. Native
+bootstrap and fail-fast exits do not pass through this managed hook; when
+enabled, Windows Error Reporting handles those failures.
+
 Each HTTP send allows 100 server-requested restarts after its initial attempt.
 Chunk and finish restarts share that budget, even when chunks are accepted.
 Exhaustion returns an error through the existing retry flow; cancellation stops

@@ -10,9 +10,8 @@ public partial class App : Application
     public App()
     {
         InitializeComponent();
-        // A XAML failure otherwise dies as 0xc000027b with no message; the
-        // log beside the executable names it. The domain hook covers threads
-        // the dispatcher never sees.
+        // The per-user crash log records managed XAML and worker failures.
+        // Native fail-fast errors bypass these hooks.
         UnhandledException += (_, e) => CrashLog.Append(e.Exception);
         AppDomain.CurrentDomain.UnhandledException += (_, e) => CrashLog.Append(e.ExceptionObject as Exception);
     }

@@ -152,6 +152,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "activation checks failed" }
           dotnet run --project client/windows/NumericTests/NumericTests.csproj -c Release -p:TreatWarningsAsErrors=true
           if ($LASTEXITCODE -ne 0) { throw "numeric checks failed" }
+          dotnet run --project client/windows/CrashLogTests/CrashLogTests.csproj -c Release -p:TreatWarningsAsErrors=true
+          if ($LASTEXITCODE -ne 0) { throw "crash log checks failed" }
 
       - name: Build the Windows shells
         working-directory: client/windows
@@ -248,6 +250,73 @@ jobs:
           tags: votport:ci
           cache-from: type=gha,scope=votport-ci
           cache-to: type=gha,mode=max,scope=votport-ci,ignore-error=true
+
+      - name: Run real S3 delivery and backup acceptance
+        env:
+          S3_TEST_ACCESS_KEY: votport-ci-access
+          S3_TEST_SECRET_KEY: votport-ci-secret
+        run: |
+          set -Eeuo pipefail
+          s3_root="$(mktemp -d)"
+          e2e_root="$s3_root/e2e"
+          s3_data="$s3_root/minio"
+          mkdir -p "$e2e_root" "$s3_data"
+          chmod 700 "$s3_root" "$e2e_root" "$s3_data"
+          cleanup() {
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              docker logs votport-s3-minio || true
+              docker logs votport-s3-server || true
+            fi
+            docker rm -f votport-s3-server votport-s3-minio >/dev/null 2>&1 || true
+            rm -rf "$s3_root"
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          docker run -d --name votport-s3-minio \
+            --user "$(id -u):$(id -g)" \
+            -e MINIO_ROOT_USER="$S3_TEST_ACCESS_KEY" \
+            -e MINIO_ROOT_PASSWORD="$S3_TEST_SECRET_KEY" \
+            --mount "type=bind,src=$s3_data,dst=/data" \
+            -p 127.0.0.1:19000:9000 \
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z-cpuv1@sha256:13582eff79c6605a2d315bdd0e70164142ea7e98fc8411e9e10d089502a6d883 \
+            server /data
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:19000/minio/health/ready >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              echo "MinIO did not become ready" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+
+          cat > "$e2e_root/votport" <<'SH'
+          #!/bin/sh
+          set -eu
+          exec docker run --rm --init --name votport-s3-server \
+            --network host --user "$(id -u):$(id -g)" \
+            --mount "type=bind,src=$VOTPORT_TEST_ROOT,dst=$VOTPORT_TEST_ROOT" \
+            --mount "type=bind,src=$VOTPORT_WEB_ROOT,dst=/app/web,readonly" \
+            -e VOTPORT_BIND -e VOTPORT_PUBLIC_URL -e VOTPORT_DATA_DIR \
+            -e VOTPORT_RECEIVE_DIR -e VOTPORT_OUTBOUND_DIR \
+            -e VOTPORT_WEB_ROOT=/app/web -e VOTPORT_ADMIN_PASSWORD \
+            -e VOTPORT_SERVE_BIND -e VOTPORT_PUSH_BIND \
+            -e VOTPORT_STORAGE_FIXTURE_ACCESS_KEY_ID \
+            -e VOTPORT_STORAGE_FIXTURE_SECRET_ACCESS_KEY \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+            -e AWS_ENDPOINT -e AWS_ENDPOINT_URL_S3 -e AWS_BUCKET \
+            -e RUST_LOG votport:ci /app/votport "$@"
+          SH
+          chmod 700 "$e2e_root/votport"
+          VOTPORT_TEST_ROOT="$e2e_root" \
+            python3 scripts/delivery-storage-e2e.py \
+              --server "$e2e_root/votport" \
+              --root "$e2e_root" \
+              --web-root "$GITHUB_WORKSPACE/web" \
+              --s3 http://127.0.0.1:19000
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

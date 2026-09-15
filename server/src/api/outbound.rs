@@ -8088,7 +8088,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn password_grant_gates_metadata_file_and_receipt() {
+    async fn password_grant_gates_metadata_file_receipt_and_evidence() {
         let (_directory, app, cookie, expected_bytes) = fixture().await;
         let response = crate::app::router(app.clone())
             .oneshot(
@@ -8211,6 +8211,48 @@ mod tests {
                 && !row.detail.to_string().contains("$argon2")
         }));
         assert_ne!(grant_id, token);
+
+        let holder = hex::encode(
+            ed25519_dalek::SigningKey::from_bytes(&[7; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let challenge_request = |cookie: &str| {
+            Request::post(format!("/api/s/{token}/evidence-challenge"))
+                .header("content-type", "application/json")
+                .header("cookie", cookie)
+                .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 4))))
+                .body(Body::from(json!({"holder": holder}).to_string()))
+                .unwrap()
+        };
+        let forged_cookie = format!("{}=forged", grant_cookie_name(&grant_id));
+        for denied_cookie in ["", cookie.as_str(), forged_cookie.as_str()] {
+            let response = crate::app::router(app.clone())
+                .oneshot(challenge_request(denied_cookie))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                body(response).await["error"],
+                "outbound grant password required"
+            );
+        }
+        let response = crate::app::router(app.clone())
+            .oneshot(challenge_request(&grant_cookie))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let signed: crate::delivery_protocol::SignedChallenge =
+            serde_json::from_value(body(response).await).unwrap();
+        assert!(signed.verify(&app.signer.public_hex));
+        assert_eq!(signed.challenge.grant_id, grant_id);
+        assert_eq!(signed.challenge.holder, holder);
+        assert_eq!(signed.challenge.origin, "https://drop.example.com");
+        assert_eq!(
+            signed.challenge.manifest,
+            app.store.delivery_manifest(&grant_id).unwrap()
+        );
 
         let metadata = crate::app::router(app.clone())
             .oneshot(
