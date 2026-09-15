@@ -3,7 +3,9 @@
 Build the server and desktop clients from the same revision. Agent access is a
 folder-scoped delivery workflow shared by the server, browser, desktop core,
 CLI, and MCP adapter. It uses the existing library, delivery links, VOT object
-identities, download counters, and audit trail.
+identities, download counters, and audit trail. The HTTP contract is pinned to
+that server revision. The session's `api_version: 1` is informational; clients
+do not negotiate HTTP versions or promise compatibility across revisions.
 
 ## Connect
 
@@ -33,9 +35,10 @@ workflows. Requests that omit permissions default to `deliveries:create`.
 Tokens expire after 1 to 365 days and can be revoked from any operator UI.
 Revoking a token stops its API access; already-issued delivery links keep their
 own expiry and revocation state. Operators can manage those links in Deliver.
-The database stores token hashes, permissions, and operation records, without
-raw agent tokens or delivery URLs. Schema 26 migrates existing development data
-and preserves existing tokens with create-only permissions.
+The database stores agent token hashes, permissions, and operation records.
+Delivery tokens are retained so authorized operators can copy and resend links;
+raw agent tokens cannot be recovered. Existing data must follow the supported
+schema transition described in [Deployment](deployment.md).
 
 ## CLI
 
@@ -111,6 +114,13 @@ server restart or a source folder disappearing. Recovery does not create a new
 snapshot or extend a link's lifetime. An administrator rotating the link causes
 recovery to return `delivery_changed` instead of returning an obsolete URL.
 
+The delivery password is part of those identical parameters. The CLI's `agent
+share` and MCP's `create_delivery` read it from `VOTPORT_SHARE_PASSWORD`, even
+though it is absent from the tool arguments. Keep the same value on retries;
+unsetting or rotating it changes the request and returns `operation_conflict`.
+Use `recover` or `recover_delivery` to retrieve an existing result without
+resupplying the password. A new password requires a new operation ID.
+
 The server share endpoint permits omitted IDs for one-off operator scripts;
 those calls cannot be safely replayed after a lost response. The client agent
 and MCP creation methods require an explicit ID.
@@ -179,6 +189,9 @@ Protocol references: [stdio transport](https://modelcontextprotocol.io/specifica
 All endpoints below require `Authorization: Bearer <token>` and return JSON with
 `Cache-Control: no-store`. JSON request bodies require `Content-Type:
 application/json`. Unknown share fields and malformed query values are rejected.
+Workflow writes also require `X-Votport: 1`, including bearer-authenticated job
+creation, retry and cancellation. The bundled clients set it automatically;
+omitting it returns 403 with `missing X-Votport header` before permission checks.
 
 | Method and path | Permission | Input/result |
 | --- | --- | --- |
@@ -189,6 +202,31 @@ application/json`. Unknown share fields and malformed query values are rejected.
 | `GET /api/automation/deliveries` | `deliveries:read` | Optional numeric `after`, `limit`; oldest first. |
 | `GET /api/automation/deliveries/{id}` | `deliveries:read` | Optional `offset`, `limit`; delivery state and file detail. |
 | `DELETE /api/automation/deliveries/{id}` | `deliveries:revoke` | Repeating revocation succeeds. |
+| `GET /api/automation/notifications` | `deliveries:create` or `jobs:create` | Destination IDs, tenant defaults and allowed creation events; credentials are omitted. |
+| `GET /api/workflows/projects` | `jobs:read` | Projects where the token has viewer, sender or approver membership. |
+| `GET /api/workflows/jobs` | `jobs:read` | Optional `after` job ID, `limit`, `project`, `state`, `q`; visible jobs and `next`. |
+| `GET /api/workflows/jobs/{id}` | `jobs:read` | Visible job state and released URL when available. |
+| `POST /api/workflows/jobs` | `jobs:create` | `operation_id`, `project_id`, `label`, `expires_days`; optional `metadata`, enrolled `recipients`, `not_before`, `deadline`, `import`, `notifications`. Requires project sender membership. |
+| `POST /api/workflows/jobs/{id}` | `jobs:create` | `{"action":"retry"}`; requires project sender membership and a retryable job state. |
+| `POST /api/workflows/jobs/{id}` | `jobs:cancel` | `{"action":"cancel"}`; requires project sender membership. |
+| `GET /api/workflows/events` | `jobs:read` | Optional numeric `after`, `limit`; visible signed events and `next`, including gaps outside the token's projects. |
+| `GET /api/workflows/jobs/{id}/evidence` | `jobs:read` | Optional numeric `after`, `limit`; visible job evidence and `next`. |
+
+These endpoints return 200 on success except job creation, which returns 202
+for both a fresh job and an identical replay. Delivery creation and recovery
+both return 200; status alone does not identify a fresh creation. Read the
+returned operation ID and grant or job ID. Revoking an owned delivery returns
+200 on repeated calls. Retry is not idempotent: after an uncertain response,
+read the job before requesting another retry.
+
+Workflow reads require project membership as well as token permissions, and
+the project directory must fit the token's folder scope. Job lifetimes accept
+1 to 365 days; scheduling fields are Unix seconds. HTTP imports use
+`{"import":{"storage_id":"ID","prefix":"folder"}}`; MCP exposes these as
+`import_storage_id` and `import_prefix`. See [Delivery workflows](delivery-workflows.md)
+for project rules and job state transitions. Storage administration, webhook
+configuration and webhook attempt history require an operator session; the
+`/api/workflows` prefix does not make those endpoints bearer-accessible.
 
 Operator token management uses the existing `/api/admin/automation-tokens`
 GET/POST and `/api/admin/automation-tokens/{id}` DELETE endpoints, with the normal

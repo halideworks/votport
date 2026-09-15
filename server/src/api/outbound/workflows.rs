@@ -1349,10 +1349,13 @@ pub async fn webhook_attempts(
         .after
         .unwrap_or_else(|| "0".into())
         .parse::<u64>()
-        .map_err(|_| conflict("invalid webhook cursor".into()))?;
+        .map_err(|_| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid webhook cursor"))?;
     let limit = page.limit.unwrap_or(50);
     if after > i64::MAX as u64 || !(1..=100).contains(&limit) {
-        return Err(conflict("invalid webhook page".into()));
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid webhook page",
+        ));
     }
     let attempts = app
         .store
@@ -1830,6 +1833,44 @@ mod tests {
             call(&app, Method::GET, path, Some(&cookie), None).await.0,
             StatusCode::CONFLICT
         );
+    }
+
+    #[tokio::test]
+    async fn webhook_attempts_reject_invalid_page_with_unprocessable_entity() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let cookie = admin_cookie(&app);
+        for query in [
+            "?limit=0",
+            "?limit=101",
+            "?after=nope",
+            "?after=9223372036854775808",
+        ] {
+            let (status, _, body) = call(
+                &app,
+                Method::GET,
+                &format!("/api/workflows/webhook/attempts{query}"),
+                Some(&cookie),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{query}");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["code"],
+                "invalid_request",
+                "{query}"
+            );
+        }
+        let (status, _, body) = call(
+            &app,
+            Method::GET,
+            "/api/workflows/webhook/attempts?after=0&limit=1",
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["attempts"].is_array());
     }
 
     #[tokio::test]

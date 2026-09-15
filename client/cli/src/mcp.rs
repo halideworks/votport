@@ -231,22 +231,22 @@ fn definitions() -> Vec<Value> {
     let limit = json!({"type": "integer", "minimum": 1, "maximum": 100, "default": 50});
     let offset = json!({"type": "integer", "minimum": 0});
     vec![
-        tool("list_notification_destinations", "List notification destinations, tenant defaults and allowed events for create_delivery and create_job. Requires job or delivery creation access. Webhook credentials remain private.", json!({}), &[], true, false),
-        tool("get_access", "Inspect this agent's tenant, folder, permissions and credential expiry.", json!({}), &[], true, false),
-        tool("list_files", "List one library directory within the token's folder. Omit directory to start at that folder. Follow next_cursor with after.", json!({"directory": string, "after": {"type": "string", "maxLength": 4096}, "limit": limit}), &[], true, false),
-        tool("create_delivery", "Create an expiring link for a server-relative folder. Choose operation_id once and reuse it with identical parameters after a timeout. Returns the same delivery on retry. Passwords are supplied through VOTPORT_SHARE_PASSWORD.", json!({"directory": string, "operation_id": id, "label": {"type": "string", "maxLength": 200}, "expires_days": {"type": "integer", "minimum": 1, "maximum": 30}, "max_downloads": {"type": "integer", "minimum": 1, "maximum": 10000}, "notifications": notifications(&["outbound_download_started", "outbound_delivery_complete"])}), &["directory", "operation_id", "expires_days"], false, false),
-        tool("recover_delivery", "Recover the URL and delivery for an operation_id, including after reconnecting or restarting. Requires deliveries:create.", json!({"operation_id": id}), &["operation_id"], true, false),
-        tool("list_deliveries", "List deliveries created by this token, oldest first. Follow next_cursor with after.", json!({"after": offset, "limit": limit}), &[], true, false),
-        tool("get_delivery", "Inspect a delivery owned by this token, including paginated object identities, signed receipts and per-file request counts. First-file and every-file request counts do not prove recipient verification or acceptance.", json!({"id": id, "offset": offset, "limit": limit}), &["id"], true, false),
-        tool("revoke_delivery", "Revoke this token's delivery link. Repeating the call is safe. Files stay in the library.", json!({"id": id}), &["id"], false, true),
-        tool("list_projects", "List the project's delivery rules, required metadata, enrolled recipient keys and agent roles. Requires jobs:read and project membership.", json!({}), &[], true, false),
-        tool("list_jobs", "List durable jobs visible to this agent. Follow next with after.", json!({"after": id, "limit": limit}), &[], true, false),
-        tool("get_job", "Read preparation, approval, checks, failures and a released delivery URL.", json!({"id": id}), &["id"], true, false),
-        tool("create_job", "Queue a project delivery. Reuse operation_id with identical arguments after a timeout. Optional schedule/deadline are Unix seconds. Approval is a separate human action. Requires jobs:create and project sender role.", json!({"operation_id": id,"project_id": id,"label": {"type":"string","minLength":1,"maxLength":200},"metadata": {"type":"object","maxProperties":50,"additionalProperties":{"type":"string","maxLength":4096}},"recipients":{"type":"array","maxItems":500,"items":{"type":"string","minLength":64,"maxLength":64}},"expires_days":{"type":"integer","minimum":1,"maximum":365},"not_before": offset,"deadline": offset,"import_storage_id": id,"import_prefix": string,"notifications":notifications(&["outbound_download_started", "outbound_delivery_complete", "workflow_retry_scheduled", "workflow_failed"])}), &["operation_id","project_id","label","expires_days"], false, false),
-        tool("retry_job", "Retry a failed job without changing its request, frozen manifest or approval. Requires jobs:create.", json!({"id":id}), &["id"], false, false),
-        tool("cancel_job", "Cancel a job and stop subsequent file admissions. Already admitted streams and delivered files cannot be recalled. Requires jobs:cancel.", json!({"id":id}), &["id"], false, true),
-        tool("list_events", "Read signed delivery events. Follow next with after; gaps may represent projects outside this agent's scope.", json!({"after":offset,"limit":limit}), &[], true, false),
-        tool("get_job_evidence", "Read signed recipient verification and explicit acceptance for a job's exact manifest. These are device statements; request counters are separate.", json!({"id":id,"after":offset,"limit":limit}), &["id"], true, false),
+        tool("list_notification_destinations", "List notification destinations, tenant defaults and allowed events for create_delivery and create_job. Requires job or delivery creation access. Webhook credentials remain private.", json!({}), &[], true, false, true),
+        tool("get_access", "Inspect this agent's tenant, folder, permissions and credential expiry.", json!({}), &[], true, false, true),
+        tool("list_files", "List one library directory within the token's folder. Omit directory to start at that folder. Follow next_cursor with after.", json!({"directory": string, "after": {"type": "string", "maxLength": 4096}, "limit": limit}), &[], true, false, true),
+        tool("create_delivery", "Create an expiring link for a server-relative folder. Choose operation_id once and reuse it with identical parameters after a timeout. Returns the same delivery on retry. Passwords are supplied through VOTPORT_SHARE_PASSWORD.", json!({"directory": string, "operation_id": id, "label": {"type": "string", "maxLength": 200}, "expires_days": {"type": "integer", "minimum": 1, "maximum": 30}, "max_downloads": {"type": "integer", "minimum": 1, "maximum": 10000}, "notifications": notifications(&["outbound_download_started", "outbound_delivery_complete"])}), &["directory", "operation_id", "expires_days"], false, false, true),
+        tool("recover_delivery", "Recover the URL and delivery for an operation_id, including after reconnecting or restarting. Requires deliveries:create.", json!({"operation_id": id}), &["operation_id"], true, false, true),
+        tool("list_deliveries", "List deliveries created by this token, oldest first. Follow next_cursor with after.", json!({"after": offset, "limit": limit}), &[], true, false, true),
+        tool("get_delivery", "Inspect a delivery owned by this token, including paginated object identities, signed receipts and per-file request counts. First-file and every-file request counts do not prove recipient verification or acceptance.", json!({"id": id, "offset": offset, "limit": limit}), &["id"], true, false, true),
+        tool("revoke_delivery", "Revoke this token's delivery link. Repeating the call is safe. Files stay in the library.", json!({"id":id}), &["id"], false, true, true),
+        tool("list_projects", "List the project's delivery rules, required metadata, enrolled recipient keys and agent roles. Requires jobs:read and project membership.", json!({}), &[], true, false, true),
+        tool("list_jobs", "List durable jobs visible to this agent. Follow next with after.", json!({"after": id, "limit": limit}), &[], true, false, true),
+        tool("get_job", "Read preparation, approval, checks, failures and a released delivery URL.", json!({"id": id}), &["id"], true, false, true),
+        tool("create_job", "Queue a project delivery. Reuse operation_id with identical arguments after a timeout. Optional schedule/deadline are Unix seconds. Approval is a separate human action. Requires jobs:create and project sender role.", json!({"operation_id": id,"project_id": id,"label": {"type":"string","minLength":1,"maxLength":200},"metadata": {"type":"object","maxProperties":50,"additionalProperties":{"type":"string","maxLength":4096}},"recipients":{"type":"array","maxItems":500,"items":{"type":"string","minLength":64,"maxLength":64}},"expires_days":{"type":"integer","minimum":1,"maximum":365},"not_before": offset,"deadline": offset,"import_storage_id": id,"import_prefix": string,"notifications":notifications(&["outbound_download_started", "outbound_delivery_complete", "workflow_retry_scheduled", "workflow_failed"])}), &["operation_id","project_id","label","expires_days"], false, false, true),
+        tool("retry_job", "Retry a failed job without changing its request, frozen manifest or approval. Requires jobs:create.", json!({"id":id}), &["id"], false, false, false),
+        tool("cancel_job", "Cancel a job and stop subsequent file admissions. Already admitted streams and delivered files cannot be recalled. Requires jobs:cancel.", json!({"id":id}), &["id"], false, true, true),
+        tool("list_events", "Read signed delivery events. Follow next with after; gaps may represent projects outside this agent's scope.", json!({"after":offset,"limit":limit}), &[], true, false, true),
+        tool("get_job_evidence", "Read signed recipient verification and explicit acceptance for a job's exact manifest. These are device statements; request counters are separate.", json!({"id":id,"after":offset,"limit":limit}), &["id"], true, false, true),
     ]
 }
 
@@ -257,8 +257,9 @@ fn tool(
     required: &[&str],
     read_only: bool,
     destructive: bool,
+    idempotent: bool,
 ) -> Value {
-    json!({"name": name, "description": description, "inputSchema": {"type": "object", "properties": properties, "required": required, "additionalProperties": false}, "outputSchema": {"type": "object"}, "annotations": {"readOnlyHint": read_only, "destructiveHint": destructive, "idempotentHint": true, "openWorldHint": true}})
+    json!({"name": name, "description": description, "inputSchema": {"type": "object", "properties": properties, "required": required, "additionalProperties": false}, "outputSchema": {"type": "object"}, "annotations": {"readOnlyHint": read_only, "destructiveHint": destructive, "idempotentHint": idempotent, "openWorldHint": true}})
 }
 
 fn call(name: &str, args: &Value) -> Result<Value, Value> {
@@ -609,5 +610,40 @@ mod tests {
             &json!({"directory": "project", "operation_id": "unicode-label", "expires_days": 1, "label": "測".repeat(200)}),
             &create["inputSchema"]
         ));
+    }
+
+    #[test]
+    fn tool_annotations_mark_retry_as_non_idempotent() {
+        let find = |name| {
+            definitions()
+                .into_iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap()["annotations"]
+                .clone()
+        };
+        assert_eq!(find("retry_job")["idempotentHint"], false);
+        for name in [
+            "create_delivery",
+            "recover_delivery",
+            "revoke_delivery",
+            "create_job",
+            "cancel_job",
+        ] {
+            assert_eq!(find(name)["idempotentHint"], true, "{name}");
+        }
+        for name in [
+            "list_notification_destinations",
+            "get_access",
+            "list_files",
+            "list_deliveries",
+            "get_delivery",
+            "list_projects",
+            "list_jobs",
+            "get_job",
+            "list_events",
+            "get_job_evidence",
+        ] {
+            assert_eq!(find(name)["idempotentHint"], true, "{name}");
+        }
     }
 }

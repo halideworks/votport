@@ -775,6 +775,9 @@ mod tests {
         assert_eq!(first.1, replay.1);
         assert_eq!(app.store.outbound_grants("").unwrap().len(), 1);
         let created = first.1;
+        assert_eq!(created["grant"]["file_count"], 2);
+        assert_eq!(created["grant"]["files_truncated"], false);
+        assert_eq!(created["grant"]["files"].as_array().unwrap().len(), 2);
         let id = created["grant"]["id"].as_str().unwrap();
         let saved = app.store.outbound_share_token("", id).unwrap().unwrap();
         assert_ne!(saved, raw);
@@ -791,10 +794,27 @@ mod tests {
         let path = format!("/api/automation/deliveries/{id}");
         let (_, detail) = request(&app, "GET", &format!("{path}?limit=1"), &raw, json!({})).await;
         assert_eq!(detail["total_bytes"], 9);
+        assert_eq!(detail["grant"]["file_count"], 2);
+        assert_eq!(detail["grant"]["files_truncated"], true);
+        assert_eq!(detail["grant"]["files"], json!([]));
         assert_eq!(detail["files"][0]["name"], "project/a.txt");
         assert_eq!(detail["files"][0]["root"].as_str().unwrap().len(), 64);
         assert!(detail["files"][0].get("receipt_b64").is_none());
         assert_eq!(detail["next_offset"], 1);
+        let (_, second_detail) = request(
+            &app,
+            "GET",
+            &format!("{path}?offset=1&limit=1"),
+            &raw,
+            json!({}),
+        )
+        .await;
+        assert_eq!(second_detail["offset"], 1);
+        assert_eq!(second_detail["total_bytes"], 9);
+        assert_eq!(second_detail["files"][0]["name"], "project/sub/b.txt");
+        assert_eq!(second_detail["has_more"], false);
+        assert!(second_detail["next_offset"].is_null());
+        assert_eq!(second_detail["grant"]["files_truncated"], true);
         for method in ["GET", "DELETE"] {
             assert_eq!(
                 request(&app, method, &path, &foreign, json!({})).await.0,
@@ -810,6 +830,9 @@ mod tests {
         )
         .await;
         assert_eq!(listing["deliveries"][0]["grant"]["id"], id);
+        assert_eq!(listing["deliveries"][0]["grant"]["file_count"], 2);
+        assert_eq!(listing["deliveries"][0]["grant"]["files_truncated"], true);
+        assert_eq!(listing["deliveries"][0]["grant"]["files"], json!([]));
         let (_, listing) = request(
             &app,
             "GET",
@@ -819,6 +842,10 @@ mod tests {
         )
         .await;
         assert_eq!(listing["deliveries"], json!([]));
+        let (status, error) =
+            request(&app, "GET", &format!("{path}?ofset=50"), &raw, json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["code"], "invalid_request");
         let mut changed = spec.clone();
         changed["expires_days"] = json!(1);
         let (status, conflict) =

@@ -1331,6 +1331,7 @@ const fn default_expiry() -> u64 {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutboundGrantsQuery {
     limit: Option<String>,
     offset: Option<String>,
@@ -4509,7 +4510,8 @@ fn public_grant(grant: OutboundGrant) -> serde_json::Value {
 }
 
 fn public_grant_with_file_count(grant: OutboundGrant, file_count: usize) -> serde_json::Value {
-    let files_truncated = file_count > OUTBOUND_GRANT_PREVIEW_FILES;
+    let files_truncated = file_count > OUTBOUND_GRANT_PREVIEW_FILES
+        || (file_count > 1 && grant.files.len() < file_count);
     let files = if files_truncated {
         Vec::new()
     } else {
