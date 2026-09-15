@@ -15,9 +15,6 @@ pub const PERMISSIONS: [&str; 7] = [
     "deliveries:revoke",
 ];
 
-// A cursor includes the admitted directory and its child filename.
-const MAX_FILE_CURSOR_BYTES: usize = 4096;
-
 pub(super) fn default_permissions() -> Vec<String> {
     vec!["deliveries:create".to_owned()]
 }
@@ -173,12 +170,19 @@ pub async fn files(
         .directory
         .unwrap_or_else(|| token.directory.clone().unwrap_or_default());
     check_directory(&app, &token, &directory)?;
+    let directory = directory.trim_matches('/').to_owned();
     let limit = page_limit(query.limit.as_deref())?;
     let after = query.after.unwrap_or_default();
-    if after.len() > MAX_FILE_CURSOR_BYTES {
+    if after.len() > MAX_LIBRARY_CURSOR_BYTES {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "cursor is too long",
+        ));
+    }
+    if !library_cursor_matches_directory(&directory, &after) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "cursor does not belong to this directory",
         ));
     }
     let root = library_root(&app, &token.tenant);
@@ -196,15 +200,7 @@ pub async fn files(
     .await
     .map_err(|_| ApiError::internal("list outbound files failed"))?
     .map_err(|_| ApiError::internal("cannot read this library directory"))?;
-    let next_cursor = has_more.then(|| {
-        directories
-            .iter()
-            .map(String::as_str)
-            .chain(files.iter().filter_map(|f| f["path"].as_str()))
-            .max()
-            .unwrap_or_default()
-            .to_owned()
-    });
+    let next_cursor = has_more.then(|| next_library_cursor(&directories, &files));
     Ok(Json(
         json!({"directory": directory, "directories": directories, "files": files, "has_more": has_more, "next_cursor": next_cursor}),
     ))
@@ -743,6 +739,16 @@ mod tests {
         .await;
         assert_eq!(second["directories"], json!(["project/sub"]));
         assert_eq!(second["has_more"], false);
+        let (status, error) = request(
+            &app,
+            "GET",
+            "/api/automation/files?limit=1&after=other/a.txt",
+            &raw,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error["code"], "invalid_request");
         for path in [
             "/api/automation/files?directory=other",
             "/api/automation/files?directory=project/../other",
@@ -1032,7 +1038,7 @@ mod tests {
         let (status, _) = request(
             &app,
             "GET",
-            &format!("{path}&after={}", "x".repeat(MAX_FILE_CURSOR_BYTES + 1)),
+            &format!("{path}&after={}", "x".repeat(MAX_LIBRARY_CURSOR_BYTES + 1)),
             &raw,
             json!({}),
         )

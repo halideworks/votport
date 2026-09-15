@@ -147,7 +147,7 @@ Agent commands always return JSON and use VOTPORT_URL and VOTPORT_AUTOMATION_TOK
          votport close-request <id>\n\
          votport deliveries                 [--json]\n\
          votport revoke-delivery <id>\n\
-         votport library [<dir>]            [--json]\n\
+         votport library [<dir>]            [--after <cursor>] [--json]\n\
          votport issue-delivery <label> <path>... [--password <p>] [--expires-days <n>] [--max-downloads <n>] [--json]\n\
          votport upload <path>...           [--into <dir>] [--json]\n\
          votport watch add <dir> <link>     [--password <p>]\n\
@@ -675,9 +675,11 @@ fn revoke_delivery(args: &[String]) -> Result<(), String> {
 }
 
 fn library(args: &[String]) -> Result<(), String> {
-    let (_, positional, json) = parse(args, &[])?;
+    let (options, positional, json) = parse(args, &["--after"])?;
     let directory = positional.first().cloned().unwrap_or_default();
-    let listing = votport_client_core::port::library(&directory).map_err(human)?;
+    let listing =
+        votport_client_core::port::library(&directory, options.get("--after").map(String::as_str))
+            .map_err(human)?;
     if json {
         println!(
             "{}",
@@ -686,6 +688,7 @@ fn library(args: &[String]) -> Result<(), String> {
                 "directories": listing.directories,
                 "files": listing.files.iter().map(|f| serde_json::json!({ "path": f.path, "bytes": f.bytes })).collect::<Vec<_>>(),
                 "truncated": listing.truncated,
+                "next_cursor": listing.next_cursor,
             })
         );
     } else {
@@ -696,7 +699,10 @@ fn library(args: &[String]) -> Result<(), String> {
             println!("{}  {}", file.path, file.bytes);
         }
         if listing.truncated {
-            println!("(more not listed)");
+            println!(
+                "(more not listed; use --after {})",
+                listing.next_cursor.as_deref().unwrap_or_default()
+            );
         }
     }
     Ok(())

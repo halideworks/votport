@@ -52,6 +52,7 @@
         <Grid.RowDefinitions>
           <RowDefinition Height="Auto" />
           <RowDefinition Height="*" />
+          <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
         <TextBlock x:Name="BrowserNote" Text="Reading what is on the port" Foreground="{ThemeResource VotMutedBrush}" Margin="6" />
         <ListView x:Name="Entries" Grid.Row="1" SelectionMode="None" IsItemClickEnabled="True" ItemClick="Entries_ItemClick">
@@ -71,6 +72,11 @@
             </DataTemplate>
           </ListView.ItemTemplate>
         </ListView>
+        <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="8" Margin="6,4,6,0">
+          <Button x:Name="PreviousPageButton" Content="Previous page" Click="PreviousPage_Click" />
+          <Button x:Name="NextPageButton" Content="Next page" Click="NextPage_Click" />
+          <TextBlock x:Name="PageNote" Foreground="{ThemeResource VotMutedBrush}" VerticalAlignment="Center" />
+        </StackPanel>
       </Grid>
     </Border>
     <StackPanel Grid.Row="4" Spacing="8">

@@ -40,7 +40,11 @@ public sealed partial class DeliverPage : Page
     private const string DropPrompt = "Drop files or folders here";
     private readonly ObservableCollection<LibraryEntry> entries = new();
     private readonly HashSet<string> chosen = new();
+    private readonly Stack<string?> previousPages = new();
     private string directory = "";
+    private string? pageAfter;
+    private string? nextPage;
+    private long pageGeneration;
     private string? issued;
     /// The cancel handle of the upload in flight, if any, and the core's
     /// last word on it.
@@ -86,17 +90,30 @@ public sealed partial class DeliverPage : Page
     private void Open(string target)
     {
         directory = target;
+        pageAfter = null;
+        previousPages.Clear();
+        LoadPage();
+    }
+
+    private void LoadPage()
+    {
+        var target = directory;
+        var after = pageAfter;
+        var generation = ++pageGeneration;
+        nextPage = null;
         entries.Clear();
         BrowserNote.Text = "Reading what is on the port";
         BrowserNote.Visibility = Visibility.Visible;
+        RefreshPageControls();
         DrawCrumbs();
-        PortStore.Shared.Library(target, listing =>
+        PortStore.Shared.Library(target, after, () => generation == pageGeneration && directory == target && pageAfter == after, listing =>
         {
-            if (listing is null || directory != target) return;
+            if (listing is null || generation != pageGeneration || directory != target || pageAfter != after) return;
+            nextPage = listing.NextCursor;
             entries.Clear();
             foreach (var name in listing.Directories)
             {
-                entries.Add(new LibraryEntry { Name = name, Path = target.Length == 0 ? name : $"{target}/{name}" });
+                entries.Add(new LibraryEntry { Name = name[(name.LastIndexOf('/') + 1)..], Path = name });
             }
             foreach (var file in listing.Files)
             {
@@ -110,7 +127,30 @@ public sealed partial class DeliverPage : Page
             }
             BrowserNote.Text = listing.Truncated ? "More files than shown" : "Nothing here yet.";
             BrowserNote.Visibility = entries.Count == 0 || listing.Truncated ? Visibility.Visible : Visibility.Collapsed;
+            RefreshPageControls();
         });
+    }
+
+    private void RefreshPageControls()
+    {
+        PreviousPageButton.IsEnabled = previousPages.Count > 0;
+        NextPageButton.IsEnabled = nextPage is not null;
+        PageNote.Text = previousPages.Count > 0 || nextPage is not null ? "Browse another page" : "";
+    }
+
+    private void PreviousPage_Click(object sender, RoutedEventArgs e)
+    {
+        if (previousPages.Count == 0) return;
+        pageAfter = previousPages.Pop();
+        LoadPage();
+    }
+
+    private void NextPage_Click(object sender, RoutedEventArgs e)
+    {
+        if (nextPage is null) return;
+        previousPages.Push(pageAfter);
+        pageAfter = nextPage;
+        LoadPage();
     }
 
     private void DropZone_DragOver(object sender, DragEventArgs e)

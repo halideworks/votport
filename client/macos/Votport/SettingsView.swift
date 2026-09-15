@@ -345,7 +345,7 @@ struct AgentAccessSection: View {
                             } else { Text("Revoked").foregroundStyle(Tokens.muted) }
                         }
                         Text(token.directory ?? "Any folder").font(Type.monoBody)
-                        Text(token.permissions.map { ["library:read": "Browse files", "deliveries:create": "Create deliveries", "deliveries:read": "Read activity", "deliveries:revoke": "Revoke deliveries"][$0] ?? $0 }.joined(separator: ", ")).font(Type.caption)
+                        Text(token.permissions.map { ["library:read": "Browse files", "deliveries:create": "Create deliveries", "deliveries:read": "Read activity", "deliveries:revoke": "Revoke deliveries", "jobs:read": "Read project jobs and verification", "jobs:create": "Create and retry project jobs", "jobs:cancel": "Cancel project jobs"][$0] ?? $0 }.joined(separator: ", ")).font(Type.caption)
                         Text("Expires \(Date(timeIntervalSince1970: Double(token.expiresAt)).formatted())").font(Type.caption)
                         if let at = token.lastUsedAt {
                             Text("Last used \(Date(timeIntervalSince1970: Double(at)).formatted())").font(Type.caption)

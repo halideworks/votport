@@ -158,7 +158,7 @@ fn an_operator_runs_the_port_from_the_core() {
         None,
         None,
     );
-    let root = ffi::library(String::new()).unwrap();
+    let root = ffi::library(String::new(), None).unwrap();
     assert_eq!(root.directory, "");
     assert_eq!(
         root.files
@@ -267,7 +267,7 @@ fn an_operator_runs_the_port_from_the_core() {
             "dailies/slate.txt"
         ]
     );
-    let listed = ffi::library("dailies/shots".to_owned()).unwrap();
+    let listed = ffi::library("dailies/shots".to_owned(), None).unwrap();
     assert_eq!(
         listed
             .files

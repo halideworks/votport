@@ -279,6 +279,7 @@ async function refreshGrants(reset = true) {
 $('outbound-grants-load-more').addEventListener('click', () => refreshGrants(false));
 
 const MAX_LIBRARY_SELECTION = 100_000;
+const LIBRARY_PAGE_SIZE = 1000;
 const MAX_LIBRARY_PROJECT_SUGGESTIONS = 200;
 const selectedLibraryPaths = new Map();
 let deliverGrantBusy = false;
@@ -287,8 +288,14 @@ let libraryFiles = [];
 let libraryDirectories = [];
 let libraryDirectory = '';
 let libraryTruncated = false;
+let libraryAfter = null;
+let libraryNextCursor = null;
+const libraryPageHistory = [];
+let libraryLoading = false;
+let libraryError = '';
 let libraryRequestGeneration = 0;
 let librarySearchTimer;
+let libraryLastSuccessfulView;
 let libraryUploading = false;
 const libraryProjectSuggestions = new Set();
 const libraryFolderSelections = new Map();
@@ -372,6 +379,10 @@ async function browseLibrary(directory) {
   clearTimeout(librarySearchTimer);
   $('library-search').value = '';
   libraryDirectory = directory;
+  libraryAfter = null;
+  libraryNextCursor = null;
+  libraryPageHistory.length = 0;
+  libraryError = '';
   await refreshLibrary();
 }
 
@@ -547,8 +558,16 @@ function renderLibraryDirectory(directory, container) {
 
 function renderLibraryView() {
   renderLibraryBreadcrumbs();
+  renderLibraryPagination();
   const container = $('library-files');
   container.replaceChildren();
+  if (libraryError) {
+    const message = document.createElement('p');
+    message.className = 'error';
+    message.setAttribute('role', 'alert');
+    message.textContent = libraryError;
+    container.append(message);
+  }
   const query = $('library-search').value.trim();
   if (query) {
     for (const file of libraryFiles) renderLibraryFile(file, container, true);
@@ -570,7 +589,7 @@ function renderLibraryView() {
   if (libraryTruncated) {
     const note = document.createElement('p');
     note.className = 'muted';
-    note.textContent = 'Showing the first 1000 entries; refine with search.';
+    note.textContent = 'More entries are available on the next page.';
     container.append(note);
   }
   if (!libraryDirectories.length && !libraryFiles.length) {
@@ -582,9 +601,11 @@ function renderLibraryView() {
 }
 
 function renderLibrary(response) {
+  libraryError = '';
   libraryFiles = (response.files || []).filter((file) => parseLibraryPath(file.path));
   libraryDirectories = (response.directories || []).filter((path) => parseLibraryPath(path));
   libraryTruncated = Boolean(response.truncated);
+  libraryNextCursor = typeof response.next_cursor === 'string' ? response.next_cursor : null;
   if (!$('library-search').value.trim()) {
     retainLibraryProjectSuggestions(
       libraryProjectSuggestions,
@@ -595,37 +616,102 @@ function renderLibrary(response) {
     updateProjectSuggestions(libraryProjectSuggestions);
   }
   updateLibrarySelectionStatus();
+  libraryLastSuccessfulView = {
+    directory: libraryDirectory,
+    search: $('library-search').value,
+    files: libraryFiles,
+    directories: libraryDirectories,
+    truncated: libraryTruncated,
+    after: libraryAfter,
+    nextCursor: libraryNextCursor,
+    history: [...libraryPageHistory],
+  };
   const restoreFocus = $('library-files').contains(document.activeElement)
     || $('library-breadcrumbs').contains(document.activeElement);
   renderLibraryView();
   if (restoreFocus) $('library-breadcrumbs').querySelector('[aria-current=page]').focus();
 }
 
+function restoreLibraryView() {
+  if (!libraryLastSuccessfulView) return;
+  libraryDirectory = libraryLastSuccessfulView.directory;
+  $('library-search').value = libraryLastSuccessfulView.search;
+  libraryFiles = libraryLastSuccessfulView.files;
+  libraryDirectories = libraryLastSuccessfulView.directories;
+  libraryTruncated = libraryLastSuccessfulView.truncated;
+  libraryAfter = libraryLastSuccessfulView.after;
+  libraryNextCursor = libraryLastSuccessfulView.nextCursor;
+  libraryPageHistory.length = 0;
+  libraryPageHistory.push(...libraryLastSuccessfulView.history);
+}
+
+function renderLibraryPagination() {
+  const controls = $('library-pagination');
+  const searching = $('library-search').value.trim().length > 0;
+  const previous = $('library-pagination-previous');
+  const next = $('library-pagination-next');
+  controls.hidden = searching || (!libraryPageHistory.length && libraryNextCursor === null);
+  previous.hidden = libraryPageHistory.length === 0;
+  next.hidden = libraryNextCursor === null;
+  previous.disabled = libraryLoading;
+  next.disabled = libraryLoading;
+  $('library-pagination-status').textContent = controls.hidden ? '' : 'Browse another page';
+}
+
+async function previousLibraryPage() {
+  if (libraryLoading || !libraryPageHistory.length) return;
+  libraryAfter = libraryPageHistory.pop();
+  await refreshLibrary();
+}
+
+async function nextLibraryPage() {
+  if (libraryLoading || libraryNextCursor === null) return;
+  libraryPageHistory.push(libraryAfter);
+  libraryAfter = libraryNextCursor;
+  await refreshLibrary();
+}
+
 async function refreshLibrary() {
   const generation = ++libraryRequestGeneration;
+  libraryLoading = true;
+  renderLibraryPagination();
   const query = $('library-search').value.trim();
   const params = query
     ? `q=${encodeURIComponent(query)}`
-    : `directory=${encodeURIComponent(libraryDirectory)}`;
+    : new URLSearchParams({
+      directory: libraryDirectory,
+      limit: String(LIBRARY_PAGE_SIZE),
+      ...(libraryAfter ? { after: libraryAfter } : {}),
+    }).toString();
   try {
     const response = await api(`/api/admin/outbound-files?${params}`);
-    if (generation !== libraryRequestGeneration) return;
+    if (generation !== libraryRequestGeneration) return false;
     renderLibrary(response);
+    return true;
   } catch (error) {
-    if (generation !== libraryRequestGeneration) return;
-    const message = document.createElement('p');
-    message.className = 'error';
-    message.setAttribute('role', 'alert');
-    message.textContent = error.message;
+    if (generation !== libraryRequestGeneration) return false;
+    libraryError = error.message;
+    restoreLibraryView();
     const restoreFocus = $('library-files').contains(document.activeElement);
-    $('library-files').replaceChildren(message);
+    renderLibraryView();
     if (restoreFocus) $('library-breadcrumbs').querySelector('[aria-current=page]').focus();
+    return false;
+  } finally {
+    if (generation === libraryRequestGeneration) {
+      libraryLoading = false;
+      renderLibraryPagination();
+    }
   }
 }
 
 $('library-refresh').addEventListener('click', () => refreshLibrary());
+$('library-pagination-previous').addEventListener('click', () => previousLibraryPage());
+$('library-pagination-next').addEventListener('click', () => nextLibraryPage());
 $('library-search').addEventListener('input', () => {
   libraryRequestGeneration += 1;
+  libraryAfter = null;
+  libraryNextCursor = null;
+  libraryPageHistory.length = 0;
   clearTimeout(librarySearchTimer);
   librarySearchTimer = setTimeout(() => refreshLibrary(), 200);
 });

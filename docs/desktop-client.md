@@ -212,7 +212,10 @@ can be reopened and copied from the web Deliver page), revokes
 one, browses the library one directory at a time
 (`GET /api/admin/outbound-files?directory=`), and issues a delivery of
 library files (`POST /api/admin/outbound-grants` with `paths`), whose
-reply carries the link. Mutations send the `X-Votport` header and are
+reply carries the link. Directory listings accept `limit` from 1 to 1000
+and return `next_cursor` for the next page; pass it as `after` for the same
+directory. The CLI accepts `votport library [dir] --after <cursor>`.
+Mutations send the `X-Votport` header and are
 never retried, except an upload chunk, which is retried when the
 connection never opened, timed out before a reply, or met a 503, and is
 safe to repeat because the server answers a chunk it already holds with

@@ -26,6 +26,7 @@ use crate::transfer;
 
 const FILE: &str = "port.json";
 const MAX_UPLOAD_BACKWARD_RECOVERIES: u8 = 3;
+const LIBRARY_PAGE_SIZE: usize = 1000;
 
 /// What a failed operator call tells a shell: the headline for the person,
 /// the detail behind it, and whether the session ended (so the operator
@@ -600,19 +601,28 @@ pub struct Library {
     /// The listing stopped at the server's cap.
     #[serde(default)]
     pub truncated: bool,
+    /// Cursor for the next page in this directory, when more entries remain.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
-/// Lists one directory of the library (`""` for the root).
+/// Lists one page of a library directory (`""` for the root).
 ///
 /// # Errors
 /// [`Error::NotSignedIn`], a refused directory, or a network failure.
-pub fn library(directory: &str) -> Result<Library> {
+pub fn library(directory: &str, after: Option<&str>) -> Result<Library> {
     run(|client, cookie| {
         let query = url_query(directory.trim_matches('/'));
-        let mut listing: Library = client.admin_get(
-            &format!("/api/admin/outbound-files?directory={query}"),
-            cookie,
-        )?;
+        let after = after.map(url_query);
+        let path = match after {
+            Some(after) => format!(
+                "/api/admin/outbound-files?directory={query}&limit={LIBRARY_PAGE_SIZE}&after={after}"
+            ),
+            None => format!(
+                "/api/admin/outbound-files?directory={query}&limit={LIBRARY_PAGE_SIZE}"
+            ),
+        };
+        let mut listing: Library = client.admin_get(&path, cookie)?;
         for file in &mut listing.files {
             file.size = crate::error::human_bytes(file.bytes);
         }
