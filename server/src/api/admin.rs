@@ -9426,6 +9426,7 @@ mod notification_and_limit_tests {
 
     use axum::body::Body;
     use axum::http::Request;
+    use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
 
     use crate::api::testing;
@@ -9486,6 +9487,37 @@ mod notification_and_limit_tests {
             .iter()
             .any(|link| link.max_bytes == Some(123)));
         assert_eq!(application.store.links("").unwrap()[0].max_bytes, None);
+    }
+
+    #[tokio::test]
+    async fn create_link_expiry_uses_requested_days() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = admin_cookie(&application);
+        let before = crate::store::now_unix();
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::post("/api/admin/links")
+                    .header("cookie", cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"label":"expiring","expires_days":7}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let after = crate::store::now_unix();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["link"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let link = application.store.upload_link(&id).unwrap().unwrap();
+        assert!((before..=after).contains(&link.created_at));
+        assert!((before + 7 * 86_400..=after + 7 * 86_400).contains(&link.expires_at.unwrap()));
     }
 
     #[tokio::test]

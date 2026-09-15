@@ -1595,6 +1595,114 @@ mod push_preflight_tests {
     }
 
     #[tokio::test]
+    async fn expired_receive_links_close_metadata_and_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = push_app(directory.path());
+        let now = crate::store::now_unix();
+        let mut expired = open_link("expired");
+        expired.expires_at = Some(now.saturating_sub(3600));
+        application.store.insert_link(expired).unwrap();
+        let mut future = open_link("future");
+        future.expires_at = Some(now + 3600);
+        application.store.insert_link(future).unwrap();
+        let router = app::router(application.clone());
+
+        let info = router
+            .clone()
+            .oneshot(Request::get("/api/r/expired").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(info.status(), StatusCode::OK);
+        let info = response_json(info).await;
+        assert_eq!(info["usable"], false);
+        assert!(info["label"].is_null());
+
+        let peer = ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1234)));
+        let verify = router
+            .clone()
+            .oneshot(
+                Request::post("/api/r/expired/verify")
+                    .header("content-type", "application/json")
+                    .extension(peer)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(verify.status(), StatusCode::GONE);
+
+        let session = router
+            .clone()
+            .oneshot(
+                Request::post("/api/r/expired/session")
+                    .header("content-type", "application/json")
+                    .extension(peer)
+                    .body(Body::from(
+                        json!({
+                            "package": {
+                                "suite": "blake3",
+                                "root": hex::encode([7_u8; 32]),
+                                "length": 1
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.status(), StatusCode::GONE);
+
+        let holder = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        assert_eq!(
+            post_push(application.clone(), "expired", request_body(&holder, 1))
+                .await
+                .status(),
+            StatusCode::GONE
+        );
+
+        let info = router
+            .clone()
+            .oneshot(Request::get("/api/r/future").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(info.status(), StatusCode::OK);
+        let info = response_json(info).await;
+        assert_eq!(info["usable"], true);
+        assert_eq!(info["label"], "open");
+
+        let session = router
+            .clone()
+            .oneshot(
+                Request::post("/api/r/future/session")
+                    .header("content-type", "application/json")
+                    .extension(peer)
+                    .body(Body::from(
+                        json!({
+                            "package": {
+                                "suite": "blake3",
+                                "root": hex::encode([8_u8; 32]),
+                                "length": 1
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.status(), StatusCode::OK);
+
+        assert_eq!(
+            post_push(application.clone(), "future", request_body(&holder, 1))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        app::suspend_sessions(&application).await;
+    }
+
+    #[tokio::test]
     async fn protected_link_password_failure_is_audited() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
