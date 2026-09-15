@@ -2750,6 +2750,7 @@ dependencies = [
  "ed25519-dalek",
  "fs4",
  "hex",
+ "percent-encoding",
  "rand 0.8.8",
  "reqwest",
  "rustix",
