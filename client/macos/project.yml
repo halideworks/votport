@@ -33,6 +33,7 @@ targets:
         CFBundleDisplayName: votport
         LSMinimumSystemVersion: "14.0"
         NSHighResolutionCapable: true
+        NSLocalNetworkUsageDescription: votport uses your local network to send and receive files from nearby ports.
         ATSApplicationFontsPath: fonts
         # The web pages' "Open in the votport app" links.
         CFBundleURLTypes:

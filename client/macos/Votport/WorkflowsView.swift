@@ -130,7 +130,9 @@ struct WorkflowsView: View {
                 busy = false
                 switch result {
                 case .success(let value): then(value)
-                case .failure(let error): problem = String(describing: error)
+                case .failure(let error):
+                    if let error = error as? PortError, case let .Failed(headline, _, _) = error { problem = headline }
+                    else { problem = "Could not complete the workflow request." }
                 }
             }
         }.start()

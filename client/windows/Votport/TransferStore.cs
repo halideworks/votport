@@ -469,18 +469,7 @@ public static class Launch
     /// shape. The base is the page's own origin, so the app talks to the
     /// votport the link came from and nowhere else.
     public static (string kind, string link)? WebLink(Uri url)
-    {
-        if (url.Scheme != "votport") return null;
-        var kind = url.Host;
-        if (kind != "r" && kind != "s") return null;
-        var token = url.AbsolutePath.Trim('/');
-        if (token.Length == 0 || token.Contains('/')) return null;
-        var query = System.Web.HttpUtility.ParseQueryString(url.Query);
-        var origin = query["base"];
-        if (origin is null || !Uri.TryCreate(origin, UriKind.Absolute, out var parsed)) return null;
-        if (parsed.Scheme != "https" && parsed.Scheme != "http") return null;
-        return (kind, $"{origin.TrimEnd('/')}/{kind}/{token}");
-    }
+        => WebLinkParser.Parse(url);
 }
 
 /// Words and units around the core's numbers. Every value comes from the

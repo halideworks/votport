@@ -10,5 +10,6 @@
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.7.250606001" ExcludeAssets="build;buildTransitive" />
     <Compile Include="..\Votport\ActivationRequest.cs" Link="ActivationRequest.cs" />
     <Compile Include="..\Votport\Protocol.cs" Link="Protocol.cs" />
+    <Compile Include="..\Votport\WebLink.cs" Link="WebLink.cs" />
   </ItemGroup>
 </Project>

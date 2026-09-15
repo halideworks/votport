@@ -63,6 +63,18 @@ try
 }
 finally { Native.LocalFree(buffer); }
 Check(Cli(Protocol.Command(@"C:\Votport.exe").Replace("%1", "votport://s/token\" --snapshot C:\\target.png --receive https://evil/s/token C:\\files")) == empty, "Embedded quotes cannot enable CLI options through protocol fallback");
+
+static Uri WebLink(string kind, string token, string baseAddress) =>
+    new($"votport://{kind}/{token}?base={Uri.EscapeDataString(baseAddress)}");
+
+Check(WebLinkParser.Parse(WebLink("r", "0123456789abcdef0123456789abcdef", "https://port"))
+    == ("r", "https://port/r/0123456789abcdef0123456789abcdef"), "Valid request links preserve their origin");
+Check(WebLinkParser.Parse(WebLink("s", "0123456789abcdef0123456789abcdef", "http://port/"))
+    == ("s", "http://port/s/0123456789abcdef0123456789abcdef"), "Valid delivery links preserve their kind");
+foreach (var origin in new[] { "https://port/path", "https://port/?query=1", "https://user:pass@port", "https://port/#fragment" })
+    Check(WebLinkParser.Parse(WebLink("r", "0123456789abcdef0123456789abcdef", origin)) is null, "Link origins accept only a bare HTTP origin");
+foreach (var token in new[] { "token%2F..%2F", "token%5C..%5C", "/token", "token/", "token//" })
+    Check(WebLinkParser.Parse(WebLink("r", token, "https://port")) is null, "Encoded token separators are refused");
 Console.WriteLine("Windows activation classification, quoting, repeated launches and snapshot isolation checks passed.");
 
 class LaunchPayload(string arguments) : ILaunchActivatedEventArgs

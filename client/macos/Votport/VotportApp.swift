@@ -204,13 +204,18 @@ enum Launch {
     /// `votport://s/<token>?base=<origin>` URL names, or nil for any other
     /// shape: an http or https base with a host, and a one-component token.
     static func webLink(from url: URL) -> String? {
-        guard url.scheme == "votport", let kind = url.host, kind == "r" || kind == "s",
-            url.pathComponents.count == 2, let token = url.pathComponents.last, !token.isEmpty,
-            let base = URLComponents(url: url, resolvingAgainstBaseURL: false)?
-                .queryItems?.first(where: { $0.name == "base" })?.value,
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+            components.scheme == "votport", let kind = components.host, kind == "r" || kind == "s",
+            components.percentEncodedPath.hasPrefix("/")
+        else { return nil }
+        let token = String(components.percentEncodedPath.dropFirst())
+        guard !token.isEmpty, let decodedToken = token.removingPercentEncoding,
+            !decodedToken.contains("/"), !decodedToken.contains("\\"),
+            let base = components.queryItems?.first(where: { $0.name == "base" })?.value,
             let origin = URL(string: base), let scheme = origin.scheme,
             scheme == "https" || scheme == "http", origin.host != nil,
-            origin.path.isEmpty || origin.path == "/", origin.query == nil, origin.user == nil
+            origin.path.isEmpty || origin.path == "/", origin.query == nil,
+            origin.fragment == nil, origin.user == nil, origin.password == nil
         else { return nil }
         let trimmed = base.hasSuffix("/") ? String(base.dropLast()) : base
         return "\(trimmed)/\(kind)/\(token)"
