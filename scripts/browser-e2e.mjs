@@ -236,7 +236,6 @@ await page.route(mastheadSearchRoute, (route) => searchUnavailable
     ],
     files: [{ link_id: createdLinkId, path: "search.txt", bytes: 42, link_label: "browser search request", completed_at: searchNow }],
     downloads: [{ id: "search-grant", label: "browser search download", name: "search.txt", revoked: false, created_at: searchNow }],
-    audit: [{ event: "created", subject: "search request", actor: "operator", at: searchNow }],
   } }));
 const searchInput = page.locator("#global-search-input");
 const searchResults = page.locator("#global-search-results");
@@ -259,6 +258,11 @@ await page.waitForFunction(() => document.getElementById("global-search-status")
 if (await options.count() !== 5 || await searchResults.locator('[role="option"][aria-selected="false"]').count() !== 5
   || await options.evaluateAll((rows) => rows.some((row) => row.tabIndex !== -1))) {
   throw new Error("masthead search must expose every result as an unselected option");
+}
+const auditOption = options.filter({ hasText: "Search audit log" });
+if (await auditOption.count() !== 1
+  || !(await auditOption.getAttribute("href")).includes("/audit?q=ac")) {
+  throw new Error("entitled masthead search must link the phrase to the audit page");
 }
 await searchInput.focus();
 await searchInput.press("Tab");

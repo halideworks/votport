@@ -183,10 +183,10 @@ function mountSearch(session) {
       }));
     }
     if (pages.includes('audit')) {
-      group('Audit', hit.audit, (row) => ({
+      group('Audit', [phrase], () => ({
         href: `/audit?q=${encodeURIComponent(phrase)}`,
-        primary: `${row.event} · ${row.subject}`,
-        secondary: `${row.actor || 'system'} · ${formatWhen(row.at)}`,
+        primary: 'Search audit log',
+        secondary: `for "${phrase}"`,
       }));
     }
     if (!results.firstChild) {

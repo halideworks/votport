@@ -5588,11 +5588,11 @@ async fn status_is_scoped_to_the_operators_tenant() {
     assert_eq!(outside["receiving"].as_array().unwrap().len(), 0);
 }
 
-/// The masthead search finds a request by label, a received file by path, a
-/// download by file name, and an audit row by subject, five of each, in the
-/// operator's tenant only; LIKE wildcards in the phrase are literal.
+/// The masthead search finds a request by label, a received file by path, and
+/// a download by file name, five of each, in the operator's tenant only. LIKE
+/// wildcards in the phrase are literal.
 #[tokio::test]
-async fn search_finds_requests_files_downloads_and_audit_rows() {
+async fn search_finds_requests_files_and_downloads() {
     let server = start_server().await;
     let base = server.base.clone();
     let client = reqwest::Client::builder()
@@ -5677,16 +5677,9 @@ async fn search_finds_requests_files_downloads_and_audit_rows() {
     assert_eq!(hit["downloads"][0]["label"], json!("Press kit"));
     assert!(grant["url"].as_str().is_some());
 
-    // The link id is an audit subject.
+    // Audit search is an explicit link on the audit page.
     let hit = search(&token[..12]).await;
-    assert!(
-        hit["audit"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|row| row["subject"] == json!(token)),
-        "{hit:?}"
-    );
+    assert!(hit.get("audit").is_none(), "{hit:?}");
     assert_eq!(hit["requests"][0]["id"], json!(token));
 
     // A wildcard in the phrase matches literally, not everything.
