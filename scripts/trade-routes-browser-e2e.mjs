@@ -155,6 +155,17 @@ try {
   assert.ok(await page.locator('#trade-accept-details').isHidden());
   await page.fill('#trade-invitation', 'https://not-an-invitation.example'); await page.click('#trade-inspect');
   await page.locator('#trade-error').getByText(/Paste the complete route invitation/).waitFor();
+  for (const wrongShape of ['{}', 'null', '[]']) {
+    await page.fill('#trade-invitation', wrongShape); await page.click('#trade-inspect');
+    await page.locator('#trade-error').getByText(/Paste the complete route invitation/).waitFor();
+    assert.ok(await page.locator('#trade-accept-details').isHidden());
+    assert.ok(await page.locator('#trade-accept').isDisabled());
+  }
+  await page.route('**/api/trade-routes/inspect', (route) => route.fulfill({ status: 500, json: { error: 'Inspection unavailable fixture' } }), { times: 1 });
+  await page.fill('#trade-invitation', invitation); await page.click('#trade-inspect');
+  await page.locator('#trade-error').getByText('Inspection unavailable fixture', { exact: true }).waitFor();
+  assert.ok(await page.locator('#trade-accept-details').isHidden());
+  assert.ok(await page.locator('#trade-accept').isDisabled());
   let releasePreview, previewStarted;
   const heldPreview = new Promise((resolve) => { releasePreview = resolve; });
   const startedPreview = new Promise((resolve) => { previewStarted = resolve; });

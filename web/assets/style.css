@@ -1970,9 +1970,20 @@ details.deployment .settings-status {
 #audit-log {
  font-size: 0.74rem;
 }
+.audit-field {
+ min-width: 0;
+ overflow-wrap: anywhere;
+}
+.audit-field-label {
+ color: var(--text-soft);
+ font-size: 0.66rem;
+ letter-spacing: 0.04em;
+ text-transform: uppercase;
+ margin-right: 0.3rem;
+}
 .audit-row {
  display: grid;
- grid-template-columns: 10.5rem 6rem minmax(9rem, auto) minmax(0, 1fr) auto;
+ grid-template-columns: 10.5rem 6rem minmax(9rem, auto) repeat(2, minmax(0, 1fr));
  gap: 0.2rem 0.9rem;
  align-items: baseline;
  padding: 0.5rem 0;
@@ -1984,14 +1995,12 @@ details.deployment .settings-status {
 .audit-event {
  color: var(--text);
  font-weight: 600;
+ overflow-wrap: anywhere;
 }
 .audit-subject {
  color: var(--text-soft);
  min-width: 0;
  overflow-wrap: anywhere;
-}
-.audit-actor:not(:empty)::before {
- content: "by ";
 }
 .audit-detail {
  grid-column: 1 / -1;
@@ -2004,12 +2013,12 @@ details.deployment .settings-status {
 }
 @media (max-width: 720px) {
  .audit-row {
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
  }
- .audit-when {
+ .audit-when-field {
   grid-column: 1 / -1;
  }
- .audit-subject {
+ .audit-subject-field {
   grid-column: 1 / -1;
  }
 }

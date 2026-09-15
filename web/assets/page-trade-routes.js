@@ -5,6 +5,7 @@ import { notificationEditor, tradeEvents } from '/assets/notifications.js';
 const $ = (id) => document.getElementById(id);
 const session = await requireSession(), admin = session.role === 'admin';
 let catalog, preview = null, previewRevision = 0, refreshTicket = 0, setup = null;
+const INVITATION_GUIDANCE = 'Paste the complete route invitation from the receiving team. A port address or connection ID cannot be used here.';
 const returnRequest = new URLSearchParams(window.location.search).get('receive');
 function node(tag, text = '', className = '') { const el = document.createElement(tag); el.textContent = text; el.className = className; return el; }
 async function guard(action) { $('trade-error').hidden = true; try { await action(); } catch (error) { $('trade-error').textContent = error.message; $('trade-error').hidden = false; $('trade-error').focus(); } }
@@ -261,7 +262,7 @@ $('trade-invitation').addEventListener('input', clearPreview);
 $('trade-inspect').onclick = () => guard(async () => {
   clearPreview();
   let invitation;
-  try { invitation = JSON.parse($('trade-invitation').value); } catch { throw new Error('Paste the complete route invitation from the receiving team. A port address or connection ID cannot be used here.'); }
+  try { invitation = JSON.parse($('trade-invitation').value); } catch { throw new Error(INVITATION_GUIDANCE); }
   const ticket = previewRevision;
   $('trade-inspect').disabled = true; $('trade-inspect').textContent = 'Checking destination…';
   try {
@@ -272,7 +273,11 @@ $('trade-inspect').onclick = () => guard(async () => {
     $('trade-accept-details').hidden = $('trade-accept-details').disabled = false; $('trade-accept').disabled = false;
     if (!$('trade-name').value) $('trade-name').value = endpoint.name;
     $('trade-review-title').focus();
-  } catch (error) { if (ticket === previewRevision) throw error; }
+  } catch (error) {
+    if (ticket !== previewRevision) return;
+    if (error.status === 422) throw new Error(INVITATION_GUIDANCE);
+    throw error;
+  }
   finally { $('trade-inspect').disabled = false; $('trade-inspect').textContent = 'Preview invitation'; }
 });
 $('trade-discover').onclick = () => guard(async () => { const result = await api('/api/trade-routes/inspect', { method: 'POST', body: JSON.stringify({ address: $('trade-discovery-address').value }) }); $('trade-discovery-result').textContent = `${result.document.body.name} · ${result.document.issuer}`; });

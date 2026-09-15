@@ -8,6 +8,7 @@ import {
   BATCH_LARGE_FILE_BYTES,
   dedupeFilenames,
   FILE_RENDER_BATCH_SIZE,
+  METADATA_PAGE_SIZE,
   metadataMoreAvailable,
   publicMetadataPageUrl,
   runWorkerPool,
@@ -36,19 +37,54 @@ function individualSave(directory, file, name) {
 test('VOTPort imposes no anchor fallback file-count cap; Chromium batches permission after 10', () => {
   assert.doesNotMatch(outboundScript, /MAX_ANCHOR_DOWNLOADS|anchorDownloadsAllowed/);
   assert.match(outboundScript, /prepareAnchorDownloads\(\)[\s\S]+loadRemainingMetadata\(\)/);
-  assert.match(outboundScript, /startAnchorDownloads\(\)[\s\S]+triggerSeparateDownloads\(pending\.files, pending\.names\)/);
-  assert.match(outboundScript, /const link = document\.createElement\('a'\);[\s\S]+await new Promise\(\(resolve\) => setTimeout\(resolve, 100\)\)/);
+  assert.match(outboundScript, /triggerSeparateDownloads\(\s*pending\.files,\s*pending\.names,/);
+  assert.match(outboundScript, /const link = document\.createElement\('a'\);[\s\S]+await new Promise\(\(resolve\) => setTimeout\(resolve, 0\)\)/);
+  assert.match(outboundScript, /separate-download-stop/);
+  assert.match(sendPage, />Stop requesting remaining files<\/button>/);
   assert.doesNotMatch(outboundScript, /cannot request more than|Chrome\/Edge/);
 });
 
 test('anchor fallback copy explains multiple downloads', () => {
-  assert.match(outboundScript, /Requested \$\{pending\.files\.length\} downloads/);
+  assert.match(outboundScript, /Requested \$\{result\.requested\} of \$\{pending\.files\.length\} downloads/);
   assert.match(outboundScript, /Your browser may ask you to allow multiple downloads; accept that prompt to receive every file\./);
+  assert.match(outboundScript, /Keep this tab open until requests are handed off/);
   assert.doesNotMatch(outboundScript, /Safari may ask|If Safari asks/);
   assert.match(sendPage, /id="separate-download-confirm" class="modal"/);
   assert.match(sendPage, /id="separate-download-confirm-detail"/);
   assert.match(sendPage, /aria-describedby="separate-download-confirm-detail"/);
   assert.match(sendPage, />Start downloads<\/button>/);
+});
+
+test('anchor requests stop before the next click and report each handoff', async () => {
+  const triggerSource = outboundScript.slice(
+    outboundScript.indexOf('async function triggerSeparateDownloads('),
+    outboundScript.indexOf('\n\nlet separateDownloadBusy', outboundScript.indexOf('async function triggerSeparateDownloads(')),
+  );
+  let clicks = 0;
+  const delays = [];
+  const trigger = runInNewContext(`${triggerSource}\ntriggerSeparateDownloads`, {
+    document: {
+      body: { append() {} },
+      createElement() { return { click() { clicks += 1; }, remove() {} }; },
+    },
+    setTimeout(callback, delay) { delays.push(delay); callback(); },
+  });
+  const stop = { stopped: false };
+  const progress = [];
+  const result = await trigger(
+    [{ download_url: '/f/0' }, { download_url: '/f/1' }, { download_url: '/f/2' }],
+    ['one', 'two', 'three'],
+    stop,
+    (requested, total) => {
+      progress.push([requested, total]);
+      if (requested === 2) stop.stopped = true;
+    },
+  );
+  assert.equal(clicks, 2);
+  assert.deepEqual(progress, [[1, 3], [2, 3]]);
+  assert.deepEqual(delays, [0, 0]);
+  assert.equal(result.requested, 2);
+  assert.equal(result.stopped, true);
 });
 
 test('recipient page has one primary action with ZIP as a secondary link', () => {
@@ -76,6 +112,7 @@ test('file batches are fixed and bounded at both ends', () => {
   assert.deepEqual(nextFileBatch(files, 100), files.slice(100, 200));
   assert.deepEqual(nextFileBatch(files, 200), files.slice(200));
   assert.deepEqual(nextFileBatch(files, 300), []);
+  assert.deepEqual(nextFileBatch(files, 100, 500), files.slice(100));
 });
 
 test('uses batch transport for multi-file selections with a large file', () => {
@@ -160,12 +197,13 @@ test('metadata accepts absent receipts while validating receipt URLs when presen
 });
 
 test('public metadata starts with the bounded page and picker precedes fetch', () => {
-  assert.equal(publicMetadataPageUrl('a/b', 0), '/api/s/a%2Fb?offset=0&limit=100');
+  assert.equal(METADATA_PAGE_SIZE, 500);
+  assert.equal(publicMetadataPageUrl('a/b', 0), '/api/s/a%2Fb?offset=0&limit=500');
   assert.match(outboundScript, /publicMetadataPageUrl\(token, offset, limit\)/);
-  assert.match(outboundScript, /appendMetadataPageAt\(metadataFiles\.length\)/);
+  assert.match(outboundScript, /appendMetadataPageAt\(metadataFiles\.length, METADATA_PAGE_SIZE\)/);
   assert.match(outboundScript, /metadataMoreAvailable\(renderedFileCount, metadataFiles\.length, metadataHasMore\)/);
-  assert.match(outboundScript, /renderedFileCount >= metadataFiles\.length && metadataHasMore/);
-  assert.match(outboundScript, /appendMetadataPageAt\(metadataFiles\.length, 500\)/);
+  assert.match(outboundScript, /const target = renderedFileCount \+ METADATA_PAGE_SIZE/);
+  assert.match(outboundScript, /renderNextFileBatch\(METADATA_PAGE_SIZE\)/);
   assert.match(outboundScript, /batchUrl = body\.batch_url/);
   assert.match(
     outboundScript,
@@ -177,7 +215,7 @@ test('public page wires an accessible bounded file list', () => {
   assert.match(sendPage, /id="file-list-controls" hidden/);
   assert.match(sendPage, /<button type="button" id="show-more-files" class="tiny ghost">Show more files<\/button>/);
   assert.match(sendPage, /id="file-list-status" class="muted" aria-live="polite"/);
-  assert.match(outboundScript, /nextFileBatch\(metadataFiles, renderedFileCount\)/);
+  assert.match(outboundScript, /nextFileBatch\(metadataFiles, renderedFileCount, limit\)/);
 });
 
 test('sanitizes flattened unsafe and reserved filenames', () => {

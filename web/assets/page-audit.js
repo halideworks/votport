@@ -7,6 +7,76 @@ const $ = (id) => document.getElementById(id);
 const PAGE_SIZE = 250;
 const MAX_RENDERED_ROWS = 1000;
 const INITIAL_CURSOR = '18446744073709551615';
+// Audit rows have no shared server catalog. Seed stable production names, then
+// merge names from retained rows so unknown historic names remain selectable.
+const KNOWN_AUDIT_EVENTS = [
+  'admin_login',
+  'admin_login_failed',
+  'admin_password_changed',
+  'automation_refused',
+  'automation_token_created',
+  'automation_token_revoked',
+  'backup_created',
+  'backup_restore_pending',
+  'backups_configured',
+  'branding_deleted',
+  'branding_logo_deleted',
+  'branding_logo_updated',
+  'branding_updated',
+  'delivery_webhook_replayed',
+  'job_notifications_changed',
+  'link_active_changed',
+  'link_created',
+  'link_deleted',
+  'link_legal_hold_changed',
+  'link_notifications_changed',
+  'link_password_failed',
+  'link_unlocked',
+  'notification_defaults_changed',
+  'notification_destination_changed',
+  'notification_destination_deleted',
+  'outbound_downloaded',
+  'outbound_fetch_minted',
+  'outbound_file_deleted',
+  'outbound_file_uploaded',
+  'outbound_grant_created',
+  'outbound_grant_extended',
+  'outbound_grant_revoked',
+  'outbound_grant_token_rotated',
+  'outbound_integrity_failure',
+  'outbound_notifications_changed',
+  'principal_provisioned',
+  'principal_revoked',
+  'principal_unblocked',
+  'push_admitted',
+  'push_connected',
+  'receive_workflow_changed',
+  'received_file_deleted',
+  'replica_pulled',
+  'retention_clock_held',
+  'scim_group_created',
+  'scim_group_deleted',
+  'scim_group_patched',
+  'scim_group_replaced',
+  'serve_admitted',
+  'serve_completed',
+  'session_rejected',
+  'settings_updated',
+  'sso_failed',
+  'sso_login',
+  'tenant_created',
+  'tenant_deleted',
+  'tenant_switched',
+  'tenant_updated',
+  'trade_endpoint_created',
+  'trade_invitation_created',
+  'trade_route_accepted',
+  'upload_completed',
+  'upload_record_cleared',
+  'upload_session_created',
+  'upload_session_ended',
+  'uploads_expired',
+];
 let beforeRowid = INITIAL_CURSOR;
 // Oldest first walks forward with the server's (at, rowid) keyset cursor:
 // since is the last row's second and after_rowid its rowid. Newest first
@@ -42,9 +112,10 @@ function updateExport() {
 }
 
 function updateEvents() {
-  const events = new Set(
-    [...$('audit-log').querySelectorAll('.audit-event')].map((event) => event.textContent),
-  );
+  const events = new Set(KNOWN_AUDIT_EVENTS);
+  for (const event of [...$('audit-log').querySelectorAll('.audit-event')].map((event) => event.textContent)) {
+    events.add(event);
+  }
   $('audit-event-options').replaceChildren(
     ...[...events].sort().map((event) => {
       const option = document.createElement('option');
@@ -54,29 +125,28 @@ function updateEvents() {
   );
 }
 
+function renderField(tag, className, label, text) {
+  const field = document.createElement('span');
+  field.className = `audit-field ${className.split(' ', 1)[0]}-field`;
+  const caption = document.createElement('span');
+  caption.className = 'audit-field-label';
+  caption.textContent = `${label}:`;
+  const value = document.createElement(tag);
+  value.className = className;
+  value.textContent = text;
+  field.append(caption, value);
+  return field;
+}
+
 function renderRow(row) {
   const line = document.createElement('div');
   line.className = 'audit-row';
 
-  const when = document.createElement('span');
-  when.className = 'audit-when muted';
-  when.textContent = formatWhen(row.at);
-
-  const tenant = document.createElement('span');
-  tenant.className = 'audit-tenant muted';
-  tenant.textContent = row.tenant || 'default';
-
-  const event = document.createElement('strong');
-  event.className = 'audit-event';
-  event.textContent = row.event;
-
-  const subject = document.createElement('span');
-  subject.className = 'audit-subject';
-  subject.textContent = row.subject || '';
-
-  const actor = document.createElement('span');
-  actor.className = 'audit-actor muted';
-  actor.textContent = row.actor || '';
+  const when = renderField('span', 'audit-when muted', 'Time', formatWhen(row.at));
+  const tenant = renderField('span', 'audit-tenant muted', 'Tenant', row.tenant || 'default');
+  const event = renderField('strong', 'audit-event', 'Event', row.event || 'unknown');
+  const subject = renderField('span', 'audit-subject', 'Subject', row.subject || 'None');
+  const actor = renderField('span', 'audit-actor muted', 'Actor', row.actor || 'None');
 
   line.append(when, tenant, event, subject, actor);
   const keys = Object.keys(row.detail ?? {});
@@ -116,7 +186,7 @@ async function load(reset = false) {
     loadedRows = 0;
     if ($('audit-log').contains(document.activeElement)) $('audit-range').focus();
     $('audit-log').replaceChildren();
-    $('audit-event-options').replaceChildren();
+    updateEvents();
   }
   // The endpoint streams JSONL; an empty log is an empty body, so parse as
   // text rather than JSON.

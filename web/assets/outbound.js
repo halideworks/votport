@@ -10,6 +10,7 @@ import {
   createDownloadFile,
   dedupeFilenames,
   FILE_RENDER_BATCH_SIZE,
+  METADATA_PAGE_SIZE,
   metadataMoreAvailable,
   nextFileBatch,
   publicMetadataPageUrl,
@@ -30,6 +31,7 @@ let metadataHasMore = false;
 let metadataLoading = false;
 let batchUrl = null;
 let anchorDownloadPreflight = null;
+let anchorDownloadStop = null;
 let totalBytes = 0;
 // Manifest rows by file index, so a finished download can mark its row.
 const rows = new Map();
@@ -37,6 +39,9 @@ const rows = new Map();
 // (rows past the first page appear only after Show more).
 const saved = new Set();
 const savedNames = new Map();
+const pendingSavedRows = new Set();
+let savedFeedbackFrame = null;
+let separateDownloadStatus = '';
 
 function manifestStatus() {
   $('manifest-status').textContent = saved.size
@@ -44,8 +49,48 @@ function manifestStatus() {
     : `${metadataTotal} file${metadataTotal === 1 ? '' : 's'}, each verified by the server before it is sent`;
 }
 
+function setSeparateDownloadStatus(text, defer = false) {
+  separateDownloadStatus = text;
+  if (defer) {
+    scheduleSavedFeedback();
+    return;
+  }
+  $('separate-download-status').textContent = text;
+}
+
+function applySavedFeedback() {
+  manifestStatus();
+  for (const index of pendingSavedRows) {
+    const row = rows.get(index);
+    if (row && saved.has(index)) landedBadge(row);
+  }
+  pendingSavedRows.clear();
+  $('separate-download-status').textContent = separateDownloadStatus;
+}
+
+function cancelSavedFeedback() {
+  if (savedFeedbackFrame !== null) window.cancelAnimationFrame(savedFeedbackFrame);
+  savedFeedbackFrame = null;
+  pendingSavedRows.clear();
+}
+
+function flushSavedFeedback() {
+  if (savedFeedbackFrame !== null) window.cancelAnimationFrame(savedFeedbackFrame);
+  savedFeedbackFrame = null;
+  applySavedFeedback();
+}
+
+function scheduleSavedFeedback() {
+  if (savedFeedbackFrame !== null) return;
+  savedFeedbackFrame = window.requestAnimationFrame(() => {
+    savedFeedbackFrame = null;
+    applySavedFeedback();
+  });
+}
+
 // Saving and the optional signed verification of saved files have separate status.
 function landedBadge(row) {
+  if (row.classList.contains('saved')) return;
   row.classList.add('saved');
   const badge = document.createElement('span');
   badge.className = 'badge on';
@@ -57,9 +102,8 @@ function markSaved(index, name) {
   savedNames.set(index, name);
   if (saved.has(index)) return;
   saved.add(index);
-  manifestStatus();
-  const row = rows.get(index);
-  if (row) landedBadge(row);
+  pendingSavedRows.add(index);
+  scheduleSavedFeedback();
 }
 
 function availability(body) {
@@ -102,8 +146,8 @@ function downloadButton(text, url, classes, name) {
   return button;
 }
 
-function renderNextFileBatch() {
-  const batch = nextFileBatch(metadataFiles, renderedFileCount);
+function renderNextFileBatch(limit = FILE_RENDER_BATCH_SIZE) {
+  const batch = nextFileBatch(metadataFiles, renderedFileCount, limit);
   for (const [offset, file] of batch.entries()) {
     const extras = [
       downloadButton('Download file', file.download_url, 'tiny', file.name),
@@ -185,8 +229,10 @@ async function saveFile(directory, file, name) {
   }
 }
 
-async function triggerSeparateDownloads(files, names) {
+async function triggerSeparateDownloads(files, names, stop, onProgress) {
+  let requested = 0;
   for (const [index, file] of files.entries()) {
+    if (stop.stopped) break;
     const link = document.createElement('a');
     link.href = file.download_url;
     link.download = names[index];
@@ -194,9 +240,12 @@ async function triggerSeparateDownloads(files, names) {
     document.body.append(link);
     link.click();
     link.remove();
+    requested += 1;
+    onProgress(requested, files.length);
     // WebKit drops later downloads unless each anchor yields to the event loop.
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await new Promise((resolve) => setTimeout(resolve, 0));
   }
+  return { requested, stopped: stop.stopped };
 }
 
 let separateDownloadBusy = false;
@@ -205,19 +254,23 @@ async function prepareAnchorDownloads() {
   if (separateDownloadBusy) return;
   separateDownloadBusy = true;
   const button = $('separate-download-button');
-  const status = $('separate-download-status');
   button.disabled = true;
   try {
+    if (metadataHasMore) {
+      setSeparateDownloadStatus(`Loading file metadata: ${metadataFiles.length} of ${metadataTotal}`);
+    }
     const files = metadataHasMore ? await loadRemainingMetadata() : metadataFiles;
     anchorDownloadPreflight = { files, names: dedupeFilenames(files.map((file) => file.name)) };
+    setSeparateDownloadStatus(`Ready to request ${files.length} of ${metadataTotal} downloads.`);
     $('separate-download-confirm-detail').textContent =
       `This will download ${files.length} payload files individually to your browser's configured download location. ` +
-      'No ZIP or receipt files are included. Your browser may ask you to allow multiple downloads; accept that prompt to receive every file.';
+      'No ZIP or receipt files are included. Your browser may ask you to allow multiple downloads; accept that prompt to receive every file. ' +
+      'Keep this tab open until requests are handed off, then check browser downloads for blocked or failed files.';
     const dialog = $('separate-download-confirm');
     dialog.returnValue = 'cancel';
     dialog.showModal();
   } catch (error) {
-    status.textContent = `Could not prepare downloads: ${error.message}`;
+    setSeparateDownloadStatus(`Could not prepare downloads: ${error.message}`);
   } finally {
     separateDownloadBusy = false;
     button.disabled = false;
@@ -230,20 +283,33 @@ async function startAnchorDownloads() {
   anchorDownloadPreflight = null;
   $('separate-download-confirm').close('start');
   const button = $('separate-download-button');
-  const status = $('separate-download-status');
   separateDownloadBusy = true;
   button.disabled = true;
+  const stop = { stopped: false };
+  anchorDownloadStop = stop;
+  const stopButton = $('separate-download-stop');
+  stopButton.hidden = false;
+  setSeparateDownloadStatus(`Requested 0 of ${pending.files.length} downloads`);
   try {
-    await triggerSeparateDownloads(pending.files, pending.names);
-    status.textContent =
-      `Requested ${pending.files.length} downloads. Your browser may ask you to allow multiple downloads; accept that prompt to receive every file.`;
+    const result = await triggerSeparateDownloads(
+      pending.files,
+      pending.names,
+      stop,
+      (requested, total) => setSeparateDownloadStatus(`Requested ${requested} of ${total} downloads`),
+    );
+    const handoff = 'Keep this tab open until requests are handed off, then check browser downloads for blocked or failed files.';
+    setSeparateDownloadStatus(result.stopped && result.requested < pending.files.length
+      ? `Requested ${result.requested} of ${pending.files.length} downloads. Remaining requests stopped. ${handoff}`
+      : `Requested ${result.requested} of ${pending.files.length} downloads. ${handoff}`);
   } finally {
+    anchorDownloadStop = null;
+    stopButton.hidden = true;
     separateDownloadBusy = false;
     button.disabled = false;
   }
 }
 
-async function fetchMetadataPage(offset, limit = FILE_RENDER_BATCH_SIZE) {
+async function fetchMetadataPage(offset, limit = METADATA_PAGE_SIZE) {
   let response;
   try {
     response = await deliveryMetadata(publicMetadataPageUrl(token, offset, limit), token);
@@ -300,7 +366,7 @@ async function fetchMetadataPage(offset, limit = FILE_RENDER_BATCH_SIZE) {
   return { ...body, files };
 }
 
-async function appendMetadataPageAt(offset, limit = FILE_RENDER_BATCH_SIZE) {
+async function appendMetadataPageAt(offset, limit = METADATA_PAGE_SIZE) {
   const page = await fetchMetadataPage(offset, limit);
   const next = appendMetadataPage(
     { files: metadataFiles, total: metadataFiles.length ? metadataTotal : null },
@@ -318,7 +384,7 @@ async function loadRemainingMetadata() {
   try {
     while (metadataHasMore) {
       $('file-list-status').textContent = `Loading file metadata: ${metadataFiles.length} of ${metadataTotal}`;
-      await appendMetadataPageAt(metadataFiles.length, 500);
+      await appendMetadataPageAt(metadataFiles.length, METADATA_PAGE_SIZE);
     }
     showMetadataProgress();
     return metadataFiles;
@@ -331,7 +397,6 @@ async function downloadSeparately() {
   if (separateDownloadBusy) return;
   separateDownloadBusy = true;
   const button = $('separate-download-button');
-  const status = $('separate-download-status');
   button.disabled = true;
   try {
     let directory;
@@ -344,7 +409,7 @@ async function downloadSeparately() {
     let remainingNames = names;
     let batchSaved = 0;
     if (batchUrl && batchDownloadEligible(files)) {
-      status.textContent = `Downloading files in optimized batch mode: 0/${files.length}`;
+      setSeparateDownloadStatus(`Downloading files in optimized batch mode: 0/${files.length}`);
       try {
         const response = await fetch(batchUrl, { credentials: 'same-origin' });
         if (response.status === 413 || response.status === 507) {
@@ -355,9 +420,10 @@ async function downloadSeparately() {
         await saveBatchFiles(response, directory, files, names, (completed, total, name) => {
           batchSaved = completed;
           markSaved(completed - 1, name);
-          status.textContent = `Saving files: ${completed} of ${total}`;
+          setSeparateDownloadStatus(`Saving files: ${completed} of ${total}`, true);
         });
-        status.textContent = `Downloaded ${files.length} files.`;
+        flushSavedFeedback();
+        setSeparateDownloadStatus(`Downloaded ${files.length} files.`);
         return;
       } catch (error) {
         if (error?.name === 'AbortError') throw error;
@@ -365,9 +431,9 @@ async function downloadSeparately() {
         // individually instead of failing the whole set.
         remainingFiles = files.slice(batchSaved);
         remainingNames = names.slice(batchSaved);
-        status.textContent = error instanceof BatchDownloadUnsupportedError
+        setSeparateDownloadStatus(error instanceof BatchDownloadUnsupportedError
           ? 'Batch mode unavailable; downloading files individually…'
-          : `Batch stream interrupted; downloading the remaining ${remainingFiles.length} files individually…`;
+          : `Batch stream interrupted; downloading the remaining ${remainingFiles.length} files individually…`);
       }
     }
     const failures = [];
@@ -383,17 +449,19 @@ async function downloadSeparately() {
       },
       4,
       (_file, _index, completed, _total) => {
-        status.textContent = `Saving files: ${batchSaved + completed} of ${files.length}`;
+        setSeparateDownloadStatus(`Saving files: ${batchSaved + completed} of ${files.length}`, true);
       },
     );
     const savedFiles = files.length - failures.length;
-    status.textContent = failures.length
+    flushSavedFeedback();
+    setSeparateDownloadStatus(failures.length
       ? `Downloaded ${savedFiles}/${files.length}. Failed: ${summarizeFailures(failures)}`
-      : `Downloaded ${files.length} files.`;
+      : `Downloaded ${files.length} files.`);
   } catch (error) {
-    status.textContent = error?.name === 'AbortError'
+    flushSavedFeedback();
+    setSeparateDownloadStatus(error?.name === 'AbortError'
       ? 'Download cancelled.'
-      : `Could not download files: ${error.message}`;
+      : `Could not download files: ${error.message}`);
   } finally {
     separateDownloadBusy = false;
     button.disabled = false;
@@ -415,6 +483,7 @@ async function loadMetadata() {
   }
 
   $('download-gate').hidden = true;
+  cancelSavedFeedback();
   $('object').replaceChildren();
   rows.clear();
   saved.clear();
@@ -442,7 +511,8 @@ async function loadMetadata() {
   if (body.bundle_url) $('bundle-download-button').onclick = () => window.location.assign(body.bundle_url);
   const separateNote = $('separate-download-note');
   const separateButton = $('separate-download-button');
-  $('separate-download-status').textContent = '';
+  setSeparateDownloadStatus('');
+  $('separate-download-stop').hidden = true;
   separateButton.disabled = false;
   if (metadataTotal > 1) {
     const pickerAvailable = typeof window.showDirectoryPicker === 'function';
@@ -519,6 +589,9 @@ function offerApp(kind) {
 }
 
 $('separate-download-start').addEventListener('click', startAnchorDownloads);
+$('separate-download-stop').addEventListener('click', () => {
+  if (anchorDownloadStop) anchorDownloadStop.stopped = true;
+});
 $('separate-download-confirm').addEventListener('close', (event) => {
   if (event.target.returnValue !== 'start') anchorDownloadPreflight = null;
 });
@@ -528,10 +601,11 @@ $('show-more-files').addEventListener('click', async () => {
   metadataLoading = true;
   $('show-more-files').disabled = true;
   try {
-    if (renderedFileCount >= metadataFiles.length && metadataHasMore) {
-      await appendMetadataPageAt(metadataFiles.length);
+    const target = renderedFileCount + METADATA_PAGE_SIZE;
+    while (metadataFiles.length < target && metadataHasMore) {
+      await appendMetadataPageAt(metadataFiles.length, METADATA_PAGE_SIZE);
     }
-    renderNextFileBatch();
+    renderNextFileBatch(METADATA_PAGE_SIZE);
   } catch (error) {
     $('file-list-status').textContent = error.message;
   } finally {
