@@ -170,6 +170,7 @@ fn convert(data: &Path, public_url: &str) -> Result<Conversion> {
              ALTER TABLE outbound_grants ADD COLUMN share_token TEXT;",
     )?;
     transaction.execute_batch(OUTBOUND_INDEXES)?;
+    transaction.execute_batch(AUDIT_INDEXES)?;
     rebuild(
         &transaction,
         &target,
@@ -1397,7 +1398,11 @@ mod tests {
             .prepare(
                 "SELECT name FROM sqlite_schema WHERE type='index' AND name IN (
                     'outbound_fetch_tickets_expires',
-                    'outbound_grants_open_expires'
+                    'outbound_grants_open_expires',
+                    'audit_log_tenant',
+                    'audit_log_event',
+                    'audit_log_tenant_at',
+                    'audit_log_event_at'
                 ) ORDER BY name",
             )
             .unwrap()
@@ -1409,6 +1414,10 @@ mod tests {
         assert_eq!(
             indexes,
             [
+                "audit_log_event".to_owned(),
+                "audit_log_event_at".to_owned(),
+                "audit_log_tenant".to_owned(),
+                "audit_log_tenant_at".to_owned(),
                 "outbound_fetch_tickets_expires".to_owned(),
                 "outbound_grants_open_expires".to_owned()
             ]

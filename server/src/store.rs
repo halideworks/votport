@@ -486,6 +486,14 @@ thread_local! {
     static LAST_TENANT_RECEIVED_VM_STEPS: Cell<u64> = const { Cell::new(TENANT_RECEIVED_VM_UNOBSERVED) };
 }
 
+#[cfg(test)]
+const AUDIT_VM_STEPS_UNOBSERVED: u64 = u64::MAX;
+
+#[cfg(test)]
+thread_local! {
+    static LAST_AUDIT_VM_STEPS: Cell<u64> = const { Cell::new(AUDIT_VM_STEPS_UNOBSERVED) };
+}
+
 pub const OUTBOUND_DOWNLOAD_LIMIT_REACHED: &str = "outbound download limit reached";
 
 const SETTINGS_SCHEMA: &str = "
@@ -602,6 +610,15 @@ const OUTBOUND_INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS outbound_fetch_tickets_expires ON outbound_fetch_tickets(expires_at);
 CREATE INDEX IF NOT EXISTS outbound_grants_open_expires
     ON outbound_grants(expires_at) WHERE revoked_at IS NULL;
+";
+
+// Recent pages use rowid order while exports use at,rowid order. Rowid is
+// implicit in ordinary indexes, so it cannot appear in CREATE INDEX.
+const AUDIT_INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS audit_log_tenant ON audit_log(tenant);
+CREATE INDEX IF NOT EXISTS audit_log_event ON audit_log(event);
+CREATE INDEX IF NOT EXISTS audit_log_tenant_at ON audit_log(tenant,at);
+CREATE INDEX IF NOT EXISTS audit_log_event_at ON audit_log(event,at);
 ";
 
 const OUTBOUND_GRANTS_SCHEMA: &str = "
@@ -1038,6 +1055,9 @@ impl Store {
             .map_err(|e| e.to_string())?;
         transaction
             .execute_batch(OUTBOUND_INDEXES)
+            .map_err(|e| e.to_string())?;
+        transaction
+            .execute_batch(AUDIT_INDEXES)
             .map_err(|e| e.to_string())?;
         transaction.commit().map_err(|e| e.to_string())?;
         connection
@@ -5234,6 +5254,33 @@ pub struct AuditFilters<'a> {
     pub query: Option<&'a str>,
 }
 
+fn append_audit_filters(
+    sql: &mut String,
+    parameters: &mut Vec<rusqlite::types::Value>,
+    tenant: Option<&str>,
+    filters: AuditFilters<'_>,
+) {
+    if let Some(tenant) = tenant {
+        sql.push_str(" AND tenant = ?");
+        parameters.push(rusqlite::types::Value::Text(tenant.to_owned()));
+    }
+    if let Some(event) = filters.event.filter(|value| !value.is_empty()) {
+        sql.push_str(" AND event = ?");
+        parameters.push(rusqlite::types::Value::Text(event.to_owned()));
+    }
+    if let Some(query) = filters.query.filter(|value| !value.is_empty()) {
+        sql.push_str(
+            " AND (instr(lower(CASE WHEN tenant = '' THEN 'default' ELSE tenant END), lower(?)) > 0
+                    OR instr(lower(actor), lower(?)) > 0
+                    OR instr(lower(event), lower(?)) > 0
+                    OR instr(lower(subject), lower(?)) > 0)",
+        );
+        for _ in 0..4 {
+            parameters.push(rusqlite::types::Value::Text(query.to_owned()));
+        }
+    }
+}
+
 fn map_tenant(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tenant> {
     Ok(Tenant {
         incarnation: row.get(7)?,
@@ -5450,29 +5497,35 @@ impl Store {
         filters: AuditFilters<'_>,
     ) -> Result<Vec<AuditRow>, String> {
         self.with(|connection| {
-            let mut statement = connection.prepare_cached(
-                "SELECT rowid, at, tenant, actor, event, subject, detail
-                 FROM audit_log
-                 WHERE (?1 IS NULL OR tenant = ?1)
-                   AND (?2 = '' OR event = ?2)
-                   AND (?3 = '' OR instr(lower(CASE WHEN tenant = '' THEN 'default' ELSE tenant END), lower(?3)) > 0
-                        OR instr(lower(actor), lower(?3)) > 0
-                        OR instr(lower(event), lower(?3)) > 0
-                        OR instr(lower(subject), lower(?3)) > 0)
-                   AND (?4 = 0 OR rowid < ?4)
-                 ORDER BY rowid DESC LIMIT ?5",
-            )?;
-            let rows = statement.query_map(
-                rusqlite::params![
-                    tenant,
-                    filters.event.unwrap_or(""),
-                    filters.query.unwrap_or(""),
+            let mut sql = "SELECT rowid, at, tenant, actor, event, subject, detail
+                            FROM audit_log
+                            WHERE 1"
+                .to_owned();
+            let mut parameters = Vec::new();
+            append_audit_filters(&mut sql, &mut parameters, tenant, filters);
+            if before_rowid != 0 {
+                sql.push_str(" AND rowid < ?");
+                parameters.push(rusqlite::types::Value::Integer(
                     i64::try_from(before_rowid).unwrap_or(i64::MAX),
-                    i64::try_from(limit).unwrap_or(i64::MAX),
-                ],
-                map_audit_row,
-            )?;
-            rows.collect()
+                ));
+            }
+            sql.push_str(" ORDER BY rowid DESC LIMIT ?");
+            parameters.push(rusqlite::types::Value::Integer(
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            ));
+            let mut statement = connection.prepare_cached(&sql)?;
+            #[cfg(test)]
+            statement.reset_status(rusqlite::StatementStatus::VmStep);
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(parameters), map_audit_row)?
+                .collect();
+            #[cfg(test)]
+            LAST_AUDIT_VM_STEPS.with(|steps| {
+                steps.set(
+                    u64::try_from(statement.get_status(rusqlite::StatementStatus::VmStep)).unwrap(),
+                )
+            });
+            rows
         })
     }
 
@@ -5487,30 +5540,30 @@ impl Store {
         let since = i64::try_from(since).unwrap_or(0);
         let after_rowid = i64::try_from(after_rowid).unwrap_or(0);
         let limit = i64::try_from(limit).unwrap_or(1000);
-        let mut statement = connection.prepare_cached(
-            "SELECT rowid, at, tenant, actor, event, subject, detail
-             FROM audit_log
-             WHERE (at > ?1 OR (at = ?1 AND rowid > ?2))
-               AND (?3 = '' OR event = ?3)
-               AND (?4 = '' OR instr(lower(CASE WHEN tenant = '' THEN 'default' ELSE tenant END), lower(?4)) > 0
-                    OR instr(lower(actor), lower(?4)) > 0
-                    OR instr(lower(event), lower(?4)) > 0
-                    OR instr(lower(subject), lower(?4)) > 0)
-               AND (?5 IS NULL OR tenant = ?5)
-             ORDER BY at, rowid LIMIT ?6",
-        )?;
-        let rows = statement.query_map(
-            rusqlite::params![
-                since,
-                after_rowid,
-                filters.event.unwrap_or(""),
-                filters.query.unwrap_or(""),
-                tenant,
-                limit,
-            ],
-            map_audit_row,
-        )?;
-        rows.collect()
+        let mut sql = "SELECT rowid, at, tenant, actor, event, subject, detail
+                        FROM audit_log
+                        WHERE (at,rowid) > (?1,?2)"
+            .to_owned();
+        let mut parameters = vec![
+            rusqlite::types::Value::Integer(since),
+            rusqlite::types::Value::Integer(after_rowid),
+        ];
+        append_audit_filters(&mut sql, &mut parameters, tenant, filters);
+        sql.push_str(" ORDER BY at, rowid LIMIT ?");
+        parameters.push(rusqlite::types::Value::Integer(limit));
+        let mut statement = connection.prepare_cached(&sql)?;
+        #[cfg(test)]
+        statement.reset_status(rusqlite::StatementStatus::VmStep);
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(parameters), map_audit_row)?
+            .collect();
+        #[cfg(test)]
+        LAST_AUDIT_VM_STEPS.with(|steps| {
+            steps.set(
+                u64::try_from(statement.get_status(rusqlite::StatementStatus::VmStep)).unwrap(),
+            )
+        });
+        rows
     }
 
     /// Deletes audit rows older than `before`; returns how many.
@@ -5605,6 +5658,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
         UPLOAD_SESSIONS_SCHEMA,
         OUTBOUND_GRANT_MANIFESTS_SCHEMA,
         OUTBOUND_INDEXES,
+        AUDIT_INDEXES,
         evidence::SCHEMA,
         workflows::SCHEMA,
         workflows::INDEXES,
@@ -7269,7 +7323,12 @@ pub(crate) mod tests {
                         "DROP INDEX delivery_jobs_deadline_pending;
                          DROP INDEX delivery_jobs_retirement_due;
                          DROP INDEX outbound_fetch_tickets_expires;
-                         DROP INDEX outbound_grants_open_expires;",
+                         DROP INDEX outbound_grants_open_expires;
+                         DROP INDEX audit_log_tenant;
+                         DROP INDEX audit_log_event;
+                         DROP INDEX audit_log_tenant_at;
+                         DROP INDEX audit_log_event_at;
+                         ",
                     )
                 })
                 .unwrap();
@@ -7288,7 +7347,11 @@ pub(crate) mod tests {
                                 'delivery_jobs_deadline_pending',
                                 'delivery_jobs_retirement_due',
                                 'outbound_fetch_tickets_expires',
-                                'outbound_grants_open_expires'
+                                'outbound_grants_open_expires',
+                                'audit_log_tenant',
+                                'audit_log_event',
+                                'audit_log_tenant_at',
+                                'audit_log_event_at'
                             ) ORDER BY name",
                         )?
                         .query_map([], |row| row.get(0))?
@@ -7298,6 +7361,10 @@ pub(crate) mod tests {
             assert_eq!(
                 indexes,
                 [
+                    "audit_log_event".to_owned(),
+                    "audit_log_event_at".to_owned(),
+                    "audit_log_tenant".to_owned(),
+                    "audit_log_tenant_at".to_owned(),
                     "delivery_jobs_deadline_pending".to_owned(),
                     "delivery_jobs_retirement_due".to_owned(),
                     "outbound_fetch_tickets_expires".to_owned(),
@@ -7394,7 +7461,11 @@ pub(crate) mod tests {
                             'delivery_jobs_deadline_pending',
                             'delivery_jobs_retirement_due',
                             'outbound_fetch_tickets_expires',
-                            'outbound_grants_open_expires'
+                            'outbound_grants_open_expires',
+                            'audit_log_tenant',
+                            'audit_log_event',
+                            'audit_log_tenant_at',
+                            'audit_log_event_at'
                         ) ORDER BY name",
                     )?
                     .query_map([], |row| row.get(0))?
@@ -7402,6 +7473,10 @@ pub(crate) mod tests {
                 assert_eq!(
                     indexes,
                     [
+                        "audit_log_event".to_owned(),
+                        "audit_log_event_at".to_owned(),
+                        "audit_log_tenant".to_owned(),
+                        "audit_log_tenant_at".to_owned(),
                         "delivery_jobs_deadline_pending".to_owned(),
                         "delivery_jobs_retirement_due".to_owned(),
                         "outbound_fetch_tickets_expires".to_owned(),
@@ -9805,6 +9880,219 @@ mod phase4_review_tests {
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].subject, "first");
     }
+
+    #[test]
+    fn filtered_audit_reads_use_scope_indexes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .with(|connection| {
+                connection.execute_batch("BEGIN")?;
+                for index in 0..100 {
+                    connection.execute(
+                        "INSERT INTO audit_log(at,tenant,actor,event,subject)
+                         VALUES (?1,?2,'actor',?3,?4)",
+                        rusqlite::params![
+                            (index / 4) as i64,
+                            if index % 10 < 2 { "acme" } else { "other" },
+                            if index % 7 == 0 { "rare" } else { "common" },
+                            if index == 70 { "needle" } else { "other" },
+                        ],
+                    )?;
+                }
+                connection.execute_batch("COMMIT")
+            })
+            .unwrap();
+        fn measure_audit<F>(read: F) -> Vec<AuditRow>
+        where
+            F: FnOnce() -> Result<Vec<AuditRow>, String>,
+        {
+            LAST_AUDIT_VM_STEPS.with(|steps| steps.set(AUDIT_VM_STEPS_UNOBSERVED));
+            let rows = read().unwrap();
+            let vm_steps = LAST_AUDIT_VM_STEPS.with(Cell::get);
+            assert!(vm_steps > 0, "audit reader did not report VM steps");
+            assert!(vm_steps < 500, "audit reader used {vm_steps} VM steps");
+            rows
+        }
+
+        let tenant_recent = measure_audit(|| {
+            store.audit_recent_filtered(Some("acme"), 0, 5, AuditFilters::default())
+        });
+        assert_eq!(
+            tenant_recent
+                .iter()
+                .map(|row| row.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["other", "other", "other", "other", "other"]
+        );
+        assert!(tenant_recent.iter().all(|row| row.tenant == "acme"));
+        let tenant_recent_page_two = measure_audit(|| {
+            store.audit_recent_filtered(
+                Some("acme"),
+                tenant_recent.last().unwrap().rowid as u64,
+                5,
+                AuditFilters::default(),
+            )
+        });
+        assert_eq!(tenant_recent_page_two.len(), 5);
+        assert!(tenant_recent_page_two
+            .iter()
+            .all(|row| row.tenant == "acme"));
+
+        let event_recent = measure_audit(|| {
+            store.audit_recent_filtered(
+                None,
+                0,
+                5,
+                AuditFilters {
+                    event: Some("rare"),
+                    query: None,
+                },
+            )
+        });
+        assert_eq!(event_recent.len(), 5);
+        assert!(event_recent.iter().all(|row| row.event == "rare"));
+
+        let common_recent = measure_audit(|| {
+            store.audit_recent_filtered(
+                None,
+                0,
+                5,
+                AuditFilters {
+                    event: Some("common"),
+                    query: None,
+                },
+            )
+        });
+        assert_eq!(common_recent.len(), 5);
+        assert!(common_recent.iter().all(|row| row.event == "common"));
+
+        let combined_recent = measure_audit(|| {
+            store.audit_recent_filtered(
+                Some("acme"),
+                0,
+                5,
+                AuditFilters {
+                    event: Some("rare"),
+                    query: Some("NEEDLE"),
+                },
+            )
+        });
+        assert_eq!(combined_recent.len(), 1);
+        assert_eq!(combined_recent[0].subject, "needle");
+
+        let tenant_export = measure_audit(|| {
+            store.audit_export_filtered(Some("acme"), 0, 0, 5, AuditFilters::default())
+        });
+        assert_eq!(
+            tenant_export
+                .iter()
+                .map(|row| row.rowid)
+                .collect::<Vec<_>>(),
+            [1, 2, 11, 12, 21]
+        );
+        let tenant_export_page_two = measure_audit(|| {
+            store.audit_export_filtered(
+                Some("acme"),
+                tenant_export.last().unwrap().at,
+                tenant_export.last().unwrap().rowid as u64,
+                5,
+                AuditFilters::default(),
+            )
+        });
+        assert_eq!(
+            tenant_export_page_two
+                .iter()
+                .map(|row| row.rowid)
+                .collect::<Vec<_>>(),
+            [22, 31, 32, 41, 42]
+        );
+
+        let event_export = measure_audit(|| {
+            store.audit_export_filtered(
+                None,
+                0,
+                0,
+                5,
+                AuditFilters {
+                    event: Some("rare"),
+                    query: None,
+                },
+            )
+        });
+        assert_eq!(
+            event_export.iter().map(|row| row.rowid).collect::<Vec<_>>(),
+            [1, 8, 15, 22, 29]
+        );
+
+        let common_export = measure_audit(|| {
+            store.audit_export_filtered(
+                None,
+                0,
+                0,
+                5,
+                AuditFilters {
+                    event: Some("common"),
+                    query: None,
+                },
+            )
+        });
+        assert_eq!(
+            common_export
+                .iter()
+                .map(|row| row.rowid)
+                .collect::<Vec<_>>(),
+            [2, 3, 4, 5, 6]
+        );
+
+        let combined_export = measure_audit(|| {
+            store.audit_export_filtered(
+                Some("acme"),
+                0,
+                0,
+                5,
+                AuditFilters {
+                    event: Some("rare"),
+                    query: None,
+                },
+            )
+        });
+        assert_eq!(
+            combined_export
+                .iter()
+                .map(|row| row.rowid)
+                .collect::<Vec<_>>(),
+            [1, 22, 71, 92]
+        );
+
+        let deep_directory = tempfile::tempdir().unwrap();
+        let deep_store = Store::open(deep_directory.path()).unwrap();
+        deep_store
+            .with(|connection| {
+                connection.execute_batch("BEGIN")?;
+                for index in 0..1000 {
+                    connection.execute(
+                        "INSERT INTO audit_log(at,tenant,actor,event,subject)
+                         VALUES (?1,?2,'actor',?3,'subject')",
+                        rusqlite::params![
+                            (index / 4) as i64,
+                            if index % 10 < 2 { "acme" } else { "other" },
+                            if index % 7 == 0 { "rare" } else { "common" },
+                        ],
+                    )?;
+                }
+                connection.execute_batch("COMMIT")
+            })
+            .unwrap();
+        let deep_export = measure_audit(|| {
+            deep_store.audit_export_filtered(None, 200, 803, 5, AuditFilters::default())
+        });
+        assert_eq!(
+            deep_export.iter().map(|row| row.rowid).collect::<Vec<_>>(),
+            [804, 805, 806, 807, 808]
+        );
+        assert!(deep_export.iter().all(|row| row.at >= 200));
+    }
 }
 
 #[cfg(test)]
@@ -10010,7 +10298,7 @@ mod settings_tests {
             drop(store);
             let path = directory.path().join("votport.db");
             let connection = Connection::open(&path).unwrap();
-            connection.execute_batch("PRAGMA journal_mode=DELETE; DROP INDEX links_tenant; DROP INDEX links_tenant_created; DROP INDEX delivery_jobs_deadline_pending; DROP INDEX delivery_jobs_retirement_due; DROP INDEX outbound_fetch_tickets_expires; DROP INDEX outbound_grants_open_expires; DELETE FROM meta WHERE key='schema_version';").unwrap();
+            connection.execute_batch("PRAGMA journal_mode=DELETE; DROP INDEX links_tenant; DROP INDEX links_tenant_created; DROP INDEX delivery_jobs_deadline_pending; DROP INDEX delivery_jobs_retirement_due; DROP INDEX outbound_fetch_tickets_expires; DROP INDEX outbound_grants_open_expires; DROP INDEX audit_log_tenant; DROP INDEX audit_log_event; DROP INDEX audit_log_tenant_at; DROP INDEX audit_log_event_at; DELETE FROM meta WHERE key='schema_version';").unwrap();
             if let Some(version) = version {
                 connection
                     .execute(
@@ -10033,7 +10321,11 @@ mod settings_tests {
                         'delivery_jobs_deadline_pending',
                         'delivery_jobs_retirement_due',
                         'outbound_fetch_tickets_expires',
-                        'outbound_grants_open_expires'
+                        'outbound_grants_open_expires',
+                        'audit_log_tenant',
+                        'audit_log_event',
+                        'audit_log_tenant_at',
+                        'audit_log_event_at'
                     )",
                     [],
                     |row| row.get(0),

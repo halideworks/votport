@@ -1271,8 +1271,8 @@ pub struct SearchQuery {
     q: Option<String>,
 }
 
-/// The masthead search: requests, downloads, received files, and audit rows
-/// matching a phrase, five of each, scoped like the pages that show them.
+/// The masthead search: requests, downloads, and received files matching a
+/// phrase, five of each, scoped like the pages that show them.
 pub async fn admin_search(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -1292,29 +1292,10 @@ pub async fn admin_search(
         .store
         .search(&identity.tenant, phrase, 5)
         .map_err(super::store_unavailable)?;
-    let audit = app
-        .store
-        .audit_recent_filtered(
-            audit_tenant(&identity),
-            0,
-            5,
-            AuditFilters {
-                event: None,
-                query: Some(phrase),
-            },
-        )
-        .map_err(super::store_unavailable)?;
     Ok(Json(json!({
         "requests": results.requests,
         "downloads": results.downloads,
         "files": results.files,
-        "audit": audit.iter().map(|row| json!({
-            "rowid": row.rowid,
-            "at": row.at,
-            "event": row.event,
-            "subject": row.subject,
-            "actor": row.actor,
-        })).collect::<Vec<_>>(),
     })))
 }
 
@@ -5116,25 +5097,21 @@ mod tenant_authz_tests {
                 }
                 assert_eq!(response.status(), StatusCode::OK, "{tenant}/{role} {uri}");
                 let bytes = response.into_body().collect().await.unwrap().to_bytes();
-                let subjects: Vec<String> = if uri.contains("/search") {
-                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["audit"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|row| row["subject"].as_str().unwrap().to_owned())
-                        .collect()
-                } else {
-                    std::str::from_utf8(&bytes)
-                        .unwrap()
-                        .lines()
-                        .map(|line| {
-                            serde_json::from_str::<serde_json::Value>(line).unwrap()["subject"]
-                                .as_str()
-                                .unwrap()
-                                .to_owned()
-                        })
-                        .collect()
-                };
+                if uri.contains("/search") {
+                    let body = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+                    assert!(body.get("audit").is_none(), "{tenant}/{role} {uri}");
+                    continue;
+                }
+                let subjects: Vec<String> = std::str::from_utf8(&bytes)
+                    .unwrap()
+                    .lines()
+                    .map(|line| {
+                        serde_json::from_str::<serde_json::Value>(line).unwrap()["subject"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned()
+                    })
+                    .collect();
                 let mut expected: Vec<_> = if all {
                     ["", "acme", "other"].to_vec()
                 } else {
