@@ -58,7 +58,10 @@ notification-area API on a hidden message window (the third-party WinUI
 tray library crashed the XAML runtime), toasts go through the app
 notification manager, the `votport:` protocol is in the MSIX manifest and
 registered for the user by an unpackaged build, and one instance handles
-every activation. `dotnet build` alone builds it, and with
+every activation. The tray restores its icon and current tooltip when Explorer
+restarts. To verify on a disposable Windows desktop, hide the main window,
+restart Windows Explorer from Task Manager, then check that both tray click
+actions still open their panels. `dotnet build` alone builds it, and with
 `WindowsPackageType=MSIX` produces an unsigned package; no Visual Studio
 workload is needed. On tr-desktop it received the 300 MB delivery
 byte-identical from the `--receive` launch argument, started into the

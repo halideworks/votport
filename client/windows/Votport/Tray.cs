@@ -18,12 +18,16 @@ public sealed class Tray : IDisposable
     private readonly IntPtr icon;
     private readonly Action panel;
     private readonly Action menu;
+    private readonly uint taskbarCreated;
+    private string tip = "votport";
     private bool disposed;
 
     public Tray(string iconPath, Action panel, Action menu)
     {
         this.panel = panel;
         this.menu = menu;
+        // Explorer forgets notification icons when it restarts; it broadcasts this message when ready.
+        taskbarCreated = RegisterWindowMessage("TaskbarCreated");
         procedure = Procedure;
         var instance = GetModuleHandle(null);
         var cls = new WndClass
@@ -35,12 +39,7 @@ public sealed class Tray : IDisposable
         RegisterClass(ref cls);
         window = CreateWindowEx(0, "VotportTray", "votport", 0, 0, 0, 0, 0, IntPtr.Zero, IntPtr.Zero, instance, IntPtr.Zero);
         icon = LoadImage(IntPtr.Zero, iconPath, 1, 16, 16, 0x10);
-        var data = Data();
-        data.uFlags = NifMessage | NifIcon | NifTip;
-        data.uCallbackMessage = WmTray;
-        data.hIcon = icon;
-        data.szTip = "votport";
-        Shell_NotifyIcon(NimAdd, ref data);
+        AddIcon();
     }
 
     public void SetTip(string tip)
@@ -48,8 +47,20 @@ public sealed class Tray : IDisposable
         if (disposed) return;
         var data = Data();
         data.uFlags = NifTip;
-        data.szTip = tip.Length > 120 ? tip[..120] : tip;
+        this.tip = tip.Length > 120 ? tip[..120] : tip;
+        data.szTip = this.tip;
         Shell_NotifyIcon(NimModify, ref data);
+    }
+
+    private void AddIcon()
+    {
+        if (disposed || window == IntPtr.Zero || icon == IntPtr.Zero) return;
+        var data = Data();
+        data.uFlags = NifMessage | NifIcon | NifTip;
+        data.uCallbackMessage = WmTray;
+        data.hIcon = icon;
+        data.szTip = tip;
+        Shell_NotifyIcon(NimAdd, ref data);
     }
 
     private NotifyIconData Data() => new()
@@ -63,9 +74,15 @@ public sealed class Tray : IDisposable
     {
         if (message == WmTray)
         {
+            if (disposed) return IntPtr.Zero;
             var mouse = (uint)(lParam.ToInt64() & 0xffff);
             if (mouse == WmLButtonUp) panel();
             else if (mouse == WmRButtonUp) menu();
+            return IntPtr.Zero;
+        }
+        if (taskbarCreated != 0 && message == taskbarCreated)
+        {
+            AddIcon();
             return IntPtr.Zero;
         }
         return DefWindowProc(hwnd, message, wParam, lParam);
@@ -119,6 +136,7 @@ public sealed class Tray : IDisposable
     }
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern ushort RegisterClass(ref WndClass cls);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern uint RegisterWindowMessage(string message);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr CreateWindowEx(uint exStyle, string cls, string name, uint style, int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr instance, IntPtr param);
     [DllImport("user32.dll")] private static extern bool DestroyWindow(IntPtr hwnd);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr DefWindowProc(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
