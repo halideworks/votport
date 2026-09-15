@@ -63,6 +63,7 @@ pub async fn link_info(
         .map_err(super::store_unavailable)?
         .ok_or_else(ApiError::not_found)?;
     let usable = link.usable_now();
+    let max_bytes = effective_cap(&app, &link);
     let branding = if usable {
         super::public_branding(&app, &link.tenant).map_err(super::store_unavailable)?
     } else {
@@ -77,12 +78,12 @@ pub async fn link_info(
         "needs_password": link.password_hash.is_some(),
         "authorized": link_authorized(&app, &link, &headers),
         "usable": usable,
-        "max_bytes": effective_cap(&app, &link),
+        "max_bytes": max_bytes,
         "chunk_bytes": session::CHUNK_BYTES,
         // The sender refuses dotfiles before hashing when this is off; the
         // server re-checks at begin.
         "allow_hidden": app.config.allow_hidden,
-        "max_entries": session::MAX_ENTRIES,
+        "max_entries": session::max_entries_for_bytes(max_bytes),
         "push": app.push.is_some(),
         "web_build": app.web_build,
     })))
@@ -154,8 +155,7 @@ pub struct PushPackageAnnouncement {
     suite: u64,
     root: String,
     length: u64,
-    #[serde(rename = "entries")]
-    _entries: usize,
+    entries: usize,
 }
 
 #[derive(Deserialize)]
@@ -732,6 +732,13 @@ pub async fn create_push_session(
         || parse_push_object(&request.package),
     )
     .await?;
+    let max_entries = session::max_entries_for_bytes(prepared.cap);
+    if request.package.entries == 0 || request.package.entries > max_entries {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("package entry count is outside 1..={max_entries}"),
+        ));
+    }
     let route = super::outbound::workflows::routes::admission(
         &app,
         request.route.as_deref(),
@@ -1990,13 +1997,21 @@ mod push_preflight_tests {
     }
 
     fn request_body(holder: &ed25519_dalek::SigningKey, length: u64) -> serde_json::Value {
+        request_body_with_entries(holder, length, 3)
+    }
+
+    fn request_body_with_entries(
+        holder: &ed25519_dalek::SigningKey,
+        length: u64,
+        entries: usize,
+    ) -> serde_json::Value {
         json!({
             "holder_key": hex::encode(holder.verifying_key().to_bytes()),
             "package": {
                 "suite": 1,
                 "root": hex::encode([7_u8; 32]),
                 "length": length,
-                "entries": 3
+                "entries": entries
             }
         })
     }
@@ -2091,6 +2106,80 @@ mod push_preflight_tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn link_info_advertises_the_byte_bound_entry_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let mut link = open_link("small-cap");
+        link.max_bytes = Some(1024 * 1024);
+        application.store.insert_link(link).unwrap();
+
+        let info = app::router(application)
+            .oneshot(
+                Request::get("/api/r/small-cap")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let info = response_json(info).await;
+        assert_eq!(info["max_bytes"], 1024 * 1024);
+        assert_eq!(
+            info["max_entries"],
+            crate::session::max_entries_for_bytes(1024 * 1024)
+        );
+    }
+
+    #[tokio::test]
+    async fn native_entry_count_is_checked_at_the_route_before_admission_history() {
+        let cap = 1024 * 1024;
+        let limit = crate::session::max_entries_for_bytes(cap);
+        let holder = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        for (entries, status, admitted) in [
+            (0, StatusCode::UNPROCESSABLE_ENTITY, false),
+            (limit, StatusCode::OK, true),
+            (limit + 1, StatusCode::UNPROCESSABLE_ENTITY, false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let application = push_app(directory.path());
+            let mut link = open_link("native-count");
+            link.max_bytes = Some(cap);
+            application.store.insert_link(link).unwrap();
+
+            let response = post_push(
+                application.clone(),
+                "native-count",
+                request_body_with_entries(&holder, 7, entries),
+            )
+            .await;
+            assert_eq!(response.status(), status, "entries={entries}");
+            assert_eq!(application.sessions.total(), usize::from(admitted));
+            assert_eq!(
+                application.push_tickets.lock().unwrap().len(),
+                usize::from(admitted)
+            );
+            assert_eq!(
+                application.store.load_push_sessions().unwrap().len(),
+                usize::from(admitted)
+            );
+            if !admitted {
+                let stage = application.config.receive_dir.join(".vot-stage");
+                assert!(!std::fs::read_dir(stage).unwrap().any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".vot-push-")));
+            }
+            if admitted {
+                let session = response_json(response).await["session"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let _ = upload_abort(State(application.clone()), Path(session)).await;
+            }
+        }
     }
 
     #[tokio::test]
