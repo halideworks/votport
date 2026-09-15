@@ -435,8 +435,8 @@ function addNamed(pairs) {
         return;
       }
     }
-    if (utf8.encode(components.at(-1) ?? '').length > 243) {
-      fail(`"${path}": filename exceeds 243 UTF-8 bytes; shorten it to leave room for its signed receipt`);
+    if (utf8.encode(components.at(-1) ?? '').length > 242) {
+      fail(`"${path}": filename exceeds 242 UTF-8 bytes; shorten it to leave room for its signed receipt and receive journal`);
       return;
     }
     const joined = components.join('/');

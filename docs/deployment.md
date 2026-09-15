@@ -60,10 +60,10 @@ Generated receipt downloads and verification remain available. Recovery reuses
 an existing receipt only when its signature, object and publication identity
 match. Existing damaged payload/receipt pairs require separate recovery.
 
-Payload filenames may use at most 243 UTF-8 bytes so the signed receipt's
-`.vot-receipt` suffix fits the filesystem's 255-byte component limit. Parent
-directories may still use 255 bytes. A collision that would exceed the filename
-budget is refused with a shorten-name error; names are never truncated.
+Payload filenames may use at most 242 UTF-8 bytes so the `.vot-<name>.journal`
+and signed receipt sidecars fit the filesystem's 255-byte component limit.
+Parent directories may still use 255 bytes. A collision that would exceed the
+filename budget is refused with a shorten-name error; names are never truncated.
 
 HTTP and native uploads reserve final filenames together when their manifests
 are admitted. Reservations include unfinished sessions retained across restart

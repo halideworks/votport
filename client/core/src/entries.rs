@@ -167,12 +167,12 @@ mod tests {
     #[test]
     fn payload_names_leave_receipt_space_without_shortening_parents() {
         let parent = "p".repeat(255);
-        for name in ["a".repeat(243), "ア".repeat(81)] {
+        for name in ["a".repeat(242), format!("{}ab", "ア".repeat(80))] {
             admit(&format!("{parent}/{name}"), source(), false).unwrap();
         }
-        for name in ["a".repeat(244), format!("{}a", "ア".repeat(81))] {
+        for name in ["a".repeat(243), "ア".repeat(81)] {
             let error = admit(&format!("{parent}/{name}"), source(), false).unwrap_err();
-            assert!(error.reason.contains("243 UTF-8 bytes; shorten"));
+            assert!(error.reason.contains("242 UTF-8 bytes; shorten"));
         }
     }
 
