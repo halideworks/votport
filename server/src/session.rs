@@ -65,6 +65,13 @@ impl SessionError {
         }
     }
 
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: 503,
+            message: message.into(),
+        }
+    }
+
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: 500,
@@ -89,6 +96,7 @@ pub enum Cmd {
     Begin {
         reply: Reply<Vec<EntryInfo>>,
         _lease: SessionLease,
+        stopping: Arc<AtomicBool>,
     },
     Chunk {
         entry: usize,
@@ -687,8 +695,18 @@ fn spawn_worker_from(
                 } => {
                     send_noted!(reply, handle_page(&mut phase, &bytes));
                 }
-                Cmd::Begin { reply, _lease } => {
-                    let result = handle_begin(&setup, &mut phase);
+                Cmd::Begin {
+                    reply,
+                    _lease,
+                    stopping,
+                } => {
+                    let result = if stopping.load(Ordering::Acquire) {
+                        Err(SessionError::unavailable(
+                            "the server is shutting down; retry after restart",
+                        ))
+                    } else {
+                        handle_begin(&setup, &mut phase)
+                    };
                     if result.is_ok() && !opened {
                         log.push(TransferLog::plain(now_unix(), "opened", None));
                         opened = true;
@@ -3642,6 +3660,19 @@ pub struct Sessions {
     inner: Arc<Mutex<SessionsInner>>,
 }
 
+/// Ownership won before process shutdown. It keeps a request admitted while
+/// preparation runs without holding the registry mutex across I/O.
+pub struct AdmissionGuard {
+    inner: Arc<Mutex<SessionsInner>>,
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        let mut inner = self.inner.lock().expect("sessions poisoned");
+        inner.active_admissions = inner.active_admissions.saturating_sub(1);
+    }
+}
+
 pub struct TenantPin {
     inner: Arc<Mutex<SessionsInner>>,
     tenant: String,
@@ -3674,6 +3705,9 @@ impl Drop for LinkPin {
 
 struct SessionsInner {
     map: HashMap<String, SessionHandle>,
+    admission_closed: bool,
+    commands_closed: bool,
+    active_admissions: usize,
     /// Tenants whose storage subtrees are being deleted. Lives on the same
     /// mutex as `map` so [`Sessions::insert_admitted`] cannot race the pin.
     pinned: HashSet<String>,
@@ -3806,6 +3840,7 @@ pub enum TouchError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InsertError {
+    ShuttingDown,
     TenantPinned,
     LinkPinned,
     ByteQuota,
@@ -3825,6 +3860,9 @@ impl Sessions {
         Self {
             inner: Arc::new(Mutex::new(SessionsInner {
                 map: HashMap::new(),
+                admission_closed: false,
+                commands_closed: false,
+                active_admissions: 0,
                 pinned: HashSet::new(),
                 outbound: HashMap::new(),
                 pinned_links: HashSet::new(),
@@ -3838,6 +3876,36 @@ impl Sessions {
                 finish_stall: None,
             })),
         }
+    }
+
+    /// Wins the process-local admission fence, if shutdown has not closed it.
+    pub fn try_admit(&self) -> Option<AdmissionGuard> {
+        let mut inner = self.inner.lock().expect("sessions poisoned");
+        if inner.admission_closed {
+            return None;
+        }
+        inner.active_admissions += 1;
+        Some(AdmissionGuard {
+            inner: Arc::clone(&self.inner),
+        })
+    }
+
+    /// Irreversibly stops new sessions. Existing command leases remain valid
+    /// until the checkpoint takes HTTP senders below.
+    pub fn close_admission(&self) -> bool {
+        let mut inner = self.inner.lock().expect("sessions poisoned");
+        let first = !inner.admission_closed;
+        inner.admission_closed = true;
+        first
+    }
+
+    /// Preparations that won admission but have not reached their ownership
+    /// mutation yet. Shutdown waits for these permits or the shared deadline.
+    pub fn active_admissions(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("sessions poisoned")
+            .active_admissions
     }
 
     /// Excludes other tenant mutations and new sessions until the guard drops.
@@ -4046,6 +4114,29 @@ impl Sessions {
         sender: mpsc::Sender<Cmd>,
         received_bytes: impl FnOnce() -> Result<(u64, Vec<crate::store::RetainedReservation>), String>,
     ) -> Result<(), InsertError> {
+        self.insert_admitted_inner(admission, sender, received_bytes, false)
+    }
+
+    /// Inserts a request that acquired admission before shutdown. The guard
+    /// is retained through the quota read and registry mutation.
+    pub fn insert_admitted_with_guard(
+        &self,
+        admission: SessionAdmission,
+        sender: mpsc::Sender<Cmd>,
+        received_bytes: impl FnOnce() -> Result<(u64, Vec<crate::store::RetainedReservation>), String>,
+        guard: AdmissionGuard,
+    ) -> Result<AdmissionGuard, InsertError> {
+        self.insert_admitted_inner(admission, sender, received_bytes, true)
+            .map(|()| guard)
+    }
+
+    fn insert_admitted_inner(
+        &self,
+        admission: SessionAdmission,
+        sender: mpsc::Sender<Cmd>,
+        received_bytes: impl FnOnce() -> Result<(u64, Vec<crate::store::RetainedReservation>), String>,
+        reserved: bool,
+    ) -> Result<(), InsertError> {
         let SessionAdmission {
             id,
             link_id,
@@ -4066,6 +4157,9 @@ impl Sessions {
             None => None,
         };
         let mut inner = self.inner.lock().expect("sessions poisoned");
+        if inner.commands_closed || (inner.admission_closed && !reserved) {
+            return Err(InsertError::ShuttingDown);
+        }
         if !tenant.is_empty() && inner.pinned.contains(&tenant) {
             return Err(InsertError::TenantPinned);
         }
@@ -4203,15 +4297,17 @@ impl Sessions {
         let mut senders = Vec::new();
         self.inner
             .lock()
-            .expect("sessions poisoned")
-            .map
-            .retain(|_, handle| {
-                if matches!(handle.kind, SessionKind::Http) {
-                    senders.push(handle.sender.clone());
-                    return false;
-                }
-                true
-            });
+            .map(|mut inner| {
+                inner.commands_closed = true;
+                inner.map.retain(|_, handle| {
+                    if matches!(handle.kind, SessionKind::Http) {
+                        senders.push(handle.sender.clone());
+                        return false;
+                    }
+                    true
+                });
+            })
+            .expect("sessions poisoned");
         senders
     }
 
@@ -4495,6 +4591,33 @@ mod pin_tests {
             )
             .unwrap();
         assert_eq!(sessions.total(), 1);
+    }
+
+    #[test]
+    fn shutdown_admission_is_irreversible_and_owned_work_finishes() {
+        let sessions = Sessions::new();
+        let guard = sessions.try_admit().expect("admission before stop");
+        assert!(sessions.close_admission());
+        assert!(!sessions.close_admission());
+
+        sessions
+            .insert_admitted_with_guard(
+                admission("owned", 1, 100, 2),
+                dummy_sender(),
+                || Ok((0, Vec::new())),
+                guard,
+            )
+            .expect("owned setup may finish after stop");
+        assert_eq!(sessions.total(), 1);
+        let _ = sessions.take_http();
+        assert!(matches!(
+            sessions.insert_admitted(admission("late", 1, 100, 2), dummy_sender(), || Ok((
+                0,
+                Vec::new()
+            )),),
+            Err(InsertError::ShuttingDown)
+        ));
+        assert!(sessions.try_admit().is_none());
     }
 
     #[test]
@@ -4925,6 +5048,36 @@ mod push_tests {
             quiet_after_secs: 5,
             ended: mpsc::unbounded_channel().0,
         }
+    }
+
+    #[tokio::test]
+    async fn queued_begin_is_rejected_by_worker_after_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let setup = setup_with_app(directory.path(), object(Suite::Blake3Bao64, b""), &app);
+        let (sender, receiver) = mpsc::channel(1);
+        spawn_worker(setup, receiver);
+        let activity = Arc::new(SessionActivity {
+            in_flight: AtomicUsize::new(1),
+            last_active: Mutex::new(Instant::now()),
+            received: AtomicU64::new(0),
+        });
+        let (reply, result) = oneshot::channel();
+        app.request_shutdown();
+        sender
+            .send(Cmd::Begin {
+                reply,
+                _lease: SessionLease { activity },
+                stopping: Arc::clone(&app.stopping),
+            })
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), result)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.status, 503);
     }
 
     fn record_delivered_files(setup: &WorkerSetup, files: Vec<FileRecord>) {

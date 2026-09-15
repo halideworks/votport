@@ -1024,10 +1024,13 @@ pub(crate) fn begin_outbound_operation<'a>(
     app: &'a App,
     tenant: &str,
 ) -> ApiResult<OutboundOperation<'a>> {
-    let operation = app
-        .sessions
-        .try_begin_outbound(tenant)
-        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "tenant deletion in progress"))?;
+    let operation = app.sessions.try_begin_outbound(tenant).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tenant deletion in progress",
+        )
+        .with_retry_after(1)
+    })?;
     if !tenant.is_empty()
         && app
             .store
@@ -1044,7 +1047,13 @@ fn begin_outbound_operation_owned(app: &App, tenant: &str) -> ApiResult<OwnedOut
     let operation = app
         .sessions
         .try_begin_outbound_owned(tenant)
-        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "tenant deletion in progress"))?;
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "tenant deletion in progress",
+            )
+            .with_retry_after(1)
+        })?;
     if !tenant.is_empty()
         && app
             .store
@@ -1586,7 +1595,7 @@ pub async fn create_automation_token(
     };
     app.store
         .insert_automation_token(token.clone())
-        .map_err(ApiError::internal)?;
+        .map_err(super::store_unavailable)?;
     app.store.audit(
         &identity.tenant,
         &identity.subject,
@@ -1649,6 +1658,7 @@ pub async fn create_outbound_grant(
             StatusCode::TOO_MANY_REQUESTS,
             "too many grant preparations; try again later",
         )
+        .with_retry_after(1)
     })?;
     let Json(request) = Json::<CreateOutboundRequest>::from_request(request, &app)
         .await
@@ -2300,7 +2310,7 @@ async fn create_library_grant(
                 options.workflow.as_ref(),
                 Some(&token),
             )
-            .map_err(ApiError::internal)?;
+            .map_err(super::store_unavailable)?;
     }
     app.store.audit(
         &identity.tenant,
@@ -3025,7 +3035,8 @@ pub async fn outbound_batch(
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many downloads; try again later",
-        ));
+        )
+        .with_retry_after(600));
     }
     let count = if grant.files.is_empty() {
         1
@@ -3469,7 +3480,8 @@ async fn outbound_file_inner(
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many downloads; try again later",
-        ));
+        )
+        .with_retry_after(600));
     }
     let legacy = grant.files.is_empty() && file.is_none();
     let (source, operation) = source_info_async(
@@ -3553,7 +3565,8 @@ async fn outbound_file_head_inner(
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many downloads; try again later",
-        ));
+        )
+        .with_retry_after(600));
     }
     let (source, _operation) =
         source_info_async(&app, Arc::clone(&grant), index, file, operation, None).await?;
@@ -3709,7 +3722,8 @@ pub async fn outbound_bundle(
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many downloads; try again later",
-        ));
+        )
+        .with_retry_after(600));
     }
     let count = if grant.files.is_empty() {
         1
@@ -4738,7 +4752,8 @@ impl ActiveDownload {
             return Err(ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 "too many downloads in progress",
-            ));
+            )
+            .with_retry_after(1));
         }
         active.insert(key.to_owned());
         drop(active);
@@ -4957,6 +4972,22 @@ mod tests {
             &app.config.admin_token_tag,
         );
         format!("votport_admin={token}")
+    }
+
+    #[test]
+    fn outbound_operation_refusal_is_retryable_during_tenant_purge() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let operation = app.sessions.try_begin_outbound("acme").unwrap();
+        let _pin = app.sessions.try_pin_tenant("acme").unwrap();
+        let error = match begin_outbound_operation(&app, "acme") {
+            Err(error) => error,
+            Ok(_) => panic!("tenant purge did not block a second outbound operation"),
+        };
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.retry_after_seconds, Some(1));
+        assert_eq!(error.code, "unavailable");
+        drop(operation);
     }
 
     async fn body(response: Response) -> serde_json::Value {

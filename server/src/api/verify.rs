@@ -31,7 +31,8 @@ pub async fn verify_receipt(
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many checks from your address; try again later",
-        ));
+        )
+        .with_retry_after(600));
     }
     if body.is_empty() {
         return Err(not_a_receipt());

@@ -232,7 +232,8 @@ pub(crate) async fn check_password(
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed attempts; wait a minute",
-        ));
+        )
+        .with_retry_after(60));
     }
     let password = password.unwrap_or_default().to_owned();
     let hash = hash.to_owned();
@@ -376,6 +377,12 @@ async fn prepare_session(
     peer: &std::net::SocketAddr,
     parse: impl FnOnce() -> ApiResult<ObjectId>,
 ) -> ApiResult<PreparedSession> {
+    if app.is_stopping() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the server is shutting down; retry after restart",
+        ));
+    }
     // Refuse new sessions while draining so active uploads finish before a
     // restart. 503 is transient to the sender, which pauses and resumes.
     if app
@@ -407,7 +414,8 @@ async fn prepare_session(
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many uploads started from your address; try again later",
-        ));
+        )
+        .with_retry_after(600));
     }
     if !link_authorized(app, &link, headers) {
         check_password(
@@ -510,7 +518,8 @@ async fn register_session(
     sender: mpsc::Sender<Cmd>,
     kind: session::SessionKind,
     route: Option<&crate::store::InboundRoute>,
-) -> ApiResult<()> {
+    admission_guard: session::AdmissionGuard,
+) -> ApiResult<session::AdmissionGuard> {
     #[cfg(test)]
     app.sessions.wait_session_create_stall().await;
     let transport = if matches!(kind, session::SessionKind::Http) {
@@ -532,10 +541,13 @@ async fn register_session(
     // Off the runtime thread: admission's quota check reads the store.
     let admit_app = Arc::clone(app);
     let admit_tenant = prepared.link.tenant.clone();
-    tokio::task::spawn_blocking(move || {
-        admit_app.sessions.insert_admitted(admission, sender, || {
-            admit_app.store.tenant_admission_usage(&admit_tenant)
-        })
+    let admission_guard = tokio::task::spawn_blocking(move || {
+        admit_app.sessions.insert_admitted_with_guard(
+            admission,
+            sender,
+            || admit_app.store.tenant_admission_usage(&admit_tenant),
+            admission_guard,
+        )
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?
@@ -563,7 +575,7 @@ async fn register_session(
                     return Err(ApiError::new(StatusCode::CONFLICT, error));
                 }
             }
-            Ok(())
+            Ok(admission_guard)
         }
         Ok(_) => {
             app.sessions.remove(id);
@@ -586,6 +598,10 @@ async fn register_session(
 
 fn session_insert_error(app: &App, tenant: &str, error: session::InsertError) -> ApiError {
     match error {
+        session::InsertError::ShuttingDown => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the server is shutting down; retry after restart",
+        ),
         session::InsertError::TenantPinned => {
             audit_session_rejected(app, tenant, "tenant pinned for delete");
             ApiError::new(StatusCode::GONE, "this link's tenant no longer exists")
@@ -607,6 +623,7 @@ fn session_insert_error(app: &App, tenant: &str, error: session::InsertError) ->
                 StatusCode::TOO_MANY_REQUESTS,
                 "too many concurrent uploads for this tenant",
             )
+            .with_retry_after(1)
         }
         session::InsertError::Capacity => {
             audit_session_rejected(app, tenant, "global or per-link session cap");
@@ -614,6 +631,7 @@ fn session_insert_error(app: &App, tenant: &str, error: session::InsertError) ->
                 StatusCode::TOO_MANY_REQUESTS,
                 "too many uploads in progress; try again shortly",
             )
+            .with_retry_after(1)
         }
         session::InsertError::Store(error) => super::store_unavailable(error),
     }
@@ -681,13 +699,20 @@ pub async fn create_session(
     // Depth matches the client's chunk concurrency so handlers rarely block
     // on send. Register the sender before the worker can create_dir_all.
     let (sender, receiver) = mpsc::channel(8);
-    register_session(
+    let admission_guard = app.sessions.try_admit().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the server is shutting down; retry after restart",
+        )
+    })?;
+    let _admission_guard = register_session(
         &app,
         &prepared,
         &session_id,
         sender,
         session::SessionKind::Http,
         route.as_ref(),
+        admission_guard,
     )
     .await?;
     session::spawn_worker(setup, receiver);
@@ -766,6 +791,12 @@ pub async fn create_push_session(
     let holder = ed25519_dalek::VerifyingKey::from_bytes(&holder)
         .map_err(|_| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid holder_key"))?
         .to_bytes();
+    let admission_guard = app.sessions.try_admit().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the server is shutting down; retry after restart",
+        )
+    })?;
     let session_id = auth::random_token();
     let session_bytes: [u8; 16] = hex::decode(&session_id)
         .ok()
@@ -839,19 +870,23 @@ pub async fn create_push_session(
         ended: app.session_ended.clone(),
     };
     let (sender, _receiver) = mpsc::channel(1);
-    if let Err(error) = register_session(
+    let admission_guard = match register_session(
         &app,
         &prepared,
         &session_id,
         sender,
         session::SessionKind::Push(control.clone()),
         route.as_ref(),
+        admission_guard,
     )
     .await
     {
-        let _ = std::fs::remove_dir(&directory);
-        return Err(error);
-    }
+        Ok(guard) => guard,
+        Err(error) => {
+            let _ = std::fs::remove_dir(&directory);
+            return Err(error);
+        }
+    };
 
     if let Err(error) = session::persist_push(&setup, key) {
         app.sessions.remove(&session_id);
@@ -927,6 +962,7 @@ pub async fn create_push_session(
             "bytes": prepared.expected.length
         }),
     );
+    drop(admission_guard);
     Ok(Json(json!({
         "session": session_id,
         "capability": base64::engine::general_purpose::STANDARD.encode(capability),
@@ -1009,7 +1045,13 @@ pub async fn upload_begin(
     State(app): State<Arc<App>>,
     Path(sid): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let entries = dispatch(&app, &sid, |reply, _lease| Cmd::Begin { reply, _lease }).await?;
+    let stopping = Arc::clone(&app.stopping);
+    let entries = dispatch(&app, &sid, |reply, _lease| Cmd::Begin {
+        reply,
+        _lease,
+        stopping,
+    })
+    .await?;
     Ok(Json(json!({ "entries": entries })))
 }
 
@@ -1269,6 +1311,7 @@ mod session_rate_tests {
             .unwrap();
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "600");
     }
 
     #[tokio::test]
@@ -1312,6 +1355,7 @@ mod session_rate_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
         assert_eq!(
             application.sessions.total(),
             application.config.max_link_sessions
@@ -1352,6 +1396,61 @@ mod session_rate_tests {
         release.send(()).unwrap();
 
         assert_eq!(create.await.unwrap().status(), StatusCode::GONE);
+        assert_eq!(application.sessions.total(), 0);
+    }
+
+    #[tokio::test]
+    async fn session_creation_stopped_while_registration_is_waiting_has_no_late_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_link(open_link("shutdown-race"))
+            .unwrap();
+        let (entered, release) = application.sessions.arm_session_create_stall();
+        let router = app::router(application.clone());
+        let mut create = tokio::spawn(async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/r/shutdown-race/session")
+                        .header("content-type", "application/json")
+                        .extension(ConnectInfo(std::net::SocketAddr::from((
+                            [127, 0, 0, 1],
+                            1234,
+                        ))))
+                        .body(Body::from(
+                            r#"{"package":{"suite":"blake3","root":"0000000000000000000000000000000000000000000000000000000000000000","length":1}}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        if tokio::time::timeout(std::time::Duration::from_secs(1), entered)
+            .await
+            .is_err()
+        {
+            let _ = release.send(());
+            create.abort();
+            let _ = create.await;
+            panic!("session creation did not reach the admission barrier");
+        }
+        application.request_shutdown();
+        let _ = application.sessions.take_http();
+        release.send(()).unwrap();
+
+        let response =
+            match tokio::time::timeout(std::time::Duration::from_secs(1), &mut create).await {
+                Ok(result) => result.unwrap(),
+                Err(_) => {
+                    create.abort();
+                    let _ = create.await;
+                    panic!("session creation did not finish after admission release");
+                }
+            };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(application.sessions.total(), 0);
     }
 

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -293,7 +293,8 @@ pub async fn admin_login(
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed attempts; wait a minute",
-        ));
+        )
+        .with_retry_after(60));
     }
     // Sign-in's own argon2 budget, and nothing global that can refuse or
     // delay a correct password. The permit moves into the blocking task, so
@@ -365,7 +366,24 @@ pub async fn admin_audit_export(
             "before_rowid cannot be combined with since or after_rowid",
         ));
     }
-    let limit = query.limit.unwrap_or(1000).min(10_000);
+    let limit = query
+        .limit
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "limit must be between 1 and 10000",
+            )
+        })?
+        .unwrap_or(1000);
+    if !(1..=10_000).contains(&limit) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "limit must be between 1 and 10000",
+        ));
+    }
     let event = validate_audit_filter(query.event, "event")?;
     let search = validate_audit_filter(query.q, "q")?;
     let since = query.since;
@@ -394,6 +412,7 @@ pub async fn admin_audit_export(
     .await
     .map_err(|_| ApiError::internal("audit query worker failed"))?
     .map_err(ApiError::internal)?;
+    let cursor = rows.last().map(|row| format!("{},{}", row.at, row.rowid));
     use std::fmt::Write as _;
     let mut body = String::new();
     for row in rows {
@@ -413,14 +432,22 @@ pub async fn admin_audit_export(
         )
         .map_err(|error| ApiError::internal(error.to_string()))?;
     }
-    Ok((
+    let mut response = (
         [(
             axum::http::header::CONTENT_TYPE,
             "application/x-ndjson; charset=utf-8",
         )],
         body,
     )
-        .into_response())
+        .into_response();
+    if let Some(cursor) = cursor {
+        response.headers_mut().insert(
+            "x-votport-audit-cursor",
+            HeaderValue::try_from(cursor)
+                .map_err(|_| ApiError::internal("audit cursor header invalid"))?,
+        );
+    }
+    Ok(response)
 }
 
 /// Platform-wide link and live-byte totals without loading upload history.
@@ -440,7 +467,7 @@ pub struct AuditQuery {
     /// final `rowid`).
     after_rowid: Option<u64>,
     before_rowid: Option<u64>,
-    limit: Option<u64>,
+    limit: Option<String>,
     event: Option<String>,
     q: Option<String>,
 }
@@ -3248,7 +3275,8 @@ pub async fn admin_change_password(
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed attempts; wait a minute",
-        ));
+        )
+        .with_retry_after(60));
     }
     // Its own budget, not the sign-in one: rotating the password is what an
     // operator does while under attack, so an anonymous sign-in flood must
@@ -3947,7 +3975,7 @@ pub async fn update_link(
         if app
             .store
             .link_metadata(&identity.tenant, &id)
-            .map_err(ApiError::internal)?
+            .map_err(super::store_unavailable)?
             .is_none()
         {
             return Err(ApiError::not_found());
@@ -3961,7 +3989,7 @@ pub async fn update_link(
         let found = app
             .store
             .set_link_legal_hold(&identity.tenant, &id, legal_hold, &identity.subject)
-            .map_err(ApiError::internal)?;
+            .map_err(super::store_unavailable)?;
         if !found {
             return Err(ApiError::not_found());
         }
@@ -3981,7 +4009,7 @@ pub async fn update_link(
             .update_link(&identity.tenant, &id, |link| {
                 link.notifications = Some(policy.clone());
             })
-            .map_err(ApiError::internal)?
+            .map_err(super::store_unavailable)?
         {
             return Err(ApiError::not_found());
         }
@@ -4348,6 +4376,7 @@ mod handler_tests {
 
     use axum::body::Body;
     use axum::http::Request;
+    use http_body_util::BodyExt as _;
     use tower::ServiceExt;
 
     use crate::api::testing;
@@ -4842,7 +4871,25 @@ mod handler_tests {
 
         let router = app::router(application.clone());
         let cookie = login_cookie(router).await;
-        let router = app::router(application);
+        let expected_cursor = application
+            .store
+            .audit_export(None, 0, 0, 100)
+            .unwrap()
+            .last()
+            .map(|row| format!("{},{}", row.at, row.rowid));
+        let router = app::router(application.clone());
+        for limit in ["0", "10001"] {
+            let response = app::router(application.clone())
+                .oneshot(
+                    Request::get(format!("/api/admin/audit?limit={limit}"))
+                        .header("cookie", &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
         let request = Request::builder()
             .uri("/api/admin/audit?limit=100")
             .header("cookie", &cookie)
@@ -4850,6 +4897,13 @@ mod handler_tests {
             .unwrap();
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-votport-audit-cursor")
+                .and_then(|value| value.to_str().ok()),
+            expected_cursor.as_deref()
+        );
         use http_body_util::BodyExt as _;
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(body.to_vec()).unwrap();
@@ -4857,6 +4911,85 @@ mod handler_tests {
         assert_eq!(line["event"], "link_created");
         assert_eq!(line["subject"], "l-1");
         assert_eq!(line["detail"]["label"], "x");
+    }
+
+    #[tokio::test]
+    async fn audit_export_cursor_walks_tied_timestamps_to_empty_terminal_page() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .with(|connection| {
+                for index in 0..5 {
+                    connection.execute(
+                        "INSERT INTO audit_log(at,tenant,actor,event,subject,detail)
+                         VALUES (?1,'','','cursor_test',?2,'{}')",
+                        rusqlite::params![77_i64, format!("subject-{index}")],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let cookie = login_cookie(app::router(application.clone())).await;
+        let mut after_rowid = 0;
+        let mut subjects = Vec::new();
+        for expected_count in [2, 2, 1] {
+            let response = app::router(application.clone())
+                .oneshot(
+                    Request::get(format!(
+                        "/api/admin/audit?limit=2&since=77&after_rowid={after_rowid}&event=cursor_test"
+                    ))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let cursor = response
+                .headers()
+                .get("x-votport-audit-cursor")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            use http_body_util::BodyExt as _;
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let rows: Vec<_> = String::from_utf8(body.to_vec())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), expected_count);
+            let last = rows.last().unwrap();
+            let expected_cursor = format!("77,{}", last["rowid"]);
+            assert_eq!(cursor.as_deref(), Some(expected_cursor.as_str()));
+            after_rowid = last["rowid"].as_u64().unwrap();
+            subjects.extend(
+                rows.into_iter()
+                    .map(|row| row["subject"].as_str().unwrap().to_owned()),
+            );
+        }
+        assert_eq!(
+            subjects,
+            (0..5)
+                .map(|index| format!("subject-{index}"))
+                .collect::<Vec<_>>()
+        );
+
+        let response = app::router(application)
+            .oneshot(
+                Request::get(format!(
+                    "/api/admin/audit?limit=2&since=77&after_rowid={after_rowid}&event=cursor_test"
+                ))
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("x-votport-audit-cursor").is_none());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
     }
 
     #[tokio::test]
@@ -7527,8 +7660,10 @@ mod backup_tests {
             serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
         let id = created["id"].as_str().unwrap();
-        let shutdown = Arc::clone(&application.shutdown);
-        let shutdown_waiter = tokio::spawn(async move { shutdown.notified().await });
+        let shutdown_application = Arc::clone(&application);
+        let shutdown_waiter = tokio::spawn(async move {
+            shutdown_application.wait_for_shutdown().await;
+        });
         tokio::task::yield_now().await;
         let response = app::router(application.clone())
             .oneshot(

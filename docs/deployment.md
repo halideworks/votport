@@ -604,6 +604,9 @@ clears optional values. See the [configuration reference](../README.md#configura
 Named destinations and recipient lists are managed separately under
 [Notifications](notifications.md).
 
+Primary and standby startup warn once about each unrecognized `VOTPORT_*`
+environment name. Warnings include the name only; unknown settings are ignored.
+
 ## Admin password minimum
 
 `VOTPORT_ADMIN_PASSWORD` must be at least 12 characters, and votport exits at
@@ -979,8 +982,10 @@ is diagnostic and never authorizes takeover. Do not point a single-upstream
 proxy at `/readyz`: drain keeps downloads and the admin pages up on purpose,
 and a proxy that drops the upstream on 503 would take them down.
 
-In-flight upload sessions survive a restart. On SIGTERM the process stops
-serving, then each upload worker records how far its file is contiguously
+In-flight upload sessions survive a restart. SIGTERM and API restart close new
+transfer admission and make `/readyz` return 503. Existing HTTP and native
+transfers share a 240-second drain window, followed by up to 30 seconds for
+upload checkpoints. Each upload worker records how far its file is contiguously
 verified and leaves its staging on disk; at boot those sessions are re-attached
 under the same session id and the sender continues from that offset (the
 browser pauses while the server is down, then re-begins on its own). Ranges

@@ -65,6 +65,21 @@ fn conflict(error: String) -> ApiError {
     ApiError::new(StatusCode::CONFLICT, error)
 }
 
+fn workflow_store_error(error: crate::store::WorkflowMutationError) -> ApiError {
+    match error {
+        crate::store::WorkflowMutationError::Invalid(message) => {
+            ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message)
+        }
+        crate::store::WorkflowMutationError::Conflict(message) => conflict(message),
+        crate::store::WorkflowMutationError::OperationConflict(message) => {
+            conflict(message).with_code("operation_conflict")
+        }
+        crate::store::WorkflowMutationError::Store(message) => {
+            crate::api::store_unavailable(message)
+        }
+    }
+}
+
 pub async fn projects(
     State(app): State<Arc<App>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -101,7 +116,7 @@ pub async fn put_project(
     let project = app
         .store
         .save_delivery_project(&identity.tenant, &identity.subject, project)
-        .map_err(conflict)?;
+        .map_err(workflow_store_error)?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(project)).into_response())
 }
 
@@ -152,7 +167,7 @@ pub async fn create(
             project,
             request,
         )
-        .map_err(conflict)?;
+        .map_err(workflow_store_error)?;
     app.workflow_ready.notify_one();
     Ok((
         StatusCode::ACCEPTED,
@@ -403,7 +418,7 @@ pub async fn reprocess(
             &request.manifest,
             request.project_revision,
         )
-        .map_err(conflict)?;
+        .map_err(workflow_store_error)?;
     app.workflow_ready.notify_one();
     Ok((
         StatusCode::ACCEPTED,
@@ -473,7 +488,7 @@ pub async fn change(
             &action.action,
             action.manifest.as_deref(),
         )
-        .map_err(conflict)?;
+        .map_err(workflow_store_error)?;
     app.workflow_ready.notify_one();
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
@@ -594,7 +609,7 @@ pub async fn export_events(
 
 pub async fn worker(app: Arc<App>) {
     loop {
-        if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) {
+        if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) || app.is_stopping() {
             return;
         }
         if let Ok(operation) = begin_outbound_operation(&app, "") {
@@ -610,7 +625,7 @@ pub async fn worker(app: Arc<App>) {
                                 .fail_delivery_job(&job.id, job.attempts, &error.message)
                         {
                             tracing::error!(%store_error,job_id=%job.id,"record delivery job failure");
-                            tokio::select! { _ = app.shutdown.notified() => return, _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {} }
+                            tokio::select! { _ = app.wait_for_shutdown() => return, _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {} }
                         }
                     }
                     if let Ok(Some(current)) = app.store.delivery_job(&job.id) {
@@ -631,7 +646,7 @@ pub async fn worker(app: Arc<App>) {
                 _ => {}
             }
         }
-        tokio::select! { _ = app.shutdown.notified() => return, _ = app.workflow_ready.notified() => {}, _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {} }
+        tokio::select! { _ = app.wait_for_shutdown() => return, _ = app.workflow_ready.notified() => {}, _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {} }
     }
 }
 
@@ -732,7 +747,11 @@ async fn prepare(app: &Arc<App>, mut job: Job) -> ApiResult<()> {
     });
     for id in &job.project.destinations {
         if job.checks["trade_routes"][id]["permission"]["grant"] == "" {
-            let route = app.store.trade_route(&job.tenant, id).map_err(conflict)?;
+            let route = app
+                .store
+                .trade_route(&job.tenant, id)
+                .map_err(crate::api::store_unavailable)?
+                .ok_or_else(|| conflict("trade route is missing".into()))?;
             if route.remote_grant.is_empty() {
                 return Err(conflict(
                     "route enrollment is incomplete; retry after pairing".into(),
@@ -1414,13 +1433,13 @@ pub async fn event_worker(app: Arc<App>) {
     };
     let mut next_retirement = tokio::time::Instant::now();
     loop {
-        if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) {
+        if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) || app.is_stopping() {
             return;
         }
         if let Err(error) = dispatch_events(&app, &client).await {
             tracing::error!(%error,"dispatch delivery events");
         }
-        if tokio::time::Instant::now() >= next_retirement {
+        if !app.is_stopping() && tokio::time::Instant::now() >= next_retirement {
             match retire_snapshot(&app).await {
                 Ok(true) => next_retirement = tokio::time::Instant::now() + DISPATCH_INTERVAL,
                 Ok(false) => {
@@ -1432,7 +1451,7 @@ pub async fn event_worker(app: Arc<App>) {
                 }
             }
         }
-        tokio::select! { _ = app.shutdown.notified() => return, _ = tokio::time::sleep(DISPATCH_INTERVAL) => {} }
+        tokio::select! { _ = app.wait_for_shutdown() => return, _ = tokio::time::sleep(DISPATCH_INTERVAL) => {} }
     }
 }
 
@@ -1441,6 +1460,9 @@ async fn dispatch_events(app: &App, client: &reqwest::Client) -> Result<(), Stri
     app.store.escalate_delivery_jobs(now_unix())?;
     app.store.queue_delivery_webhooks(now_unix())?;
     for attempt in app.store.due_delivery_webhooks(now_unix())? {
+        if app.is_stopping() {
+            break;
+        }
         let Some(hook) = app
             .store
             .delivery_webhook(&attempt.tenant)?
@@ -1634,6 +1656,182 @@ mod tests {
                 &app.config.admin_token_tag
             )
         )
+    }
+
+    #[test]
+    fn workflow_store_errors_keep_domain_statuses_and_hide_unknown_failures() {
+        let operation =
+            workflow_store_error(crate::store::WorkflowMutationError::OperationConflict(
+                "operation ID already used with a different request".into(),
+            ));
+        assert_eq!(operation.status, StatusCode::CONFLICT);
+        assert_eq!(operation.code, "operation_conflict");
+
+        let validation = workflow_store_error(crate::store::WorkflowMutationError::Invalid(
+            "unknown job action".into(),
+        ));
+        assert_eq!(validation.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(validation.code, "invalid_request");
+
+        let store = workflow_store_error(crate::store::WorkflowMutationError::Store(
+            "UNIQUE constraint failed: delivery_jobs".into(),
+        ));
+        assert_eq!(store.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(store.code, "request_failed");
+        assert_eq!(store.message, "database unavailable; try again");
+    }
+
+    #[tokio::test]
+    async fn approval_route_distinguishes_storage_policy_from_store_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let destination = directory.path().join("destination");
+        std::fs::create_dir(&destination).unwrap();
+        let storage = serde_json::from_value(json!({
+            "id": "destination",
+            "revision": 0,
+            "label": "Destination",
+            "kind": "folder",
+            "directory": destination,
+            "tenants": [""],
+            "enabled": true
+        }))
+        .unwrap();
+        app.store
+            .save_delivery_storage("local", storage, None)
+            .unwrap();
+        std::fs::create_dir_all(app.config.outbound_dir.join("project")).unwrap();
+        std::fs::write(
+            app.config.outbound_dir.join("project/file.bin"),
+            b"contents",
+        )
+        .unwrap();
+        let mut project = crate::workflow::tests::project();
+        project.destinations = vec!["destination".into()];
+        let project = app
+            .store
+            .save_delivery_project("", "local", project)
+            .unwrap();
+        let job = app
+            .store
+            .enqueue_delivery_job(
+                "",
+                "sender",
+                1,
+                None,
+                project,
+                crate::workflow::tests::request(),
+            )
+            .unwrap();
+        let running = app
+            .store
+            .claim_delivery_job("worker", now_unix())
+            .unwrap()
+            .unwrap();
+        prepare(&app, running).await.unwrap();
+        let pending = app.store.delivery_job(&job.id).unwrap().unwrap();
+        assert_eq!(pending.state, "awaiting_approval");
+        let cookie = admin_cookie(&app);
+        let action = json!({
+            "action": "approve",
+            "manifest": pending.manifest.clone().unwrap()
+        });
+        app.store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE delivery_storage SET document=json_set(document,'$.enabled',json('false')) WHERE id='destination'",
+                    [],
+                )
+            })
+            .unwrap();
+        let response = call(
+            &app,
+            Method::POST,
+            &format!("/api/workflows/jobs/{}", job.id),
+            Some(&cookie),
+            Some(action.clone()),
+        )
+        .await;
+        assert_eq!(
+            response.0,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&response.2)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&response.2).unwrap();
+        assert_eq!(
+            body["error"],
+            "storage authorization changed; submit a new job"
+        );
+        assert_eq!(body["retryable"], false);
+
+        app.store
+            .with(|connection| connection.execute_batch("DROP TABLE delivery_storage"))
+            .unwrap();
+        let response = call(
+            &app,
+            Method::POST,
+            &format!("/api/workflows/jobs/{}", job.id),
+            Some(&cookie),
+            Some(action),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
+        let body: serde_json::Value = serde_json::from_slice(&response.2).unwrap();
+        assert_eq!(body["error"], "database unavailable; try again");
+        assert_eq!(body["retryable"], true);
+    }
+
+    #[tokio::test]
+    async fn create_route_preserves_operation_conflict_and_invalid_job_statuses() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let cookie = admin_cookie(&app);
+        let project = app
+            .store
+            .save_delivery_project("", "local", crate::workflow::tests::project())
+            .unwrap();
+        let request = crate::workflow::tests::request();
+        let (status, _, body) = call(
+            &app,
+            Method::POST,
+            "/api/workflows/jobs",
+            Some(&cookie),
+            Some(serde_json::to_value(&request).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(created["job"]["project"]["id"], project.id);
+
+        let mut duplicate = request.clone();
+        duplicate.label = "different request".into();
+        let (status, _, body) = call(
+            &app,
+            Method::POST,
+            "/api/workflows/jobs",
+            Some(&cookie),
+            Some(serde_json::to_value(duplicate).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "operation_conflict");
+
+        let mut invalid = request;
+        invalid.operation_id = "invalid-operation".into();
+        invalid.expires_days = 0;
+        let (status, _, body) = call(
+            &app,
+            Method::POST,
+            "/api/workflows/jobs",
+            Some(&cookie),
+            Some(serde_json::to_value(invalid).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "invalid_request");
     }
 
     #[tokio::test]
@@ -2856,7 +3054,10 @@ mod tests {
                 crate::api::trade::enroll_outgoing(&source, &route)
                     .await
                     .unwrap();
-                assert_eq!(source.store.trade_route("", "nyc").unwrap().state, "active");
+                assert_eq!(
+                    source.store.trade_route("", "nyc").unwrap().unwrap().state,
+                    "active"
+                );
             } else {
                 source
                     .store

@@ -33,6 +33,7 @@ use super::outbound::{
 };
 use super::{ApiError, ApiResult};
 use crate::app::App;
+use crate::session::AdmissionGuard;
 use crate::store::{now_unix, FetchTicket, OutboundGrant};
 
 /// vot-cli's bundle layout, which `BundleServer::assemble` reads and which
@@ -169,17 +170,26 @@ impl ServeRegistry {
     }
 
     /// Takes the fetch's slot on its first session, counts every later one.
-    fn claim_slot(&self, app: &Arc<App>, token: [u8; 16], token_hash: &str) -> Result<(), ()> {
+    fn claim_slot(
+        &self,
+        app: &Arc<App>,
+        token: [u8; 16],
+        token_hash: &str,
+        admission: Option<AdmissionGuard>,
+    ) -> Result<Option<AdmissionGuard>, ()> {
         let mut slots = self.slots.lock().expect("serve registry poisoned");
         if let Some(slot) = slots.get_mut(&token) {
             slot.sessions += 1;
-            return Ok(());
+            return Ok(None);
         }
+        let Some(admission) = admission else {
+            return Err(());
+        };
         let key = format!("{token_hash}:quic:{}", hex::encode(token));
         let guard =
             ActiveDownload::claim_with_grant(Arc::clone(app), &key, token_hash).map_err(|_| ())?;
         slots.insert(token, FetchSlot { guard, sessions: 1 });
-        Ok(())
+        Ok(Some(admission))
     }
 
     /// Releases one session of a fetch; the last one returns the slot, so a
@@ -732,6 +742,12 @@ pub async fn mint_fetch(
     let Some(serve) = app.serve.as_ref() else {
         return Err(ApiError::not_found());
     };
+    let admission = app.sessions.try_admit().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the server is shutting down; retry after restart",
+        )
+    })?;
     let grant = active_grant(&app, &token)?;
     let _operation = begin_outbound_operation(&app, &grant.tenant)?;
     require_grant_access(&app, &grant, &headers)?;
@@ -739,7 +755,8 @@ pub async fn mint_fetch(
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many requests for this delivery",
-        ));
+        )
+        .with_retry_after(600));
     }
     let holder = hex::decode(&request.holder_key)
         .ok()
@@ -812,6 +829,7 @@ pub async fn mint_fetch(
             now_unix(),
         )
         .map_err(super::store_unavailable)?;
+    drop(admission);
     if !reserved {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -958,13 +976,18 @@ pub(crate) fn admit_fetch(
     ) else {
         return refuse(app, ServeRefusalReason::Capability, peer);
     };
-    if serve
+    // Acquire before looking at the slot. If the last rail drops between a
+    // preliminary check and claim_slot, the permit lets this valid fetch
+    // become the new owner instead of being falsely refused as busy. An
+    // already-running slot consumes and drops this permit in claim_slot.
+    let admission = app.sessions.try_admit();
+    let admission = match serve
         .registry
-        .claim_slot(app, token, &grant.token_hash)
-        .is_err()
+        .claim_slot(app, token, &grant.token_hash, admission)
     {
-        return refuse(app, ServeRefusalReason::Busy, peer);
-    }
+        Ok(admission) => admission,
+        Err(()) => return refuse(app, ServeRefusalReason::Busy, peer),
+    };
     let hold = SessionHold {
         registry: Arc::clone(&serve.registry),
         token,
@@ -976,6 +999,7 @@ pub(crate) fn admit_fetch(
     {
         return refuse_closed_fetch(app, token, peer);
     }
+    drop(admission);
     tracing::info!(
         target: "audit", event = "serve_admitted", grant_id = %grant.id, %peer,
         "fetch session admitted"
@@ -1440,8 +1464,18 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
         let registry = Arc::new(ServeRegistry::default());
-        registry.claim_slot(&app, [1; 16], "hash").unwrap();
-        registry.claim_slot(&app, [1; 16], "hash").unwrap();
+        registry
+            .claim_slot(&app, [1; 16], "hash", app.sessions.try_admit())
+            .unwrap();
+        registry
+            .claim_slot(&app, [2; 16], "hash", app.sessions.try_admit())
+            .unwrap();
+        drop(SessionHold {
+            registry: Arc::clone(&registry),
+            token: [2; 16],
+        });
+        app.request_shutdown();
+        registry.claim_slot(&app, [1; 16], "hash", None).unwrap();
         assert_eq!(registry.active_sessions(), 2);
         // No ticket names the token, but a session still runs: the sweep
         // evicts servers, never slots.
@@ -1455,15 +1489,27 @@ mod tests {
             app.outbound_active.lock().unwrap().is_empty(),
             "the download slot returned with the last session"
         );
-        // Admitted but never served (the seam discards the admission and
-        // its observer): the hold the observer owns releases on drop.
-        registry.claim_slot(&app, [2; 16], "hash").unwrap();
-        assert_eq!(registry.active_sessions(), 1);
-        drop(SessionHold {
-            registry: Arc::clone(&registry),
-            token: [2; 16],
-        });
         assert_eq!(registry.active_sessions(), 0);
         assert!(app.outbound_active.lock().unwrap().is_empty());
+        assert!(registry.claim_slot(&app, [3; 16], "hash", None).is_err());
+    }
+
+    #[test]
+    fn a_new_fetch_reclaims_a_slot_after_the_last_rail_drops() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let registry = Arc::new(ServeRegistry::default());
+        registry
+            .claim_slot(&app, [1; 16], "hash", app.sessions.try_admit())
+            .unwrap();
+        registry.release_slot([1; 16]);
+        assert_eq!(registry.active_sessions(), 0);
+
+        registry
+            .claim_slot(&app, [2; 16], "hash", app.sessions.try_admit())
+            .unwrap();
+        assert_eq!(registry.active_sessions(), 1);
+        registry.release_slot([2; 16]);
+        assert_eq!(registry.active_sessions(), 0);
     }
 }

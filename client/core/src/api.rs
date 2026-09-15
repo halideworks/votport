@@ -358,7 +358,7 @@ impl Client {
             return Err(Error::Server {
                 status: response.status().as_u16(),
                 what: "submit delivery acknowledgement".into(),
-                body: String::new(),
+                body: error_body_with_retry_after(response),
             });
         }
         #[derive(Deserialize)]
@@ -557,7 +557,7 @@ impl Client {
             })?;
             let status = response.status();
             if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-                let body = error_body(response);
+                let body = error_body_with_retry_after(response);
                 if body.contains("not fully received") {
                     return Err(Error::Rebegin);
                 }
@@ -664,7 +664,7 @@ impl Client {
                 })?;
             let status = response.status();
             if !status.is_success() {
-                let body = error_body(response);
+                let body = error_body_with_retry_after(response);
                 return Err(Error::Server {
                     status: status.as_u16(),
                     what: "delivery verify".to_owned(),
@@ -715,7 +715,7 @@ impl Client {
             })?;
             let status = response.status();
             if !status.is_success() {
-                let body = error_body(response);
+                let body = error_body_with_retry_after(response);
                 return Err(Error::Server {
                     status: status.as_u16(),
                     what: "download".to_owned(),
@@ -833,7 +833,7 @@ impl Client {
             return Err(Error::Server {
                 status: status.as_u16(),
                 what: "sign in".to_owned(),
-                body: error_body(response),
+                body: error_body_with_retry_after(response),
             });
         }
         set_cookie(&response, ADMIN_COOKIE)
@@ -1077,8 +1077,6 @@ fn is_retryable(error: &Error, idempotent: bool) -> bool {
         // 503 while draining, or 429 from a download rate limiter on an
         // idempotent GET. The budget rides out a brief burst; a delivery of
         // more files than the per-window cap needs resume, which is C7.
-        // ponytail: no Retry-After honored (the server sends none); the
-        // fixed budget is the ceiling until resume lands.
         Error::Server { status, .. } => *status == 503 || (idempotent && *status == 429),
         _ => false,
     }
@@ -1104,6 +1102,43 @@ fn retry<T>(idempotent: bool, mut attempt: impl FnMut() -> Result<T>) -> Result<
     }
 }
 
+const MAX_RETRY_AFTER_SECONDS: u64 = 24 * 60 * 60;
+
+fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let seconds = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    (seconds <= MAX_RETRY_AFTER_SECONDS).then_some(seconds)
+}
+
+fn body_with_retry_after(body: String, retry_after: Option<u64>) -> String {
+    let Some(seconds) = retry_after else {
+        return body;
+    };
+    let mut value = match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(serde_json::Value::Object(object)) => serde_json::Value::Object(object),
+        _ => serde_json::json!({
+            "error": if body.is_empty() {
+                "server refused the request".to_owned()
+            } else {
+                body.clone()
+            }
+        }),
+    };
+    let object = value.as_object_mut().expect("retry body is an object");
+    if object
+        .get("retry_after_seconds")
+        .is_some_and(|value| !value.is_null())
+    {
+        return body;
+    }
+    object.insert("retry_after_seconds".to_owned(), serde_json::json!(seconds));
+    serde_json::to_string(&value).unwrap_or(body)
+}
+
 /// Reads a JSON body, turning a non-success status into [`Error::Server`].
 fn json<T: for<'de> Deserialize<'de>>(
     response: reqwest::blocking::Response,
@@ -1111,7 +1146,7 @@ fn json<T: for<'de> Deserialize<'de>>(
 ) -> Result<T> {
     let status = response.status();
     if !status.is_success() {
-        let body = error_body(response);
+        let body = error_body_with_retry_after(response);
         return Err(Error::Server {
             status: status.as_u16(),
             what: what.to_owned(),
@@ -1129,6 +1164,13 @@ fn error_body(response: impl std::io::Read) -> String {
     let mut bytes = Vec::new();
     let _ = response.take(8192).read_to_end(&mut bytes);
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn error_body_with_retry_after(response: reqwest::blocking::Response) -> String {
+    let retry_after = (response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS)
+        .then(|| retry_after_header(response.headers()))
+        .flatten();
+    body_with_retry_after(error_body(response), retry_after)
 }
 
 /// Which way a link moves bytes.
@@ -1209,6 +1251,142 @@ mod tests {
         assert_eq!(super::error_body(std::io::repeat(b'x')).len(), 8192);
         assert_eq!(super::error_body(&b"bad\xff"[..]), "bad\u{fffd}");
         assert!(super::error_body(std::io::empty()).is_empty());
+    }
+
+    #[test]
+    fn retry_after_header_fallback_accepts_only_bounded_seconds() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "600".parse().unwrap());
+        assert_eq!(super::retry_after_header(&headers), Some(600));
+        assert_eq!(
+            super::body_with_retry_after(
+                r#"{"error":"busy","retry_after_seconds":null}"#.into(),
+                super::retry_after_header(&headers),
+            ),
+            r#"{"error":"busy","retry_after_seconds":600}"#
+        );
+        let empty: serde_json::Value =
+            serde_json::from_str(&super::body_with_retry_after(String::new(), Some(600))).unwrap();
+        assert_eq!(empty["error"], "server refused the request");
+        assert_eq!(empty["retry_after_seconds"], 600);
+        let plain: serde_json::Value = serde_json::from_str(&super::body_with_retry_after(
+            "temporarily busy".into(),
+            Some(600),
+        ))
+        .unwrap();
+        assert_eq!(plain["error"], "temporarily busy");
+        assert_eq!(plain["retry_after_seconds"], 600);
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            (super::MAX_RETRY_AFTER_SECONDS + 1)
+                .to_string()
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(super::retry_after_header(&headers), None);
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(super::retry_after_header(&headers), None);
+    }
+
+    #[test]
+    fn client_routes_header_only_retry_after_to_automation_errors() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for response in [
+                b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 600\r\nConnection: close\r\n\r\n" as &[u8],
+                b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 600\r\nConnection: close\r\n\r\n{\"error\":\"busy\",\"retry_after_seconds\":42}",
+                b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 600\r\nConnection: close\r\n\r\n{\"error\":\"busy\"}",
+                b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 600\r\nConnection: close\r\n\r\n{\"error\":\"busy\",\"retry_after_seconds\":null}",
+                b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: Wed, 21 Oct 2015 07:28:00 GMT\r\nConnection: close\r\n\r\nbusy",
+            ] {
+                let (mut stream, _) = (0..400)
+                    .find_map(|_| match listener.accept() {
+                        Ok(stream) => Some(stream),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            None
+                        }
+                        Err(error) => panic!("accept failed: {error}"),
+                    })
+                    .expect("client request reached the responder");
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut length = 0;
+                for _ in 0..64 {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                reader.read_exact(&mut vec![0; length]).unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream.write_all(response).unwrap();
+            }
+        });
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let authorization = crate::delivery_protocol::SignedChallenge::issue(
+            crate::delivery_protocol::Challenge {
+                origin: base.clone(),
+                grant_id: "grant".into(),
+                manifest: "manifest".into(),
+                holder: hex::encode(key.verifying_key().to_bytes()),
+                nonce: "nonce".into(),
+                issued_at: 1,
+                expires_at: 2,
+            },
+            &key,
+        );
+        let evidence = crate::delivery_protocol::Evidence::sign(
+            authorization,
+            crate::delivery_protocol::EvidenceKind::Accepted,
+            &key,
+        );
+        let client =
+            super::Client::with_timeout(base.clone(), Some(Duration::from_secs(2))).unwrap();
+        let error = client.submit_evidence(&evidence).unwrap_err();
+        let body = crate::automation::error_json(&error);
+        assert_eq!(body["status"], 429);
+        assert_eq!(body["retry_after_seconds"], 600);
+        assert_eq!(body["retryable"], true);
+        let error = client
+            .admin_send::<serde_json::Value>(reqwest::Method::POST, "/api/test", "", None)
+            .unwrap_err();
+        let body = crate::automation::error_json(&error);
+        assert_eq!(body["retry_after_seconds"], 42);
+        let error = client
+            .admin_send::<serde_json::Value>(reqwest::Method::POST, "/api/test", "", None)
+            .unwrap_err();
+        let body = crate::automation::error_json(&error);
+        assert_eq!(body["retry_after_seconds"], 600);
+        let error = client
+            .admin_send::<serde_json::Value>(reqwest::Method::POST, "/api/test", "", None)
+            .unwrap_err();
+        let body = crate::automation::error_json(&error);
+        assert_eq!(body["retry_after_seconds"], 600);
+        let error = client
+            .admin_send::<serde_json::Value>(reqwest::Method::POST, "/api/test", "", None)
+            .unwrap_err();
+        let body = crate::automation::error_json(&error);
+        assert_eq!(body["retry_after_seconds"], serde_json::Value::Null);
+        server.join().unwrap();
     }
 
     #[test]

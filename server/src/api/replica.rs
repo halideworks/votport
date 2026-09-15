@@ -29,7 +29,8 @@ fn authorize(app: &App, headers: &HeaderMap, ip: &str) -> ApiResult<()> {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed attempts; wait a minute",
-        ));
+        )
+        .with_retry_after(60));
     }
     let presented = headers
         .get(header::AUTHORIZATION)

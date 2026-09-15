@@ -138,11 +138,20 @@ pub async fn session(
 pub struct FilesQuery {
     directory: Option<String>,
     after: Option<String>,
-    limit: Option<usize>,
+    limit: Option<String>,
 }
 
-fn page_limit(limit: Option<usize>) -> ApiResult<usize> {
-    let limit = limit.unwrap_or(50);
+fn page_limit(limit: Option<&str>) -> ApiResult<usize> {
+    let limit = limit
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "limit must be an integer between 1 and 100",
+            )
+        })?
+        .unwrap_or(50);
     if !(1..=100).contains(&limit) {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -164,7 +173,7 @@ pub async fn files(
         .directory
         .unwrap_or_else(|| token.directory.clone().unwrap_or_default());
     check_directory(&app, &token, &directory)?;
-    let limit = page_limit(query.limit)?;
+    let limit = page_limit(query.limit.as_deref())?;
     let after = query.after.unwrap_or_default();
     if after.len() > MAX_FILE_CURSOR_BYTES {
         return Err(ApiError::new(
@@ -429,8 +438,8 @@ fn delivery_page(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeliveriesQuery {
-    after: Option<i64>,
-    limit: Option<usize>,
+    after: Option<String>,
+    limit: Option<String>,
 }
 
 pub async fn deliveries(
@@ -441,8 +450,18 @@ pub async fn deliveries(
 ) -> ApiResult<Json<serde_json::Value>> {
     let (token, _) = authenticate(&app, &headers, peer, Some("deliveries:read"))?;
     let _operation = begin_outbound_operation(&app, &token.tenant)?;
-    let limit = page_limit(query.limit)?;
-    let after = query.after.unwrap_or_default();
+    let limit = page_limit(query.limit.as_deref())?;
+    let after = query
+        .after
+        .as_deref()
+        .unwrap_or("0")
+        .parse::<i64>()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "after must be a non-negative integer",
+            )
+        })?;
     if after < 0 {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -742,6 +761,8 @@ mod tests {
         );
         for (method, path, payload) in [
             ("GET", "/api/automation/files?limit=nope", json!({})),
+            ("GET", "/api/automation/files?limit=0", json!({})),
+            ("GET", "/api/automation/deliveries?after=nope", json!({})),
             (
                 "POST",
                 "/api/automation/share",
@@ -752,6 +773,9 @@ mod tests {
             assert!(status.is_client_error());
             assert_eq!(error["code"], "invalid_request");
             assert_eq!(error["retryable"], false);
+            if path.contains("files") || path.contains("deliveries") {
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{path}");
+            }
         }
         let spec = json!({"directory": "project", "expires_days": 7, "operation_id": "render-1"});
         assert_eq!(

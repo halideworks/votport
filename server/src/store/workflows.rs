@@ -17,18 +17,86 @@ CREATE INDEX IF NOT EXISTS delivery_jobs_deadline_pending ON delivery_jobs(deadl
 CREATE INDEX IF NOT EXISTS delivery_jobs_retirement_due ON delivery_jobs(COALESCE(json_extract(document,'$.checks.retirement_attempt_at'),0),id) WHERE state IN ('retiring','failed','cancelled','ready','awaiting_approval');
 ";
 
-pub(super) fn ensure_tenant(connection: &Connection, tenant: &str) -> Result<(), String> {
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorkflowMutationError {
+    Invalid(String),
+    Conflict(String),
+    OperationConflict(String),
+    Store(String),
+}
+
+impl WorkflowMutationError {
+    pub(super) fn invalid(message: impl Into<String>) -> Self {
+        Self::Invalid(message.into())
+    }
+
+    pub(super) fn conflict(message: impl Into<String>) -> Self {
+        Self::Conflict(message.into())
+    }
+
+    pub(super) fn operation_conflict(message: impl Into<String>) -> Self {
+        Self::OperationConflict(message.into())
+    }
+
+    pub(super) fn store(message: impl Into<String>) -> Self {
+        Self::Store(message.into())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, needle: &str) -> bool {
+        self.message().contains(needle)
+    }
+
+    #[cfg(test)]
+    fn message(&self) -> &str {
+        match self {
+            Self::Invalid(message)
+            | Self::Conflict(message)
+            | Self::OperationConflict(message)
+            | Self::Store(message) => message,
+        }
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<&str> for WorkflowMutationError {
+    fn eq(&self, other: &&str) -> bool {
+        self.message() == *other
+    }
+}
+
+impl From<String> for WorkflowMutationError {
+    fn from(message: String) -> Self {
+        Self::Store(message)
+    }
+}
+
+impl From<WorkflowMutationError> for String {
+    fn from(error: WorkflowMutationError) -> Self {
+        match error {
+            WorkflowMutationError::Invalid(message)
+            | WorkflowMutationError::Conflict(message)
+            | WorkflowMutationError::OperationConflict(message)
+            | WorkflowMutationError::Store(message) => message,
+        }
+    }
+}
+
+pub(super) fn ensure_tenant(
+    connection: &Connection,
+    tenant: &str,
+) -> Result<(), WorkflowMutationError> {
     let exists: bool = connection
         .query_row(
             "SELECT ?1='' OR EXISTS(SELECT 1 FROM tenants WHERE key=?1)",
             [tenant],
             |row| row.get(0),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| WorkflowMutationError::store(e.to_string()))?;
     if exists {
         Ok(())
     } else {
-        Err("tenant missing".into())
+        Err(WorkflowMutationError::conflict("tenant missing"))
     }
 }
 
@@ -121,10 +189,12 @@ fn principal_active(
     connection.query_row("SELECT COALESCE((SELECT blocked=0 AND credential_version=?2 FROM principals WHERE subject=?1), ?2=1)", params![actor,credential_version as i64], |row| row.get(0))
 }
 
-fn actor_active(connection: &Connection, job: &Job) -> Result<(), String> {
+fn actor_active(connection: &Connection, job: &Job) -> Result<(), WorkflowMutationError> {
     if let Some(received) = &job.received {
         if !job.project.receive {
-            return Err("project no longer accepts incoming workflows".into());
+            return Err(WorkflowMutationError::conflict(
+                "project no longer accepts incoming workflows",
+            ));
         }
         if job.actor == format!("reception:{}", received.link_id)
             && job.credential_version == 0
@@ -137,11 +207,14 @@ fn actor_active(connection: &Connection, job: &Job) -> Result<(), String> {
         connection.query_row("SELECT EXISTS(SELECT 1 FROM automation_tokens WHERE id=?1 AND tenant=?2 AND revoked_at IS NULL AND expires_at>?3 AND EXISTS(SELECT 1 FROM json_each(permissions) WHERE value='jobs:create') AND (directory IS NULL OR directory=?4 OR substr(?4,1,length(directory)+1)=directory||'/'))", params![token_id,job.tenant,now_unix() as i64,job.project.directory], |row| row.get(0))
     } else {
         principal_active(connection, &job.actor, job.credential_version)
-    }.map_err(|e| e.to_string())?;
+    }
+    .map_err(|e| WorkflowMutationError::store(e.to_string()))?;
     if active {
         Ok(())
     } else {
-        Err("submitting identity is no longer authorized".into())
+        Err(WorkflowMutationError::conflict(
+            "submitting identity is no longer authorized",
+        ))
     }
 }
 
@@ -613,7 +686,7 @@ impl Store {
     ) -> Result<Storage, String> {
         let connection = self.connection.lock().expect("store poisoned");
         let job = export_in(&connection, id, attempt)?;
-        check_job_destination(&connection, &job, destination)
+        Ok(check_job_destination(&connection, &job, destination)?)
     }
 
     pub fn complete_delivery_export(
@@ -691,8 +764,8 @@ impl Store {
         tenant: &str,
         actor: &str,
         mut project: Project,
-    ) -> Result<Project, String> {
-        project.validate()?;
+    ) -> Result<Project, WorkflowMutationError> {
+        project.validate().map_err(WorkflowMutationError::invalid)?;
         let mut connection = self.connection.lock().expect("store poisoned");
         let tx = connection.transaction().map_err(|e| e.to_string())?;
         ensure_tenant(&tx, tenant)?;
@@ -701,13 +774,17 @@ impl Store {
             || current.as_ref().map_or(0, |p| p.notification_revision)
                 != project.notification_revision
         {
-            return Err("project changed; reload before saving".into());
+            return Err(WorkflowMutationError::conflict(
+                "project changed; reload before saving",
+            ));
         }
         if current
             .as_ref()
             .is_some_and(|p| p.directory != project.directory)
         {
-            return Err("a protected project's directory cannot change".into());
+            return Err(WorkflowMutationError::conflict(
+                "a protected project's directory cannot change",
+            ));
         }
         let mut query = tx
             .prepare("SELECT document FROM delivery_projects WHERE tenant=?1 AND id<>?2")
@@ -724,11 +801,13 @@ impl Store {
             if crate::workflow::within(&other.directory, &project.directory)
                 || crate::workflow::within(&project.directory, &other.directory)
             {
-                return Err("project directories must not overlap".into());
+                return Err(WorkflowMutationError::conflict(
+                    "project directories must not overlap",
+                ));
             }
         }
         if count >= 100 {
-            return Err("project limit reached".into());
+            return Err(WorkflowMutationError::conflict("project limit reached"));
         }
         drop(query);
         let notifications_only = current.as_ref().is_some_and(|p| {
@@ -758,7 +837,7 @@ impl Store {
         automation_token_id: Option<String>,
         project: Project,
         request: JobRequest,
-    ) -> Result<Job, String> {
+    ) -> Result<Job, WorkflowMutationError> {
         let now = now_unix();
         let mut connection = self.connection.lock().expect("store poisoned");
         let tx = connection.transaction().map_err(|e| e.to_string())?;
@@ -768,20 +847,26 @@ impl Store {
             return if previous.request == request {
                 Ok(previous)
             } else {
-                Err("operation ID already used with a different request".into())
+                Err(WorkflowMutationError::operation_conflict(
+                    "operation ID already used with a different request",
+                ))
             };
         }
-        project.validate_job(&request, now)?;
+        project
+            .validate_job(&request, now)
+            .map_err(WorkflowMutationError::invalid)?;
         if project_in(&tx, tenant, &project.id)
             .map_err(|e| e.to_string())?
             .as_ref()
             != Some(&project)
         {
-            return Err("project changed; reload before submitting".into());
+            return Err(WorkflowMutationError::conflict(
+                "project changed; reload before submitting",
+            ));
         }
         let count: i64 = tx.query_row("SELECT COUNT(*) FROM delivery_jobs WHERE tenant=?1 AND state IN ('queued','preparing','awaiting_approval','exporting','retrying')", [tenant], |row| row.get(0)).map_err(|e| e.to_string())?;
         if count >= 1000 {
-            return Err("active job limit reached".into());
+            return Err(WorkflowMutationError::conflict("active job limit reached"));
         }
         let checks = trade::snapshot(&tx, tenant, &project)?;
         let job = Job {
@@ -954,59 +1039,76 @@ impl Store {
         id: &str,
         manifest: &str,
         project_revision: u64,
-    ) -> Result<Job, String> {
+    ) -> Result<Job, WorkflowMutationError> {
         if !matches!(identity.role.as_str(), "admin" | "viewer")
             || identity.subject.starts_with("automation:")
         {
-            return Err("reprocessing requires a human project sender".into());
+            return Err(WorkflowMutationError::conflict(
+                "reprocessing requires a human project sender",
+            ));
         }
         let mut connection = self.connection.lock().expect("store poisoned");
         let tx = connection.transaction().map_err(|e| e.to_string())?;
         if !principal_active(&tx, &identity.subject, identity.credential_version)
             .map_err(|e| e.to_string())?
         {
-            return Err("submitting identity is no longer authorized".into());
+            return Err(WorkflowMutationError::conflict(
+                "submitting identity is no longer authorized",
+            ));
         }
         let mut original = job_in(&tx, id)
             .map_err(|e| e.to_string())?
             .filter(|job| job.tenant == identity.tenant)
-            .ok_or("job missing")?;
-        let received = original
-            .received
-            .clone()
-            .ok_or("only incoming deliveries can be reprocessed")?;
+            .ok_or_else(|| WorkflowMutationError::conflict("job missing"))?;
+        let received = original.received.clone().ok_or_else(|| {
+            WorkflowMutationError::conflict("only incoming deliveries can be reprocessed")
+        })?;
         let project = project_in(&tx, &identity.tenant, &original.project.id)
             .map_err(|e| e.to_string())?
-            .ok_or("project missing")?;
+            .ok_or_else(|| WorkflowMutationError::conflict("project missing"))?;
         if !project.allows(&identity.subject, "sender", identity.role == "admin") {
-            return Err("project sender permission required".into());
+            return Err(WorkflowMutationError::conflict(
+                "project sender permission required",
+            ));
         }
         if original.manifest.as_deref() != Some(manifest) || manifest.is_empty() {
-            return Err("delivery manifest changed; reload before reprocessing".into());
+            return Err(WorkflowMutationError::conflict(
+                "delivery manifest changed; reload before reprocessing",
+            ));
         }
         if let Some(id) = &original.reprocessed_as {
             return job_in(&tx, id)
                 .map_err(|e| e.to_string())?
-                .ok_or_else(|| "replacement delivery missing".into());
+                .ok_or_else(|| WorkflowMutationError::conflict("replacement delivery missing"));
         }
         if !["failed", "retrying", "awaiting_approval", "ready"].contains(&original.state.as_str())
         {
-            return Err("only an inactive prepared delivery can be reprocessed".into());
+            return Err(WorkflowMutationError::conflict(
+                "only an inactive prepared delivery can be reprocessed",
+            ));
         }
         if project.revision != project_revision || project.revision == original.project.revision {
-            return Err("project policy changed; reload before reprocessing".into());
+            return Err(WorkflowMutationError::conflict(
+                "project policy changed; reload before reprocessing",
+            ));
         }
         let workflow = receive_workflow_in(&tx, &identity.tenant, &received.link_id)
             .map_err(|e| e.to_string())?
             .filter(|workflow| workflow.project_id == project.id)
-            .ok_or("the receive request must still select this project")?;
+            .ok_or_else(|| {
+                WorkflowMutationError::conflict(
+                    "the receive request must still select this project",
+                )
+            })?;
         if !received_requires_workflow(
             &tx,
             &identity.tenant,
             &received.link_id,
             &received.upload_id,
         )? {
-            return Err("incoming workflow ownership is missing".into());
+            return Err(WorkflowMutationError::conflict(
+                "incoming workflow ownership is missing",
+            ));
         }
         let upload = read_upload(
             &tx,
@@ -1021,7 +1123,9 @@ impl Store {
                 && !upload.files.is_empty()
                 && upload.files.iter().all(|file| !file.deleted)
         })
-        .ok_or("incoming package is incomplete or unavailable")?;
+        .ok_or_else(|| {
+            WorkflowMutationError::conflict("incoming package is incomplete or unavailable")
+        })?;
         if crate::route_protocol::manifest_digest(upload.files.iter().map(|file| {
             (
                 file.path.as_str(),
@@ -1031,7 +1135,9 @@ impl Store {
             )
         })) != manifest
         {
-            return Err("incoming inventory no longer matches the prepared delivery".into());
+            return Err(WorkflowMutationError::conflict(
+                "incoming inventory no longer matches the prepared delivery",
+            ));
         }
         super::routes::require_shareable(&tx, &received.upload_id)?;
         let now = now_unix();
@@ -1039,7 +1145,9 @@ impl Store {
             &format!("reprocess_{}", original.id),
             &original.request.label,
         );
-        project.validate_job(&request, now)?;
+        project
+            .validate_job(&request, now)
+            .map_err(WorkflowMutationError::invalid)?;
         let replacement = Job {
             id: crate::auth::random_token(),
             tenant: identity.tenant.clone(),
@@ -1069,11 +1177,13 @@ impl Store {
         save_job(&tx, &original).map_err(|e| e.to_string())?;
         let count: i64 = tx.query_row("SELECT COUNT(*) FROM delivery_jobs WHERE tenant=?1 AND state IN ('queued','preparing','awaiting_approval','exporting','retrying')",[&identity.tenant],|row| row.get(0)).map_err(|e| e.to_string())?;
         if count >= 1000 {
-            return Err("active job limit reached".into());
+            return Err(WorkflowMutationError::conflict("active job limit reached"));
         }
         let revoked = tx.execute("UPDATE outbound_grants SET revoked_at=COALESCE(revoked_at,?2) WHERE id=?1 AND tenant=?3",params![original.id,now as i64,identity.tenant]).map_err(|e| e.to_string())?;
         if revoked != 1 {
-            return Err("prepared delivery link is missing".into());
+            return Err(WorkflowMutationError::conflict(
+                "prepared delivery link is missing",
+            ));
         }
         tx.execute(
             "UPDATE delivery_jobs SET owner='' WHERE id=?1",
@@ -1095,18 +1205,20 @@ impl Store {
         administrator: bool,
         action: &str,
         manifest: Option<&str>,
-    ) -> Result<Job, String> {
+    ) -> Result<Job, WorkflowMutationError> {
         let mut connection = self.connection.lock().expect("store poisoned");
         let tx = connection.transaction().map_err(|e| e.to_string())?;
         let mut job = job_in(&tx, id)
             .map_err(|e| e.to_string())?
             .filter(|job| job.tenant == tenant)
-            .ok_or("job missing")?;
+            .ok_or_else(|| WorkflowMutationError::conflict("job missing"))?;
         let project = project_in(&tx, tenant, &job.project.id)
             .map_err(|e| e.to_string())?
-            .ok_or("project missing")?;
+            .ok_or_else(|| WorkflowMutationError::conflict("project missing"))?;
         if job.state == "suspended" {
-            return Err("delivery is held after restore; create a new job".into());
+            return Err(WorkflowMutationError::conflict(
+                "delivery is held after restore; create a new job",
+            ));
         }
         match action {
             "approve" => {
@@ -1114,14 +1226,18 @@ impl Store {
                     || actor == job.actor
                     || !project.allows(actor, "approver", administrator)
                 {
-                    return Err("approval requires a different authorized human operator".into());
+                    return Err(WorkflowMutationError::conflict(
+                        "approval requires a different authorized human operator",
+                    ));
                 }
                 if job.state != "awaiting_approval"
                     || job.manifest.as_deref() != manifest
                     || manifest.is_none()
                     || project.revision != job.project.revision
                 {
-                    return Err("approval does not match the pending manifest and policy".into());
+                    return Err(WorkflowMutationError::conflict(
+                        "approval does not match the pending manifest and policy",
+                    ));
                 }
                 actor_active(&tx, &job)?;
                 check_job_storage(&tx, &job)?;
@@ -1138,10 +1254,14 @@ impl Store {
             }
             "cancel" => {
                 if !project.allows(actor, "sender", administrator) && actor != job.actor {
-                    return Err("sender permission required".into());
+                    return Err(WorkflowMutationError::conflict(
+                        "sender permission required",
+                    ));
                 }
                 if ["retiring", "retired"].contains(&job.state.as_str()) {
-                    return Err("delivery is retiring or retired".into());
+                    return Err(WorkflowMutationError::conflict(
+                        "delivery is retiring or retired",
+                    ));
                 }
                 if job.state == "cancelled" {
                     return Ok(job);
@@ -1150,26 +1270,38 @@ impl Store {
             }
             "retry" => {
                 if !project.allows(actor, "sender", administrator) && actor != job.actor {
-                    return Err("sender permission required".into());
+                    return Err(WorkflowMutationError::conflict(
+                        "sender permission required",
+                    ));
                 }
                 if !["failed", "retrying"].contains(&job.state.as_str()) {
-                    return Err("only a failed job can retry".into());
+                    return Err(WorkflowMutationError::conflict(
+                        "only a failed job can retry",
+                    ));
                 }
                 if let (Some(received), None) = (&job.received, &job.manifest) {
                     let workflow = receive_workflow_in(&tx, tenant, &received.link_id)
                         .map_err(|e| e.to_string())?
                         .filter(|workflow| workflow.project_id == project.id)
-                        .ok_or("the receive request must still select this project")?;
+                        .ok_or_else(|| {
+                            WorkflowMutationError::conflict(
+                                "the receive request must still select this project",
+                            )
+                        })?;
                     job.request.metadata = workflow.metadata;
                     job.request.recipients = workflow.recipients;
                     job.request.notifications = workflow.notifications;
                     job.project = project.clone();
                     job.checks = trade::snapshot(&tx, tenant, &project)?;
                 } else if project.revision != job.project.revision {
-                    return Err("this delivery requires its original project policy".into());
+                    return Err(WorkflowMutationError::conflict(
+                        "this delivery requires its original project policy",
+                    ));
                 }
                 actor_active(&tx, &job)?;
-                project.validate_job(&job.request, job.created_at)?;
+                project
+                    .validate_job(&job.request, job.created_at)
+                    .map_err(WorkflowMutationError::invalid)?;
                 job.attempts += 1;
                 job.checks["retry_base"] = serde_json::json!(job.attempts);
                 job.checks["first_failure_at"] = serde_json::Value::Null;
@@ -1181,7 +1313,7 @@ impl Store {
                 }
                 .into();
             }
-            _ => return Err("unknown job action".into()),
+            _ => return Err(WorkflowMutationError::invalid("unknown job action")),
         }
         job.updated_at = now_unix();
         job.error = None;
@@ -1321,7 +1453,7 @@ fn delivery_access_in(
     }
 }
 
-fn check_job_storage(connection: &Connection, job: &Job) -> Result<(), String> {
+fn check_job_storage(connection: &Connection, job: &Job) -> Result<(), WorkflowMutationError> {
     check_job_source(connection, job)?;
     for id in &job.project.destinations {
         if job.checks["destinations"][id]["state"] != "complete" {
@@ -1331,7 +1463,7 @@ fn check_job_storage(connection: &Connection, job: &Job) -> Result<(), String> {
     Ok(())
 }
 
-fn check_job_source(connection: &Connection, job: &Job) -> Result<(), String> {
+fn check_job_source(connection: &Connection, job: &Job) -> Result<(), WorkflowMutationError> {
     trade::check_export(connection, job)?;
     if let Some(import) = &job.request.import {
         check_storage(
@@ -1348,9 +1480,11 @@ fn check_job_destination(
     connection: &Connection,
     job: &Job,
     destination: &str,
-) -> Result<Storage, String> {
+) -> Result<Storage, WorkflowMutationError> {
     if !job.project.destinations.iter().any(|id| id == destination) {
-        return Err("destination is not part of this job".into());
+        return Err(WorkflowMutationError::conflict(
+            "destination is not part of this job",
+        ));
     }
     trade::check_destination(connection, job, destination)?;
     check_storage(
@@ -1366,19 +1500,27 @@ fn check_storage(
     tenant: &str,
     id: &str,
     revision: Option<u64>,
-) -> Result<Storage, String> {
-    let config: Storage = connection
+) -> Result<Storage, WorkflowMutationError> {
+    let config: Option<Storage> = connection
         .query_row(
             "SELECT document FROM delivery_storage WHERE id=?1",
             [id],
             |row| decode(row.get(0)?),
         )
-        .map_err(|_| "storage connection missing")?;
+        .optional()
+        .map_err(|error| WorkflowMutationError::store(error.to_string()))?;
+    let Some(config) = config else {
+        return Err(WorkflowMutationError::conflict(
+            "storage connection missing",
+        ));
+    };
     if !config.enabled
         || !config.tenants.iter().any(|allowed| allowed == tenant)
         || Some(config.revision) != revision
     {
-        return Err("storage authorization changed; submit a new job".into());
+        return Err(WorkflowMutationError::conflict(
+            "storage authorization changed; submit a new job",
+        ));
     }
     Ok(config)
 }

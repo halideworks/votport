@@ -761,7 +761,7 @@ pub(super) async fn export(app: &Arc<App>, job: &Job) -> ApiResult<()> {
                 .fail_delivery_destination(&job.id, job.attempts, &id, &error.message)
                 .map_err(conflict)?;
             if job.checks["destinations"][&id]["state"] != "failed" {
-                if let (Ok(route), Ok(policy)) = (
+                if let (Ok(Some(route)), Ok(policy)) = (
                     app.store.trade_route(&job.tenant, &id),
                     serde_json::from_value(
                         job.checks["trade_routes"][&id]["notifications"].clone(),
