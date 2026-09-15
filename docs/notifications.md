@@ -7,9 +7,10 @@ can inspect destinations and routing; auditors cannot access them. Switching
 tenants switches the destination catalog. Tenant deletion removes its connections
 and defaults, including stored credentials.
 
-Each destination has a name and destination description. For Slack, Teams and
-Google Chat, configure the real channel, chat, or space when creating the webhook
-in that service. The description in Votport is a label, not a channel override.
+Each destination has a destination name and a label shown when people choose it.
+For Slack, Teams and Google Chat, configure the real channel, chat, or space
+when creating the webhook in that service. The Votport label is descriptive and
+does not change where the service sends messages.
 Discord also accepts a thread ID; forum and media channels require a thread.
 Email destinations have their own recipient lists and use the server SMTP relay.
 JSON webhooks and ntfy support optional bearer tokens. Pushover destinations have
@@ -82,9 +83,10 @@ Read responses use `Cache-Control: no-store`.
 
 - `GET /api/notifications`: tenant destinations, tenant
   defaults, event names, and latest destination outcomes. Credentials are omitted.
-- `POST /api/notifications`: create or update a destination. Supply `label`,
-  `channel`, `target`, `enabled`, and service fields `url`, `token`, `user`,
-  `recipients`, or `thread_id`. For an update, also supply its `id` and `revision`;
+- `POST /api/notifications`: create or update a destination. Supply `label`
+  (the destination name), `channel`, `target` (the picker label), `enabled`, and
+  service fields `url`, `token`, `user`, `recipients`, or `thread_id`. For an
+  update, also supply its `id` and `revision`;
   stale updates are rejected with 409 and the 100-destination cap with 422.
   `clear_token: true` removes an optional bearer token.
 - `POST /api/notifications/{id}/test`: test the saved, enabled destination.

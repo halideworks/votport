@@ -200,6 +200,40 @@ try {
   await source(`trade-routes/${route.id}/test`, {}); await page.click('#trade-refresh'); await outgoingCard.getByText('Recent deliveries', { exact: true }).click(); await outgoingCard.getByText(/Received and verified · Released/).waitFor();
   for (const width of [320, 390, 768, 1440]) { await page.setViewportSize({ width, height: 1000 }); assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), `No overflow at ${width}px`); }
   await page.screenshot({ path: path.join(root, 'trade-routes.png'), fullPage: true });
+  await outgoingCard.getByText('Permissions and notifications', { exact: true }).click();
+  await outgoingCard.getByLabel('Permission on this port', { exact: true }).selectOption('paused');
+  const retainedEditor = await outgoingCard.locator('form[data-unsaved]').elementHandle();
+  // Arm the return listener without opening another tab or changing browser focus.
+  await outgoingCard.getByRole('link', { name: 'Add or manage destinations ↗', exact: true }).evaluate((link) => {
+    link.addEventListener('click', (event) => event.preventDefault(), { once: true });
+    link.click();
+  });
+  const oldCard = await outgoingCard.elementHandle();
+  await page.click('#trade-refresh');
+  await page.waitForFunction((card) => !card.isConnected, oldCard);
+  assert.ok(await retainedEditor.evaluate((form) => form.isConnected), 'Refresh retains the dirty route editor');
+  assert.equal(await outgoingCard.getByLabel('Permission on this port', { exact: true }).inputValue(), 'paused');
+  const hideRoute = async (request) => {
+    const response = await request.fetch(), data = await response.json();
+    data.routes = data.routes.filter((entry) => entry.id !== route.id);
+    await request.fulfill({ response, json: data });
+  };
+  await page.route('**/api/trade-routes', hideRoute);
+  try {
+    await page.click('#trade-refresh');
+    await outgoingCard.waitFor({ state: 'detached' });
+    await page.waitForLoadState('networkidle');
+    let catalogRequests = 0;
+    const countCatalog = (request) => { if (new URL(request.url()).pathname === '/api/notifications') catalogRequests++; };
+    page.on('request', countCatalog);
+    try {
+      await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+      await page.waitForTimeout(100);
+      assert.equal(catalogRequests, 0, 'Removing a retained route editor removes its notification return listener');
+    } finally { page.off('request', countCatalog); }
+  } finally { await page.unroute('**/api/trade-routes', hideRoute); }
+  await page.click('#trade-refresh');
+  await outgoingCard.waitFor();
   incoming = (await destination('trade-routes')).routes.find((r) => r.id === incoming.id);
   await destination(`trade-routes/${incoming.id}`, { revision: incoming.revision, state: 'revoked', cancel_active: false, notifications: incoming.notifications }, 'PUT');
   await source(`trade-routes/${route.id}/test`, {}); assert.equal((await source('trade-routes')).routes.find((r) => r.id === route.id).remote_state, 'revoked');

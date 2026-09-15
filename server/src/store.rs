@@ -1966,6 +1966,16 @@ impl Store {
         let transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
+        let owned: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM links WHERE tenant=?1 AND id=?2)",
+                [tenant, id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !owned {
+            return Ok(false);
+        }
         if workflows::receive_pending(&transaction, tenant, id).map_err(|e| e.to_string())? {
             return Err(
                 "incoming workflows still use this request; wait for their deliveries to be archived before deleting it".into(),
@@ -1978,10 +1988,37 @@ impl Store {
             return Err("trade routes still deliver to this request; revoke them under Trade routes before deleting it".into());
         }
         for statement in [
-            "DELETE FROM trade_rotations WHERE route_id IN (SELECT id FROM trade_routes WHERE tenant=?1 AND endpoint=?2)",
-            "DELETE FROM trade_routes WHERE tenant=?1 AND endpoint=?2 AND direction='incoming'",
-            "DELETE FROM trade_invitations WHERE tenant=?1 AND endpoint=?2",
-            "DELETE FROM trade_endpoints WHERE tenant=?1 AND id=?2",
+            "DELETE FROM receive_workflow_uploads
+             WHERE link_id=?2",
+            "DELETE FROM receive_workflows
+             WHERE link_id=?2",
+            "DELETE FROM route_uploads
+             WHERE route_id IN (
+                 SELECT id FROM inbound_routes WHERE tenant=?1 AND link_id=?2
+             )",
+            "DELETE FROM trade_delivery_policies
+             WHERE route_id IN (
+                 SELECT id FROM inbound_routes WHERE tenant=?1 AND link_id=?2
+             )",
+            "DELETE FROM inbound_routes
+             WHERE tenant=?1 AND link_id=?2",
+            "DELETE FROM upload_session_files
+             WHERE session_id IN (
+                 SELECT id FROM upload_sessions WHERE tenant=?1 AND link_id=?2
+             )",
+            "DELETE FROM upload_sessions
+             WHERE tenant=?1 AND link_id=?2",
+            "DELETE FROM trade_rotations
+             WHERE route_id IN (
+                 SELECT id FROM trade_routes
+                 WHERE tenant=?1 AND endpoint=?2 AND direction='incoming'
+             )",
+            "DELETE FROM trade_routes
+             WHERE tenant=?1 AND endpoint=?2 AND direction='incoming'",
+            "DELETE FROM trade_invitations
+             WHERE tenant=?1 AND endpoint=?2",
+            "DELETE FROM trade_endpoints
+             WHERE tenant=?1 AND id=?2",
         ] {
             transaction
                 .execute(statement, [tenant, id])
@@ -1990,13 +2027,14 @@ impl Store {
         transaction
             .execute(
                 "DELETE FROM files
-                 WHERE link_id IN (SELECT id FROM links WHERE tenant = ?1 AND id = ?2)",
+                 WHERE tenant = ?1 AND link_id = ?2",
                 rusqlite::params![tenant, id],
             )
             .map_err(|error| error.to_string())?;
         transaction
             .execute(
-                "DELETE FROM link_uploads WHERE tenant=?1 AND link_id=?2",
+                "DELETE FROM link_uploads
+                 WHERE tenant=?1 AND link_id=?2",
                 [tenant, id],
             )
             .map_err(|e| e.to_string())?;
@@ -8244,6 +8282,234 @@ pub(crate) mod tests {
         assert!(store.remove_link("", "link-1").unwrap());
         assert!(!store.remove_link("", "link-1").unwrap());
         assert!(store.link("", "link-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn remove_link_cleans_request_children_atomically_and_scoped() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        for tenant in ["acme", "other"] {
+            store.insert_tenant(test_tenant(tenant)).unwrap();
+        }
+        for (tenant, link, route, session, upload) in [
+            (
+                "acme",
+                "target",
+                "route-target",
+                "session-target",
+                "upload-target",
+            ),
+            ("acme", "same", "route-same", "session-same", "upload-same"),
+            (
+                "other",
+                "other-link",
+                "route-other",
+                "session-other",
+                "upload-other",
+            ),
+        ] {
+            store.insert_link(link_in(tenant, link)).unwrap();
+            store
+                .with(|connection| {
+                    connection.execute(
+                        "INSERT INTO receive_workflows(link_id,document) VALUES (?1,'{}')",
+                        [link],
+                    )?;
+                    connection.execute(
+                        "INSERT INTO receive_workflow_uploads(link_id,upload_id) VALUES (?1,?2)",
+                        rusqlite::params![link, upload],
+                    )?;
+                    connection.execute(
+                        "INSERT INTO inbound_routes(id,tenant,link_id,issuer,operation_id,source,ancestry,created_at)
+                         VALUES (?1,?2,?3,'issuer','operation','{}','[]',1)",
+                        rusqlite::params![route, tenant, link],
+                    )?;
+                    connection.execute(
+                        "INSERT INTO route_uploads(route_id,upload_id,partial) VALUES (?1,?2,0)",
+                        rusqlite::params![route, upload],
+                    )?;
+                    connection.execute(
+                        "INSERT INTO trade_delivery_policies(route_id,document) VALUES (?1,'{}')",
+                        [route],
+                    )?;
+                    connection.execute(
+                        "INSERT INTO upload_sessions
+                         (id,link_id,tenant,dest_dir,dest_rel,package_suite,package_root,package_length,
+                          max_total_bytes,started_at,created_at,push_key,committed_upload_id)
+                         VALUES (?1,?2,?3,'dest','',1,'root',1,NULL,1,1,NULL,?4)",
+                        rusqlite::params![session, link, tenant, (upload.to_owned())],
+                    )?;
+                    connection.execute(
+                        "INSERT INTO upload_session_files
+                         (session_id,entry,display_path,stored_components,object_suite,object_root,
+                          object_length,staging_path,journal_path,incarnation)
+                         VALUES (?1,0,'file','[]',1,'root',1,'stage','journal','incarnation')",
+                        [session],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        store
+            .with(|connection| {
+                connection.execute_batch(
+                    "INSERT INTO trade_routes(id,tenant,direction,peer_key,endpoint,document,credential,enrollment)
+                     VALUES ('trade-incoming','acme','incoming','peer','target','{\"state\":\"revoked\"}','credential',NULL);
+                     INSERT INTO trade_rotations(route_id,credential) VALUES ('trade-incoming','rotation-incoming');
+                     INSERT INTO trade_routes(id,tenant,direction,peer_key,endpoint,document,credential,enrollment)
+                     VALUES ('trade-outgoing','acme','outgoing','peer','target','{\"state\":\"active\"}','credential',NULL);
+                     INSERT INTO trade_rotations(route_id,credential) VALUES ('trade-outgoing','rotation-outgoing');",
+                )
+            })
+            .unwrap();
+
+        let child_counts = |link: &str, route: &str, session: &str| {
+            store
+                .with(|connection| {
+                    connection.query_row(
+                        "SELECT
+                           (SELECT COUNT(*) FROM receive_workflows WHERE link_id=?1),
+                           (SELECT COUNT(*) FROM receive_workflow_uploads WHERE link_id=?1),
+                           (SELECT COUNT(*) FROM inbound_routes WHERE id=?2),
+                           (SELECT COUNT(*) FROM route_uploads WHERE route_id=?2),
+                           (SELECT COUNT(*) FROM trade_delivery_policies WHERE route_id=?2),
+                           (SELECT COUNT(*) FROM upload_sessions WHERE id=?3),
+                           (SELECT COUNT(*) FROM upload_session_files WHERE session_id=?3)",
+                        rusqlite::params![link, route, session],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, i64>(4)?,
+                                row.get::<_, i64>(5)?,
+                                row.get::<_, i64>(6)?,
+                            ))
+                        },
+                    )
+                })
+                .unwrap()
+        };
+        let expected = (1, 1, 1, 1, 1, 1, 1);
+        assert_eq!(
+            child_counts("target", "route-target", "session-target"),
+            expected
+        );
+
+        assert!(!store.remove_link("other", "target").unwrap());
+        assert_eq!(
+            child_counts("target", "route-target", "session-target"),
+            expected
+        );
+
+        store
+            .with(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER fail_request_child_delete
+                     BEFORE DELETE ON links
+                     WHEN OLD.id='target'
+                     BEGIN SELECT RAISE(ABORT,'fixture remove failure'); END;",
+                )
+            })
+            .unwrap();
+        assert!(store.remove_link("acme", "target").is_err());
+        assert!(store.link("acme", "target").unwrap().is_some());
+        assert_eq!(
+            child_counts("target", "route-target", "session-target"),
+            expected
+        );
+        store
+            .with(|connection| connection.execute_batch("DROP TRIGGER fail_request_child_delete"))
+            .unwrap();
+
+        assert!(store.remove_link("acme", "target").unwrap());
+        assert!(store.link("acme", "target").unwrap().is_none());
+        assert_eq!(
+            child_counts("target", "route-target", "session-target"),
+            (0, 0, 0, 0, 0, 0, 0)
+        );
+        assert_eq!(child_counts("same", "route-same", "session-same"), expected);
+        assert_eq!(
+            child_counts("other-link", "route-other", "session-other"),
+            expected
+        );
+        assert_eq!(
+            store
+                .with(|connection| connection.query_row(
+                    "SELECT COUNT(*) FROM trade_rotations WHERE route_id='trade-incoming'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                ))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .with(|connection| connection.query_row(
+                    "SELECT COUNT(*) FROM trade_rotations WHERE route_id='trade-outgoing'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                ))
+                .unwrap(),
+            1
+        );
+        assert!(!store.remove_link("acme", "target").unwrap());
+        assert!(!store.remove_link("acme", "missing").unwrap());
+    }
+
+    #[test]
+    fn remove_missing_link_ignores_stale_matching_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.insert_tenant(test_tenant("acme")).unwrap();
+        store
+            .with(|connection| {
+                connection.execute(
+                    "INSERT INTO delivery_jobs
+                     (id,tenant,actor,operation_id,project_id,state,owner,not_before,
+                      deadline,escalated,token,document)
+                     VALUES ('stale-job','acme','actor','operation','project','queued','',0,
+                             NULL,0,'token','{\"received\":{\"link_id\":\"stale\"}}')",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO trade_routes
+                     (id,tenant,direction,peer_key,endpoint,document,credential,enrollment)
+                     VALUES ('stale-route','acme','incoming','peer','stale',
+                             '{\"state\":\"active\"}','credential',NULL)",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO trade_rotations(route_id,credential)
+                     VALUES ('stale-route','rotation')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(!store.remove_link("acme", "stale").unwrap());
+        assert!(store.link("acme", "stale").unwrap().is_none());
+        assert_eq!(
+            store
+                .with(|connection| connection.query_row(
+                    "SELECT
+                       (SELECT COUNT(*) FROM delivery_jobs WHERE id='stale-job'),
+                       (SELECT COUNT(*) FROM trade_routes WHERE id='stale-route'),
+                       (SELECT COUNT(*) FROM trade_rotations WHERE route_id='stale-route')",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                ))
+                .unwrap(),
+            (1, 1, 1)
+        );
     }
 
     #[test]

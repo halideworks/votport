@@ -36,6 +36,7 @@ export function notificationEditor({ policy = null, events = Object.keys(notific
   const reload = button('Refresh destinations', 'ghost tiny', () => load(true)); reload.hidden = defaults || readOnly;
   element.append(legend, modeLabel, summary, addRow, rules, status, manage, reload); element.disabled = true;
   let catalog, selected;
+  let manageReturn;
   function readRules() {
     return [...rules.querySelectorAll('.notification-destination')].map((group) => ({ destination_id: group.dataset.destination, events: [...group.querySelectorAll('input:checked')].map((input) => input.dataset.event) }));
   }
@@ -78,7 +79,32 @@ export function notificationEditor({ policy = null, events = Object.keys(notific
     if (mode.value === 'custom') {
       const chosen = readRules();
       status.textContent = chosen.length ? `${chosen.length} ${chosen.length === 1 ? 'destination selected' : 'destinations selected'}. Only checked events will be sent.` : 'Add a destination, then choose when it should hear from this port.';
-    } else status.textContent = mode.value === 'off' ? 'Notifications are off for this item.' : '';
+    } else status.textContent = mode.value === 'off'
+      ? `Notifications are off for this item.${configuredDefaults() ? ' Tenant defaults are available.' : ''}`
+      : '';
+  }
+  function configuredDefaults() {
+    return catalog?.defaults?.mode === 'custom' && catalog.defaults.rules.length > 0;
+  }
+  function applicableDefaults() {
+    return configuredDefaults()
+      && catalog.defaults.rules.some((rule) => rule.events.some((event) => events.includes(event)));
+  }
+  function stopManageReturn() {
+    if (!manageReturn) return;
+    window.removeEventListener('focus', manageReturn);
+    document.removeEventListener('visibilitychange', manageReturn);
+    manageReturn = null;
+  }
+  function watchManageReturn() {
+    if (manageReturn) return;
+    manageReturn = () => {
+      if (document.visibilityState === 'hidden') return;
+      stopManageReturn();
+      void load(true);
+    };
+    window.addEventListener('focus', manageReturn);
+    document.addEventListener('visibilitychange', manageReturn);
   }
   let loadTicket = 0;
   async function load(refresh = false) {
@@ -90,7 +116,9 @@ export function notificationEditor({ policy = null, events = Object.keys(notific
       const loaded = settings || await loadNotificationSettings(refresh);
       if (ticket !== loadTicket) return;
       catalog = loaded;
-      selected ||= policy || (inherit !== undefined ? { mode: 'inherit', rules: [] } : { mode: 'off', rules: [] });
+      selected ||= policy || (inherit !== undefined
+        ? { mode: 'inherit', rules: [] }
+        : applicableDefaults() ? { mode: 'default', rules: [] } : { mode: 'off', rules: [] });
       mode.value = selected.mode;
       const available = new Map(catalog.destinations.map((destination) => [destination.id, destination]));
       for (const rule of selected.rules || []) if (!available.has(rule.destination_id)) available.set(rule.destination_id, { id: rule.destination_id, label: 'Unavailable destination', target: rule.destination_id, enabled: false });
@@ -99,15 +127,20 @@ export function notificationEditor({ policy = null, events = Object.keys(notific
       updatePicker();
       element.disabled = readOnly; mode.disabled = false; status.textContent = ''; renderMode();
     } catch (error) {
+      if (ticket !== loadTicket) return;
       status.setAttribute('role', 'alert');
       status.textContent = error.message; status.append(button('Retry loading destinations', 'link', () => load(true)));
       element.disabled = false; mode.disabled = true;
     }
   }
+  manage.addEventListener('click', watchManageReturn);
   mode.addEventListener('change', renderMode);
   rules.addEventListener('change', renderMode);
   const ready = load();
-  return { element, ready, reset() { mode.value = 'default'; rules.replaceChildren(); if (catalog) { updatePicker(); renderMode(); } }, read() {
+  return { element, ready, reset() {
+    mode.value = inherit !== undefined ? 'inherit' : applicableDefaults() ? 'default' : 'off';
+    selected = null; rules.replaceChildren(); if (catalog) { updatePicker(); renderMode(); }
+  }, destroy() { ++loadTicket; stopManageReturn(); }, read() {
     if (!catalog) throw new Error('Notification destinations could not be loaded. Retry before saving.');
     if (mode.value === 'inherit') return null;
     const policy = { mode: mode.value, rules: [] };
@@ -135,5 +168,7 @@ export function notificationDetails({ policy, events, save, readOnly = false, in
     finally { apply.disabled = false; editor.element.disabled = false; }
   });
   editor.element.addEventListener('change', () => { details.dataset.dirty = 'true'; });
-  apply.hidden = readOnly; details.append(summary, editor.element, apply, status); return details;
+  apply.hidden = readOnly; details.append(summary, editor.element, apply, status);
+  details.destroy = () => editor.destroy();
+  return details;
 }

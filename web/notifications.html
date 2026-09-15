@@ -43,12 +43,12 @@
       <div class="page-heading"><div><p class="eyebrow">Team updates</p><h1>Notifications</h1><p class="page-lead">Choose who hears about received files, delivery progress, and failures.</p></div><button id="notification-new" type="button">Add destination</button></div>
       <p id="notification-error" class="error feedback" role="alert" hidden></p>
       <p id="notification-notice" class="feedback" role="status"></p>
-      <div class="info-banner"><strong>1. Add a destination · 2. Send a test · 3. Choose events</strong><p>Add as many Slack channels, Teams chats or other destinations as you need. Each destination has its own connection and can receive different events.</p></div>
-      <p class="field-help">Destinations belong to the current tenant. Adding one does not subscribe existing transfers. Choose destinations on a request, delivery, or workflow, or include them in tenant defaults.</p>
+      <div class="info-banner"><strong>1. Add a destination · 2. Send a test · 3. Choose events where notifications belong</strong><p>A destination is a saved service connection. Test it here, then choose its events on a receive request, delivery, or workflow, or include them in tenant defaults below.</p></div>
+      <p class="field-help">Destinations belong to the current tenant. The destination name identifies the connection; its label helps people choose it. Adding one does not subscribe existing transfers.</p>
       <form data-unsaved id="notification-form" class="card editor" hidden>
         <div class="section-heading"><h2 id="notification-editor-title">Add destination</h2><button id="notification-cancel" type="button" class="ghost">Cancel</button></div>
-        <div class="grid"><label>Name<input id="nd-label" required maxlength="100" placeholder="Production updates" /></label><label>Service<select id="nd-channel"></select></label></div>
-        <label>Channel, chat or recipients<input id="nd-target" required maxlength="200" placeholder="Production workspace · #incoming" /><span class="field-help">A label to help your team choose. The webhook or recipients determine where messages arrive.</span></label>
+        <div class="grid"><label>Destination name<input id="nd-label" required maxlength="100" placeholder="Production updates" /></label><label>Service<select id="nd-channel"></select></label></div>
+        <label>Label<input id="nd-target" required maxlength="200" placeholder="Production workspace · #incoming" /><span class="field-help">Shown when people choose a destination. It does not change the service channel, chat, space, or recipients that receive messages.</span></label>
         <p id="nd-guide" class="field-help"></p>
         <label id="nd-url-field">Webhook or topic URL<input id="nd-url" type="password" autocomplete="new-password" maxlength="8192" spellcheck="false" /><span class="field-help">Use a separate destination for each channel or chat. When editing, leave blank to keep the saved URL.</span></label>
         <label id="nd-token-field">Application or bearer token<input id="nd-token" type="password" autocomplete="new-password" maxlength="8192" /><span class="field-help">Blank preserves the saved token.</span></label>

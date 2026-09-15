@@ -114,6 +114,8 @@ async function refresh() {
   const routeEdits = new Map([...$('trade-connections').querySelectorAll('.trade-route form[data-unsaved]')].filter(isFormDirty).map((form) => [form.closest('.trade-route').id, form.closest('details')]));
   const peerEdits = new Map([...$('trade-connections').querySelectorAll('details[data-peer]')].filter((details) => isFormDirty(details.querySelector('form'))).map((details) => [details.dataset.peer, details]));
   const invitationEdits = new Map([...$('trade-endpoints').querySelectorAll('form')].filter(isFormDirty).map((form) => [form.parentElement.id, form]));
+  const routeIds = new Set(catalog.routes.map((route) => `route-${route.id}`));
+  for (const card of $('trade-connections').querySelectorAll('.trade-route')) if (!routeIds.has(card.id) || !routeEdits.has(card.id)) card.destroy?.();
   $('trade-endpoints').replaceChildren(); $('trade-connections').replaceChildren();
   $('trade-endpoints-section').hidden = !catalog.endpoints.length && setup !== 'receive';
   for (const endpoint of catalog.endpoints) {
@@ -213,22 +215,28 @@ function routeCard(route, savedEditor) {
         finally { element.disabled = false; }
       })));
     } card.append(actions);
-    const details = node('details'), form = node('form'); details.append(node('summary', 'Permissions and notifications'));
-    const policy = notificationEditor({ events: tradeEvents, policy: route.notifications });
-    const state = select([...(route.state === 'pending_approval' ? [['pending_approval', 'Keep pending approval']] : []), ...(route.state !== 'revoked' ? [['active', route.state === 'pending_approval' && route.direction === 'incoming' ? 'Approve route' : 'Active'], ['paused', 'Paused']] : []), ['revoked', 'Revoked']], route.state);
-    const active = select([['finish', 'Let admitted transfers finish'], ['cancel', 'Cancel admitted transfers']], route.cancel_active ? 'cancel' : 'finish');
-    const inFlight = field('When pausing or revoking', active); inFlight.hidden = !['paused', 'revoked'].includes(state.value);
-    state.onchange = () => { inFlight.hidden = !['paused', 'revoked'].includes(state.value); };
-    form.setAttribute('data-unsaved', '');
-    form.append(field('Permission on this port', state), inFlight, policy.element);
-    const save = node('button', 'Save route settings'); save.type = 'submit'; form.append(save);
-    form.addEventListener('submit', (event) => { event.preventDefault(); if (form.inert) return;
-      guard(async () => {
-        if (state.value === 'revoked' && !await confirmModal('Revoke this route', 'New deliveries will be denied. Restoring permission requires a new invitation. Previously received files remain on the destination.', 'Revoke route')) return;
-        form.inert = true;
-        try { await api(`/api/trade-routes/${route.id}`, { method: 'PUT', body: JSON.stringify({ revision: revisionOf(route), state: state.value, cancel_active: active.value === 'cancel', notifications: policy.read() }) }); markFormSaved(form); $('trade-notice').textContent = 'Route settings saved.'; await refresh(); $(`route-${route.id}`).focus(); } finally { form.inert = false; }
-      });
-    }); details.append(form); card.append(savedEditor || details);
+    const details = savedEditor || node('details');
+    if (!savedEditor) {
+      const form = node('form'); details.append(node('summary', 'Permissions and notifications'));
+      const policy = notificationEditor({ events: tradeEvents, policy: route.notifications });
+      details.destroy = () => policy.destroy();
+      const state = select([...(route.state === 'pending_approval' ? [['pending_approval', 'Keep pending approval']] : []), ...(route.state !== 'revoked' ? [['active', route.state === 'pending_approval' && route.direction === 'incoming' ? 'Approve route' : 'Active'], ['paused', 'Paused']] : []), ['revoked', 'Revoked']], route.state);
+      const active = select([['finish', 'Let admitted transfers finish'], ['cancel', 'Cancel admitted transfers']], route.cancel_active ? 'cancel' : 'finish');
+      const inFlight = field('When pausing or revoking', active); inFlight.hidden = !['paused', 'revoked'].includes(state.value);
+      state.onchange = () => { inFlight.hidden = !['paused', 'revoked'].includes(state.value); };
+      form.setAttribute('data-unsaved', '');
+      form.append(field('Permission on this port', state), inFlight, policy.element);
+      const save = node('button', 'Save route settings'); save.type = 'submit'; form.append(save);
+      form.addEventListener('submit', (event) => { event.preventDefault(); if (form.inert) return;
+        guard(async () => {
+          if (state.value === 'revoked' && !await confirmModal('Revoke this route', 'New deliveries will be denied. Restoring permission requires a new invitation. Previously received files remain on the destination.', 'Revoke route')) return;
+          form.inert = true;
+          try { await api(`/api/trade-routes/${route.id}`, { method: 'PUT', body: JSON.stringify({ revision: revisionOf(route), state: state.value, cancel_active: active.value === 'cancel', notifications: policy.read() }) }); markFormSaved(form); $('trade-notice').textContent = 'Route settings saved.'; await refresh(); $(`route-${route.id}`).focus(); } finally { form.inert = false; }
+        });
+      }); details.append(form);
+    }
+    card.destroy = () => details.destroy();
+    card.append(details);
     if (route.direction === 'outgoing' && route.remote_grant && route.state !== 'revoked') {
       const credential = node('details', '', 'trade-advanced'); credential.append(node('summary', 'Connection security'), node('p', 'Replace this route’s private access credential. The port’s identity and route permission stay the same.', 'field-help'), button('Rotate credential', 'ghost', (element) => guard(async () => {
         element.disabled = true;

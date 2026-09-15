@@ -1,4 +1,4 @@
-import { markFormChanged, markFormSaved } from '/assets/form-drafts.js';
+import { isFormDirty, markFormChanged, markFormSaved } from '/assets/form-drafts.js';
 import { notificationEditor, notificationDetails, downloadEvents } from '/assets/notifications.js';
 if (window.location.hash === '#workflows') window.location.replace('/workflows');
 
@@ -46,6 +46,11 @@ let grantLoading = false;
 function renderGrants() {
   const grants = grantRows;
   const container = $('outbound-grants');
+  const editingNotifications = new Map([...container.querySelectorAll('.link-item')]
+    .map((card) => [card.id, card.querySelector('.notification-details')])
+    .filter(([id, editor]) => editor && isFormDirty(editor) && grants.some((grant) => `grant-${grant.id}` === id)));
+  const retainedEditors = new Set(editingNotifications.values());
+  for (const editor of container.querySelectorAll('.notification-details')) if (!retainedEditors.has(editor)) editor.destroy?.();
   if (container.contains(document.activeElement)) {
     announce('outbound-grants-status', 'Issued downloads updated.');
     $('outbound-grants-status').focus({ preventScroll: true });
@@ -116,7 +121,7 @@ function renderGrants() {
     }
     meta.textContent = metaParts.join(' · ');
     card.append(meta);
-    card.append(notificationDetails({ policy: grant.notifications, events: downloadEvents, readOnly: notificationsReadOnly,
+    card.append(editingNotifications.get(card.id) || notificationDetails({ policy: grant.notifications, events: downloadEvents, readOnly: notificationsReadOnly,
       save: async (notifications) => {
         await api(`/api/admin/outbound-grants/${grant.id}`, { method: 'PATCH', body: JSON.stringify({ notifications }) });
         grant.notifications = notifications;

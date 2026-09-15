@@ -73,6 +73,7 @@ function form(id, action) {
 
 function projectFields() {
   const project = projects.find((item) => item.id === value('workflow-project'));
+  jobNotifications?.destroy();
   jobNotifications = notificationEditor({ inherit: project?.notifications || null, events: workflowEvents }); $('workflow-notifications').replaceChildren(jobNotifications.element);
   $('workflow-metadata').replaceChildren();
   $('workflow-recipients').replaceChildren($('workflow-recipients').querySelector('legend'));
@@ -124,6 +125,7 @@ async function newDelivery(id) {
   }
   projectFields();
   if (saved) {
+    jobNotifications.destroy();
     jobNotifications = notificationEditor({ policy: saved.notifications, inherit: projects.find((project) => project.id === saved.project_id)?.notifications || null, events: workflowEvents }); $('workflow-notifications').replaceChildren(jobNotifications.element);
     for (const input of $('workflow-metadata').querySelectorAll('input')) input.value = saved.metadata[input.dataset.key] || '';
     for (const input of $('workflow-recipients').querySelectorAll('input')) input.checked = saved.recipients.includes(input.value);
@@ -177,6 +179,7 @@ function editProject(project) {
   $('workflow-save-project').reset(); $('workflow-save-project').hidden = false;
   $('project-editor-title').textContent = project ? `Edit ${project.label}` : 'New project';
   for (const key of ['id', 'label', 'directory']) { $(`wp-${key}`).value = project?.[key] || ''; }
+  projectNotifications?.destroy();
   projectNotifications = notificationEditor({ policy: project?.notifications, events: workflowEvents }); $('project-notifications').replaceChildren(projectNotifications.element);
   $('wp-id').readOnly = $('wp-directory').readOnly = !!project;
   for (const kind of Object.keys(fields)) $(`wp-${kind}`).replaceChildren();
@@ -233,7 +236,10 @@ async function refreshJobs(more = false, background = false, discardEdits = fals
   committedFilters = filterKey;
   const list = $('workflow-jobs');
   if (discardEdits) for (const editor of list.querySelectorAll('[data-unsaved]')) markFormSaved(editor);
-  const editingNotifications = new Map([...list.querySelectorAll('.job-card')].map((card) => [card.id, card.querySelector('.notification-details')]).filter(([, editor]) => isFormDirty(editor)));
+  const jobIds = new Set(jobs.map(({ job }) => `job-${job.id}`));
+  const editingNotifications = new Map([...list.querySelectorAll('.job-card')].map((card) => [card.id, card.querySelector('.notification-details')]).filter(([id, editor]) => isFormDirty(editor) && jobIds.has(id)));
+  const retainedEditors = new Set(editingNotifications.values());
+  for (const editor of list.querySelectorAll('.notification-details')) if (!retainedEditors.has(editor)) editor.destroy?.();
   list.replaceChildren();
   $('workflow-filter-status').textContent = `${jobs.length}${cursor ? '+' : ''} ${jobs.length === 1 ? 'delivery' : 'deliveries'}${Object.values(jobFilter).some(Boolean) ? ' matching these filters' : ''}`;
   if (!jobs.length && Object.values(jobFilter).some(Boolean)) list.append(empty('No deliveries match', 'Try another name, project or status.', button('Clear filters', 'ghost', () => clearFilters())));
