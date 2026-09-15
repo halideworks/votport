@@ -1,9 +1,10 @@
 //! Environment-driven configuration.
 
 use std::env;
+use std::ffi::OsStr;
 use std::fmt;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -99,6 +100,7 @@ pub struct Config {
 
 impl Config {
     pub(crate) fn validate(&self) -> Result<(), String> {
+        self.validate_storage_roots()?;
         if let Some(url) = self.public_url.as_deref() {
             validate_public_url(url)?;
         }
@@ -107,6 +109,208 @@ impl Config {
         }
         validate_admin_password_hash(&self.admin_password_hash)
     }
+
+    pub(crate) fn validate_storage_roots(&self) -> Result<(), String> {
+        validate_storage_roots(&self.data_dir, &self.receive_dir, &self.outbound_dir)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedStorageRoot {
+    path: PathBuf,
+    #[cfg(unix)]
+    ancestors: Vec<(u64, u64)>,
+    #[cfg(unix)]
+    anchor: StorageAnchor,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct StorageAnchor {
+    identity: (u64, u64),
+    suffix: Vec<std::ffi::OsString>,
+}
+
+fn validate_storage_roots(
+    data_dir: &Path,
+    receive_dir: &Path,
+    outbound_dir: &Path,
+) -> Result<(), String> {
+    let roots = [
+        ("VOTPORT_DATA_DIR", data_dir),
+        ("VOTPORT_RECEIVE_DIR", receive_dir),
+        ("VOTPORT_OUTBOUND_DIR", outbound_dir),
+    ];
+    let resolved = roots
+        .iter()
+        .map(|(name, path)| resolve_storage_root(name, path))
+        .collect::<Result<Vec<_>, _>>()?;
+    // Shared ancestors are valid; only a root matching another root or its ancestor overlaps.
+    for (left, right) in [(0, 1), (0, 2), (1, 2)] {
+        if storage_paths_overlap(&resolved[left].path, &resolved[right].path)
+            || storage_roots_share_physical_directory(&resolved[left], &resolved[right])
+        {
+            return Err(format!(
+                "{} and {} must be separate storage directories",
+                roots[left].0, roots[right].0
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_storage_root(name: &str, path: &Path) -> Result<ResolvedStorageRoot, String> {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        env::current_dir()
+            .map_err(|error| format!("{name} cannot resolve its working directory: {error}"))?
+            .join(path)
+    };
+    let mut current = absolute;
+    let mut missing = Vec::new();
+    let mut symlinks = 0;
+    let resolved = loop {
+        match std::fs::canonicalize(&current) {
+            Ok(path) => {
+                let mut resolved = path;
+                for component in missing.iter().rev() {
+                    if component == OsStr::new(".") {
+                        continue;
+                    }
+                    if component == OsStr::new("..") {
+                        resolved.pop();
+                    } else {
+                        resolved.push(component);
+                    }
+                }
+                match std::fs::canonicalize(&resolved) {
+                    Ok(canonical) => break canonical,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if missing
+                            .iter()
+                            .all(|component| component != OsStr::new(".."))
+                        {
+                            break resolved;
+                        }
+                        current = resolved;
+                        missing.clear();
+                        continue;
+                    }
+                    Err(error) => return Err(format!("{name} cannot be resolved: {error}")),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Ok(metadata) = std::fs::symlink_metadata(&current) {
+                    if metadata.file_type().is_symlink() {
+                        symlinks += 1;
+                        if symlinks > 40 {
+                            return Err(format!("{name} contains too many symlinks"));
+                        }
+                        let target = std::fs::read_link(&current)
+                            .map_err(|error| format!("{name} cannot be resolved: {error}"))?;
+                        current = if target.is_absolute() {
+                            target
+                        } else {
+                            current.parent().unwrap_or(Path::new("/")).join(target)
+                        };
+                        continue;
+                    }
+                }
+                let Some(component) = current.file_name() else {
+                    return Err(format!("{name} has no existing parent directory"));
+                };
+                missing.push(component.to_owned());
+                let Some(parent) = current.parent() else {
+                    return Err(format!("{name} has no existing parent directory"));
+                };
+                current = parent.to_owned();
+            }
+            Err(error) => return Err(format!("{name} cannot be resolved: {error}")),
+        }
+    };
+    match std::fs::metadata(&resolved) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(format!("{name} must be a directory")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("{name} cannot be checked: {error}")),
+    }
+    #[cfg(unix)]
+    let (ancestors, anchor) = storage_root_identities(&resolved, name)?;
+    Ok(ResolvedStorageRoot {
+        path: resolved,
+        #[cfg(unix)]
+        ancestors,
+        #[cfg(unix)]
+        anchor,
+    })
+}
+
+fn storage_paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+#[cfg(unix)]
+fn storage_root_identities(
+    path: &Path,
+    name: &str,
+) -> Result<(Vec<(u64, u64)>, StorageAnchor), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mut ancestors = Vec::new();
+    let mut suffix = Vec::new();
+    let mut anchor = None;
+    let mut current = path;
+    loop {
+        match std::fs::metadata(current) {
+            Ok(metadata) if metadata.is_dir() => {
+                let current_identity = (metadata.dev(), metadata.ino());
+                if anchor.is_none() {
+                    anchor = Some(StorageAnchor {
+                        identity: current_identity,
+                        suffix: std::mem::take(&mut suffix).into_iter().rev().collect(),
+                    });
+                }
+                ancestors.push(current_identity);
+                if current == Path::new("/") {
+                    return Ok((ancestors, anchor.expect("root anchor")));
+                }
+                current = current.parent().unwrap_or(Path::new("/"));
+            }
+            Ok(_) => return Err(format!("{name} has a non-directory ancestor")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if current == Path::new("/") {
+                    return Err(format!("{name} has no existing parent directory"));
+                }
+                let Some(component) = current.file_name() else {
+                    return Err(format!("{name} has no existing parent directory"));
+                };
+                suffix.push(component.to_owned());
+                current = current.parent().unwrap_or(Path::new("/"));
+            }
+            Err(error) => return Err(format!("{name} cannot be checked: {error}")),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn storage_roots_share_physical_directory(
+    left: &ResolvedStorageRoot,
+    right: &ResolvedStorageRoot,
+) -> bool {
+    (left.anchor.suffix.is_empty() && right.ancestors.contains(&left.anchor.identity))
+        || (right.anchor.suffix.is_empty() && left.ancestors.contains(&right.anchor.identity))
+        || (left.anchor.identity == right.anchor.identity
+            && (left.anchor.suffix.starts_with(&right.anchor.suffix)
+                || right.anchor.suffix.starts_with(&left.anchor.suffix)))
+}
+
+#[cfg(not(unix))]
+fn storage_roots_share_physical_directory(
+    _left: &ResolvedStorageRoot,
+    _right: &ResolvedStorageRoot,
+) -> bool {
+    false
 }
 
 /// Identity-provider settings for admin SSO (docs/multi-tenancy.md phase 3).
@@ -1197,5 +1401,92 @@ mod tests {
         assert!(parse_bytes("500x").is_err());
         assert!(parse_bytes("-5").is_err());
         assert!(parse_bytes("G").is_err());
+    }
+
+    #[test]
+    fn storage_roots_reject_nested_paths_and_allow_missing_siblings() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let receive = directory.path().join("received");
+        let outbound = directory.path().join("outbound");
+        assert!(validate_storage_roots(&data, &receive, &outbound).is_ok());
+        assert!(!data.exists());
+        assert!(validate_storage_roots(&data, &receive, &data).is_err());
+        assert!(validate_storage_roots(&data, &data.join("received"), &outbound).is_err());
+        assert!(!data.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_roots_reject_symlink_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let alias = directory.path().join("received");
+        let outbound = directory.path().join("outbound");
+        std::fs::create_dir(&data).unwrap();
+        symlink(&data, &alias).unwrap();
+        assert!(validate_storage_roots(&data, &alias, &outbound).is_err());
+
+        let future_data = directory.path().join("future-data");
+        let future_alias = directory.path().join("future-received");
+        symlink(&future_data, &future_alias).unwrap();
+        assert!(validate_storage_roots(&future_data, &future_alias, &outbound).is_err());
+
+        let target = directory.path().join("target");
+        let target_child = target.join("child");
+        let target_data = target.join("data");
+        let target_link = directory.path().join("target-link");
+        std::fs::create_dir_all(&target_child).unwrap();
+        symlink(&target_child, &target_link).unwrap();
+        let receive_via_link = target_link.join("../data");
+        assert!(!target_data.exists());
+        assert!(!receive_via_link.exists());
+        let error = validate_storage_roots(&target_data, &receive_via_link, &outbound).unwrap_err();
+        assert!(error.contains("VOTPORT_DATA_DIR"), "{error}");
+        assert!(error.contains("VOTPORT_RECEIVE_DIR"), "{error}");
+        assert!(validate_storage_roots(&target_data, &target.join("received"), &outbound).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn physical_root_projection_rejects_equal_and_nested_missing_aliases() {
+        let projected = |identity, suffix: &[&str]| ResolvedStorageRoot {
+            path: PathBuf::new(),
+            ancestors: Vec::new(),
+            anchor: StorageAnchor {
+                identity,
+                suffix: suffix.iter().map(std::ffi::OsString::from).collect(),
+            },
+        };
+        assert!(storage_roots_share_physical_directory(
+            &projected((7, 11), &["data"]),
+            &projected((7, 11), &["data"]),
+        ));
+        assert!(storage_roots_share_physical_directory(
+            &projected((7, 11), &["data"]),
+            &projected((7, 11), &["data", "child"]),
+        ));
+        assert!(!storage_roots_share_physical_directory(
+            &projected((7, 11), &["data"]),
+            &projected((7, 11), &["received"]),
+        ));
+        assert!(!storage_roots_share_physical_directory(
+            &projected((7, 11), &["data"]),
+            &projected((7, 12), &["data"]),
+        ));
+        let existing = ResolvedStorageRoot {
+            path: PathBuf::new(),
+            ancestors: vec![(7, 11)],
+            anchor: StorageAnchor {
+                identity: (7, 11),
+                suffix: Vec::new(),
+            },
+        };
+        assert!(storage_roots_share_physical_directory(
+            &existing,
+            &projected((7, 11), &["data"]),
+        ));
     }
 }

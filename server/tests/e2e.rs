@@ -228,7 +228,7 @@ async fn start_server_in(
         // same issuer, a second port.
         serve_bind: enable_push.then(|| "127.0.0.1:0".parse().unwrap()),
         serve_advertise: None,
-        data_dir: data.path().to_path_buf(),
+        data_dir: data.path().join("state"),
         receive_dir: received.path().to_path_buf(),
         outbound_dir: data.path().join("outbound"),
         web_root: PathBuf::from("./web"),
@@ -1003,7 +1003,7 @@ async fn corrupt_events_fail_begin_before_destination() {
             .await
             .unwrap();
     }
-    rusqlite::Connection::open(server._data.path().join("votport.db"))
+    rusqlite::Connection::open(server.application.config.data_dir.join("votport.db"))
         .unwrap()
         .execute(
             "UPDATE links SET events_json = 'broken' WHERE id = ?1",
@@ -3309,7 +3309,7 @@ async fn standby_pull_stages_the_live_copy_and_a_boot_promotes_it() {
 
     let standby_data = tempfile::tempdir().unwrap();
     let config = votport::standby::Config {
-        data_dir: standby_data.path().to_path_buf(),
+        data_dir: standby_data.path().join("state"),
         bind: "127.0.0.1:0".parse().unwrap(),
         source: base.clone(),
         token: "replica-secret".to_owned(),
@@ -3320,7 +3320,7 @@ async fn standby_pull_stages_the_live_copy_and_a_boot_promotes_it() {
     assert!(manifest.schema_version > 0);
     // A second pull replaces the first stage rather than piling up.
     votport::standby::pull_once(&puller, &config).await.unwrap();
-    let stages = std::fs::read_dir(standby_data.path())
+    let stages = std::fs::read_dir(standby_data.path().join("state"))
         .unwrap()
         .flatten()
         .filter(|entry| {
@@ -4453,7 +4453,7 @@ async fn native_push_store_failure_preserves_published_files_for_retry() {
     let response = preflight_push(&client, &server.base, &token, &holder, summary).await;
     let session = response["session"].as_str().unwrap().to_owned();
     let (capability, holder_key) = write_push_credentials(fixture.path(), &response, &holder);
-    rusqlite::Connection::open(server._data.path().join("votport.db"))
+    rusqlite::Connection::open(server.application.config.data_dir.join("votport.db"))
         .unwrap()
         .execute_batch(
             "CREATE TRIGGER fail_push_record
@@ -4512,7 +4512,7 @@ async fn native_push_store_failure_preserves_published_files_for_retry() {
         })
         .collect();
     assert_eq!(server.application.sessions.total(), 1);
-    rusqlite::Connection::open(server._data.path().join("votport.db"))
+    rusqlite::Connection::open(server.application.config.data_dir.join("votport.db"))
         .unwrap()
         .execute_batch("DROP TRIGGER fail_push_record;")
         .unwrap();
@@ -6339,7 +6339,7 @@ async fn start_nas_test_server(push: bool) -> TestServer {
         "campaign requires an actual NAS mount"
     );
     {
-        let store = votport::store::Store::open(data.path()).unwrap();
+        let store = votport::store::Store::open(&data.path().join("state")).unwrap();
         let qualified = votport::receiving::Qualification {
             storage: identity,
             qualified_at: votport::store::now_unix(),
