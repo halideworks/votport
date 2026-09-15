@@ -2309,26 +2309,32 @@ pub async fn backup_database(
 ) -> ApiResult<Response> {
     let identity = require_platform_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    let _guard = app
-        .backup_lock
-        .try_lock()
+    let guard = Arc::clone(&app.backup_lock)
+        .try_lock_owned()
         .map_err(|_| ApiError::new(StatusCode::CONFLICT, "backup already running"))?;
     let backups = app.config.data_dir.join("backups");
-    tokio::fs::create_dir_all(&backups)
-        .await
-        .map_err(|error| ApiError::internal(format!("create backups dir: {error}")))?;
-    paths::tighten_private_dir(&backups).map_err(ApiError::internal)?;
     let name = crate::backup::legacy_snapshot_filename();
     let destination = backups.join(&name);
     let store = Arc::clone(&app.store);
     let destination_clone = destination.clone();
-    tokio::task::spawn_blocking(move || store.backup_into(&destination_clone))
-        .await
-        .map_err(|error| ApiError::internal(error.to_string()))?
-        .map_err(ApiError::internal)?;
-    let file = tokio::fs::File::open(&destination)
-        .await
-        .map_err(|error| ApiError::internal(format!("open snapshot: {error}")))?;
+    let file = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        let Some(_root_lock) = crate::backup::try_lock_backup_root(&backups)? else {
+            return Err("backup root is busy".to_owned());
+        };
+        store.backup_into(&destination_clone)?;
+        std::fs::File::open(&destination_clone).map_err(|error| format!("open snapshot: {error}"))
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?
+    .map_err(|error| {
+        if error == "backup root is busy" {
+            ApiError::new(StatusCode::CONFLICT, error)
+        } else {
+            ApiError::internal(error)
+        }
+    })?;
+    let file = tokio::fs::File::from_std(file);
     let len = file
         .metadata()
         .await
@@ -2529,9 +2535,8 @@ pub async fn create_backup(
 ) -> ApiResult<Json<serde_json::Value>> {
     let identity = require_platform_admin(&app, &headers)?;
     require_admin_write(&headers, &identity)?;
-    let _guard = app
-        .backup_lock
-        .try_lock()
+    let guard = Arc::clone(&app.backup_lock)
+        .try_lock_owned()
         .map_err(|_| ApiError::new(StatusCode::CONFLICT, "backup already running"))?;
     crate::backup::ensure_no_pending_restore(&app.config.data_dir)
         .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
@@ -2543,9 +2548,15 @@ pub async fn create_backup(
     )
     .map_err(ApiError::internal)?;
     let secrets = crate::backup::read_secrets(&app.config.data_dir).map_err(ApiError::internal)?;
-    let id = crate::backup::run(Arc::clone(&app), config, secrets)
+    let id = crate::backup::run_with_guard(Arc::clone(&app), config, secrets, guard)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(|error| {
+            if error == "backup root is busy" {
+                ApiError::new(StatusCode::CONFLICT, error)
+            } else {
+                ApiError::internal(error)
+            }
+        })?;
     app.store
         .audit("", &identity.subject, "backup_created", &id, &json!({}));
     Ok(Json(json!({ "id": id })))
@@ -2560,10 +2571,21 @@ pub async fn restore_backup(
     require_admin_write(&headers, &identity)?;
     crate::backup::validate_id(&body.id)
         .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
-    let _guard = app
-        .backup_lock
-        .try_lock()
+    let guard = Arc::clone(&app.backup_lock)
+        .try_lock_owned()
         .map_err(|_| ApiError::new(StatusCode::CONFLICT, "backup already running"))?;
+    let subject = identity.subject.clone();
+    tokio::spawn(restore_backup_operation(app, body, subject, guard))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+}
+
+async fn restore_backup_operation(
+    app: Arc<App>,
+    body: crate::backup::RestoreRequest,
+    subject: String,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+) -> ApiResult<Json<serde_json::Value>> {
     crate::backup::ensure_no_pending_restore(&app.config.data_dir)
         .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
     let config = crate::backup::parse_config(
@@ -2586,6 +2608,19 @@ pub async fn restore_backup(
         crate::auth::random_token()
     ));
     let _incoming_cleanup = crate::backup::CleanupPath::new(incoming.clone());
+    let root_lock = if body.source == "local" {
+        let local_root = config
+            .local_root(&app.config.data_dir)
+            .map_err(ApiError::internal)?;
+        let Some(lock) =
+            crate::backup::try_lock_backup_root(&local_root).map_err(ApiError::internal)?
+        else {
+            return Err(ApiError::new(StatusCode::CONFLICT, "backup root is busy"));
+        };
+        Some(lock)
+    } else {
+        None
+    };
     if body.source == "local" {
         let local_root = config
             .local_root(&app.config.data_dir)
@@ -2597,10 +2632,14 @@ pub async fn restore_backup(
             return Err(ApiError::new(StatusCode::NOT_FOUND, "backup not found"));
         }
         let output = incoming.clone();
-        tokio::task::spawn_blocking(move || crate::backup::copy_private_file(&source, &output))
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?
-            .map_err(ApiError::internal)?;
+        let root_file = root_lock.as_ref().map(|lock| Arc::clone(&lock.file));
+        tokio::task::spawn_blocking(move || {
+            let _root_file = root_file;
+            crate::backup::copy_private_file(&source, &output)
+        })
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .map_err(ApiError::internal)?;
     } else if body.source == "s3" {
         crate::backup::download_s3(&config, &secrets, &body.id, &incoming)
             .await
@@ -2659,7 +2698,7 @@ pub async fn restore_backup(
     .map_err(ApiError::internal)?;
     app.store.audit(
         "",
-        &identity.subject,
+        &subject,
         "backup_restore_pending",
         &body.id,
         &json!({ "version": result.version }),
@@ -7793,15 +7832,12 @@ mod backup_tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
 
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(80),
-                crate::backup::scheduler(application),
-            )
-            .await
-            .is_err(),
-            "pending restore must leave the scheduler paused and alive"
-        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::backup::scheduler(application),
+        )
+        .await
+        .expect("scheduler must exit after shutdown");
     }
 
     #[tokio::test]

@@ -449,6 +449,7 @@ impl Store {
         &self,
         control: &OutboundControl,
         acknowledgement: Option<&RouteRevoked>,
+        error: Option<&str>,
         now: u64,
     ) -> Result<(), String> {
         if acknowledgement.is_some_and(|ack| !ack.verify(&control.request)) {
@@ -461,7 +462,7 @@ impl Store {
         if changed == 0 {
             return Ok(());
         }
-        let status = serde_json::json!({"state":if acknowledgement.is_some() { "acknowledged" } else { "pending" },"attempts":control.attempts,"retry_at":if acknowledgement.is_none() { Some(next) } else { None },"acknowledgement":acknowledgement});
+        let status = serde_json::json!({"state":if acknowledgement.is_some() { "acknowledged" } else { "pending" },"attempts":control.attempts,"retry_at":if acknowledgement.is_none() { Some(next) } else { None },"error":if acknowledgement.is_none() { error } else { None::<&str> },"acknowledgement":acknowledgement});
         tx.execute(
             "UPDATE delivery_jobs SET document=json_set(document,?2,json(?3)) WHERE id=?1",
             params![

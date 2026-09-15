@@ -272,6 +272,11 @@ without replacing the last backup result. The scheduler checks again each
 minute and resumes when the blocker clears; applying a restore still requires
 a restart.
 
+Backup and restore work retains its ownership locks if the requesting client
+disconnects. At startup, VOTPort removes owned scratch files under the data or
+backup directory lock. It preserves pending restore inputs, rollback files,
+and older scratch names whose writers do not use the backup directory lock.
+
 Pruning is owned by VOTPort for snapshots it created under the configured
 local path and for generated `votport-backup-v2-*` objects under the configured
 S3 prefix. It does not delete unrelated local files or bucket objects. S3
@@ -729,6 +734,9 @@ and diagnostic `votport_lease_age_seconds` gauges. QUIC delivery exports
 `votport_serve_deliveries_total` and `votport_serve_refused_total{reason}`
 (`rate`, `capability`, `unknown`, `closed`, `busy`). Served bytes update when
 sessions end; completions count successfully recorded fetch acknowledgements.
+`votport_delivery_event_chain_failures_total` counts stored delivery-history
+signature, issuer, hash and chain verification failures. It resets on restart;
+invalid client cursors and unrelated database errors do not increment it.
 [The Grafana dashboard](../ops/grafana-votport.json) includes these series.
 Request metrics never include paths, tenants, addresses,
 methods, or tokens. Set `VOTPORT_METRICS_TOKEN` to require a bearer token, and
@@ -761,6 +769,8 @@ retention waits 24 hours after startup and after each completed pass, so it
 never runs immediately at boot. The two schedules run independently. Restarting
 resets these delays; a service restarted more often than daily will postpone
 daily retention until it stays up long enough.
+If receiving storage becomes unavailable, upload retention stops the current
+pass and logs one error. It retries on the next daily pass.
 
 ## Performance
 

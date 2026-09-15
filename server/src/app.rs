@@ -939,6 +939,26 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
     let data_lock = lock_data_dir(&config.data_dir)?;
     crate::backup::apply_pending_restore(&config.data_dir, crate::store::SCHEMA_VERSION)?;
     let store = Arc::new(Store::open(&config.data_dir)?);
+    let orphan_count = crate::backup::sweep_data_dir_orphans(&config.data_dir)?;
+    if orphan_count > 0 {
+        tracing::info!(
+            count = orphan_count,
+            "removed interrupted backup and restore scratch"
+        );
+    }
+    match store
+        .setting(crate::backup::SETTING_KEY)
+        .and_then(|setting| crate::backup::parse_config(setting, &config.data_dir))
+        .and_then(|backup| backup.local_root(&config.data_dir))
+        .and_then(|root| crate::backup::sweep_backup_root_orphans(&root))
+    {
+        Ok(Some(count)) if count > 0 => {
+            tracing::info!(count, "removed interrupted backup archive stages")
+        }
+        Ok(None) => tracing::debug!("backup archive stage cleanup deferred while root is busy"),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "backup archive stage cleanup skipped"),
+    }
     crate::api::serve::sweep_manifests(&store, &config.data_dir);
     // A saved NAS root is never created on a missing mount's local backing directory.
     if crate::receiving::saved_qualification(&store)?.is_none() {
@@ -3487,9 +3507,9 @@ mod health_tests {
         app.store
             .audit("", "", "metrics_test", "row", &serde_json::json!({}));
 
-        assert!(metrics_text(&app)
-            .unwrap()
-            .contains("votport_audit_rows 1\n"));
+        let metrics = metrics_text(&app).unwrap();
+        assert!(metrics.contains("votport_audit_rows 1\n"));
+        assert!(metrics.contains("votport_delivery_event_chain_failures_total "));
     }
 }
 
@@ -5317,6 +5337,12 @@ fn metrics_text(app: &App) -> Result<String, String> {
     );
     let _ = write!(
         body,
+        "# TYPE votport_delivery_event_chain_failures_total counter\nvotport_delivery_event_chain_failures_total {}\n",
+        crate::store::DELIVERY_EVENT_CHAIN_FAILURES
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    let _ = write!(
+        body,
         "# TYPE votport_integrity_failures_total counter\nvotport_integrity_failures_total {}\n",
         crate::api::outbound::OUTBOUND_INTEGRITY_FAILURES
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -5621,11 +5647,11 @@ async fn expire_link_uploads(
     candidate: crate::store::Link,
     cutoff: u64,
     effective_now: u64,
-) {
+) -> Option<Result<(), String>> {
     sweep_task(app, "upload retention", move |app| {
-        expire_link_uploads_sync(app, candidate, cutoff, effective_now);
+        expire_link_uploads_sync(app, candidate, cutoff, effective_now)
     })
-    .await;
+    .await
 }
 
 fn expire_link_uploads_sync(
@@ -5633,36 +5659,34 @@ fn expire_link_uploads_sync(
     candidate: crate::store::Link,
     cutoff: u64,
     effective_now: u64,
-) {
-    if app.receiving_destinations().is_err() {
-        return;
-    }
+) -> Result<(), String> {
+    app.receiving_destinations()?;
     if candidate.legal_hold {
-        return;
+        return Ok(());
     }
     match app
         .store
         .receive_workflow_pending(&candidate.tenant, &candidate.id)
     {
         Ok(false) => {}
-        Ok(true) => return,
+        Ok(true) => return Ok(()),
         Err(error) => {
             tracing::error!(%error, "read incoming workflows; skipping retention");
-            return;
+            return Ok(());
         }
     }
     let Some(_pin) = app.sessions.try_pin_link(&candidate.id) else {
-        return;
+        return Ok(());
     };
     if app.sessions.active_for_link(&candidate.id) > 0 {
-        return;
+        return Ok(());
     }
     let link = match app.store.link(&candidate.tenant, &candidate.id) {
         Ok(Some(link)) if !link.legal_hold => link,
-        Ok(_) => return,
+        Ok(_) => return Ok(()),
         Err(error) => {
             tracing::error!(%error, "link re-read failed; skipping retention for link");
-            return;
+            return Ok(());
         }
     };
     let mut protected: HashSet<&str> = link
@@ -5681,7 +5705,7 @@ fn expire_link_uploads_sync(
             Ok(keys) => keys,
             Err(error) => {
                 tracing::error!(%error, "outbound grant read failed; skipping retention for link");
-                return;
+                return Ok(());
             }
         };
     let mut active_outbound_files: HashSet<(&str, usize)> = active_outbound_files
@@ -5697,7 +5721,7 @@ fn expire_link_uploads_sync(
     }
     if !active_outbound_files.is_empty() {
         tracing::error!("outbound grant references a missing file; skipping retention for link");
-        return;
+        return Ok(());
     }
     let candidates: std::collections::HashMap<&str, &crate::store::FileRecord> = link
         .uploads
@@ -5709,11 +5733,9 @@ fn expire_link_uploads_sync(
         .collect();
     let candidates: Vec<_> = candidates.into_values().collect();
     if candidates.is_empty() {
-        return;
+        return Ok(());
     }
-    let Ok(destinations) = app.receiving_destinations() else {
-        return;
-    };
+    let destinations = app.receiving_destinations()?;
     let removed = (|| -> Result<usize, String> {
         let prepare = |record: &crate::store::FileRecord| {
             let mut components = crate::paths::tenant_prefix(&link.tenant);
@@ -5769,6 +5791,7 @@ fn expire_link_uploads_sync(
             tracing::error!(link = %link.id, %error, "retention failed; files were retained")
         }
     }
+    Ok(())
 }
 
 /// Discards idle upload sessions and expired audit rows.
@@ -6007,7 +6030,14 @@ async fn sweep_daily_at(app: &Arc<App>, retention: RetentionObservation) {
                     }
                     None => return,
                 };
-                expire_link_uploads(app, link, cutoff, now).await;
+                match expire_link_uploads(app, link, cutoff, now).await {
+                    Some(Ok(())) => {}
+                    Some(Err(error)) => {
+                        tracing::error!(%error, "retention stopped; receiving storage unavailable");
+                        return;
+                    }
+                    None => return,
+                }
             }
             if page_len < RETENTION_LINK_PAGE_SIZE {
                 break;
@@ -6803,7 +6833,11 @@ mod retention_tests {
                 std::fs::write(&expired_path, b"replacement").unwrap();
             }
             let candidate = app.store.link("", "expired").unwrap().unwrap();
-            expire_link_uploads(&app, candidate, cutoff, cutoff).await;
+            let result = expire_link_uploads(&app, candidate, cutoff, cutoff).await;
+            let Some(Err(error)) = result else {
+                panic!("unavailable receiving storage must surface a retention error");
+            };
+            assert!(!error.is_empty());
             assert!(!app.store.link("", "expired").unwrap().unwrap().uploads[0].files[0].deleted);
             assert_eq!(
                 std::fs::read(displaced.join("expired.txt")).unwrap(),
@@ -6815,10 +6849,49 @@ mod retention_tests {
             }
             std::fs::rename(displaced, &app.config.receive_dir).unwrap();
         }
+        let daily_displaced = directory.path().join("daily-displaced");
+        std::fs::rename(&app.config.receive_dir, &daily_displaced).unwrap();
+        use tracing::instrument::WithSubscriber;
+        let daily_log = tempfile::NamedTempFile::new().unwrap();
+        let daily_writer = daily_log.reopen().unwrap();
+        let daily_subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || daily_writer.try_clone().unwrap())
+            .finish();
+        sweep_daily_at(
+            &app,
+            RetentionObservation {
+                effective_at: cutoff,
+                allow_age: true,
+            },
+        )
+        .with_subscriber(daily_subscriber)
+        .await;
+        let daily_log = std::fs::read_to_string(daily_log.path()).unwrap();
+        assert_eq!(
+            daily_log
+                .lines()
+                .filter(|line| line.contains("retention stopped; receiving storage unavailable"))
+                .count(),
+            1,
+            "{daily_log}"
+        );
+        assert!(!app.store.link("", "expired").unwrap().unwrap().uploads[0].files[0].deleted);
+        assert!(!app.store.link("", "failed").unwrap().unwrap().uploads[0].files[0].deleted);
+        assert_eq!(
+            std::fs::read(daily_displaced.join("expired.txt")).unwrap(),
+            b"expired"
+        );
+        std::fs::rename(daily_displaced, &app.config.receive_dir).unwrap();
         receiving.check_current().unwrap();
         let mut stale_held = held;
         stale_held.legal_hold = false;
-        expire_link_uploads(&app, stale_held, cutoff, cutoff).await;
+        assert!(matches!(
+            expire_link_uploads(&app, stale_held, cutoff, cutoff).await,
+            Some(Ok(()))
+        ));
 
         let (active_tx, _active_rx) = tokio::sync::mpsc::channel(1);
         app.sessions
@@ -6830,11 +6903,17 @@ mod retention_tests {
             )
             .unwrap();
         let active_candidate = app.store.link("", "active").unwrap().unwrap();
-        expire_link_uploads(&app, active_candidate, cutoff, cutoff).await;
+        assert!(matches!(
+            expire_link_uploads(&app, active_candidate, cutoff, cutoff).await,
+            Some(Ok(()))
+        ));
         assert!(active_path.exists());
 
         let shared_candidate = app.store.link("", "shared").unwrap().unwrap();
-        expire_link_uploads(&app, shared_candidate, cutoff, cutoff).await;
+        assert!(matches!(
+            expire_link_uploads(&app, shared_candidate, cutoff, cutoff).await,
+            Some(Ok(()))
+        ));
         assert!(shared_path.exists());
         assert!(app
             .store
@@ -6846,7 +6925,10 @@ mod retention_tests {
             .all(|upload| !upload.files[0].deleted));
 
         let outbound_candidate = app.store.link("", "outbound").unwrap().unwrap();
-        expire_link_uploads(&app, outbound_candidate, cutoff, cutoff).await;
+        assert!(matches!(
+            expire_link_uploads(&app, outbound_candidate, cutoff, cutoff).await,
+            Some(Ok(()))
+        ));
         assert!(outbound_path.exists());
         assert!(!app.store.link("", "outbound").unwrap().unwrap().uploads[0].files[0].deleted);
 
@@ -6859,7 +6941,10 @@ mod retention_tests {
             )
             .unwrap();
         let malformed_candidate = app.store.link("", "outbound").unwrap().unwrap();
-        expire_link_uploads(&app, malformed_candidate, cutoff, cutoff).await;
+        assert!(matches!(
+            expire_link_uploads(&app, malformed_candidate, cutoff, cutoff).await,
+            Some(Ok(()))
+        ));
         assert!(outbound_path.exists());
         assert!(!app.store.link("", "outbound").unwrap().unwrap().uploads[0].files[0].deleted);
 
@@ -6870,7 +6955,10 @@ mod retention_tests {
             )
             .unwrap();
         let failed_candidate = app.store.link("", "failed").unwrap().unwrap();
-        expire_link_uploads(&app, failed_candidate, cutoff, cutoff).await;
+        assert!(matches!(
+            expire_link_uploads(&app, failed_candidate, cutoff, cutoff).await,
+            Some(Ok(()))
+        ));
         connection
             .execute_batch("DROP TRIGGER fail_link_update")
             .unwrap();

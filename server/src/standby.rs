@@ -205,33 +205,9 @@ async fn pull_replica(
     Ok(manifest)
 }
 
-/// Removes what a pull killed mid-way left behind: downloads, and stage
-/// directories the pending marker does not point at. The marker's own
-/// stage is never touched, whatever phase it is in.
+/// Removes interrupted pull/restore scratch after this instance owns the data directory.
 fn sweep_orphans(data_dir: &Path) -> Result<usize, String> {
-    let keep = crate::backup::pending_restore_stage(data_dir)?;
-    let mut removed = 0;
-    for entry in std::fs::read_dir(data_dir).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_dir()
-            && name.starts_with(".votport-restore-stage-")
-            && keep.as_deref() != Some(name.as_str())
-        {
-            std::fs::remove_dir_all(entry.path()).map_err(|error| error.to_string())?;
-            removed += 1;
-        } else if kind.is_file()
-            && name.starts_with(".votport-restore-")
-            && name.ends_with(".download")
-        {
-            std::fs::remove_file(entry.path()).map_err(|error| error.to_string())?;
-            removed += 1;
-        }
-    }
-    Ok(removed)
+    crate::backup::sweep_data_dir_orphans(data_dir)
 }
 
 /// Runs pulls forever and serves /healthz and /readyz on the bind address.
@@ -461,9 +437,12 @@ mod tests {
     fn orphan_sweep_keeps_the_marked_stage_and_removes_the_rest() {
         let directory = tempfile::tempdir().unwrap();
         let data = directory.path();
-        std::fs::create_dir(data.join(".votport-restore-stage-live")).unwrap();
-        std::fs::create_dir(data.join(".votport-restore-stage-orphan")).unwrap();
-        std::fs::write(data.join(".votport-restore-abc.download"), b"x").unwrap();
+        let live = ".votport-restore-stage-11111111111111111111111111111111";
+        let orphan = ".votport-restore-stage-22222222222222222222222222222222";
+        let download = ".votport-restore-33333333333333333333333333333333.download";
+        std::fs::create_dir(data.join(live)).unwrap();
+        std::fs::create_dir(data.join(orphan)).unwrap();
+        std::fs::write(data.join(download), b"x").unwrap();
         std::fs::write(data.join("keep.txt"), b"x").unwrap();
         let manifest = crate::backup::Manifest {
             version: crate::backup::VERSION,
@@ -473,15 +452,15 @@ mod tests {
         };
         crate::backup::write_pending_restore(
             data,
-            crate::backup::CleanupPath::directory(data.join(".votport-restore-stage-live")),
+            crate::backup::CleanupPath::directory(data.join(live)),
             manifest,
             crate::backup::RestoreMode::Replica,
         )
         .unwrap();
         assert_eq!(sweep_orphans(data).unwrap(), 2);
-        assert!(data.join(".votport-restore-stage-live").exists());
-        assert!(!data.join(".votport-restore-stage-orphan").exists());
-        assert!(!data.join(".votport-restore-abc.download").exists());
+        assert!(data.join(live).exists());
+        assert!(!data.join(orphan).exists());
+        assert!(!data.join(download).exists());
         assert!(data.join("keep.txt").exists());
         assert_eq!(sweep_orphans(data).unwrap(), 0);
     }

@@ -96,12 +96,15 @@ fn job(value: Value) -> crate::Result<WorkflowJob> {
             let leg = &value.job.checks["destinations"][id];
             let revocation = &value.job.checks["route_revocations"][id];
             let status = match revocation["state"].as_str() {
-                Some("acknowledged") => "Revocation acknowledged",
-                Some("pending") => "Revocation awaiting destination",
+                Some("acknowledged") => "Revocation acknowledged".to_owned(),
+                Some("pending") => revocation["error"]
+                    .as_str()
+                    .map(|error| format!("Revocation awaiting destination: {error}"))
+                    .unwrap_or_else(|| "Revocation awaiting destination".to_owned()),
                 _ => match leg["state"].as_str() {
-                    Some("complete") => "Verified copy complete",
-                    Some("sending") => "Transferring files",
-                    _ => leg["error"].as_str().unwrap_or("Copy pending"),
+                    Some("complete") => "Verified copy complete".to_owned(),
+                    Some("sending") => "Transferring files".to_owned(),
+                    _ => leg["error"].as_str().unwrap_or("Copy pending").to_owned(),
                 },
             };
             format!("{id}: {status}")
@@ -215,13 +218,13 @@ mod tests {
 
     #[test]
     fn jobs_expose_reception_and_each_destinations_control_status() {
-        let result = job(json!({"url":"https://port.example/s/link","job":{"id":"job","request":{"label":"Received masters"},"project":{"label":"Studio","destinations":["nyc","s3","shared"]},"state":"retrying","manifest":"root","error":null,"approved_by":null,"created_at":1,"received":{"upload_id":"upload"},"checks":{"destinations":{"nyc":{"state":"complete"},"s3":{"state":"failed","error":"Bucket unavailable"}},"route_revocations":{"nyc":{"state":"pending"}}}}})).unwrap();
+        let result = job(json!({"url":"https://port.example/s/link","job":{"id":"job","request":{"label":"Received masters"},"project":{"label":"Studio","destinations":["nyc","s3","shared"]},"state":"retrying","manifest":"root","error":null,"approved_by":null,"created_at":1,"received":{"upload_id":"upload"},"checks":{"destinations":{"nyc":{"state":"complete"},"s3":{"state":"failed","error":"Bucket unavailable"}},"route_revocations":{"nyc":{"state":"pending","error":"destination refused revocation"}}}}})).unwrap();
         assert!(result.received);
         assert!(result.url.is_some());
         assert_eq!(
             result.destinations,
             vec![
-                "nyc: Revocation awaiting destination",
+                "nyc: Revocation awaiting destination: destination refused revocation",
                 "s3: Bucket unavailable",
                 "shared: Copy pending"
             ]

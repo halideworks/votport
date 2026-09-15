@@ -728,16 +728,13 @@ pub async fn worker(app: Arc<App>) {
     // A dead peer costs two 15 s timeouts per probe; back off per route so a
     // pass stays near a minute and known-dead peers are not hammered.
     let backoff: std::sync::Mutex<HashMap<String, (u32, Instant)>> = Default::default();
+    let mut settings_error_reported = false;
     loop {
         tokio::select! {_=app.wait_for_shutdown()=>return,_=tokio::time::sleep(std::time::Duration::from_secs(60))=>{}}
         if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) || app.is_stopping() {
             return;
         }
-        if app
-            .store
-            .resolved_settings(&app.config)
-            .map_or(true, |s| s.draining)
-        {
+        if trade_monitoring_is_draining(&app, &mut settings_error_reported) {
             continue;
         }
         if let Err(error) = app.store.prune_trade_invitations() {
@@ -779,6 +776,22 @@ pub async fn worker(app: Arc<App>) {
                     .await
             }
             Err(error) => tracing::warn!(%error,"cannot monitor trade routes"),
+        }
+    }
+}
+
+fn trade_monitoring_is_draining(app: &App, settings_error_reported: &mut bool) -> bool {
+    match app.store.resolved_settings(&app.config) {
+        Ok(settings) => {
+            *settings_error_reported = false;
+            settings.draining
+        }
+        Err(error) => {
+            if !*settings_error_reported {
+                tracing::warn!(%error, "cannot read trade monitoring settings");
+                *settings_error_reported = true;
+            }
+            true
         }
     }
 }
@@ -831,6 +844,100 @@ mod tests {
                 &app.config.admin_token_tag,
             )
         )
+    }
+
+    #[test]
+    fn trade_monitoring_reports_settings_outage_once_per_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let mut settings_error_reported = false;
+        assert!(!trade_monitoring_is_draining(
+            &app,
+            &mut settings_error_reported
+        ));
+        app.store
+            .put_settings(
+                "test",
+                &[(
+                    "draining".to_owned(),
+                    crate::store::SettingWrite::Set("0".to_owned()),
+                )],
+            )
+            .unwrap();
+        app.store
+            .with(|connection| connection.execute_batch("DROP TABLE settings"))
+            .unwrap();
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let writer = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(trade_monitoring_is_draining(
+                &app,
+                &mut settings_error_reported
+            ));
+            assert!(settings_error_reported);
+            assert!(trade_monitoring_is_draining(
+                &app,
+                &mut settings_error_reported
+            ));
+            assert!(settings_error_reported);
+            app.store
+                .with(|connection| {
+                    connection.execute_batch(
+                        "CREATE TABLE settings (
+                            key TEXT PRIMARY KEY,
+                            value TEXT NOT NULL,
+                            updated_at INTEGER NOT NULL,
+                            updated_by TEXT NOT NULL DEFAULT ''
+                        )",
+                    )
+                })
+                .unwrap();
+            app.store
+                .put_settings(
+                    "test",
+                    &[(
+                        "draining".to_owned(),
+                        crate::store::SettingWrite::Set("1".to_owned()),
+                    )],
+                )
+                .unwrap();
+            let warnings_after_outage =
+                std::fs::read_to_string(log.path()).unwrap().lines().count();
+            assert!(trade_monitoring_is_draining(
+                &app,
+                &mut settings_error_reported
+            ));
+            assert!(!settings_error_reported);
+            assert_eq!(
+                std::fs::read_to_string(log.path()).unwrap().lines().count(),
+                warnings_after_outage
+            );
+            app.store
+                .put_settings(
+                    "test",
+                    &[(
+                        "draining".to_owned(),
+                        crate::store::SettingWrite::Set("0".to_owned()),
+                    )],
+                )
+                .unwrap();
+            app.store
+                .with(|connection| connection.execute_batch("DROP TABLE settings"))
+                .unwrap();
+            assert!(trade_monitoring_is_draining(
+                &app,
+                &mut settings_error_reported
+            ));
+            assert!(settings_error_reported);
+        });
+        let records = std::fs::read_to_string(log.path()).unwrap().lines().count();
+        assert_eq!(records, 2);
     }
 
     #[derive(Clone)]

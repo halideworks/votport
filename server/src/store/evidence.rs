@@ -124,6 +124,10 @@ pub(super) const EVENT_COLUMNS: &str =
     "id,tenant,grant_id,kind,created_at,payload,previous_hash,hash,issuer,signature";
 pub const MAX_EVENT_PAGE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Stored delivery events that failed signature or chain verification.
+pub static DELIVERY_EVENT_CHAIN_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn invalid_chain() -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure("invalid or incomplete delivery event chain".into())
 }
@@ -159,7 +163,10 @@ fn predecessor(
     let event = connection.query_row(&format!("SELECT {EVENT_COLUMNS} FROM delivery_events WHERE tenant=?1 AND id<=?2 ORDER BY id DESC LIMIT 1"), params![tenant, through as i64], event_row).optional()?;
     match event {
         Some(event) if event.verify_for(issuer, tenant) => Ok(EventCheckpoint::of(&event)),
-        Some(_) => Err(invalid_chain()),
+        Some(_) => {
+            DELIVERY_EVENT_CHAIN_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(invalid_chain())
+        }
         None => Ok(EventCheckpoint::default()),
     }
 }
@@ -202,10 +209,12 @@ fn event_page(
     let mut bytes = 0;
     for row in rows {
         let event = row?;
-        if !event.verify_for(issuer, tenant)
-            || event.id <= previous.id
-            || event.previous_hash != previous.hash
-        {
+        let verified = event.verify_for(issuer, tenant);
+        let linked = event.previous_hash == previous.hash;
+        if !verified || event.id <= previous.id || !linked {
+            if !verified || !linked {
+                DELIVERY_EVENT_CHAIN_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return Err(invalid_chain());
         }
         bytes += serde_json::to_vec(&event)
@@ -533,15 +542,63 @@ mod tests {
         tx.commit().unwrap();
     }
 
-    #[test]
-    fn delivery_events_reject_tampering_before_returning_rows() {
+    #[tokio::test]
+    async fn delivery_events_reject_tampering_before_returning_rows() {
+        const CHILD_MARKER: &str = "VOTPORT_TEST_DELIVERY_EVENT_TAMPER";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            delivery_events_reject_tampering_fixture();
+            return;
+        }
+        let marker = format!("{}-{}", std::process::id(), crate::auth::random_token());
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "store::evidence::tests::delivery_events_reject_tampering_before_returning_rows",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, marker)
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(20), command.output())
+            .await
+            .expect("delivery event tampering child timed out")
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+    }
+
+    fn delivery_events_reject_tampering_fixture() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         append(&store, "", 1);
+        append(&store, "", 2);
+        let first = store.delivery_events("", 0, 1).unwrap()[0].clone();
         store
-            .with(|c| c.execute("UPDATE delivery_events SET payload='{}'", []))
+            .with(|c| c.execute("UPDATE delivery_events SET signature=?1 WHERE id=2", ["00"]))
             .unwrap();
-        assert!(store.delivery_events("", 0, 100).is_err());
+        let before = DELIVERY_EVENT_CHAIN_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(store.delivery_events("", first.id, 100).is_err());
+        assert_eq!(
+            DELIVERY_EVENT_CHAIN_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1
+        );
+        let before_invalid_cursor =
+            DELIVERY_EVENT_CHAIN_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(store
+            .delivery_event_export(
+                "",
+                EventCheckpoint {
+                    id: first.id,
+                    hash: "0".repeat(64),
+                },
+                None,
+                100,
+            )
+            .is_err());
+        assert_eq!(
+            DELIVERY_EVENT_CHAIN_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+            before_invalid_cursor
+        );
     }
 
     #[test]
