@@ -167,9 +167,11 @@ impl Error {
     pub fn headline(&self) -> String {
         match self {
             Self::Http { .. } => "Could not reach the server.".to_owned(),
-            Self::Server { status, body, .. } => match status {
+            Self::Server {
+                status, what, body, ..
+            } => match status {
                 401 | 403 => "The password was not accepted.".to_owned(),
-                404 | 410 => "This link is closed or has expired.".to_owned(),
+                404 | 410 => not_found_headline(what),
                 409 => "The server is busy with that. Try again in a moment.".to_owned(),
                 413 => "The drop is larger than this link accepts.".to_owned(),
                 // The server's own reason, when its JSON carries one: "label
@@ -261,6 +263,26 @@ impl Error {
             }
         }
     }
+}
+
+fn not_found_headline(what: &str) -> String {
+    if what == "/api/admin/outbound-grants" {
+        return "That path is not an available library file. Select files inside folders, or upload local files first with `votport upload <path>`.".to_owned();
+    }
+    if what.starts_with("/api/admin/outbound-files?") {
+        return "That library path was not found. Upload it first with `votport upload <path>`."
+            .to_owned();
+    }
+    if what.starts_with("/api/admin/outbound-grants/") {
+        return "That delivery is no longer on record.".to_owned();
+    }
+    if what.starts_with("/api/admin/links/") {
+        return "That request is no longer on record.".to_owned();
+    }
+    if what.starts_with("/api/admin/") {
+        return "That admin record no longer exists.".to_owned();
+    }
+    "This link is closed or has expired.".to_owned()
 }
 
 impl Error {
@@ -399,6 +421,30 @@ mod tests {
                     body: String::new(),
                 },
                 "This link is closed or has expired.",
+            ),
+            (
+                Error::Server {
+                    status: 404,
+                    what: "/api/admin/outbound-grants".into(),
+                    body: String::new(),
+                },
+                "That path is not an available library file. Select files inside folders, or upload local files first with `votport upload <path>`.",
+            ),
+            (
+                Error::Server {
+                    status: 404,
+                    what: "/api/admin/outbound-grants/missing".into(),
+                    body: String::new(),
+                },
+                "That delivery is no longer on record.",
+            ),
+            (
+                Error::Server {
+                    status: 404,
+                    what: "/api/admin/links/missing".into(),
+                    body: String::new(),
+                },
+                "That request is no longer on record.",
             ),
             (
                 Error::Server {

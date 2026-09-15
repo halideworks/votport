@@ -434,10 +434,17 @@ pub async fn admin_audit_export(
         .map_err(|error| ApiError::internal(error.to_string()))?;
     }
     let mut response = (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "application/x-ndjson; charset=utf-8",
-        )],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/x-ndjson; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                "attachment; filename=\"audit.jsonl\"",
+            ),
+        ],
         body,
     )
         .into_response();
@@ -4882,6 +4889,11 @@ mod handler_tests {
             .unwrap();
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            response.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"audit.jsonl\""
+        );
         assert_eq!(
             response
                 .headers()

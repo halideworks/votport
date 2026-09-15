@@ -3801,6 +3801,7 @@ mod asset_cache_tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
 
     async fn fetch(path: &str) -> Response {
@@ -3830,6 +3831,47 @@ mod asset_cache_tests {
         let missing = fetch("/assets/no-such-file.png?v=0011223344556677").await;
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
         assert_eq!(missing.headers()[header::CACHE_CONTROL], "no-cache");
+        assert_eq!(
+            missing.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        let body = missing.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"asset not found\n");
+
+        let directory = tempfile::tempdir().unwrap();
+        let application = crate::api::testing::build(directory.path());
+        let head = router(application)
+            .oneshot(
+                Request::head("/assets/no-such-file.png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            head.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        assert!(head
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_page_returns_plain_text_not_found_body() {
+        let response = fetch("/mistyped-page").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"page not found\n");
     }
 }
 
@@ -3837,11 +3879,21 @@ mod asset_cache_tests {
 /// successful responses to them are safe to cache forever. Everything else
 /// under /assets keeps no-cache and revalidates.
 async fn asset_cache_control(request: Request<axum::body::Body>, next: Next) -> Response {
+    let is_get = request.method() == Method::GET;
     let stamped = request
         .uri()
         .query()
         .is_some_and(|query| query.split('&').any(|pair| pair.starts_with("v=")));
     let mut response = next.run(request).await;
+    if response.status() == StatusCode::NOT_FOUND {
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        if is_get {
+            *response.body_mut() = axum::body::Body::from("asset not found\n");
+        }
+    }
     if stamped && (response.status().is_success() || response.status() == StatusCode::NOT_MODIFIED)
     {
         response.headers_mut().insert(
@@ -3864,7 +3916,7 @@ pub fn router(app: Arc<App>) -> Router {
     // verification engine; there is no JS eval anywhere.
     const CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; \
         style-src 'self'; font-src 'self'; connect-src 'self'; \
-        img-src 'self' data:; worker-src 'self'; \
+        img-src 'self'; worker-src 'self'; \
         frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
     // Request pages carry the secret link token in the URL; never let the
     // browser forward it as a referrer.
@@ -3960,6 +4012,10 @@ pub fn router(app: Arc<App>) -> Router {
                     }
                     Err(_) => (
                         axum::http::StatusCode::NOT_FOUND,
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/plain; charset=utf-8",
+                        )],
                         "page not found; is VOTPORT_WEB_ROOT set correctly?",
                     )
                         .into_response(),
@@ -4372,6 +4428,13 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/api/session/{sid}/finish", post(api::upload_finish))
         .route("/api/session/{sid}/abort", post(api::upload_abort))
+        .fallback(|| async {
+            (
+                StatusCode::NOT_FOUND,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "page not found\n",
+            )
+        })
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(
             tower_http::set_header::SetResponseHeaderLayer::if_not_present(
