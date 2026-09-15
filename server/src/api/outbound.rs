@@ -339,19 +339,10 @@ pub async fn list_outbound_files(
             "truncated": result.2,
         })));
     }
-    let files = tokio::task::spawn_blocking(move || {
-        let mut files = Vec::new();
-        if let Ok(meta) = std::fs::symlink_metadata(&root) {
-            if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
-                list_library_dir(&root, &root, &mut files);
-            }
-        }
-        files.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
-        files
-    })
-    .await
-    .map_err(|_| ApiError::internal("list outbound files failed"))?;
-    Ok(Json(json!({ "files": files })))
+    Err(ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "directory, q or selection is required",
+    ))
 }
 
 pub async fn upload_outbound_file(
@@ -995,35 +986,6 @@ fn begin_outbound_operation_owned(app: &App, tenant: &str) -> ApiResult<OwnedOut
     Ok(operation)
 }
 
-fn list_library_dir(root: &Path, dir: &Path, files: &mut Vec<serde_json::Value>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if is_private_library_name(&name) {
-            continue;
-        }
-        let path = entry.path();
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        if dir == root && name == crate::paths::TENANT_STORAGE_DIR {
-            continue;
-        }
-        if meta.file_type().is_dir() {
-            list_library_dir(root, &path, files);
-        } else if meta.file_type().is_file() {
-            if let Ok(relative) = path.strip_prefix(root) {
-                files.push(json!({ "path": relative.to_string_lossy().replace('\\', "/"), "bytes": meta.len() }));
-            }
-        }
-    }
-}
-
 fn is_private_library_name(name: &std::ffi::OsStr) -> bool {
     name.to_str().is_some_and(|name| {
         name.eq_ignore_ascii_case(".votport-workflows")
@@ -1037,28 +999,11 @@ fn library_root_safe(root: &Path) -> bool {
 }
 
 fn library_directory_safe(root: &Path, directory: &Path) -> bool {
-    if !library_root_safe(root) || !library_directory_components_safe(root, directory) {
+    if !library_components_safe(root, directory) {
         return false;
     }
     std::fs::symlink_metadata(directory)
         .is_ok_and(|meta| meta.file_type().is_dir() && !meta.file_type().is_symlink())
-}
-
-fn library_directory_components_safe(root: &Path, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
-        return false;
-    };
-    let mut current = root.to_owned();
-    for component in relative.components() {
-        current.push(component);
-        let Ok(meta) = std::fs::symlink_metadata(&current) else {
-            return true;
-        };
-        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
-            return false;
-        }
-    }
-    true
 }
 
 fn direct_library_entries(
@@ -7248,7 +7193,7 @@ mod tests {
 
         let listed = crate::app::router(app.clone())
             .oneshot(
-                Request::get("/api/admin/outbound-files")
+                Request::get("/api/admin/outbound-files?directory=project")
                     .header("cookie", &cookie)
                     .body(Body::empty())
                     .unwrap(),
@@ -8077,7 +8022,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_library_listing_excludes_tenants_and_stages_and_is_sorted() {
+    async fn root_library_listing_excludes_tenants_and_stages_and_is_sorted() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
         std::fs::write(app.config.outbound_dir.join("z.bin"), b"z").unwrap();
@@ -8101,7 +8046,7 @@ mod tests {
 
         let response = crate::app::router(app.clone())
             .oneshot(
-                Request::get("/api/admin/outbound-files")
+                Request::get("/api/admin/outbound-files?directory=")
                     .header("cookie", admin_cookie(&app))
                     .body(Body::empty())
                     .unwrap(),
@@ -8249,7 +8194,7 @@ mod tests {
             {"path":"public/.vot-workflows.txt","bytes":1},
             {"path":"public/visible.bin","bytes":1},
         ]);
-        for query in ["", "?directory=public", "?selection=public"] {
+        for query in ["?directory=public", "?selection=public"] {
             let response = crate::app::router(app.clone())
                 .oneshot(
                     Request::get(format!("/api/admin/outbound-files{query}"))
@@ -8279,6 +8224,37 @@ mod tests {
             direct_library_entries_page(root, root, "", 1).unwrap();
         assert_eq!(directories, ["public"]);
         assert!(files.is_empty() && !has_more);
+    }
+
+    #[test]
+    fn library_directory_safety_checks_root_and_every_component() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("library");
+        std::fs::create_dir_all(root.join("nested/child")).unwrap();
+        std::fs::write(root.join("file"), b"x").unwrap();
+        for (path, expected) in [
+            (root.clone(), true),
+            (root.join("nested/child"), true),
+            (root.join("missing"), false),
+            (root.join("file"), false),
+            (root.join("file/child"), false),
+            (directory.path().to_owned(), false),
+        ] {
+            assert_eq!(library_directory_safe(&root, &path), expected, "{path:?}");
+        }
+        assert!(!library_directory_safe(
+            &root.join("file"),
+            &root.join("file")
+        ));
+        #[cfg(unix)]
+        {
+            let link = directory.path().join("link");
+            std::os::unix::fs::symlink(&root, &link).unwrap();
+            assert!(!library_directory_safe(&link, &link.join("nested")));
+            std::os::unix::fs::symlink(root.join("nested"), root.join("link")).unwrap();
+            assert!(!library_directory_safe(&root, &root.join("link")));
+            assert!(!library_directory_safe(&root, &root.join("link/child")));
+        }
     }
 
     #[test]
@@ -8747,6 +8723,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
         for uri in [
+            "/api/admin/outbound-files".to_owned(),
             "/api/admin/outbound-files?directory=one&q=two".to_owned(),
             "/api/admin/outbound-files?directory=one&selection=two".to_owned(),
             "/api/admin/outbound-files?selection=".to_owned(),

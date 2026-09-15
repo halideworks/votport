@@ -394,10 +394,6 @@ impl Destinations {
         self.check_live()
     }
 
-    pub fn is_nas(&self) -> bool {
-        self.contract() == NasContract::ServerAcknowledged
-    }
-
     pub fn push_directory(&self, key: &str) -> Result<PathBuf, String> {
         self.check_live()?;
         if key.len() != 32 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {

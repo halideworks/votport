@@ -1231,7 +1231,8 @@ pub fn owned_legacy_snapshot(name: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-pub fn ensure_backups_dir(data_dir: &Path) -> Result<PathBuf, String> {
+#[cfg(test)]
+pub(crate) fn ensure_backups_dir(data_dir: &Path) -> Result<PathBuf, String> {
     ensure_backup_root(&data_dir.join("backups"))
 }
 pub fn ensure_backup_root(path: &Path) -> Result<PathBuf, String> {

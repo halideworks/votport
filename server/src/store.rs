@@ -2882,7 +2882,8 @@ impl Store {
         Ok(())
     }
 
-    pub fn delete_setting(&self, key: &str) -> Result<(), String> {
+    #[cfg(test)]
+    pub(crate) fn delete_setting(&self, key: &str) -> Result<(), String> {
         self.with(|connection| {
             connection.execute("DELETE FROM settings WHERE key = ?1", [key])?;
             self.settings_generation

@@ -178,7 +178,7 @@ pub async fn files(
     } else {
         automation_directory(&app, &token.tenant, &directory)?
     };
-    if !library_root_safe(&root) || !library_directory_safe(&root, &path) {
+    if !library_directory_safe(&root, &path) {
         return Err(ApiError::not_found());
     }
     let (directories, files, has_more) = tokio::task::spawn_blocking(move || {
