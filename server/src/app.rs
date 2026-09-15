@@ -2,9 +2,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::io::Read as _;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
@@ -213,6 +215,7 @@ pub struct App {
     /// deploy can tell it is stale and reload instead of failing on a changed
     /// contract.
     pub web_build: String,
+    pub(crate) asset_versions: Arc<HashMap<String, AssetVersion>>,
     pub secret: [u8; 32],
     /// Counter for `admin_change_password`, which refuses when tripped.
     /// Reaching that endpoint needs a valid session, so a global bound there
@@ -1041,13 +1044,14 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         .serve_bind
         .map(|address| build_serve_state(&config, address))
         .transpose()?;
-    let web_build = web_build(&config.web_root);
+    let (web_build, asset_versions) = web_assets(&config.web_root);
     Ok(Arc::new(App {
         store,
         retention_clock,
         sessions,
         secret,
         web_build,
+        asset_versions: Arc::new(asset_versions),
         change_password_throttle: LoginThrottle::new(),
         login_throttle: crate::auth::IpThrottle::new(),
         scim_throttle: crate::auth::IpThrottle::new(),
@@ -1519,39 +1523,211 @@ fn resume_upload_session(
     Ok(kept)
 }
 
-/// First 16 hex of the SHA-256 over every .js and .wasm file under
-/// assets/ and assets/vendor/ (sorted by path), or "unknown" when the web
-/// root is missing (tests without one). Computed once at startup: with a
-/// web root served from disk, an edit without a restart keeps the old hash.
-fn web_build(web_root: &std::path::Path) -> String {
-    use sha2::{Digest, Sha256};
-    let assets = web_root.join("assets");
-    let mut paths = Vec::new();
-    for dir in [assets.clone(), assets.join("vendor")] {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AssetFingerprint {
+    len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume_serial_number: u32,
+    #[cfg(windows)]
+    file_index: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AssetVersion {
+    path: PathBuf,
+    stamp: String,
+    fingerprint: AssetFingerprint,
+}
+
+impl AssetVersion {
+    async fn is_current(&self) -> bool {
+        tokio::fs::symlink_metadata(&self.path)
+            .await
+            .ok()
+            .and_then(asset_fingerprint_from_metadata)
+            .is_some_and(|fingerprint| fingerprint == self.fingerprint)
+    }
+}
+
+struct AssetFile {
+    path: PathBuf,
+    relative: PathBuf,
+    through_symlink: bool,
+}
+
+fn collect_asset_files(
+    path: &Path,
+    relative: &Path,
+    through_symlink: bool,
+    files: &mut Vec<AssetFile>,
+) {
+    let Ok(link_metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if link_metadata.file_type().is_symlink() {
+        if relative == Path::new("vendor")
+            && std::fs::metadata(path).is_ok_and(|metadata| metadata.is_dir())
+        {
+            let Ok(entries) = std::fs::read_dir(path) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let child_relative = relative.join(entry.file_name());
+                collect_asset_files(&entry.path(), &child_relative, true, files);
+            }
+        } else if std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+            files.push(AssetFile {
+                path: path.to_owned(),
+                relative: relative.to_owned(),
+                through_symlink: true,
+            });
+        }
+        return;
+    }
+    if link_metadata.is_dir() {
+        if through_symlink {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
         };
         for entry in entries.flatten() {
-            let path = entry.path();
-            let ext = path.extension().and_then(|ext| ext.to_str());
-            if path.is_file() && matches!(ext, Some("js" | "wasm")) {
-                paths.push(path);
+            let child_relative = relative.join(entry.file_name());
+            collect_asset_files(&entry.path(), &child_relative, false, files);
+        }
+    } else if link_metadata.is_file() {
+        files.push(AssetFile {
+            path: path.to_owned(),
+            relative: relative.to_owned(),
+            through_symlink,
+        });
+    }
+}
+
+fn asset_fingerprint_from_metadata(metadata: std::fs::Metadata) -> Option<AssetFingerprint> {
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    Some(AssetFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok()?,
+        #[cfg(unix)]
+        device: std::os::unix::fs::MetadataExt::dev(&metadata),
+        #[cfg(unix)]
+        inode: std::os::unix::fs::MetadataExt::ino(&metadata),
+        #[cfg(windows)]
+        volume_serial_number: std::os::windows::fs::MetadataExt::volume_serial_number(&metadata)?,
+        #[cfg(windows)]
+        file_index: std::os::windows::fs::MetadataExt::file_index(&metadata)?,
+    })
+}
+
+fn asset_fingerprint(path: &Path) -> Option<AssetFingerprint> {
+    asset_fingerprint_from_metadata(std::fs::symlink_metadata(path).ok()?)
+}
+
+fn asset_cache_key(relative: &Path) -> Option<String> {
+    let mut key = String::new();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        key.push('/');
+        key.push_str(name.to_str()?);
+    }
+    (!key.is_empty()).then_some(key)
+}
+
+fn is_web_build_asset(relative: &Path) -> bool {
+    let depth = relative.components().count();
+    (depth == 1 || (depth == 2 && relative.starts_with("vendor")))
+        && matches!(
+            relative
+                .extension()
+                .and_then(|extension| extension.to_str()),
+            Some("js" | "wasm")
+        )
+}
+
+fn hash_asset_file(
+    path: &Path,
+    mut aggregate: Option<&mut sha2::Sha256>,
+    aggregate_name: &Path,
+) -> Option<String> {
+    use sha2::Digest as _;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    if let Some(aggregate) = aggregate.as_deref_mut() {
+        aggregate.update(aggregate_name.to_string_lossy().as_bytes());
+    }
+    let mut digest = sha2::Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        if let Some(aggregate) = aggregate.as_deref_mut() {
+            aggregate.update(&buffer[..read]);
+        }
+    }
+    let mut stamp = hex::encode(digest.finalize());
+    stamp.truncate(16);
+    Some(stamp)
+}
+
+/// Hashes static files once at startup and retains no asset contents.
+fn web_assets(web_root: &Path) -> (String, HashMap<String, AssetVersion>) {
+    use sha2::Digest as _;
+
+    let assets = web_root.join("assets");
+    let mut files = Vec::new();
+    collect_asset_files(&assets, Path::new(""), false, &mut files);
+    files.sort_by(|left, right| left.relative.cmp(&right.relative));
+
+    let mut web_build_digest = sha2::Sha256::new();
+    let mut web_build_has_files = false;
+    let mut versions = HashMap::new();
+    for file in files {
+        let web_build_asset = is_web_build_asset(&file.relative);
+        web_build_has_files |= web_build_asset;
+        let fingerprint = (!file.through_symlink)
+            .then(|| asset_fingerprint(&file.path))
+            .flatten();
+        let aggregate_name = Path::new("assets").join(&file.relative);
+        let stamp = hash_asset_file(
+            &file.path,
+            web_build_asset.then_some(&mut web_build_digest),
+            &aggregate_name,
+        );
+        let Some(stamp) = stamp else {
+            continue;
+        };
+        if let (Some(fingerprint), Some(key)) = (fingerprint, asset_cache_key(&file.relative)) {
+            if asset_fingerprint(&file.path).is_some_and(|current| current == fingerprint) {
+                versions.insert(
+                    key,
+                    AssetVersion {
+                        path: file.path,
+                        stamp,
+                        fingerprint,
+                    },
+                );
             }
         }
     }
-    if paths.is_empty() {
-        return "unknown".to_owned();
-    }
-    paths.sort();
-    let mut hasher = Sha256::new();
-    for path in paths {
-        // Relative to the web root so the same assets hash the same under
-        // any install path.
-        let name = path.strip_prefix(web_root).unwrap_or(&path);
-        hasher.update(name.to_string_lossy().as_bytes());
-        hasher.update(std::fs::read(&path).unwrap_or_default());
-    }
-    hex::encode(hasher.finalize())[..16].to_owned()
+    let web_build = if web_build_has_files {
+        hex::encode(web_build_digest.finalize())[..16].to_owned()
+    } else {
+        "unknown".to_owned()
+    };
+    (web_build, versions)
 }
 
 /// Takes the single-writer lock. flock is advisory and per open file
@@ -3844,6 +4020,10 @@ mod asset_cache_tests {
     async fn fetch(path: &str) -> Response {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
+        request(app, path).await
+    }
+
+    async fn request(app: Arc<App>, path: &str) -> Response {
         router(app)
             .oneshot(Request::get(path).body(Body::empty()).unwrap())
             .await
@@ -3856,9 +4036,26 @@ mod asset_cache_tests {
         let assets = directory.path().join("web/assets");
         std::fs::create_dir_all(&assets).unwrap();
         std::fs::create_dir(assets.join("subdir")).unwrap();
+        std::fs::create_dir(assets.join("vendor")).unwrap();
+        std::fs::write(assets.join("app.js"), b"root-script").unwrap();
+        std::fs::write(assets.join("vendor/vendor.js"), b"vendor-script").unwrap();
         std::fs::write(assets.join("fonts.css"), b"body {}").unwrap();
-        std::fs::write(assets.join("favicon.png"), b"fixture").unwrap();
+        let favicon = assets.join("favicon.png");
+        std::fs::write(&favicon, b"fixture").unwrap();
         let app = crate::api::testing::build(directory.path());
+        use sha2::Digest as _;
+        let mut expected_web_build = sha2::Sha256::new();
+        for (name, contents) in [
+            ("assets/app.js", &b"root-script"[..]),
+            ("assets/vendor/vendor.js", &b"vendor-script"[..]),
+        ] {
+            expected_web_build.update(name.as_bytes());
+            expected_web_build.update(contents);
+        }
+        let expected_web_build = hex::encode(expected_web_build.finalize());
+        assert_eq!(app.web_build, expected_web_build[..16]);
+        let favicon_stamp = app.asset_versions["/favicon.png"].stamp.clone();
+        let fonts_stamp = app.asset_versions["/fonts.css"].stamp.clone();
         let plain = router(app.clone())
             .oneshot(
                 Request::get("/assets/fonts.css")
@@ -3881,14 +4078,11 @@ mod asset_cache_tests {
             b"body {}"
         );
 
-        let stamped = router(app.clone())
-            .oneshot(
-                Request::get("/assets/favicon.png?v=0011223344556677")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let stamped = request(
+            app.clone(),
+            &format!("/assets/favicon.png?v={favicon_stamp}"),
+        )
+        .await;
         assert_eq!(stamped.status(), StatusCode::OK);
         assert_eq!(
             stamped.headers()[header::CACHE_CONTROL],
@@ -3896,14 +4090,68 @@ mod asset_cache_tests {
         );
         assert_eq!(stamped.headers()[header::REFERRER_POLICY], "no-referrer");
 
-        let missing = router(app.clone())
-            .oneshot(
-                Request::get("/assets/no-such-file.png?v=0011223344556677")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        for query in [
+            "not-a-stamp".to_owned(),
+            "0011223344556677".to_owned(),
+            "001122334455667A".to_owned(),
+            "001122334455667G".to_owned(),
+            "001122334455667".to_owned(),
+            format!("{favicon_stamp}&v={favicon_stamp}"),
+        ] {
+            let response = request(app.clone(), &format!("/assets/favicon.png?v={query}")).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+        }
+
+        let wrong_path =
+            request(app.clone(), &format!("/assets/fonts.css?v={favicon_stamp}")).await;
+        assert_eq!(wrong_path.status(), StatusCode::OK);
+        assert_eq!(wrong_path.headers()[header::CACHE_CONTROL], "no-cache");
+
+        let encoded_alias = request(
+            app.clone(),
+            &format!("/assets/%66avicon.png?v={favicon_stamp}"),
+        )
+        .await;
+        assert_eq!(encoded_alias.status(), StatusCode::OK);
+        assert_eq!(encoded_alias.headers()[header::CACHE_CONTROL], "no-cache");
+
+        let dot_alias = request(
+            app.clone(),
+            &format!("/assets/./favicon.png?v={favicon_stamp}"),
+        )
+        .await;
+        assert_eq!(dot_alias.status(), StatusCode::OK);
+        assert_eq!(dot_alias.headers()[header::CACHE_CONTROL], "no-cache");
+
+        std::fs::write(&favicon, b"replacement").unwrap();
+        let replaced = request(
+            app.clone(),
+            &format!("/assets/favicon.png?v={favicon_stamp}"),
+        )
+        .await;
+        assert_eq!(replaced.status(), StatusCode::OK);
+        assert_eq!(replaced.headers()[header::CACHE_CONTROL], "no-cache");
+        assert_eq!(
+            replaced
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .as_ref(),
+            b"replacement"
+        );
+
+        let unchanged_other =
+            request(app.clone(), &format!("/assets/fonts.css?v={fonts_stamp}")).await;
+        assert_eq!(unchanged_other.status(), StatusCode::OK);
+        assert_eq!(
+            unchanged_other.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+
+        let missing = request(app.clone(), "/assets/no-such-file.png?v=0011223344556677").await;
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
         assert_eq!(missing.headers()[header::CACHE_CONTROL], "no-cache");
         assert_eq!(
@@ -4280,16 +4528,25 @@ mod api_response_tests {
     }
 }
 
-/// Asset URLs stamped with a content hash (?v=) never change meaning, so
-/// successful responses to them are safe to cache forever. Everything else
-/// under /assets keeps no-cache and revalidates.
-async fn asset_cache_control(request: Request<axum::body::Body>, next: Next) -> Response {
+/// Only an exact startup-approved content stamp gets immutable caching.
+async fn asset_cache_control(
+    State(app): State<Arc<App>>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
     let is_get = request.method() == Method::GET;
-    let stamped = request
-        .uri()
-        .query()
-        .is_some_and(|query| query.split('&').any(|pair| pair.starts_with("v=")));
+    let path = request.uri().path().to_owned();
+    let stamp = request.uri().query().and_then(requested_asset_stamp);
+    let version = stamp.and_then(|stamp| {
+        app.asset_versions
+            .get(&path)
+            .filter(|version| version.stamp == stamp)
+    });
     let mut response = next.run(request).await;
+    let current = match version {
+        Some(version) => version.is_current().await,
+        None => false,
+    };
     if response.status() == StatusCode::NOT_FOUND {
         response.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -4299,7 +4556,7 @@ async fn asset_cache_control(request: Request<axum::body::Body>, next: Next) -> 
             *response.body_mut() = axum::body::Body::from("asset not found\n");
         }
     }
-    if stamped && (response.status().is_success() || response.status() == StatusCode::NOT_MODIFIED)
+    if current && (response.status().is_success() || response.status() == StatusCode::NOT_MODIFIED)
     {
         response.headers_mut().insert(
             header::CACHE_CONTROL,
@@ -4307,6 +4564,25 @@ async fn asset_cache_control(request: Request<axum::body::Body>, next: Next) -> 
         );
     }
     response
+}
+
+fn requested_asset_stamp(query: &str) -> Option<&str> {
+    let mut stamp = None;
+    for pair in query.split('&') {
+        let Some(value) = pair.strip_prefix("v=") else {
+            continue;
+        };
+        if stamp.is_some()
+            || value.len() != 16
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return None;
+        }
+        stamp = Some(value);
+    }
+    stamp
 }
 
 async fn api_response_policy(request: Request<axum::body::Body>, next: Next) -> Response {
@@ -4508,7 +4784,10 @@ pub fn router(app: Arc<App>) -> Router {
                             axum::http::header::REFERRER_POLICY,
                             axum::http::HeaderValue::from_static("no-referrer"),
                         ))
-                        .layer(axum::middleware::from_fn(asset_cache_control)),
+                        .layer(axum::middleware::from_fn_with_state(
+                            Arc::clone(&app),
+                            asset_cache_control,
+                        )),
                 ),
         )
         // Admin API.
