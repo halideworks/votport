@@ -32,7 +32,13 @@ function updateExport() {
   for (const [key, value] of Object.entries(appliedFilters)) {
     if (value.trim()) query.set(key, value);
   }
-  $('export').href = `/api/admin/audit?${query}`;
+  const newest = order === 'newest';
+  if (newest) query.set('before_rowid', '0');
+  const direction = newest ? 'newest' : 'oldest';
+  const exportLink = $('export');
+  exportLink.href = `/api/admin/audit?${query}`;
+  exportLink.textContent = `Export ${direction} 10,000 rows`;
+  exportLink.title = `Exports the current filters, ${direction} first, up to 10,000 rows`;
 }
 
 function updateEvents() {
@@ -103,6 +109,7 @@ async function load(reset = false) {
   $('load-more').disabled = true;
   if (reset) {
     order = $('audit-order').value;
+    updateExport();
     beforeRowid = INITIAL_CURSOR;
     sinceAt = '0';
     afterRowid = '0';

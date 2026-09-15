@@ -21,6 +21,48 @@ try {
     assert.ok(response.ok(), `${route}: ${response.status()} ${await response.text()}`); return response.json();
   };
   await api('admin/login', { password: process.env.ADMIN_PASSWORD });
+  await api('admin/login', { password: process.env.ADMIN_PASSWORD });
+  await api('admin/login', { password: process.env.ADMIN_PASSWORD });
+  const auditPageResponse = await page.goto(`${base}/audit`);
+  await page.waitForLoadState('networkidle');
+  assert.ok(auditPageResponse.headers()['content-security-policy'].includes("img-src 'self';"));
+  assert.ok(!auditPageResponse.headers()['content-security-policy'].includes("img-src 'self' data:"));
+  await page.fill('#audit-event', 'admin_login');
+  await Promise.all([
+    page.waitForResponse((response) => response.url().includes('/api/admin/audit?') && response.request().method() === 'GET'),
+    page.getByRole('button', { name: 'Apply', exact: true }).click(),
+  ]);
+  const exportRows = async (href) => {
+    const response = await context.request.fetch(new URL(href, base).toString(), { headers: { 'X-Votport': '1' } });
+    assert.equal(response.status(), 200);
+    return (await response.text()).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  };
+  const newestHref = await page.locator('#export').getAttribute('href');
+  assert.ok(newestHref);
+  assert.match(newestHref, /(?:\?|&)limit=10000(?:&|$)/);
+  assert.match(newestHref, /(?:\?|&)before_rowid=0(?:&|$)/);
+  assert.match(newestHref, /(?:\?|&)event=admin_login(?:&|$)/);
+  assert.equal(await page.locator('#export').textContent(), 'Export newest 10,000 rows');
+  const newestRows = await exportRows(newestHref);
+  assert.ok(newestRows.length >= 2);
+  assert.ok(Number(newestRows[0].rowid) > Number(newestRows[1].rowid), 'newest export order');
+  await Promise.all([
+    page.waitForResponse((response) => response.url().includes('/api/admin/audit?') && response.request().method() === 'GET'),
+    page.selectOption('#audit-order', 'oldest'),
+  ]);
+  const oldestHref = await page.locator('#export').getAttribute('href');
+  assert.ok(oldestHref);
+  assert.match(oldestHref, /(?:\?|&)limit=10000(?:&|$)/);
+  assert.doesNotMatch(oldestHref, /(?:\?|&)(?:before_rowid|after_rowid|since)=/);
+  assert.match(oldestHref, /(?:\?|&)event=admin_login(?:&|$)/);
+  assert.equal(await page.locator('#export').textContent(), 'Export oldest 10,000 rows');
+  const oldestRows = await exportRows(oldestHref);
+  assert.ok(oldestRows.length >= 2);
+  assert.ok(Number(oldestRows[0].rowid) < Number(oldestRows[1].rowid), 'oldest export order');
+  await page.goto(`${base}/receive`); await page.locator('#create-password').waitFor({ state: 'attached' });
+  assert.equal(await page.locator('#create-password').getAttribute('autocomplete'), 'new-password');
+  await page.goto(`${base}/r/${id}`, { waitUntil: 'domcontentloaded' }); await page.locator('#link-password').waitFor({ state: 'attached' });
+  assert.equal(await page.locator('#link-password').getAttribute('autocomplete'), 'current-password');
   for (const route of ['receive', 'workflows', 'trade-routes', 'notifications', 'system']) {
     await page.goto(`${base}/${route}`); await page.waitForLoadState('networkidle');
     const labels = await page.locator('button[data-hint]').evaluateAll((buttons) => buttons.map((button) => button.getAttribute('aria-label')));

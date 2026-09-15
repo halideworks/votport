@@ -56,7 +56,7 @@ pub async fn link_info(
     State(app): State<Arc<App>>,
     Path(token): Path<String>,
     headers: HeaderMap,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Response> {
     let link = app
         .store
         .upload_link(&token)
@@ -69,7 +69,12 @@ pub async fn link_info(
     } else {
         None
     };
-    Ok(Json(json!({
+    Ok((
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::VARY, "Cookie"),
+        ],
+        Json(json!({
         // The label leaks nothing new to an authorized sender, but an old URL
         // for a closed request should not keep revealing what it was for.
         "label": if usable { Some(&link.label) } else { None },
@@ -86,7 +91,9 @@ pub async fn link_info(
         "max_entries": session::max_entries_for_bytes(max_bytes),
         "push": app.push.is_some(),
         "web_build": app.web_build,
-    })))
+        })),
+    )
+        .into_response())
 }
 
 /// Tenant logo for a request link. Ungated like the link label: the metadata
@@ -2229,6 +2236,67 @@ mod push_preflight_tests {
             info["max_entries"],
             crate::session::max_entries_for_bytes(1024 * 1024)
         );
+    }
+
+    #[tokio::test]
+    async fn link_info_varies_and_is_not_cached_across_password_authorization() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let mut link = open_link("cache-headers");
+        link.password_hash = Some(auth::hash_password("correct password").unwrap());
+        application.store.insert_link(link).unwrap();
+
+        let response = app::router(application.clone())
+            .oneshot(
+                Request::get("/api/r/cache-headers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()[header::VARY], "Cookie");
+        assert_eq!(response_json(response).await["authorized"], false);
+
+        let verified = app::router(application.clone())
+            .oneshot(
+                Request::post("/api/r/cache-headers/verify")
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        1234,
+                    ))))
+                    .body(Body::from(r#"{"password":"correct password"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(verified.status(), StatusCode::OK);
+        let cookie = verified
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let response = app::router(application)
+            .oneshot(
+                Request::get("/api/r/cache-headers")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()[header::VARY], "Cookie");
+        assert_eq!(response_json(response).await["authorized"], true);
     }
 
     #[tokio::test]

@@ -717,6 +717,11 @@ fn issue_delivery(args: &[String]) -> Result<(), String> {
     if paths.is_empty() {
         return Err("issue-delivery needs at least one library path".to_owned());
     }
+    if let Some(path) = paths.iter().find(|path| is_absolute_filesystem_path(path)) {
+        return Err(format!(
+            "{path:?} is a local filesystem path. Upload it first with `votport upload <path>`, then use the printed library path."
+        ));
+    }
     let issued =
         votport_client_core::port::issue_delivery(votport_client_core::port::DeliverySpec {
             paths: paths.to_vec(),
@@ -735,6 +740,17 @@ fn issue_delivery(args: &[String]) -> Result<(), String> {
         println!("{}", issued.url);
     }
     Ok(())
+}
+
+fn is_absolute_filesystem_path(value: &str) -> bool {
+    Path::new(value).is_absolute()
+        || value.starts_with(r"\\")
+        || value
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphabetic())
+            && value.as_bytes().get(1) == Some(&b':')
+            && matches!(value.as_bytes().get(2), Some(b'/' | b'\\'))
 }
 
 /// `votport upload <path>... [--into <dir>]`: each file or folder goes into
@@ -865,4 +881,31 @@ fn watch(args: &[String]) -> Result<(), String> {
 
 fn watch_json(item: &votport_client_core::watch::Watch) -> serde_json::Value {
     serde_json::json!({ "id": item.id, "dir": item.dir, "link": item.link, "has_password": item.has_password })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_absolute_filesystem_path, issue_delivery};
+
+    #[test]
+    fn issue_delivery_explains_unambiguous_local_paths_before_network() {
+        for path in [
+            "/tmp/clip.mov",
+            r"C:\clips\clip.mov",
+            "C:/clips/clip.mov",
+            r"\\server\share\clip.mov",
+        ] {
+            let args = ["label".to_owned(), path.to_owned()];
+            let error = issue_delivery(&args).expect_err(path);
+            assert!(error.contains("votport upload"), "{error}");
+            assert!(error.contains("local filesystem path"), "{error}");
+        }
+    }
+
+    #[test]
+    fn relative_library_paths_are_not_classified_by_local_shape() {
+        for path in ["clip.mov", "./clip.mov", "folder/clip.mov", "C:clip.mov"] {
+            assert!(!is_absolute_filesystem_path(path), "{path}");
+        }
+    }
 }
