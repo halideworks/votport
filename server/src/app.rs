@@ -2990,6 +2990,35 @@ mod health_tests {
         build(config).unwrap();
     }
 
+    #[test]
+    fn overlapping_storage_roots_fail_before_store_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::api::testing::config(directory.path());
+        config.outbound_dir = config.data_dir.join("library");
+        let error = build(config.clone())
+            .err()
+            .expect("overlapping roots booted");
+        assert!(error.contains("VOTPORT_DATA_DIR"), "{error}");
+        assert!(error.contains("VOTPORT_OUTBOUND_DIR"), "{error}");
+        assert!(!config.data_dir.exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = crate::api::testing::config(directory.path());
+            std::fs::create_dir_all(&config.data_dir).unwrap();
+            let alias = directory.path().join("received-alias");
+            symlink(&config.data_dir, &alias).unwrap();
+            config.receive_dir = alias;
+            let error = build(config.clone()).err().expect("symlink alias booted");
+            assert!(error.contains("VOTPORT_DATA_DIR"), "{error}");
+            assert!(error.contains("VOTPORT_RECEIVE_DIR"), "{error}");
+            assert!(!config.data_dir.join("votport.db").exists());
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_second_instance_on_the_same_data_directory_refuses_to_boot() {

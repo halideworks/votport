@@ -2725,6 +2725,9 @@ pub async fn check_receiving_storage(
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let conflict = |message| ApiError::new(StatusCode::CONFLICT, message);
+        app.config
+            .validate_storage_roots()
+            .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
         let current = app.receiving.lock().expect("receiving state poisoned").clone();
         if crate::receiving::storage_identity(&app.config.receive_dir).map_err(ApiError::internal)? != request.storage {
             return Err(conflict("Storage changed. Refresh this page and review the current mount."));
@@ -7863,6 +7866,35 @@ mod settings_api_tests {
         assert!(crate::receiving::saved_qualification(&application.store)
             .unwrap()
             .is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn receiving_storage_recheck_rejects_a_root_alias_before_probe() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let storage = crate::receiving::storage_identity(&application.config.receive_dir).unwrap();
+        let moved = directory.path().join("received-before-alias");
+        std::fs::rename(&application.config.receive_dir, &moved).unwrap();
+        symlink(
+            &application.config.data_dir,
+            &application.config.receive_dir,
+        )
+        .unwrap();
+        let cookie = cookie_for(&application, "", "admin");
+        let (status, _) = send(
+            Arc::clone(&application),
+            Request::post("/api/admin/receiving-storage")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"storage":storage}).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
