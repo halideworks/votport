@@ -5,8 +5,11 @@ import { webcrypto } from 'node:crypto';
 
 globalThis.crypto ||= webcrypto;
 const source = (await readFile(new URL('../web/assets/delivery-evidence.js', import.meta.url), 'utf8'))
-  .replace(/^import .*$/gm, '');
-const { authorization, manifestDigest, message } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+  .replace(/^import .*$/gm, '') + `
+    devicePromise = Promise.resolve({ holder: '8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394' });
+    export { verifyAuthorization };
+  `;
+const { authorization, manifestDigest, message, verifyAuthorization } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 
 test('browser evidence uses the same ordered manifest and signed bytes as the Rust protocol', async () => {
   const manifest = await manifestDigest([{ name: 'file', suite: 'blake3', root: 'abcd', bytes: 7 }]);
@@ -22,4 +25,26 @@ test('browser evidence uses the same ordered manifest and signed bytes as the Ru
   const signature = Buffer.from('5f50ff0e9bf768b9ab3a33645c7397f443d59ecb39e07413385084a86f7a4d8725607fd0256d036fb3ed1352d91bae6c244e61bd02727354c0d299f2049d1c0c', 'hex');
   assert.equal(await crypto.subtle.verify('Ed25519', device, signature, message('votport-evidence-statement-v1\0', [auth, 'verified'])), true);
   assert.equal(await crypto.subtle.verify('Ed25519', device, signature, message('votport-evidence-statement-v1\0', [auth, 'accepted'])), false);
+
+  globalThis.window = { location: { origin: challenge.origin } };
+  const wallClock = Date.now;
+  Date.now = () => 3_000;
+  try {
+    await assert.doesNotReject(() => verifyAuthorization(auth, auth.issuer));
+    await assert.rejects(
+      () => verifyAuthorization({ ...auth, signature: '00'.repeat(64) }, auth.issuer),
+      /invalid or expired/
+    );
+    await assert.rejects(
+      () => verifyAuthorization({ ...auth, challenge: { ...auth.challenge, holder: '00'.repeat(32) } }, auth.issuer),
+      /invalid or expired/
+    );
+    await assert.rejects(
+      () => verifyAuthorization({ ...auth, challenge: { ...auth.challenge, expires_at: '2' } }, auth.issuer),
+      /invalid or expired/
+    );
+  } finally {
+    Date.now = wallClock;
+    delete globalThis.window;
+  }
 });
