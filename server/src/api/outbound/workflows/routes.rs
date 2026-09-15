@@ -429,7 +429,8 @@ pub(super) async fn export(app: &Arc<App>, job: &Job, config: &storage::Storage)
         let policy =
             serde_json::from_value(job.checks["trade_routes"][&config.id]["notifications"].clone())
                 .map_err(|_| conflict("route notification snapshot missing".into()))?;
-        crate::notify::trade_event(app, &route, &policy, "route_received").await;
+        let detail = format!("receipt:{}", receipt.digest());
+        crate::notify::trade_event(app, &route, &policy, "route_received", Some(&detail)).await;
         let _ = crate::api::trade::refresh_route(app, &route).await;
     }
     Ok(())

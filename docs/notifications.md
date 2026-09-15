@@ -70,6 +70,11 @@ in the title and 4 KiB in the message, measured in UTF-8 bytes. ntfy titles
 use an encoded query parameter so Unicode and line breaks cannot make an
 invalid HTTP header. Transfer IDs precede the summary and remain visible when
 its file list is shortened. JSON webhook records keep their structured fields.
+Upload completion records include `link_id` and the persisted `completed_at`;
+outbound download records include `event_at`. Both times are Unix seconds.
+Trade route records include `detail` when an error or receipt identity is available.
+Slack, Teams, Discord and Google Chat summaries use character limits of 150 for
+titles and 1,500 for bodies, preserving Unicode characters within those limits.
 
 Email uses a UTF-8 plain-text MIME part. Votport bounds email summaries to
 64 KiB before MIME encoding and subjects to 250 characters; these are application

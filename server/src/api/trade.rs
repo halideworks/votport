@@ -16,10 +16,11 @@ fn unauthorized(message: impl Into<String>) -> ApiError {
 }
 /// Notification delivery waits on remote webhooks; a peer's request or an
 /// admin's save must not.
-fn notify_later(app: &Arc<App>, route: &TradeRoute, event: &'static str) {
+fn notify_later(app: &Arc<App>, route: &TradeRoute, event: &'static str, detail: Option<String>) {
     let (app, route) = (Arc::clone(app), route.clone());
     tokio::spawn(async move {
-        crate::notify::trade_event(&app, &route, &route.notifications, event).await;
+        crate::notify::trade_event(&app, &route, &route.notifications, event, detail.as_deref())
+            .await;
     });
 }
 fn write(app: &App, headers: &HeaderMap) -> ApiResult<admin::AdminSession> {
@@ -471,7 +472,7 @@ pub async fn enroll(
         "route_approval_requested"
     };
     if created {
-        notify_later(&app, &route, event);
+        notify_later(&app, &route, event, None);
     }
     Ok(private(app.signer.port_message(
         "enrolled",
@@ -554,6 +555,7 @@ async fn refresh_route_inner(app: &Arc<App>, route: &TradeRoute) -> ApiResult<()
             } else {
                 "route_recovered"
             },
+            None,
         );
     }
     Ok(())
@@ -618,7 +620,7 @@ pub async fn update(
         }
     }
     if previous.state == "pending_approval" && route.state == "active" {
-        notify_later(&app, &route, "route_approved");
+        notify_later(&app, &route, "route_approved", None);
     }
     Ok(private(route))
 }
@@ -821,6 +823,7 @@ pub async fn refresh_route(app: &Arc<App>, route: &TradeRoute) -> ApiResult<()> 
                 } else {
                     "route_failed"
                 },
+                Some(error.message.clone()),
             );
         }
     }

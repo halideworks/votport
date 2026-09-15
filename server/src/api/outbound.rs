@@ -5515,7 +5515,7 @@ mod tests {
         );
         assert_eq!(
             response.headers().get(header::CACHE_CONTROL).unwrap(),
-            "no-cache"
+            "no-store"
         );
     }
 

@@ -741,11 +741,32 @@ pub(crate) fn upload_completed(
     }
     if let Some(link) = link.filter(|link| link.notifications.as_ref().is_some_and(|p| p.enabled()))
     {
-        let app = Arc::clone(app);
-        let report = report.clone();
-        runtime.spawn(async move {
-            crate::notify::uploaded(app, link.tenant, link.label, report, link.notifications).await;
-        });
+        if let Some(completed_at) = app
+            .store
+            .upload_completed_at(&link.tenant, &link.id, &report.upload_id)
+            .inspect_err(|error| {
+                tracing::warn!(%error, upload = %report.upload_id, link = %link.id, "completed upload timestamp read failed")
+            })
+            .ok()
+            .flatten()
+        {
+            let app = Arc::clone(app);
+            let report = report.clone();
+            runtime.spawn(async move {
+                crate::notify::uploaded(
+                    app,
+                    link.tenant,
+                    link.id,
+                    link.label,
+                    completed_at,
+                    report,
+                    link.notifications,
+                )
+                .await;
+            });
+        } else {
+            tracing::warn!(upload = %report.upload_id, link = %link.id, "completed upload timestamp missing for notification");
+        }
     }
     let started_at = app
         .sessions
@@ -3834,6 +3855,7 @@ mod asset_cache_tests {
         let directory = tempfile::tempdir().unwrap();
         let assets = directory.path().join("web/assets");
         std::fs::create_dir_all(&assets).unwrap();
+        std::fs::create_dir(assets.join("subdir")).unwrap();
         std::fs::write(assets.join("fonts.css"), b"body {}").unwrap();
         std::fs::write(assets.join("favicon.png"), b"fixture").unwrap();
         let app = crate::api::testing::build(directory.path());
@@ -3891,6 +3913,39 @@ mod asset_cache_tests {
         let body = missing.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), b"asset not found\n");
 
+        for path in ["/assets/subdir", "/assets/subdir/"] {
+            let directory_response = router(app.clone())
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(directory_response.status(), StatusCode::NOT_FOUND);
+            assert!(directory_response.headers().get(header::LOCATION).is_none());
+            assert_eq!(
+                directory_response
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .as_ref(),
+                b"asset not found\n"
+            );
+
+            let directory_head = router(app.clone())
+                .oneshot(Request::head(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(directory_head.status(), StatusCode::NOT_FOUND);
+            assert!(directory_head.headers().get(header::LOCATION).is_none());
+            assert!(directory_head
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .is_empty());
+        }
+
         let head = router(app)
             .oneshot(
                 Request::head("/assets/no-such-file.png")
@@ -3926,6 +3981,305 @@ mod asset_cache_tests {
     }
 }
 
+#[cfg(test)]
+mod api_response_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{HeaderValue, Request};
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn api_responses_are_private_and_keep_head_and_method_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+
+        let success = router(app.clone())
+            .oneshot(
+                Request::get("/api/receipt-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(success.status(), StatusCode::OK);
+        assert_eq!(success.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(success.headers()[header::CONTENT_TYPE], "application/json");
+
+        let audit = router(app.clone())
+            .oneshot(
+                Request::get("/api/admin/audit")
+                    .header(
+                        header::COOKIE,
+                        crate::api::admin::test_admin_cookie(
+                            &app,
+                            &crate::auth::AdminIdentity::local_admin(),
+                        ),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(audit.status(), StatusCode::OK);
+        assert_eq!(audit.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            audit.headers()[header::CONTENT_TYPE],
+            "application/x-ndjson; charset=utf-8"
+        );
+        let _ = audit.into_body().collect().await.unwrap().to_bytes();
+
+        let fallback = router(app.clone())
+            .oneshot(
+                Request::get("/api/no-such-endpoint")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fallback.status(), StatusCode::NOT_FOUND);
+        assert_eq!(fallback.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(fallback.headers()[header::CONTENT_TYPE], "application/json");
+        let fallback_body = fallback.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&fallback_body).contains("request does not match"));
+
+        let method_error = router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(method_error.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(method_error.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(method_error
+            .headers()
+            .get(header::ALLOW)
+            .is_some_and(|value| value.as_bytes().windows(3).any(|part| part == b"GET")));
+        assert_eq!(
+            method_error.headers()[header::CONTENT_TYPE],
+            "application/json"
+        );
+        let body = method_error.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "request_failed");
+
+        let unsupported = router(app.clone())
+            .oneshot(
+                Request::post("/api/r/missing/verify")
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        8080,
+                    ))))
+                    .body(Body::from("not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsupported.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(unsupported.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            unsupported.headers()[header::CONTENT_TYPE],
+            "application/json"
+        );
+        let unsupported_body = unsupported.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&unsupported_body).contains("request does not match"));
+
+        let invalid_receipt = router(app.clone())
+            .oneshot(
+                Request::post("/api/verify")
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        8080,
+                    ))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_receipt.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(invalid_receipt.headers()[header::CACHE_CONTROL], "no-store");
+        let invalid_receipt_body = invalid_receipt
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let invalid_receipt_body: serde_json::Value =
+            serde_json::from_slice(&invalid_receipt_body).unwrap();
+        assert_eq!(invalid_receipt_body["error"], "This is not a vot-receipt.");
+
+        let too_large = router(app.clone())
+            .oneshot(
+                Request::post("/api/verify")
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        8080,
+                    ))))
+                    .body(Body::from(vec![0; 64 * 1024 + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(too_large.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            too_large.headers()[header::CONTENT_TYPE],
+            "application/json"
+        );
+        let too_large_body = too_large.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&too_large_body).contains("request does not match"));
+
+        let head_failure = router(app.clone())
+            .oneshot(
+                Request::head("/api/no-such-endpoint")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head_failure.status(), StatusCode::NOT_FOUND);
+        assert_eq!(head_failure.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            head_failure.headers()[header::CONTENT_TYPE],
+            "application/json"
+        );
+        assert!(head_failure
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty());
+
+        let head_fixture = tower::ServiceBuilder::new()
+            .layer(axum::middleware::from_fn(api_response_policy))
+            .service(tower::service_fn(|_| async {
+                Ok::<_, std::convert::Infallible>(
+                    (
+                        StatusCode::BAD_REQUEST,
+                        [(header::CONTENT_TYPE, "text/plain")],
+                        Body::from("fixture error"),
+                    )
+                        .into_response(),
+                )
+            }));
+        let head_fixture_response = head_fixture
+            .oneshot(
+                Request::head("/api/head-fixture")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head_fixture_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            head_fixture_response.headers()[header::CONTENT_TYPE],
+            "application/json"
+        );
+        assert!(head_fixture_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty());
+
+        let head = router(app)
+            .oneshot(
+                Request::head("/api/receipt-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(head.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(head
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_normalization_preserves_non_body_headers() {
+        let mut response = (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(header::CONTENT_TYPE, "text/plain")],
+            Body::from("legacy error"),
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .append(header::ALLOW, HeaderValue::from_static("GET"));
+        response
+            .headers_mut()
+            .append(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        response.headers_mut().append(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=api"),
+        );
+        response
+            .headers_mut()
+            .append(header::SET_COOKIE, HeaderValue::from_static("a=1"));
+        response
+            .headers_mut()
+            .append(header::SET_COOKIE, HeaderValue::from_static("b=2"));
+        response.extensions_mut().insert(7_u32);
+
+        let normalized = crate::api::normalize_response(response).await;
+        assert_eq!(normalized.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(normalized.headers()[header::ALLOW], "GET");
+        assert_eq!(normalized.headers()[header::RETRY_AFTER], "60");
+        assert_eq!(
+            normalized.headers()[header::WWW_AUTHENTICATE],
+            "Bearer realm=api"
+        );
+        assert_eq!(
+            normalized
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .count(),
+            2
+        );
+        assert_eq!(
+            normalized.headers()[header::CONTENT_TYPE],
+            "application/json"
+        );
+        assert_eq!(normalized.extensions().get::<u32>(), Some(&7));
+        let body = normalized.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("request does not match the API"));
+
+        let scim_body = r#"{"schemas":["urn:ietf:params:scim:api:messages:2.0:Error"],"status":"401","detail":"invalid bearer"}"#;
+        let scim = Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(header::CONTENT_TYPE, "Application/SCIM+JSON; charset=utf-8")
+            .body(Body::from(scim_body))
+            .unwrap();
+        let scim = crate::api::normalize_response(scim).await;
+        assert_eq!(
+            scim.headers()[header::CONTENT_TYPE],
+            "Application/SCIM+JSON; charset=utf-8"
+        );
+        assert_eq!(
+            scim.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .as_ref(),
+            scim_body.as_bytes()
+        );
+    }
+}
+
 /// Asset URLs stamped with a content hash (?v=) never change meaning, so
 /// successful responses to them are safe to cache forever. Everything else
 /// under /assets keeps no-cache and revalidates.
@@ -3951,6 +4305,25 @@ async fn asset_cache_control(request: Request<axum::body::Body>, next: Next) -> 
             header::CACHE_CONTROL,
             axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"),
         );
+    }
+    response
+}
+
+async fn api_response_policy(request: Request<axum::body::Body>, next: Next) -> Response {
+    let is_api =
+        matches!(request.uri().path(), "/api") || request.uri().path().starts_with("/api/");
+    let is_head = request.method() == Method::HEAD;
+    let mut response = next.run(request).await;
+    if !is_api {
+        return response;
+    }
+    response = api::normalize_response(response).await;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    if is_head {
+        *response.body_mut() = axum::body::Body::empty();
     }
     response
 }
@@ -4120,7 +4493,9 @@ pub fn router(app: Arc<App>) -> Router {
         .nest_service(
             "/assets",
             Router::new()
-                .fallback_service(ServeDir::new(web_root.join("assets")))
+                .fallback_service(
+                    ServeDir::new(web_root.join("assets")).append_index_html_on_directories(false),
+                )
                 .layer(
                     tower::ServiceBuilder::new()
                         .layer(
@@ -4471,14 +4846,7 @@ pub fn router(app: Arc<App>) -> Router {
                     get(api::outbound::automation::delivery)
                         .delete(api::outbound::automation::revoke),
                 )
-                .route("/operations/{id}", get(api::outbound::automation::recover))
-                .layer(axum::middleware::map_response(
-                    api::outbound::automation::normalize_response,
-                ))
-                .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
-                    axum::http::header::CACHE_CONTROL,
-                    axum::http::HeaderValue::from_static("no-store"),
-                )),
+                .route("/operations/{id}", get(api::outbound::automation::recover)),
         )
         .route("/api/s/{token}/receipt", get(api::outbound_receipt))
         .route(
@@ -4532,6 +4900,7 @@ pub fn router(app: Arc<App>) -> Router {
             Arc::clone(&app),
             request_observability,
         ))
+        .layer(axum::middleware::from_fn(api_response_policy))
         .with_state(app)
 }
 
