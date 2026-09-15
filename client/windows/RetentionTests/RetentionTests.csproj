@@ -12,6 +12,6 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.7.250606001" />
-    <ProjectReference Include="..\Votport\Votport.csproj" />
+    <ProjectReference Include="..\Votport\Votport.csproj" Aliases="VotportApp" />
   </ItemGroup>
 </Project>

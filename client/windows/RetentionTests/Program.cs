@@ -1,7 +1,9 @@
+extern alias VotportApp;
+
 using System.Reflection;
 using Microsoft.UI.Dispatching;
-using uniffi.votport_client_core;
-using Votport;
+using VotportApp::uniffi.votport_client_core;
+using VotportApp::Votport;
 
 static void Check(bool condition, string message)
 {
