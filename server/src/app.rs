@@ -3041,6 +3041,18 @@ mod health_tests {
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
+
+    #[test]
+    fn metrics_reports_the_maintained_audit_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        app.store
+            .audit("", "", "metrics_test", "row", &serde_json::json!({}));
+
+        assert!(metrics_text(&app)
+            .unwrap()
+            .contains("votport_audit_rows 1\n"));
+    }
 }
 
 #[cfg(test)]
