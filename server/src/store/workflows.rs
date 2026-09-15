@@ -2362,7 +2362,7 @@ mod tests {
         grant.max_downloads = Some(1);
         store.insert_outbound_grant(grant.clone()).unwrap();
         let ticket = FetchTicket {
-            holder: String::new(),
+            holder: "first-holder".into(),
             grant_token_hash: grant.token_hash.clone(),
             policy_revision: 0,
             token_id: "first".into(),
@@ -2374,6 +2374,7 @@ mod tests {
         assert!(store.put_fetch_ticket(&ticket, now).unwrap());
         let mut next = ticket.clone();
         next.token_id = "second".into();
+        next.holder = "second-holder".into();
         assert!(!store.put_fetch_ticket(&next, now).unwrap());
         store
             .rotate_outbound_grant_token("", &grant.id, "rotated")
@@ -2391,6 +2392,61 @@ mod tests {
         assert!(!store.put_fetch_ticket(&third, now).unwrap());
         assert!(!store.admit_fetch_ticket(&next, now).unwrap());
         assert!(!store.admit_fetch_ticket(&third, now).unwrap());
+    }
+
+    #[test]
+    fn interrupted_fetch_can_be_replaced_by_its_holder_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let now = now_unix();
+        let mut grant = crate::store::tests::test_outbound_grant("capped", "", 0);
+        grant.expires_at = now + 3600;
+        grant.max_downloads = Some(1);
+        store.insert_outbound_grant(grant.clone()).unwrap();
+        let ticket = |token_id: &str, holder: &str| FetchTicket {
+            holder: holder.into(),
+            grant_token_hash: grant.token_hash.clone(),
+            policy_revision: 0,
+            token_id: token_id.into(),
+            grant_id: grant.id.clone(),
+            manifest_root: "root".into(),
+            expires_at: now + 600,
+            delivered_at: None,
+        };
+        let first = ticket("first", "holder-a");
+        assert!(store.put_fetch_ticket(&first, now).unwrap());
+        assert!(
+            store
+                .put_fetch_ticket(&ticket("retry", "holder-a"), now)
+                .unwrap(),
+            "an unadmitted interrupted ticket is replaceable by its holder"
+        );
+        assert!(
+            store.fetch_ticket("first").unwrap().is_none(),
+            "the replaced ticket cannot remain admissible"
+        );
+        assert!(
+            !store.admit_fetch_ticket(&first, now).unwrap(),
+            "the replaced ticket cannot admit after the replacement"
+        );
+        assert!(
+            store
+                .admit_fetch_ticket(&ticket("retry", "holder-a"), now)
+                .unwrap(),
+            "the replacement ticket admits"
+        );
+        assert!(
+            !store
+                .put_fetch_ticket(&ticket("after-admission", "holder-a"), now)
+                .unwrap(),
+            "an admitted ticket cannot be replaced by a retry"
+        );
+        assert!(
+            !store
+                .put_fetch_ticket(&ticket("other", "holder-b"), now)
+                .unwrap(),
+            "another holder cannot bypass the outstanding reservation"
+        );
     }
 
     #[test]

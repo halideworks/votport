@@ -12,12 +12,14 @@
 //! path's name, existence, and temp-then-rename guards: a QUIC fetch is a
 //! different transport, not a different trust boundary.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 use vot_cli::authz::Holder;
 use vot_cli::{fetch_bundle_with_seams, parse_rendezvous, Error as VotError, FetchOptions};
 use vot_object::ObjectId;
@@ -35,6 +37,10 @@ use crate::send_push::{direct_rails, probe_any, Probe};
 /// The resume store vot-cli writes inside a bundle while fetching and removes
 /// once the bundle is whole. Its presence means a fetch owns the stage.
 const RESUME_STORE: &str = "resume.vot";
+/// The signed capability that owns a resumable fetch. It is kept beside the
+/// upstream resume store because the store intentionally contains no bearer
+/// credentials, while an admitted ticket must be reused after a restart.
+const CAPABILITY_EXTENSION: &str = "capability";
 
 /// The outcome of an attempted fetch.
 pub enum Outcome {
@@ -46,6 +52,28 @@ pub enum Outcome {
         metadata: Box<crate::api::OutboundMetadata>,
         cookie: Option<String>,
     },
+}
+
+fn mint_refusal_is_unreachable(error: &Error) -> bool {
+    matches!(error, Error::Server { status: 404, .. })
+}
+
+enum FetchAttemptError {
+    Client(Error),
+    Vot(VotError),
+}
+
+impl From<Error> for FetchAttemptError {
+    fn from(error: Error) -> Self {
+        Self::Client(error)
+    }
+}
+
+fn is_capability_refusal(error: &VotError) -> bool {
+    matches!(
+        error,
+        VotError::PeerClosed(code) if *code == vot_cli::authz::REFUSAL_REASON
+    )
 }
 
 /// Fetches `delivery` into `dest` over QUIC, erroring rather than falling back
@@ -78,8 +106,9 @@ pub fn receive_over_fetch(
 /// caller can fall back to HTTP; after the mint the fetch is committed.
 ///
 /// # Errors
-/// A missing or wrong password, a serve identity mismatch, a mint refusal, a
-/// fetch failure, or a materialize failure.
+/// A missing or wrong password, a serve identity mismatch, a mint failure
+/// other than an unavailable reservation, a fetch failure, or a materialize
+/// failure.
 pub fn try_fetch(
     client: &Client,
     delivery: &Delivery,
@@ -97,6 +126,18 @@ pub(crate) fn try_fetch_with_resume(
     dest: &Path,
     observer: &mut dyn Observer,
     resume: bool,
+) -> Result<Outcome> {
+    try_fetch_with_resume_mode(client, delivery, device, dest, observer, resume, false)
+}
+
+fn try_fetch_with_resume_mode(
+    client: &Client,
+    delivery: &Delivery,
+    device: &Device,
+    dest: &Path,
+    observer: &mut dyn Observer,
+    resume: bool,
+    renew_saved: bool,
 ) -> Result<Outcome> {
     let mut metadata = client.outbound_metadata_for_device(&delivery.token, None, Some(device))?;
 
@@ -117,14 +158,6 @@ pub(crate) fn try_fetch_with_resume(
         }
     }
 
-    // A delivery without a fetch endpoint does not serve: fall back to HTTP.
-    let Some(endpoint) = metadata.fetch.as_ref() else {
-        return Ok(Outcome::Unreachable {
-            metadata: Box::new(metadata),
-            cookie,
-        });
-    };
-
     // The delivery's own file list, so a screen has rows while the carrier
     // moves the bundle; materialize announces the manifest's list after.
     observer.event(Event::Planned {
@@ -139,39 +172,101 @@ pub(crate) fn try_fetch_with_resume(
             })
             .collect(),
     });
-    // Refuse a receive that would overwrite before reserving a fetch ticket,
-    // the way the HTTP path refuses before downloading: a mint counts an
-    // undelivered ticket against the delivery's download cap for the
-    // capability's lifetime, so a refusal after the mint would lock the
-    // delivery out. materialize re-checks on the authoritative manifest names.
+    let staging_parent = dest
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // A token hash keeps this name stable across process restarts while
+    // preventing a server-controlled grant id from becoming a path.
+    let stage = fetch_stage(staging_parent, client.base(), &delivery.token);
+    let capability_path = stage.with_extension(CAPABILITY_EXTENSION);
+    let has_stage_state = stage.exists() || capability_path.exists();
+    if metadata.fetch.is_none() && !has_stage_state {
+        return Ok(Outcome::Unreachable {
+            metadata: Box::new(metadata),
+            cookie,
+        });
+    }
+    fs::create_dir_all(staging_parent)?;
+    let _stage_lock = FetchLock::try_acquire(&stage)?;
+    let saved_capability = load_saved_holder(
+        &capability_path,
+        device,
+        client.base(),
+        &delivery.token,
+        &metadata,
+    )?;
+    let saved_holder = match &saved_capability {
+        SavedCapabilityState::Valid(holder) if !renew_saved => Some(Arc::clone(holder)),
+        SavedCapabilityState::Missing | SavedCapabilityState::Valid(_) => None,
+    };
+    let allow_reuse = resume || matches!(&saved_capability, SavedCapabilityState::Valid(_));
+
+    // Refuse an unowned receive that would overwrite before reserving a fetch
+    // ticket. A validated sidecar or explicit resume may reuse matching files;
+    // materialize re-checks every name and root before publishing.
     let mut remaining = 0u64;
     let paths =
         crate::receive::local_paths(dest, metadata.files.iter().map(|file| file.name.as_str()))?;
     for (file, path) in metadata.files.iter().zip(paths) {
         let path = path?;
         let object = crate::receive::decode_object(&file.suite, &file.root, file.bytes)?;
-        if !reusable_file(&path, &object, resume, observer)? {
+        if !reusable_file(&path, &object, allow_reuse, observer)? {
             remaining = remaining.saturating_add(file.bytes);
         }
     }
-    // The bundle is staged beside the destination and then copied into it,
-    // so a fetch needs room for two copies until the stage is cleared. A
-    // destination with room for one still fits over HTTP, which stages
-    // nothing, so that is a fallback rather than a refusal.
-    // ponytail: a stage a prior fetch left is not credited against the two
-    // copies, so a nearly complete resume on a tight destination goes over
-    // HTTP instead. vot-cli pre-sizes objects sparsely, so a stage's lengths
-    // say nothing, and allocated blocks are unreliable too (ZFS compresses
-    // and delays allocation; Windows reports none). A VOT accessor for the
-    // resume store's verified coverage is the upgrade.
-    // The stage's filesystem is the one asked, which is the destination's
-    // parent: for a destination that is itself a mount root the two differ.
-    let staging_parent = dest
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+    // The QUIC library removes its resume store immediately after the last
+    // object is durable. If the process dies while our materializer is still
+    // publishing those objects, the admitted ticket remains the only way to
+    // retry safely. Finish that local materialization before considering a
+    // new mint; a fresh capability would be refused after delivery. The
+    // resume store may still be present when the transport completed, so an
+    // owned stage must be checked by content rather than by its marker.
+    if matches!(&saved_capability, SavedCapabilityState::Valid(_))
+        && owned_stage_is_complete(&stage, &metadata, observer)?
+    {
+        let evidence = crate::evidence::prepare_receive(client, &metadata, Some(device), observer)?;
+        observer.event(Event::Transport(Transport::Fetch));
+        let received = materialize_complete_stage(&stage, &metadata, dest, observer, allow_reuse)?;
+        let _ = fs::remove_dir_all(&stage);
+        let _ = fs::remove_file(&capability_path);
+        crate::evidence::complete(client.base(), evidence, observer);
+        observer.event(Event::Finished {
+            files: received.files.len(),
+        });
+        return Ok(Outcome::Fetched(received));
+    }
+    if matches!(&saved_capability, SavedCapabilityState::Missing) && stage_is_stale_complete(&stage)
+    {
+        fs::remove_dir_all(&stage)?;
+        let _ = fs::remove_file(&capability_path);
+    }
+
+    // A delivery without a fetch endpoint does not serve: fall back to HTTP.
+    // A saved capability means an earlier mint committed a reservation, so
+    // sending this request through HTTP would bypass that reservation.
+    let Some(endpoint) = metadata.fetch.as_ref() else {
+        if !matches!(&saved_capability, SavedCapabilityState::Missing) {
+            return Err(Error::Other(
+                "the interrupted fetch has no QUIC endpoint; retry when serving is available"
+                    .to_owned(),
+            ));
+        }
+        return Ok(Outcome::Unreachable {
+            metadata: Box::new(metadata),
+            cookie,
+        });
+    };
+
     let total: u64 = metadata.files.iter().map(|file| file.bytes).sum();
+    // ponytail: reserve the full stage plus remaining copies; credit verified
+    // staged bytes when VOT exposes coverage. An owned retry cannot switch to HTTP.
     if require_space(staging_parent, total.saturating_add(remaining)).is_err() {
+        if !matches!(&saved_capability, SavedCapabilityState::Missing) {
+            return Err(Error::Other(
+                "the interrupted fetch has insufficient staging space; retry later".to_owned(),
+            ));
+        }
         return Ok(Outcome::Unreachable {
             metadata: Box::new(metadata),
             cookie,
@@ -180,6 +275,11 @@ pub(crate) fn try_fetch_with_resume(
 
     let probe_digest = decode_digest(&endpoint.certificate_digest)?;
     let Ok(addresses) = parse_rendezvous(&endpoint.address) else {
+        if !matches!(&saved_capability, SavedCapabilityState::Missing) {
+            return Err(Error::Other(
+                "the interrupted fetch has an invalid QUIC endpoint; retry later".to_owned(),
+            ));
+        }
         return Ok(Outcome::Unreachable {
             metadata: Box::new(metadata),
             cookie,
@@ -187,11 +287,16 @@ pub(crate) fn try_fetch_with_resume(
     };
     let reachable = match probe_any(&addresses, probe_digest) {
         Probe::Reachable(address) => address,
-        Probe::Unreachable => {
+        Probe::Unreachable if matches!(&saved_capability, SavedCapabilityState::Missing) => {
             return Ok(Outcome::Unreachable {
                 metadata: Box::new(metadata),
                 cookie,
             })
+        }
+        Probe::Unreachable => {
+            return Err(Error::Other(
+                "the interrupted fetch cannot reach its QUIC endpoint; retry later".to_owned(),
+            ))
         }
         Probe::Mismatch => return Err(Error::Package(VotError::ServeIdentityMismatch)),
     };
@@ -199,44 +304,68 @@ pub(crate) fn try_fetch_with_resume(
     if observer.cancelled() {
         return Err(Error::Cancelled);
     }
-    // The serve answered, so mint a capability and commit to the fetch.
-    let mint = client.mint_fetch(&delivery.token, &device.holder_key_hex(), cookie.as_deref())?;
-    let capability = base64_decode(&mint.capability)?;
-    let holder = Arc::new(
-        Holder::new(capability, device.signing_key()).map_err(|error| {
-            Error::Other(format!(
-                "the device key does not match the capability: {error:?}"
-            ))
-        })?,
-    );
-    let identity = decode_digest(&mint.certificate_digest)?;
-    let pin = decode_digest(&mint.package_root)?;
+    let (holder, identity, pin) = if let Some(holder) = saved_holder {
+        // Reuse the capability that owns the persisted server ticket. The
+        // resume store supplies the package pin after a manifest was received.
+        (holder, decode_digest(&endpoint.certificate_digest)?, None)
+    } else {
+        // The serve answered, so mint a capability and commit to the fetch.
+        let mint =
+            match client.mint_fetch(&delivery.token, &device.holder_key_hex(), cookie.as_deref()) {
+                // A missing serve does not reserve a ticket, so the HTTP path is
+                // still safe and useful. Reservation conflicts stay errors: an
+                // admitted QUIC ticket cannot be bypassed by HTTP.
+                Err(error)
+                    if matches!(&saved_capability, SavedCapabilityState::Missing)
+                        && mint_refusal_is_unreachable(&error) =>
+                {
+                    return Ok(Outcome::Unreachable {
+                        metadata: Box::new(metadata),
+                        cookie,
+                    })
+                }
+                Err(error) => return Err(error),
+                Ok(mint) => mint,
+            };
+        let capability = base64_decode(&mint.capability)?;
+        let holder = Arc::new(
+            Holder::new(capability.clone(), device.signing_key()).map_err(|error| {
+                Error::Other(format!(
+                    "the device key does not match the capability: {error:?}"
+                ))
+            })?,
+        );
+        let saved = SavedCapability {
+            origin: client.base().to_owned(),
+            token: delivery.token.clone(),
+            grant_id: metadata.grant_id.clone(),
+            delivery_manifest: metadata.delivery_manifest.clone(),
+            package_root: mint.package_root.clone(),
+            holder: device.holder_key_hex(),
+            capability: capability.clone(),
+        };
+        let saved = serde_json::to_vec(&saved)
+            .map_err(|error| Error::Other(format!("encode saved fetch capability: {error}")))?;
+        crate::identity::write_private(&capability_path, &saved)?;
+        (
+            holder,
+            decode_digest(&mint.certificate_digest)?,
+            Some(decode_digest(&mint.package_root)?),
+        )
+    };
 
     // Fetch into a stable bundle staged beside the destination, so the objects
     // land on the same filesystem the files will and a re-run resumes it. The
-    // stage is keyed by the package root, so the same delivery resumes even
-    // under a fresh capability after the old one expired. vot-cli keeps a
-    // resume store in the stage until the bundle is whole and resumes from a
-    // partial one; the stage is kept on failure for that resume and removed
-    // once the files materialized.
+    // stage is stable for this delivery, and the capability sidecar keeps an
+    // admitted ticket usable across process restarts. vot-cli keeps a resume
+    // store in the stage until the bundle is whole and resumes from a partial
+    // one; the stage is kept on failure for that resume and removed once the
+    // files materialized.
     // ponytail: the bundle is a full second copy on disk; fetch-to-loose or a
     // hardlink materialize is the upgrade when a large sequence needs it.
-    // ponytail: a stable stage name is what makes resume possible, but two
-    // receives of the same delivery into the same destination running at once
-    // now share it and can clear each other's bundle (a failed transfer, not
-    // lost data: materialize never overwrites an existing file). A lock would
-    // close it, at the cost of a stale lock blocking every retry after a crash;
-    // the CLI is one receive per process, so this stays a documented edge.
-    fs::create_dir_all(staging_parent)?;
-    let stage = staging_parent.join(format!(".vot-fetch-{}.bundle", hex::encode(pin)));
-
-    // A bundle a prior fetch finished but materialize did not clear would make
-    // vot-cli refuse the stage (a non-empty dir with no resume store); remove
-    // only that exact shape, never a fetch in progress or resuming.
-    if stage_is_stale_complete(&stage) {
-        fs::remove_dir_all(&stage)?;
-    }
-
+    // A per-delivery lock keeps concurrent receives from clearing or writing
+    // the same stage. The kernel releases it when an owner crashes, while the
+    // lock file itself remains as harmless coordination state.
     let evidence = crate::evidence::prepare_receive(client, &metadata, Some(device), observer)?;
     observer.event(Event::Transport(Transport::Fetch));
     let expected: HashMap<_, _> = metadata
@@ -266,88 +395,112 @@ pub(crate) fn try_fetch_with_resume(
             if let Some(event) = event {
                 observer.event(event);
             }
+            if observer.cancelled() {
+                cancellation.cancel();
+            }
         },
         |sender| {
-            std::thread::scope(|scope| -> Result<Received> {
-                let state = StreamingSave {
-                    bundle: stage.clone(),
-                    dest: dest.to_path_buf(),
-                    references,
-                    pending: Vec::new(),
-                    files: Vec::new(),
-                    resume,
-                };
-                let (ready, jobs) = std::sync::mpsc::sync_channel(16);
-                let mut save_observer = StreamObserver {
-                    sender: sender.clone(),
-                    cancellation: cancellation.clone(),
-                };
-                let saver = scope.spawn(move || state.run(jobs, &mut save_observer));
-                let expected = Arc::new(expected);
-                let manifest_expected = Arc::clone(&expected);
-                let progress_sender = sender.clone();
-                let seams = vot_cli::ReceiveSeams {
-                    manifest: Some(Arc::new(move |_, _, entries| {
-                        validate_stream_manifest(&manifest_expected, entries)
-                    })),
-                    complete: Some(Arc::new(move |_, object| {
-                        for entry in &object.entries {
-                            let (index, object) = expected
-                                .get(&package_path_string(&entry.path))
-                                .ok_or(VotError::InvalidBundle)?;
-                            ready
-                                .send((
-                                    *index,
-                                    StoredEntry {
-                                        path: entry.path.clone(),
-                                        object: object.clone(),
-                                    },
-                                ))
-                                .map_err(|_| VotError::InvalidBundle)?;
+            std::thread::scope(
+                |scope| -> std::result::Result<Received, FetchAttemptError> {
+                    let state = StreamingSave {
+                        bundle: stage.clone(),
+                        dest: dest.to_path_buf(),
+                        references,
+                        pending: Vec::new(),
+                        files: Vec::new(),
+                        resume: allow_reuse,
+                    };
+                    let (ready, jobs) = std::sync::mpsc::sync_channel(16);
+                    let mut save_observer = StreamObserver {
+                        sender: sender.clone(),
+                        cancellation: cancellation.clone(),
+                    };
+                    let saver = scope.spawn(move || state.run(jobs, &mut save_observer));
+                    let expected = Arc::new(expected);
+                    let manifest_expected = Arc::clone(&expected);
+                    let progress_sender = sender.clone();
+                    let seams = vot_cli::ReceiveSeams {
+                        manifest: Some(Arc::new(move |_, _, entries| {
+                            validate_stream_manifest(&manifest_expected, entries)
+                        })),
+                        complete: Some(Arc::new(move |_, object| {
+                            for entry in &object.entries {
+                                let (index, object) = expected
+                                    .get(&package_path_string(&entry.path))
+                                    .ok_or(VotError::InvalidBundle)?;
+                                ready
+                                    .send((
+                                        *index,
+                                        StoredEntry {
+                                            path: entry.path.clone(),
+                                            object: object.clone(),
+                                        },
+                                    ))
+                                    .map_err(|_| VotError::InvalidBundle)?;
+                            }
+                            Ok(())
+                        })),
+                        cancellation: cancellation.clone(),
+                        ..Default::default()
+                    };
+                    let fetched = fetch_bundle_with_seams(
+                        FetchOptions {
+                            address: reachable,
+                            holder: Some(holder),
+                            serve_identity: Some(identity),
+                            pin,
+                            rails: direct_rails(reachable, cfg!(target_os = "macos")),
+                            provers: None,
+                            extensions: BTreeSet::new(),
+                            progress: Some((
+                                PROGRESS_QUANTUM,
+                                Box::new(move |moved, total| {
+                                    let _ = progress_sender.send(Event::Bytes { moved, total });
+                                }),
+                            )),
+                        },
+                        &stage,
+                        seams,
+                    );
+                    // A local saving failure must retain the stage even when its hook
+                    // reports InvalidBundle through the transport's error type.
+                    let received = saver.join().map_err(|_| {
+                        FetchAttemptError::Client(Error::Other("the saving worker failed".into()))
+                    })??;
+                    let (_, moved) = match fetched {
+                        Ok(fetched) => fetched,
+                        Err(error) => {
+                            if stage_unresumable(&error) {
+                                let _ = fs::remove_dir_all(&stage);
+                            }
+                            return Err(FetchAttemptError::Vot(error));
                         }
-                        Ok(())
-                    })),
-                    cancellation: cancellation.clone(),
-                    ..Default::default()
-                };
-                let fetched = fetch_bundle_with_seams(
-                    FetchOptions {
-                        address: reachable,
-                        holder: Some(holder),
-                        serve_identity: Some(identity),
-                        pin: Some(pin),
-                        rails: direct_rails(reachable, cfg!(target_os = "macos")),
-                        provers: None,
-                        extensions: BTreeSet::new(),
-                        progress: Some((
-                            PROGRESS_QUANTUM,
-                            Box::new(move |moved, total| {
-                                let _ = progress_sender.send(Event::Bytes { moved, total });
-                            }),
-                        )),
-                    },
-                    &stage,
-                    seams,
-                );
-                // A local saving failure must retain the stage even when its hook
-                // reports InvalidBundle through the transport's error type.
-                let received = saver
-                    .join()
-                    .map_err(|_| Error::Other("the saving worker failed".into()))??;
-                let (_, moved) = fetched.map_err(|error| {
-                    if stage_unresumable(&error) {
-                        let _ = fs::remove_dir_all(&stage);
-                    }
-                    Error::from(error)
-                })?;
-                let _ = sender.send(Event::Transferred { bytes: moved });
-                Ok(received)
-            })
+                    };
+                    let _ = sender.send(Event::Transferred { bytes: moved });
+                    Ok(received)
+                },
+            )
         },
-    )?;
+    );
+    let received = match received {
+        Ok(received) => received,
+        Err(FetchAttemptError::Vot(error))
+            if !renew_saved
+                && matches!(&saved_capability, SavedCapabilityState::Valid(_))
+                && is_capability_refusal(&error) =>
+        {
+            drop(_stage_lock);
+            return try_fetch_with_resume_mode(
+                client, delivery, device, dest, observer, resume, true,
+            );
+        }
+        Err(FetchAttemptError::Vot(error)) => return Err(Error::from(error)),
+        Err(FetchAttemptError::Client(error)) => return Err(error),
+    };
     // The files are on disk and verified; a failure to clear the stage must not
     // fail the receive. A leftover whole bundle is removed on the next run.
     let _ = fs::remove_dir_all(&stage);
+    let _ = fs::remove_file(&capability_path);
     crate::evidence::complete(client.base(), evidence, observer);
     observer.event(Event::Finished {
         files: received.files.len(),
@@ -374,6 +527,195 @@ fn stage_is_stale_complete(stage: &Path) -> bool {
             .map(|meta| meta.len() == entry.object.length)
             .unwrap_or(false)
     })
+}
+
+/// Checks a whole stage owned by a saved capability before selecting an
+/// endpoint. A complete transport can leave its resume marker behind while
+/// the saver is interrupted; every staged object must still prove its full
+/// identity before that stage is materialized locally.
+fn owned_stage_is_complete(
+    stage: &Path,
+    metadata: &crate::api::OutboundMetadata,
+    observer: &mut dyn Observer,
+) -> Result<bool> {
+    if observer.cancelled() {
+        return Err(Error::Cancelled);
+    }
+    let entries = match read_manifest(stage) {
+        Ok(entries) => entries,
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    validate_staged_manifest(metadata, &entries)?;
+    let objects = stage.join("objects");
+    let mut checked = HashSet::new();
+    for entry in entries {
+        let identity = (entry.object.suite, entry.object.root, entry.object.length);
+        if !checked.insert(identity) {
+            continue;
+        }
+        match reusable_file(
+            &objects.join(object_name(&entry.object.root)),
+            &entry.object,
+            true,
+            observer,
+        ) {
+            Ok(true) => {}
+            Ok(false) | Err(Error::Exists { .. }) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
+fn fetch_stage(parent: &Path, origin: &str, token: &str) -> PathBuf {
+    let digest = sha2::Sha256::digest(format!("{origin}\0{token}").as_bytes());
+    parent.join(format!(".vot-fetch-{}.bundle", hex::encode(digest)))
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SavedCapability {
+    origin: String,
+    token: String,
+    grant_id: Option<String>,
+    delivery_manifest: Option<String>,
+    package_root: String,
+    holder: String,
+    capability: Vec<u8>,
+}
+
+enum SavedCapabilityState {
+    Missing,
+    Valid(Arc<Holder>),
+}
+
+fn load_saved_holder(
+    path: &Path,
+    device: &Device,
+    origin: &str,
+    token: &str,
+    metadata: &crate::api::OutboundMetadata,
+) -> Result<SavedCapabilityState> {
+    let capability = match fs::read(path) {
+        Ok(capability) => capability,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SavedCapabilityState::Missing)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let saved: SavedCapability = serde_json::from_slice(&capability).map_err(|error| {
+        Error::Other(format!(
+            "the saved fetch capability metadata is invalid: {error}"
+        ))
+    })?;
+    let expected_package_root = metadata
+        .package_root
+        .as_deref()
+        .filter(|root| !root.is_empty());
+    if saved.origin != origin
+        || saved.token != token
+        || saved.grant_id != metadata.grant_id
+        || saved.delivery_manifest != metadata.delivery_manifest
+        || expected_package_root.is_some_and(|root| saved.package_root != root)
+        || saved.holder != device.holder_key_hex()
+    {
+        return Err(Error::Other(
+            "the saved fetch capability does not match this delivery".to_owned(),
+        ));
+    }
+    let holder = Holder::new(saved.capability, device.signing_key()).map_err(|error| {
+        Error::Other(format!(
+            "the saved fetch capability is invalid for this device: {error:?}"
+        ))
+    })?;
+    Ok(SavedCapabilityState::Valid(Arc::new(holder)))
+}
+
+struct FetchLock {
+    file: File,
+}
+
+impl FetchLock {
+    fn try_acquire(stage: &Path) -> Result<Self> {
+        let path = stage.with_extension("lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => Ok(Self { file }),
+            Err(fs4::TryLockError::WouldBlock) => Err(Error::Other(
+                "another receive is already using this delivery; retry later".to_owned(),
+            )),
+            Err(fs4::TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+}
+
+impl Drop for FetchLock {
+    fn drop(&mut self) {
+        let _ = fs4::FileExt::unlock(&self.file);
+    }
+}
+
+fn materialize_complete_stage(
+    bundle: &Path,
+    metadata: &crate::api::OutboundMetadata,
+    dest: &Path,
+    observer: &mut dyn Observer,
+    resume: bool,
+) -> Result<Received> {
+    let entries = read_manifest(bundle)?;
+    validate_staged_manifest(metadata, &entries)?;
+    let references = entries.iter().fold(HashMap::new(), |mut counts, entry| {
+        *counts.entry(entry.object.root).or_insert(0usize) += 1;
+        counts
+    });
+    let entries: Vec<_> = entries.into_iter().enumerate().collect();
+    let files = materialize_entries(bundle, dest, &entries, observer, resume, &references, false)?;
+    Ok(Received { files })
+}
+
+fn validate_staged_manifest(
+    metadata: &crate::api::OutboundMetadata,
+    entries: &[StoredEntry],
+) -> Result<()> {
+    let expected: HashMap<_, _> = metadata
+        .files
+        .iter()
+        .map(|file| {
+            Ok((
+                file.name.clone(),
+                crate::receive::decode_object(&file.suite, &file.root, file.bytes)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    if expected.len() != metadata.files.len() || entries.len() != expected.len() {
+        return Err(Error::Other(
+            "the staged manifest does not match the delivery".to_owned(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for entry in entries {
+        let name = package_path_string(&entry.path);
+        let Some(object) = expected.get(&name) else {
+            return Err(Error::Other(
+                "the staged manifest does not match the delivery".to_owned(),
+            ));
+        };
+        if !seen.insert(name)
+            || entry.object.suite != object.suite
+            || entry.object.root != object.root
+            || entry.object.length != object.length
+        {
+            return Err(Error::Other(
+                "the staged manifest does not match the delivery".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whether a failed fetch left the stage in a state no retry can resume, so it
@@ -743,6 +1085,290 @@ mod tests {
     use super::*;
     use crate::entries::admit;
     use crate::package::build;
+
+    #[test]
+    fn mint_refusals_can_use_http_before_fetch_commit() {
+        assert!(mint_refusal_is_unreachable(&Error::Server {
+            status: 404,
+            what: "mint fetch".into(),
+            body: "serve unavailable".into(),
+        }));
+        for status in [409, 400, 401, 500] {
+            assert!(!mint_refusal_is_unreachable(&Error::Server {
+                status,
+                what: "mint fetch".into(),
+                body: "reservation unavailable".into(),
+            }));
+        }
+    }
+
+    #[test]
+    fn only_an_explicit_capability_refusal_can_trigger_one_renewal() {
+        assert!(is_capability_refusal(&VotError::PeerClosed(
+            vot_cli::authz::REFUSAL_REASON,
+        )));
+        assert!(!is_capability_refusal(&VotError::PeerClosed(0)));
+        assert!(!is_capability_refusal(&VotError::CarrierUnavailable));
+    }
+
+    #[test]
+    fn an_admitted_capability_reloads_after_a_client_restart() {
+        let home = tempfile::tempdir().unwrap();
+        let device_key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let device = Device::from_signing_key(device_key.clone());
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+        let capability = vot_cli::authz::issue(
+            "votport",
+            "test-audience",
+            &issuer,
+            device_key.verifying_key().to_bytes(),
+            [9; 32],
+            100,
+            3600,
+        )
+        .unwrap();
+        let origin = "https://test.example";
+        let token = "delivery-token";
+        let metadata = crate::api::OutboundMetadata {
+            grant_id: Some("grant".into()),
+            package_root: Some(hex::encode([9; 32])),
+            delivery_manifest: Some("manifest".into()),
+            evidence_authorization: None,
+            receipt_key: None,
+            has_password: false,
+            authorized: true,
+            label: None,
+            files: Vec::new(),
+            fetch: None,
+        };
+        let stage = fetch_stage(home.path(), origin, token);
+        let capability_path = stage.with_extension(CAPABILITY_EXTENSION);
+        let saved = SavedCapability {
+            origin: origin.into(),
+            token: token.into(),
+            grant_id: metadata.grant_id.clone(),
+            delivery_manifest: metadata.delivery_manifest.clone(),
+            package_root: hex::encode([9; 32]),
+            holder: hex::encode(device_key.verifying_key().to_bytes()),
+            capability,
+        };
+        crate::identity::write_private(&capability_path, &serde_json::to_vec(&saved).unwrap())
+            .unwrap();
+
+        assert!(
+            matches!(
+                load_saved_holder(&capability_path, &device, origin, token, &metadata).unwrap(),
+                SavedCapabilityState::Valid(_)
+            ),
+            "the minted holder must survive the first receive process"
+        );
+        let restarted = Device::from_signing_key(device_key);
+        assert!(
+            matches!(
+                load_saved_holder(&capability_path, &restarted, origin, token, &metadata).unwrap(),
+                SavedCapabilityState::Valid(_)
+            ),
+            "the same persisted device key must reuse the admitted holder"
+        );
+        let mut sidecar = serde_json::to_value(&saved).unwrap();
+        sidecar["expires_at"] = serde_json::json!(0);
+        crate::identity::write_private(&capability_path, &serde_json::to_vec(&sidecar).unwrap())
+            .unwrap();
+        assert!(matches!(
+            load_saved_holder(&capability_path, &device, origin, token, &metadata).unwrap(),
+            SavedCapabilityState::Valid(_)
+        ));
+        assert_ne!(stage, capability_path);
+        assert_ne!(
+            fetch_stage(home.path(), origin, "another-delivery"),
+            stage,
+            "each delivery keeps a separate stage and capability"
+        );
+    }
+
+    #[test]
+    fn an_admitted_complete_stage_resumes_materialization_after_interruption() {
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("source");
+        let stage = home.path().join("stage");
+        let dest = home.path().join("dest");
+        fs::create_dir(&source).unwrap();
+        for (name, bytes) in [("first", b"first".as_slice()), ("second", b"second")] {
+            fs::write(source.join(name), bytes).unwrap();
+        }
+        build(
+            ["first", "second"]
+                .into_iter()
+                .map(|name| admit(name, source.join(name), false).unwrap())
+                .collect(),
+            &stage,
+        )
+        .unwrap();
+        let objects = stage.join("objects");
+        fs::create_dir_all(&objects).unwrap();
+        for entry in read_manifest(&stage).unwrap() {
+            fs::copy(
+                source.join(package_path_string(&entry.path)),
+                objects.join(object_name(&entry.object.root)),
+            )
+            .unwrap();
+        }
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("first"), b"first").unwrap();
+
+        let entries = read_manifest(&stage).unwrap();
+        let metadata = crate::api::OutboundMetadata {
+            grant_id: Some("grant".into()),
+            package_root: None,
+            delivery_manifest: Some("manifest".into()),
+            evidence_authorization: None,
+            receipt_key: None,
+            has_password: false,
+            authorized: true,
+            label: None,
+            files: entries
+                .iter()
+                .map(|entry| crate::api::OutboundFile {
+                    name: package_path_string(&entry.path),
+                    suite: "blake3".into(),
+                    root: hex::encode(entry.object.root),
+                    bytes: entry.object.length,
+                    download_url: String::new(),
+                })
+                .collect(),
+            fetch: None,
+        };
+        fs::write(stage.join(RESUME_STORE), b"in progress").unwrap();
+        assert!(owned_stage_is_complete(&stage, &metadata, &mut crate::progress::Silent).unwrap());
+        let mut wrong_metadata = metadata.clone();
+        wrong_metadata.files[0].root = hex::encode([3; 32]);
+        assert!(materialize_complete_stage(
+            &stage,
+            &wrong_metadata,
+            &dest,
+            &mut crate::progress::Silent,
+            true,
+        )
+        .is_err());
+        let received = materialize_complete_stage(
+            &stage,
+            &metadata,
+            &dest,
+            &mut crate::progress::Silent,
+            true,
+        )
+        .unwrap();
+        assert_eq!(fs::read(dest.join("second")).unwrap(), b"second");
+        assert_eq!(
+            received.files,
+            vec![dest.join("first"), dest.join("second")]
+        );
+    }
+
+    #[test]
+    fn owned_stage_check_rejects_partial_sparse_corrupt_and_wrong_stages() {
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("source");
+        let stage = home.path().join("stage");
+        fs::create_dir(&source).unwrap();
+        for (name, bytes) in [("first", b"first".as_slice()), ("copy", b"first")] {
+            fs::write(source.join(name), bytes).unwrap();
+        }
+        build(
+            ["first", "copy"]
+                .into_iter()
+                .map(|name| admit(name, source.join(name), false).unwrap())
+                .collect(),
+            &stage,
+        )
+        .unwrap();
+        let entries = read_manifest(&stage).unwrap();
+        let objects = stage.join("objects");
+        fs::create_dir_all(&objects).unwrap();
+        for entry in &entries {
+            fs::copy(
+                source.join(package_path_string(&entry.path)),
+                objects.join(object_name(&entry.object.root)),
+            )
+            .unwrap();
+        }
+        let metadata = crate::api::OutboundMetadata {
+            grant_id: Some("grant".into()),
+            package_root: None,
+            delivery_manifest: Some("manifest".into()),
+            evidence_authorization: None,
+            receipt_key: None,
+            has_password: false,
+            authorized: true,
+            label: None,
+            files: entries
+                .iter()
+                .map(|entry| crate::api::OutboundFile {
+                    name: package_path_string(&entry.path),
+                    suite: "blake3".into(),
+                    root: hex::encode(entry.object.root),
+                    bytes: entry.object.length,
+                    download_url: String::new(),
+                })
+                .collect(),
+            fetch: None,
+        };
+        fs::write(stage.join(RESUME_STORE), b"in progress").unwrap();
+        assert!(owned_stage_is_complete(&stage, &metadata, &mut crate::progress::Silent).unwrap());
+
+        let first = &entries[0].object;
+        let first_path = objects.join(object_name(&first.root));
+        fs::write(&first_path, b"firs").unwrap();
+        assert!(!owned_stage_is_complete(&stage, &metadata, &mut crate::progress::Silent).unwrap());
+        fs::copy(source.join("first"), &first_path).unwrap();
+
+        let file = fs::File::create(&first_path).unwrap();
+        file.set_len(first.length).unwrap();
+        assert!(!owned_stage_is_complete(&stage, &metadata, &mut crate::progress::Silent).unwrap());
+        fs::copy(source.join("first"), &first_path).unwrap();
+
+        fs::write(&first_path, b"wrong").unwrap();
+        assert!(!owned_stage_is_complete(&stage, &metadata, &mut crate::progress::Silent).unwrap());
+        fs::copy(source.join("first"), &first_path).unwrap();
+
+        let mut wrong_metadata = metadata.clone();
+        wrong_metadata.files[0].root = hex::encode([3; 32]);
+        assert!(
+            owned_stage_is_complete(&stage, &wrong_metadata, &mut crate::progress::Silent).is_err()
+        );
+
+        struct Cancelled;
+        impl Observer for Cancelled {
+            fn event(&mut self, _: Event) {}
+
+            fn cancelled(&self) -> bool {
+                true
+            }
+        }
+        assert!(matches!(
+            owned_stage_is_complete(&stage, &metadata, &mut Cancelled),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn fetch_stage_lock_blocks_competing_cleanup() {
+        let home = tempfile::tempdir().unwrap();
+        let stage = fetch_stage(home.path(), "https://test.example", "delivery-token");
+        let first = FetchLock::try_acquire(&stage).unwrap();
+        let lock_path = stage.with_extension("lock");
+        let second = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        assert!(matches!(
+            fs4::FileExt::try_lock(&second),
+            Err(fs4::TryLockError::WouldBlock)
+        ));
+        drop(first);
+        assert!(fs4::FileExt::try_lock(&second).is_ok());
+    }
 
     #[test]
     fn saving_worker_publishes_before_input_closes_and_returns_delivery_order() {
