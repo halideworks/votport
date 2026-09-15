@@ -190,7 +190,7 @@ public sealed class TransferStore
 
     /// Ships a settled drop of a watched folder, as a send of that one path;
     /// the core moves it into the folder's shipped subfolder afterwards.
-    public void Ship(string watchId, string path, WatchAdmission admission)
+    private void Ship(string watchId, string path, WatchAdmission admission)
     {
         try
         {
