@@ -1173,12 +1173,13 @@ mod tests {
         use axum::body::Body;
         use axum::http::Request;
         use base64::Engine as _;
+        use http_body_util::BodyExt as _;
         use openidconnect::core::{
             CoreEdDsaPrivateSigningKey, CoreGenderClaim, CoreJweContentEncryptionAlgorithm,
             CoreJwsSigningAlgorithm,
         };
         use openidconnect::{IdToken, IdTokenClaims, PrivateSigningKey as _};
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
         use tower::ServiceExt as _;
 
@@ -1245,28 +1246,82 @@ mod tests {
             }
             let token = Arc::new(Mutex::new(String::new()));
             let response_token = Arc::clone(&token);
+            let token_calls = Arc::new(AtomicUsize::new(0));
+            let token_calls_for_provider = Arc::clone(&token_calls);
+            let pkce_valid = Arc::new(AtomicBool::new(false));
+            let pkce_valid_for_provider = Arc::clone(&pkce_valid);
+            let expected_challenge = Arc::new(Mutex::new(None::<String>));
             let userinfo_calls = Arc::new(AtomicUsize::new(0));
             let calls = Arc::clone(&userinfo_calls);
             let unexpected_calls = Arc::new(AtomicUsize::new(0));
             let unexpected = Arc::clone(&unexpected_calls);
             let jwks = json!({"keys": [key.as_verification_key()]});
-            let provider = axum::Router::new().fallback(move |uri: axum::http::Uri| {
-                let response = match uri.path() {
-                    "/.well-known/openid-configuration" => axum::Json(metadata.clone()).into_response(),
-                    "/jwks" => axum::Json(jwks.clone()).into_response(),
-                    "/token" => axum::Json(json!({"access_token": "test-access", "token_type": "Bearer", "id_token": response_token.lock().unwrap().clone()})).into_response(),
-                    "/userinfo" => {
-                        calls.fetch_add(1, Ordering::Relaxed);
-                        if case == "userinfo-failure" { StatusCode::SERVICE_UNAVAILABLE.into_response() }
-                        else { axum::Json(userinfo.clone()).into_response() }
-                    }
-                    _ => {
-                        unexpected.fetch_add(1, Ordering::Relaxed);
-                        StatusCode::NOT_FOUND.into_response()
-                    }
-                };
-                async move { response }
-            });
+            let challenge_for_provider = Arc::clone(&expected_challenge);
+            let provider = axum::Router::new()
+                .route(
+                    "/token",
+                    axum::routing::post(move |request: axum::extract::Request| {
+                        let response_token = Arc::clone(&response_token);
+                        let token_calls = Arc::clone(&token_calls_for_provider);
+                        let pkce_valid = Arc::clone(&pkce_valid_for_provider);
+                        let expected_challenge = Arc::clone(&challenge_for_provider);
+                        async move {
+                            let body = request.into_body().collect().await.unwrap().to_bytes();
+                            let query = reqwest::Url::parse(&format!(
+                                "http://provider.invalid/?{}",
+                                String::from_utf8_lossy(&body)
+                            ))
+                            .unwrap();
+                            let verifier = query
+                                .query_pairs()
+                                .find(|(name, _)| name == "code_verifier")
+                                .map(|(_, value)| value.into_owned());
+                            let actual_challenge = verifier.as_deref().map(|verifier| {
+                                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                    .encode(sha2::Sha256::digest(verifier.as_bytes()))
+                            });
+                            let valid = actual_challenge.is_some()
+                                && actual_challenge.as_deref()
+                                    == expected_challenge.lock().unwrap().as_deref();
+                            token_calls.fetch_add(1, Ordering::Relaxed);
+                            pkce_valid.store(valid, Ordering::Relaxed);
+                            if !valid {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    axum::Json(json!({"error": "invalid_grant"})),
+                                )
+                                    .into_response();
+                            }
+                            axum::Json(json!({
+                                "access_token": "test-access",
+                                "token_type": "Bearer",
+                                "id_token": response_token.lock().unwrap().clone()
+                            }))
+                            .into_response()
+                        }
+                    }),
+                )
+                .fallback(move |uri: axum::http::Uri| {
+                    let response = match uri.path() {
+                        "/.well-known/openid-configuration" => {
+                            axum::Json(metadata.clone()).into_response()
+                        }
+                        "/jwks" => axum::Json(jwks.clone()).into_response(),
+                        "/userinfo" => {
+                            calls.fetch_add(1, Ordering::Relaxed);
+                            if case == "userinfo-failure" {
+                                StatusCode::SERVICE_UNAVAILABLE.into_response()
+                            } else {
+                                axum::Json(userinfo.clone()).into_response()
+                            }
+                        }
+                        _ => {
+                            unexpected.fetch_add(1, Ordering::Relaxed);
+                            StatusCode::NOT_FOUND.into_response()
+                        }
+                    };
+                    async move { response }
+                });
             let mut tasks = tokio::task::JoinSet::new();
             tasks.spawn(async move { axum::serve(listener, provider).await.unwrap() });
             let mut config = crate::api::testing::config(directory.path());
@@ -1322,6 +1377,42 @@ mod tests {
                     .1
                     .into_owned()
             };
+            *expected_challenge.lock().unwrap() = Some(parameter("code_challenge"));
+            assert_eq!(parameter("code_challenge_method"), "S256", "{case}");
+            if case == "id-token-only" {
+                let before = token_calls.load(Ordering::Relaxed);
+                let mismatched_state = if parameter("state") == "ff".repeat(16) {
+                    "00".repeat(16)
+                } else {
+                    "ff".repeat(16)
+                };
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    router.clone().oneshot(
+                        Request::get(format!(
+                            "/api/admin/callback?code=test&state={mismatched_state}"
+                        ))
+                        .extension(peer)
+                        .header(header::COOKIE, cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                    ),
+                )
+                .await
+                .expect("mismatched-state callback timed out")
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::FOUND);
+                assert_eq!(
+                    response.headers()[header::LOCATION],
+                    "/?sso_error=state_invalid"
+                );
+                assert_eq!(token_calls.load(Ordering::Relaxed), before);
+                assert!(response
+                    .headers()
+                    .get_all(header::SET_COOKIE)
+                    .iter()
+                    .all(|value| !value.to_str().unwrap().starts_with("votport_admin=")));
+            }
             let now = crate::store::now_unix();
             let mut claims = json!({"iss": issuer, "aud": "votport", "sub": case, "iat": now, "exp": now + 300, "nonce": parameter("nonce"), "groups": ["platform-admins", "tenant-admins"]});
             match case {
@@ -1416,6 +1507,21 @@ mod tests {
                             ])
                         );
                     }
+                    if case == "id-token-only" {
+                        assert!(response.headers().get_all(header::SET_COOKIE).iter().any(
+                            |value| {
+                                let value = value.to_str().unwrap();
+                                value.starts_with("votport_sso_x=") && value.contains("Max-Age=0")
+                            }
+                        ));
+                        assert!(app.store.audit_export(None, 0, 0, 100).unwrap().iter().any(
+                            |row| {
+                                row.event == "sso_login"
+                                    && row.subject == case
+                                    && row.detail["role"] == "admin"
+                            }
+                        ));
+                    }
                 }
                 Err(code) => {
                     assert_eq!(
@@ -1437,6 +1543,8 @@ mod tests {
                     }
                 }
             }
+            assert_eq!(token_calls.load(Ordering::Relaxed), 1, "{case}");
+            assert!(pkce_valid.load(Ordering::Relaxed), "{case} PKCE verifier");
             assert_eq!(unexpected_calls.load(Ordering::Relaxed), 0, "{case}");
             tasks.shutdown().await;
         }
