@@ -254,7 +254,7 @@ function renderUpload(link, upload) {
     partial.textContent = 'partial';
     head.append(partial);
   }
-  if (!held) {
+  if (receiveAdministrator && !held) {
     head.append(
       // Files on disk stay, so this needs an undo window, not a modal.
       button('Clear record', 'tiny ghost', (control) => deferred(control, {
@@ -270,7 +270,7 @@ function renderUpload(link, upload) {
       })),
     );
   }
-  if (!held && upload.file_count) {
+  if (receiveAdministrator && !held && upload.file_count) {
     head.append(button('Delete stored files', 'tiny danger', async () => {
       if (!(await confirmModal('Delete stored files', 'Delete the stored files from this transfer? This cannot be undone.', 'Delete'))) return;
       let offset = 0;
@@ -318,10 +318,10 @@ function renderFile(link, upload, file) {
       receipt.textContent = 'receipt';
       extras.push(receipt);
     }
-    if (file.exists && file.receipt) {
+    if (receiveAdministrator && file.exists && file.receipt) {
       extras.push(button('Send', 'tiny', (control) => issueReceivedGrant(link, upload, index, file, control)));
     }
-    if (file.exists && !held) {
+    if (receiveAdministrator && file.exists && !held) {
       extras.push(
         button('Delete file', 'tiny danger', async () => {
           if (
@@ -649,6 +649,8 @@ function renderLink(link) {
         qr.append(image);
       }
     }),
+  );
+  if (receiveAdministrator) actions.append(
     button(link.active ? 'Deactivate' : 'Reactivate', 'tiny ghost', (control) => {
       if (pending) return;
       return deferred(control, {
@@ -690,7 +692,7 @@ function renderLink(link) {
       });
     }),
   );
-  if (!link.legal_hold) {
+  if (receiveAdministrator && !link.legal_hold) {
     actions.append(
       button('Delete', 'tiny danger', async () => {
         if (
@@ -865,7 +867,7 @@ async function refreshLinksSafe(options = {}) {
 $('create-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const submit = event.currentTarget.querySelector('button[type="submit"]');
-  if (submit.disabled) return;
+  if (submit.disabled || !receiveAdministrator) return;
   const submittedFocus = document.activeElement;
   let created = false;
   submit.disabled = true; $('create-form').inert = true;
@@ -915,7 +917,7 @@ $('create-form').addEventListener('submit', async (event) => {
     $('create-error').textContent = error.message;
     $('create-error').hidden = false;
   } finally {
-    submit.disabled = false; $('create-form').inert = false;
+    submit.disabled = !receiveAdministrator; $('create-form').inert = !receiveAdministrator;
     if (created && $('create-error').hidden && (document.activeElement === submittedFocus || document.activeElement === document.body)) {
       $('new-link-url').focus({ preventScroll: true });
     }
@@ -938,14 +940,23 @@ $('links-load-more').addEventListener('click', async () => {
 
 // The session check, the list, and the strip go out together; each is one
 // round trip, and none of them needs the others to have answered first.
-const sessionReady = requireSession();
+const sessionReady = requireSession().then((session) => {
+  receiveAdministrator = session.role === 'admin';
+  return session;
+});
 $('create-form').inert = true;
-const projectsReady = Promise.all([sessionReady, api('/api/workflows/projects')]).then(([session, response]) => {
-  receiveAdministrator = session.role === 'admin'; receiveProjects = response.projects.filter((project) => project.receive);
+const projectsReady = Promise.all([sessionReady, api('/api/workflows/projects')]).then(([, response]) => {
+  receiveProjects = response.projects.filter((project) => project.receive);
   createWorkflow?.destroy();
   createWorkflow = workflowEditor(); $('create-workflow').replaceChildren(createWorkflow.element);
 }).catch((error) => { $('create-error').textContent = `Could not load reception projects: ${error.message}`; $('create-error').hidden = false; })
-  .finally(() => { $('create-form').inert = false; });
+  .finally(async () => {
+    await sessionReady;
+    const submit = $('create-form').querySelector('button[type="submit"]');
+    submit.disabled = !receiveAdministrator;
+    $('create-form').hidden = !receiveAdministrator;
+    $('create-form').inert = !receiveAdministrator;
+  });
 
 $('links-query').value = linksFilter.search;
 startStatusPoll({ render: renderStatus, active: (status) => status.sessions_active > 0 });
