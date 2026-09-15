@@ -4465,6 +4465,12 @@ fn metrics_text(app: &App) -> Result<String, String> {
     );
     let _ = write!(
         body,
+        "# TYPE votport_integrity_failures_total counter\nvotport_integrity_failures_total {}\n",
+        crate::api::outbound::OUTBOUND_INTEGRITY_FAILURES
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    let _ = write!(
+        body,
         "# TYPE votport_upload_bytes_in_flight gauge\nvotport_upload_bytes_in_flight {}\n",
         app.sessions.bytes_in_flight()
     );

@@ -4,6 +4,7 @@ use std::collections::BinaryHeap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -36,7 +37,7 @@ use crate::auth;
 use crate::auth::hash_token;
 use crate::session::{OutboundOperation, OwnedOutboundOperation};
 use crate::store::{
-    now_unix, AutomationToken, OutboundDownloadResult, OutboundGrant, OutboundGrantFile,
+    now_unix, AutomationToken, OutboundDownloadResult, OutboundGrant, OutboundGrantFile, Store,
     OUTBOUND_DOWNLOAD_LIMIT_REACHED,
 };
 
@@ -106,6 +107,73 @@ const LIBRARY_SELECTION_BUDGET: LibraryEnumerationBudget = LibraryEnumerationBud
 // ponytail: one tiny global critical section; use per-tenant locks only if contention is measured.
 static LIBRARY_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static LIBRARY_HASH_PERMITS: Semaphore = Semaphore::const_new(LIBRARY_HASH_CONCURRENCY);
+
+pub(crate) static OUTBOUND_INTEGRITY_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone)]
+struct IntegrityContext {
+    store: Arc<Store>,
+    tenant: String,
+    grant_id: String,
+    index: usize,
+    component: &'static str,
+    path: PathBuf,
+}
+
+impl IntegrityContext {
+    fn for_source(
+        app: &App,
+        grant: &OutboundGrant,
+        index: usize,
+        component: &'static str,
+        source: &Source,
+    ) -> Self {
+        Self::for_path(app, grant, index, component, &source.path)
+    }
+
+    fn for_path(
+        app: &App,
+        grant: &OutboundGrant,
+        index: usize,
+        component: &'static str,
+        path: &Path,
+    ) -> Self {
+        Self {
+            store: Arc::clone(&app.store),
+            tenant: grant.tenant.clone(),
+            grant_id: grant.id.clone(),
+            index,
+            component,
+            path: path.to_owned(),
+        }
+    }
+}
+
+fn report_integrity_failure(context: &IntegrityContext, error: &io::Error) {
+    OUTBOUND_INTEGRITY_FAILURES.fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        target: "audit",
+        event = "outbound_integrity_failure",
+        grant_id = %context.grant_id,
+        file_index = context.index,
+        component = context.component,
+        path = %context.path.display(),
+        error = %error,
+        "outbound source integrity verification failed"
+    );
+    context.store.audit(
+        &context.tenant,
+        "",
+        "outbound_integrity_failure",
+        &context.grant_id,
+        &json!({
+            "file_index": context.index,
+            "component": context.component,
+            "path": context.path.to_string_lossy(),
+            "error": error.to_string(),
+        }),
+    );
+}
 // Batch staging copies, hashes, and receipt-checks files on the blocking
 // pool; every batch stream keeps up to BATCH_LOOKAHEAD stages running (the
 // streaming chunk's stage is done), so MAX_ACTIVE streams could run 64
@@ -1718,7 +1786,7 @@ pub async fn create_outbound_grant(
             root,
             length: file.bytes,
         };
-        read_verified_receipt(&app, &source, &expected)?;
+        read_verified_receipt(&app, &source, &expected, None)?;
         let proof_root = app.config.data_dir.join("outbound.proofs");
         let source_for_catalog = source.clone();
         tokio::task::spawn_blocking(move || {
@@ -2130,7 +2198,7 @@ async fn create_library_grant(
                 let path = admin::stored_path(app, &identity.tenant, &original.stored_as)
                     .ok_or_else(ApiError::not_found)?;
                 file.receipt_b64 = base64::prelude::BASE64_STANDARD
-                    .encode(read_verified_receipt(app, &path, &object)?);
+                    .encode(read_verified_receipt(app, &path, &object, None)?);
             }
             let name = source_prefix
                 .as_deref()
@@ -2891,7 +2959,7 @@ pub async fn outbound_receipt_indexed(
     let grant = Arc::new(active_grant(&app, &token)?);
     let operation = begin_outbound_operation_owned(&app, &grant.tenant)?;
     require_grant_access(&app, &grant, &headers)?;
-    let (source, _operation) = source_info_async(&app, grant, index, None, operation).await?;
+    let (source, _operation) = source_info_async(&app, grant, index, None, operation, None).await?;
     let bytes = source.receipt.ok_or_else(ApiError::not_found)?;
     let filename = format!("{}.vot-receipt", source.name);
     let mut response = bytes.into_response();
@@ -3233,8 +3301,9 @@ fn validate_batch_sources(app: &App, grant: &OutboundGrant, count: usize) -> Api
     let mut output = io::sink();
     let mut buf = vec![0u8; CHUNK];
     for index in 0..count {
-        let source = source_info_indexed(app, grant, index)?;
-        write_verified_source(&mut output, source, &verifying_key, &mut buf)
+        let source = source_info_indexed_for_delivery(app, grant, index, "batch")?;
+        let context = IntegrityContext::for_source(app, grant, index, "batch", &source);
+        write_verified_source(&mut output, source, &verifying_key, &mut buf, &context)
             .map_err(map_batch_error)?;
     }
     Ok(())
@@ -3251,26 +3320,36 @@ fn start_batch_chunk(
         drop(permit);
         return Ok(tokio::spawn(async move {
             let worker = Arc::clone(&app);
-            let (source, catalog, pin, operation) = tokio::task::spawn_blocking(move || {
-                let pin = legacy_link_pin(&worker, &grant, grant.files.is_empty())
-                    .map_err(api_error_io)?;
-                let source =
-                    source_info_indexed(&worker, &grant, chunk.start).map_err(api_error_io)?;
-                let catalog = ensure_catalog(
-                    &worker.config.data_dir.join("outbound.proofs"),
-                    &source.path,
-                    &source.object,
-                )
-                .map_err(map_source_io_error)?;
-                Ok::<_, io::Error>((source, catalog, pin, operation))
-            })
-            .await
-            .map_err(|_| io::Error::other("catalog generation failed"))??;
+            let (source, catalog, pin, operation, integrity) =
+                tokio::task::spawn_blocking(move || {
+                    let pin = legacy_link_pin(&worker, &grant, grant.files.is_empty())
+                        .map_err(api_error_io)?;
+                    let source =
+                        source_info_indexed_for_delivery(&worker, &grant, chunk.start, "batch")
+                            .map_err(api_error_io)?;
+                    let integrity = IntegrityContext::for_source(
+                        &worker,
+                        &grant,
+                        chunk.start,
+                        "batch",
+                        &source,
+                    );
+                    let catalog = ensure_catalog(
+                        &worker.config.data_dir.join("outbound.proofs"),
+                        &source.path,
+                        &source.object,
+                    )
+                    .map_err(|error| report_io_integrity(&integrity, error))?;
+                    Ok::<_, io::Error>((source, catalog, pin, operation, integrity))
+                })
+                .await
+                .map_err(|_| io::Error::other("catalog generation failed"))??;
             let stream = start_verified_stream(
-                source.path,
-                source.object,
+                source.path.clone(),
+                source.object.clone(),
                 catalog,
                 None,
+                integrity,
                 Some(operation),
                 None,
             )
@@ -3318,8 +3397,10 @@ fn start_batch_chunk(
         let mut output = options.open(&stage.path)?;
         let mut buf = vec![0u8; CHUNK];
         for index in chunk.start..chunk.end {
-            let source = source_info_indexed(&app, &grant, index).map_err(api_error_io)?;
-            write_verified_source(&mut output, source, &verifying_key, &mut buf)?;
+            let source = source_info_indexed_for_delivery(&app, &grant, index, "batch")
+                .map_err(api_error_io)?;
+            let context = IntegrityContext::for_source(&app, &grant, index, "batch", &source);
+            write_verified_source(&mut output, source, &verifying_key, &mut buf, &context)?;
         }
         Ok(BatchFile::Staged(open_staged_reader(stage)?))
     }))
@@ -3348,19 +3429,20 @@ async fn await_batch_chunk(
 
 fn api_error_io(error: ApiError) -> io::Error {
     if error.status == StatusCode::NOT_FOUND {
-        io::Error::new(io::ErrorKind::InvalidData, error.message)
+        io::Error::new(io::ErrorKind::NotFound, error.message)
     } else {
         io::Error::other(error.message)
     }
 }
 
 fn map_batch_error(error: io::Error) -> ApiError {
-    if error.kind() == io::ErrorKind::InvalidData {
-        tracing::warn!("outbound batch verification failed");
-        ApiError::not_found()
-    } else {
-        tracing::error!(%error, "outbound batch build failed");
-        ApiError::internal("build outbound batch failed")
+    match error.kind() {
+        io::ErrorKind::InvalidData => ApiError::not_found(),
+        io::ErrorKind::NotFound => ApiError::not_found(),
+        _ => {
+            tracing::error!(%error, "outbound batch build failed");
+            ApiError::internal("build outbound batch failed")
+        }
     }
 }
 
@@ -3390,8 +3472,15 @@ async fn outbound_file_inner(
         ));
     }
     let legacy = grant.files.is_empty() && file.is_none();
-    let (source, operation) =
-        source_info_async(&app, Arc::clone(&grant), index, file, operation).await?;
+    let (source, operation) = source_info_async(
+        &app,
+        Arc::clone(&grant),
+        index,
+        file,
+        operation,
+        Some("file"),
+    )
+    .await?;
     let range = requested_range(&headers, &source.object)?;
     let active = if leased {
         ActiveDownload::claim_with_grant(
@@ -3407,9 +3496,16 @@ async fn outbound_file_inner(
         let proof_root = app.config.data_dir.join("outbound.proofs");
         let source_path = source.path.clone();
         let expected = source.object.clone();
+        let integrity = IntegrityContext::for_source(&app, &grant, index, "file", &source);
+        let catalog_integrity = integrity.clone();
         let (catalog, pin, operation) = tokio::task::spawn_blocking(move || {
-            let catalog = ensure_catalog(&proof_root, &source_path, &expected)
-                .map_err(|_| ApiError::not_found())?;
+            let catalog =
+                ensure_catalog(&proof_root, &source_path, &expected).map_err(|error| {
+                    if error.kind() == io::ErrorKind::InvalidData {
+                        report_integrity_failure(&catalog_integrity, &error);
+                    }
+                    ApiError::not_found()
+                })?;
             Ok::<_, ApiError>((catalog, pin, operation))
         })
         .await
@@ -3419,6 +3515,7 @@ async fn outbound_file_inner(
             source.object.clone(),
             catalog,
             range,
+            integrity,
             Some(operation),
             Some(active),
         )
@@ -3459,7 +3556,7 @@ async fn outbound_file_head_inner(
         ));
     }
     let (source, _operation) =
-        source_info_async(&app, Arc::clone(&grant), index, file, operation).await?;
+        source_info_async(&app, Arc::clone(&grant), index, file, operation, None).await?;
     let mut response = Body::empty().into_response();
     add_file_headers(&mut response, &source, source.object.length, None)?;
     Ok(response)
@@ -3659,7 +3756,7 @@ pub async fn outbound_bundle(
         let _pin = legacy_link_pin(&worker, &grant, grant.files.is_empty())?;
         let mut files = Vec::with_capacity(count);
         for index in 0..count {
-            let source = source_info_indexed(&worker, &grant, index)?;
+            let source = source_info_indexed_for_delivery(&worker, &grant, index, "bundle")?;
             let relative = bundle_path(&source.name).ok_or_else(|| {
                 ApiError::new(
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -3668,7 +3765,7 @@ pub async fn outbound_bundle(
             })?;
             files.push((source, relative));
         }
-        let archive = build_bundle(&worker, files)?;
+        let archive = build_bundle(&worker, &grant, files)?;
         Ok::<_, ApiError>((grant, archive, operation, active, _pin))
     })
     .await
@@ -3987,7 +4084,11 @@ fn bundle_path(name: &str) -> Option<String> {
 // ponytail: every request re-copies and re-verifies each source; cache the
 // built archive keyed by grant id + file set if concurrent same-ZIP fetches
 // are ever measured as a pattern.
-fn build_bundle(app: &App, files: Vec<(Source, String)>) -> ApiResult<StagedFile> {
+fn build_bundle(
+    app: &App,
+    grant: &OutboundGrant,
+    files: Vec<(Source, String)>,
+) -> ApiResult<StagedFile> {
     crate::paths::admit_portable_paths(files.iter().map(|(_, name)| name.as_str()))
         .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     let bound = archive_size_bound(&files).ok_or_else(stage_capacity_error)?;
@@ -4018,13 +4119,14 @@ fn build_bundle(app: &App, files: Vec<(Source, String)>) -> ApiResult<StagedFile
         let output = options.open(&archive_path)?;
         let mut builder = ZipWriter::new(output);
         let mut buf = vec![0u8; CHUNK];
-        for (source, name) in files {
+        for (index, (source, name)) in files.into_iter().enumerate() {
+            let integrity = IntegrityContext::for_source(app, grant, index, "bundle", &source);
             let expected = source.object.clone();
             let options = SimpleFileOptions::default()
                 .compression_method(CompressionMethod::Stored)
                 .large_file(expected.length >= u32::MAX as u64);
             builder.start_file(name, options)?;
-            write_verified_source(&mut builder, source, &verifying_key, &mut buf)?;
+            write_verified_source(&mut builder, source, &verifying_key, &mut buf, &integrity)?;
         }
         let output = builder.finish()?;
         output.sync_all()?;
@@ -4039,50 +4141,60 @@ fn write_verified_source<W: io::Write>(
     source: Source,
     verifying_key: &ed25519_dalek::VerifyingKey,
     buf: &mut [u8],
+    context: &IntegrityContext,
 ) -> io::Result<()> {
     use std::io::Read;
 
     let expected = source.object;
-    let suite = Suite::try_from(expected.suite)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "suite"))?;
-    let mut input = std::fs::File::open(&source.path).map_err(map_source_io_error)?;
+    let suite = Suite::try_from(expected.suite).map_err(|_| invalid_integrity(context, "suite"))?;
+    let mut input = std::fs::File::open(&source.path)?;
     let mut object = InMemoryObjectBuilder::new(suite, Some(expected.length), expected.length)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "builder"))?;
+        .map_err(|_| invalid_integrity(context, "builder"))?;
     loop {
-        let count = input.read(buf).map_err(map_source_io_error)?;
+        let count = input.read(buf)?;
         if count == 0 {
             break;
         }
         object
             .update(&buf[..count])
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "object"))?;
+            .map_err(|_| invalid_integrity(context, "object"))?;
         output.write_all(&buf[..count])?;
     }
     let actual = object
         .finish()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "object"))?;
+        .map_err(|_| invalid_integrity(context, "object"))?;
     if actual.object_id() != &expected {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "source mismatch",
-        ));
+        return Err(invalid_integrity(context, "source mismatch"));
     }
     if let Some(receipt) = source.receipt {
         if receipt.len() as u64 > MAX_RECEIPT_BYTES
             || verify_receipt_with_key(verifying_key, &receipt, &expected).is_err()
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "receipt verification failed",
-            ));
+            return Err(invalid_integrity(context, "receipt verification failed"));
         }
     }
     Ok(())
 }
 
-fn map_source_io_error(error: io::Error) -> io::Error {
-    if error.kind() == io::ErrorKind::NotFound {
-        io::Error::new(io::ErrorKind::InvalidData, error)
+fn invalid_integrity(context: &IntegrityContext, message: &'static str) -> io::Error {
+    let error = io::Error::new(io::ErrorKind::InvalidData, message);
+    report_integrity_failure(context, &error);
+    error
+}
+
+fn report_io_integrity(context: &IntegrityContext, error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::InvalidData {
+        report_integrity_failure(context, &error);
+    }
+    error
+}
+
+fn classify_integrity_eof(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "verified outbound proof truncated",
+        )
     } else {
         error
     }
@@ -4125,12 +4237,13 @@ fn map_stage_reserve_error(error: StageReserveError) -> ApiError {
 }
 
 fn map_bundle_error(error: io::Error) -> ApiError {
-    if error.kind() == io::ErrorKind::InvalidData {
-        tracing::warn!("outbound bundle verification failed");
-        ApiError::not_found()
-    } else {
-        tracing::error!(%error, "outbound bundle build failed");
-        ApiError::internal("build bundle failed")
+    match error.kind() {
+        io::ErrorKind::InvalidData => ApiError::not_found(),
+        io::ErrorKind::NotFound => ApiError::not_found(),
+        _ => {
+            tracing::error!(%error, "outbound bundle build failed");
+            ApiError::internal("build bundle failed")
+        }
     }
 }
 
@@ -4166,7 +4279,12 @@ pub(crate) struct Source {
     pub(crate) receipt: Option<Vec<u8>>,
 }
 
-fn read_verified_receipt(app: &App, path: &Path, object: &ObjectId) -> ApiResult<Vec<u8>> {
+fn read_verified_receipt(
+    app: &App,
+    path: &Path,
+    object: &ObjectId,
+    integrity: Option<&IntegrityContext>,
+) -> ApiResult<Vec<u8>> {
     use std::io::Read as _;
     let mut receipt = Vec::new();
     std::fs::File::open(receipt_path(path))
@@ -4175,6 +4293,10 @@ fn read_verified_receipt(app: &App, path: &Path, object: &ObjectId) -> ApiResult
         .read_to_end(&mut receipt)
         .map_err(|_| ApiError::not_found())?;
     if receipt.len() as u64 > MAX_RECEIPT_BYTES || verify_receipt(app, &receipt, object).is_err() {
+        if let Some(integrity) = integrity {
+            let error = io::Error::new(io::ErrorKind::InvalidData, "receipt verification failed");
+            report_integrity_failure(integrity, &error);
+        }
         return Err(ApiError::not_found());
     }
     Ok(receipt)
@@ -4203,13 +4325,16 @@ async fn start_verified_stream(
     expected: ObjectId,
     catalog: PathBuf,
     range: Option<(u64, u64)>,
+    integrity: IntegrityContext,
     operation: Option<OwnedOutboundOperation>,
     active: Option<ActiveDownload>,
 ) -> io::Result<VerifiedStream> {
     let (first_tx, first_rx) = oneshot::channel();
     let (sender, receiver) = mpsc::channel(1);
     tokio::task::spawn_blocking(move || {
-        let result = produce_verified_stream(source, expected, catalog, range, first_tx, sender);
+        let result = produce_verified_stream(
+            source, expected, catalog, range, integrity, first_tx, sender,
+        );
         if let Err(error) = result {
             tracing::debug!(%error, "verified outbound stream stopped");
         }
@@ -4230,16 +4355,18 @@ fn produce_verified_stream(
     expected: ObjectId,
     catalog: PathBuf,
     range: Option<(u64, u64)>,
+    integrity: IntegrityContext,
     first: oneshot::Sender<io::Result<Bytes>>,
     sender: mpsc::Sender<io::Result<Bytes>>,
 ) -> io::Result<()> {
     use std::io::{Read as _, Seek as _};
     let mut first = Some(first);
     let mut first_sent = false;
-    let result = (|| {
-        let mut input = std::fs::File::open(&source).map_err(map_source_io_error)?;
-        let mut catalog_file = std::fs::File::open(&catalog).map_err(map_source_io_error)?;
-        let header = catalog_header(&mut catalog_file, &expected)?;
+    let result: io::Result<()> = (|| {
+        let mut input = std::fs::File::open(&source)?;
+        let mut catalog_file = std::fs::File::open(&catalog)?;
+        let header =
+            catalog_header(&mut catalog_file, &expected).map_err(classify_integrity_eof)?;
         if header.record_count() == 0 {
             first
                 .take()
@@ -4259,7 +4386,9 @@ fn produce_verified_stream(
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "catalog entry"))?;
             let mut index = [0u8; proof::INDEX_ENTRY_LENGTH];
             catalog_file.seek(SeekFrom::Start(index_offset))?;
-            catalog_file.read_exact(&mut index)?;
+            catalog_file
+                .read_exact(&mut index)
+                .map_err(classify_integrity_eof)?;
             let entry = header
                 .decode_entry(ordinal, &index)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "catalog entry"))?;
@@ -4267,12 +4396,16 @@ fn produce_verified_stream(
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "proof length"))?;
             let mut proof_bytes = vec![0u8; proof_length];
             catalog_file.seek(SeekFrom::Start(entry.proof_offset()))?;
-            catalog_file.read_exact(&mut proof_bytes)?;
+            catalog_file
+                .read_exact(&mut proof_bytes)
+                .map_err(classify_integrity_eof)?;
             let data_length = usize::try_from(entry.data_length())
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "data length"))?;
             let mut data = vec![0u8; data_length];
             input.seek(SeekFrom::Start(entry.data_offset()))?;
-            input.read_exact(&mut data).map_err(map_source_io_error)?;
+            input
+                .read_exact(&mut data)
+                .map_err(classify_integrity_eof)?;
             entry
                 .verify(&data, &proof_bytes)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "source proof"))?;
@@ -4304,6 +4437,9 @@ fn produce_verified_stream(
         Ok(())
     })();
     if let Err(error) = result {
+        if error.kind() == io::ErrorKind::InvalidData {
+            report_integrity_failure(&integrity, &error);
+        }
         if first_sent {
             let _ = sender.blocking_send(Err(error));
         } else if let Some(first) = first.take() {
@@ -4319,18 +4455,25 @@ async fn source_info_async(
     index: usize,
     file: Option<OutboundGrantFile>,
     operation: OwnedOutboundOperation,
+    component: Option<&'static str>,
 ) -> ApiResult<(Source, OwnedOutboundOperation)> {
     let app = Arc::clone(app);
     tokio::task::spawn_blocking(move || {
-        let source = source_info_indexed_with_file(&app, &grant, index, file.as_ref())?;
+        let source =
+            source_info_indexed_with_component(&app, &grant, index, file.as_ref(), component)?;
         Ok((source, operation))
     })
     .await
     .map_err(|_| ApiError::internal("inspect delivery source failed"))?
 }
 
-fn source_info_indexed(app: &App, grant: &OutboundGrant, index: usize) -> ApiResult<Source> {
-    source_info_indexed_with_file(app, grant, index, None)
+fn source_info_indexed_for_delivery(
+    app: &App,
+    grant: &OutboundGrant,
+    index: usize,
+    component: &'static str,
+) -> ApiResult<Source> {
+    source_info_indexed_with_component(app, grant, index, None, Some(component))
 }
 
 pub(crate) fn source_info_indexed_with_file(
@@ -4338,6 +4481,16 @@ pub(crate) fn source_info_indexed_with_file(
     grant: &OutboundGrant,
     index: usize,
     indexed_file: Option<&OutboundGrantFile>,
+) -> ApiResult<Source> {
+    source_info_indexed_with_component(app, grant, index, indexed_file, None)
+}
+
+fn source_info_indexed_with_component(
+    app: &App,
+    grant: &OutboundGrant,
+    index: usize,
+    indexed_file: Option<&OutboundGrantFile>,
+    component: Option<&'static str>,
 ) -> ApiResult<Source> {
     if let Some(file) = indexed_file.or_else(|| grant.files.get(index)) {
         let (root, path) = if let Some(stored_as) = file.source.strip_prefix("received:") {
@@ -4379,11 +4532,19 @@ pub(crate) fn source_info_indexed_with_file(
             root,
             length: file.bytes,
         };
-        let receipt = file
-            .source
-            .starts_with("received:")
-            .then(|| read_verified_receipt(app, &path, &object))
-            .transpose()?;
+        let integrity = component
+            .filter(|_| file.source.starts_with("received:"))
+            .map(|component| IntegrityContext::for_path(app, grant, index, component, &path));
+        let receipt = if file.source.starts_with("received:") {
+            Some(read_verified_receipt(
+                app,
+                &path,
+                &object,
+                integrity.as_ref(),
+            )?)
+        } else {
+            None
+        };
         return Ok(Source {
             path,
             object,
@@ -4433,7 +4594,14 @@ pub(crate) fn source_info_indexed_with_file(
         root,
         length: file.bytes,
     };
-    let receipt = Some(read_verified_receipt(app, &path, &object)?);
+    let integrity =
+        component.map(|component| IntegrityContext::for_path(app, grant, index, component, &path));
+    let receipt = Some(read_verified_receipt(
+        app,
+        &path,
+        &object,
+        integrity.as_ref(),
+    )?);
     Ok(Source {
         path,
         object,
@@ -4720,7 +4888,12 @@ impl BatchStream {
                 handle
             } else {
                 let permit = staging_permit(&self.app, &chunk).await;
-                start_batch_chunk(Arc::clone(&self.app), self.grant.clone(), chunk, permit)?
+                start_batch_chunk(
+                    Arc::clone(&self.app),
+                    self.grant.clone(),
+                    chunk.clone(),
+                    permit,
+                )?
             };
             drop(await_batch_chunk(handle).await?);
             self.validated_end = self.chunks[chunk_index].end;
@@ -4858,7 +5031,7 @@ mod tests {
                         .map(|_| ())
                 } else {
                     let operation = begin_outbound_operation_owned(&worker, "acme")?;
-                    source_info_async(&worker, grant, 0, None, operation)
+                    source_info_async(&worker, grant, 0, None, operation, None)
                         .await
                         .map(|_| ())
                 }
@@ -5410,6 +5583,190 @@ mod tests {
                 .downloads,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn batch_integrity_failure_reports_the_corrupt_file() {
+        let (_directory, app, cookie, _expected) = fixture().await;
+        for (path, bytes) in [
+            ("batch/first.bin", b"first".as_slice()),
+            ("batch/second.bin", b"second".as_slice()),
+        ] {
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::post(format!("/api/admin/outbound-files?path={path}"))
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .body(Body::from(bytes.to_vec()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let created = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"paths":["batch/first.bin","batch/second.bin"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let created = body(created).await;
+        let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
+        let grant_id = created["grant"]["id"].as_str().unwrap().to_owned();
+        let corrupt_path = app.config.outbound_dir.join("batch/second.bin");
+        std::fs::write(&corrupt_path, b"tampered").unwrap();
+        let failures_before = OUTBOUND_INTEGRITY_FAILURES.load(Ordering::Relaxed);
+        let audits_before = app.store.audit_count().unwrap();
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/batch"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            OUTBOUND_INTEGRITY_FAILURES.load(Ordering::Relaxed) > failures_before,
+            "integrity metric did not increment"
+        );
+        assert_eq!(app.store.audit_count().unwrap(), audits_before + 1);
+        let audit = app
+            .store
+            .audit_recent(Some(""), 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.event == "outbound_integrity_failure" && row.subject == grant_id)
+            .expect("integrity audit row");
+        assert_eq!(audit.detail["file_index"], 1);
+        assert_eq!(audit.detail["component"], "batch");
+        assert_eq!(
+            audit.detail["path"],
+            corrupt_path.to_string_lossy().as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_received_receipt_reports_file_context() {
+        let (_directory, app, cookie, _expected) = fixture().await;
+        let created = body(
+            crate::app::router(app.clone())
+                .oneshot(
+                    Request::post("/api/admin/outbound-grants")
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7,"max_downloads":1}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
+        let grant_id = created["grant"]["id"].as_str().unwrap().to_owned();
+        let source_path = app.config.receive_dir.join("received.bin");
+        std::fs::write(receipt_path(&source_path), b"invalid receipt").unwrap();
+        let failures_before = OUTBOUND_INTEGRITY_FAILURES.load(Ordering::Relaxed);
+        let audits_before = app.store.audit_count().unwrap();
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/files/0"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            OUTBOUND_INTEGRITY_FAILURES.load(Ordering::Relaxed) > failures_before,
+            "integrity metric did not increment"
+        );
+        assert_eq!(app.store.audit_count().unwrap(), audits_before + 1);
+        let audit = app
+            .store
+            .audit_recent(Some(""), 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.event == "outbound_integrity_failure" && row.subject == grant_id)
+            .expect("integrity audit row");
+        assert_eq!(audit.detail["file_index"], 0);
+        assert_eq!(audit.detail["component"], "file");
+        assert_eq!(audit.detail["path"], source_path.to_string_lossy().as_ref());
+        assert_eq!(audit.detail["error"], "receipt verification failed");
+    }
+
+    #[tokio::test]
+    async fn truncated_cached_catalog_source_reports_integrity_failure() {
+        let (_directory, app, cookie, expected) = fixture().await;
+        let created = body(
+            crate::app::router(app.clone())
+                .oneshot(
+                    Request::post("/api/admin/outbound-grants")
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"link_id":"link","upload_id":"upload","file_index":0,"expires_days":7,"max_downloads":1}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let token = created["url"].as_str().unwrap().rsplit('/').next().unwrap();
+        let grant_id = created["grant"]["id"].as_str().unwrap().to_owned();
+        let source_path = app.config.receive_dir.join("received.bin");
+        let expected_object = object_id(&expected);
+        let catalog = ensure_catalog(
+            &app.config.data_dir.join("outbound.proofs"),
+            &source_path,
+            &expected_object,
+        )
+        .unwrap();
+        assert!(catalog.is_file());
+        std::fs::write(&source_path, &expected[..expected.len() - 1]).unwrap();
+        let failures_before = OUTBOUND_INTEGRITY_FAILURES.load(Ordering::Relaxed);
+        let audits_before = app.store.audit_count().unwrap();
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/files/0"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            OUTBOUND_INTEGRITY_FAILURES.load(Ordering::Relaxed) > failures_before,
+            "integrity metric did not increment"
+        );
+        assert_eq!(app.store.audit_count().unwrap(), audits_before + 1);
+        let audit = app
+            .store
+            .audit_recent(Some(""), 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.event == "outbound_integrity_failure" && row.subject == grant_id)
+            .expect("integrity audit row");
+        assert_eq!(audit.detail["file_index"], 0);
+        assert_eq!(audit.detail["component"], "file");
+        assert_eq!(audit.detail["path"], source_path.to_string_lossy().as_ref());
+        assert_eq!(audit.detail["error"], "verified outbound proof truncated");
     }
 
     #[tokio::test]
@@ -6504,8 +6861,10 @@ mod tests {
             )
             .unwrap();
 
+        let grant = branding_grant("bundle-test", None);
         let archive = build_bundle(
             &app,
+            &grant,
             vec![
                 (
                     Source {
@@ -6539,6 +6898,7 @@ mod tests {
     fn build_bundle_rejects_ambiguous_names_before_staging() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
+        let grant = branding_grant("bundle-test", None);
         for names in [
             ["Café.mov", "Cafe\u{301}.mov"],
             ["folder", "FOLDER/clip.mov"],
@@ -6561,7 +6921,7 @@ mod tests {
                     )
                 })
                 .collect();
-            let error = build_bundle(&app, files).err().unwrap();
+            let error = build_bundle(&app, &grant, files).err().unwrap();
             assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
             assert!(error.message.contains("collide"));
             assert!(!app.config.data_dir.join("outbound.stage").exists());
@@ -6572,12 +6932,17 @@ mod tests {
     fn build_bundle_rejects_source_mismatch_without_archive() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
+        let grant = branding_grant("integrity-test", None);
         let source_path = directory.path().join("source");
+        let source_for_assert = source_path.clone();
         std::fs::write(&source_path, b"actual payload").unwrap();
         let expected = object_id(b"expected payload");
+        let failures_before = OUTBOUND_INTEGRITY_FAILURES.load(Ordering::Relaxed);
+        let audits_before = app.store.audit_count().unwrap();
 
         assert!(build_bundle(
             &app,
+            &grant,
             vec![(
                 Source {
                     path: source_path,
@@ -6589,6 +6954,25 @@ mod tests {
             )],
         )
         .is_err());
+        assert!(
+            OUTBOUND_INTEGRITY_FAILURES.load(Ordering::Relaxed) > failures_before,
+            "integrity metric did not increment"
+        );
+        assert_eq!(app.store.audit_count().unwrap(), audits_before + 1);
+        let audit = app
+            .store
+            .audit_recent(Some(&grant.tenant), 0, 10)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.event == "outbound_integrity_failure")
+            .expect("integrity audit row");
+        assert_eq!(audit.subject, grant.id);
+        assert_eq!(audit.detail["file_index"], 0);
+        assert_eq!(audit.detail["component"], "bundle");
+        assert_eq!(
+            audit.detail["path"],
+            source_for_assert.to_string_lossy().as_ref()
+        );
         assert!(app
             .config
             .data_dir
@@ -6608,6 +6992,10 @@ mod tests {
         assert_eq!(
             map_bundle_error(io::Error::other("disk full")).status,
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            map_bundle_error(io::Error::new(io::ErrorKind::NotFound, "gone")).status,
+            StatusCode::NOT_FOUND
         );
     }
 
