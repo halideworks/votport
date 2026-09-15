@@ -811,13 +811,23 @@ fn watch(args: &[String]) -> Result<(), String> {
                 json: bool,
             }
             impl votport_client_core::watch::WatchListener for Ship {
-                fn ready(&self, watch_id: String, path: String) {
+                fn ready(
+                    &self,
+                    watch_id: String,
+                    path: String,
+                    admission: std::sync::Arc<votport_client_core::watch::WatchAdmission>,
+                ) {
                     // ponytail: one drop at a time on the watcher's thread;
                     // a pool when a facility drops faster than it ships.
                     let listener = std::sync::Arc::new(ViewPrinter { json: self.json });
                     let transfer = votport_client_core::ffi::Transfer::new();
-                    match votport_client_core::ffi::ship(watch_id, path.clone(), transfer, listener)
-                    {
+                    match votport_client_core::ffi::ship(
+                        watch_id,
+                        path.clone(),
+                        admission,
+                        transfer,
+                        listener,
+                    ) {
                         Ok(report) if self.json => println!(
                             "{}",
                             serde_json::json!({ "event": "shipped", "path": path, "files": report.files, "parked": report.parked, "park_problem": report.park_problem })

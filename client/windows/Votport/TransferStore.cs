@@ -190,15 +190,24 @@ public sealed class TransferStore
 
     /// Ships a settled drop of a watched folder, as a send of that one path;
     /// the core moves it into the folder's shipped subfolder afterwards.
-    public void Ship(string watchId, string path)
+    public void Ship(string watchId, string path, WatchAdmission admission)
     {
-        var item = Start(TransferItem.Kinds.Send, Subject(new[] { path }), "");
-        Run(item, (transfer, listener) =>
+        try
         {
-            try { VotportClientCoreMethods.Ship(watchId, path, transfer, listener); }
-            catch (VotportException) { /* the final view carries the outcome */ }
-            return Array.Empty<string>();
-        });
+            var item = Start(TransferItem.Kinds.Send, Subject(new[] { path }), "");
+            Run(item, (transfer, listener) =>
+            {
+                try { VotportClientCoreMethods.Ship(watchId, path, admission, transfer, listener); }
+                catch (VotportException) { /* the final view carries the outcome */ }
+                finally { admission.Dispose(); }
+                return Array.Empty<string>();
+            });
+        }
+        catch
+        {
+            admission.Dispose();
+            throw;
+        }
     }
 
     /// Stops a transfer and keeps its journal entry, so the card ends as
@@ -223,7 +232,11 @@ public sealed class TransferStore
         private readonly TransferStore store;
         private readonly DispatcherQueue dispatcher;
         public WatchHandoff(TransferStore store, DispatcherQueue dispatcher) { this.store = store; this.dispatcher = dispatcher; }
-        public void Ready(string watchId, string path) => dispatcher.TryEnqueue(() => store.Ship(watchId, path));
+        public void Ready(string watchId, string path, WatchAdmission admission)
+        {
+            if (!dispatcher.TryEnqueue(() => store.Ship(watchId, path, admission)))
+                admission.Dispose();
+        }
     }
 
     /// Lists the transfers the journal held over from an earlier run, as
