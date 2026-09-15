@@ -554,8 +554,9 @@ $('signin-form').addEventListener('submit', async (event) => {
     return;
   }
   const hours = parseInt($('sso-session-hours').value, 10);
-  if (!Number.isInteger(hours) || hours < 1) {
-    formError(event.currentTarget, new Error('SSO session lifetime must be at least 1 hour.'));
+  const maxHours = Number($('sso-session-hours').max);
+  if (!Number.isInteger(hours) || hours < 1 || hours > maxHours) {
+    formError(event.currentTarget, new Error('SSO session lifetime must be between 1 hour and 365 days.'));
     return;
   }
   const body = {

@@ -98,13 +98,13 @@ fn admit_component(component: &str, allow_hidden: bool) -> Result<(), String> {
     if component.eq_ignore_ascii_case(TENANT_STORAGE_DIR) {
         return Err("name is reserved for tenant storage".to_owned());
     }
-    // Resume journals and leases must not alias delivered names on
+    // Resume journals, identities, and leases must not alias delivered names on
     // case-insensitive filesystems.
     let lower = component.to_ascii_lowercase();
     if is_push_staging_name(component)
         || (component.starts_with(".vot-") && component.ends_with(".stage"))
         || (lower.starts_with(".vot-")
-            && (lower.ends_with(".journal") || lower.ends_with(".lease")))
+            && (lower.ends_with(".id") || lower.ends_with(".journal") || lower.ends_with(".lease")))
     {
         return Err("name is reserved for votport staging files".to_owned());
     }
@@ -223,6 +223,7 @@ mod tests {
                 true,
                 "reserved for votport staging",
             ),
+            (".vot-anything.id", true, "reserved for votport staging"),
             // Case-insensitively, so an uppercased variant cannot alias the
             // client's own resume temporary on a case-insensitive filesystem.
             (

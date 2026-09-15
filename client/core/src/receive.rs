@@ -372,6 +372,8 @@ pub(crate) fn write_verified(
 
 pub(crate) struct PendingFile {
     pub(crate) journal: File,
+    identity: File,
+    identity_path: PathBuf,
     builder: ObjectBuilder,
     destination: PathBuf,
     announced: [u8; 32],
@@ -395,6 +397,7 @@ pub(crate) fn prepare_verified(
     }
     let temporary = part_path(destination);
     let mut journal = open_journal(&temporary)?;
+    let identity_path = identity_path(destination);
     match fs::symlink_metadata(destination) {
         Ok(_) => {
             return Err(Error::Exists {
@@ -404,12 +407,17 @@ pub(crate) fn prepare_verified(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    let (identity_file, prior_identity) = read_identity(&identity_path)?;
 
-    // Resume: hash any prior partial into the builder and continue past it. A
-    // partial that hashes to the wrong root fails at finish and is removed, so
-    // the next run starts clean; a bad prefix cannot land silently.
+    // Only matching object identities can resume. Open the source before resetting
+    // journal data or its companion identity.
     let mut builder = ObjectBuilder::new(suite, Some(total))?;
-    let mut resume_from = feed_partial(&mut journal, &mut builder, total)?;
+    let identity_matches = prior_identity.as_ref() == Some(announced);
+    let mut resume_from = if identity_matches && journal.metadata()?.len() < total {
+        feed_partial(&mut journal, &mut builder, total)?
+    } else {
+        0
+    };
     let resumed = source(resume_from)?;
     if resumed.start != resume_from {
         if resumed.start != 0 {
@@ -424,9 +432,26 @@ pub(crate) fn prepare_verified(
     }
     let mut reader = resumed.reader;
 
+    // Use the inspected writable handle throughout. Create a missing companion
+    // only after the source opens; never adopt an intervening file.
+    let mut identity = match identity_file {
+        Some(file) => file,
+        None => open_receive_file_create_new(&identity_path)?,
+    };
+    if !identity_matches {
+        if !vot_platform_fs::same_file_handle(&identity, &identity_path)? {
+            return Err(Error::Other(
+                "receive identity changed before reset".to_owned(),
+            ));
+        }
+        journal.set_len(0)?;
+        journal.sync_all()?;
+        write_identity(&mut identity, &identity_path, announced)?;
+    }
+
     // A stream failure keeps the partial for the next run to resume; only a
     // verification failure removes it.
-    stream_to_temp(
+    if let Err(error) = stream_to_temp(
         &mut journal,
         &mut *reader,
         &mut builder,
@@ -434,9 +459,18 @@ pub(crate) fn prepare_verified(
         total,
         index,
         observer,
-    )?;
+    ) {
+        if !vot_platform_fs::same_file_handle(&journal, &temporary).unwrap_or(false)
+            && vot_platform_fs::same_file_handle(&identity, &identity_path).unwrap_or(false)
+        {
+            let _ = fs::remove_file(&identity_path);
+        }
+        return Err(error);
+    }
     Ok(PendingFile {
         journal,
+        identity,
+        identity_path,
         builder,
         destination: destination.to_owned(),
         announced: announced.root,
@@ -447,23 +481,37 @@ pub(crate) fn prepare_verified(
 
 impl PendingFile {
     pub(crate) fn publish(self) -> Result<()> {
-        match verify_and_rename(
+        let result = verify_and_rename(
             self.builder,
             &self.destination,
             self.announced,
             &self.announced_hex,
             &self.temporary,
             &self.journal,
-        ) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                // A short stream retains its usable prefix; a complete but
-                // rejected file retains nothing under the owned journal name.
-                if !matches!(error, Error::Object(vot_object::Error::LengthMismatch))
-                    && vot_platform_fs::same_file_handle(&self.journal, &self.temporary)
-                        .unwrap_or(false)
+        );
+        match result {
+            Ok(()) => {
+                if vot_platform_fs::same_file_handle(&self.identity, &self.identity_path)
+                    .unwrap_or(false)
                 {
-                    let _ = fs::remove_file(&self.temporary);
+                    let _ = fs::remove_file(&self.identity_path);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                // Short streams retain their prefix and identity. Other publication failures
+                // discard only the paths still owned by these opened handles.
+                if !matches!(error, Error::Object(vot_object::Error::LengthMismatch)) {
+                    if vot_platform_fs::same_file_handle(&self.journal, &self.temporary)
+                        .unwrap_or(false)
+                    {
+                        let _ = fs::remove_file(&self.temporary);
+                    }
+                    if vot_platform_fs::same_file_handle(&self.identity, &self.identity_path)
+                        .unwrap_or(false)
+                    {
+                        let _ = fs::remove_file(&self.identity_path);
+                    }
                 }
                 Err(error)
             }
@@ -471,10 +519,8 @@ impl PendingFile {
     }
 }
 
-/// The resumable temporary beside `destination`: a hidden `.vot-<name>.journal`
-/// in its directory. That shape is one `admit` refuses, so no delivered file
-/// lands on it, and no common tool produces it, so a browser's `<name>.part`
-/// or a user's own file is never mistaken for votport's partial and destroyed.
+/// The reserved `.vot-<name>.journal` stores payload bytes beside the destination;
+/// its `.id` companion binds resumable bytes to the announced object.
 fn part_path(destination: &Path) -> PathBuf {
     let mut name = std::ffi::OsString::from(".vot-");
     name.push(destination.file_name().unwrap_or_default());
@@ -485,6 +531,89 @@ fn part_path(destination: &Path) -> PathBuf {
     }
 }
 
+const IDENTITY_MAGIC: &[u8; 4] = b"VOTI";
+const IDENTITY_BYTES: usize = 4 + 2 + 32 + 8;
+
+/// The fixed companion beside a receive journal binds its bytes to one object.
+fn identity_path(destination: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".vot-");
+    name.push(destination.file_name().unwrap_or_default());
+    name.push(".id");
+    match destination.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+fn encode_identity(object: &ObjectId) -> [u8; IDENTITY_BYTES] {
+    let mut bytes = [0; IDENTITY_BYTES];
+    bytes[..IDENTITY_MAGIC.len()].copy_from_slice(IDENTITY_MAGIC);
+    bytes[4..6].copy_from_slice(&object.suite.to_le_bytes());
+    bytes[6..38].copy_from_slice(&object.root);
+    bytes[38..46].copy_from_slice(&object.length.to_le_bytes());
+    bytes
+}
+
+fn decode_identity(bytes: &[u8]) -> Option<ObjectId> {
+    if bytes.len() != IDENTITY_BYTES || &bytes[..IDENTITY_MAGIC.len()] != IDENTITY_MAGIC {
+        return None;
+    }
+    Some(ObjectId {
+        suite: u16::from_le_bytes(bytes[4..6].try_into().ok()?),
+        root: bytes[6..38].try_into().ok()?,
+        length: u64::from_le_bytes(bytes[38..46].try_into().ok()?),
+    })
+}
+
+fn read_identity(path: &Path) -> Result<(Option<File>, Option<ObjectId>)> {
+    let mut file = match open_existing_identity(path) {
+        Ok(file) => file,
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((None, None));
+        }
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(Error::Other(
+            "receive identity is not a regular file".to_owned(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(IDENTITY_BYTES + 1);
+    (&mut file)
+        .take((IDENTITY_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if !vot_platform_fs::same_file_handle(&file, path)? {
+        return Err(Error::Other(
+            "receive identity changed while reading".to_owned(),
+        ));
+    }
+    let identity = decode_identity(&bytes);
+    Ok((Some(file), identity))
+}
+
+fn write_identity(file: &mut File, path: &Path, object: &ObjectId) -> Result<()> {
+    if !file.metadata()?.is_file() {
+        return Err(Error::Other(
+            "receive identity is not a regular file".to_owned(),
+        ));
+    }
+    if !vot_platform_fs::same_file_handle(file, path)? {
+        return Err(Error::Other(
+            "receive identity changed before writing".to_owned(),
+        ));
+    }
+    file.rewind()?;
+    file.write_all(&encode_identity(object))?;
+    file.set_len(IDENTITY_BYTES as u64)?;
+    file.sync_all()?;
+    if !vot_platform_fs::same_file_handle(file, path)? {
+        return Err(Error::Other(
+            "receive identity changed after writing".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn open_receive_file(path: &Path, write: bool) -> Result<File> {
     let mut options = fs::OpenOptions::new();
     options
@@ -492,6 +621,26 @@ fn open_receive_file(path: &Path, write: bool) -> Result<File> {
         .write(write)
         .create(write)
         .truncate(false);
+    open_receive_file_with_options(path, options)
+}
+
+fn open_receive_file_create_new(path: &Path) -> Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .truncate(false);
+    open_receive_file_with_options(path, options)
+}
+
+fn open_existing_identity(path: &Path) -> Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(false).truncate(false);
+    open_receive_file_with_options(path, options)
+}
+
+fn open_receive_file_with_options(path: &Path, mut options: fs::OpenOptions) -> Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1240,6 +1389,18 @@ mod tests {
         )
     }
 
+    fn object_for(bytes: &[u8], suite: Suite) -> ObjectId {
+        let mut builder = ObjectBuilder::new(suite, Some(bytes.len() as u64)).unwrap();
+        builder.update(bytes).unwrap();
+        builder.finish().unwrap().object_id().clone()
+    }
+
+    fn seed_partial(destination: &Path, object: &ObjectId, bytes: &[u8]) {
+        fs::write(part_path(destination), bytes).unwrap();
+        let mut identity = open_receive_file(&identity_path(destination), true).unwrap();
+        write_identity(&mut identity, &identity_path(destination), object).unwrap();
+    }
+
     fn stream(bytes: &[u8], start: u64) -> Resumed {
         Resumed {
             reader: Box::new(std::io::Cursor::new(bytes.to_vec())),
@@ -1287,7 +1448,11 @@ mod tests {
         for restart in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let destination = dir.path().join("file");
-            fs::write(part_path(&destination), b"ab").unwrap();
+            seed_partial(
+                &destination,
+                &object_for(b"abcd", Suite::Blake3Bao64),
+                b"ab",
+            );
             receive_from(&destination, b"abcd", &mut |offset| {
                 assert_eq!(offset, 2);
                 Ok(if restart {
@@ -1302,7 +1467,11 @@ mod tests {
         for initial in [b"abcd".as_slice(), b"abcde"] {
             let dir = tempfile::tempdir().unwrap();
             let destination = dir.path().join("file");
-            fs::write(part_path(&destination), initial).unwrap();
+            seed_partial(
+                &destination,
+                &object_for(b"abcd", Suite::Blake3Bao64),
+                initial,
+            );
             receive_from(&destination, b"abcd", &mut |offset| {
                 assert_eq!(offset, 0);
                 Ok(stream(b"abcd", 0))
@@ -1326,7 +1495,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let destination = dir.path().join("file");
             let journal = part_path(&destination);
-            fs::write(&journal, initial).unwrap();
+            let object = object_for(b"abcd", Suite::Blake3Bao64);
+            seed_partial(&destination, &object, initial);
             let result = receive_from(&destination, b"abcd", &mut |offset| {
                 assert_eq!(offset, if initial.len() < 4 { 2 } else { 0 });
                 Err(Error::Other("source unavailable".to_owned()))
@@ -1334,6 +1504,237 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(fs::read(journal).unwrap(), initial);
         }
+    }
+
+    #[test]
+    fn receive_identity_fits_the_existing_journal_filename_limit() {
+        for name in ["a".repeat(242), format!("{}ab", "ア".repeat(80))] {
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join(name);
+            receive_from(&destination, b"data", &mut |offset| {
+                assert_eq!(offset, 0);
+                Ok(stream(b"data", 0))
+            })
+            .unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), b"data");
+            assert!(!identity_path(&destination).exists());
+        }
+    }
+
+    #[test]
+    fn partial_identity_restarts_other_objects_and_preserves_same_object_resume() {
+        let object_a = object_for(b"aaaa", Suite::Blake3Bao64);
+        let object_b = object_for(b"bbbb", Suite::Blake3Bao64);
+
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("different");
+        let result = write_verified(
+            &mut |_| Ok(stream(b"aa", 0)),
+            &destination,
+            &object_a,
+            0,
+            &mut crate::progress::Silent,
+        );
+        assert!(matches!(
+            result,
+            Err(Error::Object(vot_object::Error::LengthMismatch))
+        ));
+        assert_eq!(fs::read(part_path(&destination)).unwrap(), b"aa");
+        assert!(identity_path(&destination).is_file());
+        let mut requested = Vec::new();
+        write_verified(
+            &mut |offset| {
+                requested.push(offset);
+                assert_eq!(offset, 0);
+                Ok(stream(b"bbbb", 0))
+            },
+            &destination,
+            &object_b,
+            0,
+            &mut crate::progress::Silent,
+        )
+        .unwrap();
+        assert_eq!(requested, [0]);
+        assert_eq!(fs::read(&destination).unwrap(), b"bbbb");
+        assert!(!part_path(&destination).exists());
+        assert!(!identity_path(&destination).exists());
+
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("same");
+        seed_partial(&destination, &object_a, b"aa");
+        write_verified(
+            &mut |offset| {
+                assert_eq!(offset, 2);
+                Ok(stream(b"aa", offset))
+            },
+            &destination,
+            &object_a,
+            0,
+            &mut crate::progress::Silent,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"aaaa");
+        assert!(!identity_path(&destination).exists());
+
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("source-error");
+        let journal = part_path(&destination);
+        let identity = identity_path(&destination);
+        seed_partial(&destination, &object_a, b"aa");
+        let old_identity = fs::read(&identity).unwrap();
+        let result = write_verified(
+            &mut |offset| {
+                assert_eq!(offset, 0);
+                Err(Error::Other("source unavailable".to_owned()))
+            },
+            &destination,
+            &object_b,
+            0,
+            &mut crate::progress::Silent,
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(journal).unwrap(), b"aa");
+        assert_eq!(fs::read(identity).unwrap(), old_identity);
+
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("short");
+        let result = write_verified(
+            &mut |_| Ok(stream(b"aa", 0)),
+            &destination,
+            &object_a,
+            0,
+            &mut crate::progress::Silent,
+        );
+        assert!(matches!(
+            result,
+            Err(Error::Object(vot_object::Error::LengthMismatch))
+        ));
+        assert_eq!(fs::read(part_path(&destination)).unwrap(), b"aa");
+        assert!(identity_path(&destination).is_file());
+
+        struct Cancelled;
+        impl Observer for Cancelled {
+            fn event(&mut self, _: Event) {}
+            fn cancelled(&self) -> bool {
+                true
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("cancelled");
+        let result = write_verified(
+            &mut |_| Ok(stream(b"aaaa", 0)),
+            &destination,
+            &object_a,
+            0,
+            &mut Cancelled,
+        );
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(part_path(&destination).is_file());
+        assert!(identity_path(&destination).is_file());
+    }
+
+    #[test]
+    fn identity_replacements_are_not_adopted_during_reset() {
+        let object_a = object_for(b"aaaa", Suite::Blake3Bao64);
+        let object_b = object_for(b"bbbb", Suite::Blake3Bao64);
+
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("existing");
+        let journal = part_path(&destination);
+        let identity = identity_path(&destination);
+        let moved = dir.path().join("moved-identity");
+        seed_partial(&destination, &object_a, b"aa");
+        let old_identity = fs::read(&identity).unwrap();
+        let result = write_verified(
+            &mut |_| {
+                fs::rename(&identity, &moved).unwrap();
+                fs::write(&identity, b"external owner").unwrap();
+                Ok(stream(b"bbbb", 0))
+            },
+            &destination,
+            &object_b,
+            0,
+            &mut crate::progress::Silent,
+        );
+        assert!(matches!(result, Err(Error::Other(_))), "{result:?}");
+        assert_eq!(fs::read(&journal).unwrap(), b"aa");
+        assert_eq!(fs::read(&moved).unwrap(), old_identity);
+        assert_eq!(fs::read(&identity).unwrap(), b"external owner");
+        assert!(!destination.exists());
+
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("absent");
+        let journal = part_path(&destination);
+        let identity = identity_path(&destination);
+        fs::write(&journal, b"aa").unwrap();
+        let result = write_verified(
+            &mut |_| {
+                fs::write(&identity, b"external owner").unwrap();
+                Ok(stream(b"bbbb", 0))
+            },
+            &destination,
+            &object_b,
+            0,
+            &mut crate::progress::Silent,
+        );
+        assert!(
+            matches!(result, Err(Error::Io(ref error)) if error.kind() == std::io::ErrorKind::AlreadyExists),
+            "{result:?}"
+        );
+        assert_eq!(fs::read(&journal).unwrap(), b"aa");
+        assert_eq!(fs::read(&identity).unwrap(), b"external owner");
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn malformed_or_mismatched_partial_identity_starts_at_zero() {
+        let object = object_for(b"abcd", Suite::Blake3Bao64);
+        for identity_bytes in [
+            b"bad identity".as_slice(),
+            &encode_identity(&ObjectId {
+                suite: 2,
+                root: object.root,
+                length: object.length,
+            }),
+            &encode_identity(&ObjectId {
+                suite: object.suite,
+                root: object.root,
+                length: object.length + 1,
+            }),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let destination = dir.path().join("file");
+            fs::write(part_path(&destination), b"ab").unwrap();
+            fs::write(identity_path(&destination), identity_bytes).unwrap();
+            write_verified(
+                &mut |offset| {
+                    assert_eq!(offset, 0);
+                    Ok(stream(b"abcd", 0))
+                },
+                &destination,
+                &object,
+                0,
+                &mut crate::progress::Silent,
+            )
+            .unwrap();
+            assert_eq!(fs::read(destination).unwrap(), b"abcd");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("missing");
+        fs::write(part_path(&destination), b"ab").unwrap();
+        write_verified(
+            &mut |offset| {
+                assert_eq!(offset, 0);
+                Ok(stream(b"abcd", 0))
+            },
+            &destination,
+            &object,
+            0,
+            &mut crate::progress::Silent,
+        )
+        .unwrap();
+        assert_eq!(fs::read(destination).unwrap(), b"abcd");
     }
 
     #[test]
@@ -1400,6 +1801,7 @@ mod tests {
         let result = receive_from(&destination, b"abcd", &mut |_| Ok(stream(b"wxyz", 0)));
         assert!(matches!(result, Err(Error::Verify { .. })), "{result:?}");
         assert!(!part_path(&destination).exists());
+        assert!(!identity_path(&destination).exists());
         assert!(!destination.exists());
     }
 

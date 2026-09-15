@@ -25,6 +25,32 @@ pub fn server_binary() -> Option<String> {
 
 pub const ADMIN_PASSWORD: &str = "e2e-password";
 
+/// Seeds the receive journal's compact object identity for an interrupted
+/// transfer fixture.
+pub fn write_receive_identity(destination: &Path, suite: u16, root: [u8; 32], length: u64) {
+    let mut name = std::ffi::OsString::from(".vot-");
+    name.push(destination.file_name().expect("destination file name"));
+    name.push(".id");
+    let path = destination.parent().expect("destination parent").join(name);
+    let mut bytes = Vec::with_capacity(46);
+    bytes.extend_from_slice(b"VOTI");
+    bytes.extend_from_slice(&suite.to_le_bytes());
+    bytes.extend_from_slice(&root);
+    bytes.extend_from_slice(&length.to_le_bytes());
+    std::fs::write(path, bytes).unwrap();
+}
+
+pub fn write_receive_identity_for_bytes(
+    destination: &Path,
+    suite: vot_object::Suite,
+    bytes: &[u8],
+) {
+    let mut builder = vot_object::ObjectBuilder::new(suite, Some(bytes.len() as u64)).unwrap();
+    builder.update(bytes).unwrap();
+    let object = builder.finish().unwrap().object_id().clone();
+    write_receive_identity(destination, object.suite, object.root, object.length);
+}
+
 /// A running server, killed on drop.
 pub struct Server {
     child: Child,

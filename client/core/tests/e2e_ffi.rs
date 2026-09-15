@@ -461,6 +461,11 @@ fn a_cancel_before_the_download_lands_nothing_and_a_partial_resumes_next_time(bi
     // download would not, and the poisoned partial is removed.
     let partial = dest.path().join(".vot-plate.bin.journal");
     std::fs::write(&partial, vec![0xffu8; 5 * 1024 * 1024]).unwrap();
+    common::write_receive_identity_for_bytes(
+        &dest.path().join("plate.bin"),
+        vot_object::Suite::Blake3Bao64,
+        &big,
+    );
     let poisoned = ffi::receive(
         link.clone(),
         None,
@@ -477,6 +482,11 @@ fn a_cancel_before_the_download_lands_nothing_and_a_partial_resumes_next_time(bi
     // A partial from an interrupted run (the first 5 MiB, as a dropped
     // connection leaves it) is resumed by the next run and lands whole.
     std::fs::write(&partial, &big[..5 * 1024 * 1024]).unwrap();
+    common::write_receive_identity_for_bytes(
+        &dest.path().join("plate.bin"),
+        vot_object::Suite::Blake3Bao64,
+        &big,
+    );
     let resumed = Arc::new(Recorder::default());
     let report = ffi::receive(
         link,

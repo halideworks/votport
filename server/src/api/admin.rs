@@ -16,6 +16,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::app::App;
 use crate::auth;
+use crate::config::MAX_SSO_SESSION_SECS;
 use crate::paths;
 use crate::store::{now_unix, AuditFilters, Link, LinkCursor};
 
@@ -2974,6 +2975,7 @@ fn write_u64(
     key: &str,
     value: &serde_json::Value,
     allow_zero: bool,
+    max: Option<u64>,
 ) -> ApiResult<crate::store::SettingWrite> {
     match value {
         serde_json::Value::Null => Ok(crate::store::SettingWrite::Reset),
@@ -2989,6 +2991,14 @@ fn write_u64(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     format!("{key} must be greater than zero"),
                 ));
+            }
+            if let Some(max) = max {
+                if parsed > max {
+                    return Err(ApiError::new(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!("{key} must be at most {max}"),
+                    ));
+                }
             }
             Ok(crate::store::SettingWrite::Set(parsed.to_string()))
         }
@@ -3069,11 +3079,11 @@ pub async fn put_settings(
             | "scim_token"
             | "scim_token_previous"
             | "replica_token" => write_secret(key, value)?,
-            "audit_retention_days" | "upload_retention_days" => write_u64(key, value, true)?,
-            "default_max_total_bytes"
-            | "default_max_links"
-            | "default_max_sessions"
-            | "sso_session_secs" => write_u64(key, value, false)?,
+            "audit_retention_days" | "upload_retention_days" => write_u64(key, value, true, None)?,
+            "default_max_total_bytes" | "default_max_links" | "default_max_sessions" => {
+                write_u64(key, value, false, None)?
+            }
+            "sso_session_secs" => write_u64(key, value, false, Some(MAX_SSO_SESSION_SECS))?,
             "public_password_login" | "smtp_starttls" | "draining" | "require_provisioning" => {
                 write_bool(key, value)?
             }
@@ -7919,6 +7929,46 @@ mod settings_api_tests {
         let local =
             issue_admin_cookie(&application, &auth::AdminIdentity::local_admin(), None).unwrap();
         assert!(local.contains("Max-Age=604800"), "{local}");
+    }
+
+    #[tokio::test]
+    async fn sso_session_setting_bounds_are_atomic_and_resettable() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let cookie = cookie_for(&application, "", "admin");
+        let put = |value: serde_json::Value| {
+            app::router(application.clone()).oneshot(
+                Request::put("/api/admin/settings")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"sso_session_secs": value}).to_string()))
+                    .unwrap(),
+            )
+        };
+
+        let response = put(json!(MAX_SSO_SESSION_SECS)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            application.store.setting("sso_session_secs").unwrap(),
+            Some(MAX_SSO_SESSION_SECS.to_string())
+        );
+        for value in [json!(0), json!(MAX_SSO_SESSION_SECS + 1), json!(u64::MAX)] {
+            let response = put(value).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                application.store.setting("sso_session_secs").unwrap(),
+                Some(MAX_SSO_SESSION_SECS.to_string())
+            );
+        }
+
+        let response = put(serde_json::Value::Null).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(application
+            .store
+            .setting("sso_session_secs")
+            .unwrap()
+            .is_none());
     }
 
     fn cookie_for(app: &App, tenant: &str, role: &str) -> String {

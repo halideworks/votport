@@ -186,6 +186,7 @@ remain retained while in flight.
 | `VOTPORT_DEFAULT_MAX_LINKS` | unlimited | Same overlay for max links (new tenants when omitted, and the unnamed default tenant). |
 | `VOTPORT_DEFAULT_MAX_SESSIONS` | unlimited | Same overlay for max concurrent sessions. |
 | `VOTPORT_PUBLIC_PASSWORD_LOGIN` | on | Set `0` to prefer collapsing the local password form when SSO is offered (login API stays available). |
+| `VOTPORT_SSO_SESSION_SECS` | `604800` | SSO session lifetime in seconds, from 1 through `31536000` (365 days). Overridable via `PUT /api/admin/settings`. |
 | `VOTPORT_METRICS_TOKEN` | — | When set, `GET /metrics` requires this bearer token. Counts only; scrape over an internal interface. |
 | `VOTPORT_TRUSTED_PROXIES` | loopback + private ranges | Comma-separated CIDR blocks (or bare addresses) whose `X-Forwarded-For` is believed. Anything else is keyed on its socket address. The default trusts any loopback or RFC1918/ULA peer, which is broad: on a shared container network or a LAN bind, anything that can reach the port can pick its own throttle bucket. Name your reverse proxy to close that; see [Client addresses](docs/deployment.md#client-addresses). |
 | `VOTPORT_OIDC_ISSUER` | — | OIDC issuer URL for admin single sign-on. Requires the client id/secret and `VOTPORT_PUBLIC_URL`; see [Single sign-on](#single-sign-on). |
