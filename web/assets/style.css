@@ -509,7 +509,6 @@ label .muted {
  letter-spacing: 0;
  font-weight: 400;
  font-size: 0.68rem;
- opacity: 0.85;
 }
 label .muted::before {
  content: "(";
@@ -547,6 +546,12 @@ textarea:focus,
  outline: none;
  border-color: var(--border-active);
  background: var(--ink-5);
+}
+input:focus-visible,
+textarea:focus-visible,
+.card select:focus-visible {
+ outline: 2px solid var(--progress);
+ outline-offset: 2px;
 }
 input::placeholder {
  color: var(--muted);
@@ -687,13 +692,6 @@ textarea { resize: vertical; }
 @media (max-width: 640px) {
  .grid {
   grid-template-columns: 1fr;
- }
- /* The object id is a copy control; a 64-hex string cannot fit a phone row. */
- .uploads .object-card > .file-id {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  word-break: normal;
  }
 }
 
@@ -962,6 +960,12 @@ textarea { resize: vertical; }
  border: 1px solid var(--border-faint);
  border-radius: 0.85rem;
  min-width: 0;
+}
+.stat dd {
+ margin: 0;
+ display: flex;
+ flex-direction: column;
+ gap: 0.15rem;
 }
 .stat-label {
  font-size: 0.6rem;
@@ -1297,7 +1301,7 @@ textarea { resize: vertical; }
 .file-id {
  flex-basis: 100%;
  font-size: 0.68rem;
- opacity: 0.8;
+ overflow-wrap: anywhere;
 }
 .object-card > .status {
  color: var(--muted);
@@ -1417,13 +1421,6 @@ textarea { resize: vertical; }
 .manifest-head > p {
  margin: 0 0 1rem;
 }
-/* Object ids on the recipient page are copy controls; one line each. */
-#object .file-id {
- white-space: nowrap;
- overflow: hidden;
- text-overflow: ellipsis;
- word-break: normal;
-}
 /* A file that landed on this device. */
 .files li.saved > span:first-child {
  color: var(--text);
@@ -1456,7 +1453,7 @@ textarea { resize: vertical; }
 }
 .library-file {
  display: grid;
- grid-template-columns: auto minmax(0, 1fr) auto auto;
+ grid-template-columns: minmax(0, 1fr) auto auto;
  align-items: center;
  gap: 0.5rem;
  padding: 0.5rem 0.6rem;
@@ -1466,6 +1463,18 @@ textarea { resize: vertical; }
  font-weight: 400;
  letter-spacing: normal;
  text-transform: none;
+}
+.library-file > .library-file-name {
+ display: flex;
+ align-items: center;
+ gap: 0.5rem;
+ min-width: 0;
+ margin: 0;
+ font-size: inherit;
+ font-weight: inherit;
+ letter-spacing: inherit;
+ text-transform: none;
+ color: var(--muted);
 }
 .library-file input {
  margin: 0;
@@ -1956,6 +1965,10 @@ details.deployment .settings-status {
 #tenant-switcher:focus {
  outline: none;
  border-color: var(--border-active);
+}
+#tenant-switcher:focus-visible {
+ outline: 2px solid var(--progress);
+ outline-offset: 2px;
 }
 
 .link-item > details > summary {

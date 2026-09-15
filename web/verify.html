@@ -34,13 +34,13 @@
       <div class="verify-slot">
         <span class="slot-label">File</span>
         <span class="slot-name mono muted" id="payload-name">not picked</span>
-        <button type="button" id="pick-payload" class="ghost">Browse&hellip;</button>
+        <button type="button" id="pick-payload" class="ghost" aria-label="Browse for file" aria-describedby="payload-name">Browse&hellip;</button>
         <button type="button" id="clear-payload" class="ghost" hidden aria-label="Clear file">&#10005;</button>
       </div>
       <div class="verify-slot">
         <span class="slot-label">Receipt</span>
         <span class="slot-name mono muted" id="sidecar-name">the .vot-receipt is enough on its own</span>
-        <button type="button" id="pick-sidecar" class="ghost">Browse&hellip;</button>
+        <button type="button" id="pick-sidecar" class="ghost" aria-label="Browse for receipt" aria-describedby="sidecar-name">Browse&hellip;</button>
         <button type="button" id="clear-sidecar" class="ghost" hidden aria-label="Clear receipt">&#10005;</button>
       </div>
       <input type="file" id="payload-input" hidden>

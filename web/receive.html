@@ -45,28 +45,32 @@
       <h1>Receive files</h1>
       <p id="receive-dir" class="mono muted"></p>
 
-      <section id="status-strip" class="status-strip" aria-label="Status" hidden>
+      <dl id="status-strip" class="status-strip" aria-label="Status" hidden>
         <div class="stat">
-          <span class="stat-label">Active transfers</span>
-          <strong id="stat-active">0</strong>
+          <dt class="stat-label">Active transfers</dt>
+          <dd><strong id="stat-active">0</strong>
           <span id="stat-active-detail" class="muted">nothing in flight</span>
+          </dd>
         </div>
         <div class="stat">
-          <span class="stat-label">Today</span>
-          <strong id="stat-today">0</strong>
+          <dt class="stat-label">Today</dt>
+          <dd><strong id="stat-today">0</strong>
           <span id="stat-today-detail" class="muted">received</span>
+          </dd>
         </div>
         <div class="stat">
-          <span class="stat-label">Stored</span>
-          <strong id="stat-stored">&ndash;</strong>
+          <dt class="stat-label">Stored</dt>
+          <dd><strong id="stat-stored">&ndash;</strong>
           <span id="stat-stored-detail" class="muted">received files on disk</span>
+          </dd>
         </div>
         <div class="stat">
-          <span class="stat-label">Disk free</span>
-          <strong id="stat-disk">&ndash;</strong>
+          <dt class="stat-label">Disk free</dt>
+          <dd><strong id="stat-disk">&ndash;</strong>
           <span class="muted">receive root</span>
+          </dd>
         </div>
-      </section>
+      </dl>
       <p id="status-cache-note" class="status-cache-note muted" role="status" aria-live="polite" hidden></p>
 
       <form data-unsaved data-draft id="create-form" class="card">
@@ -156,7 +160,7 @@
         <div id="timeline-files" role="region" aria-label="Received files" tabindex="0"></div>
         <div class="actions"><button type="button" id="timeline-retry" class="ghost" hidden>Try again</button><button type="button" id="timeline-previous" class="ghost" hidden>Previous files</button><button type="button" id="timeline-next" class="ghost" hidden>Next files</button></div>
         <h3>Timeline</h3>
-        <ol id="timeline-events" class="timeline-events" tabindex="0"></ol>
+        <ol id="timeline-events" class="timeline-events" tabindex="0" aria-label="Transfer timeline"></ol>
         <div class="modal-actions timeline-actions">
           <a class="button ghost tiny" id="timeline-download">Download timeline JSON</a>
           <a id="timeline-audit" class="button tiny ghost" href="/audit">Open audit rows</a>
