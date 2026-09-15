@@ -1466,6 +1466,13 @@ pub async fn create_tenant(
             .filter(|&sessions| sessions > 0),
         created_at: now_unix(),
     };
+    let detail = json!({
+        "label": tenant.label,
+        "admin_group": tenant.admin_group,
+        "max_total_bytes": tenant.max_total_bytes,
+        "max_links": tenant.max_links,
+        "max_sessions": tenant.max_sessions,
+    });
     app.store
         .insert_tenant(tenant)
         .map_err(|error| match error {
@@ -1476,7 +1483,7 @@ pub async fn create_tenant(
         })?;
     tracing::info!(target: "audit", event = "tenant_created", key = %key, "tenant namespace created");
     app.store
-        .audit("", &identity.subject, "tenant_created", &key, &json!({}));
+        .audit("", &identity.subject, "tenant_created", &key, &detail);
     Ok(Json(json!({ "key": key })))
 }
 
@@ -2328,8 +2335,13 @@ pub async fn backup_database(
         .map_err(|error| ApiError::internal(format!("snapshot metadata: {error}")))?
         .len();
     tracing::info!(target: "audit", event = "backup_created", file = %name, bytes = len, "database snapshot exported");
-    app.store
-        .audit("", "", "backup_created", &name, &json!({ "bytes": len }));
+    app.store.audit(
+        "",
+        &identity.subject,
+        "backup_created",
+        &name,
+        &json!({ "bytes": len }),
+    );
     Ok((
         [
             (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
@@ -2763,6 +2775,47 @@ fn storage_is_nas(storage: Option<&crate::receiving::StorageIdentity>) -> bool {
     })
 }
 
+fn save_nas_qualification(
+    store: &crate::store::Store,
+    actor: &str,
+    storage: crate::receiving::StorageIdentity,
+    qualified_at: u64,
+) -> Result<(), String> {
+    let qualification = crate::receiving::Qualification {
+        storage,
+        qualified_at,
+        qualified_by: actor.to_owned(),
+    };
+    let value = serde_json::to_string(&qualification).map_err(|error| error.to_string())?;
+    store.put_settings(
+        actor,
+        &[(
+            crate::receiving::SETTING_KEY.to_owned(),
+            crate::store::SettingWrite::Set(value),
+        )],
+    )?;
+    let detail = json!({
+        "storage": qualification.storage,
+        "qualified_at": qualification.qualified_at,
+    });
+    tracing::info!(
+        target: "audit",
+        event = "receiving_nas_qualification_saved",
+        actor = %actor,
+        storage = %qualification.storage.path.display(),
+        qualified_at = qualification.qualified_at,
+        "NAS qualification saved"
+    );
+    store.audit(
+        "",
+        actor,
+        "receiving_nas_qualification_saved",
+        crate::receiving::SETTING_KEY,
+        &detail,
+    );
+    Ok(())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReceivingStorageCheck {
@@ -2823,10 +2876,8 @@ pub async fn check_receiving_storage(
             let active = crate::receiving::Active::open(destinations, &app.lease_holder)
                 .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
             if nas {
-                let qualification = crate::receiving::Qualification { storage: request.storage, qualified_at: now_unix(), qualified_by: identity.subject.clone() };
-                app.store.put_settings(&identity.subject, &[(crate::receiving::SETTING_KEY.to_owned(), crate::store::SettingWrite::Set(
-                    serde_json::to_string(&qualification).map_err(|e| ApiError::internal(e.to_string()))?
-                ))]).map_err(super::store_unavailable)?;
+                save_nas_qualification(&app.store, &identity.subject, request.storage, now_unix())
+                    .map_err(super::store_unavailable)?;
             }
             if let Err(error) = app.resume_receiving(&active) {
                 app.lease_lost.store(true, std::sync::atomic::Ordering::Release);
@@ -3911,7 +3962,15 @@ pub async fn create_link(
         &identity.subject,
         "link_created",
         &view.id,
-        &serde_json::json!({ "label": view.label, "dest": view.dest, "tenant": identity.tenant, "notifications": view.notifications }),
+        &serde_json::json!({
+            "label": view.label,
+            "dest": view.dest,
+            "tenant": identity.tenant,
+            "notifications": view.notifications,
+            "has_password": view.has_password,
+            "expires_at": view.expires_at,
+            "max_bytes": view.max_bytes,
+        }),
     );
     Ok(Json(json!({ "link": view })))
 }
@@ -7489,6 +7548,34 @@ mod backup_tests {
         application
             .store
             .audit("", "", "probe", "", &serde_json::json!({}));
+        let cookie = super::test_admin_cookie(
+            &application,
+            &auth::AdminIdentity {
+                subject: "platform-admin".to_owned(),
+                tenant: String::new(),
+                role: "admin".to_owned(),
+                grants: vec![auth::TenantGrant {
+                    incarnation: None,
+                    tenant: String::new(),
+                    role: "admin".to_owned(),
+                }],
+                credential_version: 1,
+            },
+        );
+        let backup_audits = || {
+            application
+                .store
+                .audit_recent_filtered(
+                    None,
+                    0,
+                    100,
+                    AuditFilters {
+                        event: Some("backup_created"),
+                        query: None,
+                    },
+                )
+                .unwrap()
+        };
 
         // Unauthenticated requests are refused.
         let router = app::router(application.clone());
@@ -7501,10 +7588,9 @@ mod backup_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(backup_audits().is_empty());
 
         // Signed in, the route serves a non-empty SQLite snapshot.
-        let cookie = login(application.clone()).await;
-
         // Without the CSRF header a cross-site navigation cannot trigger a snapshot.
         let router = app::router(application.clone());
         let response = router
@@ -7517,8 +7603,9 @@ mod backup_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(backup_audits().is_empty());
 
-        let router = app::router(application);
+        let router = app::router(application.clone());
         let response = router
             .oneshot(
                 Request::get("/api/admin/backup")
@@ -7540,6 +7627,10 @@ mod backup_tests {
         // SQLite databases begin with the magic string.
         assert!(body.starts_with(b"SQLite format 3\0"));
         assert_eq!(content_length, Some(body.len()));
+        let audits = backup_audits();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].actor, "platform-admin");
+        assert_eq!(audits[0].detail["bytes"], body.len());
     }
 
     #[tokio::test]
@@ -8234,6 +8325,79 @@ mod settings_api_tests {
         assert!(crate::receiving::saved_qualification(&application.store)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn nas_qualification_saves_each_value_with_audit() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&directory.path().join("data")).unwrap();
+        let first = crate::receiving::StorageIdentity {
+            path: directory.path().join("received-a"),
+            filesystem: "nfs4".to_owned(),
+            source: "server:/share-a".to_owned(),
+            mount_root: "/".to_owned(),
+            inode: "1".to_owned(),
+            service_uid: 1000,
+        };
+        save_nas_qualification(&store, "operator-a", first.clone(), 41).unwrap();
+        let saved = crate::receiving::saved_qualification(&store)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.storage, first);
+        assert_eq!(saved.qualified_at, 41);
+        assert_eq!(saved.qualified_by, "operator-a");
+        let event = |storage: &crate::receiving::StorageIdentity, qualified_at: u64| {
+            json!({
+                "storage": storage,
+                "qualified_at": qualified_at,
+            })
+        };
+        let audits = || {
+            store
+                .audit_recent_filtered(
+                    None,
+                    0,
+                    100,
+                    AuditFilters {
+                        event: Some("receiving_nas_qualification_saved"),
+                        query: None,
+                    },
+                )
+                .unwrap()
+        };
+        let rows = audits();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].actor, "operator-a");
+        assert_eq!(rows[0].subject, crate::receiving::SETTING_KEY);
+        assert_eq!(rows[0].detail, event(&first, 41));
+
+        let second = crate::receiving::StorageIdentity {
+            path: directory.path().join("received-b"),
+            filesystem: "cifs".to_owned(),
+            source: "//server/share-b".to_owned(),
+            mount_root: "/mnt/share-b".to_owned(),
+            inode: "2".to_owned(),
+            service_uid: 1001,
+        };
+        save_nas_qualification(&store, "operator-b", second.clone(), 42).unwrap();
+        let saved = crate::receiving::saved_qualification(&store)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.storage, second);
+        assert_eq!(saved.qualified_at, 42);
+        assert_eq!(saved.qualified_by, "operator-b");
+        let rows = audits();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].actor, "operator-b");
+        assert_eq!(rows[0].detail, event(&second, 42));
+        assert_eq!(rows[1].actor, "operator-a");
+        assert_eq!(rows[1].detail, event(&first, 41));
+
+        store
+            .with(|connection| connection.execute_batch("DROP TABLE settings"))
+            .unwrap();
+        assert!(save_nas_qualification(&store, "operator-c", second, 43).is_err());
+        assert_eq!(audits().len(), 2);
     }
 
     #[tokio::test]
@@ -9042,7 +9206,9 @@ mod settings_api_tests {
                 .header("cookie", &cookie)
                 .header("x-votport", "1")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"key":"acme","label":"Acme"}"#))
+                .body(Body::from(
+                    r#"{"key":"acme","label":"Acme","admin_group":" admins "}"#,
+                ))
                 .unwrap(),
         )
         .await;
@@ -9056,6 +9222,61 @@ mod settings_api_tests {
         assert_eq!(tenant.max_total_bytes, Some(100));
         assert_eq!(tenant.max_links, None);
         assert_eq!(tenant.max_sessions, None);
+        assert_eq!(tenant.admin_group.as_deref(), Some(" admins "));
+        let audits = application
+            .store
+            .audit_recent_filtered(
+                None,
+                0,
+                100,
+                AuditFilters {
+                    event: Some("tenant_created"),
+                    query: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].actor, "sso::admin");
+        assert_eq!(audits[0].subject, "acme");
+        assert_eq!(
+            audits[0].detail,
+            json!({
+                "label": "Acme",
+                "admin_group": " admins ",
+                "max_total_bytes": 100,
+                "max_links": null,
+                "max_sessions": null,
+            })
+        );
+        let (status, _) = send(
+            application.clone(),
+            Request::post("/api/admin/tenants")
+                .header("cookie", &cookie)
+                .header("x-votport", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"key":"acme","label":"Acme","admin_group":" admins "}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            application
+                .store
+                .audit_recent_filtered(
+                    None,
+                    0,
+                    100,
+                    AuditFilters {
+                        event: Some("tenant_created"),
+                        query: None,
+                    },
+                )
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -9854,10 +10075,28 @@ mod notification_and_limit_tests {
     async fn explicit_link_max_bytes_must_be_within_configured_bounds() {
         let directory = tempfile::tempdir().unwrap();
         let application = testing::build(directory.path());
+        let audit_count = || {
+            application
+                .store
+                .audit_recent_filtered(
+                    None,
+                    0,
+                    100,
+                    AuditFilters {
+                        event: Some("link_created"),
+                        query: None,
+                    },
+                )
+                .unwrap()
+                .len()
+        };
+        let before = audit_count();
         assert_eq!(
             create_link(application.clone(), Some(0)).await,
             StatusCode::UNPROCESSABLE_ENTITY
         );
+        assert_eq!(audit_count(), before);
+        let before = audit_count();
         assert_eq!(
             create_link(
                 application.clone(),
@@ -9866,6 +10105,7 @@ mod notification_and_limit_tests {
             .await,
             StatusCode::UNPROCESSABLE_ENTITY
         );
+        assert_eq!(audit_count(), before);
         assert_eq!(create_link(application.clone(), None).await, StatusCode::OK);
         assert_eq!(
             create_link(application.clone(), Some(123)).await,
@@ -9878,6 +10118,7 @@ mod notification_and_limit_tests {
             .iter()
             .any(|link| link.max_bytes == Some(123)));
         assert_eq!(application.store.links("").unwrap()[0].max_bytes, None);
+        assert_eq!(audit_count(), 2);
     }
 
     #[tokio::test]
@@ -9893,7 +10134,13 @@ mod notification_and_limit_tests {
                     .header("x-votport", "1")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        json!({"label":"expiring","expires_days":7}).to_string(),
+                        json!({
+                            "label": "expiring",
+                            "password": "audit-secret",
+                            "expires_days": 7,
+                            "max_bytes": 123,
+                        })
+                        .to_string(),
                     ))
                     .unwrap(),
             )
@@ -9909,6 +10156,33 @@ mod notification_and_limit_tests {
         let link = application.store.upload_link(&id).unwrap().unwrap();
         assert!((before..=after).contains(&link.created_at));
         assert!((before + 7 * 86_400..=after + 7 * 86_400).contains(&link.expires_at.unwrap()));
+        assert!(link.password_hash.is_some());
+        assert_eq!(link.max_bytes, Some(123));
+        let audits = application
+            .store
+            .audit_recent_filtered(
+                None,
+                0,
+                100,
+                AuditFilters {
+                    event: Some("link_created"),
+                    query: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].actor, "local");
+        assert_eq!(audits[0].subject, id);
+        assert_eq!(audits[0].detail["label"], "expiring");
+        assert_eq!(audits[0].detail["has_password"], true);
+        assert_eq!(audits[0].detail["expires_at"], json!(link.expires_at));
+        assert_eq!(audits[0].detail["max_bytes"], 123);
+        let detail = audits[0].detail.to_string();
+        assert!(!detail.contains("audit-secret"));
+        assert!(!link
+            .password_hash
+            .as_deref()
+            .is_some_and(|hash| detail.contains(hash)));
     }
 
     #[tokio::test]

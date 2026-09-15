@@ -1,6 +1,10 @@
 services:
   votport:
-    build: .
+    build:
+      context: .
+      args:
+        VOTPORT_VERSION: "${VOTPORT_VERSION:-dev}"
+        VOTPORT_REVISION: "${VOTPORT_REVISION:-unknown}"
     restart: unless-stopped
     # Allow streaming requests to finish during a normal stop.
     stop_grace_period: 5m
