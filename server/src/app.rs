@@ -1439,15 +1439,10 @@ fn resume_upload_session(
         }
         let control = session::PushControl::resumable(key.clone(), None);
         let directory = control.staging_dir(&setup);
-        let lock = session::lock_push_directory(&directory, setup.destinations.contract())
+        // Lock ownership and persisted identity are trusted at boot. Its mtime
+        // is wall clock state, so it cannot decide whether this session is idle.
+        let _lock = session::lock_push_directory(&directory, setup.destinations.contract())
             .map_err(|error| error.to_string())?;
-        let modified = lock
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .map_err(|error| error.to_string())?;
-        if modified.elapsed().unwrap_or_default().as_secs() >= config.session_idle_secs {
-            return Err("push staging expired".to_owned());
-        }
         let (sender, _) = tokio::sync::mpsc::channel(1);
         sessions
             .insert_admitted(
@@ -4572,7 +4567,7 @@ mod push_tests {
         std::fs::create_dir_all(stage.join("objects")).unwrap();
         let object_path = stage.join("objects/retained.stage");
         std::fs::write(&object_path, b"staged bytes").unwrap();
-        let mut persisted = crate::store::PersistedUploadSession {
+        let persisted = crate::store::PersistedUploadSession {
             committed_upload_id: None,
             id: hex::encode([5; 16]),
             push_key: Some(key.clone()),
@@ -4637,22 +4632,6 @@ mod push_tests {
         app.store.insert_upload_session(&persisted).unwrap();
         sweep_push_staging(&app);
         assert!(app.store.load_push_sessions().unwrap().is_empty());
-        let lock =
-            session::lock_push_directory(&stage, vot_sdk_file::NasContract::Unqualified).unwrap();
-        lock.set_modified(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap();
-        drop(lock);
-        assert!(resume_upload_session(
-            &app.config,
-            &app.store,
-            &app.signer,
-            &app.sessions,
-            &app.session_ended,
-            &app.receiving_destinations().unwrap(),
-            &mut persisted
-        )
-        .is_err());
-        assert!(!app.sessions.contains_push_key(&key));
     }
 
     fn push_config(directory: &std::path::Path) -> Config {

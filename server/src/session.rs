@@ -5712,10 +5712,34 @@ mod push_tests {
         assert!(!saved.files[0].published);
         drop(application);
 
+        for modified in [
+            std::time::SystemTime::UNIX_EPOCH,
+            std::time::SystemTime::now() + Duration::from_secs(365 * 86_400),
+        ] {
+            let lock = lock_push_directory(&stage, vot_sdk_file::NasContract::Unqualified).unwrap();
+            lock.set_modified(modified).unwrap();
+            drop(lock);
+            let application = crate::app::build(config.clone()).unwrap();
+            assert!(application.sessions.contains_push_key(&key));
+            drop(application);
+        }
+
         let application = crate::app::build(config).unwrap();
         assert_eq!(
             application.store.load_push_sessions().unwrap(),
             std::slice::from_ref(&saved)
+        );
+        application.sessions.sweep(0);
+        assert!(!application.sessions.contains_push_key(&key));
+        assert_eq!(
+            application
+                .store
+                .load_push_session(&key)
+                .unwrap()
+                .unwrap()
+                .files[0]
+                .prefix_bytes,
+            65536
         );
         let competing_object = object(Suite::Blake3Bao64, b"competing");
         let mut competing =

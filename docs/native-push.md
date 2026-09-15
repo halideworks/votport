@@ -220,6 +220,9 @@ check; the received manifest is checked later against `MAX_ENTRIES`.
   activity at most once per second during writes. `Sessions::sweep` keeps
   commands with in-flight leases registered and cancels an idle connected
   push; its reservation remains until the receive seams exit.
+  After restart, a valid saved session gets one fresh idle window; file
+  timestamps do not decide its age across clock changes. Reconnecting still
+  requires a fresh authorized preflight and capability.
 
 ### 4. Push worker
 

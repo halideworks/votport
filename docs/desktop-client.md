@@ -282,8 +282,9 @@ id per file through `POST /api/admin/outbound-files?path=` with
 is returned. Retries overwrite any unacknowledged tail, including a complete
 but unpublished stage; file length alone cannot prove that tail survived a
 crash. Stages created before durable acknowledgements restart from zero and
-age out through the existing idle cleanup. A file published before its reply was lost is still refused as already
-on the port
+age out through the existing idle cleanup. If publication succeeded before its
+reply was lost, retrying the same upload replays completion while its retained
+stage still proves the published file; otherwise an existing path is refused.
 (`port::upload`, `UploadListener` with a core-computed line such as
 "Uploading reel.mov, 1.2 GB of 4.0 GB (2 of 5 files)", cancel through a
 `Transfer` handle, `votport upload` in the CLI); what lands comes back

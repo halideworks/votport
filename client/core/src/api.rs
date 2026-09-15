@@ -950,10 +950,10 @@ impl Client {
     /// One chunk of an outbound library upload: `POST
     /// /api/admin/outbound-files?path=` with `Content-Range` and the
     /// upload id. Retried only when the connection never opened, timed out
-    /// before a reply, or met a 503: the server compares the stage's length with the
-    /// range and answers 409 with its offset when a chunk lands twice, but
-    /// a replayed final chunk finds the file already published and gets the
-    /// same 409 as a foreign file, with no offset to tell them apart.
+    /// before a reply, or met a 503: the server compares the stage's length with
+    /// the range and answers 409 with its offset when a chunk lands twice; a
+    /// replayed final chunk is complete when its published stage proves the
+    /// destination belongs to this upload.
     ///
     /// # Errors
     /// [`Error::NotSignedIn`], a 409 without an offset (the file exists or
