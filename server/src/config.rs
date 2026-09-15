@@ -465,6 +465,93 @@ fn prefix_matches(network: &[u8], ip: &[u8], bits: u8) -> bool {
     network[whole] & mask == ip[whole] & mask
 }
 
+const KNOWN_ENVIRONMENT_NAMES: &[&str] = &[
+    "VOTPORT_ADMIN_PASSWORD",
+    "VOTPORT_ADMIN_PASSWORD_HASH",
+    "VOTPORT_ALLOW_HIDDEN",
+    "VOTPORT_AUDIT_RETENTION_DAYS",
+    "VOTPORT_AUTOMATION_TOKEN",
+    "VOTPORT_BIND",
+    "VOTPORT_CLAMDSCAN",
+    "VOTPORT_DATA_DIR",
+    "VOTPORT_DEFAULT_MAX_LINKS",
+    "VOTPORT_DEFAULT_MAX_SESSIONS",
+    "VOTPORT_DEFAULT_MAX_TOTAL_BYTES",
+    "VOTPORT_FFPROBE",
+    "VOTPORT_LOG_FORMAT",
+    "VOTPORT_MAX_LINK_SESSIONS",
+    "VOTPORT_MAX_TOTAL_SESSIONS",
+    "VOTPORT_MAX_UPLOAD_BYTES",
+    "VOTPORT_METRICS_TOKEN",
+    "VOTPORT_NOTIFY_SMTP_FROM",
+    "VOTPORT_NOTIFY_SMTP_HOST",
+    "VOTPORT_NOTIFY_SMTP_PASSWORD",
+    "VOTPORT_NOTIFY_SMTP_PORT",
+    "VOTPORT_NOTIFY_SMTP_STARTTLS",
+    "VOTPORT_NOTIFY_SMTP_USERNAME",
+    "VOTPORT_OIDC_ADMIN_GROUP",
+    "VOTPORT_OIDC_AUDITOR_GROUP",
+    "VOTPORT_OIDC_CLIENT_ID",
+    "VOTPORT_OIDC_CLIENT_SECRET",
+    "VOTPORT_OIDC_ISSUER",
+    "VOTPORT_OIDC_SUBJECT_CLAIM",
+    "VOTPORT_OUTBOUND_DIR",
+    "VOTPORT_PUBLIC_PASSWORD_LOGIN",
+    "VOTPORT_PUBLIC_URL",
+    "VOTPORT_PUSH_ADVERTISE",
+    "VOTPORT_PUSH_BIND",
+    "VOTPORT_PUSH_CERT",
+    "VOTPORT_PUSH_KEY",
+    "VOTPORT_RECEIVE_DIR",
+    "VOTPORT_REPLICA_TOKEN",
+    "VOTPORT_SCIM_REQUIRE_PROVISIONING",
+    "VOTPORT_SCIM_TOKEN",
+    "VOTPORT_SERVE_ADVERTISE",
+    "VOTPORT_SERVE_BIND",
+    "VOTPORT_SESSION_IDLE_SECS",
+    "VOTPORT_SHARE_PASSWORD",
+    "VOTPORT_SSO_SESSION_SECS",
+    "VOTPORT_STANDBY_INTERVAL_SECS",
+    "VOTPORT_STANDBY_SOURCE",
+    "VOTPORT_TRUSTED_PROXIES",
+    "VOTPORT_UPLOAD_RETENTION_DAYS",
+    "VOTPORT_URL",
+    "VOTPORT_WEB_ROOT",
+    "VOTPORT_WORKFLOW_SNAPSHOT_BYTES",
+];
+
+fn is_known_dynamic_environment_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("VOTPORT_STORAGE_") else {
+        return false;
+    };
+    ["_ACCESS_KEY_ID", "_SECRET_ACCESS_KEY", "_SESSION_TOKEN"]
+        .iter()
+        .any(|suffix| {
+            rest.strip_suffix(suffix).is_some_and(|id| {
+                !id.is_empty()
+                    && id.len() <= 100
+                    && id.bytes().all(|byte| {
+                        byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+            })
+        })
+}
+
+fn is_known_environment_name(name: &str) -> bool {
+    KNOWN_ENVIRONMENT_NAMES.contains(&name) || is_known_dynamic_environment_name(name)
+}
+
+/// Warn about VOTPORT names that have no consumer. Values are intentionally
+/// ignored so secrets and invalid Unicode values never enter the log path.
+pub fn warn_unknown_environment() {
+    for (key, _) in env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("VOTPORT_") && !is_known_environment_name(&name) {
+            tracing::warn!(environment = ?name, "unknown environment setting ignored");
+        }
+    }
+}
+
 pub fn from_env() -> Result<Config, String> {
     let bind = env_or("VOTPORT_BIND", "0.0.0.0:8080")
         .parse()
@@ -1137,6 +1224,38 @@ mod cidr_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_environment_names_are_explicit() {
+        for name in KNOWN_ENVIRONMENT_NAMES {
+            assert!(is_known_environment_name(name), "{name}");
+        }
+        for name in [
+            "VOTPORT_STORAGE_MEDIA_ACCESS_KEY_ID",
+            "VOTPORT_STORAGE_MEDIA_SECRET_ACCESS_KEY",
+            "VOTPORT_STORAGE_MEDIA_SESSION_TOKEN",
+        ] {
+            assert!(is_known_environment_name(name), "{name}");
+        }
+        let id_100 = "A".repeat(100);
+        assert!(is_known_environment_name(&format!(
+            "VOTPORT_STORAGE_{id_100}_ACCESS_KEY_ID"
+        )));
+        let id_101 = "A".repeat(101);
+        assert!(!is_known_environment_name(&format!(
+            "VOTPORT_STORAGE_{id_101}_ACCESS_KEY_ID"
+        )));
+        for name in [
+            "VOTPORT_NOTIFY_SMTP_TO",
+            "VOTPORT_STORAGE_MEDIA_ACCESS_KEY",
+            "VOTPORT_STORAGE__SECRET_ACCESS_KEY",
+            "VOTPORT_STORAGE_MEDIA_SESSION_TOKEN_EXTRA",
+            "VOTPORT_STORAGE_media_ACCESS_KEY_ID",
+            "VOTPORT_STORAGE_MEDIA-ARCHIVE_ACCESS_KEY_ID",
+        ] {
+            assert!(!is_known_environment_name(name), "{name}");
+        }
+    }
 
     fn test_password_hash(algorithm: argon2::Algorithm, version: argon2::Version) -> String {
         use argon2::password_hash::{PasswordHasher as _, SaltString};

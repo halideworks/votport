@@ -7660,8 +7660,10 @@ mod backup_tests {
             serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
         let id = created["id"].as_str().unwrap();
-        let shutdown = Arc::clone(&application.shutdown);
-        let shutdown_waiter = tokio::spawn(async move { shutdown.notified().await });
+        let shutdown_application = Arc::clone(&application);
+        let shutdown_waiter = tokio::spawn(async move {
+            shutdown_application.wait_for_shutdown().await;
+        });
         tokio::task::yield_now().await;
         let response = app::router(application.clone())
             .oneshot(

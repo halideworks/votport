@@ -504,7 +504,7 @@ async fn revoke_remote(
 
 pub async fn control_worker(app: Arc<App>) {
     loop {
-        if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) {
+        if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) || app.is_stopping() {
             return;
         }
         if let Ok(_operation) = begin_outbound_operation(&app, "") {
@@ -523,7 +523,7 @@ pub async fn control_worker(app: Arc<App>) {
                 Ok(None) => {}
             }
         }
-        tokio::select! { _ = app.shutdown.notified() => return, _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {} }
+        tokio::select! { _ = app.wait_for_shutdown() => return, _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {} }
     }
 }
 

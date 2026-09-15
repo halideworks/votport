@@ -5,7 +5,11 @@
 //! This program is proprietary commercial software. See the VOTPORT
 //! PROPRIETARY LICENSE for the applicable terms and lack of warranty.
 
+use std::future::IntoFuture;
+
 use votport::{app, config};
+
+const HTTP_NATIVE_DRAIN: std::time::Duration = std::time::Duration::from_secs(240);
 
 #[tokio::main]
 async fn main() {
@@ -49,6 +53,7 @@ async fn main() {
     } else {
         tracing_subscriber::fmt().with_env_filter(filter()).init();
     }
+    config::warn_unknown_environment();
     if command.as_deref() == Some("standby") {
         let result = match votport::standby::config_from_env() {
             Ok(config) => votport::standby::run(config).await,
@@ -104,20 +109,25 @@ async fn main() {
         application.config.receive_dir.display()
     );
     // ConnectInfo carries the peer address to the per-IP link throttle.
-    if let Err(error) = axum::serve(
+    // Keep the serve future owned while the same deadline also gives native
+    // transfers a chance to finish. Tokio can bound cooperative waiting, but
+    // it cannot interrupt a blocking VOT listener; process::exit below keeps
+    // runtime destruction from joining those threads.
+    let server = axum::serve(
         listener,
         router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(application.clone()))
-    .await
+    .with_graceful_shutdown(app::shutdown_signal(application.clone()));
+    if let Err(error) =
+        app::drain_and_checkpoint(application.clone(), server.into_future(), HTTP_NATIVE_DRAIN)
+            .await
     {
         tracing::error!("server error: {error}");
         std::process::exit(1);
     }
-    // No handler can reach a session now; park the in-flight uploads on
-    // disk so the next boot re-attaches them. Process exit releases both
-    // kernel locks without waiting for NAS cleanup or blocking workers.
-    app::suspend_sessions(&application).await;
+    // The shared helper kept the server future owned through native drain and
+    // the checkpoint. Process exit releases both kernel locks without waiting
+    // for NAS cleanup or blocking workers.
     std::process::exit(0);
 }
 
@@ -297,30 +307,6 @@ async fn share(arguments: Vec<String>) -> Result<(), String> {
         println!("{url}");
     }
     Ok(())
-}
-
-async fn shutdown_signal(application: std::sync::Arc<votport::app::App>) {
-    // Docker and systemd stop the process with SIGTERM; ctrl_c is SIGINT
-    // only. Without this a container stop skips graceful shutdown entirely.
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        use tokio::signal::unix::{signal, SignalKind};
-        signal(SignalKind::terminate())
-            .expect("install SIGTERM handler")
-            .recv()
-            .await;
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-        _ = application.shutdown.notified() => {},
-    }
-    tracing::info!("shutting down");
 }
 
 #[cfg(test)]

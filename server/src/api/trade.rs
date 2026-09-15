@@ -729,8 +729,8 @@ pub async fn worker(app: Arc<App>) {
     // pass stays near a minute and known-dead peers are not hammered.
     let backoff: std::sync::Mutex<HashMap<String, (u32, Instant)>> = Default::default();
     loop {
-        tokio::select! {_=app.shutdown.notified()=>return,_=tokio::time::sleep(std::time::Duration::from_secs(60))=>{}}
-        if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) {
+        tokio::select! {_=app.wait_for_shutdown()=>return,_=tokio::time::sleep(std::time::Duration::from_secs(60))=>{}}
+        if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) || app.is_stopping() {
             return;
         }
         if app

@@ -1,6 +1,7 @@
 //! Application state and router assembly.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,6 +14,7 @@ use axum::routing::{get, post};
 use axum::Json;
 use axum::Router;
 use rand::RngCore as _;
+use std::fmt::Display;
 use std::fmt::Write as _;
 use tower_http::services::ServeDir;
 use tracing::Instrument as _;
@@ -289,6 +291,10 @@ pub struct App {
     /// must never produce two snapshots or apply two restores concurrently.
     pub backup_lock: Arc<tokio::sync::Mutex<()>>,
     pub shutdown: Arc<tokio::sync::Notify>,
+    /// Process-local, irreversible shutdown state. Persisted draining is a
+    /// tenant policy and is deliberately independent of this bit.
+    pub stopping: Arc<AtomicBool>,
+    shutdown_requested_at: Mutex<Option<std::time::Instant>>,
     pub workflow_ready: tokio::sync::Notify,
     /// Exclusive flock on `<data_dir>/lock`, held for the life of the
     /// process: a second instance over the same data directory (an
@@ -1044,6 +1050,8 @@ pub fn build(config: Config) -> Result<Arc<App>, String> {
         push_tickets: Mutex::new(HashMap::new()),
         backup_lock: Arc::new(tokio::sync::Mutex::new(())),
         shutdown: Arc::new(tokio::sync::Notify::new()),
+        stopping: Arc::new(AtomicBool::new(false)),
+        shutdown_requested_at: Mutex::new(None),
         workflow_ready: tokio::sync::Notify::new(),
         _data_lock: data_lock,
         lease_holder,
@@ -1124,7 +1132,74 @@ impl App {
     }
 
     pub fn request_shutdown(&self) {
+        // This short mutex serializes the admission linearization point,
+        // timestamp, stopping publication, and notification. No caller can
+        // start a fresh budget from a notification that raced its timestamp.
+        let mut requested = self
+            .shutdown_requested_at
+            .lock()
+            .expect("shutdown state poisoned");
+        let first = self.sessions.close_admission();
+        if first {
+            *requested = Some(std::time::Instant::now());
+        }
+        self.stopping.store(true, Ordering::Release);
         self.shutdown.notify_waiters();
+    }
+
+    #[must_use]
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
+    /// Waits for the persistent shutdown state without losing a notification
+    /// between the check and registration of the waiter.
+    pub async fn wait_for_shutdown(&self) {
+        loop {
+            let notified = self.shutdown.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_stopping() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub fn shutdown_deadline(&self, budget: std::time::Duration) -> Option<std::time::Instant> {
+        self.shutdown_requested_at
+            .lock()
+            .expect("shutdown state poisoned")
+            .map(|started| started + budget)
+    }
+
+    /// Counts work that still owns the drain: setup admissions and live
+    /// transport slots. Idle pre-minted tickets are intentionally excluded.
+    pub(crate) fn native_active(&self) -> usize {
+        let push = self
+            .push_tickets
+            .lock()
+            .expect("push tickets poisoned")
+            .values()
+            .filter(|ticket| ticket.control.is_connected())
+            .count();
+        let serve = self
+            .serve
+            .as_ref()
+            .map_or(0, |serve| serve.registry.active_sessions());
+        self.sessions.active_admissions() + push + serve
+    }
+
+    pub async fn wait_native_drain(&self, deadline: std::time::Instant) {
+        while self.native_active() != 0 {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                tracing::warn!("native drain deadline reached");
+                return;
+            }
+            let next = (deadline - now).min(std::time::Duration::from_millis(25));
+            tokio::time::sleep(next).await;
+        }
     }
 }
 
@@ -1152,6 +1227,87 @@ pub async fn suspend_sessions(app: &App) {
         Ok(_) => tracing::info!(count, "suspended upload sessions for restart"),
         Err(_) => tracing::warn!(count, "suspending upload sessions timed out"),
     }
+}
+
+/// Owns the HTTP server through the bounded native drain and the final
+/// checkpoint. `budget` is the production allowance; tests pass a short
+/// budget through the same path without adding a runtime configuration knob.
+pub async fn drain_and_checkpoint<F, E>(
+    application: Arc<App>,
+    server: F,
+    budget: std::time::Duration,
+) -> Result<(), String>
+where
+    F: Future<Output = Result<(), E>>,
+    E: Display,
+{
+    let mut server = Box::pin(server);
+    let drain_app = Arc::clone(&application);
+    let mut drain = Box::pin(async move {
+        drain_app.wait_for_shutdown().await;
+        let deadline = drain_app
+            .shutdown_deadline(budget)
+            .expect("shutdown state must publish its deadline before waking");
+        tokio::time::sleep_until(deadline.into()).await;
+    });
+    let server_result = tokio::select! {
+        result = &mut server => Some(result),
+        _ = &mut drain => None,
+    };
+    if let Some(Err(error)) = server_result {
+        return Err(error.to_string());
+    }
+    if let Some(deadline) = application.shutdown_deadline(budget) {
+        application.wait_native_drain(deadline).await;
+    }
+    // Keep `server` owned until after this checkpoint. In production the
+    // process exits immediately afterward, so a blocking native listener
+    // cannot be joined by runtime teardown.
+    suspend_sessions(&application).await;
+    Ok(())
+}
+
+/// Waits for the process stop signal used by the real server. API-triggered
+/// restarts publish the same `request_shutdown` state directly.
+pub async fn shutdown_signal(application: Arc<App>) {
+    shutdown_signal_inner(application, None).await;
+}
+
+#[cfg(test)]
+async fn shutdown_signal_ready(application: Arc<App>, ready: tokio::sync::oneshot::Sender<()>) {
+    shutdown_signal_inner(application, Some(ready)).await;
+}
+
+async fn shutdown_signal_inner(
+    application: Arc<App>,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
+) {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        if let Some(ready) = ready {
+            let _ = ready.send(());
+        }
+        terminate.recv().await;
+    };
+    #[cfg(not(unix))]
+    let terminate = async move {
+        if let Some(ready) = ready {
+            let _ = ready.send(());
+        }
+        std::future::pending::<()>().await
+    };
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+        _ = application.wait_for_shutdown() => {},
+    }
+    application.request_shutdown();
+    tracing::info!("shutting down");
 }
 
 /// Reattaches recorded uploads and preserves unresolved recovery evidence.
@@ -1920,6 +2076,9 @@ fn admit_push(
         return None;
     }
     let token_id = capability.token_id;
+    // A connected ticket owns the drain already, so later rails may join it.
+    // An idle pre-minted ticket must win this fence before connect consumes it.
+    let admission = app.sessions.try_admit();
     let (session_id, directory, seams, joined) = {
         let mut tickets = app.push_tickets.lock().expect("push tickets poisoned");
         let Some(ticket) = tickets.get_mut(&token_id) else {
@@ -1949,6 +2108,9 @@ fn admit_push(
                 true,
             )
         } else {
+            if admission.is_none() {
+                return refuse_push(app, PushRefusalReason::Spent, presentation.peer);
+            }
             if !ticket.control.connect() {
                 return refuse_push(app, PushRefusalReason::Spent, presentation.peer);
             }
@@ -2317,6 +2479,23 @@ async fn healthz(State(app): State<Arc<App>>) -> Response {
 /// up on purpose (docs/deployment.md, Scaling and availability). The body
 /// carries the active upload count so a failover script can wait for zero.
 async fn readyz(State(app): State<Arc<App>>) -> Response {
+    if app.is_stopping() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ready": false,
+                "draining": true,
+                "sessions_active": app.sessions.total(),
+                "lease": {
+                    "holder": serde_json::Value::Null,
+                    "mine": false,
+                    "age_secs": serde_json::Value::Null,
+                    "lost": app.lease_lost.load(Ordering::Relaxed),
+                },
+            })),
+        )
+            .into_response();
+    }
     let snapshot = health_snapshot(&app).await;
     let lease_lost = app.lease_lost.load(Ordering::Relaxed);
     let (ready, draining) = match snapshot.as_ref() {
@@ -3097,6 +3276,42 @@ mod health_tests {
     }
 
     #[tokio::test]
+    async fn readyz_reports_process_stop_without_waiting_for_health() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        app.request_shutdown();
+        let response = router(app)
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["ready"], false);
+        assert_eq!(value["draining"], true);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waiter_observes_stop_requested_before_it_starts() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        app.request_shutdown();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            app.wait_for_shutdown(),
+        )
+        .await
+        .expect("persistent stop state wakes late waiter");
+        assert!(app
+            .shutdown_deadline(std::time::Duration::from_secs(240))
+            .is_some());
+        app.request_shutdown();
+        assert!(app.is_stopping());
+    }
+
+    #[tokio::test]
     async fn readyz_is_unavailable_when_storage_cannot_be_probed() {
         let directory = tempfile::tempdir().unwrap();
         let app = crate::api::testing::build(directory.path());
@@ -3279,6 +3494,305 @@ mod health_tests {
         assert!(metrics_text(&app)
             .unwrap()
             .contains("votport_audit_rows 1\n"));
+    }
+}
+
+#[cfg(test)]
+mod shutdown_process_tests {
+    use super::*;
+
+    use std::future::IntoFuture;
+
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+    use vot_sdk::object::{InMemoryObjectBuilder, Suite};
+    use vot_sdk::package::{PackageBuilder, PackageEntry};
+
+    const CHILD_ROOT: &str = "VOTPORT_TEST_SHUTDOWN_CHILD_ROOT";
+    const EXPECTED_PREFIX_BYTES: u64 = 64 * 1024;
+
+    async fn send_request(
+        application: &Arc<App>,
+        request: Request<Body>,
+    ) -> axum::response::Response {
+        router(Arc::clone(application))
+            .oneshot(request)
+            .await
+            .unwrap()
+    }
+
+    fn connect_info(request: &mut Request<Body>) {
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                43210,
+            ))));
+    }
+
+    async fn child_setup_and_checkpoint(root: &std::path::Path) {
+        let application = crate::api::testing::build(root);
+        application
+            .store
+            .insert_link(crate::store::tests::test_link("child"))
+            .unwrap();
+
+        let bytes = vec![7u8; 128 * 1024];
+        let mut object = InMemoryObjectBuilder::new(
+            Suite::Blake3Bao64,
+            Some(bytes.len() as u64),
+            bytes.len() as u64,
+        )
+        .unwrap();
+        object.update(&bytes).unwrap();
+        let prepared = object.finish().unwrap();
+        let mut package = PackageBuilder::new().unwrap();
+        let entry =
+            PackageEntry::direct(vec!["partial.bin".to_owned()], prepared.object_id()).unwrap();
+        assert!(package.push(&entry).unwrap().is_none());
+        let (summary, final_page, mut finalizer) = package.finish().unwrap().into_parts();
+        let page = finalizer.push(final_page).unwrap().into_bytes();
+        let seal = finalizer.finish().unwrap().into_bytes();
+        let package_id = summary.object_id();
+
+        let mut create = Request::builder()
+            .method("POST")
+            .uri("/api/r/child/session")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "package": {
+                        "suite": "blake3",
+                        "root": hex::encode(package_id.root),
+                        "length": package_id.length,
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        connect_info(&mut create);
+        let response = send_request(&application, create).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let session = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["session"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        for (path, body) in [
+            (format!("/api/session/{session}/seal"), seal),
+            (format!("/api/session/{session}/page"), page),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .body(Body::from(body))
+                .unwrap();
+            assert_eq!(
+                send_request(&application, request).await.status(),
+                StatusCode::OK
+            );
+        }
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/session/{session}/begin"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            send_request(&application, request).await.status(),
+            StatusCode::OK
+        );
+
+        let proof = prepared.prove(0, EXPECTED_PREFIX_BYTES).unwrap();
+        let start = proof.covered_offset() as usize;
+        let end = start + proof.covered_length() as usize;
+        assert_eq!(start, 0);
+        assert_eq!(proof.covered_length(), EXPECTED_PREFIX_BYTES);
+        let mut body = proof.proof().to_vec();
+        let proof_len = body.len();
+        body.extend_from_slice(&bytes[start..end]);
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/api/session/{session}/chunk?entry=0&offset={start}"
+            ))
+            .header("x-votport-proof", proof_len.to_string())
+            .body(Body::from(body))
+            .unwrap();
+        assert_eq!(
+            send_request(&application, request).await.status(),
+            StatusCode::OK
+        );
+        let saved = application.store.load_upload_sessions().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].files[0].prefix_bytes, 0);
+
+        // Hold a real handler so graceful shutdown cannot finish before checkpoint.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let entered = Arc::new(tokio::sync::Mutex::new(Some(entered_tx)));
+        let release = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let held_route = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            get(move || {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                async move {
+                    if let Some(sender) = entered.lock().await.take() {
+                        let _ = sender.send(());
+                    }
+                    if let Some(receiver) = release.lock().await.take() {
+                        let _ = receiver.await;
+                    }
+                    StatusCode::OK
+                }
+            })
+        };
+        let router = router(Arc::clone(&application)).route("/__test_hold", held_route);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (signal_ready_tx, signal_ready_rx) = tokio::sync::oneshot::channel();
+        let server = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal_ready(
+            Arc::clone(&application),
+            signal_ready_tx,
+        ))
+        .into_future();
+        let mut drain = tokio::spawn(drain_and_checkpoint(
+            Arc::clone(&application),
+            server,
+            std::time::Duration::from_millis(50),
+        ));
+        let client = reqwest::Client::new();
+        let held = tokio::spawn(client.get(format!("http://{address}/__test_hold")).send());
+        match tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => {
+                held.abort();
+                drain.abort();
+                let _ = held.await;
+                let _ = drain.await;
+                panic!("held HTTP handler did not start");
+            }
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(1), signal_ready_rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => {
+                held.abort();
+                drain.abort();
+                let _ = held.await;
+                let _ = drain.await;
+                panic!("shutdown signal was not installed");
+            }
+        }
+        // Unix exercises the same SIGTERM waiter as main; other targets use the API path.
+        #[cfg(unix)]
+        {
+            let status = std::process::Command::new("kill")
+                .args(["-TERM", &std::process::id().to_string()])
+                .status()
+                .unwrap();
+            assert!(status.success(), "self SIGTERM failed: {status}");
+        }
+        #[cfg(not(unix))]
+        application.request_shutdown();
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            application.wait_for_shutdown(),
+        )
+        .await
+        .is_err()
+        {
+            held.abort();
+            drain.abort();
+            let _ = held.await;
+            let _ = drain.await;
+            panic!("SIGTERM did not request shutdown");
+        }
+        if held.is_finished() {
+            held.abort();
+            drain.abort();
+            let _ = held.await;
+            let _ = drain.await;
+            panic!("held handler completed before drain");
+        }
+
+        let drain_result =
+            match tokio::time::timeout(std::time::Duration::from_secs(2), &mut drain).await {
+                Ok(result) => result,
+                Err(_) => {
+                    held.abort();
+                    drain.abort();
+                    let _ = held.await;
+                    let _ = drain.await;
+                    panic!("bounded shutdown did not reach checkpoint");
+                }
+            };
+        drain_result
+            .expect("shutdown task panicked")
+            .expect("shutdown checkpoint failed");
+    }
+
+    #[tokio::test]
+    async fn child_deadline_checkpoints_and_restart_reattaches_upload() {
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            child_setup_and_checkpoint(std::path::Path::new(&root)).await;
+            std::process::exit(0);
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("child.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "app::shutdown_process_tests::child_deadline_checkpoints_and_restart_reattaches_upload",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, directory.path())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "child shutdown did not complete: {}",
+            std::fs::read_to_string(log_path).unwrap()
+        );
+
+        let application = crate::api::testing::build(directory.path());
+        let sessions = application.store.load_upload_sessions().unwrap();
+        assert_eq!(sessions.len(), 1, "checkpoint was not durable");
+        assert_eq!(application.sessions.total(), 1, "restart did not reattach");
+        assert_eq!(
+            sessions[0]
+                .files
+                .iter()
+                .find(|file| file.display_path == "partial.bin")
+                .map(|file| file.prefix_bytes),
+            Some(EXPECTED_PREFIX_BYTES)
+        );
+        release_data_lock(&application);
     }
 }
 

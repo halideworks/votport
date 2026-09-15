@@ -609,7 +609,7 @@ pub async fn export_events(
 
 pub async fn worker(app: Arc<App>) {
     loop {
-        if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) {
+        if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) || app.is_stopping() {
             return;
         }
         if let Ok(operation) = begin_outbound_operation(&app, "") {
@@ -625,7 +625,7 @@ pub async fn worker(app: Arc<App>) {
                                 .fail_delivery_job(&job.id, job.attempts, &error.message)
                         {
                             tracing::error!(%store_error,job_id=%job.id,"record delivery job failure");
-                            tokio::select! { _ = app.shutdown.notified() => return, _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {} }
+                            tokio::select! { _ = app.wait_for_shutdown() => return, _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {} }
                         }
                     }
                     if let Ok(Some(current)) = app.store.delivery_job(&job.id) {
@@ -646,7 +646,7 @@ pub async fn worker(app: Arc<App>) {
                 _ => {}
             }
         }
-        tokio::select! { _ = app.shutdown.notified() => return, _ = app.workflow_ready.notified() => {}, _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {} }
+        tokio::select! { _ = app.wait_for_shutdown() => return, _ = app.workflow_ready.notified() => {}, _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {} }
     }
 }
 
@@ -1433,13 +1433,13 @@ pub async fn event_worker(app: Arc<App>) {
     };
     let mut next_retirement = tokio::time::Instant::now();
     loop {
-        if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) {
+        if app.lease_lost.load(std::sync::atomic::Ordering::Relaxed) || app.is_stopping() {
             return;
         }
         if let Err(error) = dispatch_events(&app, &client).await {
             tracing::error!(%error,"dispatch delivery events");
         }
-        if tokio::time::Instant::now() >= next_retirement {
+        if !app.is_stopping() && tokio::time::Instant::now() >= next_retirement {
             match retire_snapshot(&app).await {
                 Ok(true) => next_retirement = tokio::time::Instant::now() + DISPATCH_INTERVAL,
                 Ok(false) => {
@@ -1451,7 +1451,7 @@ pub async fn event_worker(app: Arc<App>) {
                 }
             }
         }
-        tokio::select! { _ = app.shutdown.notified() => return, _ = tokio::time::sleep(DISPATCH_INTERVAL) => {} }
+        tokio::select! { _ = app.wait_for_shutdown() => return, _ = tokio::time::sleep(DISPATCH_INTERVAL) => {} }
     }
 }
 
@@ -1460,6 +1460,9 @@ async fn dispatch_events(app: &App, client: &reqwest::Client) -> Result<(), Stri
     app.store.escalate_delivery_jobs(now_unix())?;
     app.store.queue_delivery_webhooks(now_unix())?;
     for attempt in app.store.due_delivery_webhooks(now_unix())? {
+        if app.is_stopping() {
+            break;
+        }
         let Some(hook) = app
             .store
             .delivery_webhook(&attempt.tenant)?
