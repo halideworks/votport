@@ -1103,6 +1103,214 @@ await page.getByRole("button", { name: `Open folder ${PROJECT}` }).click();
 await page.waitForFunction(() => document.querySelectorAll("#library-files input[type=checkbox]").length === 12);
 console.log("agent access: selected permissions, MCP config, pagination, and revocation ok");
 
+// Page controls keep a bounded listing usable without making the browser own
+// a large result set; hold the second page to exercise the stale-response guard.
+const PAGED = `browser-paged-${run}`;
+const ROOT_MARKER = `browser-root-${run}.txt`;
+let releasePendingPage;
+const pendingPage = new Promise((resolve) => { releasePendingPage = resolve; });
+let releaseStalePage;
+const stalePage = new Promise((resolve) => { releaseStalePage = resolve; });
+let releaseMixedPage;
+const mixedPage = new Promise((resolve) => { releaseMixedPage = resolve; });
+let holdPendingPage = false;
+let holdStalePage = false;
+let holdMixedPage = false;
+let failPagedPage = false;
+let failRootPage = false;
+const pagedRoute = "**/api/admin/outbound-files?*";
+await page.route(pagedRoute, async (route) => {
+  const url = new URL(route.request().url());
+  const directory = url.searchParams.get("directory");
+  if (directory === "" && !url.searchParams.has("q")) {
+    if (failRootPage) return route.fulfill({ status: 503, json: { error: "root unavailable" } });
+    const response = await route.fetch();
+    const json = await response.json();
+    json.directories = [...(json.directories || []), PAGED].sort();
+    json.files = [...(json.files || []), { path: ROOT_MARKER, bytes: 1 }];
+    return route.fulfill({ response, json });
+  }
+  if (directory !== PAGED) return route.continue();
+  const after = url.searchParams.get("after");
+  if (!after) {
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        directory: PAGED,
+        directories: [],
+        files: [{ path: `${PAGED}/a.txt`, bytes: 1 }],
+        truncated: true,
+        next_cursor: `${PAGED}/a.txt`,
+      }),
+    });
+  }
+  if (holdPendingPage) await pendingPage;
+  if (holdStalePage) await stalePage;
+  if (holdMixedPage) await mixedPage;
+  if (failPagedPage) return route.fulfill({ status: 503, json: { error: "page unavailable" } });
+  return route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({
+      directory: PAGED,
+      directories: [],
+      files: [{ path: `${PAGED}/b.txt`, bytes: 2 }],
+      truncated: false,
+      next_cursor: null,
+    }),
+  });
+});
+await page.getByRole("button", { name: "Library", exact: true }).click();
+await page.getByRole("button", { name: `Open folder ${PAGED}`, exact: true }).click();
+const firstPagedFile = page.locator(`#library-files input[type="checkbox"][value="${PAGED}/a.txt"]`);
+await firstPagedFile.waitFor();
+await firstPagedFile.check();
+holdPendingPage = true;
+const firstNextRequest = page.waitForRequest((request) => {
+  const url = new URL(request.url());
+  return url.pathname === "/api/admin/outbound-files"
+    && url.searchParams.get("directory") === PAGED
+    && url.searchParams.has("after");
+});
+const nextButton = page.getByRole("button", { name: "Next page", exact: true });
+await nextButton.click();
+await firstNextRequest;
+if (!await nextButton.isDisabled()) throw new Error("next page stayed active while its request was pending");
+releasePendingPage();
+holdPendingPage = false;
+await page.locator(`#library-files input[type="checkbox"][value="${PAGED}/b.txt"]`).waitFor();
+if (!(await page.textContent("#library-selection-status")).startsWith("1 file selected")) {
+  throw new Error("library selection did not survive pagination");
+}
+await page.getByRole("button", { name: "Previous page", exact: true }).click();
+await firstPagedFile.waitFor();
+if (!await firstPagedFile.isChecked()) {
+  throw new Error("library selection did not survive returning to the previous page");
+}
+await firstPagedFile.uncheck();
+
+failPagedPage = true;
+const failedPage = page.waitForResponse((response) => {
+  const url = new URL(response.url());
+  return url.pathname === "/api/admin/outbound-files"
+    && url.searchParams.get("directory") === PAGED
+    && url.searchParams.has("after");
+});
+await page.getByRole("button", { name: "Next page", exact: true }).click();
+if ((await failedPage).status() !== 503) throw new Error("failed page fixture did not return 503");
+await page.waitForFunction((path) => {
+  const files = [...document.querySelectorAll("#library-files input[type=checkbox]")];
+  return files.some((checkbox) => checkbox.value === path)
+    && !document.getElementById("library-pagination-next").disabled
+    && document.getElementById("library-pagination-previous").hidden
+    && document.querySelector('#library-files [role="alert"]')?.textContent === "page unavailable";
+}, `${PAGED}/a.txt`);
+failPagedPage = false;
+await page.getByRole("button", { name: "Next page", exact: true }).click();
+await page.locator(`#library-files input[type="checkbox"][value="${PAGED}/b.txt"]`).waitFor();
+if (await page.locator('#library-files [role="alert"]').count()) throw new Error("successful page retry kept the old error");
+await page.getByRole("button", { name: "Previous page", exact: true }).click();
+
+try {
+  holdStalePage = true;
+  const latePage = page.waitForRequest((request) => {
+    const url = new URL(request.url());
+    return url.pathname === "/api/admin/outbound-files"
+      && url.searchParams.get("directory") === PAGED
+      && url.searchParams.has("after");
+  });
+  await page.getByRole("button", { name: "Next page", exact: true }).click();
+  await latePage;
+  const rootNavigation = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === "/api/admin/outbound-files"
+      && url.searchParams.get("directory") === ""
+      && !url.searchParams.has("q");
+  });
+  await page.getByRole("button", { name: "Library", exact: true }).click();
+  await rootNavigation;
+  const latePageResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === "/api/admin/outbound-files"
+      && url.searchParams.get("directory") === PAGED
+      && url.searchParams.has("after");
+  });
+  releaseStalePage();
+  await latePageResponse;
+  await page.locator(`#library-files input[type="checkbox"][value="${ROOT_MARKER}"]`).waitFor();
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await page.waitForFunction((paths) => document.querySelector('#library-breadcrumbs [aria-current="page"]')?.textContent === "Library"
+    && [...document.querySelectorAll("#library-files input[type=checkbox]")].some((checkbox) => checkbox.value === paths.root)
+    && ![...document.querySelectorAll("#library-files input[type=checkbox]")].some((checkbox) => checkbox.value === paths.stale),
+  { root: ROOT_MARKER, stale: `${PAGED}/b.txt` }, { timeout: 5000 });
+
+  await page.getByRole("button", { name: `Open folder ${PAGED}`, exact: true }).click();
+  await page.locator(`#library-files input[type="checkbox"][value="${PAGED}/a.txt"]`).waitFor();
+  holdMixedPage = true;
+  const mixedPageRequest = page.waitForRequest((request) => {
+    const url = new URL(request.url());
+    return url.pathname === "/api/admin/outbound-files"
+      && url.searchParams.get("directory") === PAGED
+      && url.searchParams.has("after");
+  });
+  await page.getByRole("button", { name: "Next page", exact: true }).click();
+  await mixedPageRequest;
+  failRootPage = true;
+  const failedRootResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === "/api/admin/outbound-files"
+      && url.searchParams.get("directory") === ""
+      && !url.searchParams.has("q");
+  });
+  await page.getByRole("button", { name: "Library", exact: true }).click();
+  if ((await failedRootResponse).status() !== 503) throw new Error("failed root fixture did not return 503");
+  await page.waitForFunction((path) => document.querySelector('#library-breadcrumbs [aria-current="page"]')?.textContent === path.directory
+    && [...document.querySelectorAll("#library-files input[type=checkbox]")].some((checkbox) => checkbox.value === path.file)
+    && document.querySelector('#library-files [role="alert"]'),
+  { directory: PAGED, file: `${PAGED}/a.txt` }, { timeout: 5000 });
+  failRootPage = false;
+  const mixedPageResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === "/api/admin/outbound-files"
+      && url.searchParams.get("directory") === PAGED
+      && url.searchParams.has("after");
+  });
+  releaseMixedPage();
+  await mixedPageResponse;
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await page.waitForFunction((path) => document.querySelector('#library-breadcrumbs [aria-current="page"]')?.textContent === path.directory
+    && [...document.querySelectorAll("#library-files input[type=checkbox]")].some((checkbox) => checkbox.value === path.file)
+    && ![...document.querySelectorAll("#library-files input[type=checkbox]")].some((checkbox) => checkbox.value === path.late),
+  { directory: PAGED, file: `${PAGED}/a.txt`, late: `${PAGED}/b.txt` }, { timeout: 5000 });
+  const recoveredRoot = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === "/api/admin/outbound-files"
+      && url.searchParams.get("directory") === ""
+      && !url.searchParams.has("q");
+  });
+  await page.getByRole("button", { name: "Library", exact: true }).click();
+  if ((await recoveredRoot).status() !== 200) throw new Error("root recovery fixture did not return 200");
+  await page.locator(`#library-files input[type="checkbox"][value="${ROOT_MARKER}"]`).waitFor();
+} finally {
+  releasePendingPage();
+  releaseStalePage();
+  releaseMixedPage();
+  holdPendingPage = false;
+  holdStalePage = false;
+  holdMixedPage = false;
+  await page.unroute(pagedRoute);
+}
+console.log("library pagination preserves selection and drops a stale page response: ok");
+
+await page.getByRole("button", { name: `Open folder ${PROJECT}`, exact: true }).click();
+await page.waitForFunction(
+  (project) => document.querySelector('#library-breadcrumbs [aria-current="page"]')?.textContent === project
+    && document.querySelectorAll("#library-files input[type=checkbox]").length === 12,
+  PROJECT,
+  { timeout: 15000 },
+);
+
 const projectFiles = await page.$$eval("#library-files .library-file:not(.library-folder) .mono", (els) =>
   els.map((el) => el.textContent).sort(),
 );
@@ -1121,11 +1329,31 @@ await page.route("**/api/admin/outbound-files?directory=*", (route) => route.ful
 await page.getByRole("button", { name: `Open folder ${PROJECT}` }).focus();
 await page.keyboard.press("Enter");
 await page.locator("#library-files [role=alert]").waitFor();
+await page.waitForFunction((paths) => {
+  const values = [...document.querySelectorAll("#library-files input[type=checkbox]")].map((checkbox) => checkbox.value);
+  return document.querySelector('#library-breadcrumbs [aria-current="page"]')?.textContent === "Library"
+    && [...document.querySelectorAll("#library-files button")].some((button) =>
+      button.getAttribute("aria-label") === `Open folder ${paths.project}`)
+    && !values.some((value) => value.startsWith(`${paths.project}/`));
+}, { project: PROJECT });
 if (!await page.evaluate(() => document.activeElement.matches('#library-breadcrumbs [aria-current="page"]'))) {
   throw new Error("failed folder navigation lost keyboard focus");
 }
 await page.keyboard.press("Enter");
 await page.waitForSelector(`#library-files input[aria-label="Select folder ${PROJECT}"]`);
+const failedSearch = `browser-search-failed-${run}`;
+await page.route("**/api/admin/outbound-files?q=*", (route) => route.fulfill({ status: 503 }), { times: 1 });
+await page.fill("#library-search", failedSearch);
+await page.locator("#library-files [role=alert]").waitFor();
+await page.waitForFunction((root) => {
+  const values = [...document.querySelectorAll("#library-files input[type=checkbox]")].map((checkbox) => checkbox.value);
+  return document.getElementById("library-search").value === ""
+    && [...document.querySelectorAll("#library-files button")].some((button) =>
+      button.getAttribute("aria-label") === `Open folder ${root}`)
+    && !values.some((value) => value.startsWith(`${root}/`))
+    && document.querySelector('#library-breadcrumbs [aria-current="page"]')?.textContent === "Library";
+}, PROJECT);
+await page.unroute("**/api/admin/outbound-files?q=*");
 await page.route("**/api/admin/outbound-files?directory=*", async (route) => {
   await page.focus("#library-search");
   await route.fulfill({ status: 503 });

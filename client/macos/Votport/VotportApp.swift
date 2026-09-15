@@ -1,3 +1,4 @@
+import AppKit
 import OSLog
 import SwiftUI
 import VotportCore
@@ -118,6 +119,7 @@ struct MainWindow: View {
             }
         }
         .background(Tokens.bg)
+        .background(MainWindowReader())
         .foregroundStyle(Tokens.text)
         .font(Type.body)
         .onAppear {
@@ -158,6 +160,20 @@ struct MainWindow: View {
             } else {
                 store.prefillReceive = link
                 section = .receive
+            }
+        }
+    }
+}
+
+private struct MainWindowReader: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { NSView() }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        if let window = nsView.window {
+            Snapshot.mainWindow = window
+        } else {
+            DispatchQueue.main.async {
+                Snapshot.mainWindow = nsView.window
             }
         }
     }

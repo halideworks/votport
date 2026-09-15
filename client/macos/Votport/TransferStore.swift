@@ -278,6 +278,8 @@ final class Listener: TransferListener, @unchecked Sendable {
 /// ends, so a headless run (over ssh) still leaves a picture of what the
 /// user would see.
 enum Snapshot {
+    static var mainWindow: NSWindow?
+
     @MainActor
     static func writeIfRequested(_ arguments: [String] = CommandLine.arguments) {
         guard let flag = arguments.firstIndex(of: "--snapshot"), arguments.count > flag + 1 else {
@@ -286,9 +288,14 @@ enum Snapshot {
         let path = arguments[flag + 1]
         // One more layout pass so the final phase is drawn before it is read.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            guard let view = (NSApp.keyWindow ?? NSApp.windows.first)?.contentView,
-                let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds)
-            else { return }
+            guard let view = mainWindow?.contentView else {
+                log.error("snapshot skipped: main window unavailable")
+                return
+            }
+            guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
+                log.error("snapshot skipped: main window has no drawable content")
+                return
+            }
             view.cacheDisplay(in: view.bounds, to: bitmap)
             guard let png = bitmap.representation(using: .png, properties: [:]) else { return }
             do {

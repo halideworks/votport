@@ -626,8 +626,11 @@ pub fn revoke_delivery(id: String) -> std::result::Result<(), port::PortError> {
 /// # Errors
 /// Not signed in, a refused directory, or an unreachable server.
 #[uniffi::export]
-pub fn library(directory: String) -> std::result::Result<port::Library, port::PortError> {
-    port::library(&directory).map_err(port::PortError::from)
+pub fn library(
+    directory: String,
+    after: Option<String>,
+) -> std::result::Result<port::Library, port::PortError> {
+    port::library(&directory, after.as_deref()).map_err(port::PortError::from)
 }
 
 /// Uploads a drop of files and folders into the port's library under `into`

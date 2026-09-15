@@ -233,12 +233,19 @@ final class PortStore: ObservableObject {
         }
     }
 
-    func library(_ directory: String, done: @escaping (Library?) -> Void) {
-        run(.deliver) { try VotportCore.library(directory: directory) } then: { [weak self] result in
+    func library(
+        _ directory: String,
+        after: String?,
+        isCurrent: @escaping @MainActor () -> Bool,
+        done: @escaping (Library?) -> Void
+    ) {
+        run(.deliver) { try VotportCore.library(directory: directory, after: after) } then: { [weak self] result in
             switch result {
             case .success(let listing): done(listing)
             case .failure(let error):
-                self?.take(error, .deliver)
+                if case let .Failed(_, _, signedOut) = error, signedOut || isCurrent() {
+                    self?.take(error, .deliver)
+                }
                 done(nil)
             }
         }

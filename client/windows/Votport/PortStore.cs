@@ -167,8 +167,8 @@ public sealed class PortStore
     public void RevokeDelivery(string id) =>
         Run(Scope.Links, () => { VotportClientCoreMethods.RevokeDelivery(id); return true; }, _ => Refresh());
 
-    internal void Library(string directory, Action<Library?> done) =>
-        Run(Scope.Deliver, () => VotportClientCoreMethods.Library(directory), done, () => done(null));
+    internal void Library(string directory, string? after, Func<bool> isCurrent, Action<Library?> done) =>
+        Run(Scope.Deliver, () => VotportClientCoreMethods.Library(directory, after), done, () => done(null), isCurrent);
 
     /// Uploads a drop (files, and folders with everything under them) into
     /// the port under `into` and hands back every library file made.
@@ -227,9 +227,9 @@ public sealed class PortStore
 
     /// Runs `work` on its own thread (a core call blocks for its round trips
     /// and through the retry budget) and hands the result to `done` on the
-    /// UI thread. A failure sets the problem; a session the server ended
+    /// UI thread. A current failure sets the problem; a session the server ended
     /// clears the port so the pages fold.
-    private void Run<T>(Scope scope, Func<T> work, Action<T> done, Action? failed = null)
+    private void Run<T>(Scope scope, Func<T> work, Action<T> done, Action? failed = null, Func<bool>? isCurrent = null)
     {
         inFlight++;
         Busy = true;
@@ -254,10 +254,13 @@ public sealed class PortStore
                 if (problem is null) done(result!);
                 else
                 {
-                    // Stamped at the failure, so a slow call landing after a
-                    // later one still reports under its own form.
-                    Problem = problem;
-                    ProblemScope = scope;
+                    if (signedOut || isCurrent is null || isCurrent())
+                    {
+                        // Stamped at the failure, so a slow call landing after a
+                        // later one still reports under its own form.
+                        Problem = problem;
+                        ProblemScope = scope;
+                    }
                     if (signedOut)
                     {
                         Port = null;

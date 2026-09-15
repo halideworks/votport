@@ -48,7 +48,7 @@ public sealed partial class SettingsPage : Page
             var row = new StackPanel { Spacing = 3 };
             row.Children.Add(new TextBlock { Text = token.Label });
             row.Children.Add(new TextBlock { Text = token.Directory ?? "Any folder" });
-            row.Children.Add(new TextBlock { Text = string.Join(", ", token.Permissions.Select(p => p switch { "library:read" => "Browse files", "deliveries:create" => "Create deliveries", "deliveries:read" => "Read activity", "deliveries:revoke" => "Revoke deliveries", _ => p })), TextWrapping = TextWrapping.Wrap });
+            row.Children.Add(new TextBlock { Text = string.Join(", ", token.Permissions.Select(p => p switch { "library:read" => "Browse files", "deliveries:create" => "Create deliveries", "deliveries:read" => "Read activity", "deliveries:revoke" => "Revoke deliveries", "jobs:read" => "Read project jobs and verification", "jobs:create" => "Create and retry project jobs", "jobs:cancel" => "Cancel project jobs", _ => p })), TextWrapping = TextWrapping.Wrap });
             row.Children.Add(new TextBlock { Text = $"Expires {DateTimeOffset.FromUnixTimeSeconds((long)token.ExpiresAt):g}" });
             if (token.LastUsedAt is ulong used) row.Children.Add(new TextBlock { Text = $"Last used {DateTimeOffset.FromUnixTimeSeconds((long)used):g}" });
             if (token.RevokedAt is not null) row.Children.Add(new TextBlock { Text = "Revoked" });

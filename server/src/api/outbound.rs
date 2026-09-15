@@ -69,6 +69,7 @@ const OUTBOUND_UPLOAD_ID: &str = "x-votport-upload-id";
 const MAX_OUTBOUND_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_LIBRARY_DIRECTORY_INPUT_BYTES: usize = 1024;
 const MAX_LIBRARY_DIRECTORY_ENTRIES: usize = 1000;
+pub(super) const MAX_LIBRARY_CURSOR_BYTES: usize = 4096;
 const MAX_LIBRARY_PROJECT_FILES: usize = 1_000_000;
 const MAX_LIBRARY_SELECTION_FILES: usize = 100_000;
 const MAX_LIBRARY_PATHS_FILES: usize = 1_000_000;
@@ -310,6 +311,8 @@ pub struct OutboundListQuery {
     directory: Option<String>,
     q: Option<String>,
     selection: Option<String>,
+    after: Option<String>,
+    limit: Option<String>,
 }
 
 pub async fn list_outbound_files(
@@ -333,6 +336,14 @@ pub async fn list_outbound_files(
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "library listing modes cannot be combined",
+        ));
+    }
+    if (query.after.is_some() || query.limit.is_some())
+        && (query.q.is_some() || query.selection.is_some())
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "pagination is only supported for directory listings",
         ));
     }
     if let Some(selection) = query.selection {
@@ -378,6 +389,8 @@ pub async fn list_outbound_files(
             ));
         }
         let directory = directory.trim_matches('/').to_owned();
+        let (after, limit) =
+            library_directory_paging(&directory, query.after.as_deref(), query.limit.as_deref())?;
         if identity.tenant.is_empty()
             && directory
                 .split('/')
@@ -394,20 +407,24 @@ pub async fn list_outbound_files(
         } else {
             safe_library_path(&app, &identity.tenant, &directory)?
         };
-        let result = tokio::task::spawn_blocking(move || list_library_directory(&root, &path))
-            .await
-            .map_err(|_| ApiError::internal("list outbound files failed"))?
-            .map_err(|_| {
-                ApiError::new(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "directory must contain only directories",
-                )
-            })?;
+        let result = tokio::task::spawn_blocking(move || {
+            list_library_directory(&root, &path, &after, limit)
+        })
+        .await
+        .map_err(|_| ApiError::internal("list outbound files failed"))?
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "directory must contain only directories",
+            )
+        })?;
+        let next_cursor = result.2.then(|| next_library_cursor(&result.0, &result.1));
         return Ok(Json(json!({
             "directory": directory,
             "directories": result.0,
             "files": result.1,
             "truncated": result.2,
+            "next_cursor": next_cursor,
         })));
     }
     Err(ApiError::new(
@@ -1088,13 +1105,6 @@ fn library_directory_safe(root: &Path, directory: &Path) -> bool {
         .is_ok_and(|meta| meta.file_type().is_dir() && !meta.file_type().is_symlink())
 }
 
-fn direct_library_entries(
-    root: &Path,
-    directory: &Path,
-) -> io::Result<(Vec<String>, Vec<serde_json::Value>, bool)> {
-    direct_library_entries_page(root, directory, "", MAX_LIBRARY_DIRECTORY_ENTRIES)
-}
-
 fn direct_library_entries_page(
     root: &Path,
     directory: &Path,
@@ -1109,6 +1119,12 @@ fn direct_library_entries_page(
         if is_private_library_name(&name) {
             continue;
         }
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.contains('\\') {
+            continue;
+        }
         let path = entry.path();
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
@@ -1116,11 +1132,7 @@ fn direct_library_entries_page(
         if meta.file_type().is_symlink() {
             continue;
         }
-        if directory == root
-            && name
-                .to_str()
-                .is_some_and(|name| name.eq_ignore_ascii_case(crate::paths::TENANT_STORAGE_DIR))
-        {
+        if directory == root && name.eq_ignore_ascii_case(crate::paths::TENANT_STORAGE_DIR) {
             continue;
         }
         let Some(relative) = path.strip_prefix(root).ok() else {
@@ -1154,9 +1166,72 @@ fn direct_library_entries_page(
     Ok((directories, files, truncated))
 }
 
+fn next_library_cursor(directories: &[String], files: &[serde_json::Value]) -> String {
+    directories
+        .iter()
+        .map(String::as_str)
+        .chain(files.iter().filter_map(|file| file["path"].as_str()))
+        .max()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn library_cursor_matches_directory(directory: &str, after: &str) -> bool {
+    if after.is_empty()
+        || after.contains('\\')
+        || after
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return after.is_empty();
+    }
+    after
+        .rsplit_once('/')
+        .map_or(directory.is_empty(), |(parent, _)| parent == directory)
+}
+
+fn library_directory_paging(
+    directory: &str,
+    after: Option<&str>,
+    raw_limit: Option<&str>,
+) -> ApiResult<(String, usize)> {
+    let after = after.unwrap_or_default();
+    if after.len() > MAX_LIBRARY_CURSOR_BYTES {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "cursor is too long",
+        ));
+    }
+    if !library_cursor_matches_directory(directory, after) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "cursor does not belong to this directory",
+        ));
+    }
+    let limit = raw_limit
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "limit must be an integer between 1 and 1000",
+            )
+        })?
+        .unwrap_or(MAX_LIBRARY_DIRECTORY_ENTRIES);
+    if !(1..=MAX_LIBRARY_DIRECTORY_ENTRIES).contains(&limit) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "limit must be between 1 and 1000",
+        ));
+    }
+    Ok((after.to_owned(), limit))
+}
+
 fn list_library_directory(
     root: &Path,
     directory: &Path,
+    after: &str,
+    limit: usize,
 ) -> Result<(Vec<String>, Vec<serde_json::Value>, bool), ()> {
     if !library_root_safe(root) {
         return Ok((Vec::new(), Vec::new(), false));
@@ -1167,7 +1242,7 @@ fn list_library_directory(
         }
         return Err(());
     }
-    direct_library_entries(root, directory).map_err(|_| ())
+    direct_library_entries_page(root, directory, after, limit).map_err(|_| ())
 }
 
 fn search_library_dir(
@@ -9134,6 +9209,67 @@ mod tests {
 
         let response = crate::app::router(app.clone())
             .oneshot(
+                Request::get("/api/admin/outbound-files?directory=&limit=2")
+                    .header("cookie", admin_cookie(&app))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let first_page = body(response).await;
+        assert_eq!(first_page["directories"], json!(["adir"]));
+        assert_eq!(
+            first_page["files"],
+            json!([{ "path": "a.bin", "bytes": 1 }])
+        );
+        assert_eq!(first_page["truncated"], true);
+        assert_eq!(first_page["next_cursor"], "adir");
+
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get("/api/admin/outbound-files?directory=&limit=2&after=adir")
+                    .header("cookie", admin_cookie(&app))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let second_page = body(response).await;
+        assert_eq!(second_page["directories"], json!(["zdir"]));
+        assert_eq!(
+            second_page["files"],
+            json!([{ "path": "z.bin", "bytes": 1 }])
+        );
+        assert_eq!(second_page["truncated"], false);
+        assert!(second_page["next_cursor"].is_null());
+
+        for query in [
+            "?directory=adir&limit=2&after=z.bin",
+            "?q=adir&after=adir",
+            "?directory=&limit=0",
+            "?directory=&limit=1001",
+            "?directory=&limit=nope",
+        ] {
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::get(format!("/api/admin/outbound-files{query}"))
+                        .header("cookie", admin_cookie(&app))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{query}"
+            );
+        }
+
+        let response = crate::app::router(app.clone())
+            .oneshot(
                 Request::get(format!(
                     "/api/admin/outbound-files?directory={}",
                     crate::paths::TENANT_STORAGE_DIR
@@ -9206,6 +9342,19 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn library_pages_skip_literal_backslash_direct_filenames() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a\\b"), b"skip").unwrap();
+        std::fs::write(directory.path().join("portable"), b"keep").unwrap();
+        let (directories, files, truncated) =
+            direct_library_entries_page(directory.path(), directory.path(), "", 1).unwrap();
+        assert!(directories.is_empty());
+        assert_eq!(files, [json!({ "path": "portable", "bytes": 4 })]);
+        assert!(!truncated);
     }
 
     #[tokio::test]
@@ -9302,8 +9451,13 @@ mod tests {
         for index in 0..=MAX_LIBRARY_DIRECTORY_ENTRIES {
             std::fs::write(directory.path().join(format!("file-{index:04}.bin")), b"x").unwrap();
         }
-        let (directories, files, truncated) =
-            direct_library_entries(directory.path(), directory.path()).unwrap();
+        let (directories, files, truncated) = direct_library_entries_page(
+            directory.path(),
+            directory.path(),
+            "",
+            MAX_LIBRARY_DIRECTORY_ENTRIES,
+        )
+        .unwrap();
         assert!(directories.is_empty());
         assert_eq!(files.len(), MAX_LIBRARY_DIRECTORY_ENTRIES);
         assert!(truncated);

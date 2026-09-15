@@ -49,17 +49,32 @@ struct TransferCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Image(systemName: item.kind == .send ? "sailboat" : "arrow.down.doc")
-                    .foregroundStyle(Tokens.muted)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(item.subject)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Text(Format.statusLine(item))
-                        .font(Type.caption.monospacedDigit())
-                        .foregroundStyle(statusColor)
-                        .fixedSize(horizontal: false, vertical: true)
+                Button(action: toggle) {
+                    HStack {
+                        Image(systemName: item.kind == .send ? "sailboat" : "arrow.down.doc")
+                            .foregroundStyle(Tokens.muted)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.subject)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Text(Format.statusLine(item))
+                                .font(Type.caption.monospacedDigit())
+                                .foregroundStyle(statusColor)
+                                .fixedSize(horizontal: false, vertical: true)
+                            if !item.running {
+                                Text("Started \(item.started.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(Type.caption)
+                                    .foregroundStyle(Tokens.muted)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                .buttonStyle(.plain)
+                .accessibilityElement(children: .combine)
+                .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+                .accessibilityHint(expanded ? "Collapse transfer details" : "Expand transfer details")
                 Spacer()
                 if item.running {
                     Button("Pause") { store.pause(item.id) }
@@ -120,8 +135,6 @@ struct TransferCard: View {
         .padding(14)
         .background(Tokens.panel)
         .clipShape(RoundedRectangle(cornerRadius: 8))
-        .contentShape(Rectangle())
-        .onTapGesture(perform: toggle)
     }
 
     private var statusColor: Color {

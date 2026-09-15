@@ -13,6 +13,9 @@ struct DeliverView: View {
     let manageLinks: () -> Void
     @State private var directory = ""
     @State private var listing: Library?
+    @State private var pageAfter: String?
+    @State private var pageHistory: [String?] = []
+    @State private var pageGeneration = 0
     @State private var chosen: Set<String> = []
     // The local day, not the core's UTC one: an evening drop belongs to today.
     @State private var into = Date.now.formatted(Date.ISO8601FormatStyle(timeZone: .current).year().month().day())
@@ -144,10 +147,14 @@ struct DeliverView: View {
                     .foregroundStyle(target == directory ? Tokens.text : Tokens.progress)
             }
             Spacer()
-            if let listing, listing.truncated {
-                Text("More files than shown")
-                    .font(Type.caption)
-                    .foregroundStyle(Tokens.muted)
+            if !pageHistory.isEmpty {
+                Button("Previous page") { previousPage() }
+            }
+            if listing?.nextCursor != nil {
+                Button("Next page") { nextPage() }
+            }
+            if listing?.truncated == true {
+                Text("More files than shown").font(Type.caption).foregroundStyle(Tokens.muted)
             }
         }
         .font(Type.monoCallout)
@@ -156,15 +163,15 @@ struct DeliverView: View {
     private var browser: some View {
         List {
             if let listing {
-                ForEach(listing.directories, id: \.self) { name in
+                ForEach(listing.directories, id: \.self) { path in
                     // A button, not a tap gesture: it answers the keyboard
                     // and assistive presses as well as the mouse.
                     Button {
-                        open(directory.isEmpty ? name : "\(directory)/\(name)")
+                        open(path)
                     } label: {
                         HStack {
                             Image(systemName: "folder").foregroundStyle(Tokens.muted)
-                            Text(name).font(Type.monoBody)
+                            Text(name(of: path)).font(Type.monoBody)
                             Spacer()
                         }
                         .contentShape(Rectangle())
@@ -250,10 +257,37 @@ struct DeliverView: View {
 
     private func open(_ target: String) {
         directory = target
+        pageAfter = nil
+        pageHistory = []
+        loadPage()
+    }
+
+    private func loadPage() {
+        let target = directory
+        let after = pageAfter
+        pageGeneration += 1
+        let generation = pageGeneration
         listing = nil
-        port.library(target) { result in
-            if directory == target { listing = result }
+        port.library(target, after: after, isCurrent: {
+            pageGeneration == generation && directory == target && pageAfter == after
+        }) { result in
+            if pageGeneration == generation && directory == target && pageAfter == after {
+                listing = result
+            }
         }
+    }
+
+    private func previousPage() {
+        guard let previous = pageHistory.popLast() else { return }
+        pageAfter = previous
+        loadPage()
+    }
+
+    private func nextPage() {
+        guard let next = listing?.nextCursor else { return }
+        pageHistory.append(pageAfter)
+        pageAfter = next
+        loadPage()
     }
 
     private func issue() {

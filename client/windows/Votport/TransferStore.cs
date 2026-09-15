@@ -104,6 +104,7 @@ public sealed class TransferItem : INotifyPropertyChanged
 
     public bool NotRunning => !running;
     public bool CanReveal => !running && Kind == Kinds.Receive && landed.Length > 0;
+    public string StartedLabel => $"Started {Started:g}";
     /// The full error text behind a failed card's headline.
     public string Detail => view?.Detail ?? "";
     public bool HasDetail => view?.Detail is not null;
