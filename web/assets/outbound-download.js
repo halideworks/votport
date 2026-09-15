@@ -1,6 +1,7 @@
 // Pure helpers for the public separate-download flow.
 
 export const FILE_RENDER_BATCH_SIZE = 100;
+export const METADATA_PAGE_SIZE = 500;
 export const BATCH_DOWNLOAD_THRESHOLD = 100;
 export const BATCH_LARGE_FILE_BYTES = 1024 ** 3;
 export class BatchDownloadUnsupportedError extends Error {}
@@ -183,9 +184,9 @@ export async function streamToWritable(fetchFn, writable, file, options = {}) {
   }
 }
 
-export function nextFileBatch(files, offset = 0) {
+export function nextFileBatch(files, offset = 0, limit = FILE_RENDER_BATCH_SIZE) {
   const start = Math.max(0, Math.min(offset, files.length));
-  return files.slice(start, start + FILE_RENDER_BATCH_SIZE);
+  return files.slice(start, start + limit);
 }
 
 export function metadataMoreAvailable(renderedCount, loadedCount, hasMore) {
@@ -235,7 +236,7 @@ export function appendMetadataPage(state, page) {
   return { files, total: page.files_total, hasMore };
 }
 
-export function publicMetadataPageUrl(token, offset = 0, limit = FILE_RENDER_BATCH_SIZE) {
+export function publicMetadataPageUrl(token, offset = 0, limit = METADATA_PAGE_SIZE) {
   const query = new URLSearchParams({ offset: String(offset), limit: String(limit) });
   return `/api/s/${encodeURIComponent(token)}?${query}`;
 }

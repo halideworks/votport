@@ -1079,6 +1079,9 @@ mod status_cache_tests {
     #[tokio::test]
     async fn stuck_refresh_keeps_live_status_response_available() {
         let directory = tempfile::tempdir().unwrap();
+        let assets = directory.path().join("web/assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(assets.join("status-strip.js"), b"").unwrap();
         let application = crate::api::testing::build(directory.path());
         let cookie = test_admin_cookie(&application, &auth::AdminIdentity::local_admin());
         application.admin_status.state.lock().unwrap().running = true;
@@ -1348,8 +1351,8 @@ pub(crate) fn admin_page_session(app: &App, headers: &HeaderMap) -> Option<Admin
 
 pub(crate) fn admin_session_view(identity: &auth::AdminIdentity) -> serde_json::Value {
     // Which dashboard pages this principal may open. Named tenants get their
-    // own links plus a tenant-filtered audit view; platform administration
-    // (tenants, system) is default-tenant admin only.
+    // own links plus a tenant-filtered audit view; only the Branding view of
+    // Tenants is available outside the default-tenant platform admin.
     let mut pages = if identity.role == "auditor" {
         vec!["audit"]
     } else {
@@ -1364,8 +1367,10 @@ pub(crate) fn admin_session_view(identity: &auth::AdminIdentity) -> serde_json::
             "audit",
         ]
     };
-    if identity.tenant.is_empty() && identity.role == "admin" {
+    if identity.role == "admin" {
         pages.push("tenants");
+    }
+    if identity.tenant.is_empty() && identity.role == "admin" {
         pages.push("system");
     }
     json!({
@@ -8277,6 +8282,19 @@ mod settings_api_tests {
     #[tokio::test]
     async fn admin_html_bootstraps_only_the_authenticated_navigation() {
         let directory = tempfile::tempdir().unwrap();
+        let web = directory.path().join("web");
+        std::fs::create_dir_all(&web).unwrap();
+        for (page, contents) in [
+            ("index.html", "<html><head></head><body></body></html>"),
+            (
+                "audit.html",
+                "<html><head></head><body><nav id=\"nav\" class=\"nav\"></nav></body></html>",
+            ),
+            ("request.html", "<html><head></head><body></body></html>"),
+            ("tenants.html", include_str!("../../../web/tenants.html")),
+        ] {
+            std::fs::write(web.join(page), contents).unwrap();
+        }
         let application = testing::build(directory.path());
         for key in ["team", "</script><script>oops</script>"] {
             application
@@ -8287,6 +8305,7 @@ mod settings_api_tests {
         for (tenant, role) in [
             ("", "admin"),
             ("team", "operator"),
+            ("team", "admin"),
             ("team", "auditor"),
             ("</script><script>oops</script>", "viewer"),
         ] {
@@ -8352,6 +8371,46 @@ mod settings_api_tests {
             }
             assert_eq!(nav.matches("aria-current=\"page\"").count(), 1);
             assert!(nav.contains("href=\"/audit\" class=\"active\" aria-current=\"page\""));
+            if tenant == "team" && role == "admin" {
+                assert!(expected["pages"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("tenants")));
+                assert!(!expected["pages"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("system")));
+                assert!(nav.contains(
+                    "href=\"/tenants\" data-hint=\"Set how recipients see this tenant.\">Branding</a>"
+                ));
+                assert!(!nav.contains(">Tenants</a>"));
+            }
+            if (tenant.is_empty() || tenant == "team") && role == "admin" {
+                let response = app::router(application.clone())
+                    .oneshot(
+                        Request::get("/tenants")
+                            .header(header::COOKIE, &cookie)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let html = std::str::from_utf8(&bytes).unwrap();
+                let expected_title = if tenant == "team" {
+                    "<title>VOTPort &middot; Branding</title>"
+                } else {
+                    "<title>VOTPort &middot; Tenants</title>"
+                };
+                let expected_heading = if tenant == "team" {
+                    "<h1 id=\"page-title\">Branding</h1>"
+                } else {
+                    "<h1 id=\"page-title\">Tenant namespaces</h1>"
+                };
+                assert!(html.contains(expected_title), "{expected_title}");
+                assert!(html.contains(expected_heading), "{expected_heading}");
+            }
         }
         for route in ["/audit", "/r/public-link", "/"] {
             let response = app::router(application.clone())

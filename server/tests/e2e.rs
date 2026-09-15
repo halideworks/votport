@@ -2670,8 +2670,15 @@ async fn post_chunk_entry(
     )
 }
 
-fn twenty_mib() -> ClientFile {
-    let bytes: Vec<u8> = (0..20 * 1024 * 1024)
+fn chunk_plus_one() -> ClientFile {
+    let bytes: Vec<u8> = (0..CHUNK as usize + 1)
+        .map(|index| (index * 7 % 251) as u8)
+        .collect();
+    prepare(vec!["resume.bin"], bytes)
+}
+
+fn two_chunks_plus_one() -> ClientFile {
+    let bytes: Vec<u8> = (0..2 * CHUNK as usize + 1)
         .map(|index| (index * 7 % 251) as u8)
         .collect();
     prepare(vec!["resume.bin"], bytes)
@@ -2700,7 +2707,7 @@ async fn upload_session_survives_a_restart() {
         .cookie_store(true)
         .build()
         .unwrap();
-    let files = [twenty_mib()];
+    let files = [two_chunks_plus_one()];
     let file = &files[0];
     let now_before_restart = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2807,7 +2814,7 @@ async fn restart_refuses_corrupted_staging() {
         .cookie_store(true)
         .build()
         .unwrap();
-    let files = [twenty_mib()];
+    let files = [two_chunks_plus_one()];
     let file = &files[0];
     let (_token, session) = open_session(&client, &server.base, "corrupt", &files).await;
     let base = server.base.clone();
@@ -2877,7 +2884,7 @@ async fn multi_file_session_survives_a_restart_after_one_file_published() {
     let small: Vec<u8> = (0..3 * 1024 * 1024)
         .map(|index| (index % 239) as u8)
         .collect();
-    let files = [prepare(vec!["first.bin"], small), twenty_mib()];
+    let files = [prepare(vec!["first.bin"], small), two_chunks_plus_one()];
     let (token, session) = open_session(&client, &server.base, "multi", &files).await;
     let base = server.base.clone();
     assert_eq!(begin(&client, &base, &session).await.0, 200);
@@ -2991,7 +2998,7 @@ async fn abandoned_session_records_its_published_files_as_partial() {
     let small: Vec<u8> = (0..3 * 1024 * 1024)
         .map(|index| (index % 241) as u8)
         .collect();
-    let files = [prepare(vec!["first.bin"], small), twenty_mib()];
+    let files = [prepare(vec!["first.bin"], small), chunk_plus_one()];
     let (token, session) = open_session(&client, &server.base, "partial", &files).await;
     let base = server.base.clone();
     assert_eq!(begin(&client, &base, &session).await.0, 200);
@@ -3077,7 +3084,7 @@ async fn early_finish_keeps_the_session_resumable() {
     let small: Vec<u8> = (0..2 * 1024 * 1024)
         .map(|index| (index % 233) as u8)
         .collect();
-    let files = [prepare(vec!["first.bin"], small), twenty_mib()];
+    let files = [prepare(vec!["first.bin"], small), chunk_plus_one()];
     let (_token, session) = open_session(&client, &server.base, "early", &files).await;
     let base = server.base.clone();
     assert_eq!(begin(&client, &base, &session).await.0, 200);
@@ -3121,7 +3128,7 @@ async fn refused_resume_records_published_files_as_partial() {
     let small: Vec<u8> = (0..2 * 1024 * 1024)
         .map(|index| (index % 251) as u8)
         .collect();
-    let files = [prepare(vec!["first.bin"], small), twenty_mib()];
+    let files = [prepare(vec!["first.bin"], small), chunk_plus_one()];
     let (token, session) = open_session(&client, &server.base, "refused", &files).await;
     let base = server.base.clone();
     assert_eq!(begin(&client, &base, &session).await.0, 200);
@@ -3395,7 +3402,7 @@ async fn restart_preserves_a_truncated_staging_session() {
         .cookie_store(true)
         .build()
         .unwrap();
-    let files = [twenty_mib()];
+    let files = [chunk_plus_one()];
     let file = &files[0];
     let (token, session) = open_session(&client, &server.base, "truncated", &files).await;
     server
@@ -3478,7 +3485,7 @@ async fn resumed_session_end_counts_bytes_from_before_the_restart() {
             .cookie_store(true)
             .build()
             .unwrap();
-        let files = [twenty_mib()];
+        let files = [chunk_plus_one()];
         let (_token, session) = open_session(&client, &server.base, "resumed-end", &files).await;
         let base = server.base.clone();
         assert_eq!(begin(&client, &base, &session).await.0, 200);

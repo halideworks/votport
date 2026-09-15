@@ -52,6 +52,7 @@ export function appendObjectCard(parent, file, options = {}) {
   id.className = "mono muted file-id";
   id.title = "Copy identity";
   id.setAttribute("role", "button");
+  id.setAttribute("aria-label", `Copy file hash: ${file.name}`);
   id.tabIndex = 0;
   id.textContent = identityLine(file);
   const copy = () => navigator.clipboard.writeText(identityLine(file));

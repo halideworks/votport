@@ -55,7 +55,8 @@ fs.writeFileSync(path.join(dir, "archive.tar"), big);
 const browser = await browserType.launch({
   env: { ...process.env, LANG: "C.UTF-8", LC_ALL: "C.UTF-8" },
 });
-const page = await browser.newPage();
+const context = await browser.newContext();
+const page = await context.newPage();
 page.on("dialog", (dialog) => dialog.accept());
 const errors = [];
 page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
@@ -101,7 +102,7 @@ async function collectDownloads(action, count) {
 // Headless Chromium does not provide a deterministic folder chooser. Force
 // the supported anchor-download fallback so this path is exercised in CI.
 await page.addInitScript(() => {
-  Object.defineProperty(window, "showDirectoryPicker", { value: undefined });
+  Object.defineProperty(window, "showDirectoryPicker", { value: undefined, configurable: true, writable: true });
 });
 
 const genericSsoError = "SSO sign-in failed. Try again or contact your administrator.";
@@ -632,7 +633,7 @@ const receivedUpload = receivedHeaders.uploads[0];
 if (browserEngine === "chromium") {
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
 }
-await page.click("#done-list li:first-child .file-id");
+await page.locator("#done-list").getByRole("button", { name: `Copy file hash: ${cards[0].name}`, exact: true }).press("Enter");
 if (browserEngine === "chromium") {
   const copied = await page.evaluate(() => navigator.clipboard.readText());
   if (copied !== ids[0]) {
@@ -1655,6 +1656,299 @@ if ((await page.evaluate(() => typeof window.showDirectoryPicker)) !== "undefine
 if (!(await page.textContent("#separate-download-note")).includes("multiple downloads")) {
   throw new Error("separate download fallback note is missing");
 }
+
+// Metadata disclosure keeps the network page at 500 while the visible list
+// grows by at most 500 rows per explicit Show more action.
+const publicToken = new URL(outboundUrl).pathname.split("/").filter(Boolean).pop();
+const publicPath = `/api/s/${publicToken}`;
+const realMetadata = await page.evaluate(async () => {
+  const token = location.pathname.split("/").filter(Boolean).pop();
+  return fetch(`/api/s/${encodeURIComponent(token)}?offset=0&limit=500`, {
+    credentials: "same-origin",
+  }).then((response) => response.json());
+});
+const metadataFixture = Array.from({ length: 1201 }, (_, index) => ({
+  name: `fixture-${String(index).padStart(4, "0")}.txt`,
+  suite: "blake3",
+  root: `fixture-root-${index}`,
+  bytes: 1,
+  download_url: `${publicPath}/files/${index}`,
+  receipt_url: `${publicPath}/receipts/${index}`,
+}));
+const metadataOffsets = [];
+let corruptMetadataOffset = null;
+const metadataRoute = async (route) => {
+  const requestUrl = new URL(route.request().url());
+  if (requestUrl.pathname !== publicPath || !requestUrl.searchParams.has("offset")) return route.continue();
+  const offset = Number(requestUrl.searchParams.get("offset"));
+  const limit = Number(requestUrl.searchParams.get("limit"));
+  const files = metadataFixture.slice(offset, offset + limit);
+  metadataOffsets.push(offset);
+  const total = corruptMetadataOffset === offset ? 1202 : metadataFixture.length;
+  if (corruptMetadataOffset === offset) corruptMetadataOffset = null;
+  return route.fulfill({
+    status: 200,
+    json: {
+      ...realMetadata,
+      files,
+      files_total: total,
+      offset,
+      limit,
+      has_more: offset + files.length < total,
+      total_bytes: metadataFixture.length,
+    },
+  });
+};
+await page.route("**/api/s/*?*", metadataRoute);
+await page.reload();
+await page.waitForSelector("#download-content:not([hidden])");
+const metadataRows = () => page.locator("#object > li");
+await page.waitForFunction(() => document.getElementById("file-list-status").textContent === "Showing 100 of 1201 files");
+if (await metadataRows().count() !== 100) throw new Error("metadata initial render exceeded 100 rows");
+for (const expected of [600, 1100, 1201]) {
+  await page.click("#show-more-files");
+  await page.waitForFunction((count) => document.getElementById("file-list-status").textContent === `Showing ${count} of 1201 files`, expected);
+  const count = await metadataRows().count();
+  if (count !== expected) throw new Error(`metadata Show more rendered ${count}, expected ${expected}`);
+}
+if (JSON.stringify([...new Set(metadataOffsets)]) !== JSON.stringify([0, 500, 1000])) {
+  throw new Error(`metadata page offsets: ${JSON.stringify(metadataOffsets)}`);
+}
+console.log("public metadata pages and disclosure window: ok");
+
+// A changed total must leave the already visible rows untouched and surface a
+// bounded error instead of appending an untrusted page.
+corruptMetadataOffset = 500;
+metadataOffsets.length = 0;
+await page.reload();
+await page.waitForFunction(() => document.getElementById("file-list-status").textContent === "Showing 100 of 1201 files");
+await page.click("#show-more-files");
+await page.waitForFunction(() => document.getElementById("file-list-status").textContent.includes("total changed"));
+if (await metadataRows().count() !== 100) throw new Error("metadata error changed visible rows");
+console.log("public metadata rejects changed totals without partial render: ok");
+await page.unroute("**/api/s/*?*", metadataRoute);
+await page.reload();
+await page.waitForSelector("#download-content:not([hidden])");
+for (const file of outboundFiles) {
+  await page.getByRole("button", { name: `Download file: ${PROJECT}/${file.name}`, exact: true }).waitFor();
+}
+
+// Exercise the saved-file path in the browser's real origin-private file
+// system. The picker is supplied by the test page, so no desktop chooser is
+// involved and the directory is removed before the page closes.
+if (await page.evaluate(() => typeof navigator.storage?.getDirectory === "function")) {
+  const savedFeedbackFolder = `saved-feedback-${Date.now()}`;
+  await page.evaluate(async (folder) => {
+    const root = await navigator.storage.getDirectory();
+    await root.getDirectoryHandle(folder, { create: true });
+  }, savedFeedbackFolder);
+  await page.addInitScript((folder) => {
+    window.showDirectoryPicker = async () => (await navigator.storage.getDirectory()).getDirectoryHandle(folder);
+    window.__savedFeedbackStatusWrites = 0;
+    window.__savedFeedbackFrameRequests = 0;
+    const writablePrototype = window.FileSystemWritableFileStream?.prototype;
+    const originalClose = writablePrototype?.close;
+    const originalRequestFrame = window.requestAnimationFrame.bind(window);
+    const originalCancelFrame = window.cancelAnimationFrame.bind(window);
+    let deterministic = false;
+    if (typeof originalClose === "function") {
+      deterministic = true;
+      const pendingFrames = new Map();
+      let nextFrame = 0;
+      let closeStarted = 0;
+      let closeCompleted = 0;
+      let resolveFirstThree;
+      let releaseFourth;
+      const firstThreeDone = new Promise((resolve) => { resolveFirstThree = resolve; });
+      const fourthGate = new Promise((resolve) => { releaseFourth = resolve; });
+      writablePrototype.close = async function(...args) {
+        const order = ++closeStarted;
+        if (order >= 4) {
+          await firstThreeDone;
+          await fourthGate;
+        }
+        const result = await originalClose.apply(this, args);
+        closeCompleted += 1;
+        if (closeCompleted === 3) resolveFirstThree();
+        return result;
+      };
+      window.requestAnimationFrame = (callback) => {
+        const id = ++nextFrame;
+        window.__savedFeedbackFrameRequests += 1;
+        pendingFrames.set(id, callback);
+        return id;
+      };
+      window.cancelAnimationFrame = (id) => pendingFrames.delete(id);
+      window.__savedFeedbackCloseCompleted = () => closeCompleted;
+      window.__savedFeedbackPendingFrames = () => pendingFrames.size;
+      window.__savedFeedbackReleaseFrame = () => {
+        const next = pendingFrames.entries().next();
+        if (next.done) return false;
+        pendingFrames.delete(next.value[0]);
+        next.value[1](performance.now());
+        return true;
+      };
+      window.__savedFeedbackReleaseClose = releaseFourth;
+    } else {
+      window.requestAnimationFrame = (callback) => {
+        window.__savedFeedbackFrameRequests += 1;
+        return originalRequestFrame(callback);
+      };
+    }
+    window.__savedFeedbackDeterministic = deterministic;
+    window.__restoreSavedFeedbackInstrumentation = () => {
+      if (writablePrototype && originalClose) writablePrototype.close = originalClose;
+      window.requestAnimationFrame = originalRequestFrame;
+      window.cancelAnimationFrame = originalCancelFrame;
+    };
+  }, savedFeedbackFolder);
+  await page.reload();
+  await page.waitForSelector("#download-content:not([hidden])");
+  await page.evaluate(() => {
+    window.__savedFeedbackStatusWrites = 0;
+    window.__savedFeedbackFrameRequests = 0;
+    const status = document.getElementById("separate-download-status");
+    window.__savedFeedbackStatusObserver = new MutationObserver((records) => {
+      window.__savedFeedbackStatusWrites += records.filter((record) =>
+        record.target === status || record.target.parentElement === status
+      ).length;
+    });
+    window.__savedFeedbackStatusObserver.observe(status, { childList: true, characterData: true, subtree: true });
+  });
+  const deterministicSavedFeedback = await page.evaluate(() => window.__savedFeedbackDeterministic);
+  await page.click("#separate-download-button");
+  if (deterministicSavedFeedback) {
+    const heldWait = { polling: 50, timeout: 10000 };
+    await page.waitForFunction(() => window.__savedFeedbackCloseCompleted() === 3, null, heldWait);
+    const heldFeedback = await page.evaluate(() => ({
+      badges: document.querySelectorAll("#object .badge.on").length,
+      closeCompleted: window.__savedFeedbackCloseCompleted(),
+      frameRequests: window.__savedFeedbackFrameRequests,
+      pendingFrames: window.__savedFeedbackPendingFrames(),
+      statusWrites: window.__savedFeedbackStatusWrites,
+    }));
+    if (heldFeedback.closeCompleted !== 3 || heldFeedback.frameRequests !== 1 ||
+        heldFeedback.pendingFrames !== 1 || heldFeedback.statusWrites !== 0 || heldFeedback.badges !== 0) {
+      throw new Error(`saved feedback did not hold the first three callbacks: ${JSON.stringify(heldFeedback)}`);
+    }
+    console.log(`saved feedback held closes/frames/pending/status/badges: ${heldFeedback.closeCompleted}/${heldFeedback.frameRequests}/${heldFeedback.pendingFrames}/${heldFeedback.statusWrites}/${heldFeedback.badges}`);
+    await page.evaluate(() => window.__savedFeedbackReleaseFrame());
+    await page.waitForFunction(() => document.querySelectorAll("#object .badge.on").length === 3, null, heldWait);
+    const firstFeedback = await page.evaluate(() => ({
+      badges: document.querySelectorAll("#object .badge.on").length,
+      manifest: document.getElementById("manifest-status").textContent,
+      statusWrites: window.__savedFeedbackStatusWrites,
+    }));
+    console.log(`saved feedback first frame badges/manifest/status writes: ${firstFeedback.badges}/${firstFeedback.manifest}/${firstFeedback.statusWrites}`);
+    if (firstFeedback.badges !== 3 || firstFeedback.manifest !== "3 of 12 saved to this device" || firstFeedback.statusWrites !== 1) {
+      throw new Error(`saved feedback first frame: ${JSON.stringify(firstFeedback)}`);
+    }
+    await page.evaluate(() => window.__savedFeedbackReleaseClose());
+    await page.waitForFunction(() => window.__savedFeedbackCloseCompleted() === 12, null, heldWait);
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      if (!await page.evaluate(() => window.__savedFeedbackReleaseFrame())) break;
+    }
+  }
+  await page.waitForFunction(
+    () => document.getElementById("separate-download-status").textContent === "Downloaded 12 files.",
+    null,
+    { polling: 50, timeout: 10000 },
+  );
+  if (await page.locator("#object .badge.on").count() !== 12 ||
+      await page.textContent("#manifest-status") !== "12 of 12 saved to this device") {
+    throw new Error("saved file feedback did not mark each closed file once");
+  }
+  const savedFeedbackStats = await page.evaluate(() => {
+    window.__savedFeedbackStatusObserver.disconnect();
+    window.__restoreSavedFeedbackInstrumentation();
+    return {
+      deterministic: window.__savedFeedbackDeterministic,
+      closeCompleted: window.__savedFeedbackCloseCompleted?.() ?? null,
+      frameRequests: window.__savedFeedbackFrameRequests,
+      statusWrites: window.__savedFeedbackStatusWrites,
+    };
+  });
+  console.log(`saved feedback deterministic=${savedFeedbackStats.deterministic} closes=${savedFeedbackStats.closeCompleted} frames/status writes=${savedFeedbackStats.frameRequests}/${savedFeedbackStats.statusWrites}`);
+  if (savedFeedbackStats.deterministic && (savedFeedbackStats.closeCompleted !== 12 ||
+      savedFeedbackStats.frameRequests < 2 || savedFeedbackStats.statusWrites < 2)) {
+    throw new Error(`saved feedback terminal flush: ${JSON.stringify(savedFeedbackStats)}`);
+  }
+  await page.evaluate(async (folder) => {
+    const root = await navigator.storage.getDirectory();
+    await root.removeEntry(folder, { recursive: true });
+  }, savedFeedbackFolder);
+  console.log("saved file feedback and terminal status: ok");
+} else {
+  console.log("saved file feedback: origin-private file system unavailable in this browser");
+}
+await page.addInitScript(() => window.__restoreSavedFeedbackInstrumentation?.());
+await page.addInitScript(() => {
+  Object.defineProperty(window, "showDirectoryPicker", { value: undefined, configurable: true, writable: true });
+});
+await page.reload();
+await page.waitForSelector("#download-content:not([hidden])");
+
+// Each page has its own browser automatic-download allowance.
+const stopPage = await page.context().newPage();
+stopPage.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
+await stopPage.addInitScript(() => {
+  Object.defineProperty(window, "showDirectoryPicker", { value: undefined });
+});
+await stopPage.goto(outboundUrl);
+await stopPage.waitForSelector("#download-content:not([hidden])");
+let cancelledPreflightRequests = 0;
+const countCancelledPreflight = async (route) => {
+  cancelledPreflightRequests += 1;
+  await route.continue();
+};
+await stopPage.route("**/api/s/*/files/*", countCancelledPreflight);
+await stopPage.click("#separate-download-button");
+await stopPage.waitForSelector("#separate-download-confirm[open]");
+await stopPage.click("#separate-download-confirm form button[value=cancel]");
+await stopPage.waitForSelector("#separate-download-confirm:not([open])", { state: "hidden" });
+await stopPage.waitForTimeout(50);
+await stopPage.unroute("**/api/s/*/files/*", countCancelledPreflight);
+if (cancelledPreflightRequests !== 0) throw new Error("cancelled anchor preflight requested a payload");
+
+let stoppedAnchorDownloads = 0;
+const countStoppedDownloads = () => { stoppedAnchorDownloads += 1; };
+stopPage.on("download", countStoppedDownloads);
+const stopAfterSecondRequest = stopPage.evaluate(() => new Promise((resolve, reject) => {
+  const status = document.getElementById("separate-download-status");
+  const stop = document.getElementById("separate-download-stop");
+  let timer;
+  const observer = new MutationObserver(() => {
+    const match = /^Requested (\d+) of/.exec(status.textContent);
+    if (match && Number(match[1]) === 2) {
+      observer.disconnect();
+      clearTimeout(timer);
+      stop.click();
+      resolve(status.textContent);
+    }
+  });
+  observer.observe(status, { childList: true, characterData: true, subtree: true });
+  timer = setTimeout(() => { observer.disconnect(); reject(new Error("anchor stop progress did not reach two")); }, 10000);
+}));
+await stopPage.click("#separate-download-button");
+await stopPage.waitForSelector("#separate-download-confirm[open]");
+await stopPage.click("#separate-download-start");
+await stopAfterSecondRequest;
+await stopPage.waitForSelector("#separate-download-stop[hidden]", { state: "hidden" });
+await stopPage.waitForTimeout(100);
+stopPage.off("download", countStoppedDownloads);
+const stoppedStatus = await stopPage.textContent("#separate-download-status");
+if (!stoppedStatus.includes("Requested 2 of 12 downloads. Remaining requests stopped.")) {
+  throw new Error(`anchor stop status: ${stoppedStatus}`);
+}
+if (stoppedAnchorDownloads !== 2) {
+  throw new Error(`anchor stop continued work: downloads=${stoppedAnchorDownloads}`);
+}
+if (await stopPage.locator("#object .badge.on").count() !== 0) {
+  throw new Error("anchor requests incorrectly marked files as landed");
+}
+console.log("anchor preflight cancellation and stop feedback: ok");
+
+await stopPage.close();
 
 const streamedBatch = await page.evaluate(async (names) => {
   const token = location.pathname.split("/").filter(Boolean).pop();

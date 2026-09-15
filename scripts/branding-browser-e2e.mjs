@@ -70,6 +70,45 @@ try {
   await mobile.close();
   await api('admin/branding/default', { name: '', color: '', footer_text: '', footer_link_label: '', footer_link_url: '' }, 'PUT');
   await page.goto(base); assert.equal(await page.locator('.footer-custom').innerText(), '');
+  await page.route('**/api/admin/tenants', (route) => route.fulfill({ status: 503, json: { error: 'Tenant list fixture unavailable' } }), { times: 1 });
+  const principalsLoaded = page.waitForResponse((response) => response.url().includes('/api/admin/principals?'));
+  await page.goto(`${base}/tenants`);
+  await page.locator('#confirm-detail').getByText('Tenant list fixture unavailable', { exact: true }).waitFor();
+  assert.equal((await principalsLoaded).status(), 200);
+  await page.click('#confirm-cancel');
+
+  const tenant = `brand-${Date.now()}`;
+  await api('admin/tenants', { key: tenant, label: 'Tenant branding fixture' });
+  await api('admin/tenant', { tenant });
+  const initial = await context.request.get(`${base}/tenants`);
+  const html = await initial.text();
+  assert.match(html, /<title>VOTPort &middot; Branding<\/title>/);
+  assert.match(html, /<h1 id="page-title">Branding<\/h1>/);
+  const platformRequests = [];
+  const trackPlatformRequest = (request) => {
+    if (/\/api\/admin\/(tenants|holdings|principals)(?:[/?]|$)/.test(request.url())) platformRequests.push(request.url());
+  };
+  page.on('request', trackPlatformRequest);
+  await page.goto(`${base}/tenants`);
+  await page.locator('#self-branding').waitFor();
+  assert.ok(await page.locator('#platform-tenant-management').isHidden());
+  assert.equal(await page.locator('#nav a[href="/tenants"]').textContent(), 'Branding');
+  assert.equal(await page.locator('#nav a[href="/system"]').count(), 0);
+  const selfForm = page.locator('#self-branding-form form');
+  await selfForm.getByLabel('Brand name').fill('Named tenant');
+  await selfForm.getByLabel('Footer message').fill('Named footer');
+  const savedBranding = page.waitForResponse((response) => response.url().includes(`/api/admin/branding/${tenant}`) && response.request().method() === 'PUT');
+  await selfForm.getByRole('button', { name: 'Save branding' }).click();
+  assert.equal((await savedBranding).status(), 200);
+  await page.reload();
+  await page.waitForFunction(() => document.querySelector('#self-branding-form input')?.value === 'Named tenant');
+  assert.deepEqual(platformRequests, []);
+  page.off('request', trackPlatformRequest);
+  const namedLink = await api('admin/links', { label: 'Named footer fixture', dest: tenant, expires_days: 1, notifications: { mode: 'off' } });
+  await page.goto(namedLink.link.url);
+  await page.locator('#title').getByText('Named tenant', { exact: true }).waitFor();
+  assert.equal(await page.locator('.footer-custom').innerText(), 'Named footer');
+  await api('admin/tenant', { tenant: '' });
   assert.deepEqual(errors, []);
   console.log('Footer and hint browser checks passed: save/reload, recipient branding, safe text, credits, clear, local connection labels, mouse, keyboard, touch, and responsive layout.');
 } finally { await browser.close(); }

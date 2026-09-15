@@ -42,6 +42,7 @@ async function layout(name) {
       }
       return result;
     });
+    if (name === 'audit-automation-identity') assert.ok(await page.locator('.audit-field').evaluateAll((fields) => fields.every((field) => field.scrollWidth <= field.clientWidth + 1)), `Audit values stay within their fields at ${width}px`);
     if (defects.length) await page.screenshot({ path: path.join(root, `${name}-${width}-failure.png`), fullPage: true });
     assert.deepEqual(defects, [], `${name} at ${width}px`);
     if (name === 'receive-request-page') await page.locator('#links-range').scrollIntoViewIfNeeded();
@@ -258,12 +259,13 @@ try {
     await page.waitForLoadState('networkidle');
     await layout(name);
   }
-  await page.route('**/api/admin/audit?*', (route) => route.fulfill({ contentType: 'application/x-ndjson', body: JSON.stringify({ at: 1, rowid: 1, event: 'automation_refused', actor: `automation:${'a'.repeat(32)}`, detail: { permission: 'deliveries:create' } }) + '\n' }));
+  await page.route('**/api/admin/audit?*', (route) => route.fulfill({ contentType: 'application/x-ndjson', body: JSON.stringify({ at: 1, rowid: 1, event: 'automation_refused', tenant: 'a'.repeat(128), actor: `automation:${'a'.repeat(128)}`, detail: { permission: 'deliveries:create' } }) + '\n' }));
   await page.goto(`${base}/audit`); await page.locator('.audit-actor').waitFor();
   await layout('audit-automation-identity');
   await page.unroute('**/api/admin/audit?*');
 
   const auditRows = Array.from({ length: 1501 }, (_, index) => ({ rowid: index + 1, at: 100 + Math.floor(index / 400), tenant: '', actor: 'fixture', event: `event_${index + 1}`, subject: `row ${index + 1}`, detail: { sequence: index + 1 } }));
+  const hiddenEvent = 'admin_login';
   const auditRequests = [];
   let failAudit = false, holdAudit = null;
   await page.route('**/api/admin/audit?*', async (route) => {
@@ -273,6 +275,7 @@ try {
     if (holdAudit) { holdAudit.started(); await holdAudit.wait; holdAudit = null; }
     if (failAudit) { failAudit = false; return route.fulfill({ status: 503, body: 'Audit fixture failure' }); }
     let rows = auditRows.filter((row) => (!query.get('event') || row.event === query.get('event')) && (!query.get('q') || row.subject.includes(query.get('q'))));
+    if (query.get('event') === hiddenEvent) rows = [{ rowid: 9000, at: 200, tenant: '', actor: 'fixture', event: hiddenEvent, subject: 'hidden event row', detail: {} }];
     if (query.has('before_rowid')) rows = rows.filter((row) => row.rowid < Number(query.get('before_rowid'))).reverse();
     else rows = rows.filter((row) => row.at > Number(query.get('since')) || (row.at === Number(query.get('since')) && row.rowid > Number(query.get('after_rowid'))));
     await route.fulfill({ contentType: 'application/x-ndjson', body: rows.slice(0, 250).map((row) => JSON.stringify(row)).join('\n') });
@@ -286,6 +289,15 @@ try {
   for (const order of ['newest', 'oldest']) {
     await auditAction(() => order === 'newest' ? page.goto(`${base}/audit`) : page.selectOption('#audit-order', order));
     const ordered = order === 'newest' ? [...auditRows].reverse() : auditRows;
+    const firstRow = page.locator('.audit-row').first();
+    assert.deepEqual(await firstRow.locator('.audit-field-label').allTextContents(), ['Time:', 'Tenant:', 'Event:', 'Subject:', 'Actor:']);
+    assert.equal(await firstRow.locator('.audit-event').textContent(), ordered[0].event);
+    assert.equal(await firstRow.locator('.audit-subject').textContent(), ordered[0].subject);
+    assert.equal(await firstRow.locator('.audit-actor').textContent(), 'fixture');
+    await page.setViewportSize({ width: 320, height: 1000 });
+    assert.equal(await firstRow.locator('.audit-field-label').count(), 5);
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'Audit rows fit at 320px');
+    await page.setViewportSize({ width: 1440, height: 1000 });
     let retainedDetail;
     for (let number = 1; number <= 7; number++) {
       if (number > 1) {
@@ -306,7 +318,8 @@ try {
       const end = Math.min(number * 250, ordered.length), expected = ordered.slice(Math.max(0, end - 1000), end);
       assert.equal(await page.locator('.audit-row').count(), expected.length, 'The Audit page retains at most 1,000 rows');
       assert.deepEqual(await page.locator('.audit-subject').allTextContents(), expected.map((row) => row.subject));
-      assert.equal(await page.locator('#audit-event-options option').count(), expected.length, 'Event suggestions follow the retained window');
+      assert.ok(await page.locator(`#audit-event-options option[value="${expected[0].event}"]`).count(), 'Unknown loaded event remains selectable');
+      assert.ok(await page.locator(`#audit-event-options option[value="${hiddenEvent}"]`).count(), 'Known event remains selectable before its first row loads');
       assert.equal(await page.locator('#audit-range').textContent(), `Showing rows ${end - expected.length + 1} to ${end}.`);
       if (number === 3) {
         retainedDetail = await page.locator('.audit-row details').nth(500).elementHandle();
@@ -316,6 +329,9 @@ try {
     }
     assert.ok(await page.locator('#load-more').isHidden());
   }
+  await page.fill('#audit-query', ''); await page.fill('#audit-event', hiddenEvent);
+  await auditAction(() => page.locator('#audit-filters button[type=submit]').click());
+  assert.deepEqual(await page.locator('.audit-subject').allTextContents(), ['hidden event row'], 'A known event can filter rows outside the current page');
   await page.fill('#audit-query', 'row 900'); await page.fill('#audit-event', 'event_900');
   await auditAction(() => page.locator('#audit-filters button[type=submit]').click());
   assert.deepEqual(await page.locator('.audit-subject').allTextContents(), ['row 900']);
@@ -324,7 +340,7 @@ try {
   assert.equal(auditExport.searchParams.get('limit'), '10000');
   await page.fill('#audit-query', 'missing');
   await auditAction(() => page.locator('#audit-filters button[type=submit]').click());
-  assert.equal(await page.locator('.audit-row').count(), 0); assert.equal(await page.locator('#audit-event-options option').count(), 0);
+  assert.equal(await page.locator('.audit-row').count(), 0); assert.ok(await page.locator(`#audit-event-options option[value="${hiddenEvent}"]`).count());
   assert.ok(await page.getByText('No audit rows yet.', { exact: true }).isVisible());
   await auditAction(() => page.click('#audit-clear'));
   assert.equal(await page.locator('.audit-subject').first().textContent(), 'row 1');
@@ -332,10 +348,13 @@ try {
   failAudit = true; await auditAction(moreAudit);
   const failedAuditQuery = auditRequests.at(-1);
   assert.equal(await page.locator('.audit-row').count(), 250);
-  assert.match(await page.locator('#audit-range').textContent(), /503/);
+  await page.locator('#audit-range').filter({ hasText: '503' }).waitFor();
   await auditAction(moreAudit);
   assert.equal(auditRequests.at(-1), failedAuditQuery, 'A failed continuation must retry the same cursor');
   assert.equal(await page.locator('.audit-row').count(), 500);
+  failAudit = true; await auditAction(() => page.click('#refresh'));
+  await page.locator('#audit-log').filter({ hasText: '503' }).waitFor();
+  assert.ok(await page.locator(`#audit-event-options option[value="${hiddenEvent}"]`).count(), 'Known events remain available after a failed reset');
   await auditAction(() => page.click('#refresh'));
   assert.equal(await page.locator('.audit-row').count(), 250);
   assert.equal(await page.locator('.audit-subject').first().textContent(), 'row 1');

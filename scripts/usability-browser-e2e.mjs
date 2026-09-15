@@ -63,6 +63,19 @@ try {
   assert.equal(await page.locator('#create-password').getAttribute('autocomplete'), 'new-password');
   await page.goto(`${base}/r/${id}`, { waitUntil: 'domcontentloaded' }); await page.locator('#link-password').waitFor({ state: 'attached' });
   assert.equal(await page.locator('#link-password').getAttribute('autocomplete'), 'current-password');
+  const session = await api('admin/session');
+  async function assertStorageNavigation(sessionOverride, expectedHint, managed) {
+    await page.route(`${base}/storage`, async (route) => {
+      const response = await route.fetch();
+      const body = (await response.text()).replace(/(<script id="admin-session" type="application\/json">)[\s\S]*?(<\/script>)/, (_, start, end) => start + JSON.stringify(sessionOverride) + end);
+      await route.fulfill({ response, body });
+    }, { times: 1 });
+    await page.goto(`${base}/storage`); await page.locator('#nav a[href="/storage"]').waitFor({ state: 'attached' });
+    assert.equal(await page.locator('#nav a[href="/storage"]').getAttribute('data-hint'), expectedHint);
+    assert.equal(await page.locator('#storage-new').isHidden(), !managed);
+  }
+  await assertStorageNavigation(session, 'Manage receiving storage, S3 buckets and shared folders.', true);
+  await assertStorageNavigation({ ...session, role: 'admin', tenant: 'named-tenant' }, 'View available storage connections.', false);
   for (const route of ['receive', 'workflows', 'trade-routes', 'notifications', 'system']) {
     await page.goto(`${base}/${route}`); await page.waitForLoadState('networkidle');
     const labels = await page.locator('button[data-hint]').evaluateAll((buttons) => buttons.map((button) => button.getAttribute('aria-label')));

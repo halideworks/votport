@@ -1,5 +1,5 @@
 import { isFormDirty, markFormChanged, markFormSaved } from '/assets/form-drafts.js';
-// votport tenants page: namespace lifecycle for platform admins.
+// VOTPort tenant management and named-tenant self-branding.
 // VOTPORT PROPRIETARY LICENSE.
 
 import {
@@ -120,7 +120,7 @@ function editTenantForm(tenant) {
   return details;
 }
 
-function brandingForm(tenant) {
+function brandingForm(tenant, { open = false } = {}) {
   const key = encodeURIComponent(tenant.key === '' ? 'default' : tenant.key);
   const details = document.createElement('details');
   const summary = document.createElement('summary');
@@ -191,11 +191,18 @@ function brandingForm(tenant) {
       : 'Logo (PNG, JPEG, or SVG, 512 KiB max)';
   };
   let loaded = false;
-  details.addEventListener('toggle', () => {
-    if (!details.open || loaded) return;
+  const loadOnce = () => {
+    if (loaded) return;
     loaded = true;
     load().then(() => { form.inert = false; }).catch((requestError) => { loaded = false; alertModal(requestError.message); });
+  };
+  details.addEventListener('toggle', () => {
+    if (details.open) loadOnce();
   });
+  if (open) {
+    details.open = true;
+    loadOnce();
+  }
 
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -510,11 +517,18 @@ $('principal-search').addEventListener('input', () => {
 $('principal-load-more').addEventListener('click', () =>
   refreshPrincipals().catch((error) => alertModal(error.message)),
 );
-// The list loads alongside the session check, one round trip for both.
-// The page itself is hidden from non-platform admins by the nav; direct
-// navigation gets bounced to their home.
-const [session] = await Promise.all([requireSession(), refreshTenants().catch(() => {})]);
+// Authenticate before platform list requests. Named-tenant admins use
+// this route only for their own branding.
+const session = await requireSession();
 if (!session.pages.includes('tenants')) {
   window.location.replace('/receive');
+} else if (session.tenant) {
+  $('page-title').textContent = 'Branding';
+  document.title = 'VOTPort · Branding';
+  $('self-branding').hidden = false;
+  $('self-branding-form').append(brandingForm({ key: session.tenant }, { open: true }));
+} else {
+  $('platform-tenant-management').hidden = false;
+  await Promise.all([refreshTenants(), refreshPrincipals(true)])
+    .catch((error) => alertModal(error.message));
 }
-await refreshPrincipals(true);

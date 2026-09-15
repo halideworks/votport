@@ -133,9 +133,9 @@ still leave only the tracing event.
 Recipient-facing surfaces can carry a tenant's identity instead of the stock
 VOTPort look. Branding is a display name, an accent color (`#rrggbb`), and an
 optional logo (PNG, JPEG, or SVG, 512 KiB cap) stored per tenant; the default
-tenant is branded from the System page, named tenants from their card on the
-Tenants page (tenant admins may also set their own via
-`/api/admin/branding/<key>`). The request/upload page, the download page, and
+tenant is branded from the System page, platform admins manage named tenants
+from the Tenants page, and named-tenant admins use their Branding page (also
+available through `/api/admin/branding/<key>`). The request/upload page, the download page, and
 notification titles use the brand name, falling back to the tenant label,
 falling back to today's appearance; logos are served on token-scoped public
 routes that expose exactly what the link or grant metadata already exposes,

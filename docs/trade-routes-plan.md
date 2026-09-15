@@ -83,7 +83,7 @@ A reusable connection needs three things:
 | Port identity | Verify which installation answered | Pinned receipt-key fingerprint |
 | Receiving permission | Authorize a specific delivery destination | Route invitation for “LA masters” |
 
-Prefer **Paste route invitation** as the setup flow. The receiving administrator
+Prefer **Send to another port** as the setup flow. The receiving administrator
 creates a one-time, expiring invitation for a receiving endpoint. It contains the
 address, expected identity, and a secret enrollment capability. The sender sees
 the destination name, fingerprint, and permitted endpoint before accepting.
@@ -92,7 +92,7 @@ preapproves that identity or explicitly approves the pending connection. A
 self-signed invitation proves consistency, not organizational ownership; confirm
 the fingerprint through the partner when the invitation's source is uncertain.
 
-Offer **Enter port address** for discovery and testing, followed by an invitation
+Offer **I only have a port address** for discovery and testing, followed by an invitation
 or approval step. Knowing an address or fingerprint never grants upload access.
 Discovery publishes protocol versions and identity, not tenant/project catalogs.
 Show only receiving endpoints granted to the authenticated peer. Secrets remain
@@ -159,7 +159,7 @@ Reuse the existing durable jobs and per-destination legs:
 4. Commit a signed custody receipt with publication; retries recover that receipt.
 5. Run the receiver's reception workflow and expose its separately authorized status.
 
-Show **Received and verified**, **Processing/held for approval**, and **Released**
+Show **Received and verified**, **Held for approval**, **Processing (workflow state)**, and **Released**
 as separate statuses. A custody receipt does not mean a downstream workflow
 finished or a human accepted the delivery. Retain the existing sender release
 choice: wait for destination receipt, or release locally and copy in the
