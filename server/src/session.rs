@@ -35,6 +35,9 @@ pub const MAX_SEAL_BYTES: usize = 1024 * 1024;
 pub const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_PAGES: u64 = 4096;
 pub const MAX_ENTRIES: usize = 2_000_000;
+// Reserve room for one file, its journal, and metadata when bytes are zero.
+const ENTRY_ADMISSION_BYTES: u64 = 4096;
+const ENTRY_ADMISSION_FLOOR: u64 = 256;
 /// Covered bytes the client sends per chunk request.
 pub const CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 /// Body cap for one chunk request (data + proof + slack).
@@ -576,6 +579,7 @@ enum Phase {
         ingest: PackageIngest,
         entries: Vec<PackageEntry>,
         pages_pushed: u64,
+        max_entries: usize,
     },
     Receiving {
         files: Vec<FileState>,
@@ -892,12 +896,22 @@ fn handle_seal(setup: &WorkerSetup, phase: &mut Phase, bytes: &[u8]) -> Result<u
         ingest,
         entries: Vec::new(),
         pages_pushed: 0,
+        max_entries: max_entries_for_bytes(setup.max_total_bytes),
     };
     Ok(pages)
 }
 
-fn entry_count_within_limit(count: usize) -> bool {
-    count <= MAX_ENTRIES
+/// The count limit follows the byte budget while retaining a small floor for
+/// legitimate empty-file drops, and never exceeds the process-wide ceiling.
+pub fn max_entries_for_bytes(max_total_bytes: u64) -> usize {
+    let budget = max_total_bytes / ENTRY_ADMISSION_BYTES + ENTRY_ADMISSION_FLOOR;
+    usize::try_from(budget)
+        .unwrap_or(usize::MAX)
+        .min(MAX_ENTRIES)
+}
+
+fn entry_count_within_limit(count: usize, max_total_bytes: u64) -> bool {
+    count <= max_entries_for_bytes(max_total_bytes)
 }
 
 fn handle_page(phase: &mut Phase, bytes: &[u8]) -> Result<u64, SessionError> {
@@ -905,6 +919,7 @@ fn handle_page(phase: &mut Phase, bytes: &[u8]) -> Result<u64, SessionError> {
         ingest,
         entries,
         pages_pushed,
+        max_entries,
     } = phase
     else {
         return Err(SessionError::conflict(
@@ -914,12 +929,16 @@ fn handle_page(phase: &mut Phase, bytes: &[u8]) -> Result<u64, SessionError> {
     let page = ingest.push_page(bytes).map_err(|error| {
         SessionError::bad(format!("manifest page rejected: {:?}", error.code()))
     })?;
-    let new_entries = page.into_entries();
-    if !entry_count_within_limit(entries.len() + new_entries.len()) {
+    let count = entries
+        .len()
+        .checked_add(page.entries().len())
+        .ok_or_else(|| SessionError::bad("package entry count overflows"))?;
+    if count > *max_entries {
         return Err(SessionError::bad(format!(
-            "package exceeds {MAX_ENTRIES} entries"
+            "package exceeds {max_entries} entries"
         )));
     }
+    let new_entries = page.into_entries();
     entries.extend(new_entries);
     *pages_pushed += 1;
     Ok(ingest.page_count().saturating_sub(*pages_pushed))
@@ -937,12 +956,7 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
         }
         return Ok(entry_infos(setup, files));
     }
-    let Phase::Pages {
-        ingest: _,
-        entries,
-        pages_pushed: _,
-    } = phase
-    else {
+    let Phase::Pages { entries, .. } = phase else {
         return Err(SessionError::conflict(
             "begin is only valid after the seal and all pages",
         ));
@@ -952,9 +966,22 @@ fn handle_begin(setup: &WorkerSetup, phase: &mut Phase) -> Result<Vec<EntryInfo>
         unreachable!("phase was matched as Pages above");
     };
     // finish() authenticates every buffered page against the expected root.
-    ingest
+    let summary = ingest
         .finish()
         .map_err(|error| SessionError::bad(format!("manifest rejected: {:?}", error.code())))?;
+
+    if summary.entries() != entries.len() as u64 {
+        return Err(SessionError::bad(
+            "package entry count does not match manifest",
+        ));
+    }
+
+    if !entry_count_within_limit(entries.len(), setup.max_total_bytes) {
+        return Err(SessionError::bad(format!(
+            "package exceeds {} entries",
+            max_entries_for_bytes(setup.max_total_bytes)
+        )));
+    }
 
     let mut total: u64 = 0;
     for entry in &entries {
@@ -3279,12 +3306,11 @@ fn validate_push_manifest(
             "push manifest does not match the admitted package",
         ));
     }
-    if entries.is_empty()
-        || !entry_count_within_limit(entries.len())
-        || summary.entries != entries.len() as u64
+    let max_entries = max_entries_for_bytes(setup.max_total_bytes);
+    if entries.is_empty() || entries.len() > max_entries || summary.entries != entries.len() as u64
     {
         return Err(SessionError::bad(format!(
-            "package entry count is outside 1..={MAX_ENTRIES}"
+            "package entry count is outside 1..={max_entries}"
         )));
     }
     let mut total = 0_u64;
@@ -4830,6 +4856,7 @@ mod pin_tests {
 mod push_tests {
     use super::*;
     use vot_sdk::object::{InMemoryObjectBuilder, Suite};
+    use vot_sdk::package::{PackageBuilder, PackageEntry};
 
     fn open_destination_for(
         setup: &WorkerSetup,
@@ -4844,6 +4871,23 @@ mod push_tests {
             InMemoryObjectBuilder::new(suite, Some(data.len() as u64), data.len() as u64).unwrap();
         builder.update(data).unwrap();
         builder.finish().unwrap().object_id().clone()
+    }
+
+    fn empty_manifest(count: usize) -> (ObjectId, Vec<u8>, Vec<u8>, Vec<vot_cli::EntryRecord>) {
+        let empty = object(Suite::Blake3Bao64, b"");
+        let mut builder = PackageBuilder::new().unwrap();
+        let mut records = Vec::with_capacity(count);
+        for index in 0..count {
+            let name = format!("empty-{index:04}");
+            let path = vot_manifest::PackagePath::portable([name.as_str()]).unwrap();
+            let entry = PackageEntry::direct(vec![name], &empty).unwrap();
+            assert!(builder.push(&entry).unwrap().is_none());
+            records.push(record(path, &empty));
+        }
+        let (summary, final_page, mut finalizer) = builder.finish().unwrap().into_parts();
+        let page = finalizer.push(final_page).unwrap().into_bytes();
+        let seal = finalizer.finish().unwrap().into_bytes();
+        (summary.object_id(), page, seal, records)
     }
 
     fn setup(directory: &std::path::Path, expected_package: ObjectId) -> WorkerSetup {
@@ -5066,6 +5110,79 @@ mod push_tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn empty_entry_admission_stays_bounded_for_http_and_native() {
+        let cap = 1024 * 1024;
+        let count = max_entries_for_bytes(cap) + 1;
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        app.store
+            .insert_link(crate::store::tests::test_link("link"))
+            .unwrap();
+        let (package, page, seal, records) = empty_manifest(count);
+        let mut setup = setup_with_app(directory.path(), package.clone(), &app);
+        setup.max_total_bytes = cap;
+
+        let mut phase = Phase::AwaitSeal;
+        handle_seal(&setup, &mut phase, &seal).unwrap();
+        let error = handle_page(&mut phase, &page).unwrap_err();
+        assert_eq!(error.status, 422);
+        assert!(error.message.contains("512 entries"), "{}", error.message);
+        let begin = handle_begin(&setup, &mut phase).unwrap_err();
+        assert_eq!(begin.status, 422);
+        assert!(begin.message.contains("does not match manifest"));
+        assert!(std::fs::read_dir(&setup.dest_dir).unwrap().next().is_none());
+        assert!(app.store.load_upload_sessions().unwrap().is_empty());
+
+        let error = validate_push_manifest(
+            &setup,
+            vot_cli::PackageSummary {
+                root: package.root,
+                logical_length: package.length,
+                entries: count as u64,
+            },
+            &records,
+        )
+        .unwrap_err();
+        assert_eq!(error.status, 422);
+        assert!(error.message.contains("1..=512"), "{}", error.message);
+        assert!(std::fs::read_dir(&setup.dest_dir).unwrap().next().is_none());
+        assert!(app.store.load_upload_sessions().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn exact_empty_entry_limit_is_accepted_by_http_begin_and_native() {
+        let cap = 1024 * 1024;
+        let count = max_entries_for_bytes(cap);
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        app.store
+            .insert_link(crate::store::tests::test_link("link"))
+            .unwrap();
+        let (package, page, seal, records) = empty_manifest(count);
+        let mut setup = setup_with_app(directory.path(), package.clone(), &app);
+        setup.max_total_bytes = cap;
+
+        let mut phase = Phase::AwaitSeal;
+        handle_seal(&setup, &mut phase, &seal).unwrap();
+        assert_eq!(handle_page(&mut phase, &page).unwrap(), 0);
+        let files = handle_begin(&setup, &mut phase).unwrap();
+        assert_eq!(files.len(), count);
+        assert_eq!(app.store.load_upload_sessions().unwrap().len(), 1);
+
+        let validated = validate_push_manifest(
+            &setup,
+            vot_cli::PackageSummary {
+                root: package.root,
+                logical_length: package.length,
+                entries: count as u64,
+            },
+            &records,
+        )
+        .unwrap();
+        assert_eq!(validated.len(), count);
     }
 
     #[tokio::test]
@@ -7470,11 +7587,20 @@ mod push_tests {
     #[test]
     fn six_figure_entry_counts_fit_without_a_large_fixture() {
         for count in [0, 100_000, 999_999, 1_000_000, 1_999_998, 2_000_000] {
-            assert!(entry_count_within_limit(count));
+            assert!(entry_count_within_limit(count, u64::MAX));
         }
         for count in [2_000_001, usize::MAX] {
-            assert!(!entry_count_within_limit(count));
+            assert!(!entry_count_within_limit(count, u64::MAX));
         }
+    }
+
+    #[test]
+    fn entry_count_budget_leaves_a_small_empty_file_floor() {
+        assert_eq!(max_entries_for_bytes(0), 256);
+        assert_eq!(max_entries_for_bytes(1024 * 1024), 512);
+        assert!(max_entries_for_bytes(20_000 * 4096) >= 20_000);
+        assert!(max_entries_for_bytes(u64::MAX) <= MAX_ENTRIES);
+        assert_eq!(max_entries_for_bytes(u64::MAX), MAX_ENTRIES);
     }
 
     #[test]
@@ -7647,7 +7773,7 @@ mod push_tests {
         let raw = record(vot_manifest::PackagePath::raw([b"file"]).unwrap(), &logical);
         assert!(validate_push_manifest(&setup, summary, &[raw]).is_err());
 
-        assert!(!entry_count_within_limit(MAX_ENTRIES + 1));
+        assert!(!entry_count_within_limit(MAX_ENTRIES + 1, u64::MAX));
     }
 
     #[test]
