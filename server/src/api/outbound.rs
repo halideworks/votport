@@ -664,12 +664,31 @@ async fn prepare_outbound_chunk<'a>(
         .ok_or_else(|| Err(ApiError::internal("outbound path has no parent")))?;
     create_library_dirs(parent).map_err(Err)?;
     let stage = parent.join(outbound_stage_name(&path, &upload_id));
-    if std::fs::symlink_metadata(&path).is_ok() {
-        let _ = std::fs::remove_file(&stage);
-        return Err(Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "outbound file already exists",
-        )));
+    match std::fs::symlink_metadata(&path) {
+        Ok(destination) => {
+            if destination.file_type().is_file()
+                && destination.len() == total
+                && vot_platform_fs::same_file_regular(&stage, &path).is_ok_and(|same| same)
+            {
+                return Err(Ok(Json(json!({
+                    "complete": true,
+                    "offset": total,
+                    "bytes": total,
+                    "path": requested_path,
+                }))
+                .into_response()));
+            }
+            return Err(Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "outbound file already exists",
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(Err(ApiError::internal(
+                "inspect outbound destination failed",
+            )));
+        }
     }
     match std::fs::symlink_metadata(&stage) {
         Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_file() => {
@@ -835,8 +854,9 @@ async fn sync_outbound_chunk(file: &mut tokio::fs::File) -> ApiResult<()> {
         .map_err(|_| ApiError::internal("sync outbound staging file failed"))
 }
 
-/// Links a complete stage into the library under `path`, drops the stage,
-/// and audits the upload.
+/// Links a complete stage into the library under `path`, and audits the
+/// upload. The stage hardlink remains as a bounded replay witness until the
+/// idle stage sweep removes it.
 fn publish_outbound_stage(
     app: &App,
     identity: &auth::AdminIdentity,
@@ -845,6 +865,13 @@ fn publish_outbound_stage(
     requested_path: &str,
     total: u64,
 ) -> ApiResult<Response> {
+    if let Err(error) = std::fs::File::open(stage).and_then(|file| {
+        file.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
+            .and_then(|()| file.sync_all())
+    }) {
+        tracing::warn!(%error, path = %stage.display(), "persisting outbound stage expiry failed");
+        return Err(ApiError::internal("persist outbound stage expiry failed"));
+    }
     if let Err(error) = std::fs::hard_link(stage, path) {
         return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
             let _ = std::fs::remove_file(stage);
@@ -853,7 +880,6 @@ fn publish_outbound_stage(
             ApiError::internal("publish outbound file failed")
         });
     }
-    let _ = std::fs::remove_file(stage);
     let relative_path = requested_path.trim_matches('/').replace('\\', "/");
     app.store.audit(
         &identity.tenant,
@@ -9210,14 +9236,15 @@ mod tests {
             std::fs::read(app.config.outbound_dir.join("resume.bin")).unwrap(),
             b"abcdef"
         );
-        assert!(!app
-            .config
-            .outbound_dir
-            .join(outbound_stage_name(
-                &app.config.outbound_dir.join("resume.bin"),
-                &upload_id,
-            ))
-            .exists());
+        let stage = app.config.outbound_dir.join(outbound_stage_name(
+            &app.config.outbound_dir.join("resume.bin"),
+            &upload_id,
+        ));
+        assert!(vot_platform_fs::same_file_regular(
+            &stage,
+            &app.config.outbound_dir.join("resume.bin")
+        )
+        .unwrap());
         let audits = app.store.audit_export(None, 0, 0, 100).unwrap();
         assert_eq!(
             audits
@@ -9227,6 +9254,269 @@ mod tests {
             1
         );
         assert_eq!(audits[0].detail["bytes"], 6);
+    }
+
+    #[tokio::test]
+    async fn resumable_library_upload_replays_only_its_published_witness() {
+        let (_directory, app, cookie, _bytes) = fixture().await;
+        let upload_id = "1".repeat(64);
+        for (start, end, bytes) in [(0, 2, b"abc".as_slice()), (3, 5, b"def".as_slice())] {
+            let response = crate::app::router(app.clone())
+                .oneshot(chunk_request(
+                    &cookie,
+                    "replay.bin",
+                    &upload_id,
+                    start,
+                    end,
+                    6,
+                    bytes,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let destination = app.config.outbound_dir.join("replay.bin");
+        let stage = app
+            .config
+            .outbound_dir
+            .join(outbound_stage_name(&destination, &upload_id));
+        let uploaded = || {
+            app.store
+                .audit_export(None, 0, 0, 100)
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.event == "outbound_file_uploaded")
+                .count()
+        };
+        assert!(vot_platform_fs::same_file_regular(&stage, &destination).unwrap());
+        let audits_before = uploaded();
+
+        // The final response may be lost after publication. The same upload
+        // id and hardlink witness make the retry an idempotent completion.
+        let replay = crate::app::router(app.clone())
+            .oneshot(chunk_request(
+                &cookie,
+                "replay.bin",
+                &upload_id,
+                3,
+                5,
+                6,
+                b"def",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(body(replay).await["complete"], true);
+        assert_eq!(uploaded(), audits_before);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"abcdef");
+
+        // A different upload id has no witness and cannot claim the name.
+        let foreign = "2".repeat(64);
+        let response = crate::app::router(app.clone())
+            .oneshot(chunk_request(
+                &cookie,
+                "replay.bin",
+                &foreign,
+                0,
+                5,
+                6,
+                b"abcdef",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(!app
+            .config
+            .outbound_dir
+            .join(outbound_stage_name(&destination, &foreign))
+            .exists());
+
+        // Matching bytes are still rejected when the caller's declared total
+        // differs from the published file.
+        let response = crate::app::router(app.clone())
+            .oneshot(chunk_request(
+                &cookie,
+                "replay.bin",
+                &upload_id,
+                0,
+                6,
+                7,
+                b"abcdefg",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        // Replacing the destination breaks the hardlink witness, even at the
+        // same size, so a stale final reply cannot bless a new file.
+        std::fs::remove_file(&destination).unwrap();
+        std::fs::write(&destination, b"ghijkl").unwrap();
+        let response = crate::app::router(app.clone())
+            .oneshot(chunk_request(
+                &cookie,
+                "replay.bin",
+                &upload_id,
+                3,
+                5,
+                6,
+                b"def",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(stage.exists());
+        assert_eq!(uploaded(), audits_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_stage_expiry_starts_at_publication() {
+        use std::time::{Duration, SystemTime};
+
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let identity = auth::AdminIdentity::local_admin();
+        let upload_id = "4".repeat(64);
+        let destination = app.config.outbound_dir.join("completion-time.bin");
+        let stage = app
+            .config
+            .outbound_dir
+            .join(outbound_stage_name(&destination, &upload_id));
+        std::fs::write(&stage, b"abcdef").unwrap();
+        std::fs::File::open(&stage).unwrap().sync_all().unwrap();
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        std::fs::File::open(&stage)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+
+        let complete = publish_outbound_stage(
+            &app,
+            &identity,
+            &stage,
+            &destination,
+            "completion-time.bin",
+            6,
+        )
+        .unwrap();
+        assert_eq!(complete.status(), StatusCode::OK);
+        let published_at = std::fs::metadata(&stage).unwrap().modified().unwrap();
+        assert!(published_at > old);
+
+        let before_expiry = published_at
+            .checked_add(Duration::from_secs(
+                app.config.session_idle_secs.saturating_sub(1),
+            ))
+            .unwrap();
+        sweep_upload_stages(&app, before_expiry);
+        assert!(stage.exists());
+        sweep_upload_stages(
+            &app,
+            published_at
+                .checked_add(Duration::from_secs(app.config.session_idle_secs))
+                .unwrap(),
+        );
+        assert!(!stage.exists());
+        assert_eq!(std::fs::read(destination).unwrap(), b"abcdef");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_refresh_failure_keeps_destination_unpublished() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = crate::api::testing::build(directory.path());
+        let identity = auth::AdminIdentity::local_admin();
+        let destination = app.config.outbound_dir.join("refresh-failure.bin");
+        let stage = app
+            .config
+            .outbound_dir
+            .join(outbound_stage_name(&destination, &"5".repeat(64)));
+        std::os::unix::fs::symlink(app.config.outbound_dir.join("missing-stage-target"), &stage)
+            .unwrap();
+
+        assert!(publish_outbound_stage(
+            &app,
+            &identity,
+            &stage,
+            &destination,
+            "refresh-failure.bin",
+            0,
+        )
+        .is_err());
+        assert!(matches!(
+            std::fs::symlink_metadata(&destination),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert!(std::fs::symlink_metadata(&stage)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resumable_library_upload_rejects_symlink_witnesses() {
+        let (_directory, app, cookie, _bytes) = fixture().await;
+        let upload_id = "3".repeat(64);
+        for (start, end, bytes) in [(0, 2, b"abc".as_slice()), (3, 5, b"def".as_slice())] {
+            let response = crate::app::router(app.clone())
+                .oneshot(chunk_request(
+                    &cookie,
+                    "symlink.bin",
+                    &upload_id,
+                    start,
+                    end,
+                    6,
+                    bytes,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let destination = app.config.outbound_dir.join("symlink.bin");
+        let stage = app
+            .config
+            .outbound_dir
+            .join(outbound_stage_name(&destination, &upload_id));
+        let external = app.config.outbound_dir.join("symlink-target.bin");
+        std::fs::remove_file(&destination).unwrap();
+        std::fs::write(&external, b"abcdef").unwrap();
+        std::os::unix::fs::symlink(&external, &destination).unwrap();
+        let response = crate::app::router(app.clone())
+            .oneshot(chunk_request(
+                &cookie,
+                "symlink.bin",
+                &upload_id,
+                3,
+                5,
+                6,
+                b"def",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(stage.exists());
+        std::fs::remove_file(&destination).unwrap();
+        std::fs::write(&destination, b"abcdef").unwrap();
+        std::fs::remove_file(&stage).unwrap();
+        std::os::unix::fs::symlink(&destination, &stage).unwrap();
+        let response = crate::app::router(app.clone())
+            .oneshot(chunk_request(
+                &cookie,
+                "symlink.bin",
+                &upload_id,
+                3,
+                5,
+                6,
+                b"def",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(std::fs::symlink_metadata(&stage)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[tokio::test]
@@ -9324,7 +9614,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(body(response).await["complete"], true);
             assert_eq!(std::fs::read(&path).unwrap(), b"whole file");
-            assert!(!stage.exists());
+            assert!(vot_platform_fs::same_file_regular(&stage, &path).unwrap());
         }
     }
 
@@ -9529,6 +9819,10 @@ mod tests {
         let stage =
             |path: &Path, id: &str| path.parent().unwrap().join(outbound_stage_name(path, id));
         let destination = root.join("project/expired.bin");
+        let completed_destination = root.join("project/completed.bin");
+        let completed_stage = stage(&completed_destination, &"0".repeat(64));
+        write(&completed_stage, old);
+        std::fs::hard_link(&completed_stage, &completed_destination).unwrap();
         let expired = stage(&destination, &"a".repeat(64));
         let abandoned = stage(&destination, &"b".repeat(64));
         let recent = stage(&destination, &"c".repeat(64));
@@ -9594,6 +9888,7 @@ mod tests {
         );
         sweep_upload_stages(&app, now);
         assert!(!expired.exists() && !abandoned.exists());
+        assert!(!completed_stage.exists() && completed_destination.exists());
         assert!(recent.exists() && active.exists());
         assert!(preserved.iter().all(|path| path.exists()));
         assert!(external_stage.exists() && linked_stage.exists());

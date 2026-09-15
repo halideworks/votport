@@ -743,7 +743,7 @@ pub async fn worker(app: Arc<App>) {
         if let Err(error) = app.store.prune_trade_invitations() {
             tracing::warn!(%error, "cannot prune expired trade invitations");
         }
-        match app.store.trade_routes(None) {
+        match app.store.trade_routes_to_monitor() {
             Ok(routes) => {
                 let now = Instant::now();
                 let due: Vec<TradeRoute> = {
@@ -751,12 +751,7 @@ pub async fn worker(app: Arc<App>) {
                     waiting.retain(|id, _| routes.iter().any(|r| &r.id == id));
                     routes
                         .into_iter()
-                        .filter(|r| {
-                            r.direction == "outgoing"
-                                && r.state != "revoked"
-                                && !r.remote_grant.is_empty()
-                                && waiting.get(&r.id).is_none_or(|(_, next)| *next <= now)
-                        })
+                        .filter(|r| waiting.get(&r.id).is_none_or(|(_, next)| *next <= now))
                         .collect()
                 };
                 stream::iter(due)

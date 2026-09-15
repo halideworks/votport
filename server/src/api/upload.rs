@@ -997,11 +997,18 @@ async fn dispatch<T>(
             ),
         })?;
     let (reply, receive) = oneshot::channel();
+    let command_to_send = build(reply, command.lease);
+    #[cfg(test)]
+    let finish_dispatch = matches!(&command_to_send, Cmd::Finish { .. });
     command
         .sender
-        .send(build(reply, command.lease))
+        .send(command_to_send)
         .await
         .map_err(|_| ApiError::new(StatusCode::GONE, "upload session ended"))?;
+    #[cfg(test)]
+    if finish_dispatch {
+        app.sessions.wait_finish_dispatch_stall().await;
+    }
     receive
         .await
         .map_err(|_| ApiError::new(StatusCode::GONE, "upload session ended"))?
@@ -1114,42 +1121,58 @@ pub async fn upload_finish(
     headers: HeaderMap,
     Path(sid): Path<String>,
 ) -> ApiResult<Json<session::FinishReport>> {
-    let link_id = app.sessions.link_id(&sid);
-    let report = dispatch(&app, &sid, |reply, _lease| Cmd::Finish { reply, _lease }).await?;
-    #[cfg(test)]
-    app.sessions.wait_finish_stall().await;
     let runtime = tokio::runtime::Handle::current();
+    let ip = client_ip(&headers, &peer, &app.config.trusted_proxies);
     // Off the runtime thread: completion does a link read plus an fsync'd
     // audit insert, once per finished file. The push path calls this from
     // its own OS thread and needs no wrapper.
-    let app_for_completion = Arc::clone(&app);
+    let application = Arc::clone(&app);
     let session_id = sid.clone();
-    let report_for_completion = report.clone();
-    if let Err(error) = tokio::task::spawn_blocking(move || {
-        crate::app::upload_completed(
-            &app_for_completion,
-            &session_id,
-            link_id,
-            &report_for_completion,
-            &runtime,
-        )
-    })
-    .await
-    {
-        // A panic here loses the completion audit row and notification for
-        // good; the session slot itself is reclaimed by the idle sweep.
-        tracing::error!(%error, session = %sid.get(..8).unwrap_or(&sid), "upload completion bookkeeping failed");
+    let session_tag = sid.get(..8).unwrap_or(&sid).to_owned();
+    let task_session_tag = session_tag.clone();
+    let finish = tokio::spawn(async move {
+        let link_id = application.sessions.link_id(&session_id);
+        let report = dispatch(&application, &session_id, |reply, _lease| Cmd::Finish {
+            reply,
+            _lease,
+        })
+        .await?;
+        #[cfg(test)]
+        application.sessions.wait_finish_stall().await;
+        let report_for_completion = report.clone();
+        let app_for_completion = Arc::clone(&application);
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            crate::app::upload_completed(
+                &app_for_completion,
+                &session_id,
+                link_id,
+                &report_for_completion,
+                &runtime,
+            )
+        })
+        .await
+        {
+            // A panic here loses the completion audit row and notification for
+            // good; the session slot itself is reclaimed by the idle sweep.
+            tracing::error!(%error, session = %task_session_tag, "upload completion bookkeeping failed");
+        }
+        // A finished session that moved bytes is not churn: a sender shipping
+        // many drops in a row would otherwise stall on the per-address creation
+        // limit after twenty of them. Refund after the slot is released above,
+        // and never for a session that finished on already-delivered files,
+        // which costs the sender nothing.
+        if report.received > 0 {
+            application.session_rate.refund(&ip);
+        }
+        Ok::<_, ApiError>(report)
+    });
+    match finish.await {
+        Ok(result) => result.map(Json),
+        Err(error) => {
+            tracing::error!(%error, session = %session_tag, "upload finish task failed");
+            Err(ApiError::internal("upload finish task failed"))
+        }
     }
-    // A finished session that moved bytes is not churn: a sender shipping
-    // many drops in a row would otherwise stall on the per-address creation
-    // limit after twenty of them. Refunded after the slot is released above,
-    // and never for a session that finished on already-delivered files,
-    // which costs the sender nothing.
-    if report.received > 0 {
-        app.session_rate
-            .refund(&client_ip(&headers, &peer, &app.config.trusted_proxies));
-    }
-    Ok(Json(report))
 }
 
 pub async fn upload_abort(
@@ -1208,7 +1231,11 @@ mod session_rate_tests {
 
     use axum::body::Body;
     use axum::http::Request;
+    use http_body_util::BodyExt as _;
     use tower::ServiceExt;
+
+    use vot_sdk::object::{InMemoryObjectBuilder, Suite};
+    use vot_sdk::package::{PackageBuilder, PackageEntry};
 
     use crate::api::testing;
     use crate::app;
@@ -1231,6 +1258,143 @@ mod session_rate_tests {
             uploads: Vec::new(),
             events: Vec::new(),
         }
+    }
+
+    async fn create_received_session(application: &Arc<App>, link_id: &str) -> String {
+        let bytes = b"finished";
+        let mut object = InMemoryObjectBuilder::new(
+            Suite::Blake3Bao64,
+            Some(bytes.len() as u64),
+            bytes.len() as u64,
+        )
+        .unwrap();
+        object.update(bytes).unwrap();
+        let prepared = object.finish().unwrap();
+        let mut package = PackageBuilder::new().unwrap();
+        let entry =
+            PackageEntry::direct(vec!["file.bin".to_owned()], prepared.object_id()).unwrap();
+        assert!(package.push(&entry).unwrap().is_none());
+        let (summary, page, mut finalizer) = package.finish().unwrap().into_parts();
+        let page = finalizer.push(page).unwrap().into_bytes();
+        let seal = finalizer.finish().unwrap().into_bytes();
+        let package_id = summary.object_id();
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], 4000));
+        let create = Request::post(format!("/api/r/{link_id}/session"))
+            .header("content-type", "application/json")
+            .extension(ConnectInfo(address))
+            .body(Body::from(
+                json!({
+                    "package": {
+                        "suite": "blake3",
+                        "root": hex::encode(package_id.root),
+                        "length": package_id.length
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app::router(application.clone())
+            .oneshot(create)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let session = serde_json::from_slice::<serde_json::Value>(
+            &response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap()["session"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        for (path, body) in [
+            (format!("/api/session/{session}/seal"), seal),
+            (format!("/api/session/{session}/page"), page),
+        ] {
+            assert_eq!(
+                app::router(application.clone())
+                    .oneshot(Request::post(path).body(Body::from(body)).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+        }
+        assert_eq!(
+            app::router(application.clone())
+                .oneshot(
+                    Request::post(format!("/api/session/{session}/begin"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let proof = prepared.prove(0, bytes.len() as u64).unwrap();
+        let mut body = proof.proof().to_vec();
+        let proof_len = body.len();
+        body.extend_from_slice(bytes);
+        assert_eq!(
+            app::router(application.clone())
+                .oneshot(
+                    Request::post(format!("/api/session/{session}/chunk?entry=0&offset=0"))
+                        .header("x-votport-proof", proof_len.to_string())
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        session
+    }
+
+    async fn assert_completed(application: &Arc<App>, link_id: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while application.sessions.active_for_link(link_id) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled finish did not release the session");
+        assert_eq!(application.sessions.total(), 0);
+        assert!(application.store.load_upload_sessions().unwrap().is_empty());
+        let uploads = application.store.uploads_by_id(link_id).unwrap().unwrap();
+        assert_eq!(uploads.len(), 1);
+        assert!(application
+            .store
+            .audit_export(Some(""), 0, 0, 100)
+            .unwrap()
+            .iter()
+            .any(|row| row.event == "upload_completed"));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !application.session_rate.allow("127.0.0.1") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled finish did not refund the session rate budget");
+    }
+
+    #[tokio::test]
+    async fn finish_with_unicode_session_id_returns_an_error_without_panicking() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        let response = app::router(application)
+            .oneshot(
+                Request::post("/api/session/aaaaaaa%C3%A9/finish")
+                    .extension(ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        4000,
+                    ))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1563,6 +1727,86 @@ mod session_rate_tests {
 
         assert_eq!(finish.await.unwrap().status(), StatusCode::OK);
         assert_eq!(application.sessions.active_for_link("finishing"), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_finish_completes_bookkeeping_and_refunds_rate_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_link(open_link("cancel-finish"))
+            .unwrap();
+
+        let session = create_received_session(&application, "cancel-finish").await;
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], 4000));
+        // The session creation already consumed one slot. Fill the bucket so
+        // the completion task's refund is observable.
+        for _ in 0..19 {
+            assert!(application.session_rate.allow("127.0.0.1"));
+        }
+        let (entered, release) = application.sessions.arm_finish_stall();
+        let router = app::router(application.clone());
+        let finish = tokio::spawn(async move {
+            router
+                .oneshot(
+                    Request::post(format!("/api/session/{session}/finish"))
+                        .extension(ConnectInfo(address))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        finish.abort();
+        assert!(finish.await.unwrap_err().is_cancelled());
+        let _ = release.send(());
+
+        assert_completed(&application, "cancel-finish").await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_finish_before_reply_completes_bookkeeping_and_refunds_rate_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = testing::build(directory.path());
+        application
+            .store
+            .insert_link(open_link("cancel-before-reply"))
+            .unwrap();
+        let session = create_received_session(&application, "cancel-before-reply").await;
+        for _ in 0..19 {
+            assert!(application.session_rate.allow("127.0.0.1"));
+        }
+
+        let (entered, release) = application.sessions.arm_finish_dispatch_stall();
+        let router = app::router(application.clone());
+        let finish = tokio::spawn(async move {
+            router
+                .oneshot(
+                    Request::post(format!("/api/session/{session}/finish"))
+                        .extension(ConnectInfo(std::net::SocketAddr::from((
+                            [127, 0, 0, 1],
+                            4000,
+                        ))))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        finish.abort();
+        assert!(finish.await.unwrap_err().is_cancelled());
+        let _ = release.send(());
+
+        assert_completed(&application, "cancel-before-reply").await;
     }
 }
 

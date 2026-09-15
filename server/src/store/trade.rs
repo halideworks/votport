@@ -296,6 +296,17 @@ impl Store {
             .collect()
         })
     }
+    pub fn trade_routes_to_monitor(&self) -> Result<Vec<TradeRoute>, String> {
+        self.with(|c| {
+            c.prepare(
+                "SELECT document FROM trade_routes WHERE direction='outgoing'
+                 AND json_extract(document,'$.state')!='revoked'
+                 AND json_extract(document,'$.remote_grant')!='' ORDER BY id",
+            )?
+            .query_map([], decode)?
+            .collect()
+        })
+    }
     pub fn trade_route(&self, tenant: &str, id: &str) -> Result<Option<TradeRoute>, String> {
         let c = self.connection.lock().expect("store poisoned");
         let route = c
@@ -936,6 +947,83 @@ impl Store {
 mod tests {
     use super::*;
     use crate::route_protocol::{RouteDocument, RoutePermission};
+
+    #[test]
+    fn monitoring_selects_only_connected_outgoing_routes_across_tenants() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        for (id, tenant, direction, state, grant) in [
+            ("active", "", "outgoing", "active", "grant"),
+            ("paused", "team", "outgoing", "paused", "grant"),
+            ("unreachable", "other", "outgoing", "unreachable", "grant"),
+            ("incoming", "", "incoming", "active", "grant"),
+            ("revoked", "team", "outgoing", "revoked", "grant"),
+            ("unpaired", "other", "outgoing", "pending", ""),
+        ] {
+            let route = TradeRoute {
+                id: id.into(),
+                revision: 1,
+                tenant: tenant.into(),
+                direction: direction.into(),
+                name: id.into(),
+                peer_name: "Peer".into(),
+                peer_key: "peer".into(),
+                address: "https://peer.example".into(),
+                endpoint: "endpoint".into(),
+                endpoint_name: "Endpoint".into(),
+                category: "external".into(),
+                forwarding: false,
+                metadata_keys: Vec::new(),
+                state: state.into(),
+                notifications: NotificationPolicy::default(),
+                last_contact: None,
+                error: None,
+                remote_grant: grant.into(),
+                remote_state: "active".into(),
+                cancel_active: false,
+            };
+            store.with(|c| c.execute(
+                "INSERT INTO trade_routes(id,tenant,direction,peer_key,endpoint,document,credential) VALUES (?1,?2,?3,'peer','endpoint',?4,'credential')",
+                params![id, tenant, direction, serde_json::to_string(&route).unwrap()],
+            )).unwrap();
+        }
+        let expected: Vec<_> = store
+            .trade_routes(None)
+            .unwrap()
+            .into_iter()
+            .filter(|route| {
+                route.direction == "outgoing"
+                    && route.state != "revoked"
+                    && !route.remote_grant.is_empty()
+            })
+            .map(|route| route.id)
+            .collect();
+        assert_eq!(expected, ["active", "paused", "unreachable"]);
+        assert_eq!(
+            store
+                .trade_routes_to_monitor()
+                .unwrap()
+                .into_iter()
+                .map(|route| route.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        // Excluded documents need no typed decoding.
+        store.with(|c| c.execute("UPDATE trade_routes SET document=json_remove(document,'$.name') WHERE id IN ('incoming','revoked','unpaired')", [])).unwrap();
+        assert_eq!(
+            store
+                .trade_routes_to_monitor()
+                .unwrap()
+                .into_iter()
+                .map(|route| route.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        store
+            .with(|c| c.execute_batch("DROP TABLE trade_routes"))
+            .unwrap();
+        assert!(store.trade_routes_to_monitor().is_err());
+    }
 
     #[test]
     fn suspended_and_orphaned_route_controls_never_requeue_and_allow_explicit_cleanup() {

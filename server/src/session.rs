@@ -3723,6 +3723,8 @@ struct SessionsInner {
     session_create_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
     #[cfg(test)]
     finish_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    #[cfg(test)]
+    finish_dispatch_stall: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
 }
 
 pub struct OutboundOperation<'a> {
@@ -3874,6 +3876,8 @@ impl Sessions {
                 session_create_stall: None,
                 #[cfg(test)]
                 finish_stall: None,
+                #[cfg(test)]
+                finish_dispatch_stall: None,
             })),
         }
     }
@@ -4065,6 +4069,17 @@ impl Sessions {
     }
 
     #[cfg(test)]
+    pub fn arm_finish_dispatch_stall(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        self.inner
+            .lock()
+            .expect("sessions poisoned")
+            .finish_dispatch_stall = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
     pub async fn wait_delete_stall(&self) {
         let stall = self
             .inner
@@ -4099,6 +4114,20 @@ impl Sessions {
             .lock()
             .expect("sessions poisoned")
             .finish_stall
+            .take();
+        if let Some((entered, release)) = stall {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn wait_finish_dispatch_stall(&self) {
+        let stall = self
+            .inner
+            .lock()
+            .expect("sessions poisoned")
+            .finish_dispatch_stall
             .take();
         if let Some((entered, release)) = stall {
             let _ = entered.send(());
@@ -5683,10 +5712,34 @@ mod push_tests {
         assert!(!saved.files[0].published);
         drop(application);
 
+        for modified in [
+            std::time::SystemTime::UNIX_EPOCH,
+            std::time::SystemTime::now() + Duration::from_secs(365 * 86_400),
+        ] {
+            let lock = lock_push_directory(&stage, vot_sdk_file::NasContract::Unqualified).unwrap();
+            lock.set_modified(modified).unwrap();
+            drop(lock);
+            let application = crate::app::build(config.clone()).unwrap();
+            assert!(application.sessions.contains_push_key(&key));
+            drop(application);
+        }
+
         let application = crate::app::build(config).unwrap();
         assert_eq!(
             application.store.load_push_sessions().unwrap(),
             std::slice::from_ref(&saved)
+        );
+        application.sessions.sweep(0);
+        assert!(!application.sessions.contains_push_key(&key));
+        assert_eq!(
+            application
+                .store
+                .load_push_session(&key)
+                .unwrap()
+                .unwrap()
+                .files[0]
+                .prefix_bytes,
+            65536
         );
         let competing_object = object(Suite::Blake3Bao64, b"competing");
         let mut competing =
