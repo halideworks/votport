@@ -12,8 +12,7 @@ use std::process::ExitCode;
 
 use votport_client_core::progress::{Event, Observer};
 use votport_client_core::{
-    collect, receive_with_device_or_http, split_link_as, Delivery, Device, Drop, LinkKind, Sent,
-    Transport,
+    receive_with_device_or_http, split_link_as, Delivery, Device, Drop, LinkKind, Sent, Transport,
 };
 
 fn main() -> ExitCode {
@@ -188,10 +187,19 @@ fn send(args: &[String]) -> Result<(), String> {
     }
     let link = split_link_as(&link, LinkKind::Request).map_err(|error| error.to_string())?;
     let (base, token) = (link.base, link.token);
+    let info = votport_client_core::api::Client::new(&base)
+        .map_err(|error| error.to_string())?
+        .link_info(&token)
+        .map_err(|error| error.to_string())?;
 
     let mut files = Vec::new();
     for path in &paths {
-        collect(Path::new(path), &mut files).map_err(|error| format!("{path}: {error}"))?;
+        votport_client_core::transfer::collect_for_link(
+            Path::new(path),
+            &mut files,
+            info.allow_hidden,
+        )
+        .map_err(|error| format!("{path}: {error}"))?;
     }
     if files.is_empty() {
         return Err("none of the given paths held any files".to_owned());

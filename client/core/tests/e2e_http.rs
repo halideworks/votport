@@ -8,7 +8,7 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use votport_client_core::progress::Silent;
-use votport_client_core::{send_over_http, Drop, Selected};
+use votport_client_core::{send_over_http, Drop, Error, Selected};
 
 #[test]
 fn a_drop_sends_over_http_and_lands_in_the_receive_directory() {
@@ -80,6 +80,39 @@ fn a_drop_sends_over_http_and_lands_in_the_receive_directory() {
             .unwrap();
         assert_eq!(&received_bytes, expected, "{relative} bytes differ");
     }
+}
+
+#[test]
+fn an_explicit_hidden_selection_is_refused_instead_of_dropped() {
+    let Some(bin) = common::server_binary() else {
+        return;
+    };
+    let server = common::start_server(&bin, &[]);
+    let token = common::create_link(&server.base);
+    let source = tempfile::tempdir().unwrap();
+    let visible = source.path().join("visible.txt");
+    let hidden = source.path().join(".secret");
+    std::fs::write(&visible, b"visible").unwrap();
+    std::fs::write(&hidden, b"hidden").unwrap();
+    let result = send_over_http(
+        &server.base,
+        Drop {
+            token,
+            password: None,
+            files: vec![
+                Selected {
+                    relative: "visible.txt".to_owned(),
+                    source: visible,
+                },
+                Selected {
+                    relative: "folder/.secret".to_owned(),
+                    source: hidden,
+                },
+            ],
+        },
+        &mut Silent,
+    );
+    assert!(matches!(result, Err(Error::Rejected { count: 1, .. })));
 }
 
 #[test]

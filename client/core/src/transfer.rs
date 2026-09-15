@@ -40,6 +40,18 @@ pub struct Selected {
 /// # Errors
 /// A symlink argument, a nameless folder, or a read failure.
 pub fn collect(path: &Path, out: &mut Vec<Selected>) -> std::io::Result<()> {
+    collect_for_link(path, out, true)
+}
+
+/// Collects a path using the request link's hidden-name policy.
+///
+/// # Errors
+/// A symlink argument, a nameless folder, or a read failure.
+pub fn collect_for_link(
+    path: &Path,
+    out: &mut Vec<Selected>,
+    allow_hidden: bool,
+) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         // A symlink arg would otherwise be neither file nor dir and yield
@@ -72,29 +84,38 @@ pub fn collect(path: &Path, out: &mut Vec<Selected>) -> std::io::Result<()> {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, "the folder has no name")
                 })?,
         };
-        walk(path, &top, out)?;
+        walk(path, &top, out, allow_hidden)?;
     }
     Ok(())
 }
 
 /// Recursively adds files under `dir`, each relative to `prefix`.
-fn walk(dir: &Path, prefix: &str, out: &mut Vec<Selected>) -> std::io::Result<()> {
+fn walk(
+    dir: &Path,
+    prefix: &str,
+    out: &mut Vec<Selected>,
+    allow_hidden: bool,
+) -> std::io::Result<()> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.path())
-        .collect();
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<_>>()?;
     entries.sort();
     for entry in entries {
-        let metadata = std::fs::symlink_metadata(&entry)?;
         let name = entry
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        if !allow_hidden && name.starts_with('.') {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&entry)?;
         let relative = format!("{prefix}/{name}");
         if metadata.file_type().is_symlink() {
+            // Never follow a directory symlink. This also stops cycles before
+            // traversal reaches them.
             continue;
         }
         if metadata.is_dir() {
-            walk(&entry, &relative, out)?;
+            walk(&entry, &relative, out, allow_hidden)?;
         } else if metadata.is_file() {
             out.push(Selected {
                 relative,
@@ -321,6 +342,61 @@ pub fn send_http(base: &str, drop: Drop, observer: &mut dyn Observer) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collect_for_link_skips_hidden_descendants_only_when_disallowed() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("visible.txt"), b"visible").unwrap();
+        std::fs::write(folder.join(".DS_Store"), b"metadata").unwrap();
+
+        let mut selected = Vec::new();
+        collect_for_link(&folder, &mut selected, false).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|file| file.relative.as_str())
+                .collect::<Vec<_>>(),
+            ["folder/visible.txt"]
+        );
+        selected.clear();
+        collect_for_link(&folder, &mut selected, true).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert!(selected
+            .iter()
+            .any(|file| file.relative == "folder/.DS_Store"));
+
+        let hidden_only = root.path().join("hidden-only");
+        std::fs::create_dir(&hidden_only).unwrap();
+        std::fs::write(hidden_only.join(".DS_Store"), b"metadata").unwrap();
+        selected.clear();
+        collect_for_link(&hidden_only, &mut selected, false).unwrap();
+        assert!(selected.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_refuses_symlink_arguments_and_skips_symlink_descendants() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("folder");
+        let outside = root.path().join("outside.txt");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("visible.txt"), b"visible").unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, folder.join("outside.txt")).unwrap();
+        symlink(&folder, folder.join("cycle")).unwrap();
+        let argument = root.path().join("argument-link");
+        symlink(&outside, &argument).unwrap();
+
+        let mut selected = Vec::new();
+        collect(&folder, &mut selected).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].relative, "folder/visible.txt");
+        assert!(collect(&argument, &mut Vec::new()).is_err());
+    }
 
     #[test]
     fn invalid_saved_http_metadata_is_rejected_before_prepare() {
