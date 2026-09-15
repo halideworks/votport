@@ -4,7 +4,7 @@ import { api, button } from '/assets/admin-common.js';
 export const notificationEvents = {
   route_approval_requested: 'Route approval requested', route_approved: 'Route approved', route_identity_changed: 'Port identity changed', route_failed: 'Route failed or unreachable', route_recovered: 'Route recovered', route_received: 'Route received and verified',
   upload_complete: 'Upload completed', upload_failed: 'Upload failed',
-  outbound_download_started: 'First download started', outbound_delivery_complete: 'Delivery completed',
+  outbound_download_started: 'First file requested', outbound_delivery_complete: 'Every file requested',
   workflow_retry_scheduled: 'Workflow retry scheduled', workflow_failed: 'Workflow failed',
 };
 export const tradeEvents = ['route_approval_requested', 'route_approved', 'route_identity_changed', 'route_failed', 'route_recovered', 'route_received'];

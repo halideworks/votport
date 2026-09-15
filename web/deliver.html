@@ -57,9 +57,9 @@
           <span class="muted">usable now</span>
         </div>
         <div class="stat">
-          <span class="stat-label">Deliveries</span>
+          <span class="stat-label">Request sets</span>
           <strong id="stat-deliveries">0</strong>
-          <span class="muted">complete, in total</span>
+          <span class="muted">in total</span>
         </div>
         <div class="stat">
           <span class="stat-label">Disk free</span>
@@ -108,16 +108,16 @@
             <label>Expires after <span class="muted">days</span>
               <input data-draft-field id="deliver-expires" type="number" min="1" max="30" value="7" required />
             </label>
-          </div><details class="form-advanced"><summary>Password and download limits <button type="button" class="hint-button" aria-label="Help about download access" data-hint="A password protects the link. A maximum of one download makes it a one-time link. Share the password separately from the link.">?</button></summary><div class="grid">
+          </div><details class="form-advanced"><summary>Password and download limits <button type="button" class="hint-button" aria-label="Help about download access" data-hint="A password protects the link. A maximum of one request set limits each file to one request. Interrupted file downloads can resume without using another request. Share the password separately from the link.">?</button></summary><div class="grid">
             <label>Access password <span class="muted">optional</span>
               <input id="deliver-password" type="password" autocomplete="new-password" placeholder="none" />
             </label>
-            <label>Max downloads <span class="muted">optional; 1 = one-time</span>
+            <label>Max downloads <span class="muted">optional; 1 = one request set</span>
               <input data-draft-field id="deliver-max-downloads" type="number" min="1" max="10000" placeholder="unlimited" />
             </label>
           </div>
           </details>
-          <details class="form-advanced"><summary>Notifications <button type="button" class="hint-button" aria-label="Help about download notifications" data-hint="First download started means a recipient began fetching files. Delivery completed is a separate event; neither is the recipient’s explicit acceptance.">?</button></summary><div id="deliver-notifications"></div></details>
+          <details class="form-advanced"><summary>Notifications <button type="button" class="hint-button" aria-label="Help about download notifications" data-hint="First file requested means a recipient began fetching files. Every file requested is a separate event; neither is the recipient’s explicit acceptance.">?</button></summary><div id="deliver-notifications"></div></details>
           <button type="submit" id="deliver-submit">Create download link</button>
           </fieldset>
         </form>
@@ -137,6 +137,7 @@
 
       <h2>Download links</h2>
       <p id="outbound-grants-count" class="muted" role="status" aria-live="polite">Loading issued downloads…</p>
+      <p class="muted">Request sets count each file request. A set is complete when every file has been requested; signed verification evidence is separate.</p>
       <p id="outbound-grants-status" class="muted" role="status" tabindex="-1"></p>
       <div id="outbound-grants"></div>
       <button id="outbound-grants-load-more" type="button" hidden>Load more</button>

@@ -257,9 +257,10 @@ not per range, so it costs nothing on the data path.
 `serve_admitted` and `serve_completed` produce audit rows and tracing events.
 Refusals emit a `serve_refused` tracing event and increment
 `votport_serve_refused_total{reason}` with the fixed reasons `rate`, `capability`,
-`unknown`, `closed` and `busy`; they do not create audit rows. A
-completed QUIC delivery sends the same `outbound_download_started` and
-`outbound_delivery_complete` notifications the HTTP path sends.
+`unknown`, `closed` and `busy`; they do not create audit rows. A QUIC fetch that
+reaches the end of its manifest sends the same
+`outbound_download_started` and `outbound_delivery_complete` notifications the
+HTTP path sends.
 
 ## votport: the publication feed and replicas
 

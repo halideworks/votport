@@ -325,8 +325,11 @@ and, later, of votdock's fleet.
   QUIC by default, at the rates VOT measures, with every object proven on
   the receiver before publication. A 500 GB sequence is never copied on the
   sending machine.
-- Receive: paste a deliver link, pick a destination, get every file
-  published atomically with a receipt, verified against the package root.
+- Receive: paste a deliver link, pick a destination, get each payload file
+  published atomically after its bytes verify against the announced object
+  identity. Optional publication receipts remain server-side: they can be
+  downloaded separately and checked at `/verify`; automatic native receipt
+  sidecar saving and verification are unimplemented.
 - Resume: a transfer survives an app quit, a sleep, a network change, and
   a reboot, and picks up where the persisted state says it left off. Over
   push this retains complete objects within the receiver's idle window;
@@ -376,8 +379,11 @@ Server, the contract the client speaks (route table in `server/src/app.rs`):
 | `GET /api/s/{token}/{file,batch,bundle,receipt}` | HTTP delivery and receipts, the fallback. |
 | `GET /api/receipt-key`, `POST /api/verify` | Public receipt verification. |
 
-The original API inventory below predates C0. Its limitations are historical;
-the current core uses the seams listed in the status at the top of this document.
+### Historical VOT API inventory
+
+The original API inventory below predates C0 and records historical VOT client
+design. It is not the current votport receive implementation; the current core
+uses the seams listed in the status at the top of this document.
 
 - `push_bundle(bundle_dir, address, capability_path, key_source, identity)`
   dials `rails` sessions, each `ServeSession::begin_push_session` over a
@@ -398,16 +404,18 @@ the current core uses the seams listed in the status at the top of this document
   the no-copy path, but nothing public drives a push from an assembled
   server, and nothing public builds a manifest without also building the
   bundle.
-- `fetch_bundle(address, bundle_dir, pin)` and `receive_bundle(bundle,
-  destination, receipt, key, observed_at)` are `vot fetch` and the publish
-  half of `vot pull`: fetch into a bundle directory, then publish through
-  `NativeFile` with a receipt. Every knob is a process environment variable
-  (`VOT_FETCH_CAPABILITY`, `VOT_FETCH_HOLDER_KEY`, `VOT_FETCH_SERVE_IDENTITY`,
-  `VOT_FETCH_RAILS`, `VOT_FETCH_STATS`), which a long-lived app with two
-  transfers in flight cannot use. The fetch already has a placed-bytes
-  callback (`BundleFetcher::report_placed`, which the CLI uses to print a
-  line every 256 MiB); the push has none, and neither is reachable
-  without the environment variables.
+- Historical `fetch_bundle(address, bundle_dir, pin)` and
+  `receive_bundle(bundle, destination, receipt, key, observed_at)` were
+  `vot fetch` and the publish half of `vot pull`: fetch into a bundle
+  directory, then publish through `NativeFile` with a receipt. The current
+  client uses `fetch_bundle_with` and its receive paths to verify payload
+  objects against their announced roots and publish them; it does not fetch,
+  write, or verify receipt sidecars. Every historical knob was a process
+  environment variable (`VOT_FETCH_CAPABILITY`, `VOT_FETCH_HOLDER_KEY`,
+  `VOT_FETCH_SERVE_IDENTITY`, `VOT_FETCH_RAILS`, `VOT_FETCH_STATS`), which a
+  long-lived app with two transfers in flight cannot use. The historical fetch
+  also had a placed-bytes callback (`BundleFetcher::report_placed`, which the
+  CLI used to print a line every 256 MiB); the push had none.
 - Platform support: `vot-platform-fs`, `vot-platform-net`, and
   `vot-sdk-file` carry Linux, macOS, and Windows code; CI tests the
   platform crates on `windows-2025` and `macos-15` and compiles
@@ -572,15 +580,18 @@ without asking; the shell shows them as "resuming".
   again. The core never writes a password to the journal.
 - The server's push and serve certificate digests are pinned per transfer
   from the preflight response, as the CLI pins `VOT_FETCH_SERVE_IDENTITY`.
-- Receipts are a receive-side artefact: they arrive with every received
-  package, are stored beside the files as the web recipient page does,
-  and the app verifies them against `/api/receipt-key` and shows the
-  result on the done card. A sender gets no receipt. Over HTTP the
-  finish report carries the upload id, each file's object root, and a
-  per-file flag saying a sidecar was written; over push the sender gets
-  only the receiver's final cursor. The send done card shows the package
-  root the core computed, and the upload id and per-file flags when the
-  HTTP path supplied them.
+- When available, publication receipts are server-side delivery artefacts
+  exposed through the delivery's receipt URLs. Native receive verifies each
+  payload against its announced object root before publication, but does not
+  download, save, or verify a receipt sidecar. `receipt_key` in
+  `OutboundMetadata` authenticates the recipient evidence challenge; it is not
+  a receipt downloader. The receive done card shows landed and verified
+  payload files and any delivery verification report status, not a local
+  publication receipt. Senders do not receive the recipient's publication
+  receipts. An HTTP upload finish report still carries the upload id, object
+  roots, and server per-file receipt flags; the native shell currently shows
+  transfer status and file states instead of those flags. Over push the sender
+  gets only the receiver's final cursor.
 
 ### 6. Design language
 
@@ -652,10 +663,9 @@ are coalesced to ten per second before they cross the FFI.
    selects HTTP; failures after preflight end the attempt. The HTTP path is
    `POST /api/r/{token}/session`, seal, pages, begin, chunks with the
    server's `chunk_bytes` and parallel ranges, finish. The HTTP finish
-   report and the push's completed cursor both end the transfer; the core
-   records the package root it computed and, on the HTTP path, the upload
-   id and the per-file receipt flags in the journal, and shows them on
-   the done card.
+   report and the push's completed cursor both end the transfer. The HTTP
+   finish report carries the upload id and server per-file receipt flags; the
+   native done card shows transfer status and file states.
 5. On a cut connection over HTTP the core retries the same session with
    backoff and resumes per file. Over push the receiver keeps the cut
    session until its rails time out (30 s) and the ticket admits joiners
@@ -671,17 +681,19 @@ are coalesced to ten per second before they cross the FFI.
 2. If the `fetch` object is present: the probe against `fetch.address`
    and `fetch.certificate_digest`, then `POST /api/s/{token}/fetch` with
    the holder key, then `fetch_bundle_with(FetchOptions)` into a staging
-   directory beside the destination on the same filesystem (so publish is
-   a rename), then `receive_bundle`-equivalent publication through
-   `NativeFile` with the receipt and the observed time. The final-cursor
-   acknowledgement is sent by the fetch path, so the delivery counts
-   against `max_downloads` (ADR-0050).
+   directory beside the destination, then materializes
+   each object into the destination, rehashing it and publishing it only after
+   it matches its announced object identity. The final-cursor acknowledgement
+   is sent by the fetch path, so the delivery counts against `max_downloads`
+   (ADR-0050). Receipt sidecars are not downloaded or written by this path.
 3. Otherwise HTTP: `/api/s/{token}/batch` for many small files, per-file
    GETs with `Range` for large ones, four in flight, each verified against
    its root as it lands, then the same publication.
-4. Receipt verification against `/api/receipt-key`; the done card shows
-   the package root, the receipt, and a Reveal in Finder or Show in
-   Explorer action.
+4. The done card reports each received file as landed and verified and offers
+   Reveal in Finder or Show in Explorer. When a server-side publication
+   receipt is available, obtain it separately from the delivery and check the
+   file and sidecar on `/verify`; automatic native sidecar saving and
+   verification are unimplemented.
 
 ### Speed budget
 
@@ -723,8 +735,10 @@ generated C# bindings.
 CLI (`client/cli`): `votport send <link> <path>...`, `votport receive
 <link> <dest>`, `votport status`, and `votport resume <id>`. `votport help`
 lists the watch, agent, and operator commands. A standalone command to verify
-receipts is unimplemented; use the server's `/verify` page for a file and its
-receipt. The Linux build supports headless sending, receiving, and watch folders.
+receipts is unimplemented, and receive does not save or verify receipt
+sidecars automatically. Obtain a receipt separately and use the server's
+`/verify` page for the file and its sidecar. The Linux build supports headless
+sending, receiving, and watch folders.
 
 Operator mode (phase C8, every shell and the CLI): sign in to a votport
 with the admin password (`POST /api/admin/login`, the same session
@@ -855,7 +869,7 @@ machines on 2026-09-04, `cargo +1.97.1 build -p vot-cli --features wire
 | --- | --- | --- | --- |
 | C0 | VOT | `build_manifest`, `build_manifest_from`, `push_from`, `fetch_bundle_with`, `probe_serve`, progress observers, wire on the platform-native job (the listener session cap is a follow-on) | Loopback push from an assembled server and fetch with options pass on Linux, macOS, and Windows in CI (landed at `0a129ea`; current pin `de66d413`) |
 | C1 | votport | `client/core` and `client/cli`: api, identity, hash, package, transfer, send over push and HTTP, journal, e2e on loopback | `votport send` moves a 20,000-entry drop and a 4 GiB file over both paths on all three platforms; the HTTP path resumes after a kill; hash and transfer rates recorded on the two target machines |
-| C2 | votport | Receive over fetch and HTTP, publish with receipt, verify | `votport receive` publishes a grant with a verified receipt and the delivery counts on the server |
+| C2 | votport | Receive over fetch and HTTP, verify payload identities, publish; receipt sidecars are separately downloadable | `votport receive` publishes each file only after its announced object identity verifies and the delivery counts on the server; automatic native receipt sidecar saving and verification are unimplemented |
 | C3 | votport | Push resume on the receiver: staging keyed by link, package root, and holder key, kept across a disconnect and by the boot sweep, adopted by a new preflight once the old session is gone, sink factory re-proves and skips complete staged objects; the core aborts the cut session, re-preflights, and re-dials | A push killed at 90% of a 20,000-entry drop, resumed after the ticket expired and after a server restart, finishes by sending only the objects that were not complete |
 | C4 | votport | macOS app | Send and receive from Finder drops, notarized DMG from CI, the design review against the web pages |
 | C5 | votport | Windows app | Same, signed MSIX |

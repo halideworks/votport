@@ -46,8 +46,9 @@ The supported events are `upload_complete`, `upload_failed`,
 `route_failed`, `route_recovered`, and `route_received` (see Trade routes
 below). Receive requests offer the two upload events. Delivery links offer the
 two download events. Workflows offer both download events and the retry/failure
-events. Tenant defaults may subscribe to any event. A first download that also
-completes a delivery emits both subscribed events. An interrupted upload without
+events. Tenant defaults may subscribe to any event. A first file request that
+also reaches the every-file request threshold emits both subscribed events. An
+interrupted upload without
 received bytes and a sender cancellation do not send failure notifications.
 
 Upgrading from the earlier environment-configured channels turns notifications

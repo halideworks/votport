@@ -61,6 +61,9 @@ const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
 const MAX_PASSWORD_BYTES: usize = 256;
 const MAX_AUTOMATION_LABEL_CHARS: usize = 100;
 const DOWNLOAD_LEASE_SECS: u64 = 24 * 60 * 60;
+// No valid file index reaches usize::MAX; this signed index represents the
+// already-admitted logical bundle and can recover any of its member files.
+const BUNDLE_DOWNLOAD_LEASE_INDEX: usize = usize::MAX;
 const OUTBOUND_UPLOAD_ID: &str = "x-votport-upload-id";
 const MAX_OUTBOUND_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_LIBRARY_DIRECTORY_INPUT_BYTES: usize = 1024;
@@ -2975,6 +2978,50 @@ pub async fn outbound_batch(
             "batch exceeds total size limit",
         ));
     }
+    // Refuse an exhausted file before any staging or payload preparation.
+    for index in 0..count {
+        if grant_is_exhausted(&grant, index, None) {
+            return Err(ApiError::not_found());
+        }
+    }
+    if is_head {
+        let mut response = Body::empty().into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/vnd.votport.batch"),
+        );
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(total_bytes));
+        return Ok(response);
+    }
+    if total_bytes == 0 {
+        let validation_app = Arc::clone(&app);
+        let validation_grant = Arc::clone(&grant);
+        tokio::task::spawn_blocking(move || {
+            validate_batch_sources(&validation_app, &validation_grant, count)
+        })
+        .await
+        .map_err(|_| ApiError::internal("batch source validation failed"))??;
+        let indexes: Vec<usize> = (0..count).collect();
+        record_download(&app, &grant, &indexes).await?;
+        audit_download_request(&app, &grant, &headers, peer, "batch", None).await?;
+        let mut response = Body::empty().into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/vnd.votport.batch"),
+        );
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(0u64));
+        return Ok(response);
+    }
     let active = ActiveDownload::claim(Arc::clone(&app), &format!("{}:batch", grant.token_hash))?;
     let chunks = batch_chunks(&grant, count);
     let permit = staging_permit(&app, &chunks[0]).await;
@@ -2986,17 +3033,12 @@ pub async fn outbound_batch(
     )?)
     .await?;
     let file = first_file;
+    let validated_end = chunks[0].end;
     // Downloads are recorded per file as its last byte is handed to the
     // transport, not all up front: an interrupted batch must leave the
-    // files it never sent still downloadable individually. The stale-copy
-    // check here refuses obviously exhausted grants before any bytes; the
-    // per-file record enforces max_downloads atomically, so two racing
-    // batch streams can both start but only one records each capped file.
-    for index in 0..count {
-        if grant_is_exhausted(&grant, index, None) {
-            return Err(ApiError::not_found());
-        }
-    }
+    // files it never sent still downloadable individually. The per-file
+    // record enforces max_downloads atomically, so two racing batch streams
+    // can both start but only one records each capped file.
     let boundaries: Vec<u64> = (0..count)
         .scan(0u64, |total, index| {
             *total += grant
@@ -3016,34 +3058,42 @@ pub async fn outbound_batch(
         file: Some(file),
         lookahead: std::collections::VecDeque::new(),
         boundaries,
+        validated_end,
         sent_bytes: 0,
         recorded: 0,
     };
     state.fill_lookahead();
-    if is_head {
-        require_grant_access(&app, &state.grant, &headers)?;
-    } else {
-        audit_download_request(&app, &state.grant, &headers, peer, "batch", None).await?;
-    }
+    audit_download_request(&app, &state.grant, &headers, peer, "batch", None).await?;
     let stream = futures_util::stream::try_unfold(state, |mut state| async move {
-        // Recording trails delivery: only files whose bytes a previous
-        // poll already handed to the transport are recorded, so a record
-        // failure can never abort bytes ahead of what it recorded and
-        // lock a capped client out of files it never got. The trade runs
-        // the safe direction: a drop or failure can leave the last
-        // yielded files unrecorded, and the client's per-file retry
-        // records them then.
+        // Normal polls record only files whose bytes a previous poll handed
+        // to the transport. The final frame is validated and admitted before
+        // it is returned because a known-length body may skip terminal None.
+        // A drop or failure before that frame leaves its files retryable.
         state.record_delivered(false).await.map_err(api_error_io)?;
         loop {
-            if let Some(file) = state.file.as_mut() {
-                if let Some(item) = file.next().await {
-                    return match item {
-                        Ok(bytes) => {
-                            state.sent_bytes += bytes.len() as u64;
-                            Ok(Some((bytes, state)))
+            let item = match state.file.as_mut() {
+                Some(file) => file.next().await,
+                None => None,
+            };
+            if let Some(item) = item {
+                match item {
+                    Ok(bytes) => {
+                        state.sent_bytes += bytes.len() as u64;
+                        // A known-length body may be dropped immediately after
+                        // its last frame, without polling terminal None. Record
+                        // the boundary before handing that frame to the body.
+                        if state.sent_bytes >= state.boundaries.last().copied().unwrap_or(0) {
+                            state
+                                .validate_trailing_chunks()
+                                .await
+                                .map_err(api_error_io)?;
+                            state.record_delivered(true).await.map_err(api_error_io)?;
+                            state.file = None;
+                            state.chunk_index = state.chunks.len() - 1;
                         }
-                        Err(error) => Err(error),
-                    };
+                        return Ok(Some((bytes, state)));
+                    }
+                    Err(error) => return Err(error),
                 }
             }
             state.file = None;
@@ -3066,6 +3116,7 @@ pub async fn outbound_batch(
             };
             let file = await_batch_chunk(handle).await.map_err(api_error_io)?;
             state.file = Some(file);
+            state.validated_end = state.chunks[state.chunk_index].end;
             state.fill_lookahead();
         }
     });
@@ -3173,6 +3224,19 @@ async fn staging_permit(
     }
     // The semaphore is never closed, so acquire only fails if it were.
     Arc::clone(&app.staging_permits).acquire_owned().await.ok()
+}
+
+fn validate_batch_sources(app: &App, grant: &OutboundGrant, count: usize) -> ApiResult<()> {
+    let _pin = legacy_link_pin(app, grant, grant.files.is_empty())?;
+    let verifying_key = app.signer.verifying_key();
+    let mut output = io::sink();
+    let mut buf = vec![0u8; CHUNK];
+    for index in 0..count {
+        let source = source_info_indexed(app, grant, index)?;
+        write_verified_source(&mut output, source, &verifying_key, &mut buf)
+            .map_err(map_batch_error)?;
+    }
+    Ok(())
 }
 
 fn start_batch_chunk(
@@ -3528,7 +3592,7 @@ fn issue_download_lease(
         super::cookie_attributes(app)
     );
     if let Ok(value) = HeaderValue::try_from(cookie) {
-        response.headers_mut().insert(header::SET_COOKIE, value);
+        response.headers_mut().append(header::SET_COOKIE, value);
     }
 }
 
@@ -3568,6 +3632,26 @@ pub async fn outbound_bundle(
             "bundle exceeds total size limit",
         ));
     }
+    for index in 0..count {
+        if grant_is_exhausted(&grant, index, None) {
+            return Err(ApiError::not_found());
+        }
+    }
+    if is_head {
+        let mut response = Body::empty().into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/zip"),
+        );
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response.headers_mut().insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment; filename=\"deliverables.zip\""),
+        );
+        return Ok(response);
+    }
     let active = ActiveDownload::claim(Arc::clone(&app), &format!("{}:bundle", grant.token_hash))?;
     let worker = Arc::clone(&app);
     let (grant, archive, _operation, active, _pin) = tokio::task::spawn_blocking(move || {
@@ -3597,7 +3681,8 @@ pub async fn outbound_bundle(
         .map_err(|_| ApiError::internal("open bundle failed"))?;
     // The ZIP is one opaque response with no per-file boundaries a client
     // commits against, so the bundle keeps up-front recording; the batch
-    // endpoint records per delivered file instead.
+    // endpoint records per delivered file instead. The bundle lease lets an
+    // interrupted bundle recover each file through the existing range path.
     let indexes: Vec<usize> = (0..count).collect();
     record_download(&app, &grant, &indexes).await?;
     let stream = ReaderStream::with_capacity(
@@ -3623,11 +3708,14 @@ pub async fn outbound_bundle(
         header::CONTENT_DISPOSITION,
         HeaderValue::from_static("attachment; filename=\"deliverables.zip\""),
     );
-    if is_head {
-        require_grant_access(&app, &grant, &headers)?;
-    } else {
-        audit_download_request(&app, &grant, &headers, peer, "bundle", None).await?;
-    }
+    issue_download_lease(
+        &app,
+        &grant,
+        &token,
+        BUNDLE_DOWNLOAD_LEASE_INDEX,
+        &mut response,
+    );
+    audit_download_request(&app, &grant, &headers, peer, "bundle", None).await?;
     Ok(response)
 }
 
@@ -3833,14 +3921,26 @@ fn download_lease_authorized(
     index: usize,
     headers: &HeaderMap,
 ) -> bool {
-    headers
+    let Some(cookies) = headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
-        .and_then(|cookies| {
-            auth::cookie_value(cookies, &download_lease_cookie_name(&grant.id, index))
-        })
-        .is_some_and(|value| {
-            auth::verify_download_lease(&app.secret, &grant.id, &grant.token_hash, index, value)
+    else {
+        return false;
+    };
+    [index, BUNDLE_DOWNLOAD_LEASE_INDEX]
+        .into_iter()
+        .any(|index| {
+            auth::cookie_value(cookies, &download_lease_cookie_name(&grant.id, index)).is_some_and(
+                |value| {
+                    auth::verify_download_lease(
+                        &app.secret,
+                        &grant.id,
+                        &grant.token_hash,
+                        index,
+                        value,
+                    )
+                },
+            )
         })
 }
 
@@ -4534,10 +4634,13 @@ struct BatchStream {
     /// Staging tasks for the chunks after `chunk_index`, in order: entry i
     /// is chunk `chunk_index + 1 + i`.
     lookahead: std::collections::VecDeque<tokio::task::JoinHandle<io::Result<BatchFile>>>,
-    /// Cumulative end offset of each file in the concatenated body; a file
-    /// is recorded as downloaded once `sent_bytes` from already-yielded
-    /// polls covers its boundary.
+    /// Cumulative end offset of each file in the concatenated body; a file is
+    /// recorded once a poll covers its boundary. The final frame flushes
+    /// before it is returned because a known-length body need not poll
+    /// terminal None. This records transport handoff, not recipient receipt.
     boundaries: Vec<u64>,
+    /// End of the chunk whose source bytes and receipts have been validated.
+    validated_end: usize,
     sent_bytes: u64,
     recorded: usize,
 }
@@ -4608,11 +4711,31 @@ impl BatchStream {
         }
     }
 
-    /// Records every file whose bytes previous polls fully yielded, once
-    /// enough of them have accumulated or when `flush` ends the stream.
+    async fn validate_trailing_chunks(&mut self) -> ApiResult<()> {
+        let mut chunk_index = self.chunk_index + 1;
+        while let Some(chunk) = self.chunks.get(chunk_index).cloned() {
+            let handle = if let Some(handle) = self.lookahead.pop_front() {
+                handle
+            } else {
+                let permit = staging_permit(&self.app, &chunk).await;
+                start_batch_chunk(Arc::clone(&self.app), self.grant.clone(), chunk, permit)?
+            };
+            drop(await_batch_chunk(handle).await?);
+            self.validated_end = self.chunks[chunk_index].end;
+            chunk_index += 1;
+        }
+        Ok(())
+    }
+
+    /// Records every file whose boundary has been covered, once enough of
+    /// them have accumulated or when `flush` ends the stream.
     async fn record_delivered(&mut self, flush: bool) -> ApiResult<()> {
-        let Some(range) = record_range(&self.boundaries, self.recorded, self.sent_bytes, flush)
-        else {
+        let Some(range) = record_range(
+            &self.boundaries[..self.validated_end],
+            self.recorded,
+            self.sent_bytes,
+            flush,
+        ) else {
             return Ok(());
         };
         let indexes: Vec<usize> = range.clone().collect();
@@ -5056,6 +5179,44 @@ mod tests {
             .to_owned();
         let peer = |port| ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
 
+        let head_batch = crate::app::router(app.clone())
+            .oneshot(
+                Request::head(format!("/api/s/{token}/batch"))
+                    .extension(peer(10))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head_batch.status(), StatusCode::OK);
+        drop(head_batch);
+        assert!(!app.config.data_dir.join("outbound.stage").exists());
+        let grant = app
+            .store
+            .outbound_grant_by_token_hash(&hash_token(&token))
+            .unwrap()
+            .unwrap();
+        assert!(grant.files.iter().all(|file| file.downloads == 0));
+
+        let head_bundle = crate::app::router(app.clone())
+            .oneshot(
+                Request::head(format!("/api/s/{token}/bundle"))
+                    .extension(peer(11))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head_bundle.status(), StatusCode::OK);
+        drop(head_bundle);
+        assert!(!app.config.data_dir.join("outbound.stage").exists());
+        let grant = app
+            .store
+            .outbound_grant_by_token_hash(&hash_token(&token))
+            .unwrap()
+            .unwrap();
+        assert!(grant.files.iter().all(|file| file.downloads == 0));
+
         // A batch response dropped before any body frame is polled records
         // nothing: the old up-front recording burned every file's single
         // download here.
@@ -5088,8 +5249,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(batch.status(), StatusCode::OK);
-        let bytes = batch.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(bytes.as_ref(), b"file afile b");
+        let expected_length = batch.headers()[header::CONTENT_LENGTH]
+            .to_str()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        let mut stream = batch.into_body().into_data_stream();
+        let mut bytes = Vec::with_capacity(expected_length);
+        while bytes.len() < expected_length {
+            bytes.extend_from_slice(&stream.next().await.unwrap().unwrap());
+        }
+        drop(stream);
+        assert_eq!(bytes.len(), expected_length);
+        assert_eq!(bytes, b"file afile b");
         let grant = app
             .store
             .outbound_grant_by_token_hash(&hash_token(&token))
@@ -5108,6 +5280,362 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+
+        for path in ["empty/a.bin", "empty/b.bin"] {
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::post(format!("/api/admin/outbound-files?path={path}"))
+                        .header("cookie", &cookie)
+                        .header("x-votport", "1")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let empty_created = crate::app::router(app.clone())
+            .oneshot(
+                Request::post("/api/admin/outbound-grants")
+                    .header("cookie", &cookie)
+                    .header("x-votport", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"paths":["empty/a.bin","empty/b.bin"],"max_downloads":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty_created.status(), StatusCode::OK);
+        let empty_token = body(empty_created).await["url"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_owned();
+        let empty_batch = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{empty_token}/batch"))
+                    .extension(peer(14))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty_batch.status(), StatusCode::OK);
+        assert_eq!(empty_batch.headers()[header::CONTENT_LENGTH], "0");
+        drop(empty_batch);
+        let empty_grant = app
+            .store
+            .outbound_grant_by_token_hash(&hash_token(&empty_token))
+            .unwrap()
+            .unwrap();
+        assert!(empty_grant.files.iter().all(|file| file.downloads == 1));
+    }
+
+    #[tokio::test]
+    async fn zero_byte_batch_validates_sources_before_counting() {
+        let (_directory, app, _cookie, _expected) = fixture().await;
+        let empty = object_id(&[]);
+        let make_grant = |id: &str, token: &str, source: &str| {
+            let mut grant = crate::store::tests::test_outbound_grant(id, "", 0);
+            grant.token_hash = hash_token(token);
+            grant.expires_at = now_unix() + 600;
+            grant.max_downloads = Some(1);
+            grant.name = "empty.bin".to_owned();
+            grant.suite = "blake3".to_owned();
+            grant.root = hex::encode(empty.root);
+            grant.bytes = 0;
+            grant.files = vec![OutboundGrantFile {
+                source: source.to_owned(),
+                name: "empty.bin".to_owned(),
+                suite: "blake3".to_owned(),
+                root: hex::encode(empty.root),
+                bytes: 0,
+                receipt_b64: String::new(),
+                downloads: 0,
+                first_download_at: None,
+                last_download_at: None,
+            }];
+            grant
+        };
+        let missing_token = "a".repeat(32);
+        let missing = make_grant("missing-zero", &missing_token, "missing-zero.bin");
+        app.store.insert_outbound_grant(missing).unwrap();
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{missing_token}/batch"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            app.store
+                .outbound_grant_by_token_hash(&hash_token(&missing_token))
+                .unwrap()
+                .unwrap()
+                .files[0]
+                .downloads,
+            0
+        );
+
+        let tampered_path = app.config.outbound_dir.join("tampered-zero.bin");
+        std::fs::write(&tampered_path, b"x").unwrap();
+        let tampered_token = "b".repeat(32);
+        let tampered = make_grant("tampered-zero", &tampered_token, "tampered-zero.bin");
+        app.store.insert_outbound_grant(tampered).unwrap();
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{tampered_token}/batch"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 2))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            app.store
+                .outbound_grant_by_token_hash(&hash_token(&tampered_token))
+                .unwrap()
+                .unwrap()
+                .files[0]
+                .downloads,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_defers_trailing_empty_file_until_its_chunk_is_validated() {
+        let (_directory, app, _cookie, expected) = fixture().await;
+        let expected_object = object_id(&expected);
+        let empty_object = object_id(&[]);
+        std::fs::write(app.config.outbound_dir.join("source.bin"), &expected).unwrap();
+        std::fs::write(app.config.outbound_dir.join("trailing-empty.bin"), b"x").unwrap();
+        let token = "c".repeat(32);
+        let mut grant = crate::store::tests::test_outbound_grant("mixed-empty", "", 0);
+        grant.token_hash = hash_token(&token);
+        grant.expires_at = now_unix() + 600;
+        grant.max_downloads = Some(1);
+        grant.bytes = expected.len() as u64;
+        grant.files = (0..64)
+            .map(|index| OutboundGrantFile {
+                source: "source.bin".to_owned(),
+                name: format!("file-{index}.bin"),
+                suite: "blake3".to_owned(),
+                root: hex::encode(expected_object.root),
+                bytes: expected.len() as u64,
+                receipt_b64: String::new(),
+                downloads: 0,
+                first_download_at: None,
+                last_download_at: None,
+            })
+            .chain(std::iter::once(OutboundGrantFile {
+                source: "trailing-empty.bin".to_owned(),
+                name: "trailing-empty.bin".to_owned(),
+                suite: "blake3".to_owned(),
+                root: hex::encode(empty_object.root),
+                bytes: 0,
+                receipt_b64: String::new(),
+                downloads: 0,
+                first_download_at: None,
+                last_download_at: None,
+            }))
+            .collect();
+        app.store.insert_outbound_grant(grant).unwrap();
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/batch"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 3))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        assert!(stream.next().await.unwrap().is_err());
+        drop(stream);
+        let grant = app
+            .store
+            .outbound_grant_by_token_hash(&hash_token(&token))
+            .unwrap()
+            .unwrap();
+        assert!(grant.files.iter().all(|file| file.downloads == 0));
+        assert_eq!(grant.files[64].downloads, 0);
+    }
+
+    #[tokio::test]
+    async fn batch_does_not_record_zero_file_before_next_chunk_validation() {
+        let (_directory, mut app, _cookie, _expected) = fixture().await;
+        Arc::get_mut(&mut app).unwrap().config.max_upload_bytes = 64 * 1024 * 1024;
+        let large = vec![b'a'; BATCH_LEAD_BYTES as usize / BATCH_LEAD_FILES];
+        let large_object = object_id(&large);
+        let empty_object = object_id(&[]);
+        std::fs::write(app.config.outbound_dir.join("large.bin"), &large).unwrap();
+        std::fs::write(app.config.outbound_dir.join("invalid-empty.bin"), b"x").unwrap();
+        let token = "e".repeat(32);
+        let mut grant = crate::store::tests::test_outbound_grant("mixed-boundary", "", 0);
+        grant.token_hash = hash_token(&token);
+        grant.expires_at = now_unix() + 600;
+        grant.max_downloads = Some(1);
+        grant.bytes = large.len() as u64;
+        grant.files = (0..BATCH_LEAD_FILES)
+            .map(|index| OutboundGrantFile {
+                source: "large.bin".to_owned(),
+                name: format!("large-{index}.bin"),
+                suite: "blake3".to_owned(),
+                root: hex::encode(large_object.root),
+                bytes: large.len() as u64,
+                receipt_b64: String::new(),
+                downloads: 0,
+                first_download_at: None,
+                last_download_at: None,
+            })
+            .chain([
+                OutboundGrantFile {
+                    source: "invalid-empty.bin".to_owned(),
+                    name: "invalid-empty.bin".to_owned(),
+                    suite: "blake3".to_owned(),
+                    root: hex::encode(empty_object.root),
+                    bytes: 0,
+                    receipt_b64: String::new(),
+                    downloads: 0,
+                    first_download_at: None,
+                    last_download_at: None,
+                },
+                OutboundGrantFile {
+                    source: "large.bin".to_owned(),
+                    name: "after-empty.bin".to_owned(),
+                    suite: "blake3".to_owned(),
+                    root: hex::encode(large_object.root),
+                    bytes: large.len() as u64,
+                    receipt_b64: String::new(),
+                    downloads: 0,
+                    first_download_at: None,
+                    last_download_at: None,
+                },
+            ])
+            .collect();
+        app.store.insert_outbound_grant(grant).unwrap();
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/batch"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 4))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let mut saw_error = false;
+        while let Some(item) = stream.next().await {
+            if item.is_err() {
+                saw_error = true;
+                break;
+            }
+        }
+        assert!(saw_error);
+        drop(stream);
+        let grant = app
+            .store
+            .outbound_grant_by_token_hash(&hash_token(&token))
+            .unwrap()
+            .unwrap();
+        assert!(grant.files[..BATCH_LEAD_FILES]
+            .iter()
+            .all(|file| file.downloads == 1));
+        assert_eq!(grant.files[BATCH_LEAD_FILES].downloads, 0);
+        assert_eq!(grant.files[BATCH_LEAD_FILES + 1].downloads, 0);
+    }
+
+    #[tokio::test]
+    async fn interrupted_bundle_issues_logical_lease_for_file_recovery() {
+        let (_directory, app, _cookie, expected) = fixture().await;
+        let object = object_id(&expected);
+        std::fs::write(app.config.outbound_dir.join("source.bin"), &expected).unwrap();
+        let token = "d".repeat(32);
+        let mut grant = crate::store::tests::test_outbound_grant("bundle-resume", "", 0);
+        grant.token_hash = hash_token(&token);
+        grant.expires_at = now_unix() + 600;
+        grant.max_downloads = Some(1);
+        grant.bytes = expected.len() as u64;
+        grant.files = ["one.bin", "two.bin"]
+            .into_iter()
+            .map(|name| OutboundGrantFile {
+                source: "source.bin".to_owned(),
+                name: name.to_owned(),
+                suite: "blake3".to_owned(),
+                root: hex::encode(object.root),
+                bytes: expected.len() as u64,
+                receipt_b64: String::new(),
+                downloads: 0,
+                first_download_at: None,
+                last_download_at: None,
+            })
+            .collect();
+        app.store.insert_outbound_grant(grant).unwrap();
+        let response = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/bundle"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookies = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(cookies.len(), 1);
+        let cookie = cookies[0].split(';').next().unwrap();
+        drop(response);
+        let grant = app
+            .store
+            .outbound_grant_by_token_hash(&hash_token(&token))
+            .unwrap()
+            .unwrap();
+        assert!(grant.files.iter().all(|file| file.downloads == 1));
+        let refused = crate::app::router(app.clone())
+            .oneshot(
+                Request::get(format!("/api/s/{token}/files/0"))
+                    .extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 6))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+        for index in 0..2 {
+            let response = crate::app::router(app.clone())
+                .oneshot(
+                    Request::get(format!("/api/s/{token}/files/{index}"))
+                        .header(header::COOKIE, cookie)
+                        .extension(ConnectInfo(std::net::SocketAddr::from((
+                            [127, 0, 0, 1],
+                            7 + index as u16,
+                        ))))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                expected
+            );
+        }
     }
 
     /// Mid-stream recording (a flush inside the window) and the end flush

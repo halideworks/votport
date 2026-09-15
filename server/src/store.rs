@@ -1281,7 +1281,7 @@ impl Store {
     }
 
     /// Issued downloads in one tenant namespace: links usable now (not
-    /// revoked, not expired, not exhausted), complete deliveries in total,
+    /// revoked, not expired, not exhausted), request sets in total,
     /// and how many of `active_hashes` (token hashes with a download in
     /// flight) belong to this tenant.
     pub fn outbound_summary(

@@ -18,7 +18,7 @@ point to the client CLI on the agent's machine.
 | --- | --- |
 | `library:read` | Browse files and subdirectories within the token's folder. |
 | `deliveries:create` | Share a folder and recover URLs for this token's operations. |
-| `deliveries:read` | List this token's deliveries and inspect their files, receipts, and download starts. |
+| `deliveries:read` | List this token's deliveries and inspect their files, receipts, and request counts. |
 | `deliveries:revoke` | Revoke this token's deliveries. Files stay in the library. |
 | `jobs:read` | Read projects, jobs, signed events and evidence allowed by project membership. |
 | `jobs:create` | Create or retry jobs as a project sender. |
@@ -198,14 +198,19 @@ operator session and write header. Creation accepts `label`, `directory`,
 ## Evidence and activity
 
 Delivery detail returns each file's VOT `suite`, `root`, `bytes`,
-`download_starts`, and first/last download timestamps. Preparing a library
-file hashes its content; it does not publish it through a VOT provider or
-produce a publication receipt. The Votport receive client verifies local
-bytes against their announced object identities.
+`download_starts`, and first/last download timestamps. A first-file request
+starts a request set; the all-files threshold means every file has been
+requested once in that set. These counters describe transport handoff and do
+not prove recipient-side verification or acceptance; signed Verify/Accept
+evidence is separate. Preparing a library file hashes its content; it does not
+publish it through a VOT provider or produce a publication receipt. The
+Votport receive client verifies local bytes against their announced object
+identities.
 
 Delivery `state` is `active`, `expired`, or `revoked`; download limits and counters
-are reported separately. Counters record download starts, and the server cannot
-infer recipient-side verification from them. Existing notification webhooks
+are reported separately. Counters record first-file and every-file request
+thresholds, and the server cannot infer recipient-side verification from them.
+Existing notification webhooks
 remain best-effort notifications. Query persistent delivery state to recover
 after missed notifications. Audit rows attribute creation and revocation to
 `automation:<token-id>` and creation records include the operation ID.

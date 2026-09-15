@@ -123,12 +123,12 @@ pub async fn outbound_downloaded(
         (
             result.first_download,
             "outbound_download_started",
-            "download started",
+            "first file requested",
         ),
         (
             result.completed_delivery,
             "outbound_delivery_complete",
-            "delivery complete",
+            "every file requested",
         ),
     ];
     let transfer_id = grant.id.clone();
@@ -157,7 +157,7 @@ pub async fn outbound_downloaded(
             file_count > MAX_NOTIFICATION_FILES,
         )
     };
-    let download_starts = grant.downloads.saturating_add(1);
+    let download_starts = grant.downloads.max(result.first_download as u64);
     for (_, event, transition) in transitions.into_iter().filter(|(send, _, _)| *send) {
         let title = format!(
             "{}: outbound {transition} for \"{}\"",
@@ -504,9 +504,9 @@ pub(crate) mod tests {
     use crate::app;
     use crate::session::FinishReport;
     use crate::store::{
-        Branding, FileRecord, NotificationDestination, NotificationMode, NotificationPolicy,
-        NotificationRule, OutboundDownloadResult, OutboundGrant, OutboundGrantFile, Tenant,
-        NOTIFICATION_EVENTS,
+        now_unix, Branding, FileRecord, NotificationDestination, NotificationMode,
+        NotificationPolicy, NotificationRule, OutboundDownloadResult, OutboundGrant,
+        OutboundGrantFile, Tenant, NOTIFICATION_EVENTS,
     };
 
     pub(crate) fn test_grant(files: Vec<OutboundGrantFile>) -> OutboundGrant {
@@ -1085,15 +1085,32 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn outbound_downloaded_sends_started_webhook_without_secrets() {
         let (application, _directory, rx, thread) = webhook_app();
-        outbound_downloaded(
-            application,
-            test_grant(vec![test_file("one.txt", 10), test_file("two.txt", 20)]),
-            OutboundDownloadResult {
-                first_download: true,
-                completed_delivery: false,
-            },
-        )
-        .await;
+        let grant = test_grant(vec![test_file("one.txt", 10), test_file("two.txt", 20)]);
+        application.store.insert_outbound_grant(grant).unwrap();
+        let result = application
+            .store
+            .record_outbound_download("grant-id", &[0], now_unix())
+            .unwrap();
+        let grant = application
+            .store
+            .outbound_grant_by_id("grant-id")
+            .unwrap()
+            .unwrap();
+        outbound_downloaded(Arc::clone(&application), grant, result).await;
+        let completed = application
+            .store
+            .record_outbound_download("grant-id", &[1], now_unix())
+            .unwrap();
+        assert!(completed.completed_delivery);
+        assert_eq!(
+            application
+                .store
+                .outbound_grant_by_id("grant-id")
+                .unwrap()
+                .unwrap()
+                .downloads,
+            1
+        );
         let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let payload = request_json(&request);
         assert_eq!(payload["event"], "outbound_download_started");
